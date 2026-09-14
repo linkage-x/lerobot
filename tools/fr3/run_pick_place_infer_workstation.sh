@@ -122,6 +122,7 @@ action_aggregate="${FR3_ACTION_AGGREGATE-}"
 action_sample_horizon="${FR3_ACTION_SAMPLE_HORIZON-}"
 terminal_servo_pose="${FR3_TERMINAL_SERVO_POSE-}"
 terminal_servo_handoff_z="${FR3_TERMINAL_SERVO_HANDOFF_Z-}"
+terminal_servo_search_ring="${FR3_TERMINAL_SERVO_SEARCH_RING-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
 controller_damping="${FR3_CONTROLLER_DAMPING-}"
 gripper_change_delay_s="${FR3_GRIPPER_CHANGE_DELAY_S-}"
@@ -288,6 +289,9 @@ fi
 if [[ -n "${terminal_servo_handoff_z}" ]]; then
   common_args+=(--terminal-servo-handoff-z "${terminal_servo_handoff_z}")
 fi
+if [[ -n "${terminal_servo_search_ring}" ]]; then
+  common_args+=(--terminal-servo-search-ring "${terminal_servo_search_ring}")
+fi
 
 home_the_arm() {
   echo "[INFO] moving FR3 ${robot_ip} to fr3_pika_gripper.xml home keyframe (FR3_MOVE_TO_START=0 to skip)"
@@ -305,7 +309,7 @@ announce() {
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
   echo "[INFO] sampling: samples=${action_samples:-1} aggregate=${action_aggregate:-<runtime default>} horizon=${action_sample_horizon:-<execution horizon>}"
-  echo "[INFO] terminal_servo: pose=${terminal_servo_pose:-<off>} handoff_z=${terminal_servo_handoff_z:-<runtime default>}"
+  echo "[INFO] terminal_servo: pose=${terminal_servo_pose:-<off>} handoff_z=${terminal_servo_handoff_z:-<runtime default>} search_ring=${terminal_servo_search_ring:-<off>}"
   echo "[INFO] rtc: mode=${rtc_mode} horizon=${rtc_execution_horizon:-<runtime default>} guidance=${rtc_max_guidance_weight:-<runtime default>} schedule=${rtc_prefix_attention_schedule:-<runtime default>} replan_q=${rtc_replan_queue_size:-<runtime default>} delay=${rtc_inference_delay_steps:-auto}"
 }
 
@@ -328,6 +332,7 @@ case "$mode" in
     echo "FR3_ACTION_SAMPLE_HORIZON=${action_sample_horizon:-<execution horizon>}"
     echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
     echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
+    echo "FR3_TERMINAL_SERVO_SEARCH_RING=${terminal_servo_search_ring:-<off>}"
     echo "FR3_CONTROLLER_STIFFNESS=${controller_stiffness:-<driver default>}"
     echo "FR3_CONTROLLER_DAMPING=${controller_damping:-<driver default>}"
     echo "HF_HOME=${HF_HOME:-<unset, tokenizer will be fetched from huggingface.co>}"

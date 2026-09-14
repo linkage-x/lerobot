@@ -114,11 +114,13 @@ from tools.fr3.scene_reset import (
     scene_reset_request_from_payload,
 )
 from tools.fr3.terminal_servo import (
+    TERMINAL_SERVO_SEARCH_POINTS,
     TerminalServoError,
-    terminal_servo_arming,
     TerminalServoRequest,
     execute_terminal_servo,
     parse_terminal_servo_pose,
+    terminal_servo_arming,
+    terminal_servo_search_offsets,
     validate_terminal_servo_trajectory,
 )
 from tools.fr3.live_frames import LiveFrameEmitter
@@ -426,6 +428,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             'requires the peg to be held and the arm to have been above this height since it '
             'was grasped, so the pick descent does not fire it.'
         ),
+    )
+    parser.add_argument(
+        '--terminal-servo-search-ring',
+        type=float,
+        default=0.0,
+        help=(
+            'E7 route C. Radius in metres of the ring the terminal servo searches when the peg '
+            'does not go in at --terminal-servo-pose: lift, step to the next landing, descend '
+            'again, stopping as soon as it seats. 0 (default) is E5 exactly, which is the '
+            'control arm this is measured against. 0.007 with the default six landings covers '
+            'offsets out to about 11 mm, against a measured 4.2 mm capture radius.'
+        ),
+    )
+    parser.add_argument(
+        '--terminal-servo-search-points',
+        type=int,
+        default=TERMINAL_SERVO_SEARCH_POINTS,
+        help='Landings on the search ring, not counting the nominal pose it always tries first.',
     )
     parser.add_argument(
         '--rtc-execution-horizon',
@@ -4620,6 +4640,8 @@ def run_inference(args: argparse.Namespace) -> int:
             terminal_servo_request = TerminalServoRequest(
                 xyz=parse_terminal_servo_pose(args.terminal_servo_pose),
                 handoffZ=float(args.terminal_servo_handoff_z),
+                searchRingM=float(args.terminal_servo_search_ring),
+                searchPoints=int(args.terminal_servo_search_points),
                 controlPeriodS=1.0 / policy_fps,
                 requestId=f'terminal_servo_{time.time_ns()}',
             )
@@ -4628,8 +4650,10 @@ def run_inference(args: argparse.Namespace) -> int:
             raise SystemExit(f'--terminal-servo-pose is not usable: {exc}') from exc
         print(
             '[INFO] terminal_servo=configured xyz=%.4f,%.4f,%.4f handoff_z=%.4f max_speed_ms=%.3f'
+            ' search_ring_m=%.4f search_landings=%d'
             % (*terminal_servo_request.xyz, terminal_servo_request.handoffZ,
-               terminal_servo_request.maxSpeedMs)
+               terminal_servo_request.maxSpeedMs, terminal_servo_request.searchRingM,
+               len(terminal_servo_search_offsets(terminal_servo_request)))
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)

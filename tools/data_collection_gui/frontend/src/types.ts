@@ -1462,6 +1462,7 @@ export type RolloutRuntimeOptions = {
   terminalServoPose?: string;
   /** null or undefined leaves the runtime's 0.12 m handoff height. */
   terminalServoHandoffZ?: number | null;
+  terminalServoSearchRing?: number | null;
   /** Open a SpaceMouse and let the operator take the arm mid-rollout. Only `real` and
    *  `real_debug` accept it; anything else is refused with a reason rather than dropped. */
   daggerTakeover?: boolean;

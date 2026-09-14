@@ -619,6 +619,7 @@ def test_the_sampling_and_terminal_servo_options_reach_the_launcher(tmp_path: Pa
             "actionSampleHorizon": 10,
             "terminalServoPose": "0.3599,-0.1333,0.0523",
             "terminalServoHandoffZ": 0.12,
+            "terminalServoSearchRing": 0.007,
         }
     )
 
@@ -629,6 +630,7 @@ def test_the_sampling_and_terminal_servo_options_reach_the_launcher(tmp_path: Pa
     assert env["FR3_ACTION_SAMPLE_HORIZON"] == "10"
     assert env["FR3_TERMINAL_SERVO_POSE"] == "0.3599,-0.1333,0.0523"
     assert env["FR3_TERMINAL_SERVO_HANDOFF_Z"] == "0.12"
+    assert env["FR3_TERMINAL_SERVO_SEARCH_RING"] == "0.007"
 
 
 def test_the_terminal_servo_is_off_unless_the_page_names_a_pose(tmp_path: Path):
@@ -638,6 +640,18 @@ def test_the_terminal_servo_is_off_unless_the_page_names_a_pose(tmp_path: Path):
 
     assert "FR3_TERMINAL_SERVO_POSE" not in env
     assert "FR3_ACTION_SAMPLES" not in env
+
+
+def test_the_search_is_off_unless_the_page_names_a_ring(tmp_path: Path):
+    """E7-C is one variable added to E5's 5/8, so a blank field has to leave E5 untouched."""
+
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {"terminalServoPose": "0.3599,-0.1333,0.0523"}
+    )
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+
+    assert env["FR3_TERMINAL_SERVO_POSE"] == "0.3599,-0.1333,0.0523"
+    assert "FR3_TERMINAL_SERVO_SEARCH_RING" not in env
 
 
 def test_a_terminal_servo_pose_is_refused_by_the_page_the_same_way_the_command_line_refuses_it():

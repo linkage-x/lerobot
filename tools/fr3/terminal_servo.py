@@ -22,6 +22,14 @@ Two things here are not in `scene_reset`, and they are why this is a module rath
     is the insertion verdict -- reported, not thresholded, because the separation between the two
     belongs in the analysis rather than hard-coded here.
 
+2026-09-10 added the search, and the reason is that the experiment above came back the other
+way. A fixed pose inserted 5 of 8, not the predicted 24%, which puts the capture radius at
+4.2 mm rather than the 2.5 mm nominal clearance and turns what is left into a covering problem
+rather than a perception one: the tip lands 6-8 mm off the hole and nothing on this arm knows
+it. `search_for_seat` is E7 route C -- try the nominal pose, and on a miss lift, step to the
+next landing on a ring, descend again. It is off by default, because that 5 of 8 is the control
+arm every reading of the search is compared against.
+
 Everything else -- the speed clamp, the workspace checks, the step loop -- is imported from
 `scene_reset` rather than copied. A second way of walking the arm to a typed-in coordinate is a
 second set of safety checks to keep in step, and the one that gets skipped is always the one
@@ -30,6 +38,7 @@ nobody thought of as a real motion.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass
 import math
 import time
@@ -54,14 +63,71 @@ from tools.fr3.scene_reset import (
 # How fast the commanded tool point may travel, in m/s. A third of the reset's, because the
 # reset's rate limit exists to keep a transfer from crossing the table at a metre a second and
 # this one exists to keep a 15 mm peg from being driven into a fixture face.
-TERMINAL_SERVO_MAX_SPEED_MS = 0.05
-# How far the tool may sit above its own setpoint before the descent calls it contact, in metres.
-# At the speed above and a 30 Hz control period the setpoint moves 1.7 mm a step, so a servo one
-# full step behind reads as 1.7 mm of lag with nothing touching anything.
+TERMINAL_SERVO_MAX_SPEED_MS = 0.02
+# How much *further* behind its own setpoint the tool has to fall before the descent calls it
+# contact, in metres. Growth, not absolute lag: the arm answers a streamed setpoint about three
+# control periods late, so a free descent runs a constant speed-times-delay behind it, and a
+# threshold on the absolute figure fires on the descent itself. It did. All eight runs of
+# 2026-09-10 stopped on "contact" about 15 mm into a 68 mm descent with `held_up_mm` sitting at
+# 5.2-5.9 the whole time, which is an arm moving three steps late, not an arm blocked: a blocked
+# tool falls a further full step behind every step, so its lag would have passed 19 mm before
+# the hold below elapsed. A constant lag has zero growth, at any speed, with any delay.
 TERMINAL_SERVO_CONTACT_LAG_M = 0.004
-# For how long, in seconds. Acceleration at the top of the descent produces the same reading for
-# a few steps.
+# For how long, in seconds.
 TERMINAL_SERVO_CONTACT_HOLD_S = 0.3
+# The commanded descent that growth is measured across, in metres. A distance rather than a time
+# so it means the same thing at any speed: across this much setpoint travel a blocked tool falls
+# the whole window behind, and a tool that is merely late falls no further behind at all.
+TERMINAL_SERVO_CONTACT_WINDOW_M = 0.006
+# How much of the descent runs before the growth test is armed, in metres, measured to the far
+# end of the window rather than the near one. The setpoint starts from rest, so the lag climbs
+# from zero to its steady value over the first few millimetres, and that climb is growth: the
+# window has to be clear of it entirely. Costs a blind 8 + 6 mm below the handoff height, which
+# is chosen to have nothing under it -- and `contactStallM` below is not blinded at all.
+TERMINAL_SERVO_CONTACT_WARMUP_M = 0.008
+# The absolute lag that is contact whatever the growth test says, in metres, with no hold and no
+# warm-up: several times the free-descent lag at the speed above. It backstops the two cases the
+# growth test can miss, a tool already against the fixture when the descent starts and one that
+# gives way slowly enough to stay under the growth threshold.
+TERMINAL_SERVO_CONTACT_STALL_M = 0.015
+# How long the descent may keep commanding the target after the setpoint has arrived there, in
+# seconds, before it gives up and reports where the tool actually is. Measured, not guessed: on
+# 2026-09-10 the three descents that met the depth met it 0.1 s after the setpoint parked, so
+# this is five times what a free arm needs. What it replaces is the full `timeoutS`, which left
+# the arm leaning on the peg for twenty seconds -- the operator wrote that down twice -- and
+# leaning is not passive here. The setpoint parks *below* whatever stopped the peg, so the
+# position error, and with it the force, is held until the softest thing in the chain gives. On
+# this rig that is the grip: the two runs graded as misses took 8.1 s and 18.1 s to close their
+# last millimetres, which is a peg sliding up between the fingers, not an arm settling.
+TERMINAL_SERVO_SETTLE_S = 0.5
+# E7-C. How far off the nominal pose the search ring sits, in metres, and how many landings on
+# it. Zero disables the search entirely and the module behaves exactly as E5 measured it, which
+# is the point: the search is one variable added to a control arm that has a number on it.
+# Nine landings: the nominal pose and eight on the ring. The count is set by the covering, not
+# picked -- a tip offset r on the worst bearing (halfway between two ring points) is
+# sqrt(R^2 + r^2 - 2Rr cos(pi/n)) from the nearest landing, and that has to stay inside the
+# 4.2 mm capture radius measured on 2026-09-10. At R = 7 mm, six landings cover only to 8.4 mm
+# and eight cover to 9.7 mm, against a demonstration scatter whose p90 is 8.7 mm. Eight also
+# keeps the *inner* gap honest: the ring's coverage starts at 3.2 mm and the nominal landing
+# reaches 4.2 mm, so there is no annulus between them that nothing can reach -- which is what
+# widening the ring instead of adding landings would have opened up.
+TERMINAL_SERVO_SEARCH_RING_M = 0.007
+TERMINAL_SERVO_SEARCH_POINTS = 8
+# How far the arm lifts between landings, in metres. Not a clearance figure -- 8 mm would clear
+# a peg standing on the fixture face -- but a run-up: the growth test below arms only after
+# `contactWarmupM + contactWindowM` of commanded descent, so a lift shorter than that leaves
+# every landing after the first with no contact detection at all, stopping instead on the settle
+# timeout with the arm leaning on the peg. Validated, not just documented.
+TERMINAL_SERVO_SEARCH_LIFT_M = 0.020
+# How close to the target depth counts as in the hole, in metres, and so ends the search. The
+# two clusters on 2026-09-10 do not overlap: seated stopped 1.1-2.5 mm above the target, standing
+# on the face 4.9-5.6 mm. This sits between them.
+TERMINAL_SERVO_SEARCH_SEATED_M = 0.003
+# Post-arrival creep that ends the search as a slip rather than a miss, in metres. Once the peg
+# has moved in the jaws every landing computed from the tool pose is aimed at the wrong place,
+# so continuing the search is searching with a ruler that changed length. The two runs graded as
+# slips crept for 8.1 s and 18.1 s; a seated one closed in 0.1 s.
+TERMINAL_SERVO_SEARCH_SLIP_M = 0.003
 # How far above the target the arm lifts once it has let go, in metres. Enough to clear a
 # standing peg before the waiting loop homes the arm across the table.
 TERMINAL_SERVO_RETREAT_M = 0.08
@@ -92,10 +158,27 @@ class TerminalServoRequest:
     maxSpeedMs: float = TERMINAL_SERVO_MAX_SPEED_MS
     contactLagM: float = TERMINAL_SERVO_CONTACT_LAG_M
     contactHoldS: float = TERMINAL_SERVO_CONTACT_HOLD_S
+    contactWindowM: float = TERMINAL_SERVO_CONTACT_WINDOW_M
+    contactWarmupM: float = TERMINAL_SERVO_CONTACT_WARMUP_M
+    contactStallM: float = TERMINAL_SERVO_CONTACT_STALL_M
+    settleS: float = TERMINAL_SERVO_SETTLE_S
+    # Off by default. E5's 5/8 is the control arm this is measured against, and a search that
+    # arrives switched on turns every later run into a different experiment than that one.
+    searchRingM: float = 0.0
+    searchPoints: int = TERMINAL_SERVO_SEARCH_POINTS
+    searchLiftM: float = TERMINAL_SERVO_SEARCH_LIFT_M
+    searchSeatedM: float = TERMINAL_SERVO_SEARCH_SEATED_M
+    searchSlipM: float = TERMINAL_SERVO_SEARCH_SLIP_M
     minZ: float = TERMINAL_SERVO_MIN_Z_M
     retreatM: float = TERMINAL_SERVO_RETREAT_M
     timeoutS: float = 20.0
     toleranceM: float = 0.002
+    # What the *positioning* steps have to reach. None keeps `toleranceM`, which is where this
+    # started and what the descent's own "reached target z" test keeps using. They were split
+    # because this arm's residual is a direction-dependent dead-band of about 2 mm, so 2.0 mm
+    # aborts runs on steps that do not need it -- while loosening the shared number would let a
+    # descent call `target` 4 mm high and reclassify a seated peg (`searchSeatedM` is 3 mm).
+    stepToleranceM: float | None = None
     gripperTolerance: float = 0.08
     controlPeriodS: float = 1.0 / 30.0
     requestId: str = ""
@@ -172,6 +255,56 @@ def terminal_servo_waypoints(
     )
 
 
+def terminal_servo_search_offsets(
+    request: TerminalServoRequest,
+) -> tuple[tuple[float, float], ...]:
+    """Where the search may put the peg down, as XY offsets from the nominal pose.
+
+    The nominal pose comes first and always: the search is an addition to E5's descent, not a
+    replacement for it, so a run in which the fixed pose would have worked spends no extra time
+    and lands in exactly the place the control arm landed. A ring after it, rather than a
+    spiral, because the thing being covered is a disc of possible peg-tip offsets and a ring of
+    six plus the centre covers one to about 11 mm with no landing wasted on the middle of an
+    already-covered patch. A spiral's extra landings buy resolution the capture radius does not
+    need -- anything within 4.2 mm of a landing goes in on its own.
+    """
+
+    if request.searchRingM <= 0.0 or request.searchPoints <= 0:
+        return ((0.0, 0.0),)
+    step = 2.0 * math.pi / float(request.searchPoints)
+    ring = tuple(
+        (request.searchRingM * math.cos(index * step), request.searchRingM * math.sin(index * step))
+        for index in range(int(request.searchPoints))
+    )
+    return ((0.0, 0.0),) + ring
+
+
+def terminal_servo_search_path(
+    request: TerminalServoRequest,
+    current_xyz: tuple[float, float, float],
+) -> tuple[tuple[str, tuple[float, float, float]], ...]:
+    """Every point the run may visit, for the QC to check before the arm moves.
+
+    The search's own geometry is not known until it runs -- each landing is lifted from wherever
+    the previous descent stopped -- so what is checked is the envelope that contains it: each
+    landing at the target depth, and each landing at the highest the transfer can happen, which
+    is a stop at the handoff height plus the lift. Both bounds are named points; the workspace
+    test is a box, so nothing between two accepted corners can fall outside it, and the reach
+    probe walks the same list.
+    """
+
+    points = list(terminal_servo_waypoints(request, current_xyz))
+    offsets = terminal_servo_search_offsets(request)
+    if len(offsets) == 1:
+        return tuple(points)
+    x, y, z = request.xyz
+    transfer_z = request.handoffZ + request.searchLiftM
+    for index, (dx, dy) in enumerate(offsets[1:], start=1):
+        points.append((f"search_transfer[{index}]", (x + dx, y + dy, transfer_z)))
+        points.append((f"search_descend[{index}]", (x + dx, y + dy, z)))
+    return tuple(points)
+
+
 def validate_terminal_servo_trajectory(
     request: TerminalServoRequest,
     *,
@@ -184,6 +317,8 @@ def validate_terminal_servo_trajectory(
 
     if request.timeoutS <= 0.0 or request.toleranceM <= 0.0 or request.controlPeriodS <= 0.0:
         raise TerminalServoError("timeoutS, toleranceM and controlPeriodS must be positive.")
+    if request.stepToleranceM is not None and request.stepToleranceM <= 0.0:
+        raise TerminalServoError("stepToleranceM must be positive when given.")
     if request.maxSpeedMs <= 0.0 or request.maxSpeedMs > TERMINAL_SERVO_MAX_SPEED_MS:
         raise TerminalServoError(
             f"maxSpeedMs must be in (0, {TERMINAL_SERVO_MAX_SPEED_MS}]: this motion drives a "
@@ -191,6 +326,32 @@ def validate_terminal_servo_trajectory(
         )
     if request.contactLagM <= 0.0 or request.contactHoldS < 0.0:
         raise TerminalServoError("contactLagM must be positive and contactHoldS non-negative.")
+    if request.settleS <= 0.0:
+        raise TerminalServoError("settleS must be positive.")
+    if request.contactWindowM <= 0.0 or request.contactWarmupM < 0.0:
+        raise TerminalServoError("contactWindowM must be positive and contactWarmupM non-negative.")
+    if request.contactStallM <= request.contactLagM:
+        raise TerminalServoError(
+            f"contactStallM {request.contactStallM:.4f} must be above contactLagM "
+            f"{request.contactLagM:.4f}, or the backstop fires before the test it backs up."
+        )
+    if request.searchRingM < 0.0:
+        raise TerminalServoError("searchRingM must be non-negative; zero disables the search.")
+    if request.searchRingM > 0.0:
+        if request.searchPoints < 3:
+            raise TerminalServoError(
+                f"searchPoints {request.searchPoints} is too few for a ring: under three the "
+                "landings leave a gap wider than the ring itself in the middle of the disc."
+            )
+        if request.searchSeatedM <= 0.0 or request.searchSlipM <= 0.0:
+            raise TerminalServoError("searchSeatedM and searchSlipM must be positive.")
+        run_up_m = request.contactWarmupM + request.contactWindowM
+        if request.searchLiftM < run_up_m:
+            raise TerminalServoError(
+                f"searchLiftM {request.searchLiftM:.4f} is below the {run_up_m:.4f} the growth "
+                "test needs to arm, so every landing after the first would descend with no "
+                "contact detection and stop by leaning on the peg until settleS."
+            )
     if not 0.0 <= request.openGripper <= 1.0:
         raise TerminalServoError("openGripper must be normalized in [0, 1].")
     if request.retreatM <= 0.0:
@@ -211,7 +372,9 @@ def validate_terminal_servo_trajectory(
 
     low, high = _workspace_bounds(workspace_min, workspace_max)
     points: list[tuple[str, tuple[float, float, float]]] = list(
-        terminal_servo_waypoints(request, current_xyz or (request.xyz[0], request.xyz[1], request.handoffZ))
+        terminal_servo_search_path(
+            request, current_xyz or (request.xyz[0], request.xyz[1], request.handoffZ)
+        )
     )
     if current_xyz is not None:
         points.insert(0, ("current", current_xyz))
@@ -238,50 +401,189 @@ def descend_until_refused(
     Three ways to stop, and all three are results rather than errors. `target` means the tool
     reached the seated depth with nothing in the way, which for a peg that is supposed to be in
     a hole means it went in -- or that it missed and the fixture is not where the target says.
-    `contact` means the arm stayed above its own setpoint, and the height it stayed at is the
-    reading. `timeout` means neither, and is reported so it is never silently read as a miss.
+    `contact` means the arm stopped following the setpoint down, and the height it stopped at is
+    the reading. `timeout` means neither, and is reported so it is never silently read as a miss.
+
+    What counts as contact is how much *further* behind its setpoint the tool falls across
+    `contactWindowM` of commanded travel, not how far behind it is. The absolute lag is mostly
+    the arm's answer delay: it scales with speed, it is there before the peg is anywhere near
+    the fixture, and thresholding it stops the descent on the descent. The growth is zero while
+    the tool is moving at all and one whole step per step once it is not. `lagMm` reports the
+    delay itself so it stays visible in the log rather than being inferred from a stop.
     """
 
     commanded, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    start_z = float(commanded[2])
     max_step_m = request.maxSpeedMs * request.controlPeriodS
-    deadline = (
-        time.perf_counter()
-        + request.timeoutS
-        + _distance(commanded, target_xyz) / request.maxSpeedMs
-    )
+    started = time.perf_counter()
+    deadline = started + request.timeoutS + _distance(commanded, target_xyz) / request.maxSpeedMs
     held_up_since: float | None = None
+    arrived_at: float | None = None
+    arrived_z: float | None = None
     current_xyz = commanded
     held_up_m = 0.0
+    growth_m = 0.0
+    peak_growth_m = 0.0
+    lags: list[float] = []
+    # (commanded travel so far, the lag then), oldest first, trimmed to just span the window.
+    trail: deque[tuple[float, float]] = deque()
+
+    def stopped(reason: str) -> dict[str, Any]:
+        ranked = sorted(lags)
+        # How long the tool went on descending after the setpoint stopped, and how far. A free
+        # arm closes its answer delay in a tenth of a second; anything longer is the tool being
+        # let down by something rather than arriving. This is the only column that sees a peg
+        # sliding in the jaws: while the setpoint is still moving, a sliding peg and a seated
+        # one are the same kinematics, because it is the peg that gives way and not the arm.
+        settle_s = 0.0 if arrived_at is None else time.perf_counter() - arrived_at
+        settle_mm = 0.0 if arrived_z is None else 1000.0 * (arrived_z - float(current_xyz[2]))
+        return {
+            "stoppedOn": reason,
+            "stoppedAtXyz": list(current_xyz),
+            "heldUpMm": 1000.0 * held_up_m,
+            "heldUpGrowthMm": 1000.0 * growth_m,
+            "peakGrowthMm": 1000.0 * peak_growth_m,
+            "lagMm": 1000.0 * (ranked[len(ranked) // 2] if ranked else 0.0),
+            "descentMm": 1000.0 * (start_z - float(current_xyz[2])),
+            "descentSeconds": time.perf_counter() - started,
+            "settleSeconds": settle_s,
+            "settleMm": settle_mm,
+        }
+
     while time.perf_counter() < deadline:
         now = time.perf_counter()
         commanded = _step_toward(commanded, target_xyz, max_step_m)
         _send_absolute(robot, commanded, rotvec, gripper)
         current_xyz, _current_rotvec, _current_gripper = _observation_xyz_rotvec_gripper(robot)
-        # Positive means the tool is sitting above where it was told to be, which on a descent
-        # is something holding it up. The sign matters: an arm that overshoots downward is not
-        # in contact, and reading |error| here would stop the descent on its own tracking.
+        # Positive means the tool is sitting above where it was told to be. The sign matters: an
+        # arm that overshoots downward is not in contact, and reading |error| here would stop the
+        # descent on its own tracking.
         held_up_m = float(current_xyz[2] - commanded[2])
-        if held_up_m < request.contactLagM:
+        travelled_m = start_z - float(commanded[2])
+        lags.append(held_up_m)
+        trail.append((travelled_m, held_up_m))
+        while len(trail) > 1 and travelled_m - trail[1][0] >= request.contactWindowM:
+            trail.popleft()
+        growth_m = held_up_m - trail[0][1]
+        peak_growth_m = max(peak_growth_m, growth_m)
+        # No hold and no warm-up on the backstop: an arm this far behind is not late, and the
+        # two cases it exists for both begin before the growth test can see them.
+        if held_up_m >= request.contactStallM:
+            return stopped("contact")
+        # The whole window has to clear the warm-up, not just its near end: a window with one
+        # foot in the ramp reads the ramp's climb as growth.
+        refused = trail[0][0] >= request.contactWarmupM and growth_m >= request.contactLagM
+        if not refused:
             held_up_since = None
         elif held_up_since is None:
             held_up_since = now
         elif now - held_up_since >= request.contactHoldS:
-            return {
-                "stoppedOn": "contact",
-                "stoppedAtXyz": list(current_xyz),
-                "heldUpMm": 1000.0 * held_up_m,
-            }
-        if commanded == target_xyz and _distance(current_xyz, target_xyz) <= request.toleranceM:
-            return {
-                "stoppedOn": "target",
-                "stoppedAtXyz": list(current_xyz),
-                "heldUpMm": 1000.0 * held_up_m,
-            }
+            return stopped("contact")
+        # Depth, not distance. The lateral leg ran before the descent and converged; what is
+        # left of it is a reading, reported as `lateralErrorMm`, not a reason to keep pressing.
+        # A seated peg holds the tool laterally -- that is what being in a hole means -- so a
+        # 3-D tolerance turns the successful insertions into timeouts. It did: on 2026-09-10
+        # five descents reached the seated depth and four of them were still commanding it
+        # twenty seconds later, two with the operator watching and writing down that the arm
+        # would not let go.
+        if commanded == target_xyz:
+            if arrived_at is None:
+                arrived_at = now
+                arrived_z = float(current_xyz[2])
+            if abs(float(current_xyz[2]) - target_xyz[2]) <= request.toleranceM:
+                return stopped("target")
+            if now - arrived_at >= request.settleS:
+                return stopped("timeout")
         precise_sleep(request.controlPeriodS)
+    return stopped("timeout")
+
+
+def search_for_seat(
+    robot: Any,
+    request: TerminalServoRequest,
+    rotvec: tuple[float, float, float],
+    gripper: float,
+) -> dict[str, Any]:
+    """Descend at the nominal pose; if the peg did not go in, lift, step sideways, try again.
+
+    This is E7 route C, and what makes it cheap rather than a research project is that both
+    things it needs already exist and were measured on 2026-09-10. The verdict per landing is
+    `above_target_mm`, whose two clusters -- 1.1-2.5 mm seated, 4.9-5.6 mm standing on the face
+    -- do not overlap, so no force channel is wanted for the decision even though this rig has
+    none. And the descent already knows how to be stopped by something rather than lean on it.
+
+    Lift, then across, then down, rather than dragging the peg over the face: the two runs that
+    crept for 8.1 s and 18.1 s showed the peg moving in the jaws under a held force, and a
+    sliding search would apply that force sideways for the whole pattern. Each landing therefore
+    starts from a fresh descent with the peg where the previous landing left it in the fingers.
+    That is also why creep ends the search rather than counting as one more miss: after a slip
+    the tool pose no longer says where the peg tip is, so every remaining landing is aimed with
+    a ruler that changed length between the marks.
+
+    The lift and the traverse run at the reset's speed, not this module's. The slow cap exists
+    for the one leg that drives a gripped peg down at a fixture; these two climb and then cross
+    a lifted plane, which is what `align_above_target` already does.
+    """
+
+    x, y, z = request.xyz
+    offsets = terminal_servo_search_offsets(request)
+    attempts: list[dict[str, Any]] = []
+    descent: dict[str, Any] = {}
+    landing = (x, y, z)
+    previous = landing
+    verdict = "exhausted"
+    index = 0
+    for index, (dx, dy) in enumerate(offsets):
+        landing = (x + dx, y + dy, z)
+        if index:
+            lifted_z = float(descent["stoppedAtXyz"][2]) + request.searchLiftM
+            _run_step(robot, request, f"search_lift[{index}]", (previous[0], previous[1], lifted_z),
+                      rotvec, gripper, tolerance_m=request.stepToleranceM)
+            _run_step(robot, request, f"search_transfer[{index}]", (landing[0], landing[1], lifted_z),
+                      rotvec, gripper, tolerance_m=request.stepToleranceM)
+        descent = descend_until_refused(robot, request, landing, rotvec, gripper)
+        above_target_m = float(descent["stoppedAtXyz"][2]) - z
+        slipped = descent["settleMm"] / 1000.0 >= request.searchSlipM
+        attempts.append(
+            {
+                "index": index,
+                "offsetMm": 1000.0 * math.hypot(dx, dy),
+                "landingXyz": list(landing),
+                "stoppedOn": descent["stoppedOn"],
+                "aboveTargetMm": 1000.0 * above_target_m,
+                "settleSeconds": descent["settleSeconds"],
+                "settleMm": descent["settleMm"],
+            }
+        )
+        if len(offsets) > 1:
+            print(
+                f"[INFO] terminal_servo_search=landing request_id={request.requestId} "
+                f"index={index}/{len(offsets) - 1} offset_mm={1000.0 * math.hypot(dx, dy):.1f} "
+                f"stopped_on={descent['stoppedOn']} above_target_mm={1000.0 * above_target_m:+.1f} "
+                f"settle_s={descent['settleSeconds']:.2f} settle_mm={descent['settleMm']:+.1f}",
+                flush=True,
+            )
+        # Creep is read before depth, and the order is the whole lesson of 2026-09-10. Two runs
+        # reached the seated depth and were graded misses: the peg had slid up between the
+        # fingers while the arm leaned, so the tool arrived where the hole is and the peg did
+        # not. Depth alone cannot tell those from an insertion -- 0.7 and 1.4 mm above target,
+        # squarely in the seated cluster -- and the only column that can is how long the last
+        # millimetres took, 8.1 s and 18.1 s against 0.1 s for a real one.
+        if slipped:
+            verdict = "slip"
+            break
+        if above_target_m <= request.searchSeatedM:
+            verdict = "seated"
+            break
+        previous = landing
     return {
-        "stoppedOn": "timeout",
-        "stoppedAtXyz": list(current_xyz),
-        "heldUpMm": 1000.0 * held_up_m,
+        **descent,
+        "searchStoppedOn": verdict,
+        "searchIndex": index,
+        "searchLandings": len(offsets),
+        "searchOffsetMm": 1000.0 * math.hypot(landing[0] - x, landing[1] - y),
+        "searchLandingXyz": list(landing),
+        "searchAttempts": attempts,
     }
 
 
@@ -328,22 +630,29 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
     )
     waypoints = dict(terminal_servo_waypoints(request, current_xyz))
     try:
-        _run_step(robot, request, "align_above_target", waypoints["align_above_target"], rotvec, gripper)
-        descent = descend_until_refused(robot, request, waypoints["descend_to_target"], rotvec, gripper)
+        _run_step(robot, request, "align_above_target", waypoints["align_above_target"], rotvec, gripper,
+                  tolerance_m=request.stepToleranceM)
+        descent = search_for_seat(robot, request, rotvec, gripper)
         stopped_at = tuple(float(value) for value in descent["stoppedAtXyz"])
+        landing = tuple(float(value) for value in descent["searchLandingXyz"])
         # Let go where the descent stopped, not at the target: on a contact stop the target is a
         # height the arm could not reach, and re-commanding it while opening the fingers would
-        # lean on the fixture through the one moment the peg is no longer clamped.
-        release_xyz = (waypoints["descend_to_target"][0], waypoints["descend_to_target"][1], stopped_at[2])
+        # lean on the fixture through the one moment the peg is no longer clamped. The XY is the
+        # landing's, which is the nominal pose whenever the search is off or found the hole on
+        # its first try, and never a lateral move made at fixture height.
+        release_xyz = (landing[0], landing[1], stopped_at[2])
+        seated = descent["searchStoppedOn"] == "seated"
+        retreat_gripper = request.openGripper
         _send_absolute(robot, release_xyz, rotvec, request.openGripper)
         precise_sleep(request.openSettleS)
         _run_step(
             robot,
             request,
             "retreat_after_release",
-            waypoints["retreat_after_release"],
+            (landing[0], landing[1], waypoints["retreat_after_release"][2]),
             rotvec,
-            request.openGripper,
+            retreat_gripper,
+            tolerance_m=request.stepToleranceM,
         )
         result = {
             "ok": True,
@@ -360,7 +669,13 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
             f"[INFO] terminal_servo=done request_id={request.requestId} "
             f"stopped_on={result['stoppedOn']} "
             f"stopped_z={stopped_at[2]:.4f} above_target_mm={result['seatedDepthErrorMm']:+.1f} "
-            f"lateral_mm={result['lateralErrorMm']:.1f} held_up_mm={result['heldUpMm']:+.1f}",
+            f"lateral_mm={result['lateralErrorMm']:.1f} held_up_mm={result['heldUpMm']:+.1f} "
+            f"growth_mm={result['heldUpGrowthMm']:+.1f} peak_growth_mm={result['peakGrowthMm']:+.1f} "
+            f"lag_mm={result['lagMm']:+.1f} descent_mm={result['descentMm']:.1f} "
+            f"descent_s={result['descentSeconds']:.1f} settle_s={result['settleSeconds']:.2f} "
+            f"settle_mm={result['settleMm']:+.1f} search={result['searchStoppedOn']} "
+            f"search_index={result['searchIndex']}/{result['searchLandings'] - 1} "
+            f"search_offset_mm={result['searchOffsetMm']:.1f}",
             flush=True,
         )
         return result

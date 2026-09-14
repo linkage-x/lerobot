@@ -128,6 +128,7 @@ export function RolloutPage() {
   const [actionAggregate, setActionAggregate] = useState<RolloutActionAggregate>("medoid");
   const [terminalServoPose, setTerminalServoPose] = useState("");
   const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
+  const [terminalServoSearchRing, setTerminalServoSearchRing] = useState("");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -236,6 +237,7 @@ export function RolloutPage() {
       actionAggregate,
       terminalServoPose: terminalServoPose.trim() || undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
+      terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
       // refuses the start rather than dropping the setting, so not sending it is what keeps a
       // leftover switch from blocking a smoke test.
@@ -257,6 +259,7 @@ export function RolloutPage() {
       actionAggregate,
       terminalServoPose,
       terminalServoHandoffZ,
+      terminalServoSearchRing,
       takeoverSupported,
       daggerTakeover,
       daggerRecord,
@@ -385,6 +388,12 @@ export function RolloutPage() {
         setTerminalServoPose("");
         setTerminalServoHandoffZ(
           options.terminalServoHandoffZ == null ? "" : String(options.terminalServoHandoffZ)
+        );
+        // The ring comes back, unlike the pose: it is only read when a pose is set, so it
+        // cannot turn a plain rollout into anything, and it is the one knob a search session
+        // re-types on every run.
+        setTerminalServoSearchRing(
+          options.terminalServoSearchRing == null ? "" : String(options.terminalServoSearchRing)
         );
         // The switch comes back with the destination and the handback. It is not one of the
         // motion gates -- it opens the SpaceMouse, it does not start the arm -- and a session
@@ -1306,6 +1315,16 @@ export function RolloutPage() {
                     value={terminalServoPose}
                     onChange={(event) => setTerminalServoPose(event.target.value)}
                     placeholder="off; e.g. 0.3599,-0.1333,0.0523"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Search ring (m)</span>
+                  <input
+                    value={terminalServoSearchRing}
+                    onChange={(event) => setTerminalServoSearchRing(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="off; 0.007 searches 9 landings"
                     disabled={isLive}
                   />
                 </label>

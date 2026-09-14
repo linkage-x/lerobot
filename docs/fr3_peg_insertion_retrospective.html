@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{color-scheme:light dark}
+  html,body{margin:0}
+  img{max-width:100%}
+  [hidden]{display:none!important}
+</style>
+<title>最后 2.5 毫米</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+<style>
+  :root{
+    --ground:#F3F5F1;
+    --surface:#FFFFFF;
+    --surface-2:#EAEDE6;
+    --ink:#171D1A;
+    --ink-2:#5C655F;
+    --ink-3:#8B948C;
+    --rule:#D6DBD2;
+    --rule-strong:#B7BFB4;
+    --accent:#14605C;
+    --accent-soft:#DCE9E6;
+    --refute:#9B372E;
+    --refute-soft:#F3DFDA;
+    --confirm:#2E6B4C;
+    --confirm-soft:#DCEBE0;
+    --pending:#8A6414;
+    --pending-soft:#F1E7CF;
+
+    --f-display:"Noto Serif SC",Songti SC,SimSun,Georgia,serif;
+    --f-body:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    --f-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+
+    --measure:34rem;
+    --gap:1.15rem;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#101413;
+      --surface:#181E1B;
+      --surface-2:#1F2622;
+      --ink:#E7EBE5;
+      --ink-2:#9AA39B;
+      --ink-3:#6F786F;
+      --rule:#2A312D;
+      --rule-strong:#3B443E;
+      --accent:#5CC0B4;
+      --accent-soft:#1A2E2C;
+      --refute:#E0897C;
+      --refute-soft:#2E1D1A;
+      --confirm:#82C39A;
+      --confirm-soft:#18291F;
+      --pending:#D4AC55;
+      --pending-soft:#2A2315;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#101413;
+    --surface:#181E1B;
+    --surface-2:#1F2622;
+    --ink:#E7EBE5;
+    --ink-2:#9AA39B;
+    --ink-3:#6F786F;
+    --rule:#2A312D;
+    --rule-strong:#3B443E;
+    --accent:#5CC0B4;
+    --accent-soft:#1A2E2C;
+    --refute:#E0897C;
+    --refute-soft:#2E1D1A;
+    --confirm:#82C39A;
+    --confirm-soft:#18291F;
+    --pending:#D4AC55;
+    --pending-soft:#2A2315;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--f-body);
+    font-size:16px;
+    line-height:1.85;
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{
+    max-width:46rem;
+    margin:0 auto;
+    padding-inline:20px;
+    padding-block:3.5rem 5rem;
+  }
+  p,li{max-width:var(--measure)}
+  p{margin:0}
+  strong{font-weight:700;color:var(--ink)}
+  code{
+    font-family:var(--f-mono);
+    font-size:0.86em;
+    background:var(--surface-2);
+    padding:0.1em 0.36em;
+    border-radius:3px;
+    word-break:break-word;
+  }
+  a{color:var(--accent)}
+
+  /* ---------- masthead ---------- */
+  .masthead{display:flex;flex-direction:column;gap:1.4rem;margin-bottom:3rem}
+  .kicker{
+    font-family:var(--f-mono);
+    font-size:0.72rem;
+    letter-spacing:0.16em;
+    text-transform:uppercase;
+    color:var(--accent);
+    display:flex;flex-wrap:wrap;gap:0.9rem;align-items:center;
+  }
+  .kicker span::before{content:"·";margin-right:0.9rem;color:var(--rule-strong)}
+  .kicker span:first-child::before{content:none;margin:0}
+  h1{
+    font-family:var(--f-display);
+    font-weight:700;
+    font-size:clamp(2.4rem,7vw,3.6rem);
+    line-height:1.14;
+    letter-spacing:-0.01em;
+    margin:0;
+    text-wrap:balance;
+  }
+  .standfirst{
+    font-size:1.06rem;
+    color:var(--ink-2);
+    max-width:32rem;
+    line-height:1.8;
+  }
+  .byline{
+    font-family:var(--f-mono);
+    font-size:0.75rem;
+    color:var(--ink-3);
+    border-top:1px solid var(--rule);
+    padding-top:0.9rem;
+  }
+
+  /* ---------- tl;dr ---------- */
+  .tldr{
+    background:var(--surface);
+    border:1px solid var(--rule);
+    border-left:3px solid var(--accent);
+    padding:1.5rem 1.5rem 1.6rem;
+    margin-bottom:3.2rem;
+    display:flex;flex-direction:column;gap:0.85rem;
+  }
+  .tldr h2{
+    font-family:var(--f-mono);
+    font-size:0.72rem;
+    letter-spacing:0.16em;
+    text-transform:uppercase;
+    color:var(--accent);
+    margin:0;font-weight:500;
+  }
+  .tldr ol{margin:0;padding-left:1.3rem;display:flex;flex-direction:column;gap:0.6rem}
+  .tldr li{font-size:0.97rem;line-height:1.75}
+  .tldr li::marker{font-family:var(--f-mono);color:var(--ink-3);font-size:0.85em}
+
+  /* ---------- sections ---------- */
+  section{margin-bottom:3.6rem;display:flex;flex-direction:column;gap:var(--gap)}
+  .sec-head{display:flex;flex-direction:column;gap:0.35rem;margin-bottom:0.4rem}
+  .sec-num{
+    font-family:var(--f-mono);
+    font-size:0.72rem;
+    letter-spacing:0.16em;
+    color:var(--ink-3);
+  }
+  h2{
+    font-family:var(--f-display);
+    font-weight:700;
+    font-size:clamp(1.5rem,4vw,1.95rem);
+    line-height:1.35;
+    margin:0;
+    text-wrap:balance;
+    border-bottom:1px solid var(--rule-strong);
+    padding-bottom:0.55rem;
+  }
+  h3{
+    font-family:var(--f-body);
+    font-weight:700;
+    font-size:1.05rem;
+    line-height:1.6;
+    margin:1.1rem 0 -0.3rem;
+    color:var(--ink);
+  }
+  h3 .h3-mark{
+    font-family:var(--f-mono);
+    font-weight:400;
+    color:var(--accent);
+    margin-right:0.5rem;
+    font-size:0.88em;
+  }
+
+  /* ---------- verdict callouts ---------- */
+  .verdict{
+    border:1px solid var(--rule);
+    border-left-width:3px;
+    background:var(--surface);
+    padding:1.05rem 1.2rem;
+    display:flex;flex-direction:column;gap:0.5rem;
+  }
+  .verdict p{max-width:none}
+  .verdict .tag{
+    font-family:var(--f-mono);
+    font-size:0.68rem;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    font-weight:500;
+  }
+  .v-refute{border-left-color:var(--refute);background:var(--refute-soft)}
+  .v-refute .tag{color:var(--refute)}
+  .v-confirm{border-left-color:var(--confirm);background:var(--confirm-soft)}
+  .v-confirm .tag{color:var(--confirm)}
+  .v-pending{border-left-color:var(--pending);background:var(--pending-soft)}
+  .v-pending .tag{color:var(--pending)}
+
+  /* ---------- data tables ---------- */
+  .tw{overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+  table{border-collapse:collapse;width:100%;min-width:34rem;font-size:0.88rem}
+  caption{
+    caption-side:top;text-align:left;
+    font-family:var(--f-mono);font-size:0.7rem;letter-spacing:0.13em;
+    text-transform:uppercase;color:var(--ink-3);
+    padding:0.85rem 1rem 0.55rem;
+  }
+  th,td{
+    padding:0.6rem 1rem;text-align:left;vertical-align:top;
+    border-top:1px solid var(--rule);line-height:1.6;
+  }
+  thead th{
+    border-top:none;background:var(--surface-2);
+    font-weight:500;font-size:0.78rem;color:var(--ink-2);
+    letter-spacing:0.03em;white-space:nowrap;
+  }
+  tbody th{font-weight:500;white-space:nowrap}
+  td.num,th.num{
+    font-family:var(--f-mono);font-variant-numeric:tabular-nums;
+    text-align:right;white-space:nowrap;
+  }
+  tr.hl td,tr.hl th{background:var(--accent-soft)}
+  .note{font-size:0.82rem;color:var(--ink-2);line-height:1.7;max-width:var(--measure)}
+
+  /* ---------- figures ---------- */
+  figure{margin:0.6rem 0;display:flex;flex-direction:column;gap:0.9rem}
+  .figbox{
+    background:var(--surface);border:1px solid var(--rule);
+    padding:1.3rem 1rem;overflow-x:auto;
+  }
+  .figbox svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  figcaption{
+    font-size:0.82rem;color:var(--ink-2);line-height:1.7;
+    max-width:var(--measure);
+  }
+  figcaption b{color:var(--ink)}
+  .legend{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));
+    gap:0.5rem 1.4rem;margin-top:0.2rem;
+  }
+  .legend div{
+    display:flex;gap:0.6rem;align-items:baseline;
+    font-size:0.83rem;line-height:1.6;
+  }
+  .legend .sw{
+    flex:0 0 auto;width:1.5rem;height:0.55rem;margin-top:0.35rem;
+    border-radius:1px;
+  }
+  .legend .val{
+    font-family:var(--f-mono);font-variant-numeric:tabular-nums;
+    color:var(--ink);font-weight:500;
+  }
+
+  /* ---------- pull stat ---------- */
+  .stat-row{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));
+    gap:1px;background:var(--rule);border:1px solid var(--rule);
+  }
+  .stat{background:var(--surface);padding:1rem 1.1rem;display:flex;flex-direction:column;gap:0.2rem}
+  .stat .n{
+    font-family:var(--f-mono);font-size:1.5rem;font-weight:500;
+    font-variant-numeric:tabular-nums;line-height:1.2;color:var(--accent);
+  }
+  .stat .l{font-size:0.79rem;color:var(--ink-2);line-height:1.55}
+
+  /* ---------- quote / lesson ---------- */
+  .lesson{
+    border-top:1px solid var(--rule-strong);
+    border-bottom:1px solid var(--rule-strong);
+    padding:1.2rem 0;
+    display:flex;flex-direction:column;gap:0.4rem;
+  }
+  .lesson .n{
+    font-family:var(--f-mono);font-size:0.72rem;letter-spacing:0.14em;
+    color:var(--accent);
+  }
+  .lesson .t{
+    font-family:var(--f-display);font-weight:600;font-size:1.12rem;line-height:1.6;
+  }
+  .lesson p{font-size:0.92rem;color:var(--ink-2)}
+
+  /* ---------- roadmap steps ---------- */
+  .steps{display:flex;flex-direction:column;gap:0;border-top:1px solid var(--rule)}
+  .step{
+    display:grid;grid-template-columns:2.6rem 1fr;gap:0 1rem;
+    padding:1rem 0;border-bottom:1px solid var(--rule);
+  }
+  .step .idx{
+    font-family:var(--f-mono);font-size:1.15rem;color:var(--ink-3);
+    line-height:1.5;font-variant-numeric:tabular-nums;
+  }
+  .step .body{display:flex;flex-direction:column;gap:0.35rem}
+  .step .t{font-weight:700;line-height:1.6}
+  .step .t em{font-style:normal;font-family:var(--f-mono);font-size:0.78rem;color:var(--accent);margin-left:0.5rem;letter-spacing:0.06em}
+  .step p{font-size:0.9rem;color:var(--ink-2);max-width:none}
+  .step.now .idx{color:var(--accent);font-weight:500}
+
+  /* ---------- editor note ---------- */
+  .editnote{
+    background:var(--surface-2);border:1px dashed var(--rule-strong);
+    padding:1.3rem 1.4rem;display:flex;flex-direction:column;gap:0.7rem;
+    margin-top:1rem;
+  }
+  .editnote h2{
+    border:none;padding:0;font-family:var(--f-mono);font-size:0.74rem;
+    letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-2);font-weight:500;
+  }
+  .editnote ul{margin:0;padding-left:1.2rem;display:flex;flex-direction:column;gap:0.45rem}
+  .editnote li{font-size:0.87rem;color:var(--ink-2);line-height:1.7}
+
+  hr.rule{border:none;border-top:1px solid var(--rule);margin:0.6rem 0}
+
+  @media (max-width:520px){
+    body{font-size:15px}
+    .page{padding-block:2.5rem 3.5rem}
+    .step{grid-template-columns:2rem 1fr}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="kicker"><span>FR3 · Pika · pi0.5</span><span>插孔任务复盘</span><span>2026-08-25 → 09-10</span></div>
+    <h1>最后 2.5 毫米</h1>
+    <p class="standfirst">50 条示教、30k 步 LoRA，机械臂学会了在任意位置找到并抓起销钉。然后我们花了三周，才搞清楚它为什么插不进那个孔——以及为什么答案不在模型里。</p>
+    <p class="byline">工作站实验记录 · 全部数字取自真机日志与离线探针，判据均为预登记</p>
+  </header>
+
+  <div class="tldr">
+    <h2>四句话版本</h2>
+    <ol>
+      <li><strong>粗活学会了形状，没学会精度。</strong>策略自己决定何时合手、何时松开，接近段的横向与下降速率与示教统计上不可区分——但<em>抓取相位在 31 条 rollout 里发生了 29 段人工接管</em>。它到了高度就合手，不管有没有对准。</li>
+      <li><strong>细活卡在一个不在坐标系里的量。</strong>孔 20 mm、销 15 mm、无倒角，单边间隙 2.5 mm；而 50 条<em>全部成功</em>的示教，其 TCP 到孔心的散布是 std 5.0 mm——两者只能同时为真，如果 TCP 位姿不等于销尖位置。</li>
+      <li><strong>一个零感知的开环控制器拿到 62%。</strong>把最后 7 厘米交给一个固定绝对位姿，5/8 成功。它同时给出了这条链上最贵的一个数字：真实捕获半径是 4.2 mm，不是 2.5 mm。</li>
+      <li><strong>距离 90% 不远，距离 100% 很远——但要先把口径说清楚。</strong>那 62% 是<em>在操作员代抓的前提下</em>测的；端到端全自主插入至今是 119 条里 1 次。90% 缺的是一个已经写完但还没跑的接触式搜索、一套能一夜跑 100 次的自动循环，以及一个从未被干净量过的数字：无人协助的抓取成功率。</li>
+    </ol>
+  </div>
+
+  <!-- ============ 1 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">01 / 评估</div>
+      <h2>先说距离：真正被量清楚的只有最后一段</h2>
+    </div>
+
+    <p>把整条链拆开，每段都有真机读数——但必须先说清楚一件事：<strong>这几个数不是同一个口径下取的。</strong>终段那 62% 是在<em>操作员代抓</em>的前提下测的，端到端全自主的数字要低得多。</p>
+
+    <div class="stat-row">
+      <div class="stat"><div class="n">1 / 119</div><div class="l">端到端全自主插入<br><span style="color:var(--ink-3)">纯策略走到底的口径</span></div></div>
+      <div class="stat"><div class="n">29 / 31</div><div class="l">抓取相位仍需接管的段数<br><span style="color:var(--ink-3)">09-08 会话，1905 帧</span></div></div>
+      <div class="stat"><div class="n">9 / 10</div><div class="l">自主走到交接高度<br><span style="color:var(--ink-3)">前提：人已代抓</span></div></div>
+      <div class="stat"><div class="n">5 / 8</div><div class="l">终段插入（固定位姿伺服）<br><span style="color:var(--ink-3)">62%，95% CI 24–91%</span></div></div>
+    </div>
+
+    <p>换句话说：<strong>真正被干净量过的只有最后 7 厘米。</strong>前面两段——把销抓正、把它搬到交接高度——目前靠操作员补位，而补位的地方正是精度最要紧的地方。唯一没有被这个问题污染的数字是那个 1/119：纯策略走到底、无接管，119 条 rollout 里成功过 1 次（基线 checkpoint，释放点距孔 6.1 mm）。</p>
+
+    <div class="verdict v-refute">
+      <div class="tag">一个我们自己读错过的字段</div>
+      <p><code>graspBy</code> / <code>releaseBy</code> 在 25/25、31/31 的会话里全部是 <code>policy</code>——这很容易被读成「抓取已自主」。<strong>它记录的是「谁下了合手指令」，不是「谁把手对准了」。</strong>同一张表的下一行写着抓取相位 29 段接管 / 1905 帧。两件事都是真的，见第三节。</p>
+    </div>
+
+    <h3><span class="h3-mark">→</span>要到 90%，缺四样东西，其中两样已经写完</h3>
+
+    <p><strong>其零，一个还不存在的数字：无人协助的抓取成功率。</strong>今天所有 rollout 的抓取相位都有人补位，所以这一项从未被干净测过。它同时是评估的洞和路线的洞——没有抓取校验（空抓 / 碰倒 / 歪抓）与自主复位，这个数永远测不出来，端到端的成功率也就永远只能靠推。</p>
+
+    <p><strong>其一，终段从 62% 到 95%。</strong>路径已经实现但还没跑：跳跃式接触搜索——固定位姿下降，没插进去就抬起、平移、再降。落点数是算出来的而不是挑的：最坏方位上偏移到最近落点的距离是 <code>√(R²+r²−2Rr·cos(π/n))</code>，要求不超过 4.2 mm 的捕获半径。R = 7 mm 时 6 个落点只覆盖到 8.4 mm，8 个覆盖到 9.7 mm；而示教散布的 p90 是 8.7 mm。所以是中心 + 环上 8 个 = 9 个落点。几何本身预测约 90%。</p>
+
+    <p><strong>其二，统计上的 n。</strong>今天每一条判决都建立在 n = 8–9 上。62% 的 95% 置信区间是 24–91%——我们现在<em>连 62% 和 90% 都区分不了</em>。要在 95% 置信下声称 ≥90%，最少需要 30 次全中（Clopper-Pearson 下界 90.5%）。这不是严谨癖，这是当前所有结论精度的硬上限。所以自动循环（取销 → 随机化交接位姿 → 搜索下降 → 自动判读 → 从孔里取回）不是加分项，是前提：半天工程换一夜 n ≥ 100。</p>
+
+    <p><strong>其三，接近段的可靠性。</strong>90% → 95%。这一项已经从主线降级：终段伺服把误差继承切断了（见第四节），它现在是吞吐量问题，不是精度问题。</p>
+
+    <div class="verdict v-pending">
+      <div class="tag">时间估计</div>
+      <p><strong>终段单独打到 90%（人代抓、固定孔位）：乐观 1–2 周，现实 2–4 周。</strong>缺的两样都是已写完的代码，剩下的是机时。</p>
+      <p><strong>端到端全自主打到 90%：还不能估。</strong>不是因为难度未知，是因为分母未知——抓取那一段今天连基线都没有。先做抓取校验与自主复位，拿到第一个无人协助的抓取成功率，这个估计才有意义。</p>
+      <p><strong>「mask 内任意销位 + 会蠕变的孔」这个真实目标：1–2 个月量级，且有真实的失败风险</strong>——它依赖相对视觉伺服，而闭环视觉伺服在这个 rig 上一次都没测过。</p>
+    </div>
+
+    <h3><span class="h3-mark">→</span>100% 在当前可观测性下不可达，原因是可以写下来的</h3>
+
+    <p>终段误差有三个来源，都不在本体感知里：<strong>销在夹爪里怎么坐</strong>（逐次抓取独立，主要落在 x，4.4 mm）、<strong>孔自己在桌面上蠕变</strong>（粘接件，会话内 y 单调漂移 r = +0.64, p = 0.002）、以及 <strong>销在下降途中会在爪里滑动</strong>（交接时横向 1.7–2.0 mm，接触时 8.0–8.6 mm）。</p>
+
+    <p>接触式搜索对第二项免疫（它不依赖任何绝对位置），对第一项在 9.7 mm 以内有效。剩下的尾巴——超出 9.7 mm 的抓取偏移、以及下降中新产生的滑动——搜索够不着。而即使把销尖偏移读到<em>完美</em>，天花板也只有 92%：这是在实测捕获半径 4.2 mm 下、用留一预测把 x 偏移完全去掉之后算出来的。</p>
+
+    <div class="verdict v-confirm">
+      <div class="tag">结构性结论</div>
+      <p>100% 不是「把均值调得更准」，而是<strong>把每一段变成可验证 + 可重试</strong>。单体策略每段 p = 0.9、三段串联只有 0.73；分段验证加重试则趋近 1。搜索本身就是这个架构的第一个实例——它把「单次落点的概率」换成了「9 次落点的覆盖」。</p>
+    </div>
+  </section>
+
+  <!-- ============ 2 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">02 / 已经成功的部分</div>
+      <h2>50 条示教、30k 步 LoRA，泛化性好到什么程度</h2>
+    </div>
+
+    <p>先把配置摆清楚，因为后面每一个数字都要挂在它上面。</p>
+
+    <div class="tw">
+      <table>
+        <caption>基线 checkpoint 的全部超参</caption>
+        <tbody>
+          <tr><th>语料</th><td>50 条人类示教 / 24 945 帧 / 双 RealSense（腕部 <code>ee</code> + 侧视 <code>side</code>），录制 60 Hz，训练视图抽到 30 Hz</td></tr>
+          <tr><th>动作契约</th><td><code>delta_ee_from_prev_cmd</code>，5 维（dx dy dz drz grip）；state 8 维（ee 位姿四元数 + gripper.pos）</td></tr>
+          <tr><th>起点</th><td>pi0.5 base，LoRA <b>r = 64, α = 64</b>；目标模块只含 action expert 的 q/v 投影与 state/action 投影——<b>SigLIP 视觉塔与 Gemma 主干全程冻结</b></td></tr>
+          <tr><th>优化</th><td>batch 8 · 30 000 步 · lr 5e−5 · warmup 200 · MEAN_STD · action_loss_weights [1,1,1,0.2,2.0]</td></tr>
+          <tr><th>代价</th><td>约 10 个 epoch，单卡 4090 <b>8 小时 21 分</b>（≈1.0 s/step）</td></tr>
+          <tr><th>留出</th><td>训练用 48 条，ep22 / ep40 留出（checkpoint 名里的 <code>holdout22_40</code> 就是它们）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>「泛化性不错」这句话不能靠印象。下面四组证据是独立取得的，口径各不相同。</p>
+
+    <h3><span class="h3-mark">A</span>真机上，抓取段与示教在统计上不可区分</h3>
+
+    <p>按<strong>相位</strong>而不是按高度切段（同一条 rollout 会四次穿过同一个 z 带：下降抓取、抬升搬运、下降插孔、撤回，按 z 汇总会让升降在中位数里互相抵消——这是我们自己先犯过的错）。策略自主、下降中的 16 步窗口：</p>
+
+    <div class="tw">
+      <table>
+        <caption>16 步窗口内的位移，策略 vs 示教</caption>
+        <thead><tr><th>相位</th><th class="num">示教 横向 / 下降</th><th class="num">基线 ckpt 横向 / 下降</th></tr></thead>
+        <tbody>
+          <tr class="hl"><th>抓取逼近</th><td class="num">13.27 / −36.5 mm @ z=0.231</td><td class="num">14.66 / −36.9 mm @ z=0.247</td></tr>
+          <tr><th>插孔逼近</th><td class="num">2.21 / −10.1 mm @ z=0.092</td><td class="num">4.67 / −11.1 mm @ z=0.126</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">抓取段横向与下降速率都落在示教的 ±10% 内。插孔段同样的下降速率下横向乱动 2 倍——它在动，只是不朝孔收敛。<strong>这一行差异就是全文的题目。</strong></p>
+
+    <h3><span class="h3-mark">B</span>夹爪的决策是策略自己做的——但它按高度触发，不看对准</h3>
+
+    <p>三个独立会话：<strong>31/31、25/25、24/26</strong> 的 rollout 里，<code>graspBy</code> 与 <code>releaseBy</code> 全部是 <code>policy</code>。夹爪不是靠外部规则触发的——它是策略自己学会的 z 触发行为：首次闭合高度中位 0.0535 m，范围 0.047–0.087。</p>
+
+    <p class="note"><strong>这条证据的边界必须一起写。</strong>「z 触发」的另一面是<em>与 XY 是否对准无关</em>——偏了也会合。同一批会话里，抓取相位发生了 29 段人工接管 / 1905 帧。所以这一项证明的是「合手这个决策学会了」，<strong>不</strong>证明「抓取自主成功」。后者见第三节。</p>
+
+    <p>销位覆盖不是「测在容易的地方」：训练语料的销距 home 位分布是 38–305 mm、中位 196 mm、48% 超过 200 mm；测试销位的 Mahalanobis 距离中位 1.28，示教自身是 1.32，<strong>超出示教 p90 的比例是 0%</strong>。同一批测试里销距最远达 339 mm。</p>
+
+    <h3><span class="h3-mark">C</span>离线开环：喂它示教自己看过的画面，它走得和人一样</h3>
+
+    <p>把 50 条示教的观测（图 + 位姿）逐帧喂给 checkpoint，取预测 chunk 前 16 步的横向合位移当航向，与示教真实航向逐段比：</p>
+
+    <div class="tw">
+      <table>
+        <caption>圆统计，每段每条 episode 取 10 帧，n ≈ 480–496 帧/段</caption>
+        <thead><tr><th>z 段 (m)</th><th class="num">策略航向</th><th class="num">示教航向</th><th class="num">差</th><th class="num">同 16 步下降量</th></tr></thead>
+        <tbody>
+          <tr><th>0.20–0.25</th><td class="num">−58.4°</td><td class="num">−63.1°</td><td class="num">+4.7°</td><td class="num">−38.0 vs −38.1 mm</td></tr>
+          <tr><th>0.15–0.20</th><td class="num">−43.0°</td><td class="num">−32.0°</td><td class="num">−11.1°</td><td class="num">−37.3 vs −38.1 mm</td></tr>
+          <tr><th>0.12–0.15</th><td class="num">−29.9°</td><td class="num">−23.6°</td><td class="num">−6.3°</td><td class="num">−33.4 vs −35.4 mm</td></tr>
+          <tr><th>0.09–0.12</th><td class="num">−39.5°</td><td class="num">−44.3°</td><td class="num">+4.8°</td><td class="num">−27.0 vs −28.3 mm</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>每一段都在 5–11° 以内，下降剖面每 16 步差 2 mm 以内。更进一步，把「瞄准误差」（航向与「当前位置→销」方位之差）拿示教自己当基准——因为示教的瞄准误差也不是 0：</p>
+
+    <div class="tw">
+      <table>
+        <caption>瞄准误差，同帧同口径</caption>
+        <thead><tr><th>z 段 (m)</th><th class="num">策略单次采样</th><th class="num">同帧 8 次取均值</th><th class="num">示教</th></tr></thead>
+        <tbody>
+          <tr class="hl"><th>0.20–0.25</th><td class="num">31.4°</td><td class="num">23.2°</td><td class="num">25.8°</td></tr>
+          <tr><th>0.12–0.15</th><td class="num">36.5°</td><td class="num">21.8°</td><td class="num">20.4°</td></tr>
+          <tr><th>0.09–0.12</th><td class="num">33.8°</td><td class="num">19.8°</td><td class="num">13.5°</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">在 0.20 m 以上，8 次取均值后策略<strong>比人还准</strong>（23.2° vs 25.8°，p = 0.17 不可区分）。这条结论一次性废掉了我们当时排在 P0 的「解冻视觉塔」——冻结的通用 SigLIP 特征足以支持正确的平均方向。<em>但它也埋下了第四节的伏笔：均值是对的，方差不是。</em></p>
+
+    <h3><span class="h3-mark">→</span>那么，它是怎么做到的？五个「合同」</h3>
+
+    <p>这套泛化性不是调参调出来的，是四次根因排查换来的。每一次修的都是同一类东西——<strong>训练时的世界和部署时的世界必须逐位相同，训练目标必须真的携带任务信息</strong>。按发现顺序：</p>
+
+    <div class="tw">
+      <table>
+        <caption>让 50 条示教足够用的四次修复</caption>
+        <thead><tr><th>合同</th><th>断在哪</th><th>修法</th></tr></thead>
+        <tbody>
+          <tr>
+            <th>观测几何</th>
+            <td>Training View 的 camera crop 只作用于训练侧，推理直接把整幅 640×480 <code>resize</code> 进 542×286。ROI 顶部错位 116 px / 286 行，约 40% 图高。<b>两条路径产出的图像形状完全相同，没有任何一层会报错。</b></td>
+            <td>推理侧从 view manifest 读同一个框，<code>resize</code> 之前先裁；分辨率不符直接 <code>raise</code> 而不是静默缩放。日志的 <code>crop_xywh</code> 必须等于 manifest，测试锁住。</td>
+          </tr>
+          <tr>
+            <th>观测光学</th>
+            <td>录制 config 把两颗相机钉死在 <code>exposure_us: 15000</code>，推理 config 两个都没设——而不设不等于沿用，等于<b>每次 rollout 都切回自动曝光</b>。附带把 60 Hz 也让了出去。</td>
+            <td>曝光/增益/fps 两份 config 逐字一致。</td>
+          </tr>
+          <tr>
+            <th>动作空间</th>
+            <td>遥操把 roll/pitch 关掉了（<code>scale_wx/wy = 0</code>），于是 drx/dry 结构性恒为零、只剩噪声；而 QUANTILES 归一化按分位带缩放，<b>这两个死轴拿走了 99.93% 的 loss</b>，三个决定定位的平移维一共 0.02%。</td>
+            <td>把死轴从 action 里裁掉（<code>--action-drop-dims</code>，在 delta 求导之后裁列），归一化换成有界的模式。</td>
+          </tr>
+          <tr>
+            <th>不可作弊</th>
+            <td>state 里带着 <code>prev_cmd.gripper.pos</code>，而 98.765% 的帧里它<b>逐帧等于</b>标签。模型学到的是把输入抄给输出（corr = 0.965），部署时成为不动点：永远张开。</td>
+            <td>state 里凡 <code>prev_cmd.</code> 开头一律剔除，16 维 → 8 维。用不看图的线性模型量「可作弊度」：首帧 R² 从 <b>0.677 → 0.183</b>，gripper 首帧 R² 从 0.9999 → 0.306。</td>
+          </tr>
+          <tr>
+            <th>监督真伪</th>
+            <td>chunk_size = 50 意味着每条 episode 尾部把最后一个动作重复最多 49 次，而 pi0.5 <b>从不读 <code>action_is_pad</code></b>（ACT 从写出来那天就 mask 了）。DAgger 片段里这一项占 32.1%，内容是「接下来 50 步不动」。</td>
+            <td>三处 reduction 全部改为按有效项求均值；接管帧的夹爪列不监督。合并视图上 <code>supervised_fraction</code> 从 1.0 变成真实的 0.8865——<b>11.3% 的动作监督原本是伪造的</b>。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="verdict v-refute">
+      <div class="tag">最重要的一条教训</div>
+      <p>修好 crop 之后，我们预期「接近/伸手会明显改善」。<strong>实际没有。</strong>原因是 crop 修的是感知，而 policy 在平移和夹爪这两个维度上从未获得过学习信号——感知修好了也没有东西去用它。<strong>观测侧的合同和训练侧的目标函数是两件独立的事，修好其中一件不会替另一件背书。</strong></p>
+    </div>
+  </section>
+
+  <!-- ============ 3 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">03 / 卡点一</div>
+      <h2>抓取定位：两个卡点，一个在 XY，一个在爪里</h2>
+    </div>
+
+    <p>我们一度以为这一段是解决了的——<code>graspBy</code> 和 <code>releaseBy</code> 在 25/25、31/31 的会话里全是 <code>policy</code>，接近段的运动统计与示教不可区分。但同一张表的下一行写着：<strong>31 条 rollout 里，抓取相位发生了 29 段人工接管，1905 帧。</strong></p>
+
+    <p>两件事都是真的，而它们之间的关系正是这一段的病理。策略确实自己决定何时合手——但它是<strong>按高度触发</strong>的：首次闭合的 z 中位 0.0535 m，与 XY 是否对准无关。所以「偏了也会合」。操作员的接管由「即将发生的物理失败」触发，其中一类正是<em>「XY 偏到会空抓或碰倒销」</em>——他必须赶在策略下压之前把 XY 推对，之后策略照常合手，日志照常记成 <code>graspBy=policy</code>。</p>
+
+    <div class="verdict v-refute">
+      <div class="tag">这个字段记录的是「谁下了合手指令」，不是「谁把手对准了」</div>
+      <p>于是抓取实际有<strong>两个独立的卡点</strong>：一个在合手<em>之前</em>（XY 没对准，需要人补位），一个在合手<em>之后</em>（销在爪里的位姿不确定）。下面分开写。</p>
+    </div>
+
+    <h3><span class="h3-mark">A</span>合手之前：XY 对准，而且我们没有它的基线</h3>
+
+    <p>这是需要接管的那一个。老实说，<strong>它目前没有任何干净的量化</strong>——所有 rollout 的抓取相位都在人的补位下完成，无人协助的抓取成功率从未被测过。它是当前评估里最大的一个洞：端到端的成功率因此只能靠推，而不能靠读。</p>
+
+    <p>好消息是三种抓取失败各自都有<em>现成的</em>检验信号，不需要新传感器：<strong>空抓</strong>（夹爪合到底，宽度 ≈ 0）→ 重新定位重抓；<strong>碰倒</strong>（销不在预期位姿）→ 重新定位，倒下的销需要不同抓取姿态；<strong>歪抓</strong>（夹爪宽度介于中间 + 腕部图像）→ 补偿或放下重抓。加上一个「把销放回随机起点」的动作，就得到自主复位。<strong>这条从工程项升成了主线</strong>——不是因为它能让抓得更好，而是因为没有它，那个分母永远拿不到。</p>
+
+    <h3><span class="h3-mark">B</span>合手之后：抓成功了，也不等于销的位姿被确定了</h3>
+
+    <p>同一条销，两次<em>都成功</em>的抓取会让销在夹爪里坐在不同的位置——而机械臂对此一无所知。它的观测里只有关节角、EE 位姿和夹爪开度，没有力/力矩，触觉通道在另一套后端上。</p>
+
+    <p>这个量有多大？我们用<strong>策略自己的冻结视觉塔</strong>做了一次线性探针（checkpoint 的 <code>adapter_config.json</code> 里 LoRA 目标模块不含视觉塔，所以 base 里那一份逐比特就是策略实际看到的表征）。对 50 条示教的抓取瞬间取腕部相机 patch 均值特征，回归该次抓取的终段 x 残差：</p>
+
+    <div class="tw">
+      <table>
+        <caption>销尖偏移的可读性，留一交叉验证</caption>
+        <thead><tr><th>探针</th><th class="num">留一 r</th><th>读法</th></tr></thead>
+        <tbody>
+          <tr class="hl"><th>腕部相机，闭合后 10 帧</th><td class="num">+0.53</td><td>R² = 0.28；跨会话留一 +0.39；会话内置换 p = 0.004</td></tr>
+          <tr><th>同一时刻的本体感知</th><td class="num">+0.01</td><td><b>图像是在加信息，不是在回声位姿</b></td></tr>
+          <tr><th>侧视相机</th><td class="num">+0.03</td><td>p = 0.25——不是「随便哪张图都行」</td></tr>
+          <tr><th>对照：从图像读机械臂自己的 x / y</th><td class="num">+0.97 / +0.96</td><td>凡是 null 的地方，不是流水线坏了</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>信号在时间上正好压在抓取事件上：闭合前 12 帧 r = 0.13 · 闭合当帧 0.50 · +3 帧 0.53 · +10 帧 0.53 · +30 帧 0.40 · +60 帧 0.03。噪声不会围绕一个事件这样组织。其中「闭合<em>之前</em>读不出来」本身是一条独立结论：<strong>销在桌上的位姿虽然是偏移的成因，却不足以预测偏移——必须等销进了手才可测。接近段做不了这件事。</strong></p>
+
+    <p>但 r = 0.53 换算成毫米之后，判决很冷酷：用留一预测把 x 偏移减掉，p90 从 8.4 降到 6.4 mm，而超出捕获半径的比例几乎纹丝不动——<strong>这个读数在任何半径上都只值 +2 个百分点</strong>。真正值钱的是把它读<em>准</em>：完美读出值 +30 个百分点。</p>
+
+    <div class="verdict v-pending">
+      <div class="tag">还有一个时刻问题</div>
+      <p>后来的终段实验发现，<strong>销在下降过程中会在爪里滑</strong>：交接那一刻横向 1.7–2.0 mm，接触时 8.0–8.6 mm——这 6 mm 是在 68 mm 的下降途中产生的。所以「在抓取帧读到的偏移」到插入时已经不是同一个偏移。这条路测的是错误的时刻。</p>
+    </div>
+  </section>
+
+  <!-- ============ 4 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">04 / 卡点二</div>
+      <h2>插孔定位：一个自相矛盾的事实，它本身就是结论</h2>
+    </div>
+
+    <p>物理参数是很晚才拿到手的，而它一到手就把之前几周的一整条推理链翻了过来：<strong>孔径 20 mm，销径 15 mm，无倒角，不允许改硬件。</strong>单边径向间隙 2.5 mm，没有任何机械引导。</p>
+
+    <p>那么问题来了。50 条示教<strong>全部成功</strong>，所以每一条的销尖都进了那个 2.5 mm 的窗口。但它们的 TCP 位姿并没有：</p>
+
+    <div class="tw">
+      <table>
+        <caption>五种孔心估计方式，全部来自示教轨迹本身</caption>
+        <thead><tr><th>估计方式</th><th class="num">n</th><th class="num">散布 (std)</th><th class="num">中位偏离</th><th class="num">p90</th><th class="num">&gt;2.5 mm</th></tr></thead>
+        <tbody>
+          <tr><th>穿过 z = 0.070</th><td class="num">50</td><td class="num">5.2 mm</td><td class="num">3.9</td><td class="num">8.7</td><td class="num">74%</td></tr>
+          <tr><th>穿过 z = 0.060</th><td class="num">50</td><td class="num">5.4 mm</td><td class="num">3.5</td><td class="num">9.9</td><td class="num">76%</td></tr>
+          <tr><th>穿过 z = 0.055</th><td class="num">41</td><td class="num">5.0 mm</td><td class="num">3.5</td><td class="num">8.7</td><td class="num">76%</td></tr>
+          <tr><th>松爪点</th><td class="num">34</td><td class="num">4.8 mm</td><td class="num">3.5</td><td class="num">8.1</td><td class="num">74%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">五个估计量把孔心定到彼此 1 mm 以内，所以中心本身是清楚的；但每一个的散布都是 ~5 mm，而且<strong>四分之三的成功示教，其 TCP 离这个中心超过 2.5 mm</strong>。</p>
+
+    <div class="verdict v-confirm">
+      <div class="tag">这两件事不可能同时为真</div>
+      <p>除非 <strong>TCP 位姿 ≠ 销尖位置</strong>。销尖必须在窗口里（它进去了），而 TCP 中位偏离 3.5 mm、p90 8.7 mm。这个差额就是「从 TCP 到销尖」这段映射逐次变化的幅度，被直接量出来了：<strong>std ≈ 5.0 mm，是间隙的两倍。</strong></p>
+    </div>
+
+    <h3><span class="h3-mark">→</span>把这 5 mm 拆开：两个不可观测量，修法完全不同</h3>
+
+    <p>孔的平移是<em>共享</em>的（两次移动之间录的每条 episode 看到同一个孔），销的坐姿是<em>每次抓取独立</em>的。50 条示教来自三个录制会话，这就给了分组：</p>
+
+    <div class="tw">
+      <table>
+        <caption>方差分解</caption>
+        <tbody>
+          <tr><th>总散布</th><td class="num">5.0 mm</td><td>—</td></tr>
+          <tr class="hl"><th>会话内</th><td class="num">4.9 mm</td><td>逐次抓取 + 会话内蠕变 —— <b>主导项</b></td></tr>
+          <tr><th>会话间</th><td class="num">0.8 mm</td><td>三个中心两两相距 1.1 / 1.4 / 2.1 mm，ANOVA p = 0.51 / 0.52，不显著</td></tr>
+          <tr><th>单边径向间隙</th><td class="num">2.5 mm</td><td>外部约束</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>按<strong>真实录制顺序</strong>（不是 <code>episode_index</code>，见第六节）看，两个 20 条的会话在 y 上同号漂移（r = +0.64, p = 0.002 与 r = +0.41, p = 0.075）——这是粘接件在一个会话里慢慢爬的签名，也是「孔有时会在桌面上轻微平移」这一观察的第一份直接证据。但 y 的总散布只有 2.4 mm，x 有 4.4 mm，且 x 完全不随顺序变（r = −0.08）。</p>
+
+    <p><strong>结论：蠕变是真的，但它是次要项；主导项是逐次抓取就变的那一部分。两个不可观测量都存在，而它们在本体感知里都是看不见的。</strong></p>
+
+    <h3><span class="h3-mark">→</span>然后我们跑了一个赔率极不对称的实验，预测被推翻了</h3>
+
+    <p>预登记的预测写死了：把 TCP 送到孔心均值 <code>(0.3597, −0.1331)</code>，销尖会落在 std ≈ 5 mm 的圆盘里，约 <strong>76% 的次数偏出 2.5 mm</strong>，所以成功率约 24%。可证伪条件也写死了：<em>若它反而稳定打进去了，整个框架要重来。</em></p>
+
+    <p>实测：10 条 rollout，9 次终段伺服全部走完 68 mm 的下降，零次假接触。操作员评分 <strong>5 次成功 / 3 次失败 / 1 次中止 = 5/8 = 62%</strong>。单边二项检验 p = 0.023。</p>
+
+    <p class="note"><strong>这个 62% 的条件必须跟着一起引用。</strong>这两批实验里操作员只关心插孔段，抓取是他代做的（第一批 8 条轨迹的夹爪闭合帧全部正好等于专家跨段的结束帧）。所以：<em>(1)</em> 它是「人代抓 + 伺服终段」的条件成功率，不是端到端；<em>(2)</em> 销在夹爪里的位姿分布是<strong>操作员的</strong>，不是策略的——若他的抓取比示教更一致，这 62% 还偏乐观。</p>
+
+    <figure>
+      <div class="figbox">
+        <svg viewBox="0 0 470 384" role="img" aria-label="同心靶盘图：2.5 毫米名义间隙、4.2 毫米实测捕获半径、5.0 毫米示教 TCP 散布、8.7 毫米 p90、9.7 毫米搜索覆盖，以及 9 个搜索落点">
+          <g transform="translate(170,190)">
+            <circle r="126.1" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="2 4" opacity="0.8"/>
+            <circle r="113.1" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="6 4"/>
+            <circle r="65" fill="none" stroke="var(--refute)" stroke-width="1.4"/>
+            <circle r="54.6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+            <circle r="32.5" fill="none" stroke="var(--ink)" stroke-width="1.4" stroke-dasharray="4 3"/>
+            <line x1="-134" y1="0" x2="134" y2="0" stroke="var(--rule)" stroke-width="0.8"/>
+            <line x1="0" y1="-134" x2="0" y2="134" stroke="var(--rule)" stroke-width="0.8"/>
+            <g fill="var(--accent)">
+              <circle cx="0" cy="0" r="4.2"/>
+              <circle cx="91" cy="0" r="3.6"/>
+              <circle cx="64.35" cy="-64.35" r="3.6"/>
+              <circle cx="0" cy="-91" r="3.6"/>
+              <circle cx="-64.35" cy="-64.35" r="3.6"/>
+              <circle cx="-91" cy="0" r="3.6"/>
+              <circle cx="-64.35" cy="64.35" r="3.6"/>
+              <circle cx="0" cy="91" r="3.6"/>
+              <circle cx="64.35" cy="64.35" r="3.6"/>
+            </g>
+            <text x="0" y="152" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--ink-3)" letter-spacing="0.08em">1 格 = 2.5 mm</text>
+          </g>
+          <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink-2)">
+            <line x1="202" y1="190" x2="330" y2="126" stroke="var(--rule-strong)" stroke-width="0.8"/>
+            <text x="334" y="130" fill="var(--ink)">2.5 mm</text>
+            <text x="334" y="145" font-size="10">名义单边间隙</text>
+
+            <line x1="222" y1="176" x2="330" y2="170" stroke="var(--accent)" stroke-width="0.8"/>
+            <text x="334" y="174" fill="var(--accent)" font-weight="500">4.2 mm</text>
+            <text x="334" y="189" font-size="10">实测捕获半径</text>
+
+            <line x1="232" y1="205" x2="330" y2="214" stroke="var(--refute)" stroke-width="0.8"/>
+            <text x="334" y="218" fill="var(--refute)">5.0 mm</text>
+            <text x="334" y="233" font-size="10">示教 TCP 散布 σ</text>
+
+            <line x1="278" y1="228" x2="330" y2="258" stroke="var(--rule-strong)" stroke-width="0.8"/>
+            <text x="334" y="262">8.7 / 9.7 mm</text>
+            <text x="334" y="277" font-size="10">示教 p90 / 搜索覆盖</text>
+          </g>
+        </svg>
+      </div>
+      <div class="legend">
+        <div><span class="sw" style="background:var(--accent)"></span><span>9 个搜索落点：中心 + R = 7 mm 环上 8 个。<span class="val">最坏方位覆盖到 9.7 mm</span></span></div>
+      </div>
+      <figcaption><b>为什么 62% 而不是 24%。</b>2.5 mm 从来不是捕获半径，只是它的下界。把 5/8 反演回示教自己的残差云，得到<b>捕获半径 4.2 mm（95% CI 2.5–8.8）</b>，是名义间隙的 1.7 倍。物理上讲得通：销在夹爪里不是刚性的，孔口 20 mm，偏心落下的销尖会被自己的边缘沿孔沿带进去。<b>凡是用 2.5 mm 算成功率的论证都低估了两倍半——包括我们自己写下的那条预测。</b></figcaption>
+    </figure>
+
+    <h3><span class="h3-mark">→</span>顺带得到的四种签名：终段日志现在能自己判结局</h3>
+
+    <p>把「行程时间」和「到位后还在动的时间」分开，日志自己就能分出四种结局。设定点从 0.119 走到 0.0523 固定约 3.3 s；<code>descent_s</code> 减掉它，剩下的就是设定点已停、工具还在下走的时间：</p>
+
+    <div class="tw">
+      <table>
+        <caption>四种签名，与操作员评分 9/9 对上</caption>
+        <thead><tr><th>签名</th><th>含义</th><th>结果</th></tr></thead>
+        <tbody>
+          <tr><th>0.1 s 内收敛</th><td>全程无阻，干净插入</td><td>3 次，全 success</td></tr>
+          <tr><th>始终不收敛，停高 ≤2.5 mm、横向 ≤2.4 mm</th><td>坐进孔里被握住</td><td>2 次，全 success</td></tr>
+          <tr><th>始终不收敛，停高 ≈5 mm、横向 ≈8 mm</th><td>站在夹具面上</td><td>2 次，abort + failure</td></tr>
+          <tr><th>8–18 s 后才收敛</th><td>夹持打滑，销顶在孔沿</td><td>2 次，全 failure</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">这台机器上没有力/力矩通道，触觉在另一套后端。<code>above_target_mm</code>（插进去 1.1–2.5 mm，站在面上 4.9–5.6 mm，<strong>两簇不重叠</strong>）加上 <code>settle_s / settle_mm</code>，就是我们能拿到的全部接触信息——而它已经够用了。这是「不需要力传感器的接触式搜索」得以成立的全部理由。</p>
+  </section>
+
+  <!-- ============ 5 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">05 / 做过的努力</div>
+      <h2>每一条都换回了什么，包括换回 0 的那些</h2>
+    </div>
+
+    <p>三周里做了九件事。这里连同<strong>失败的和被自己推翻的</strong>一起记，因为在这个问题上，「什么被排除了」比「什么被改进了」更省时间。</p>
+
+    <figure>
+      <div class="figbox">
+        <svg viewBox="0 0 580 268" role="img" aria-label="终段误差哑铃图：四组的入带误差与出带误差对比">
+          <rect x="130" y="34" width="48" height="176" fill="var(--accent-soft)"/>
+          <text x="154" y="26" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--accent)">捕获半径 4.2</text>
+
+          <g font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--ink-3)">
+            <line x1="130" y1="222" x2="530" y2="222" stroke="var(--rule-strong)" stroke-width="1"/>
+            <g text-anchor="middle">
+              <text x="130" y="240">0</text><text x="244" y="240">10</text>
+              <text x="358" y="240">20</text><text x="473" y="240">30</text>
+            </g>
+            <text x="530" y="240" text-anchor="end" fill="var(--ink-2)">到孔心横向误差 (mm)</text>
+          </g>
+
+          <g font-family="IBM Plex Mono, monospace" font-size="11">
+            <g transform="translate(0,58)">
+              <text x="120" y="4" text-anchor="end" fill="var(--ink)">示教</text>
+              <line x1="173" y1="0" x2="344" y2="0" stroke="var(--rule-strong)" stroke-width="2"/>
+              <circle cx="344" cy="0" r="5" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/>
+              <circle cx="173" cy="0" r="5" fill="var(--confirm)"/>
+              <text x="358" y="4" fill="var(--ink-2)" font-size="10">18.7 → 3.8</text>
+            </g>
+            <g transform="translate(0,102)">
+              <text x="120" y="4" text-anchor="end" fill="var(--ink)">基线 ckpt</text>
+              <line x1="336" y1="0" x2="349" y2="0" stroke="var(--rule-strong)" stroke-width="2"/>
+              <circle cx="349" cy="0" r="5" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/>
+              <circle cx="336" cy="0" r="5" fill="var(--refute)"/>
+              <text x="364" y="4" fill="var(--ink-2)" font-size="10">19.2 → 18.0</text>
+            </g>
+            <g transform="translate(0,146)">
+              <text x="120" y="4" text-anchor="end" fill="var(--ink)">+DAgger 47</text>
+              <line x1="297" y1="0" x2="415" y2="0" stroke="var(--rule-strong)" stroke-width="2"/>
+              <circle cx="415" cy="0" r="5" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/>
+              <circle cx="297" cy="0" r="5" fill="var(--pending)"/>
+              <text x="429" y="4" fill="var(--ink-2)" font-size="10">24.9 → 14.6</text>
+            </g>
+            <g transform="translate(0,190)">
+              <text x="120" y="4" text-anchor="end" fill="var(--ink)">+DAgger 108</text>
+              <line x1="264" y1="0" x2="505" y2="0" stroke="var(--rule-strong)" stroke-width="2"/>
+              <circle cx="505" cy="0" r="5" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/>
+              <circle cx="264" cy="0" r="5" fill="var(--pending)"/>
+              <text x="264" y="20" fill="var(--ink-2)" font-size="10">32.8 → 11.7</text>
+            </g>
+          </g>
+        </svg>
+      </div>
+      <div class="legend">
+        <div><span class="sw" style="background:var(--ink-2);height:2px;margin-top:0.6rem"></span><span>空心端 = 入带误差（z = 0.12 处），实心端 = 出带误差（z = 0.08 处）</span></div>
+      </div>
+      <figcaption><b>四代 DAgger 的净效果是平的。</b>终段横向做功确实被补回来了，而且比我们最初判断的还强：带内路程 5.9 → 28.1 mm，效率 −0.06 → 0.61（<b>超过示教的 0.43</b>）。但它是拿接近段换来的——入带误差单调变大 19.2 → 24.9 → 32.8 mm（p = 0.038）。两者几乎抵消：出带误差 18.0 → 11.7 mm，<b>p = 0.12，不显著</b>。而所有四组的出带误差都在 4.2 mm 的捕获半径之外。</figcaption>
+    </figure>
+
+    <div class="tw">
+      <table>
+        <caption>九件事，各自换回了什么</caption>
+        <thead><tr><th>做的事</th><th>换回了什么</th><th>判决</th></tr></thead>
+        <tbody>
+          <tr>
+            <th>推理侧补裁剪 + 曝光对齐</th>
+            <td>训练/推理观测几何从 40% 图高的仿射错位变成逐位一致</td>
+            <td><b>收益 0</b>——「轨迹形态对、伸不到位」没有改善，因为训练目标同时也是坏的</td>
+          </tr>
+          <tr>
+            <th>动作归一化换成有界模式</th>
+            <td>grdn 从每步撞 clip 的 ~100 降下来</td>
+            <td><b>部分推翻</b>——定位没变准，还多出了数据里从未出现的两个轴的旋转</td>
+          </tr>
+          <tr class="hl">
+            <th>去掉 state 里的 prev_cmd + 裁掉死轴</th>
+            <td>不看图的可作弊度 首帧 0.677 → 0.183；gripper copy 通路（R² 0.9999）被切断</td>
+            <td><b>成立</b>，且是纯 flag 改动，本轮最高杠杆的单点</td>
+          </tr>
+          <tr>
+            <th>supervision mask（padding + 接管夹爪）</th>
+            <td>11.3% 的伪造监督离开分母；「不动」的退化回填 57% → 68%</td>
+            <td><b>PARTIAL</b>——夹爪维修干净（中间带 21.9% → 6.7%），平移只修回一半</td>
+          </tr>
+          <tr>
+            <th>DAgger 四代 108 条片段</th>
+            <td>终段做功 5.9 → 28.1 mm、eff −0.06 → 0.61；离线幅度比在关键带 4.53× → 1.79×</td>
+            <td><b>净效果不显著</b>——见上图，拿接近段换的终段</td>
+          </tr>
+          <tr>
+            <th>RTC execution_horizon 16 → 4</th>
+            <td>四种截断口径下终段 cos 都没回到判据线</td>
+            <td><b>出局</b>，按预登记规则不再动 guidance / replan_q</td>
+          </tr>
+          <tr>
+            <th>解冻视觉塔</th>
+            <td>原动机（粗逼近瞄准误差）被离线探针打掉：0.20 m 以上与人持平</td>
+            <td><b>降级</b>，后来以「末端精度」为新动机重新排队</td>
+          </tr>
+          <tr>
+            <th>多次采样 + medoid 聚合</th>
+            <td>延迟前置 PASS：batch 8 一次前向 500 ms / p90 521 ms，只比单次贵 2.4 倍</td>
+            <td><b>待上机</b>——判据已从 eff 改为出带误差</td>
+          </tr>
+          <tr class="hl">
+            <th>终段固定位姿伺服</th>
+            <td><b>62%</b>，外加捕获半径 4.2 mm、四种结局签名、「销会在爪里滑」</td>
+            <td><b>零感知、零训练、半天工程</b>——目前投入产出比最高的一条</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">还有一条不在表里但吃掉了不少时间：<strong>数据卫生。</strong>DAgger 记录进程的收尾问题让我们四次踩到「parquet 没有 footer」——两次隔离、一次误判、一次真丢了约 17 条 episode。真正的缺陷不是写入路径（<code>q</code> / 停止按钮 / Ctrl-C / SIGTERM 都能正确收尾），而是<strong>没有任何东西会告诉你它还没收尾</strong>：两个预检函数都只查文件 <code>exists()</code>，从不试着打开。修法是一行——逐 shard 试 <code>pq.read_metadata</code>。检查上线当天下午就抓到了第四次，只是晚了一步。</p>
+  </section>
+
+  <!-- ============ 6 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">06 / 方法</div>
+      <h2>六条关于「判据怎么写」的教训</h2>
+    </div>
+
+    <p>这个项目里，真正省时间的不是任何一次修复，而是坚持给每张卡片写<strong>预登记判据 + 可证伪条件</strong>。下面六条都是被自己的判据抓住的错误。</p>
+
+    <div class="lesson">
+      <div class="n">教训 01</div>
+      <div class="t">闸门和天花板必须分开写</div>
+      <p>我们曾把一个<em>天花板命题</em>（「不解决不可观测量，到不了 100%」）当成<em>闸门命题</em>（「不解决它，别的都别做」）来排优先级，于是把一个 +30 pp 的收益项误当成前置依赖。实测：一个完全不含感知的控制器拿到 62%——若真是闸门，这个数该接近 0。<strong>此后凡出现「不解决 X，任何 Y 都没用」，必须先问：把 X 设成最坏值，Y 的分数是多少？不是 0，它就不是闸门。</strong></p>
+    </div>
+
+    <div class="lesson">
+      <div class="n">教训 02</div>
+      <div class="t">判据一律用结果量，代理量会在效率改变时失效</div>
+      <p>我们把「带内横向路程 ≥ 30 mm」写进了合取判据，用来抓「聚合把幅度吃掉」。实测路程 28.1 mm FAIL——但这次路程下降是<em>反过来的</em>原因：效率从 0.31 涨到 0.61，收同样的误差用更短的路。路程是「还在做功」的代理，一旦效率本身改变，这个代理就失效了。</p>
+    </div>
+
+    <div class="lesson">
+      <div class="n">教训 03</div>
+      <div class="t">基于采样式策略的判据，必须先跑重复性检验再定阈值</div>
+      <p>判据写的是「单条 episode 的转动量 ≥60° / ≤30°」。但 pi0.5 是流匹配采样，同一帧每次预测都不一样：整个实验独立跑两遍，同一条 episode 的转动量相差<strong>中位 23.2°、p90 57.0°</strong>——判据的分辨率不如噪声。此后单条数字一律不承重，全部改用汇总统计。</p>
+    </div>
+
+    <div class="lesson">
+      <div class="n">教训 04</div>
+      <div class="t">n ≪ 特征维数的探针，必须先跑一个答案已知的对照</div>
+      <p>视觉探针第一版所有格子都报 r = +1.00，连打乱标签的零分布也是 +1.00——目标均值取自全部 50 条，而 524 288 维的插值模型能精确复现去中心后的目标。<strong>是对照项抓住的</strong>：「从图像读出机械臂自己的 z」同样报 +1.00，而那不可能。</p>
+    </div>
+
+    <div class="lesson">
+      <div class="n">教训 05</div>
+      <div class="t"><code>episode_index</code> 不是时间</div>
+      <p>训练视图是三个录制会话合并出来的，而合并顺序与录制顺序<em>基本相反</em>。在打乱的序列上测漂移，测不出漂移是必然的——我们因此一度报告「孔没有移动」。按真实录制顺序重做，粘接件的蠕变立刻显形（r = +0.64, p = 0.002）。<strong>任何「随时间漂移」的检验都必须先还原真实顺序。</strong></p>
+    </div>
+
+    <div class="lesson">
+      <div class="n">教训 06</div>
+      <div class="t">缺一个物理参数，能让一整条推理链看起来自洽而实际反了</div>
+      <p>我们曾把「示教释放散布 5.0 mm」当作不可观测项的上界——那是对的；同时默认「有效容差 ≥ 5 mm，因为示教带着它成功了」——那是错的。把间隙 2.5 mm 放进来，同一个数字的读法立刻反转：示教带着 5 mm 散布成功，恰恰证明 TCP 散布与销尖位置<em>脱钩</em>。<strong>此后凡涉及精度的结论，先把任务的几何公差写在最前面。</strong></p>
+    </div>
+  </section>
+
+  <!-- ============ 7 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">07 / 下一步</div>
+      <h2>八件事，按「能不能改变计划」排序</h2>
+    </div>
+
+    <div class="steps">
+      <div class="step now">
+        <div class="idx">00</div>
+        <div class="body">
+          <div class="t">压低腕部相机曝光<em>30 分钟</em></div>
+          <p>下降帧的腕部图像里夹具是过曝的：<strong>9.4% 的像素被削顶（≥250），且集中在目标区域</strong>。恰恰在需要分辨孔沿的那一刻，孔沿不在图像里——这与「孔那一半怎么都读不出来」互相印证。曝光是相机设置，不属于被禁止的「改硬件」。这是目前唯一一件成本接近零、又可能同时打开视觉伺服和孔定位的事。</p>
+        </div>
+      </div>
+      <div class="step now">
+        <div class="idx">01</div>
+        <div class="body">
+          <div class="t">跳跃式接触搜索<em>已实现，未跑</em></div>
+          <p>固定位姿下降 → 未插入则抬起、平移、再降。判据现成（<code>above_target_mm</code> 两簇不重叠），不需要标定、标注或训练。必须是<strong>抬起—平移—下降</strong>而不是贴着面滑的螺旋：8.1 s / 18.1 s 的蠕变证明持续压会让销在爪里滑，而滑过之后，用工具位姿算出的每一个落点都是<em>用一把中途变了长度的尺子</em>量的。<strong>若它把 62% 打到 ≥9/10，那么视觉伺服、解冻视觉塔、RL 都不必做——「这个任务到底需不需要感知」当场收档。</strong></p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="idx">02</div>
+        <div class="body">
+          <div class="t">终段自动循环<em>半天工程</em></div>
+          <p>取销 → 随机化交接位姿 → 搜索下降 → 自动判读 → 从孔里取回。最难的那一环（销位定位）在终段实验里<em>不需要</em>：销要么在孔里（孔心已知），要么还在爪里。半天换一夜 n ≥ 100。至今每一条判决都建立在 n = 8–9 上——这是所有结论精度的硬上限。</p>
+        </div>
+      </div>
+      <div class="step now">
+        <div class="idx">03</div>
+        <div class="body">
+          <div class="t">抓取校验 + 自主复位<em>补上缺失的分母</em></div>
+          <p>三种失败各有现成信号（空抓 → 宽度 ≈ 0；碰倒 → 销不在预期位姿；歪抓 → 宽度居中 + 腕部图像），不需要新传感器。判据：连续 50 次「抓取 → 判定 → 恢复或放回」无人干预，且三种形态的判定与人工标注一致率 ≥95%。<strong>它交付的第一个东西不是更好的抓取，是一个我们现在没有的数字——无人协助的抓取成功率。</strong>在它之前，任何端到端百分比都是推出来的。</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="idx">04</div>
+        <div class="body">
+          <div class="t">相对视觉伺服</div>
+          <p>不估度量位姿，直接在腕部图像里把销尖对到孔上——人就是这么做的。它是唯一同时治「任意孔位」与「插入时刻的偏移」的一条，也是唯一能推向 100% 的一条。前提已验证：接管瞬间 6/6、示教下降 15/15，销在 z = 0.061–0.108 可见且未被两指遮挡。</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="idx">05</div>
+        <div class="body">
+          <div class="t">终段判据实验（采样聚合 / DAgger 代际对照）</div>
+          <p>都是终段实验，判据都是出带误差，分辨率要靠 02 提供之后才够。</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="idx">06</div>
+        <div class="body">
+          <div class="t">接近段可靠性<em>已从主线降级</em></div>
+          <p>终段伺服切断了误差继承：9 次交接横向偏差跨 <strong>15.8–61.1 mm</strong>，而对准 9/9 都先收敛到 1.7–2.0 mm 才开始下降；交接偏差与插入成败<strong>无关</strong>（Mann-Whitney p ≈ 1.0），偏差最大的那次（61.1 mm）反而是全场最干净的一次插入，3.4 s 到底。剩下的价值是「10 次里有 1 次走不到交接高度」——那是吞吐量问题，不是精度问题。</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="idx">07</div>
+        <div class="body">
+          <div class="t">强化学习<em>仍然排最后</em></div>
+          <p>不是因为它不好，是因为<strong>RL 修不了一个不可观测量</strong>。销尖相对 TCP 的偏移、孔当前的位置，如果都不在观测里，那么对策略而言两次偏移不同的抓取是<em>同一个状态</em>；任何奖励信号只能教它学这个偏移的均值——也就是示教已经在做的事——然后卡在同一个 5 mm 散布上。<strong>瓶颈是表征问题，不是优化问题。</strong>「模仿学不动就换 RL」这条推理在这里不成立：两者在同一个观测空间里，会撞同一堵墙。而一旦销和孔可观测了，RL 也就未必还是必需的。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 8 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">08 / 结语</div>
+      <h2>三周里最贵的一课</h2>
+    </div>
+
+    <p>如果只能留一句话：<strong>在开始训练之前，先把任务的几何公差写在纸的最上面。</strong></p>
+
+    <p>我们花了两周半在训练侧——归一化、动作契约、监督掩码、DAgger、采样聚合——每一项都修得很干净，每一项都有测量支撑，而且确实让策略变好了：它学会了搬运的形状，学会了何时合手，学会了在最后 4 厘米里做出比示教更高效的横向收敛。但决定成败的那 2.5 毫米，从头到尾不在它的观测里——<strong>抓取那一端也是同一件事的另一面：它到了高度就合手，因为「有没有对准」这个量它同样看不见。</strong></p>
+
+    <p class="note">写这篇复盘时我自己也踩了一次同样的坑：把日志里的 <code>graspBy=policy</code> 读成了「抓取已自主」，而它只是「合手指令由策略发出」。真实情况是抓取相位 29/31 段需要人补位。<strong>一个字段名能把「谁做了决定」和「谁把事做成了」压进同一个词——这类混淆和本文其余部分讲的是同一种病。</strong></p>
+
+    <p>然后一个半天写完、零感知、零训练的开环控制器拿到了 62%——不是因为它聪明，而是因为它<strong>不需要知道</strong>那个不可观测量：它把「猜准一次」换成了「覆盖一片」。这大概就是这个任务给出的答案：<em>当一个量真的不可观测时，正确的做法不是让模型更努力地去猜它，而是重新设计一个不需要猜它的动作。</em></p>
+
+    <p class="note">下一次更新会带上接触式搜索的 n = 10 判读——判据已经预登记：≥9/10 通过，≤6/10 转视觉伺服，7–8/10 不判读、直接把 n 抬到 50 以上再读。写在这里，是为了让它没法事后被改。</p>
+
+    <div class="editnote">
+      <h2>发稿前请核对（底稿备注）</h2>
+      <ul>
+        <li><strong>「62% 是人代抓前提下的条件成功率」这句话不能删。</strong>去掉条件之后它会被读成端到端，而端到端的干净数字是 1/119。第 01 与 04 节各有一处，两处都要留。</li>
+        <li><strong>n 的口径必须保留。</strong>62%、9/10、5/8 这几个数背后都是 n = 8–10。文中每处已标注置信区间，删任何一处都会让文章比证据更自信。</li>
+        <li><strong>抓取那一段没有基线，不要在配图或标题里补一个。</strong>无人协助的抓取成功率至今未被测过；文中所有相关表述都限定在「合手指令由策略发出」与「29/31 段接管」这两个可查的事实上。</li>
+        <li><strong>第 07 节的 00 / 01 两项截至发稿仍未执行。</strong>接触式搜索是「已实现、未跑」；若发稿前跑出了结果，第 01 项和结语的最后一段都要改写。</li>
+        <li><strong>「50 条示教」的精确说法：</strong>示教语料 50 条 / 24 945 帧，基线 checkpoint 训练用其中 48 条（ep22 / ep40 留出）。摘要里如需简写为「50 条」，正文这一处要保留。</li>
+        <li><strong>「到孔距离」类指标有 ~3.5 mm 的地板</strong>（来自参考点自身散布），只能用于组间比较，不能读成绝对精度，也不能直接与 2.5 mm 间隙相比。第 05 节的图已按此口径写。</li>
+        <li>配图建议：第 04 节靶盘图与第 05 节哑铃图可直接导出；若要补一张实物图，最有说服力的是<strong>腕部相机在 z ≈ 0.08 的原始帧</strong>（能同时看到过曝削顶与销、孔的相对关系）。</li>
+      </ul>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

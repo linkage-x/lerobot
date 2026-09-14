@@ -76,6 +76,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_ACTION_SAMPLE_HORIZON",
     "FR3_TERMINAL_SERVO_POSE",
     "FR3_TERMINAL_SERVO_HANDOFF_Z",
+    "FR3_TERMINAL_SERVO_SEARCH_RING",
     # DAgger takeover. Cleared from the inherited environment like the rest, and for a sharper
     # reason: a shell that once exported FR3_DAGGER_TAKEOVER=1 would otherwise open a second
     # action source onto a moving arm in a rollout the browser never asked to be steerable.
@@ -370,6 +371,12 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options["FR3_TERMINAL_SERVO_POSE"] = servo_pose
     _set_optional_float_env(
         options, raw, "terminalServoHandoffZ", "FR3_TERMINAL_SERVO_HANDOFF_Z", minimum=0.0
+    )
+    # E7 route C. Blank leaves the search off, which is E5 exactly -- the arm descends once at
+    # the pose above and reports where it stopped. 0.007 is the ring the covering was worked out
+    # for; the runtime refuses anything the growth test could not arm inside.
+    _set_optional_float_env(
+        options, raw, "terminalServoSearchRing", "FR3_TERMINAL_SERVO_SEARCH_RING", minimum=0.0
     )
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
