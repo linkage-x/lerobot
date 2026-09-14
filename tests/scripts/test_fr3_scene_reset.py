@@ -480,3 +480,119 @@ def test_a_pose_probe_past_the_arms_reach_is_refused_before_anything_moves():
     assert result["ok"] is False
     assert "reach" in result["error"]
     assert robot.actions == []
+
+
+def test_a_timeout_says_whether_the_arm_was_still_closing(monkeypatch):
+    """A final `pos_err_mm` cannot tell a settled arm from one that needed another second.
+
+    The two have opposite fixes -- loosen the tolerance, or lengthen the timeout -- and the
+    message that could not distinguish them cost a run on hardware being diagnosed by guesswork.
+    """
+
+    class Stuck(FakeRobot):
+        """An arm that converges to a fixed offset and stays there."""
+
+        def send_action(self, action):
+            realised = {**action, "ee.x": float(action["ee.x"]) - 0.0024}
+            return super().send_action(realised)
+
+    robot = Stuck()
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=2.5, toleranceM=0.002, controlPeriodS=0.001,
+    )
+    with pytest.raises(TimeoutError) as caught:
+        scene_reset._run_step(
+            robot, request, "align_above_target", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+            max_speed_ms=50.0,
+        )
+    message = str(caught.value)
+    assert "best_pos_err_mm=2.4" in message
+    assert "tolerance_mm=2.0" in message
+    assert "still_closing=no" in message, "a settled arm must not read as one that needed longer"
+    # The axis and the sign, because "settled short" has four candidate causes and the norm
+    # names none of them: this residual is entirely -x, which rules out a gravity droop.
+    assert "err_xyz_mm=-2.4,+0.0,+0.0" in message
+
+
+def test_the_residual_names_its_axis_so_a_droop_is_not_read_as_a_lateral_error():
+    """An unmodelled payload pulls -z; lateral stiffness and a frame offset do not.
+
+    Measured on the rig 2026-09-11: `m_load` is 0.0 while the peg shows as ~2.6 N of unmodelled
+    wrench, so "the arm settles 2.4 mm short" has a candidate cause that a 3-D norm hides.
+    """
+
+    class Drooping(FakeRobot):
+        def send_action(self, action):
+            return super().send_action({**action, "ee.z": float(action["ee.z"]) - 0.0031})
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=2.5, toleranceM=0.002, controlPeriodS=0.001,
+    )
+    with pytest.raises(TimeoutError) as caught:
+        scene_reset._run_step(
+            Drooping(), request, "align_above_target", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+            max_speed_ms=50.0,
+        )
+    assert "err_xyz_mm=+0.0,+0.0,-3.1" in str(caught.value)
+
+
+def test_a_step_too_short_to_have_measured_a_trend_says_unknown(monkeypatch):
+    """"We could not tell" and "the arm had stopped closing" send a person to different fixes."""
+
+    class Stuck(FakeRobot):
+        def send_action(self, action):
+            return super().send_action({**action, "ee.x": float(action["ee.x"]) - 0.0024})
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=0.2, toleranceM=0.002, controlPeriodS=0.001,
+    )
+    with pytest.raises(TimeoutError) as caught:
+        scene_reset._run_step(
+            Stuck(), request, "align_above_target", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+            max_speed_ms=50.0,
+        )
+    assert "still_closing=unknown" in str(caught.value)
+
+
+def test_a_step_can_be_given_its_own_tolerance_and_the_message_reports_the_one_used():
+    """One tolerance cannot serve every step: a retreat needs none of the precision an align does.
+
+    The reported number has to be the one that decided, or the next person reads the request's
+    field and concludes the arm missed a target it was never held to.
+    """
+
+    class Stuck(FakeRobot):
+        def send_action(self, action):
+            return super().send_action({**action, "ee.x": float(action["ee.x"]) - 0.0024})
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=0.5, toleranceM=0.002, controlPeriodS=0.001,
+    )
+    # 2.4 mm of dead-band: refused at the request's 2.0 mm, accepted at the step's 4.0 mm.
+    with pytest.raises(TimeoutError) as caught:
+        scene_reset._run_step(
+            Stuck(), request, "retreat_after_release", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+            max_speed_ms=50.0,
+        )
+    assert "tolerance_mm=2.0" in str(caught.value)
+
+    scene_reset._run_step(
+        Stuck(), request, "retreat_after_release", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+        max_speed_ms=50.0, tolerance_m=0.004,
+    )
+
+
+def test_a_step_tolerance_that_is_not_positive_is_refused_rather_than_treated_as_unset():
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=0.5, toleranceM=0.002, controlPeriodS=0.001,
+    )
+    with pytest.raises(scene_reset.SceneResetError, match="tolerance_m must be positive"):
+        scene_reset._run_step(
+            FakeRobot(), request, "align_above_target", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
+            tolerance_m=0.0 - 1e-9,
+        )

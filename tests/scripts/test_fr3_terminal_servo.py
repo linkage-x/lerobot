@@ -600,3 +600,38 @@ def test_a_step_tolerance_is_refused_before_the_arm_moves_when_it_is_not_a_toler
     assert result["ok"] is False
     assert "stepToleranceM must be positive" in result["error"]
 
+def test_the_regrip_follows_a_released_peg_down_rather_than_closing_where_it_let_go(capsys):
+    """Measured 2026-09-11: a clean seating, released, re-gripped at the same z -- and empty.
+
+    The fingers were holding the peg up; opening them lets it drop to its own seated depth. A
+    re-grip at the release height therefore closes above it, which is what the random 1/2/3
+    attempt counts in the one table that finished were really showing.
+    """
+
+    robot = FakeSeatedRobot(0.115, (0.0, 0.0, 0.0))
+    robot.xyz = (SEATED[0], SEATED[1], 0.118)
+    robot.gripper = 0.25
+    execute_terminal_servo(robot, _request(regripGripper=0.0, regripDropM=0.004))
+    starts = [line for line in capsys.readouterr().out.splitlines()
+              if "scene_reset_step=start" in line and "regrip_after_release" in line]
+    assert starts, "the re-grip step has to run for this to mean anything"
+    released_z = float(starts[0].split("xyz=")[1].split(",")[2].split()[0])
+    assert released_z < SEATED[2] + 0.010, released_z
+
+
+def test_a_regrip_drop_can_never_drive_the_fingers_below_the_servos_own_floor(capsys):
+    robot = FakeSeatedRobot(0.115, (0.0, 0.0, 0.0))
+    robot.xyz = (SEATED[0], SEATED[1], 0.118)
+    robot.gripper = 0.25
+    request = _request(regripGripper=0.0, regripDropM=0.5, minZ=0.03)
+    execute_terminal_servo(robot, request)
+    starts = [line for line in capsys.readouterr().out.splitlines()
+              if "scene_reset_step=start" in line and "regrip_after_release" in line]
+    assert starts
+    assert float(starts[0].split("xyz=")[1].split(",")[2].split()[0]) == pytest.approx(0.03, abs=1e-6)
+
+
+def test_a_negative_regrip_drop_is_refused_because_a_released_peg_does_not_rise():
+    result = execute_terminal_servo(_descending(0.118), _request(regripDropM=-0.001))
+    assert result["ok"] is False
+    assert "regripDropM" in result["error"]

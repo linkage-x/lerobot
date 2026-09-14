@@ -477,26 +477,57 @@ def _robot_workspace_bounds(robot: Any) -> tuple[tuple[float, float, float] | No
     )
 
 
-def _observation_xyz_rotvec_gripper(robot: Any) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+def _observation_snapshot(
+    robot: Any,
+) -> tuple[dict[str, Any], tuple[float, float, float], tuple[float, float, float], float]:
+    """One wire read, keeping the whole observation as well as the three fields a step needs.
+
+    `_observation_xyz_rotvec_gripper` throws the rest of the dict away, which is right for a step
+    that only has to know whether it has arrived. It is wrong for a recorded step: the frame a
+    policy is trained on is the *observation* paired with the action sent from it, and rebuilding
+    that observation with a second `get_observation` would pair an action with a reading taken
+    at a different instant. So the dict is kept here and the narrow helper is expressed in terms
+    of this one, rather than the two reading the arm separately.
+    """
+
     observation = robot.get_observation(include_cameras=False)
     xyz = tuple(float(observation[key]) for key in ("ee.x", "ee.y", "ee.z"))
     rotvec = tuple(float(observation[key]) for key in ("ee.wx", "ee.wy", "ee.wz"))
     gripper = float(observation["gripper.pos"])
+    return observation, xyz, rotvec, gripper
+
+
+def _observation_xyz_rotvec_gripper(robot: Any) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+    _observation, xyz, rotvec, gripper = _observation_snapshot(robot)
     return xyz, rotvec, gripper
 
 
-def _send_absolute(robot: Any, xyz: tuple[float, float, float], rotvec: tuple[float, float, float], gripper: float) -> None:
-    robot.send_action(
-        {
-            "ee.x": float(xyz[0]),
-            "ee.y": float(xyz[1]),
-            "ee.z": float(xyz[2]),
-            "ee.wx": float(rotvec[0]),
-            "ee.wy": float(rotvec[1]),
-            "ee.wz": float(rotvec[2]),
-            "gripper.pos": float(gripper),
-        }
-    )
+def _absolute_action(
+    xyz: tuple[float, float, float], rotvec: tuple[float, float, float], gripper: float
+) -> dict[str, float]:
+    return {
+        "ee.x": float(xyz[0]),
+        "ee.y": float(xyz[1]),
+        "ee.z": float(xyz[2]),
+        "ee.wx": float(rotvec[0]),
+        "ee.wy": float(rotvec[1]),
+        "ee.wz": float(rotvec[2]),
+        "gripper.pos": float(gripper),
+    }
+
+
+def _send_absolute(
+    robot: Any, xyz: tuple[float, float, float], rotvec: tuple[float, float, float], gripper: float
+) -> dict[str, float]:
+    """Send the pose and answer with the dict that was sent.
+
+    Returned rather than discarded because a recorded step has to store *what was sent*, and the
+    only place that is unambiguously known is where it was handed to the driver.
+    """
+
+    action = _absolute_action(xyz, rotvec, gripper)
+    robot.send_action(action)
+    return action
 
 
 def _distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
@@ -539,6 +570,11 @@ def _scene_reset_waits_for_gripper_position(name: str) -> bool:
         "lift_8cm_after_grasp",
         "move_to_place_above",
         "descend_8cm_to_place",
+        # Both of these hold the peg once the terminal loop re-grips in place: the first is the
+        # close itself, the second carries what it just took. Waiting for either to report the
+        # closed command would wait for a number a clamped peg never reaches.
+        "regrip_after_release",
+        "retreat_after_release",
     }
 
 
@@ -549,7 +585,42 @@ def _run_step(
     xyz: tuple[float, float, float],
     rotvec: tuple[float, float, float],
     gripper: float,
+    *,
+    tap: Any = None,
+    max_speed_ms: float | None = None,
+    tolerance_m: float | None = None,
 ) -> None:
+    """Walk the setpoint to a waypoint, optionally publishing every step to a recorder.
+
+    `tap` is the only thing a recorded step does that an unrecorded one does not, and it is
+    deliberately the cheapest possible operation: one append to a bounded in-memory queue. No
+    camera is read here, nothing is encoded, nothing touches the disk. Everything expensive
+    happens on the recorder's own thread, because this loop's timeout, its stall detection and
+    its speed limit all hang off its own timing, and anything that can block here can silently
+    break all three. See `tools/fr3/collection_recorder.py`.
+
+    `tolerance_m` exists because one tolerance cannot serve every step. Measured on the rig
+    2026-09-11: this arm's residual is a dead-band along the direction of travel -- roughly 2 mm,
+    sign following the motion, not closing with time -- so a step demanding 2.0 mm is a coin
+    flip, and it was aborting runs on `retreat_after_release`, a step that needs no precision at
+    all. The knob is per call rather than on the request because the *descent* reads
+    `request.toleranceM` for its own "reached target z" test, where 2.0 mm is right and where a
+    looser number would silently reclassify a seated peg (`searchSeatedM` is 3 mm).
+
+    `max_speed_ms` exists because the *recorded* legs of a collection run have a speed the reset
+    does not: what a policy learns is millimetres per step, and the reset's 0.15 m/s is 5.0 mm a
+    step at 30 Hz -- exactly the magnitude at which the deployment guard clips, and above the
+    99.9th percentile of the demonstrations. A reset is free to move at reset speed; a leg that
+    is going into a dataset is not. `None` keeps the reset's own limit, so nothing that does not
+    pass it changes.
+    """
+
+    speed_ms = SCENE_RESET_MAX_SPEED_MS if max_speed_ms is None else float(max_speed_ms)
+    if speed_ms <= 0.0:
+        raise SceneResetError(f"max_speed_ms must be positive, got {speed_ms}.")
+    tolerance_m_value = request.toleranceM if tolerance_m is None else float(tolerance_m)
+    if tolerance_m_value <= 0.0:
+        raise SceneResetError(f"tolerance_m must be positive, got {tolerance_m_value}.")
     print(
         f"[INFO] scene_reset_step=start request_id={request.requestId} name={name} "
         f"xyz={xyz[0]:+.4f},{xyz[1]:+.4f},{xyz[2]:+.4f} gripper={gripper:.3f}",
@@ -558,24 +629,43 @@ def _run_step(
     # Where the setpoint starts walking from. The previous step converged to within toleranceM
     # of its own waypoint, so this is that waypoint up to a few mm -- close enough that the
     # walked line and the line the QC sampled are the same line.
-    commanded, _start_rotvec, _start_gripper = _observation_xyz_rotvec_gripper(robot)
-    max_step_m = SCENE_RESET_MAX_SPEED_MS * request.controlPeriodS
+    observation, commanded, _start_rotvec, _start_gripper = _observation_snapshot(robot)
+    max_step_m = speed_ms * request.controlPeriodS
     # timeoutS keeps its meaning of "how long this step may take to settle"; the walk to the
     # waypoint is granted on top of it. Folding travel into the timeout would turn slowing the
     # setpoint down into a timeout on waypoints that are perfectly reachable.
     deadline = (
         time.perf_counter()
         + request.timeoutS
-        + _distance(commanded, xyz) / SCENE_RESET_MAX_SPEED_MS
+        + _distance(commanded, xyz) / speed_ms
     )
     last_error = ""
     position_reached_at: float | None = None
     stalled_since: float | None = None
+    # What a timeout needs to say and could not. A final `pos_err_mm` alone cannot distinguish an
+    # arm that settled short of the tolerance from one that was still closing and needed another
+    # second -- and those have opposite fixes: the first means the tolerance is below what this
+    # arm holds, the second means the timeout is too short. So the best error seen and the error
+    # one second earlier are carried to the message.
+    best_error_m = float("inf")
+    error_a_second_ago = float("inf")
+    # Started now rather than at zero, so the first comparison is against a reading taken a second
+    # into the step and not against the perf_counter epoch. A step that ends before that leaves
+    # this unset, and an unset reading is reported as `unknown` rather than as `no` -- "we could
+    # not tell" and "the arm had stopped closing" send a person to different fixes.
+    error_sampled_at = time.perf_counter()
     while time.perf_counter() < deadline:
         now = time.perf_counter()
         commanded = _step_toward(commanded, xyz, max_step_m)
-        _send_absolute(robot, commanded, rotvec, gripper)
-        current_xyz, _current_rotvec, current_gripper = _observation_xyz_rotvec_gripper(robot)
+        action = _absolute_action(commanded, rotvec, gripper)
+        # Published *before* the send and paired with the observation read at the end of the
+        # previous iteration: that is the pair a policy is trained on -- the state the expert saw
+        # and the action it chose from it. Publishing after the send would pair the action with
+        # the state it had already produced.
+        if tap is not None:
+            tap.publish(now, name, observation, action)
+        robot.send_action(action)
+        observation, current_xyz, _current_rotvec, current_gripper = _observation_snapshot(robot)
         stall_m = _reach_stall_error_m(robot)
         if stall_m <= 0.0:
             stalled_since = None
@@ -590,14 +680,27 @@ def _run_step(
                 f"this tool orientation, not the workspace fence."
             )
         pos_error = _distance(current_xyz, xyz)
+        # Per axis as well as the norm. A residual that will not close has four candidate causes
+        # -- an unmodelled payload (droop, mostly -z), lateral stiffness, a tool-frame or IK
+        # offset, and a tolerance simply set below what this arm holds -- and they have four
+        # different fixes. The norm alone cannot tell them apart; the sign and axis can.
+        axis_error = tuple((c - t) * 1000.0 for c, t in zip(current_xyz, xyz))
         gripper_error = abs(current_gripper - gripper)
-        last_error = f"pos_err_mm={pos_error * 1000.0:.1f} gripper_err={gripper_error:.3f}"
+        best_error_m = min(best_error_m, pos_error)
+        if now - error_sampled_at >= 1.0:
+            error_a_second_ago = pos_error
+            error_sampled_at = now
+        last_error = (
+            f"pos_err_mm={pos_error * 1000.0:.1f} "
+            f"err_xyz_mm={axis_error[0]:+.1f},{axis_error[1]:+.1f},{axis_error[2]:+.1f} "
+            f"gripper_err={gripper_error:.3f}"
+        )
         # The walked setpoint has to land on the waypoint before the step can be done, not merely
         # get within toleranceM of it. Otherwise a step converges on the last interpolated point
         # and the arm is left a few mm short of a coordinate that was asked for exactly -- which
         # for the pose probe, whose whole job is putting the tool at a known base coordinate for
         # the camera to be solved against, is calibration error rather than tracking error.
-        pos_ok = commanded == xyz and pos_error <= request.toleranceM
+        pos_ok = commanded == xyz and pos_error <= tolerance_m_value
         gripper_ok = gripper_error <= request.gripperTolerance
         if pos_ok and position_reached_at is None:
             position_reached_at = now
@@ -607,7 +710,7 @@ def _run_step(
         if waits_for_gripper:
             gripper_wait_done = gripper_ok
             gripper_wait = "position"
-        elif name == "close_gripper":
+        elif name in ("close_gripper", "regrip_after_release"):
             gripper_wait_done = gripper_ok or (
                 position_reached_at is not None
                 and now - position_reached_at >= request.graspSettleS
@@ -624,7 +727,17 @@ def _run_step(
             )
             return
         precise_sleep(request.controlPeriodS)
-    raise TimeoutError(f"scene reset step {name} timed out: {last_error}")
+    if not math.isfinite(error_a_second_ago):
+        closing = "unknown"
+    elif pos_error < error_a_second_ago - 1e-5:
+        closing = "yes"
+    else:
+        closing = "no"
+    raise TimeoutError(
+        f"scene reset step {name} timed out: {last_error} "
+        f"best_pos_err_mm={best_error_m * 1000.0:.1f} tolerance_mm={tolerance_m_value * 1000.0:.1f} "
+        f"still_closing={closing}"
+    )
 
 
 def _move_to_start(robot: Any) -> None:

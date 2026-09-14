@@ -179,6 +179,35 @@ class TerminalServoRequest:
     # aborts runs on steps that do not need it -- while loosening the shared number would let a
     # descent call `target` 4 mm high and reclassify a seated peg (`searchSeatedM` is 3 mm).
     stepToleranceM: float | None = None
+    # Close the fingers again on the peg, at the pose it was just released at, before retreating.
+    # None retreats with the hand open, which is what this did first and which leaves the peg
+    # standing alone for the retreat plus the next descent. Measured 2026-09-11: a peg left
+    # standing off-centre -- which is every trial that does not seat, i.e. the half of the sweep
+    # the sweep exists to produce -- falls over, and a fallen peg ends the run. Nothing measured
+    # changes: the verdict is read from the descent (`aboveTargetMm`, `settleMm`), both of which
+    # are already decided before the fingers open, so the release still happens and still means
+    # what it meant.
+    regripGripper: float | None = None
+    # Let go only when the peg is in the hole. Measured 2026-09-11, three runs in a row: a peg
+    # that stopped on the face stands on the rim off-centre, and it falls at the *instant* the
+    # fingers open -- a re-close at the same pose, milliseconds later, read 0.076 and caught
+    # nothing. So closing the gap between release and re-grip cannot help; there is no gap.
+    # Nothing measured is lost by not releasing: the verdict is read off the descent
+    # (`aboveTargetMm`, `settleMm`), both decided before the fingers move.
+    releaseOnlyWhenSeated: bool = False
+    # How long a re-close may take to settle before the step gives up on the fingers reaching the
+    # closed command. Needed only because `regripGripper` makes this request perform a grasp: a
+    # clamped peg reads its own thickness and never reaches the command, so the step has to wait
+    # on time rather than on the reading. Mirrors `TerminalTrialsRequest.graspSettleS`, which
+    # passes its own value down so the two cannot drift.
+    graspSettleS: float = 0.6
+    # How far *below* the release height to close, when re-gripping in place. A peg let go of at
+    # the height the fingers were holding it at can only go one way: down. Measured 2026-09-11 --
+    # a trial that seated cleanly, released, and then re-gripped at the same z came up empty, and
+    # the re-grips in the one table that did finish needed 1, 2 and 3 attempts at random, which
+    # is what "sometimes it fell further than the fingers are deep" looks like. 0 keeps the old
+    # behaviour. Clamped at `minZ` so this can never drive the fingers into the fixture.
+    regripDropM: float = 0.0
     gripperTolerance: float = 0.08
     controlPeriodS: float = 1.0 / 30.0
     requestId: str = ""
@@ -319,6 +348,8 @@ def validate_terminal_servo_trajectory(
         raise TerminalServoError("timeoutS, toleranceM and controlPeriodS must be positive.")
     if request.stepToleranceM is not None and request.stepToleranceM <= 0.0:
         raise TerminalServoError("stepToleranceM must be positive when given.")
+    if request.regripDropM < 0.0:
+        raise TerminalServoError("regripDropM cannot be negative: a released peg falls, it does not rise.")
     if request.maxSpeedMs <= 0.0 or request.maxSpeedMs > TERMINAL_SERVO_MAX_SPEED_MS:
         raise TerminalServoError(
             f"maxSpeedMs must be in (0, {TERMINAL_SERVO_MAX_SPEED_MS}]: this motion drives a "
@@ -642,9 +673,24 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
         # its first try, and never a lateral move made at fixture height.
         release_xyz = (landing[0], landing[1], stopped_at[2])
         seated = descent["searchStoppedOn"] == "seated"
+        released = seated or not request.releaseOnlyWhenSeated
         retreat_gripper = request.openGripper
-        _send_absolute(robot, release_xyz, rotvec, request.openGripper)
-        precise_sleep(request.openSettleS)
+        if released:
+            _send_absolute(robot, release_xyz, rotvec, request.openGripper)
+            precise_sleep(request.openSettleS)
+        else:
+            # Still holding it. The trial is over either way -- what the peg does next is not a
+            # measurement, it is the next trial's starting condition.
+            retreat_gripper = gripper
+        if released and request.regripGripper is not None:
+            regrip_xyz = (
+                release_xyz[0],
+                release_xyz[1],
+                max(release_xyz[2] - request.regripDropM, request.minZ),
+            )
+            _run_step(robot, request, "regrip_after_release", regrip_xyz, rotvec,
+                      float(request.regripGripper), tolerance_m=request.stepToleranceM)
+            retreat_gripper = float(request.regripGripper)
         _run_step(
             robot,
             request,
@@ -663,6 +709,8 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
             "lateralErrorMm": 1000.0
             * math.hypot(stopped_at[0] - request.xyz[0], stopped_at[1] - request.xyz[1]),
             "seatedDepthErrorMm": 1000.0 * (stopped_at[2] - request.xyz[2]),
+            "regripped": released and request.regripGripper is not None,
+            "released": released,
             **descent,
         }
         print(
