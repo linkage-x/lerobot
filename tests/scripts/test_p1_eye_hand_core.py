@@ -12,6 +12,7 @@ from tools.thor.p1_eye_hand_core import (
     assess_solution,
     invert_transform,
     select_diverse_pose_records,
+    solve_base_with_fixed_tcp_tags,
     solve_eye_hand,
     transform_error,
 )
@@ -58,6 +59,37 @@ def test_joint_solver_recovers_moved_base_and_both_tcp_tags() -> None:
         trans, rot = transform_error(solution["T_tcp_tags"][tag_id], expected_tags[tag_id])
         assert np.linalg.norm(trans) < 1e-7
         assert np.linalg.norm(rot) < 1e-7
+    assert assess_solution(solution)[0]
+
+
+def test_fixed_tcp_solver_recovers_only_moved_base() -> None:
+    rng = np.random.default_rng(19)
+    expected_base = _pose([-0.04, 0.02, 0.06], [0.08, -0.035, 0.018])
+    fixed_tags = {
+        56: _pose([0.2, 0.1, -0.15], [0.03, 0.01, 0.08]),
+        57: _pose([-0.1, 0.3, 0.12], [-0.025, 0.02, 0.075]),
+    }
+    observations = []
+    for index in range(18):
+        tcp = _pose(rng.normal(0, 0.45, 3), [0.45, 0.0, 0.4] + rng.normal(0, 0.08, 3))
+        for tag_id in fixed_tags:
+            observations.append(
+                EyeHandObservation(
+                    index,
+                    f"cam_{6 + index % 4:02d}",
+                    tag_id,
+                    tcp,
+                    expected_base @ tcp @ fixed_tags[tag_id],
+                )
+            )
+
+    solution = solve_base_with_fixed_tcp_tags(observations, fixed_tags, workers=3)
+
+    trans, rot = transform_error(solution["T_world_base"], expected_base)
+    assert np.linalg.norm(trans) < 1e-7
+    assert np.linalg.norm(rot) < 1e-7
+    assert solution["fixed_tcp_tags"] is True
+    assert solution["candidate_workers"] == 3
     assert assess_solution(solution)[0]
 
 

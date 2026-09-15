@@ -12,6 +12,7 @@ Notation: ``T_a_b`` maps coordinates expressed in frame ``b`` into frame
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -152,6 +153,111 @@ def solve_eye_hand(
         "observations_per_tag": {str(tag_id): sum(obs.tag_id == tag_id for obs in observations) for tag_id in tag_ids},
         "robot_poses_per_tag": {
             str(tag_id): len({obs.pose_index for obs in observations if obs.tag_id == tag_id}) for tag_id in tag_ids
+        },
+        "translation_residual_mm": {
+            "rms": float(np.sqrt(np.mean(np.square(trans_mm)))),
+            "median": float(np.median(trans_mm)),
+            "p95": float(np.percentile(trans_mm, 95)),
+            "max": float(np.max(trans_mm)),
+        },
+        "rotation_residual_deg": {
+            "rms": float(np.sqrt(np.mean(np.square(rot_deg)))),
+            "median": float(np.median(rot_deg)),
+            "p95": float(np.percentile(rot_deg, 95)),
+            "max": float(np.max(rot_deg)),
+        },
+        "optimizer": {
+            "success": bool(fit.success),
+            "message": str(fit.message),
+            "cost": float(fit.cost),
+            "nfev": int(fit.nfev),
+        },
+    }
+
+
+def solve_base_with_fixed_tcp_tags(
+    observations: Sequence[EyeHandObservation],
+    T_tcp_tags: Mapping[int, np.ndarray],
+    *,
+    translation_scale_m: float = 0.002,
+    rotation_scale_deg: float = 0.2,
+    max_nfev: int = 800,
+    workers: int = 4,
+) -> dict:
+    """Estimate only ``T_world_base`` with previously calibrated rigid tags.
+
+    Each observation supplies an independent base-pose candidate.  Candidate
+    construction is parallelized because production runs contain detections
+    from several cameras per teaching pose.  One robust six-DoF fit then
+    combines them without re-estimating the rigid ``T_tcp_tag`` transforms.
+    """
+    observations = list(observations)
+    tags = {
+        int(tag_id): np.asarray(T, dtype=np.float64).reshape(4, 4)
+        for tag_id, T in T_tcp_tags.items()
+    }
+    usable = [obs for obs in observations if obs.tag_id in tags]
+    if len(usable) < 6:
+        raise ValueError("At least 6 observations matching fixed TCP tags are required")
+    pose_count = len({obs.pose_index for obs in usable})
+    if pose_count < 3:
+        raise ValueError("At least 3 distinct robot poses are required")
+
+    def candidate(obs: EyeHandObservation) -> np.ndarray:
+        return (
+            obs.T_world_tag
+            @ invert_transform(tags[obs.tag_id])
+            @ invert_transform(obs.T_base_tcp)
+        )
+
+    worker_count = max(1, min(int(workers), len(usable)))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="base-candidate") as pool:
+        candidates = list(pool.map(candidate, usable))
+    translations = np.asarray([T[:3, 3] for T in candidates], dtype=np.float64)
+    rotations = Rotation.from_matrix(np.asarray([T[:3, :3] for T in candidates]))
+    initial = np.eye(4, dtype=np.float64)
+    initial[:3, :3] = rotations.mean().as_matrix()
+    initial[:3, 3] = np.median(translations, axis=0)
+    rot_scale = np.deg2rad(float(rotation_scale_deg))
+
+    def residual(x: np.ndarray, physical: bool = False) -> np.ndarray:
+        base = transform_from_vec6(x)
+        rows: list[np.ndarray] = []
+        for obs in usable:
+            predicted = base @ obs.T_base_tcp @ tags[obs.tag_id]
+            trans, rot = transform_error(predicted, obs.T_world_tag)
+            rows.append(
+                np.r_[trans, rot]
+                if physical
+                else np.r_[trans / translation_scale_m, rot / rot_scale]
+            )
+        return np.concatenate(rows)
+
+    fit = least_squares(
+        residual,
+        vec6_from_transform(initial),
+        loss="huber",
+        f_scale=1.0,
+        max_nfev=int(max_nfev),
+    )
+    T_world_base = transform_from_vec6(fit.x)
+    physical = residual(fit.x, physical=True).reshape(-1, 6)
+    trans_mm = np.linalg.norm(physical[:, :3], axis=1) * 1000.0
+    rot_deg = np.linalg.norm(physical[:, 3:], axis=1) * 180.0 / np.pi
+    tag_ids = sorted(tags)
+    return {
+        "T_world_base": T_world_base,
+        "T_tcp_tags": tags,
+        "fixed_tcp_tags": True,
+        "candidate_workers": worker_count,
+        "num_observations": len(usable),
+        "num_robot_poses": pose_count,
+        "num_cameras": len({obs.camera for obs in usable}),
+        "observations_per_tag": {
+            str(tag_id): sum(obs.tag_id == tag_id for obs in usable) for tag_id in tag_ids
+        },
+        "robot_poses_per_tag": {
+            str(tag_id): len({obs.pose_index for obs in usable if obs.tag_id == tag_id}) for tag_id in tag_ids
         },
         "translation_residual_mm": {
             "rms": float(np.sqrt(np.mean(np.square(trans_mm)))),
