@@ -2940,6 +2940,78 @@ def _intrinsics_coverage_payload(state: GatewayState) -> dict[str, Any]:
     return payload
 
 
+TRACKER_ALIGNMENT_ROOT = "outputs/laser_tracker"
+"""Where ``metrology.cli.validate_against_tracker`` drops its artifacts, one per
+landed session directory."""
+
+
+def _tracker_alignment_payload(state: GatewayState, dataset_root: Path, episode: int) -> dict[str, Any]:
+    """The laser-tracker comparison for one episode, or an honest absence.
+
+    The gateway reads a file and does not compute: the comparison needs a
+    registration, a lever arm and two clock fits, all of which have to be
+    auditable and none of which belong behind an HTTP request that a page refresh
+    would silently re-run with different inputs.  So the expensive step is the
+    offline CLI, and this is a lookup.
+
+    "No artifact" is a first-class answer rather than an error.  Most episodes
+    will never have one -- the tracker is a shared instrument and covers a
+    fraction of what gets recorded -- and a UI that shows a red failure for the
+    normal case teaches people to ignore it.
+    """
+    root = state.repo_root / TRACKER_ALIGNMENT_ROOT
+    if not root.is_dir():
+        return {"ok": True, "available": False, "reason": f"{TRACKER_ALIGNMENT_ROOT} does not exist"}
+
+    wanted = str(Path(dataset_root).resolve())
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for path in sorted(root.glob(f"*/alignment_ep{int(episode)}.json")):
+        payload = _read_json_file(path)
+        if not payload:
+            continue
+        # Match on the dataset the artifact says it came from, never on the file
+        # name. A session directory can hold artifacts for several datasets, and
+        # pairing by position is the mistake that put a whole run's episodes one
+        # directory out of step once already.
+        try:
+            same = Path(str(payload.get("dataset"))).resolve() == Path(wanted)
+        except OSError:
+            same = False
+        if same:
+            candidates.append((path.stat().st_mtime, path, payload))
+
+    if not candidates:
+        return {
+            "ok": True,
+            "available": False,
+            "reason": f"no alignment artifact for episode {episode} of {Path(dataset_root).name}",
+        }
+
+    mtime, path, payload = max(candidates, key=lambda item: item[0])
+    summary = payload.get("summary") or {}
+    registration = summary.get("registration") or {}
+    return {
+        "ok": True,
+        "available": True,
+        "artifact": str(path),
+        "generatedUtc": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        "episode": int(payload.get("episode") or episode),
+        "target": str(payload.get("target") or ""),
+        "session": payload.get("session") or {},
+        "summary": summary,
+        # Surfaced at the top level because they decide how the panel is read,
+        # and a UI that has to reach three levels down for "is this a
+        # measurement or a picture" will eventually stop reaching.
+        "certifiesSpace": bool(summary.get("certifies_space")),
+        "registrationSource": str(registration.get("source") or "unknown"),
+        "coverage": float(summary.get("coverage") or 0.0),
+        "series": payload.get("series") or {},
+        "dropoutsRelS": payload.get("dropouts_rel_s") or [],
+        "leverArmM": payload.get("lever_arm_m") or [0.0, 0.0, 0.0],
+        "minCoverage": float(payload.get("min_coverage") or 0.0),
+    }
+
+
 def _world_frame_payload(state: GatewayState) -> dict[str, Any]:
     """Everything the calibration page needs to describe the world's state."""
     root = _world_root(state)
@@ -13365,6 +13437,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             view_id = query.get("view", [""])[0]
             _serve_teleop_camera_snapshot(self, state=self.server.state, view_id=view_id)
+            return
+        if path == "/api/tracker/alignment":
+            dataset_raw = query.get("dataset", [""])[0]
+            try:
+                episode = int(query.get("episode", ["0"])[0])
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "episode must be an integer"})
+                return
+            dataset_root = _resolve_dataset_root(self.server.state.repo_root, dataset_raw)
+            if dataset_root is None:
+                _json_response(self, HTTPStatus.OK, {"ok": True, "available": False, "reason": "no dataset selected"})
+                return
+            _json_response(self, HTTPStatus.OK, _tracker_alignment_payload(self.server.state, dataset_root, episode))
             return
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))

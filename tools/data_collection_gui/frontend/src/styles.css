@@ -4221,3 +4221,106 @@ button.danger {
   flex-direction: column;
   gap: 6px;
 }
+
+/* ---- laser tracker ground truth ------------------------------------------
+   The panel is demoted visually when the comparison does not certify, because
+   the difference between a measurement and a picture has to survive being
+   skim-read.  Colour alone would not: the verdict line states it in words and
+   the border carries it for anyone scanning the page. */
+.tracker-panel-demoted {
+  border-left: 3px solid #f59e0b;
+}
+
+.tracker-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.tracker-verdict.ok strong {
+  color: #15803d;
+}
+
+.tracker-verdict.warn strong {
+  color: #b45309;
+}
+
+.tracker-verdict span {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.tracker-warning {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.12);
+  margin: 0 0 10px;
+}
+
+.tracker-absent {
+  font-size: 13px;
+  opacity: 0.8;
+  margin: 4px 0 0;
+}
+
+.tracker-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.tracker-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tracker-stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.tracker-stat-value {
+  font-variant-numeric: tabular-nums;
+  font-size: 16px;
+}
+
+.tracker-stat-hint {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.tracker-strata {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tracker-strata th,
+.tracker-strata td {
+  text-align: right;
+  padding: 3px 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.tracker-strata th:first-child,
+.tracker-strata td:first-child {
+  text-align: left;
+}
+
+.tracker-footnote {
+  font-size: 11px;
+  opacity: 0.6;
+  margin: 10px 0 0;
+  word-break: break-all;
+}

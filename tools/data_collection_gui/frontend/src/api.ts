@@ -31,7 +31,8 @@ import type {
   MujocoPreview,
   RealSensePreviewStatus,
   TrajectoryPoint,
-  TeleopStatus
+  TeleopStatus,
+  TrackerAlignment
 } from "./types";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -990,6 +991,30 @@ export class DataCollectionGuiApi {
         return null;
       }
       return (await response.json()) as IntrinsicsCoverageResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The laser-tracker comparison for one episode, or `available: false`.
+   *
+   * Absence is the normal case -- the tracker is a shared instrument that covers
+   * a small fraction of what gets recorded -- so this resolves rather than
+   * throws when there is no artifact, and only returns null when the gateway
+   * itself could not be reached.
+   */
+  async fetchTrackerAlignment(datasetRoot: string, episode: number): Promise<TrackerAlignment | null> {
+    if (!datasetRoot) return null;
+    const query = new URLSearchParams({ dataset: datasetRoot, episode: String(episode) });
+    try {
+      const response = await fetch(`${this.apiBase}/api/tracker/alignment?${query.toString()}`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as TrackerAlignment;
     } catch {
       return null;
     }
