@@ -1130,7 +1130,24 @@ export type TrackerAlignmentSummary = {
   residual_mm: Record<string, number | null>;
   strata: Record<string, Record<string, number | null>>;
   clock: Record<string, number>;
-  registration: { source: string; certifies_space: boolean; rms_mm: number | null; scale_diagnostic: number | null };
+  registration: {
+    source: string;
+    certifies_space: boolean;
+    rms_mm: number | null;
+    scale_diagnostic: number | null;
+    /**
+     * Error modes the registration -- and the lever arm fitted beside it --
+     * removed before the residual was computed, so the residual is silent about
+     * them however small it is.
+     *
+     * Independence and absorption are different questions. `certifies_space`
+     * says the transform came from data other than this trajectory; this says
+     * which constant biases that independent fit still soaked up. A lever arm
+     * fitted from parked poses is independent *and* absorbs both body-frame
+     * constants, which together are the marker-to-TCP constant.
+     */
+    absorbed_modes?: string[];
+  };
   lever_arm_mm: number;
   /**
    * Millimetres of residual one degree of orientation error would produce.
@@ -1163,4 +1180,16 @@ export type TrackerAlignment =
       dropoutsRelS: Array<[number, number]>;
       leverArmM: [number, number, number];
       minCoverage: number;
+      /** Provenance of the fitted lever arm, when one was used. */
+      mountFit: {
+        artifact?: string | null;
+        mount_id?: string | null;
+        session_id?: string | null;
+        station_artifact?: string | null;
+        n_poses?: number | null;
+        holdout_rms_mm?: number | null;
+        per_pose_c_spread_mm?: number | null;
+        sigma?: { c_sigma_norm_mm?: number | null } | null;
+        observability?: { fixed_attitude?: boolean; rotation_span_deg?: number } | null;
+      } | null;
     };

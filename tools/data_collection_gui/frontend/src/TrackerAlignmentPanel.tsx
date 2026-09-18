@@ -4,19 +4,37 @@ import type { TrackerAlignment, TrackerAlignmentSummary } from "./types";
 /**
  * The laser-tracker comparison for the selected episode.
  *
- * The panel is built around one distinction, because everything else is
- * downstream of it: a residual computed against an *independent* registration is
- * a measurement, and a residual computed against a transform fitted on this very
- * trajectory is a picture. The second is useful -- you cannot see two point
- * clouds in one frame without it -- and it is worth nothing as an accuracy
- * claim, since the fit absorbs exactly the error being asked about. So the
- * verdict line is the first thing rendered and the numbers are visibly demoted
- * when it is not a measurement, rather than the caveat living in a tooltip.
+ * The panel is built around two questions, and they are not the same one:
+ *
+ * 1. **Is it independent?** A residual computed against a transform fitted on
+ *    this very trajectory is a picture, not a measurement -- the fit absorbs
+ *    exactly the error being asked about. That is `registration.source`.
+ * 2. **What did the independent fit still absorb?** Since the single-nest
+ *    interface the lever arm `c` is fitted from parked poses too, and a fit
+ *    soaks up every constant it can reach: a constant offset and a constant
+ *    rotation in the rig frame, which together *are* the marker-to-TCP
+ *    constant. The residual is then a real measurement of something narrower
+ *    than "TCP error", and calling it TCP error is the mistake this panel
+ *    exists to make impossible. That is `registration.absorbed_modes`.
+ *
+ * So the verdict line names the narrowest true statement rather than the
+ * flattering one, the absorbed modes are spelled out in prose underneath, and
+ * the numbers are visibly demoted when the verdict is not a measurement.
  *
  * Absence is rendered as a calm note, not an error. The tracker is a shared
  * instrument and most episodes will never have an artifact; a red banner on the
  * normal case trains people to ignore the panel.
  */
+
+/** Plain-language gloss for each absorbed mode, keyed by the solver's vocabulary. */
+const ABSORBED_MODE_TEXT: Record<string, string> = {
+  body_frame_constant_translation: "a constant offset in the rig frame",
+  body_frame_constant_rotation: "a constant rotation of the rig frame",
+  world_frame_constant_translation: "a constant offset in the world frame",
+  world_frame_constant_rotation: "a constant rotation of the world frame",
+  all_rotation_error_at_fixed_attitude:
+    "every orientation error, because attitude was held fixed for this session"
+};
 
 function fmt(value: number | null | undefined, digits = 3, unit = ""): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
@@ -100,16 +118,28 @@ export function TrackerAlignmentPanel({ alignment }: { alignment: TrackerAlignme
   }
 
   const { summary, series } = alignment;
-  const independent = summary.registration.source === "parked_poses" && summary.registration.certifies_space;
+  const absorbed = summary.registration.absorbed_modes ?? [];
+  const shapeOnly = summary.registration.source !== "parked_poses";
+  const fixedAttitude = absorbed.includes("all_rotation_error_at_fixed_attitude");
+  const absorbsRigConstants = absorbed.includes("body_frame_constant_rotation");
   const covered = alignment.coverage >= alignment.minCoverage;
-  const verdict = summary.certifies_space
-    ? "measurement"
-    : independent
+  const mount = alignment.mountFit;
+
+  // Ordered most-limiting first, so the verdict is always the narrowest true
+  // statement: no independence beats no coverage beats a fitted lever arm.
+  const verdict = shapeOnly
+    ? "picture only — transform fitted on this trajectory"
+    : !covered
       ? "independent registration, insufficient coverage"
-      : "picture only — transform fitted on this trajectory";
+      : fixedAttitude
+        ? "position measurement — attitude was held, so rotation error is invisible"
+        : absorbsRigConstants
+          ? "measurement at the SMR point — not TCP error"
+          : "measurement";
+  const verdictTone = shapeOnly || !covered ? "warn" : "ok";
 
   return (
-    <section className={`panel tracker-panel ${summary.certifies_space ? "" : "tracker-panel-demoted"}`}>
+    <section className={`panel tracker-panel ${verdictTone === "ok" ? "" : "tracker-panel-demoted"}`}>
       <div className="panel-heading">
         <h2>Laser tracker GT</h2>
         <span>
@@ -117,7 +147,7 @@ export function TrackerAlignmentPanel({ alignment }: { alignment: TrackerAlignme
         </span>
       </div>
 
-      <div className={`tracker-verdict ${summary.certifies_space ? "ok" : "warn"}`}>
+      <div className={`tracker-verdict ${verdictTone}`}>
         <strong>{verdict}</strong>
         <span>
           registration: {summary.registration.source.replace(/_/g, " ")}
@@ -125,11 +155,27 @@ export function TrackerAlignmentPanel({ alignment }: { alignment: TrackerAlignme
         </span>
       </div>
 
-      {!independent ? (
+      {shapeOnly ? (
         <p className="tracker-warning">
           The transform between tracker and camera frames was fitted on this trajectory, so it has
           already absorbed any constant offset and rotation the pipeline carries. The shapes can be
           compared; the absolute error cannot. Register from parked poses to get a number.
+        </p>
+      ) : null}
+
+      {!shapeOnly && absorbed.length ? (
+        <p className="tracker-warning">
+          Fitted away before this residual was computed, so it is silent about them however small
+          it is:{" "}
+          {absorbed.map((m) => ABSORBED_MODE_TEXT[m] ?? m.replace(/_/g, " ")).join("; ")}.
+          {absorbsRigConstants ? (
+            <>
+              {" "}
+              The first two together <em>are</em> the marker&nbsp;→&nbsp;TCP constant, so this
+              number is the error of the SMR centre and may not be reported as TCP error. Measuring
+              that constant needs three non-collinear nests, or an STS.
+            </>
+          ) : null}
         </p>
       ) : null}
 
@@ -176,6 +222,24 @@ export function TrackerAlignmentPanel({ alignment }: { alignment: TrackerAlignme
           value={fmt(summary.interp_error_mm_bound, 4, " mm")}
           hint="resampling the 1 kHz stream onto frame times"
         />
+        {mount ? (
+          <StatRow
+            label="lever arm σ"
+            value={fmt(mount.sigma?.c_sigma_norm_mm ?? null, 3, " mm")}
+            hint={`bootstrap over ${mount.n_poses ?? "?"} parked poses${
+              mount.holdout_rms_mm !== null && mount.holdout_rms_mm !== undefined
+                ? ` · holdout ${fmt(mount.holdout_rms_mm, 3)} mm`
+                : ""
+            }`}
+          />
+        ) : null}
+        {mount ? (
+          <StatRow
+            label="per-pose c spread"
+            value={fmt(mount.per_pose_c_spread_mm ?? null, 3, " mm")}
+            hint="structure here is attitude-dependent rig-pose error, not mount flex"
+          />
+        ) : null}
       </div>
 
       <StrataTable summary={summary} />
@@ -185,6 +249,12 @@ export function TrackerAlignmentPanel({ alignment }: { alignment: TrackerAlignme
         {alignment.dropoutsRelS.length
           ? ` · ${alignment.dropoutsRelS.length} loss-of-lock window(s) excluded`
           : " · no loss of lock"}
+        {mount?.mount_id ? (
+          <>
+            {" · mount "}
+            <code>{mount.mount_id}</code>
+          </>
+        ) : null}
         {" · "}
         <code>{alignment.artifact}</code>
       </p>

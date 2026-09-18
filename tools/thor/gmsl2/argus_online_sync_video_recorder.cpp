@@ -67,6 +67,7 @@ struct Options {
     uint32_t frames = 120;  // 0 = signal controlled
     uint32_t sensor_mode = 0;
     uint32_t fps = 60;
+    uint32_t exposure_us = 0;  // 0 = leave Argus auto-exposure alone
     uint32_t bitrate = 40000000;
     uint32_t iframe_interval = 60;
     uint32_t preset_level = 1;
@@ -117,6 +118,10 @@ struct FrameMetadata {
     uint64_t sof_tsc_ns = 0;
     uint64_t eof_tsc_ns = 0;
     uint64_t internal_frame_count = 0;
+    // See the note in argus_frame_metadata_capture.cpp: SOF is not mid-exposure,
+    // and under auto-exposure the gap between them moves with the scene.
+    uint64_t sensor_exposure_time_ns = 0;
+    float sensor_analog_gain = 0.0f;
 };
 
 static constexpr uint32_t kArgusBuffers = 12;
@@ -292,6 +297,10 @@ bool parse_args(int argc, char** argv, Options* options) {
             const char* value = require_value("--fps");
             if (!value) return false;
             options->fps = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+        } else if (arg == "--exposure-us") {
+            const char* value = require_value("--exposure-us");
+            if (!value) return false;
+            options->exposure_us = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
         } else if (arg == "--bitrate") {
             const char* value = require_value("--bitrate");
             if (!value) return false;
@@ -1137,7 +1146,64 @@ bool open_episode_outputs(
         return false;
     }
     cam->csv << "camera,logical_frame_index,local_frame_number,sensor_timestamp_ns,"
-             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count\n";
+             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count,"
+             << "sensor_exposure_time_ns,sensor_analog_gain\n";
+    return true;
+}
+
+// Pin the exposure instead of letting Argus hunt for it.
+//
+// Two reasons, and the second is the one that motivated this.  (1) A varying
+// exposure varies the motion blur, so detection accuracy changes frame to
+// frame.  (2) The frame label is start-of-frame, but the scene was sampled
+// around mid-exposure, so the label carries an offset of roughly exposure/2 --
+// and under auto-exposure that offset *moves with scene brightness*, which
+// moves with pose.  It is a pose-correlated timing bias, so it does not average
+// out and no clock work can find it.  At 680 mm/s an exposure swinging between
+// 4 ms and 12 ms is about 2.7 mm of wander in the position label alone.
+//
+// In external-trigger (slave) mode the sensor also has to finish integrating
+// and read out inside one trigger period, so the request is clamped to a
+// fraction of the frame period rather than trusted -- the same rule
+// ``gmsl2_record._clamp_exposure_for_pwm_period`` applies on the GStreamer
+// path, repeated here because this binary does not go through it.
+bool apply_exposure_lock(
+    IRequest* i_request,
+    ISourceSettings* i_source_settings,
+    uint32_t exposure_us,
+    uint32_t fps,
+    const std::string& cam_name
+) {
+    if (exposure_us == 0) {
+        return true;  // 0 means "leave Argus in auto", which stays the default.
+    }
+    const uint64_t period_ns = fps > 0 ? (1000000000ULL / fps) : 0ULL;
+    uint64_t exposure_ns = static_cast<uint64_t>(exposure_us) * 1000ULL;
+    if (period_ns > 0) {
+        const uint64_t cap_ns = static_cast<uint64_t>(0.85 * static_cast<double>(period_ns));
+        if (exposure_ns > cap_ns) {
+            std::cerr << cam_name << ": exposure " << exposure_us << " us exceeds 85% of the "
+                      << (period_ns / 1000ULL) << " us frame period; clamping to "
+                      << (cap_ns / 1000ULL) << " us so the sensor cannot miss a trigger"
+                      << std::endl;
+            exposure_ns = cap_ns;
+        }
+    }
+    if (i_source_settings->setExposureTimeRange(Range<uint64_t>(exposure_ns, exposure_ns))
+            != STATUS_OK) {
+        std::cerr << cam_name << ": setExposureTimeRange failed" << std::endl;
+        return false;
+    }
+    // Belt and braces: an equal-ended range already pins it, but an explicit AE
+    // lock keeps auto-control from re-entering if a later request forgets the
+    // range.  Missing interface is not fatal -- the range is what does the work.
+    IAutoControlSettings* i_auto = interface_cast<IAutoControlSettings>(
+        i_request->getAutoControlSettings());
+    if (i_auto && i_auto->setAeLock(true) != STATUS_OK) {
+        std::cerr << cam_name << ": setAeLock failed (exposure range still pinned)" << std::endl;
+    }
+    std::cerr << cam_name << ": exposure locked at " << (exposure_ns / 1000ULL) << " us"
+              << std::endl;
     return true;
 }
 
@@ -1188,6 +1254,10 @@ bool init_camera(ICameraProvider* provider, UniqueObj<CameraProvider>& provider_
     }
     i_source_settings->setSensorMode(cam->sensor_mode);
     i_source_settings->setFrameDurationRange(1000000000ULL / options.fps);
+    if (!apply_exposure_lock(i_request, i_source_settings, options.exposure_us,
+                             options.fps, cam->name)) {
+        return false;
+    }
     return true;
 }
 
@@ -1216,6 +1286,8 @@ bool extract_metadata(DmaBuffer* dma, FrameMetadata* out) {
     out->sof_tsc_ns = i_tsc ? i_tsc->getSensorSofTimestampTsc() : 0;
     out->eof_tsc_ns = i_tsc ? i_tsc->getSensorEofTimestampTsc() : 0;
     out->internal_frame_count = i_internal ? i_internal->getInternalFrameCount() : 0;
+    out->sensor_exposure_time_ns = i_meta ? i_meta->getSensorExposureTime() : 0;
+    out->sensor_analog_gain = i_meta ? i_meta->getSensorAnalogGain() : 0.0f;
     return out->sof_tsc_ns > 0;
 }
 
@@ -1682,7 +1754,9 @@ bool push_cluster(
                          << bundle->meta.sensor_timestamp_ns << ","
                          << bundle->meta.sof_tsc_ns << ","
                          << bundle->meta.eof_tsc_ns << ","
-                         << bundle->meta.internal_frame_count << "\n";
+                         << bundle->meta.internal_frame_count << ","
+                         << bundle->meta.sensor_exposure_time_ns << ","
+                         << bundle->meta.sensor_analog_gain << "\n";
     }
     return true;
 }

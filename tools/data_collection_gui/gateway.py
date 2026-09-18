@@ -3009,6 +3009,11 @@ def _tracker_alignment_payload(state: GatewayState, dataset_root: Path, episode:
         "dropoutsRelS": payload.get("dropouts_rel_s") or [],
         "leverArmM": payload.get("lever_arm_m") or [0.0, 0.0, 0.0],
         "minCoverage": float(payload.get("min_coverage") or 0.0),
+        # Provenance of a fitted lever arm.  Surfaced at the top level rather
+        # than left inside ``summary`` because the panel has to decide its
+        # verdict wording from it, and a field the UI must not miss should not
+        # be three levels down.
+        "mountFit": payload.get("mount_fit"),
     }
 
 

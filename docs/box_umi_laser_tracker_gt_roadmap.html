@@ -164,7 +164,7 @@
     <span class="pill">GT 链自身预算：未测</span>
     <span class="pill">首个受检构型：现有夹爪（cube）</span>
     <span class="pill">靶标接法 2026-09-17 改版：SMR 常驻本体</span>
-    <span class="pill">0.5″ SMR · 球心↔TCP 60 mm · 站位固定 1.5 m</span>
+    <span class="pill">1.5″ SMR · 球心↔TCP 60 mm · 站位固定 1.5 m</span>
     <span class="pill">本页 v1.3</span>
   </div>
   <div class="readouts">
@@ -451,38 +451,86 @@
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>参数</th><th>值</th><th>它决定什么</th></tr>
-    <tr><td class="key">SMR</td><td class="num">300400 40M-Prec<br/>d = 12.5 mm（0.5″ 级）</td><td><b>质量 ≈ 8–9 g</b>，比 1.5″ 轻一到两个数量级 —— 手持动力学与磁吸防脱这两条风险直接降级（见下面失效模式 2 / 3 / 6，分配值已相应下调）。<b>待查数据表两项：接收角与球心偏差（centering error）。</b>Prec 级的球心偏差是 µm 量级，对 3 mm 预算无关紧要；<b>接收角是决定成败的那个数</b>，见下一行。</td></tr>
-    <tr class="lead"><td class="key">站位</td><td class="num">固定，r ≈ 1.5 m</td><td><b>跟踪动态不是问题</b>：ω = v/r，680 mm/s 下只有 26°/s，1.5 m/s 下 57°/s，远在仪器能力内。<b>问题在角度预算</b>：工作区半径 0.5 m 时，光束方向在工作区内自己就要摆 ±18.4°，接收角 ±30° 时<b>只剩 11.6° 留给夹爪姿态</b>。退到 3 m 剩 20.5°，4 m 剩 22.9°。<b>真实操作的腕部摆动远不止 11.6°，所以 1.5 m 下 coverage 会显著偏低</b>。另需确认工作区最近点不低于仪器最小测程。</td></tr>
+    <tr class="lead"><td class="key">SMR 口径</td><td class="num"><b>1.5″（38.1 mm）</b><br/><span class="small">2026-09-17 定；0.5″ 300400 40M-Prec 不配套采购</span></td><td><b>按覆盖率选，不按精度选</b>——理由见下面「靶球口径为什么不是精度问题」。1.5″ 在跟踪捕获窗口上有 3 倍余量（1.5 m 处 13.3 mm vs 4.4 mm 瞬时横向容差），在接收锥边缘的有效通光孔上更耐用，断光后重捕也更快，<b>而这三条全都直接计入 coverage</b>——本装置当前最紧、且是交付项的那一项。代价是质量（百克量级 vs 8–9 g），见失效模式 2 / 3 / 6。<span class="badge ok">2026-09-17 已确认 1.5″ 磁吸窝在库</span>，选型落地。</td></tr>
+    <tr><td class="key">装配形态</td><td class="num">同轴叠装<br/><span class="small">夹爪座 → 垫圈 → <b>3 mm 钢片</b> → 蓝色套筒 → 1.5″ 磁吸窝 → SMR</span></td><td><b>这不是我先前设想的「悬臂板」，力学要重新讲。</b>钢片是被整面夹在叠装里的圆片，不是横向伸出去的板；SMR 悬在整叠的末端。于是<b>弯矩的承担者是套筒和螺接界面，不是钢片</b>——钢片只在夹持圈与套筒承面之间的环带里弯一点。<b>结论变了：厚度不是主要设计变量，「悬伸长度」才是</b>，见机加表。</td></tr>
+    <tr class="lead"><td class="key">站位</td><td class="num">固定，r ≈ 1.5 m</td><td><b>跟踪动态不是问题</b>：ω = v/r，680 mm/s 下只有 26°/s，1.5 m/s 下 57°/s，远在仪器能力内。<b>问题在角度预算</b>：工作区半径 0.5 m 时，光束方向在工作区内自己就要摆 ±18.4°，接收角 ±30° 时<b>只剩 11.6° 留给夹爪姿态</b>。退到 3 m 剩 20.5°，4 m 剩 22.9°。<b>真实操作的腕部摆动远不止 11.6°，所以 1.5 m 下 coverage 会显著偏低</b>——这正是 <a href="#experiments">E3a</a>（姿态钉死、只验位置）先做的理由。</td></tr>
     <tr><td class="key">|c|（球心 ↔ cube 中心）</td><td class="num">≈ 160 mm</td><td>旋转灵敏度 = <b>2.79 mm/°</b>。姿态误差在残差里放大得足够明显，<b>时变的姿态误差观测得很好</b>。</td></tr>
-    <tr class="lead"><td class="key">|c − c<sub>TCP</sub>|（球心 ↔ TCP）</td><td class="num">60 mm</td><td><b>这个数是本次设计最好的一处。</b>把测到的球心误差搬到 TCP，代价是 |δθ| × 60 mm = <b>1.05 mm/°</b>：按现行 2° 声明是 2.09 mm，δθ 标到 0.5° 就只剩 0.52 mm。老方案 B 的 250 mm 力臂这一项要 9 mm 量级。</td></tr>
-    <tr><td class="key">固定方式</td><td class="num">挂夹爪侧的<b>静止本体</b><br/>仅验证场次装</td><td><span class="badge ok">2026-09-17 已确认在静止本体上，不在活动指上</span> ⇒ <b>c 与夹爪开口无关</b>，采集期间不必钉死开口，<b>这一轮可以做抓取动作</b>（老方案 A 的指间 insert 正是卡在这一条上）。挂夹爪侧 ⇒ cube ↔ 本体的装配间隙留在残差里可见。仅验证场次装 ⇒ 每次装拆都是新 <code>mount_id</code>、c 必须重拟合（本来就要），且「附加质量改了被测系统」这条限定要写进结论——不过 8–9 g 的球之下主导项是钢片本身，做薄即可。</td></tr>
+    <tr class="lead"><td class="key">|c − c<sub>TCP</sub>|（球心 ↔ TCP）</td><td class="num">60 mm<br/><span class="small">按 0.5″ 报的，换 1.5″ 后偏大</span></td><td><b>这个数是本次设计最好的一处。</b>把测到的球心误差搬到 TCP，代价是 |δθ| × 60 mm = <b>1.05 mm/°</b>：按现行 2° 声明是 2.09 mm，δθ 标到 0.5° 就只剩 0.52 mm。老方案 B 的 250 mm 力臂这一项要 9 mm 量级。<b>注意这两个力臂是按 0.5″ 球报的</b>：1.5″ 的球心离板面更远，两个数都会长一两厘米。<b>但不必重新推导任何东西</b>——c 是拟合量不是假设量，第一次驻点集就给出实测值；变的只是灵敏度与转移项的数值。</td></tr>
+    <tr><td class="key">固定方式</td><td class="num">挂夹爪侧的<b>静止本体</b><br/>仅验证场次装</td><td><span class="badge ok">2026-09-17 已确认在静止本体上，不在活动指上</span> ⇒ <b>c 与夹爪开口无关</b>，采集期间不必钉死开口，<b>这一轮可以做抓取动作</b>（老方案 A 的指间 insert 正是卡在这一条上）。挂夹爪侧 ⇒ cube ↔ 本体的装配间隙留在残差里可见。仅验证场次装 ⇒ 每次装拆都是新 <code>mount_id</code>、c 必须重拟合（本来就要）。<b>遮挡不是约束</b>：<span class="badge ok">2026-09-17 现场确认</span> cube 的 front 面<b>本来就被相机支架挡着</b>，球再挡一次不增加损失；干涉同样已确认不存在。</td></tr>
+    <tr><td class="key">cube front 面</td><td class="num">已被相机支架遮挡</td><td><b>既有事实，与靶球无关，但值得单独记一条。</b>它意味着 cube 的可用面比标称少一个，<b>是「姿态相关误差」的一个现成候选解释</b>：某些姿态下能解位姿的相机组会因此变窄。E3b 的「窝法线 ↔ 视线夹角」分层和 <code>tracker_mount_fit</code> 的<b>逐位姿 c 散布</b>都会把它画出来——所以这条不必现在追，但结论里看到姿态相关项时要先想到它，别先怀疑标定。</td></tr>
     <tr><td class="key">测程</td><td class="num">最近工作点 0.8 m<br/>仪器最小测程 &lt; 0.2 m</td><td><span class="badge ok">2026-09-17 已核，无冲突</span>，余量 4 倍。<b>但近端是接收角预算的瓶颈，不是测程</b>：同样 0.3 m 的横向偏移，在 2.2 m 处只张 7.8°，在 0.8 m 处张 <b>20.6°</b>。见下面的角度预算。</td></tr>
   </table>
   </div>
   <div class="callout warn"><p><b>三个数不自洽，要核对。</b>|c| = 160 mm、|c − c<sub>TCP</sub>| = 60 mm 由三角不等式给出 cube 中心 ↔ TCP ∈ <b>[100, 220] mm</b>，而本页别处沿用的是 <b>247 / 259.5 mm</b>（「9.1 mm」那个数的出处）。可能是「cube 中心」与 URDF 里 rig 系原点不是同一点，也可能 259.5 mm 来自另一副构型。<b>结论不依赖于它的精确值</b>：代入区间两端，2° 声明仍给 3.5–7.7 mm，照样是预算里最大的一项。但这个数要在 T4a 装好后用跟踪仪直接量一次定下来——这正是本页记录 6.15 mm URDF 矛盾时用的同一个办法。</p></div>
+
+  <p class="sub-h">靶球口径为什么不是精度问题 <span class="badge ok">2026-09-17 定为 1.5″</span></p>
+  <p>选型讨论很容易滑进「哪个更准」，而口径能进入误差预算的路径就下面这几条，列全了看反而清楚：</p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>项</th><th>0.5″</th><th>1.5″</th><th>说明</th></tr>
+    <tr><td class="key">球心偏差（centering）</td><td class="num">~10 µm</td><td class="num">~5–13 µm</td><td><b>两者都被 c 吸收</b>，见下</td></tr>
+    <tr><td class="key">入射角相关的球心游走</td><td class="num">µm 级</td><td class="num">µm 级</td><td>这个<b>不</b>被吸收（随姿态变），但仍是 µm 级</td></tr>
+    <tr><td class="key">回光 SNR → 位置噪声</td><td class="num">1.5 m 处饱和</td><td class="num">同</td><td>短距离下链路余量极大，无差别</td></tr>
+    <tr><td class="key">钢片挠度</td><td class="num">0.05 mm</td><td class="num"><b>0.15 mm</b></td><td>1.5″ 差；板刚度 ∝ 厚度³，<b>厚度 ×2.7 就补回来</b>（板还没切）</td></tr>
+    <tr><td class="key">窝内微动</td><td class="num">0.05 mm</td><td class="num"><b>0.10 mm</b></td><td>1.5″ 差</td></tr>
+    <tr class="total"><td><b>GT 链合计</b></td><td class="num">0.75 mm</td><td class="num"><b>0.77 mm</b></td><td>门限 ≤ 1.0 mm。<b>差 0.02 mm，是被裁决的 3 mm 的 0.7%</b></td></tr>
+  </table>
+  </div>
+  <p>两条结构性事实让「精度」这个论点整个站不住：</p>
+  <ul>
+    <li><b>球心偏差被 c 吸收。</b>球磁吸在窝里、随机体一起转，所以「光学中心 ↔ 球心」这个偏差是一个<b>机体系常量</b>——正是拟合 c 时整个吸收掉的那一类，对残差的贡献恒为零。<b>推论顺带省钱：T4a 不必为 tooling 级比 precision 级多花钱。</b>球心偏差只在用跟踪仪去量<b>绝对</b>位置对 CAD 时才重要，那是 <a href="#target-interface">T4b</a> 的三窝间距自检和固定窝网络，不是这里。</li>
+    <li><b>边缘半遮挡不产生偏差，只产生丢锁。</b>角锥反射器无论光打在通光孔的哪个位置，回光都平行于入射、并且过顶点。所以光束偏到孔边缘时损失的是<b>信号</b>，不是位置——接收锥边缘的行为是「锁不锁得住」，不是「准不准」。</li>
+  </ul>
+  <p><b>所以口径按覆盖率选。</b>跟踪捕获窗口 = 通光半径 / 距离，在 1.5 m 处：</p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>SMR</th><th>通光孔（≈ 0.7 × 直径）</th><th>角度余量</th><th>瞬时横向容差</th><th>1 m/s 下的急动预算</th></tr>
+    <tr><td class="key">0.5″（12.5 mm）</td><td class="num">~8.9 mm</td><td class="num">0.17°</td><td class="num">4.4 mm</td><td class="num">4.4 ms</td></tr>
+    <tr class="lead"><td class="key">1.5″（38.1 mm）</td><td class="num">~26.7 mm</td><td class="num">0.51°</td><td class="num"><b>13.3 mm</b></td><td class="num"><b>13 ms</b></td></tr>
+  </table>
+  </div>
+  <p class="small">0.7 这个系数是估的，<b>比例 1 : 3 是稳的</b>。稳态下伺服绰绰有余——<b>杀死跟踪的是换向和急动，而手持操作正是由换向和急动组成的</b>。最近工作点 0.8 m 处 ω = v/r 更大（1.5 m/s → 107°/s），伺服要甩得最快，而小孔给的余量最少。再加上接收锥边缘有效通光孔的衰减、以及断光后 PowerLock 的重捕速度——<b>三条全部指向同一个方向，而且全部直接计入 coverage</b>。</p>
+  <div class="callout">
+    <p><b>曾经反对 1.5″ 的三条，2026-09-17 全部关闭：</b><b>①</b> 遮挡——cube 的 front 面<b>本来就被相机支架挡着</b>，球再挡一次不增加损失；<b>②</b> 干涉——现场确认球的包络不进抓取走廊；<b>③</b> 质量——见<a href="#smr-on-body">失效模式 6</a>，分层报告已经化解了大部分，剩下的用「生产时坐等重哑球」可以彻底抹平。</p>
+    <p><b>于是 0.5″ 的配套靶座不采购。</b>它对应的是一个几何风险的对冲，而那个风险已经不存在；它不是一个精度选项。<b>一个失效模式能终结实验，一个误差项只进预算</b>——0.02 mm 不该压过 3 倍的捕获窗口。</p>
+  </div>
 
   <p class="sub-h">几何：9 个未知量，和它们各自靠什么可观测</p>
   <p>比较的两边根本不是同一个量：跟踪仪测<b>一个点</b>（球心，3 自由度，跟踪仪系 G），相机测<b>一个完整位姿</b>（6 自由度，相机 world 系 W）。把它们放进同一句话需要两样东西：</p>
   <pre class="mono" style="background:var(--code);border-radius:8px;padding:12px 14px;overflow-x:auto;line-height:1.7"> p̂(t) = R<sub>W,rig</sub>(t) · c + t<sub>W,rig</sub>(t)      相机说球心在哪（c = 球心在 rig 系中的位置）
  p(t)  = R<sub>WG</sub> · p<sub>G</sub>(t) + t<sub>WG</sub>            跟踪仪说球心在哪（T<sub>WG</sub> = 注册）
  e(t)  = p̂(t) − p(t)</pre>
+  <p class="small">上表的四条「吸收」不是推测：<code>metrology/tests/test_tracker_mount_fit.py</code> 逐条注入单一偏差再拟合，断言残差为零、ĉ 按上式移动；尺度那一行断言残差<b>不</b>为零。任何一条翻转都说明某处报告在说它没资格说的话。</p>
   <p>未知量是 T<sub>WG</sub> 六个加 c 三个，共 <b>9 个</b>。一个静止位姿给 3 个方程，所以计数上 3 个位姿就够；但可观测性要的是<b>转轴</b>。两个位姿相减消掉 t<sub>WG</sub>：</p>
   <pre class="mono" style="background:var(--code);border-radius:8px;padding:12px 14px;overflow-x:auto;line-height:1.7"> (R<sub>i</sub> − R<sub>j</sub>) c = R<sub>WG</sub>(p<sub>i</sub> − p<sub>j</sub>) − (t<sub>i</sub> − t<sub>j</sub>)</pre>
   <p><b>纯平移的位姿对 R<sub>i</sub> = R<sub>j</sub>，左边恒为零，对 c 一个比特的信息都不给。</b>这与 AX = XB 的可观测性条件同源，所以驻点集必须绕 <b>≥ 2 根不平行轴</b>转——这条不是从旧方案抄过来的，是同一个数学重新推出来的。</p>
 
-  <p class="sub-h">c 能定到多准：接收角限制了转角，但没有限制到致命</p>
-  <p>绕轴 n 转 θ 时，(R<sub>i</sub> − R<sub>j</sub>)c 的模是 <b>2 sin(θ/2)·|c<sub>⊥</sub>|</b>，所以 σ<sub>c</sub> ≈ σ<sub>pose</sub> / (2 sin(θ/2) · √N)。SMR 接收角常见 ±30°，即 θ 最多到 <b>60°</b>，此时 2 sin(θ/2) = <b>1.0</b>——<b>刚好落在系数不惩罚的那一侧</b>（θ = 20° 时系数只有 0.35，要差 3 倍）。代入 N = 20 个位姿、每姿态静置 2 s 平均：σ<sub>pose</sub> 取 0812 实测的球心分散度 1.40 mm（未平均，保守口径）给 σ<sub>c</sub> ≈ 0.31 mm；取平均后的乐观口径 0.3 mm 给 ≈ 0.07 mm。<b>两端都远小于 3 mm，数值上这条路是通的。</b>真值由驻点集的 bootstrap 出，不靠这个估计——这里算它只是为了确认「接收角把转角卡死在 ±30°」不会把方案否掉。</p>
+  <p class="sub-h">c 能定到多准 <span class="badge warn">2026-09-17 订正：原估计乐观了 3–8 倍</span></p>
+  <p>绕轴 n 转 θ 时 (R<sub>i</sub> − R<sub>j</sub>)c 的模是 <b>2 sin(θ/2)·|c<sub>⊥</sub>|</b>，据此本页原先写「±30° 即 θ 到 60°，2 sin(θ/2) = 1.0，不惩罚」。<b>那是最好的一对位姿，不是拟合真正看到的东西。</b>每一对在自己的转轴方向上贡献为零，把全部位姿对堆起来之后，<b>最弱方向的增益只有 ≈ 0.31</b>（±20° 时 0.21），也就是<b>三倍放大</b>而不是一倍。实测（<code>test_freezing_the_station_is_worth_about_a_factor_of_four</code> 等）：</p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>σ<sub>pose</sub>（驻点上相机位姿散布）</th><th>联合解 (T<sub>WG</sub>, c)</th><th>冻结 T<sub>WG</sub>、只解 c</th></tr>
+    <tr><td class="num">0.3 mm</td><td class="num">0.54 mm</td><td class="num"><b>0.12 mm</b></td></tr>
+    <tr><td class="num">1.0 mm</td><td class="num">1.81 mm</td><td class="num"><b>0.41 mm</b></td></tr>
+    <tr><td class="num">1.4 mm（0812 实测，未平均）</td><td class="num">2.54 mm</td><td class="num"><b>0.57 mm</b></td></tr>
+  </table>
+  </div>
+  <p class="small">N = 20、±30° 锥内。<b>比值稳定在 4.4 倍</b>，与 σ<sub>pose</sub> 无关。</p>
+  <div class="callout warn">
+    <p><b>结论变了一半：联合解在 ±30° 锥内达不到 T6 给 c 的 0.20 mm，冻结站位的解可以。</b>冻结后 c 是逐位姿直接平均，规律是 <b>σ<sub>c</sub> = √3 · σ<sub>pose</sub> / √N</b>（三个分量各自按 √N 收敛），于是 0.20 mm 在 N = 20 时要求 <b>σ<sub>pose</sub> ≤ 0.52 mm</b>——这是一条可以直接去测的门限，不是声明。联合解要满足同样的门限需要 σ<sub>pose</sub> ≤ 0.12 mm，不现实。</p>
+    <p><b>所以「站位固定」不是运维上的方便，它是这条路能不能达标的分水岭。</b>而且它比加位姿有效得多：σ 按 √N 收敛，要靠加位姿弥补 4.4 倍需要 19 倍的位姿数。</p>
+  </div>
 
   <p class="sub-h">代价：四个常量模式里，有两个被 c 吸收了</p>
   <p>这是整页最需要写清楚的一条。c 由驻点集拟合得到，意味着<b>任何「机体系常量」都能被 c 原样吸收</b>，于是它在评测残差里恒为零——不是被测小了，是被结构性地消掉了。</p>
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>相机侧的偏差模式</th><th>数学形式</th><th>老方案（c 由 CAD 构造）</th><th>新方案（c 由驻点拟合）</th></tr>
-    <tr><td>world 系常量平移</td><td class="num">t<sub>i</sub> → t<sub>i</sub> + δ<sub>W</sub></td><td>被 t<sub>WG</sub> 吸收</td><td>被 t<sub>WG</sub> 吸收</td></tr>
-    <tr class="lead"><td><b>机体系常量平移</b></td><td class="num">t<sub>i</sub> → t<sub>i</sub> + R<sub>i</sub>δ<sub>B</sub></td><td><b>进残差，可见</b></td><td><b>被 c → c + δ<sub>B</sub> 吸收，不可见</b></td></tr>
-    <tr><td>world 系常量旋转</td><td class="num">R<sub>i</sub> → δR<sub>W</sub>R<sub>i</sub></td><td>进残差，可见</td><td>进残差，<b>仍可见</b>（ω<sub>W</sub> × R<sub>i</sub>c 随位姿变，c 只能给机体系常量，复现不出它）</td></tr>
-    <tr class="lead"><td><b>机体系常量旋转</b></td><td class="num">R<sub>i</sub> → R<sub>i</sub>δR<sub>B</sub></td><td><b>进残差，可见</b></td><td><b>被 c → δR<sub>B</sub>·c 吸收，不可见</b></td></tr>
-    <tr><td>全场尺度</td><td class="num">t<sub>i</sub> → (1+s)t<sub>i</sub></td><td>可见</td><td><b>仍可见</b>——(1+s)t 不是刚体映射、也不是机体系常量，两个吸收器都够不着它</td></tr>
+    <tr><td>world 系常量平移</td><td class="num">t̂<sub>i</sub> = t<sub>i</sub> + δ<sub>W</sub></td><td>被 t<sub>WG</sub> 吸收</td><td>被 t<sub>WG</sub> 吸收</td></tr>
+    <tr class="lead"><td><b>机体系常量平移</b></td><td class="num">t̂<sub>i</sub> = t<sub>i</sub> + R<sub>i</sub>δ<sub>B</sub></td><td><b>进残差，可见</b></td><td><b>被 ĉ = c − δ<sub>B</sub> 吸收，不可见</b></td></tr>
+    <tr><td>world 系常量旋转</td><td class="num">R̂<sub>i</sub> = δR<sub>W</sub>R<sub>i</sub></td><td>进残差，可见</td><td>进残差，<b>仍可见</b>（ω<sub>W</sub> × R<sub>i</sub>c 随位姿变，c 只能给机体系常量，复现不出它）</td></tr>
+    <tr class="lead"><td><b>机体系常量旋转</b></td><td class="num">R̂<sub>i</sub> = R<sub>i</sub>δR<sub>B</sub></td><td><b>进残差，可见</b></td><td><b>被 ĉ = δR<sub>B</sub><sup>T</sup>c 吸收，不可见</b>（|ĉ| = |c| 精确成立）</td></tr>
+    <tr><td>全场尺度</td><td class="num">t̂<sub>i</sub> = (1+s)t<sub>i</sub></td><td>可见</td><td><b>仍可见</b>——(1+s)t 不是刚体映射、也不是机体系常量，两个吸收器都够不着它</td></tr>
     <tr><td>位姿相关 / 速度相关 / 相机集合相关 / 时间相关</td><td class="num">随 t 变</td><td>可见</td><td><b>仍可见</b>（且覆盖率从 50 个驻点变成整段轨迹）</td></tr>
   </table>
   </div>
@@ -513,11 +561,11 @@
   <p class="sub-h">新接法带来的六个新失效模式</p>
   <ul class="verdict">
     <li><b>接收角把评测集选偏了。</b>「适当保持夹爪姿态」这句操作要求，在数据上等于<b>只有一部分姿态有 GT</b>；而被排除的那些极端姿态，恰恰最可能是标签误差最大的。这是选择偏差，不是覆盖率不足。<b>对策两条：</b>逐 episode 报 coverage；并<b>按「SMR 窝法线 ↔ 跟踪仪视线夹角」分层报残差</b>，让「接近接收角边界时误差是否变大」成为可回答的问题。结论里必须写明它只适用于测到的那段姿态范围。</li>
-    <li><b>磁吸保持力要对抗动态载荷——但选了 0.5″ 之后这条降级了。</b>8–9 g 的球在 30 m/s² 下只有 <b>0.27 N</b>，而不是 1.5″ 那 4 N 量级；磁窝的轴向吸力有一到两个数量级的余量。<b>系绳仍然做</b>：说明书 §1.9 要求开测前确认磁吸底座粘牢，靶球摔落是设备损坏、而且是共享设备——一根绳的成本对一台共享仪器来说不值得省。分配值从 0.15 降到 0.05 mm。</li>
-    <li><b>球在窝里的微动会伪装成相机误差——同样因为 0.5″ 而降级，但判据照做。</b>球若在高加速度下相对窝滑动几十微米再弹回，它进的是残差，长得像标签抖动。惯性力小了 15 倍，风险随之下降。<b>判据便宜，所以照做：同一段动作快慢各一遍，看残差随加速度（而不是随速度）的变化</b>——速度相关指向时钟，加速度相关指向机械。老的 T1「落座重复性取放 20 次」是静态口径，不覆盖它。分配值 0.05 mm。</li>
+    <li><b>磁吸保持力要对抗动态载荷。</b>百克量级的球在 30 m/s² 下是 <b>4–6 N</b>。1.5″ 磁窝本来就是为这颗球设计的（轴向吸力 20–50 N），但<b>剪切与剥离方向弱一个量级</b>，余量只有一到三倍，不是二十倍。<b>机械防脱（挡圈或系绳）是必做项</b>：说明书 §1.9 要求开测前确认磁吸底座粘牢；靶球摔落是设备损坏，而且是共享设备。一根绳把「摔球 = 毁掉共享仪器」变成「球晃一下、本场作废」。分配值 0.15 mm。</li>
+    <li><b>球在窝里的微动会伪装成相机误差。</b>球若在高加速度下相对窝滑动几十微米再弹回，它进的是残差，长得像标签抖动。<b>判据便宜：同一段动作快慢各一遍，看残差随加速度（而不是随速度）的变化</b>——速度相关指向时钟，加速度相关指向机械。老的 T1「落座重复性取放 20 次」是静态口径，不覆盖它。分配值 0.10 mm。</li>
     <li><b>钢片是悬臂，SMR 在它末端。</b>板的挠度直接进残差。钢比铝好，但决定刚度的是<b>厚度与跨距</b>而不是材料。静载检查当场就能做：板上装好 SMR，用弹簧秤加已知侧向力，跟踪仪读位移，直接得到 mm/N。</li>
     <li><b>激光现在打在机体上，紧挨着相机。</b>老方案球在独立工装上；新方案光束终点就在相机支架上。钢片的镜面反射会让自动曝光跳变、marker 检出率掉。<b>钢片做哑黑（发黑或哑光漆），不要抛光。</b>T1 里「对相机的干扰」那一项因此从「顺带测一下」升级为<b>上线前必过的门</b>：跟踪开 / 关各录一段，比 marker 检出率与角点残差。</li>
-    <li><b>加了质量就改了被测系统 —— 已定「仅验证场次装」，所以这条限定要写进每一份结论。</b>带板采的 episode 与生产 episode 不是同一个动力学。好消息是球只有 8–9 g，<b>主导项是钢片本身</b>，做薄做小就能把这条压到可忽略；坏消息是它无法被证明为零，只能被做小。结论里固定写一句「本结论取自带 SMR 工装的构型」。</li>
+    <li><b>加了质量就改了被测系统 —— 但这条比它听起来轻，原因在报告口径而不在机械。</b>1.5″ 球 + 加厚的板约 300–350 g，挂在 1.5 kg 量级的手持 BOX 上是约 20% 的质量增加与重心偏移，操作者的动作分布会变。<b>但本页报的不是一个池化数字，而是 error(速度, 姿态, 相机数) 的分层曲线，而输入分布偏移不会让一个在该分布上测出来的函数失效</b>——只要生产工况落在测过的范围内。<b>于是真正剩下的风险只有「范围覆盖」</b>：如果多出来的质量让操作者再也上不到生产速度，快档就没测过。对策已经在设计里——<b>E3a 是主动跑速度档，不是靠自然动作碰运气</b>。<br/><b>想让它彻底消失还有个便宜办法：</b>板与窝常驻，球不常驻，生产采集时在窝里坐一颗<b>等重的哑光钢球</b>，验证时换成 SMR。钢球几乎不要钱，SMR 不必跟着上生产线冒险，两种场次的动力学完全一致。<br/>在做这件事之前，结论里固定写一句「本结论取自带 SMR 工装的构型」。</li>
   </ul>
 
   <p class="sub-h">机加口径：新方案省掉的是最难的那一条</p>
@@ -525,12 +573,14 @@
   <table class="metric-table">
     <tr><th>项</th><th>口径</th><th>为什么</th></tr>
     <tr class="lead"><td class="key">球心位置</td><td><b>不需要 CAD 精确构造，也不需要装配自检</b></td><td><b>这是本次改版省下的最大一笔。</b>老方案要「三窝间距实测 vs CAD 偏差 p95 ≤ 0.10 mm」——一块板上三个窝位的相对位置要做到 0.1 mm，那是 CNC + 坐标测量的活。新方案 c 是拟合量，机加只需要「装得牢、不晃」。</td></tr>
-    <tr><td class="key">窝</td><td>买标准磁吸窝，不自制球面</td><td>磁吸窝是三点运动学定位；自制球面窝的间隙会变成姿态相关项，rig 那边已经吃过这个亏</td></tr>
+    <tr><td class="key">窝</td><td><b>1.5″ 标准磁吸窝</b>，不自制球面</td><td>磁吸窝是三点运动学定位；自制球面窝的间隙会变成姿态相关项，rig 那边已经吃过这个亏</td></tr>
     <tr><td class="key">板材与表面</td><td>钢，<b>哑黑，不抛光</b></td><td>镜面反射进相机（上面第 5 条）</td></tr>
-    <tr class="lead"><td class="key">尺寸</td><td><b>做到刚够用的最小尺寸。跨距要求整个移走，不在这块板上。</b></td><td><b>「板大会遮 cube」这个担心是对的，而且这个权衡根本不需要存在。</b>T4b 是一场<b>独立的静态采集</b>，它可以用<b>另一块板</b>——两块板共用夹爪上的同一组定位销与螺孔即可。T4b 解出的 R<sub>box,rig</sub> 是<b>机器的属性、与板无关</b>（AX = XB 里板↔cube 的变换 X 是当场自解的），所以结果照样搬回来用。<b>于是现在唯一要做的事，是把安装接口做成能换第二块板</b>——两个定位销 + 螺孔，成本近似为零。T4a 的板因此可以做到最小，不遮 marker 面。</td></tr>
+    <tr class="lead"><td class="key">刚度 <span class="badge warn">2026-09-17 订正</span></td><td><b>先缩悬伸长度，别先加板厚</b></td><td>我先前按「悬臂板、载荷在末端」给过「厚度 ×2.7」——<b>看到实际装配形态后那条不成立</b>。3 mm 钢片是被整面夹住的圆片，弯矩由<b>套筒与螺接界面</b>承担，钢片本身只在环带里弯一点，厚度是次要项。真正的杠杆是<b>球心到安装面的悬伸</b>：1.5″ 球约 150–200 g，悬伸 100 mm 时 30 m/s² 下就是 <b>0.45–0.6 N·m</b> 的弯矩，作用在一个不大的螺接面上。<b>力与力矩都随悬伸线性下降，所以能缩就缩</b>（代价是 |c| 变小、旋转灵敏度下降，两者要一起看）。板厚 3 mm 大概率够，但这件事<b>推不出来只能测</b>——见下一行。</td></tr>
+    <tr class="lead"><td class="key">刚度验收</td><td>E0 静载实测 mm/N，<b>不接受估算</b></td><td>叠装的柔度来自螺接预紧、贴合面平面度、套筒本身——<b>板理论算不出来</b>。做法很便宜：装好整叠，用弹簧秤在球上加已知侧向力，跟踪仪读位移，当场得到 mm/N，乘手持峰值加速度就是 T6 那一行。<b>这是选 1.5″ 之后唯一必须实测才能关闭的项。</b></td></tr>
+    <tr class="lead"><td class="key">尺寸</td><td><b>做到刚够用的最小尺寸。跨距要求整个移走，不在这块板上。</b><br/><span class="small">2026-09-17 装配图确认：同轴圆片 + 同轴窝，<b>物理上放不下三个非共线窝</b>，所以这条不再是选择而是事实</span></td><td><b>「板大会遮 cube」这个担心是对的，而且这个权衡根本不需要存在。</b>T4b 是一场<b>独立的静态采集</b>，它可以用<b>另一块板</b>——两块板共用夹爪上的同一组定位销与螺孔即可。T4b 解出的 R<sub>box,rig</sub> 是<b>机器的属性、与板无关</b>（AX = XB 里板↔cube 的变换 X 是当场自解的），所以结果照样搬回来用。<b>于是现在唯一要做的事，是把安装接口做成能换第二块板</b>——两个定位销 + 螺孔，成本近似为零。T4a 的板因此可以做到最小，不遮 marker 面。</td></tr>
     <tr><td class="key">固定</td><td>两个定位销 + 螺钉；<b>但 c 仍每场次重拟合</b></td><td>定位销让两次拟合的结果可比（于是拆装重复性变成一个可观测量），<b>不是</b>用来免掉重拟合的</td></tr>
-    <tr><td class="key">防脱</td><td>挡圈或系绳，必做</td><td>共享设备，摔球是损坏（§1.9）</td></tr>
-    <tr><td class="key">朝向</td><td>窝面法线对准跟踪仪常用站位</td><td>接收角直接决定 coverage</td></tr>
+    <tr class="lead"><td class="key">防脱</td><td>挡圈或系绳，<b>必做</b></td><td>1.5″ 球 30 m/s² 下 4–6 N，而磁窝的<b>剪切与剥离方向比轴向弱一个量级</b>，余量只有一到三倍。共享设备，摔球是损坏（§1.9）。一根绳把「摔球 = 毁掉共享仪器」变成「球晃一下、本场作废」。<b>优先系绳而不是挡圈</b>：球悬在整叠末端、朝外暴露，而挡圈要想不侵入 ±30° 的接收锥，留给它的空间很窄；绳没有这个约束</td></tr>
+    <tr class="lead"><td class="key">朝向</td><td>窝面法线对准跟踪仪常用站位；<b>叠装里留一片可换的斜垫</b></td><td>接收角直接决定 coverage，而这套同轴叠装把<b>窝的法线方向锁死在现有安装接口上</b>——它不是一个自由参数。好在叠装本来就是分件的，<b>在钢片与套筒之间插一片带角度的垫片，就能把法线独立于安装面转过去</b>，几十块钱的事。E0 扫完姿态就知道该转多少、往哪转；<b>先把这个接口留出来，比事后重做整叠便宜得多</b>。</td></tr>
     <tr><td class="key">遮挡</td><td>不遮 cube 的 marker 面，不挡相机到工件的视线</td><td>先在 CAD 里跑一遍可见性，别等现场发现检出率掉了</td></tr>
   </table>
   </div>
@@ -663,6 +713,36 @@
         <li><b>T3e 粗对齐：</b>采集机 ↔ Thor 主机钟同步，只用于会话关联与下面的 T3f，同步状态写进 manifest。</li>
         <li class="lead"><b>T3f index 0 锚点（索引对齐唯一的整数歧义）：</b>脉冲索引对应只给「跟踪仪第 N 条 ↔ 相机第 N 帧」，<b>前提是两边从同一个脉冲开始数</b>。PWM 是自由运行的，TTL 采集与相机录制不会同时起，所以必须先定 index 0。两种办法：<b>①</b> 会话开始时把 PWM 停一拍制造一个已知缺口，两边都看得见，是共同基准；<b>②</b> 用粗主机钟直接认——脉冲间隔 16.667 ms，<b>只要主机钟对到 ±8 ms 以内就能唯一确定是哪一个脉冲</b>，之后由索引接管精度。这是典型的粗捕获 + 精跟踪：<b>主机钟的精度要求从 0.7 ms 放宽了一个数量级</b>，NTP 随便满足，PTP 完全不必要。锚点判定结果与所用方法写进 manifest。</li>
       </ul>
+      <p class="sub-h">T3g 如果 Trigger 口规格始终拿不到：软同步的量化代价 <span class="badge todo">2026-09-17 估算</span></p>
+      <p class="small"><b>先纠一个前提：「API 不回复」不等于「规格不可知」。</b>T3a 本来就写了两条路——问 API，或台架实测。信号发生器扫电平 / 边沿 / 脉宽、灌已知频率验证回调条数，一个下午的事。下面按最坏情况估：连台架也不做。</p>
+      <p>非时间项的平方和固定在 <b>0.587 mm</b>（仪器 0.10 + 落座 0.05 + c 0.20 + 注册 0.50 + 钢片 0.15 + 微动 0.10 + 空气 0.10）。时间项按 σ<sub>t</sub> × |v| 进平方和，σ<sub>rand</sub> = <b>293 µs</b> 是本机实测（289 µs 的 1 ms 量化底 + 74 µs 不对称界）：</p>
+      <div class="table-scroll">
+      <table class="metric-table">
+        <tr><th>场景</th><th>等效 σ<sub>t</sub></th><th>200 mm/s</th><th>680 mm/s（p95）</th><th>1500 mm/s（峰值）</th></tr>
+        <tr><td class="key">A 硬触发（脉冲计数）</td><td class="num">100 µs</td><td class="num">0.59</td><td class="num">0.59</td><td class="num">0.61</td></tr>
+        <tr class="lead"><td class="key">B1 软同步 + 偏置标定</td><td class="num">355 µs</td><td class="num">0.59</td><td class="num"><b>0.63</b></td><td class="num">0.79</td></tr>
+        <tr><td class="key">B2 软同步，偏置标不出来</td><td class="num">1042 µs</td><td class="num">0.62</td><td class="num">0.92</td><td class="num"><b>1.67</b></td></tr>
+        <tr><td class="key">B3 软同步 + 相机侧也没标</td><td class="num">4410 µs</td><td class="num">1.06</td><td class="num"><b>3.06</b></td><td class="num">6.64</td></tr>
+      </table>
+      </div>
+      <ul>
+        <li><b>B1 几乎不输给硬触发</b>——p95 速度下 0.63 vs 0.59 mm，因为随机项本来就小。<b>B2 在 p95 下还过得去、在峰值速度下崩</b>（1.67 mm 已是被测量的一半多，不再是「参考」）。<b>B3 直接不成立。</b></li>
+        <li class="lead"><b>最大的那一项不在 Trigger 口上。</b>B2 → B3 的差就是相机侧那个 lumped <b>+4.4 ms</b>，在 680 mm/s 下是 <b>3.0 mm</b>，比其余所有项加起来还大。<b>而 T3c 里修它的那一半不需要 Trigger 口</b>：用 PWM 驱动 LED 扫延迟、测曝光窗相对 PWM 沿的位置，全程在 Thor / 相机侧。</li>
+        <li class="lead"><b>曝光现在是 Argus 自动、元数据里没有曝光列，这是最贵的一条。</b>SOF → 曝光中点 = T<sub>exp</sub>/2 + 常量；曝光若在 4–12 ms 间摆，中点就摆 <b>4 ms</b>，在 680 mm/s 下是 <b>2.7 mm 的逐帧变动偏置</b>——而且它随场景亮度、随姿态变，<b>不是随机的，平均不掉</b>。<b>锁定曝光 + 逐帧记录曝光是投入产出比最高的一件事，而且完全在我们这边。</b></li>
+      </ul>
+      <div class="callout warn">
+        <p><b>硬触发买到的是可分离性，不是精度。</b>软同步下要估时间偏置只有两条路——运动互相关，或残差对速度的斜率（<code>decompose_residual_by_speed</code>）。<b>两条估出来的都是同一个东西：所有随 |v| 线性增长的项之和。</b>而相机自己就有随速度增长的误差：滚动快门的行相关偏斜、模糊下检测阈值的不对称、曝光期内的加速度二阶项。<b>它们与时钟偏置具有完全相同的特征，拆不开</b>——这正是<a href="#redlines">红线</a>那句「运动互相关的 Δt 只能认证空间精度」的由来。硬触发把时钟那一项从这个和里拿掉，剩下的斜率就纯粹是相机自己的运动相关误差，<b>而那恰恰是要测的东西之一</b>。</p>
+        <p><b>所以交付物会变窄而不是失效：</b>结论从「标签误差 X mm，其中时钟贡献 a、运动模糊贡献 b」退化成「标签误差 X mm，<b>其中速度相关的那部分无法归因</b>」。判决 3 mm <b>没有代价</b>（用户关心总误差不关心归因）；<b>改进流水线代价很大</b>（不知道该修时钟还是修曝光）；重调平滑器 σ 居中。</p>
+      </div>
+      <p class="sub-h">按投入产出排序（Trigger 口排最后）</p>
+      <ol>
+        <li><b>锁定曝光 + 逐帧记录曝光</b>——零成本，消掉一个 2.7 mm 量级的逐帧变动项。</li>
+        <li><b>T3c 的相机那一半</b>（PWM + LED 扫延迟）——不需要 Trigger 口，消掉 3.0 mm 的 lumped 偏置。做完 1+2 就落在 B1。</li>
+        <li><b>自己上台架测 Trigger 口</b>——从低电平小电流起步、顺便量负载幅度判断是不是 50 Ω 端接。一个下午，不欠 API 人情。</li>
+        <li><b>缩短曝光</b>——8.7 ms 在 680 mm/s 下是 <b>5.9 mm 拖影</b>，直接影响检测精度，也缩小 SOF ↔ 中点的不确定度。</li>
+        <li>等 API 回复。</li>
+      </ol>
+      <p class="small"><b>做完 1+2，硬触发的边际收益只剩 0.04 mm 和「可归因性」。</b>即使 API 永远不回，这条 GT 链不会死；死的是把误差拆开的那部分能力。</p>
       <div class="gate"><span class="gate-label">GATE</span>首选按<b>脉冲计数</b>结案：一段 ≥ 10 min 的采集里，TTL 回调条数 == PWM 脉冲数 == 相机帧数，三者逐段可核；<code>device_time</code> 相邻差的直方图只有 16.667 ms 一个峰。加上触发延迟与「SOF → 曝光中点」偏置两个实测常数，时间行就只剩这两个常数的不确定度。<b>计数对不上时</b>才退回原判据：Δt 残差 ≤ 0.7 ms、钟速比 s ≤ 30 ppm。</div>
     </article>
 
@@ -698,7 +778,7 @@
         <li><b>静态位姿法（驻点集）：</b>靶标置于 ≥ 15 个静止位姿，<b>必须</b>包含绕 ≥ 2 根不平行轴的旋转——纯平移的位姿对对 c 零信息，这是可观测性条件不是建议；每个位姿静置 ≥ 2 s，相机取 T<sub>W,rig</sub> 均值，跟踪仪取 p<sub>G</sub> 均值。SMR 球心 c 已知时解 6 个未知量，<b>未知时解 9 个（现行口径）</b>。FR3 只当定位器，不读 FK。静态把时间整个移出注册问题，所以 T5 不等 T3。</li>
         <li><b>场内两次、取差值：</b>评测 episode 前后各采一组驻点集，A / B 解出的 (T<sub>WG</sub>, c) 之差就是本场次的漂移与碰撞检查，免费且必须做；超限时作废本场评测数据，<b>不是</b>取平均继续。</li>
         <li><b>留出位姿：</b>≥ 5 个位姿不参与拟合，只用来出复核残差。拟合残差是模型自评，留出残差才是预测能力。</li>
-        <li class="lead"><b>站位固定（2026-09-17 已定）带来一个结构性简化：</b>T<sub>WG</sub> 在 <code>world_frame_id</code> × <code>tracker_station_id</code> 不变期间是常量，可以跨场次累积拟合；<b>每场次只需重拟合 c（3 个未知量，线性、每个位姿都贡献）</b>，于是「必须绕 ≥ 2 根不平行轴」从可观测性硬条件降为一致性检查——转角仍要有，但不再是成败所系。这对 ±30° 接收角下转不动大角度的现实是一个实质性缓解。</li>
+        <li class="lead"><b>站位固定（2026-09-17 已定）带来一个结构性简化，而且代价差距是量化过的：</b>T<sub>WG</sub> 在 <code>world_frame_id</code> × <code>tracker_station_id</code> 不变期间是常量，可以跨场次累积拟合；<b>每场次只需重拟合 c（3 个未知量，线性、每个位姿都贡献，不需要任何转角）</b>。<b>实测：同样的位姿与噪声，冻结站位后 σ<sub>c</sub> 比联合解小 4.4 倍</b>，而且这个比值与噪声大小无关。要靠加位姿弥补 4.4 倍需要 19 倍的位姿数，所以这不是方便，是这条路能不能达到 T6 那 0.20 mm 的分水岭。于是「必须绕 ≥ 2 根不平行轴」只对<b>第一次</b>建立 T<sub>WG</sub> 是硬条件，之后降为一致性检查——这对 ±30° 接收角下转不动大角度的现实是实质性缓解。</li>
         <li><b>而且它白送两个诊断：</b><b>①</b> 跨场次的 ΔT<sub>WG</sub> 同时监视跟踪仪站位和相机外参有没有漂——主 roadmap P2 想要的 global-drift watchdog，不用另做。<b>②</b> T<sub>WG</sub> 固定后，把<b>逐位姿单独解出的 c 对姿态作图</b>：任何系统性变化就是姿态相关的 rig 位姿误差，被直接画出来而不是混在残差里。这两件事老方案都做不了。</li>
         <li><b>只用 SE(3)：</b>尺度不吸收，另报 Sim(3) 拟合出的尺度（ppm）作诊断。全场尺度正是要暴露的共模误差。</li>
         <li><b>先判可观测性再出数、没有 σ 不算测量：</b>沿用 <code>hand_eye.py</code> 的约定，转轴近平行时拒绝出数，bootstrap 给 σ。</li>
@@ -854,16 +934,16 @@
     <tr><th>项</th><th>工程分配 p95</th><th>出处</th><th>状态</th></tr>
     <tr><td class="key">仪器：噪声 + 漂移 + 站位一致性</td><td class="num">0.10 mm</td><td>T1 实测；证书 MPE 作参照</td><td><span class="badge hold">未测</span></td></tr>
     <tr><td class="key">SMR 落座与窝</td><td class="num">0.05 mm</td><td>T1 取放 20 次</td><td><span class="badge hold">未测</span></td></tr>
-    <tr><td class="key">SMR 球心 ↔ rig 系（c）</td><td class="num">0.20 mm</td><td><b>改版后这是拟合量，不是构造量。</b>常量部分按定义为 0（被吸收），这里填的只是驻点集的 bootstrap σ：σ<sub>c</sub> ≈ σ<sub>pose</sub>/(2 sin(θ/2)·√N)，±30° 接收角下 2 sin(θ/2) = 1.0，N = 20 时估计落在 0.07–0.31 mm。T5 出真值。</td><td><span class="badge hold">未测</span></td></tr>
-    <tr><td class="key">钢片与安装界面刚度</td><td class="num">0.05 mm</td><td><b>新增行。</b>SMR 在悬臂末端，动态载荷下板的挠度直接进残差。<b>选定 0.5″ SMR（8–9 g）后从 0.15 下调到 0.05</b>：30 m/s² 下末端载荷只有 0.27 N。T4a 静载实测（弹簧秤加已知侧向力，跟踪仪读位移）× 手持峰值加速度。老方案没有这一行，因为球不在机体上。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
-    <tr><td class="key">窝内微动（动态）</td><td class="num">0.05 mm</td><td><b>新增行。</b>球在高加速度下相对窝滑动再弹回，长得像标签抖动。<b>同样因 0.5″ 从 0.10 下调到 0.05。</b>T1 的「取放 20 次」是静态落座重复性，不覆盖它。判据：同一段动作快慢各一遍，看残差随<b>加速度</b>而非随速度的变化。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
+    <tr class="lead"><td class="key">SMR 球心 ↔ rig 系（c）</td><td class="num">0.20 mm<br/><span class="small">仅冻结站位路径可达</span></td><td><b>改版后这是拟合量，不是构造量。</b>常量部分按定义为 0（被吸收），这里填的是驻点集的 bootstrap σ。<b>2026-09-17 订正：</b>冻结 T<sub>WG</sub> 后 σ<sub>c</sub> = <b>√3·σ<sub>pose</sub>/√N</b>（实测标定），于是这一行成立的条件是 <b>σ<sub>pose</sub> ≤ 0.52 mm @ N = 20</b>——一条可以直接去测的门限。<b>联合解做不到</b>：同样数据它差 4.4 倍，要满足 0.20 mm 需要 σ<sub>pose</sub> ≤ 0.12 mm。</td><td><span class="badge hold">未测 · 有可测门限</span></td></tr>
+    <tr><td class="key">钢片与安装界面刚度</td><td class="num">0.15 mm</td><td><b>新增行。</b>SMR 在悬臂末端，动态载荷下板的挠度直接进残差。1.5″ 球在 30 m/s² 下末端载荷 <b>4–6 N</b>。<b>板刚度 ∝ 厚度³，所以载荷大 20 倍只要厚度 ×2.7</b>（例如 2 mm → 5.4 mm）——板还没切，现在改是零成本。T4a 静载实测（弹簧秤加已知侧向力，跟踪仪读位移）× 手持峰值加速度。老方案没有这一行，因为球不在机体上。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
+    <tr><td class="key">窝内微动（动态）</td><td class="num">0.10 mm</td><td><b>新增行。</b>球在高加速度下相对窝滑动再弹回，长得像标签抖动。T1 的「取放 20 次」是静态落座重复性，不覆盖它。判据：同一段动作快慢各一遍，看残差随<b>加速度</b>而非随速度的变化——速度相关指向时钟，加速度相关指向机械。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
     <tr><td class="key">注册 T<sub>WG</sub></td><td class="num">0.50 mm</td><td>T5 bootstrap + 留出位姿复核</td><td><span class="badge hold">未测</span></td></tr>
-    <tr><td class="key">时间：Δt 残差 × 速度</td><td class="num">0.50 mm</td><td>T3：0.7 ms × p95 680 mm/s。<b>走 TTL 脉冲索引路径时这一行的构成变了</b>——不再是 Δt 估计残差，而是「触发延迟 + SOF→曝光中点偏置」两个可一次性标定的常数，<b>分配值有望大幅下调</b>，但在 T3a 台架跑通前不改数字。走 D 路径时这一行只认证空间对齐，时间戳偏置另列。</td><td><span class="badge hold">未测</span></td></tr>
+    <tr class="lead"><td class="key">时间：Δt 残差 × 速度</td><td class="num">0.50 mm<br/><span class="small">软同步实测可达 0.24</span></td><td>原分配 0.7 ms × p95 680 mm/s。<b>本机实测的随机项已经比这个小得多</b>：σ<sub>rand</sub> = <b>293 µs</b>（289 µs 量化底 + 74 µs 不对称界）→ 0.199 mm @ 680 mm/s。真正决定这一行的是<b>偏置</b>而不是随机项，而偏置的大小取决于走哪条路——<b>四个场景的完整估算见 <a href="#t3">T3g</a></b>：硬触发 0.07 mm、软同步+偏置标定 0.24 mm、软同步偏置标不出来 0.71 mm、相机侧也没标 3.00 mm（全部 @ 680 mm/s）。<b>这一行是全表唯一随速度增长的项</b>，所以峰值速度下的数字才是判据。</td><td><span class="badge warn">随机项已测 · 偏置未标</span></td></tr>
     <tr><td class="key">插值</td><td class="num">&lt; 0.001 mm</td><td>1 kHz 线性插值，二阶项 a·T²/8（a ≈ 5 m/s²）。禁止最近邻：1 ms/√12 在 680 mm/s 下是 0.20 mm。</td><td><span class="badge ok">计算值</span></td></tr>
     <tr><td class="key">失锁边缘</td><td class="num">0（剔除）</td><td>T1 定剔除窗口；不跨缺口插值</td><td><span class="badge hold">未测</span></td></tr>
     <tr><td class="key">空气折射与温度</td><td class="num">0.10 mm</td><td>Radian Pro 传感器插着即启用；<code>GetWeatherStationData</code> 逐 session 记 T/P/H（T0/T1）</td><td><span class="badge hold">未测</span></td></tr>
     <tr><td class="key">STS 载荷变形<br/><span class="small">仅 6D 场次，与 T4a 主路线无关</span></td><td class="num">待定</td><td><b>新增行。</b>1.36 kg 的 STS 挂在夹爪上会使 cube ↔ TCP 之间的链产生载荷相关变形，而这段链正是待测量。判据便宜：同一批静止位姿，装 STS 与不装 STS 各测一次 SMR 球心，差值就是它。<b>未并入下面的平方和</b>，因为它只出现在 STS 场次，且尚无任何测量。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
-    <tr class="total"><td>合计（平方和）· <b>球心口径</b></td><td class="num">0.75 mm</td><td>≤ 1.0 mm，留约 0.66 mm 的平方余量给实测超支。<b>不含 STS 载荷变形行</b>（仅 6D 场次、尚无测量）。改版新增两行、c 那一行从 0.30 降到 0.20，两下抵消，合计几乎没动——<b>但适用对象从 TCP 缩到了球心</b>。</td><td></td></tr>
+    <tr class="total"><td>合计（平方和）· <b>球心口径</b></td><td class="num">0.77 mm</td><td>≤ 1.0 mm，留约 0.64 mm 的平方余量给实测超支。<b>选 1.5″ 让这个数从 0.75 升到 0.77</b>——0.7% 的 3 mm，不是一个选型理由，见 <a href="#smr-on-body">靶球口径为什么不是精度问题</a>。<b>不含 STS 载荷变形行</b>（仅 6D 场次、尚无测量）。改版新增两行、c 那一行从 0.30 降到 0.20，两下抵消，合计几乎没动——<b>但适用对象从 TCP 缩到了球心</b>。</td><td></td></tr>
     <tr class="total"><td><b>表外 ①</b>：rig → TCP 旋转 × 力臂<br/><span class="small">常量部分，被 c 吸收</span></td><td class="num">3.5 – 9.1 mm</td><td>2.0° 声明（从未观测）× cube ↔ TCP 力臂。<b>力臂本身待核</b>：|c| = 160 与 |c−c<sub>TCP</sub>| = 60 给出区间 [100, 220] mm（3.5–7.7 mm），本页别处沿用 259.5 mm（9.1 mm）。<b>无论取哪一端，它都是预算里最大的一项，而且新接法结构性地测不到</b>——不能并进平方和，也不能默认它小。</td><td><span class="badge warn">零观测</span></td></tr>
     <tr class="total"><td><b>表外 ②</b>：球心 → TCP 转移<br/><span class="small">时变部分，随测随有</span></td><td class="num">1.05 mm/°</td><td>e<sub>TCP</sub> − e<sub>球心</sub> = δθ × (c<sub>TCP</sub> − c)，|c<sub>TCP</sub> − c| = <b>60 mm</b>。按现行 2° 声明是 <b>2.09 mm</b>；δθ 标到 0.5° 降到 0.52 mm，标到 0.22° 降到 0.23 mm。<b>球心装得离 TCP 只有 60 mm，是本次设计最省的一处</b>——老方案 B 的 250 mm 力臂这一项要 9 mm 量级。</td><td><span class="badge warn">随 ① 一起塌</span></td></tr>
   </table>
@@ -877,7 +957,7 @@
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>实验</th><th>构型</th><th>依赖</th><th>裁决什么</th><th>回写</th></tr>
-    <tr class="lead"><td class="key">E0 工装鉴定 + 姿态 → 覆盖率图 <span class="badge warn">新增 · 上线前必做</span></td><td>钢片装好、球装上，<b>不采任何评测数据</b>。三项工装检查（静载刚度、加速度扫掠下球不移位、跟踪开启不改变 marker 检出率）＋ 一次专门的姿态扫掠：绕两轴各慢慢转到失锁，记录失锁角。</td><td>T4a 装好即可</td><td>本机 SMR 在本机站位下的<b>实际</b>接收边界 α（数据表的标称值待查，通常 ±25°–30°）；钢片刚度的实测 mm/N；跟踪仪是否干扰相机。</td><td>给操作者<b>一句可执行的话</b>（「窝法线保持在跟踪仪方向 ±X° 内」），以及 T6 两个新增行的实测值。<b>还决定站位要不要退后</b>：可用工作区半径 R ≈ r·tan(α − β)，现定 r = 1.5 m 时工作区自身就吃掉 ±18.4°，±30° 下只剩 11.6° 给姿态、±25° 下只剩 6.6°。<b>所以 E0 必须在定站位之前跑，不是之后。</b>没有这张图，E3 的 coverage 就只是个数字，没人知道怎么把它提高。</td></tr>
+    <tr class="lead"><td class="key">E0 工装鉴定 + 姿态 → 覆盖率图 <span class="badge warn">新增 · 上线前必做</span></td><td>钢片装好、球装上，<b>不采任何评测数据</b>。三项工装检查（静载刚度、加速度扫掠下球不移位、跟踪开启不改变 marker 检出率）＋ 一次专门的姿态扫掠：绕两轴各慢慢转到失锁，记录失锁角。</td><td>T4a 装好即可</td><td>本机 1.5″ SMR 在本机站位下的<b>实际</b>接收边界 α（数据表标称值待查，通常 ±25°–30°）；钢片刚度的实测 mm/N（按 4–6 N 末端载荷校核）；加速度扫掠下球不移位、不脱落；跟踪仪是否干扰相机。</td><td>给操作者<b>一句可执行的话</b>（「窝法线保持在跟踪仪方向 ±X° 内」），以及 T6 两个新增行的实测值。<b>还决定站位要不要退后</b>：可用工作区半径 R ≈ r·tan(α − β)，现定 r = 1.5 m 时工作区自身就吃掉 ±18.4°，±30° 下只剩 11.6° 给姿态、±25° 下只剩 6.6°。<b>所以 E0 必须在定站位之前跑，不是之后。</b>没有这张图，E3 的 coverage 就只是个数字，没人知道怎么把它提高。</td></tr>
     <tr><td class="key">E1 静态空间精度图</td><td><b>受检构型 = 现有夹爪（cube）</b>。靶标静置 ≥ 30 个位姿，与驻点集不同；覆盖工作区与 2 / 3 / 4+ 台相机可见。<b>不再与 AX = XB 共用位姿</b>——那一场随 T4b 顺延。</td><td>T0–T2、T4a、T5；<b>不需要 T3</b></td><td><b>改版后它裁决的事窄了但没变假：</b>全场尺度（ppm）<b>仍然可测</b>（(1+s)t 既不是刚体映射也不是机体系常量，c 与 T<sub>WG</sub> 都吸收不了它）；相机误差的<b>空间分布</b>与相机数台阶仍可测；<b>不再能裁决「≈ 2.0 mm 系统偏置」中的常量部分</b>——那部分已被 c 与 T<sub>WG</sub> 吸收，要它必须走 T4b。</td><td>误差预算表「独立 GT benchmark」行的第一个数（静态口径，<b>球心</b>，模去常量 rig 系偏置与旋转）</td></tr>
     <tr><td class="key">E2 FR3 搭载动态</td><td>UMI 夹爪 + 靶标装在 FR3 上，FR3 只当运动源：直线 / 圆 / 8 字 × 速度档（≤ 100、100–300、300–700 mm/s），加限速重放真实人手轨迹。</td><td>+ T3</td><td>A′ 3.8–4.0 mm 估计与实测之差；速度相关项在标签口径下多大；sidecar σ 是否低估一个量级（|e|/σ 分布）；相机集合切换的台阶是不是真实标签误差；离线平滑器平滑前后各差多少。</td><td>σ 校准；平滑器重调的真值集（调参段与评测段分开）。结论只适用于 FR3 搭载构型。</td></tr>
     <tr class="lead"><td class="key">E3a 固定姿态动态 <span class="badge ok">新增 · 第一场</span></td><td>钢片 + 单窝，手持但<b>姿态钉死</b>（窝法线朝跟踪仪，允许 ±10° 摆动，可加简单限位或提示）。直线 / 圆 / 8 字 × 速度档，横向范围按上表控制在允许半径内。驻点集仍带转角。</td><td>T4a、T5、E0</td><td><b>位置链的干净判决</b>：注册、时钟链、插值、<b>速度相关项</b>（|v|·Δt，老静态方案原理上拿不到的那一项）。姿态误差全部退化成常量被 c 吸收，所以残差<b>就是</b>纯位置误差。</td><td>误差预算「独立 GT benchmark」行的<b>第一个动态数</b>。本场 coverage 应该很高——低了说明工装或站位有问题，而不是方法有问题。</td></tr>
@@ -892,18 +972,19 @@
 
 <section class="card" id="code">
   <div class="section-title"><h2>代码与工具</h2><span class="badge ok">离线链已落地</span><span class="badge warn">缺 (T<sub>WG</sub>, c) 联合解</span></div>
-  <p class="goal">2026-09-17 复核：采集侧与离线对齐侧已经跑通并有测试，<b>改版后唯一缺的一块是驻点集的联合解</b>——因为老方案里 c 来自 CAD，根本不需要解。</p>
+  <p class="goal">2026-09-17 复核：<b>整条离线链已接通并端到端跑过</b>——驻点集求解 → 冻结站位 → 逐 episode 对齐 → 网关 → 面板措辞。metrology 全套 <b>608 passed</b>，前端 138 passed，<code>tsc</code> 与 <code>vite build</code> 均通过。端到端夹具复用<b>真实会话的 sync.csv 与真实时钟拟合</b>，只替换 rt 位置列：驻点帧残差 p95 = <b>0.012 mm</b>，c 精确还原，留出残差 0.0006 mm。</p>
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>位置</th><th>做什么</th><th>复用</th><th>状态</th></tr>
     <tr><td><code>metrology/laser_tracker/collector_win/</code></td><td>厂家 SDK 取流（1 kHz <code>SetRealTimeCallbackFunction</code>），只落盘，写 manifest。<code>--duration</code> / <code>--stop-file</code> 优雅退出（session 0 进程收不到 Ctrl+C，<code>taskkill /f</code> 会让 meta.json 写不出去、封存拒绝）。</td><td>—</td><td><span class="badge ok">已落地 · 实测 1 kHz 无丢样</span></td></tr>
     <tr><td><code>metrology/laser_tracker_io.py</code></td><td>读已封存会话；缺字段 / 未知 schema / sync 文件跨 Thor 重启，一律拒绝不修补；丢样与失锁段表。</td><td><code>sidecar_schema.py</code> 的拒收做法</td><td><span class="badge ok">已落地</span></td></tr>
     <tr><td><code>metrology/laser_tracker_registration.py</code></td><td>静态位姿刚体注册；SE(3) + Sim(3) 尺度诊断；几何条件数与留一残差；<code>certifies_space()</code> 门限。</td><td><code>hand_eye.py</code> 的纯 numpy SO(3) 与 returncode 约定</td><td><span class="badge ok">已落地</span></td></tr>
-    <tr class="lead"><td><code>metrology/tracker_mount_fit.py</code> + CLI（<b>新 · 改版新增</b>）</td><td><b>驻点集上联合解 (T<sub>WG</sub>, c)</b>，9 个未知量。必须带三件事：<b>①</b> 可观测性先判后出数——转轴近平行时拒绝出数，并报 2 sin(θ/2) 的实际取值；<b>②</b> bootstrap σ；<b>③</b> 留出位姿的复核残差。产物写成带 <code>mount_id</code> 的 world graph 边：<b>钢片一拆一装就是新 mount，旧 c 作废</b>，和「跟踪仪一挪就是新站位」同构。</td><td><code>laser_tracker_registration.py</code> 的拒绝与 bootstrap；<code>hand_eye.py</code> 的可观测性约定</td><td><span class="badge warn">缺这一块</span></td></tr>
+    <tr class="lead"><td><code>metrology/tracker_mount_fit.py</code></td><td><b>拆成两个入口，正对着「站位固定」这个事实：</b><code>fit_station()</code> 跨场次累积 T<sub>WG</sub>、每场次一个 c（<b>唯一需要转角的那一步</b>，转轴近平行时拒绝出数并在报错里写明出路）；<code>fit_lever_arm()</code> 冻结 T<sub>WG</sub> 后<b>线性</b>解 c，<b>不需要任何转角</b>，所以固定姿态场次（E3a）是合法输入而不是要被拒绝的输入。解法是交替最小二乘：给定 c 求 T<sub>WG</sub> 是一次 Kabsch，给定 T<sub>WG</sub> 求 c 是一次线性最小二乘，两半都有闭式，不需要优化器。带 bootstrap σ、留出位姿、<code>mount_id</code> 作用域，以及 <code>absorbed_modes</code>——<b>把「这个残差不能叫 TCP 误差」写进类型而不是注释</b>。</td><td><code>laser_tracker_registration.py</code> 的 Kabsch 与 bootstrap；<code>hand_eye.py</code> 的可观测性与 SO(3) 约定</td><td><span class="badge ok">已落地 · 28 单测</span></td></tr>
     <tr><td><code>metrology/tracker_alignment.py</code></td><td>时钟链合成、失锁护带、逐帧配对、速度分层、运动互相关交叉检验。<code>SpatialRegistration</code> 只有两个构造器：<code>from_parked_poses()</code> 可认证，<code>shape_only()</code> <b>永远</b> <code>certifies_space = False</code>——红线用类型系统焊死，不靠注释。</td><td><code>metrics.py</code> 的 APE / RPE</td><td><span class="badge ok">已落地 · 19 单测</span></td></tr>
     <tr><td><code>metrology/time_offset.py</code>（改）</td><td>加 |v| 通道与子窗回归求 s；去掉 scipy 依赖（本机与 Thor 的 venv 都没有 scipy）。</td><td>现有 |ω| 两段式</td><td><span class="badge ok">可先写</span></td></tr>
-    <tr><td><code>metrology/cli/validate_against_tracker.py</code></td><td>产出逐 episode 的 JSON 产物：verdict、逐帧残差、两条轨迹重采样到配对时刻。退出码 0/1/2 区分「数据的问题」与「装置的问题」。<b>改版待补：</b><code>--lever-arm</code> 从「CAD 三个数」改为「读 <code>tracker_mount_fit</code> 的产物」，并把<b>被吸收的模式</b>写进 summary，让前端能据此措辞。</td><td><code>metrics.py</code> 的 APE / RPE</td><td><span class="badge ok">已落地</span><span class="badge warn">接口待改</span></td></tr>
-    <tr><td>GUI：<code>gateway.py</code> <code>/api/tracker/alignment</code> + <code>TrackerAlignmentPanel.tsx</code></td><td>Replay 界面里叠加 GT 轨迹、残差时序、分层表。<b>网关只读文件不算数</b>——注册、c、两个钟拟合都要可审计，不能藏在一次刷新就会用不同输入重跑的 HTTP 请求后面。<b>改版待补：</b>verdict 增加一档措辞，明说「已模去常量 rig 系偏置与旋转」；分层增加「窝法线 ↔ 视线夹角」。</td><td><code>Pose3DViewer</code> / <code>SeriesPlot</code></td><td><span class="badge ok">已落地</span><span class="badge warn">措辞待改</span></td></tr>
+    <tr><td><code>metrology/cli/fit_tracker_mount.py</code>（<b>新</b>）</td><td>两个子命令 <code>station</code> / <code>lever-arm</code>，直接从「跟踪仪会话 + episode」出数，<b>驻点由跟踪仪流自己分段</b>——1 kHz、且与注册/时钟/被检流水线无关，所以「哪一段是静止的」这个判断落在被检对象之外。每个候选窗口还要过 <code>check_dwell</code>。<b>两端各剪掉 0.3 s</b>：到位的沉降与离开的起步都够慢、都不是那个位姿，取进去会把均值拉向来的方向。<b>速度按 50 ms 窗口算而不是逐样本差分</b>：1 kHz 下逐样本差分是在测跟踪仪自己的噪声（几微米 ÷ 1 ms = 几 mm/s），阈值会永远不成立。</td><td><code>validate_against_tracker</code> 的 sidecar 读取；<code>check_dwell</code></td><td><span class="badge ok">已落地 · 端到端跑通</span></td></tr>
+    <tr><td><code>metrology/cli/validate_against_tracker.py</code></td><td>产出逐 episode 的 JSON 产物：verdict、逐帧残差、两条轨迹重采样到配对时刻。退出码 0/1/2 区分「数据的问题」与「装置的问题」。<b>新增 <code>--mount-fit</code></b>：注册、拟合出的 c、以及<b>被吸收的模式</b>三样<b>一起</b>读进来——拆成三个 flag 正是「站位配错 mount」和「把球心误差叫成 TCP 误差」这两个错误的发生方式。同时给 <code>--mount-fit</code> 和 <code>--lever-arm</code> 会被拒绝，而不是悄悄挑一个。</td><td><code>metrics.py</code> 的 APE / RPE</td><td><span class="badge ok">已接通</span></td></tr>
+    <tr><td>GUI：<code>gateway.py</code> <code>/api/tracker/alignment</code> + <code>TrackerAlignmentPanel.tsx</code></td><td>Replay 界面里叠加 GT 轨迹、残差时序、分层表。<b>网关只读文件不算数</b>——注册、c、两个钟拟合都要可审计，不能藏在一次刷新就会用不同输入重跑的 HTTP 请求后面。<b>verdict 现在有五档</b>，按「最受限的那句真话」排序：图而已 → 覆盖率不足 → <b>位置测量（姿态钉死，旋转不可见）</b> → <b>球心测量，不是 TCP 误差</b> → 测量。被吸收的模式用大白话列在下面，不藏在 tooltip 里。另加两行：杠杆臂 σ、逐位姿 c 散布。</td><td><code>Pose3DViewer</code> / <code>SeriesPlot</code></td><td><span class="badge ok">已接通</span></td></tr>
     <tr><td>FR3 测试脚本（新，Thor）</td><td>把说明书 §3 的坐标系对齐 / 示教点 / 自动循环三类脚本移植到 FR3，每点静置采集。</td><td><code>tools/fr3/fr3_cycle_motion_runtime.py</code></td><td><span class="badge hold">E5 前</span></td></tr>
     <tr><td>Thor 录制器（改）</td><td>逐帧记录曝光时间；走触发方案时记录同步脉冲计数。</td><td><code>tools/thor/gmsl2/gmsl2_record.py</code></td><td><span class="badge hold">T3</span></td></tr>
   </table>
@@ -930,7 +1011,7 @@
 </section>
 
 <section class="card" id="inputs">
-  <div class="section-title"><h2>需要你提供或决定</h2><span class="badge warn">6 项在办</span><span class="badge todo">6 项改版新问</span></div>
+  <div class="section-title"><h2>需要你提供或决定</h2><span class="badge ok">改版 6 问已答</span><span class="badge todo">装配图新带出 2 问</span></div>
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>输入</th><th>用在哪</th><th>不给会卡住</th></tr>
@@ -950,15 +1031,17 @@
     <tr><th>问题</th><th>答复</th><th>后果</th></tr>
     <tr class="lead"><td class="key">① marker → TCP 旋转要不要？</td><td><span class="badge ok">冲突已解除</span>——T4a 板做最小，跨距移给 T4b 的<b>另一块板</b></td><td><b>「板大会遮 cube」的担心成立，但这个权衡不必存在。</b>T4b 是独立静态场次，可以换一块板、共用同一组定位销与螺孔；它解出的 R<sub>box,rig</sub> 是机器属性、与板无关，照样搬回来用。<b>现在唯一要做的是把安装接口做成能换第二块板</b>，成本近似为零。要不要做 T4b 因此可以推迟到看见第一批球心残差之后再决定。</td></tr>
     <tr><td class="key">② 固定点挂哪一侧？</td><td><span class="badge ok">夹爪侧的静止本体，已确认</span></td><td>cube ↔ 本体的装配间隙留在残差里<b>可见</b>，新接法成立的前提已满足。<b>在静止本体上还白拿一条：c 与夹爪开口无关，采集期间不必钉死开口，这一轮可以做抓取动作</b>——老方案 A 的指间 insert 正是卡在这一条上。</td></tr>
-    <tr><td class="key">③ SMR 规格？</td><td><span class="badge ok">300400 40M-Prec，d 12.5 mm</span></td><td>0.5″ 级，≈ 8–9 g。防脱与窝内微动两条风险降级，T6 两行从 0.15 / 0.10 下调到 0.05 / 0.05，合计 0.77 → <b>0.75 mm</b>。接收角 α 仍待查/待测，<b>但它不再是拦路虎</b>：E3a 把姿态钉死后，α 只需覆盖工作区自身的方向张角，E0 扫出实测值即可反算允许的横向半径。</td></tr>
+    <tr class="lead"><td class="key">③ SMR 口径？</td><td><span class="badge ok">2026-09-17 定：<b>1.5″</b></span><br/><span class="small">0.5″ 配套靶座不采购</span></td><td><b>按覆盖率选，不按精度选</b>——口径进预算的全部路径合计只差 0.02 mm（0.75 → 0.77），是被裁决的 3 mm 的 0.7%；而跟踪捕获窗口差 <b>3 倍</b>，接收锥边缘的有效通光孔与重捕速度同向。推导见 <a href="#smr-on-body">靶球口径为什么不是精度问题</a>。反对的三条已全部关闭（遮挡、干涉、质量）。<b>剩一条待办：清点确认 1.5″ 磁吸窝在库。</b></td></tr>
     <tr><td class="key">④ 两个力臂？</td><td><span class="badge ok">球心 ↔ cube 160 mm；球心 ↔ TCP 60 mm</span><br/><span class="badge ok">与 247/259.5 的矛盾：以实验为准</span></td><td>旋转灵敏度 <b>2.79 mm/°</b>（时变姿态误差观测得好）；球心 → TCP 转移 <b>1.05 mm/°</b>，比老方案省一个数量级。矛盾的裁决<b>不需要额外做任何事</b>：<b>第一次驻点集拟合出的 c，它的模就是 |c| 的实测值</b>，而且带方向。与 160 mm 对不上就是一个发现。cube 中心 ↔ TCP 那一段仍要等 T4b 或 pivot。</td></tr>
-    <tr><td class="key">⑤ 常驻还是验证场次装？</td><td><span class="badge ok">仅验证场次装</span></td><td>每次装拆是新 <code>mount_id</code>、c 重拟合（本来就要）。「附加质量改了被测系统」这条限定写进每份结论；8–9 g 的球之下主导项是钢片，做薄即可压到可忽略。</td></tr>
+    <tr><td class="key">⑤ 常驻还是验证场次装？</td><td><span class="badge ok">仅验证场次装</span></td><td>每次装拆是新 <code>mount_id</code>、c 重拟合（本来就要）。「附加质量改了被测系统」这条限定写进每份结论——<b>但它比听起来轻</b>：本页报的是 error(速度, 姿态, 相机数) 的分层曲线，输入分布偏移不会让在该分布上测出来的函数失效，剩下的只有「范围覆盖」，而 E3a 是主动跑速度档。想彻底抹平就让板与窝常驻、生产时坐一颗等重哑球。</td></tr>
+    <tr><td class="key">⑦ 这叠装会不会占掉/挡住腕部相机？ <span class="badge todo">装配图带出</span></td><td><span class="badge warn">待答</span></td><td>蓝色套筒看着像相机安装环。<b>如果这一叠占用的是某台参与位姿解算的相机的位置，那验证 episode 就比生产 episode 少一台相机</b>——而 <code>num_cameras</code> 恰好是本页的分层轴之一，等于拿一个更差的构型去代表生产构型。若只是共用安装面、不挤掉相机，这条自动关闭。</td></tr>
+    <tr><td class="key">⑧ 球心到夹爪安装面的悬伸是多少？ <span class="badge todo">装配图带出</span></td><td><span class="badge warn">待答</span></td><td>它同时决定三件事：弯矩（∝ 悬伸）、|c|（旋转灵敏度 2.79 mm/° 是按 160 mm 算的）、以及球心↔TCP 的转移项（1.05 mm/°）。<b>1.5″ 球心比 0.5″ 更靠外，所以先前那两个数都要按这一叠重报一次。</b>不影响方法——c 是拟合量，第一次驻点集就给实测值。</td></tr>
     <tr class="lead"><td class="key">⑥ 站位？</td><td><span class="badge ok">固定，r ≈ 1.5 m；最近工作点 0.8 m，最小测程 &lt; 0.2 m</span></td><td><b>固定是纯赚</b>：T<sub>WG</sub> 成为跨场次常量，每场次只需重拟合 c；跨场次的 ΔT<sub>WG</sub> 白送一个站位 + 相机外参的漂移看门狗（主 roadmap P2 想要的那个）。测程 4 倍余量，无冲突。<b>剩下的唯一约束是接收角，而且瓶颈在近端而不是站位</b>——0.8 m 处横向 0.5 m 就张 32°，单独吃光整个锥。出路见 <a href="#smr-on-body">「接收角预算」</a>：<b>先跑 E3a 固定姿态只验位置</b>。</td></tr>
   </table>
   </div>
 
   <p class="sub-h">接收角预算：唯一的真约束，以及「固定姿态只验位置」这条出路</p>
-  <p>跟踪动态不是问题（ω = v/r：680 mm/s 下 26°/s，1.5 m/s 下 57°/s）；测程也不是问题（最近工作点 0.8 m vs 最小测程 &lt; 0.2 m，4 倍余量）。<b>唯一会把方法卡死的是接收角，而它是一笔要分两处花的预算：工作区自身的方向张角 + 夹爪姿态的摆动。</b>方向张角 = atan(横向偏移 / 距离)，<b>近端最贵</b>：</p>
+  <p>跟踪动态不是问题（ω = v/r：680 mm/s 下 26°/s，1.5 m/s 下 57°/s）；测程也不是问题（最近工作点 0.8 m vs 最小测程 &lt; 0.2 m，4 倍余量）；回光在 1.5 m 处对任何口径都饱和。<b>唯一会把方法卡死的是接收角，而它是一笔要分两处花的预算：工作区自身的方向张角 + 夹爪姿态的摆动。</b>方向张角 = atan(横向偏移 / 距离)，<b>近端最贵</b>：</p>
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>到跟踪仪的距离</th><th>横向 0.2 m</th><th>横向 0.3 m</th><th>横向 0.4 m</th><th>横向 0.5 m</th></tr>
