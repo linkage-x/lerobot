@@ -293,8 +293,11 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " [--fps 60] [--codec h265] [--bitrate 40000000]"
                       << " [--iframe-interval 1] [--container mkv]"
                       << " [--startup-min-rows N] [--startup-timeout-ms MS]"
-                      << " [--name-prefix cam]"
+                      << " [--name-prefix cam] [--exposure-us 0]"
                       << "\n       --frames 0 records until SIGINT/SIGTERM"
+                      << "\n       --exposure-us 0 leaves Argus auto-exposure alone;"
+                         " any other value pins the exposure and locks AE."
+                         " The per-frame exposure is recorded either way."
                       << std::endl;
             std::exit(0);
         } else {

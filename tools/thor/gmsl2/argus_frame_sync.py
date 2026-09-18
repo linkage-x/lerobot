@@ -34,11 +34,15 @@ class ArgusFrameMetadata:
     """Integration time Argus reported for this frame.
 
     Defaults to 0 so sidecars written before the column existed still load.
-    It matters because ``sof_tsc_ns`` is *not* the instant the scene was
-    sampled -- mid-exposure sits roughly half an exposure earlier -- and under
-    auto-exposure that gap tracks scene brightness, which tracks pose. A
-    pose-correlated timing bias does not average out, so the only defence is to
-    pin the exposure and record what actually happened."""
+    It matters because the frame stamps are *not* the instant the scene was
+    sampled: the frame timeline is trigger -> integrate -> read out, so
+    mid-exposure sits about half an exposure *after* start-of-frame.  Under
+    auto-exposure that gap tracks scene brightness, which tracks pose, and a
+    pose-correlated timing bias does not average out.  Pin the exposure and the
+    gap becomes constant; record it per frame and the gap becomes correctable
+    (``thor_lerobot_v3.EXPOSURE_CENTER_FRACTION``) whether it was pinned or not.
+    Which edge the Tegra VI actually stamps is settled by the two-exposure
+    experiment described there, not by this comment."""
     sensor_analog_gain: float = 0.0
     """Recorded alongside exposure because auto-control trades one against the
     other: gain moving while exposure sits still is the signature of a lock that

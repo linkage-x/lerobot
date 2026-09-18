@@ -736,13 +736,21 @@
       </div>
       <p class="sub-h">按投入产出排序（Trigger 口排最后）</p>
       <ol>
-        <li><b>锁定曝光 + 逐帧记录曝光</b>——零成本，消掉一个 2.7 mm 量级的逐帧变动项。</li>
+        <li><b>逐帧记录曝光（不再追锁定）</b>——零成本，消掉那个 2.7 mm 量级的逐帧变动项。<span class="badge ok">2026-09-18 代码已落地</span> <b>口径改了</b>：曝光记下来之后，摆动是<b>被逐帧减掉</b>的，不是偏置，所以<b>不需要锁</b>，只需要<b>记</b>——原来那条「锁不锁得住」的判据反而会误杀已经正确的 episode。三个 recorder 都写 <code>sensor_exposure_time_ns</code> / <code>sensor_analog_gain</code>；<code>check_exposure_lock.py</code> → <code>check_exposure_timing.py</code>，改判<b>修正之后还剩什么</b>。<b>还没在 Thor 上编译过</b>——<code>check_recorder_build.py</code> 把三个目标编到临时目录，不碰线上的 <code>/tmp/lerobot_argus_*</code>。</li>
+        <li><b>剩下的那一项：跨相机曝光差。</b>各路曝光不同 → 采样时刻不同，而<b>一个融合位姿只有一个时间戳</b>，这部分<b>记录修不掉</b>，是地板。4 ms 差在 680 mm/s 下是 2.7 mm。唯一的解法是把各路曝光<b>拉齐</b>（与「锁不锁」是两件事），否则就当作误差地板计入。</li>
         <li><b>T3c 的相机那一半</b>（PWM + LED 扫延迟）——不需要 Trigger 口，消掉 3.0 mm 的 lumped 偏置。做完 1+2 就落在 B1。</li>
         <li><b>自己上台架测 Trigger 口</b>——从低电平小电流起步、顺便量负载幅度判断是不是 50 Ω 端接。一个下午，不欠 API 人情。</li>
         <li><b>缩短曝光</b>——8.7 ms 在 680 mm/s 下是 <b>5.9 mm 拖影</b>，直接影响检测精度，也缩小 SOF ↔ 中点的不确定度。</li>
         <li>等 API 回复。</li>
       </ol>
       <p class="small"><b>做完 1+2，硬触发的边际收益只剩 0.04 mm 和「可归因性」。</b>即使 API 永远不回，这条 GT 链不会死；死的是把误差拆开的那部分能力。</p>
+      <p class="sub-h">2026-09-18 落地时挖出来的两件事 <span class="badge warn">都比曝光那一项更靠前</span></p>
+      <div class="callout warn">
+        <p><b>① 标签用的根本不是 SOF，是 N/fps 名义栅格。</b><code>thor_lerobot_v3</code> 里写得很明白：<code>timestamp_s = frame_origin_s + local_frame / fps</code>，注释是「parquet <code>timestamp</code> 列保持 N/fps（loader 合同）」。硬件 SOF（<code>camera_frame_times_rel</code>）只拿去做 <b>BOX 最近邻查找的目标</b>，没有进 parquet。而 GT 链读的是 v2 sidecar 的 <code>timestamp_s</code> ← parquet <code>timestamp</code>，<b>所以跟踪仪比对用的是名义栅格</b>。ts_sync.md §5.4 实测 N/fps 与硬件 SOF 之间有 <b>逐 episode 变的 10–55 ms 固定 skew</b>；在 680 mm/s 下 45 ms 就是 <b>30 mm</b>。<b>这一项比曝光那 2.7 mm 大一个数量级</b>，而且它不是猜的，是已经量过的。曝光中点修正必须搭一个不违反 loader 合同的载体才能到达 GT 标签——现在这一版只到了 BOX 对齐那条路。</p>
+        <p><b>② <code>validate_against_tracker</code> 把 episode 本地秒当成了 Thor 绝对秒。</b><code>_read_sidecar</code> 读出的 <code>cam_t</code> 是 episode 本地时间（从 ~0 开始），直接当 <code>camera_thor_s</code> 传进 <code>pair_on_camera_times</code>，命令行上<b>没有任何 t0 锚点参数</b>。好消息是它会<b>响亮地失败</b>而不是悄悄给个错数——两段时间根本不重叠，覆盖率直接 0、走「cannot run」分支。之前跑通的那次是 fixture 自己造的 <code>sync.csv</code>，时间对得上，把这个缺口盖住了。<b>上真机前必须把 <code>meta.json</code> 的 <code>t0_mono_s</code> 接进来</b>，这也正好是 ① 的那个载体。</p>
+      </div>
+      <p class="sub-h">曝光中点的<b>符号</b>：不问供应商，用两档曝光自己读出来</p>
+      <p class="small">帧时间线是 触发 → 积分 → 读出（§3.1 的 slave mode 约束 <code>exposure_us + readout_time &lt; PWM 周期</code> 就是这个顺序的证据），所以若 <code>getSensorTimestamp</code> 给的是积分<b>起点</b>，采样时刻 = SOF + T<sub>exp</sub>/2。但 Tegra VI 到底锁存哪条边，是驱动细节不是数据手册条目。<b>实验判据</b>：同一段运动录两档锁定曝光（如 2 ms 与 12 ms），各自用 <code>--exposure-fraction 0.0</code>（即不做修正）估相机↔IMU 偏置，两个偏置之差必须正好是 <b>(e<sub>长</sub> − e<sub>短</sub>)/2 = 5 ms</b>：<b>差值的符号直接读出锁存的是哪条边，差值的大小顺带检验「中点模型」本身成立与否</b>。两个问题都不欠供应商。代码里它是 <code>EXPOSURE_CENTER_FRACTION = 0.5</code>，一个具名常量而不是字面量，就是为了这个实验有地方落结论；<b>符号搞反的代价是一整个 T<sub>exp</sub>，不是 T<sub>exp</sub>/2</b>。</p>
       <div class="gate"><span class="gate-label">GATE</span>首选按<b>脉冲计数</b>结案：一段 ≥ 10 min 的采集里，TTL 回调条数 == PWM 脉冲数 == 相机帧数，三者逐段可核；<code>device_time</code> 相邻差的直方图只有 16.667 ms 一个峰。加上触发延迟与「SOF → 曝光中点」偏置两个实测常数，时间行就只剩这两个常数的不确定度。<b>计数对不上时</b>才退回原判据：Δt 残差 ≤ 0.7 ms、钟速比 s ≤ 30 ppm。</div>
     </article>
 

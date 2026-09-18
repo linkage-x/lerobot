@@ -670,24 +670,74 @@ def _nearest_sample_data(
     return samples[idx].get("data", {})
 
 
+#: Fraction of the integration window that separates ``sensor_timestamp_ns``
+#: from the instant the scene was actually sampled.
+#:
+#: ``+0.5`` says the stamp is the *start* of integration, so mid-exposure is
+#: half an exposure later.  ``-0.5`` would say the stamp is latched at the
+#: start of readout, i.e. the *end* of integration.  ts_sync.md §3.1 pins the
+#: frame timeline as trigger -> integrate -> read out (slave mode requires
+#: ``exposure_us + readout_time < PWM period``), which makes ``+0.5`` the
+#: reading that matches the hardware -- but which of the two edges the Tegra VI
+#: hands to ``getSensorTimestamp`` is a driver detail, not a datasheet one.
+#:
+#: It is a named constant rather than a literal because the two-exposure
+#: experiment settles it directly: record the same motion at two locked
+#: exposures and estimate the camera<->IMU offset for each *without* this
+#: correction.  The offsets must differ by exactly ``(e_long - e_short) / 2``,
+#: and the sign of that difference reads the convention straight off.  Until
+#: that has been run, this is an assumption -- a wrong sign here is a
+#: ``exposure`` error, not ``exposure / 2``.
+EXPOSURE_CENTER_FRACTION = 0.5
+
+#: Fixed sensor->stamp latency, in seconds, on top of the exposure term.
+#:
+#: Zero means *uncalibrated*, not *measured to be zero*.  Unlike the exposure
+#: term this one is constant, so it is absorbed by the T3c intercept and does
+#: not move a trajectory's shape; it is exposed here so the T3c LED sweep has
+#: somewhere to put its answer.
+READOUT_OFFSET_S = 0.0
+
+
 def camera_frame_times_rel(
     ep_dir: Path,
     t0_mono_s: float | None,
     *,
     camera: str | None = None,
+    exposure_fraction: float = EXPOSURE_CENTER_FRACTION,
+    readout_offset_s: float = READOUT_OFFSET_S,
 ) -> list[float | None] | None:
     """Camera hardware frame time per online-sync ``logical_frame_index``, in
     the t0-relative domain shared with BOX ``t_rel_s`` (both anchored to the
     same ``time.monotonic()`` origin)::
 
-        time[N] = sensor_timestamp_ns[N] / 1e9 - t0_mono_s
+        time[N] = (sensor_timestamp_ns[N] / 1e9
+                   + exposure_fraction * sensor_exposure_time_ns[N] / 1e9
+                   + readout_offset_s) - t0_mono_s
 
     ``sensor_timestamp_ns`` is the Argus/V4L2 kernel **start-of-frame (SOF)**
     timestamp (``getSensorTimestamp``, CLOCK_MONOTONIC) — the same clock as the
     ``time.monotonic()`` latched into ``t0_mono_s`` at ``start_episode``.  It is
-    a hardware frame-time anchor, not a proven exposure-center; a small *fixed*
-    exposure/readout offset may remain, but being constant it does not affect
-    the per-episode-varying skew this corrects.  The idealized ``N/fps`` grid
+    a hardware frame-time anchor, not the exposure center.
+
+    The gap between the two is ``exposure_fraction * exposure``, and it is
+    *not* constant: under Argus auto-exposure the integration time tracks scene
+    brightness, which tracks pose, so the label's time offset varies with where
+    the rig is.  That is a pose-correlated timing bias -- it does not average
+    out, and no amount of clock work can find it, because both clocks are fine.
+    At this rig's p95 hand speed (680 mm/s) an exposure swinging 4-12 ms is
+    ~2.7 mm of position-label wander on its own.  Subtracting the term
+    per-frame is what turns that from a bias into a correction, so the exposure
+    does *not* have to be pinned -- it has to be *recorded*.  What the
+    correction cannot remove is cross-camera exposure differences, since one
+    fused pose carries one time; ``check_exposure_timing.py`` prices that.
+
+    Frames whose sidecar carries no exposure column read 0 and are therefore
+    left exactly where they were, so pre-column episodes load unchanged.
+
+    ``readout_offset_s`` is the remaining fixed latency and defaults to
+    *uncalibrated* zero; being constant it shifts a trajectory without
+    deforming it.  The idealized ``N/fps`` grid
     instead assumes frame 0 == t0 and exactly 60.000 Hz; on real Thor data it is
     offset from the SOF anchor by a per-episode fixed skew of ~10-55 ms
     (ts_sync.md §5.4 / experiments/ts_sync_skew_20260716/).  Using these times
@@ -718,8 +768,19 @@ def camera_frame_times_rel(
                         sof = float(row["sensor_timestamp_ns"])
                     except (KeyError, ValueError, TypeError):
                         continue
+                    # Absent / all-zero column == pre-lock sidecar: contribute
+                    # nothing rather than guess an exposure.
+                    try:
+                        exposure_ns = float(row.get("sensor_exposure_time_ns") or 0.0)
+                    except (ValueError, TypeError):
+                        exposure_ns = 0.0
                     if sof > 0:
-                        by_frame[n] = sof / 1e9 - float(t0_mono_s)
+                        by_frame[n] = (
+                            sof / 1e9
+                            + exposure_fraction * max(exposure_ns, 0.0) / 1e9
+                            + readout_offset_s
+                            - float(t0_mono_s)
+                        )
         except (OSError, csv.Error):
             continue
         if by_frame:
