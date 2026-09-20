@@ -50,7 +50,7 @@ def test_session_paths_use_windows_separators() -> None:
     # and seal rglobs a directory, so pointing it at the root would sweep every
     # past session into one manifest.
     assert session.probe_stop_file == r"D:\lt\lt_x\STOP_PROBE"
-    assert session.episode_stop_file == r"D:\lt\lt_x\STOP_EPISODE"
+    assert session.logger_stop_file == r"D:\lt\lt_x\STOP_LOGGER"
 
 
 def test_disabled_start_is_a_quiet_false() -> None:
@@ -73,6 +73,42 @@ def test_episode_calls_are_inert_when_not_connected() -> None:
     assert session.start_recording(0, 123.0) is False
     assert session.stop_recording() == {}
     assert session.stop() == {"session_id": session.session_id, "landed_to": "", "sealed": False}
+
+
+def test_start_recording_makes_no_remote_call() -> None:
+    """Start Episode is on the same critical path as the cameras.
+
+    The tracker stream has been running since Connect precisely so that this is
+    bookkeeping: the logger needs 15-16 s to produce its first sample, and no
+    episode can wait for that.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    calls = []
+    session._run = lambda *a, **k: calls.append(a)  # type: ignore[method-assign]
+
+    assert session.start_recording(3, 999.0) is True
+    assert calls == []
+
+
+def test_a_stalled_stream_is_caught_at_episode_stop() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 5000
+    session._count_rows = lambda _name: 5000  # type: ignore[method-assign]
+
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    assert rec["stream_advanced"] is False
+    assert "beam" in rec["error"]
+
+    # And an advancing stream is quiet.
+    session._count_rows = lambda _name: 9000  # type: ignore[method-assign]
+    session.start_recording(1, 2.0)
+    rec = session.stop_recording()
+    assert rec["stream_advanced"] is True
+    assert rec["error"] == ""
+    assert rec["rt_rows_total_at_stop"] == 9000
 
 
 def test_status_is_renderable_before_anything_happens() -> None:
@@ -137,3 +173,38 @@ def test_set_device_state_ignores_an_undeclared_device() -> None:
     state = type("S", (), {"devices": rows})()
     gateway._set_device_state(state, "not_a_device", "error", "nope")
     assert rows == before
+
+
+def test_repo_root_is_found_not_counted(tmp_path) -> None:
+    """A moved file must not break path resolution with an opaque error.
+
+    ``parents[3]`` raised ``IndexError(3)``, and that exception's whole string
+    form is ``3`` -- so the operator's warning read "connect failed: 3".
+    """
+    session = lts.LaserTrackerSession(_cfg(), repo_root=tmp_path)
+    assert session.repo_root == tmp_path
+    # and the default still finds the real checkout from the installed location
+    assert (lts.LaserTrackerSession(_cfg()).repo_root / "third_party").is_dir()
+
+
+def test_failure_message_is_a_diagnosis_not_a_number() -> None:
+    session = lts.LaserTrackerSession(_cfg(win_host="user@192.0.2.1"))
+    assert session.start() is False
+    # "connect failed: 3" is what an IndexError used to produce. Whatever the
+    # cause, the operator must get words.
+    assert len(session.last_error) > 20
+    assert not session.last_error.rstrip().endswith(": 3")
+
+
+def test_windows_oem_output_never_breaks_a_connect() -> None:
+    """cmd.exe answers in the OEM codepage, and 0xD5 is not valid UTF-8.
+
+    `del` on a missing stop-file replies 找不到文件 on a Chinese install, which
+    is routine; decoding it with utf-8 raised and failed the whole Connect.
+    """
+    # The exact bytes from the field report: 找不到文件 in CP936.
+    assert lts._decode("找不到文件".encode("cp936")) == "找不到文件"
+    assert lts._decode(b"ok") == "ok"
+    # Anything at all decodes rather than raising -- latin-1 terminates the chain.
+    assert lts._decode(bytes(range(256)))
+    assert lts._decode(b"\xd5\x00\xff")

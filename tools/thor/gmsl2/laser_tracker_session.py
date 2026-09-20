@@ -9,10 +9,23 @@ contributes is the clock responder and, at the end, a place to put the files.
 Lifecycle, deliberately the same shape as ``box_collection.BoxPool`` so the
 recorder's episode loop treats it like any other sensor:
 
-    start()                 Connect      responder up, probe running, link alive
-    start_recording(...)    Start        one lt_realtime_logger per episode
-    stop_recording()        Stop         stop that logger, count what it wrote
-    stop(land_to=...)       Disconnect   stop probe, seal, land, verify
+    start()                 Connect      responder + clock probe + tracker stream
+    start_recording(...)    Start        mark this episode's boundary in the stream
+    stop_recording()        Stop         close the boundary, check the stream is alive
+    stop(land_to=...)       Disconnect   stop both, seal, land, verify
+
+**One logger per Connect, not per episode.**  Measured on DESKTOP-API
+2026-09-20: `lt_realtime_logger` takes **15-16 s** from launch to its first
+sample, almost all of it inside the SDK's `Connect()` handshake (reproduced
+twice: 16 s and 15 s).  Paying that per episode would either block Start Episode
+for a quarter of a minute or silently drop the first 16 s of every episode's
+tracker data, and a GT session cannot afford either.  So the stream runs for the
+whole Connect window and Start/Stop Episode record boundaries into it.
+
+That is also the honest shape.  The 1 kHz stream is stamped by the controller
+and only becomes comparable to camera frames through the offline
+`QPC <-> CLOCK_MONOTONIC` fit, so slicing it per episode is an offline operation
+either way -- doing it at record time would buy nothing and cost 16 s.
 
 **Nothing here raises into the recorder.**  The tracker is a shared instrument
 that is unavailable more often than not, and a laboratory that cannot record
@@ -36,6 +49,7 @@ session before they were understood (see
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import time
@@ -47,6 +61,39 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _SSH_BASE = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new")
+
+
+def _decode(raw: bytes) -> str:
+    """Decode whatever the Windows console said, without ever raising.
+
+    cmd.exe answers in the system OEM codepage, not UTF-8: on a Chinese install
+    `del` on a missing file replies 找不到文件, whose first byte is 0xD5, and
+    ``text=True`` then dies with "'utf-8' codec can't decode byte 0xd5".  That
+    turned a routine "the stop-file was not there" into a failed Connect.
+
+    latin-1 cannot fail, so the chain always terminates: mojibake in a log line
+    is a far better outcome than losing the session it was describing.
+    """
+    for encoding in ("utf-8", "cp936", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _default_repo_root() -> Path:
+    """Walk up until the tree looks like the repo, rather than counting levels.
+
+    ``parents[3]`` was right until this file was read from somewhere else, and
+    then it raised ``IndexError(3)`` -- whose entire string form is ``3``, so the
+    operator's warning read "laser tracker unavailable: connect failed: 3".
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "third_party").is_dir() or (parent / ".git").exists():
+            return parent
+    return here.parent
 
 
 @dataclass
@@ -68,7 +115,8 @@ class LaserTrackerConfig:
     # a gateway that died without cleaning up cannot leave a process on the
     # capture PC forever.
     session_cap_s: float = 24 * 3600.0
-    episode_cap_s: float = 3600.0
+    # Generous: the SDK handshake alone measured 15-16 s.
+    logger_ready_timeout_s: float = 60.0
     land: bool = True
     note: str = ""
 
@@ -106,11 +154,15 @@ class EpisodeRecord:
     """What one episode's tracker capture produced, for the episode meta."""
 
     episode_index: int
-    session_name: str = ""
     started: bool = False
-    rt_rows: int = 0
-    error: str = ""
     t_start_wall_s: float = 0.0
+    t_end_wall_s: float = 0.0
+    # Total rows the ONE session-long stream had written when this episode
+    # ended -- not this episode's count, which is an offline slice by timestamp.
+    # Named so nobody reads it as the latter.
+    rt_rows_total_at_stop: int = 0
+    stream_advanced: bool = True
+    error: str = ""
 
 
 @dataclass
@@ -131,14 +183,22 @@ class LaserTrackerStatus:
 class LaserTrackerSession:
     """Drives the capture PC over ssh for one Connect..Disconnect window."""
 
-    def __init__(self, cfg: LaserTrackerConfig, *, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        cfg: LaserTrackerConfig,
+        *,
+        session_id: str | None = None,
+        repo_root: Path | None = None,
+    ) -> None:
         self.cfg = cfg
+        self.repo_root = Path(repo_root) if repo_root is not None else _default_repo_root()
         self.session_id = session_id or datetime.now(timezone.utc).strftime("lt_%Y%m%d_%H%M%S")
         self.last_error = ""
         self._connected = False
         self._probe: subprocess.Popen[str] | None = None
         self._episode: EpisodeRecord | None = None
         self._episodes: list[EpisodeRecord] = []
+        self._rows_mark = 0
         self._logger_proc: subprocess.Popen[str] | None = None
 
     # ---------------------------------------------------------------- ssh --
@@ -152,19 +212,22 @@ class LaserTrackerSession:
         return f"{self.win_dir}\\STOP_PROBE"
 
     @property
-    def episode_stop_file(self) -> str:
-        return f"{self.win_dir}\\STOP_EPISODE"
+    def logger_stop_file(self) -> str:
+        return f"{self.win_dir}\\STOP_LOGGER"
 
     def _ssh_argv(self) -> list[str]:
         key = str(Path(self.cfg.ssh_key).expanduser())
         return ["ssh", "-i", key, *_SSH_BASE, self.cfg.win_host]
 
     def _run(self, remote_cmd: str, *, timeout_s: float = 30.0) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        # Captured as bytes and decoded here rather than text=True: see _decode.
+        raw = subprocess.run(
             [*self._ssh_argv(), remote_cmd],
             capture_output=True,
-            text=True,
             timeout=timeout_s,
+        )
+        return subprocess.CompletedProcess(
+            raw.args, raw.returncode, _decode(raw.stdout or b""), _decode(raw.stderr or b"")
         )
 
     def _spawn(self, remote_cmd: str) -> subprocess.Popen[str]:
@@ -180,6 +243,7 @@ class LaserTrackerSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",
             start_new_session=True,
         )
 
@@ -191,15 +255,22 @@ class LaserTrackerSession:
             return False
         try:
             self._ensure_responder()
-            probe = self._start_probe()
-            if not probe:
+            if not self._spawn_probe():
+                return False
+            # Spawned before either is awaited so the probe's ~2 s and the
+            # tracker's ~16 s handshake overlap instead of adding up.
+            self._spawn_logger()
+            if not self._await_probe():
+                return False
+            if not self._await_logger():
+                self._teardown_probe()
                 return False
             self._connected = True
             self.last_error = ""
             logger.info("laser tracker session %s connected (%s)", self.session_id, self.win_dir)
             return True
         except Exception as exc:  # never break Connect for the other devices
-            self.last_error = f"connect failed: {exc}"
+            self.last_error = f"connect failed: {type(exc).__name__}: {exc}"
             logger.warning("laser tracker connect failed: %s", exc)
             self._teardown_probe()
             return False
@@ -213,12 +284,12 @@ class LaserTrackerSession:
         notices it is gone until the probe writes an empty file, which is how
         2026-09-18's reboot cost 2026-09-20's morning.
         """
-        script = Path(__file__).resolve().parents[3] / self.cfg.responder_script
+        script = self.repo_root / self.cfg.responder_script
         if not script.exists():
             raise RuntimeError(f"responder script not found: {script}")
-        subprocess.run([str(script), "start"], capture_output=True, text=True, timeout=30)
+        subprocess.run([str(script), "start"], capture_output=True, text=True, errors="replace", timeout=30)
 
-    def _start_probe(self) -> bool:
+    def _spawn_probe(self) -> bool:
         out = f"{self.win_dir}\\{self.session_id}.sync.csv"
         mk = self._run(f'if not exist "{self.win_dir}" mkdir "{self.win_dir}"')
         if mk.returncode != 0:
@@ -232,20 +303,80 @@ class LaserTrackerSession:
             f'--interval {self.cfg.probe_interval_s:g} --duration {self.cfg.session_cap_s:g}'
         )
         self._probe = self._spawn(cmd)
+        return True
+
+    def _spawn_logger(self) -> None:
+        """One stream for the whole Connect window. See the module docstring."""
+        self._run(f'del /q "{self.logger_stop_file}"')
+        note = self.cfg.note or f"{self.session_id} (gateway session)"
+        cmd = (
+            f'cd /d {self.cfg.win_root} && "{self.cfg.logger_exe}" '
+            f'--ip {self.cfg.tracker_ip} --out "{self.win_dir}" --session {self.session_id} '
+            f'--note "{note}" --duration {self.cfg.session_cap_s:g} '
+            f'--stop-file "{self.logger_stop_file}"'
+        )
+        self._logger_proc = self._spawn(cmd)
+
+    def _await_probe(self) -> bool:
         # The probe is its own link check: if rows are landing, the responder is
         # up, UDP is open and the path works.  A separate 30 s --check would just
         # make Connect slower to learn the same thing.
-        time.sleep(2.0)
-        if self._probe.poll() is not None:
-            self.last_error = f"probe exited immediately: {(self._probe.stdout.read() if self._probe.stdout else '').strip()[:300]}"
-            self._probe = None
-            return False
-        rows = self.sync_rows()
+        #
+        # Polled rather than sampled once: rows appear on disk a flush at a time,
+        # so a single read at a fixed instant races the writer and reports zero
+        # exchanges on a perfectly healthy link.
+        deadline = time.monotonic() + 8.0
+        rows = 0
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            if self._probe.poll() is not None:
+                tail = (self._probe.stdout.read() if self._probe.stdout else "").strip()
+                self.last_error = f"probe exited immediately: {tail[:300]}"
+                self._probe = None
+                return False
+            rows = self.sync_rows()
+            if rows > 0:
+                break
         if rows <= 0:
-            self.last_error = "clock probe is producing no exchanges -- responder down or UDP blocked"
+            self.last_error = (
+                "clock probe produced no exchanges in 8 s -- is the responder up on "
+                f"{self.cfg.thor_host}:{self.cfg.responder_port}, and is UDP open?"
+            )
             self._teardown_probe()
             return False
-        logger.info("clock probe alive: %d exchanges in the first 2 s", rows)
+        logger.info("clock probe alive: %d exchanges", rows)
+        return True
+
+    def _await_logger(self) -> bool:
+        """Wait for the tracker stream to actually produce samples.
+
+        Measured 15-16 s to the first sample, so the budget is generous; a
+        process that is merely alive proves nothing, because every failure mode
+        worth catching (SA holding the instrument, not warmed up, no beam lock)
+        leaves it alive and silent.
+        """
+        deadline = time.monotonic() + max(60.0, self.cfg.logger_ready_timeout_s)
+        rows = 0
+        while time.monotonic() < deadline:
+            time.sleep(2.0)
+            if self._logger_proc is not None and self._logger_proc.poll() is not None:
+                tail = (self._logger_proc.stdout.read() if self._logger_proc.stdout else "").strip()
+                # Commonest cause by far: the tracker admits one client and SA
+                # has it. Say that rather than printing an SDK ordinal.
+                self.last_error = f"tracker logger exited: {tail[:300]}"
+                self._logger_proc = None
+                return False
+            rows = self._count_rows(f"{self.session_id}.rt.csv")
+            if rows > 0:
+                break
+        if rows <= 0:
+            self.last_error = (
+                f"tracker produced no samples in {self.cfg.logger_ready_timeout_s:g} s -- "
+                "is it warmed up, locked on an SMR, and not held by SA?"
+            )
+            return False
+        self._rows_mark = rows
+        logger.info("tracker stream alive: %d samples", rows)
         return True
 
     def sync_rows(self) -> int:
@@ -262,62 +393,46 @@ class LaserTrackerSession:
     # ------------------------------------------------------------ episode --
 
     def start_recording(self, episode_index: int, t_start_wall_s: float) -> bool:
-        """Start Episode: one logger run, named after the episode."""
+        """Start Episode: open a boundary. No remote call, so no added latency.
+
+        The stream is already running (see the module docstring), so this is
+        bookkeeping. Deliberately: anything here lands on the same critical path
+        as the cameras' own episode start.
+        """
         if not self._connected:
             return False
-        name = f"episode_{episode_index:06d}"
-        rec = EpisodeRecord(episode_index=episode_index, session_name=name, t_start_wall_s=t_start_wall_s)
-        try:
-            self._run(f'del /q "{self.episode_stop_file}"')
-            note = self.cfg.note or f"{name} @ {datetime.now(timezone.utc).isoformat()}"
-            cmd = (
-                f'cd /d {self.cfg.win_root} && "{self.cfg.logger_exe}" '
-                f'--ip {self.cfg.tracker_ip} --out "{self.win_dir}" --session {name} '
-                f'--note "{note}" --duration {self.cfg.episode_cap_s:g} '
-                f'--stop-file "{self.episode_stop_file}"'
-            )
-            self._logger_proc = self._spawn(cmd)
-            time.sleep(0.5)
-            if self._logger_proc.poll() is not None:
-                out = (self._logger_proc.stdout.read() if self._logger_proc.stdout else "").strip()
-                # The commonest cause by far: the tracker admits one client and
-                # SA is holding it.  Say so rather than printing an SDK ordinal.
-                rec.error = f"logger exited at once: {out[:300]}"
-                self.last_error = rec.error
-                self._logger_proc = None
-            else:
-                rec.started = True
-        except Exception as exc:
-            rec.error = f"start failed: {exc}"
-            self.last_error = rec.error
-        self._episode = rec
-        return rec.started
+        self._episode = EpisodeRecord(
+            episode_index=episode_index, started=True, t_start_wall_s=t_start_wall_s
+        )
+        return True
 
     def stop_recording(self) -> dict[str, Any]:
-        """Stop Episode: stop-file, wait for the logger, count what landed."""
+        """Stop Episode: close the boundary and check the stream is still alive.
+
+        One remote call, after the episode has already ended, so it costs the
+        operator nothing. The number it reads is the session total; this
+        episode's own rows are an offline slice by timestamp, and the field is
+        named so that it cannot be mistaken for one.
+        """
         rec = self._episode
         self._episode = None
         if rec is None:
             return {}
-        if rec.started:
-            try:
-                self._run(f'type nul > "{self.episode_stop_file}"')
-                if self._logger_proc is not None:
-                    try:
-                        self._logger_proc.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        self._logger_proc.terminate()
-                        rec.error = "logger did not stop within 30 s; terminated"
-                        self.last_error = rec.error
-                rec.rt_rows = self._count_rows(f"{rec.session_name}.rt.csv")
-                if rec.rt_rows <= 0:
-                    rec.error = rec.error or "tracker stream is empty for this episode"
-                    self.last_error = rec.error
-            except Exception as exc:
-                rec.error = f"stop failed: {exc}"
+        rec.t_end_wall_s = time.time()
+        try:
+            total = self._count_rows(f"{self.session_id}.rt.csv")
+            rec.rt_rows_total_at_stop = total
+            # If the stream did not advance at all across an episode the tracker
+            # stalled or lost the beam -- the one failure this can catch now,
+            # while the rig is still set up.
+            rec.stream_advanced = total > self._rows_mark
+            if not rec.stream_advanced:
+                rec.error = "tracker stream did not advance during this episode (beam lost?)"
                 self.last_error = rec.error
-            finally:
-                self._logger_proc = None
+            self._rows_mark = max(total, self._rows_mark)
+        except Exception as exc:
+            rec.error = f"stop failed: {type(exc).__name__}: {exc}"
+            self.last_error = rec.error
         self._episodes.append(rec)
         return asdict(rec)
 
@@ -330,9 +445,19 @@ class LaserTrackerSession:
             return result
         try:
             if self._episode is not None:
-                self.stop_recording()  # an exit mid-episode still gets its rows counted
+                self.stop_recording()  # an exit mid-episode still closes its boundary
+            self._teardown_logger()
             self._teardown_probe()
             result["sync_rows"] = self.sync_rows()
+            result["rt_rows"] = self._count_rows(f"{self.session_id}.rt.csv")
+            # Written before sealing so the manifest covers it: without the
+            # boundaries the 1 kHz stream cannot be cut back into episodes, and
+            # a sealed session that cannot be cut is not a usable session.
+            self._write_episode_index()
+            # The stop-files are plumbing, not data. Sealing them would put two
+            # zero-byte sentinels in a manifest that is supposed to describe the
+            # capture, and every later `verify` would carry them along.
+            self._run(f'del /q "{self.logger_stop_file}" "{self.probe_stop_file}"')
             seal = self._run(
                 f'cd /d {self.cfg.win_root} && {self.cfg.python} session_manifest.py seal "{self.win_dir}"',
                 timeout_s=300,
@@ -344,13 +469,49 @@ class LaserTrackerSession:
             if self.cfg.land and land_to is not None:
                 result["landed_to"] = self._land(land_to)
         except Exception as exc:
-            self.last_error = f"stop failed: {exc}"
+            self.last_error = f"stop failed: {type(exc).__name__}: {exc}"
             logger.warning("laser tracker stop failed: %s", exc)
         finally:
             self._connected = False
         result["episodes"] = [asdict(r) for r in self._episodes]
         result["last_error"] = self.last_error
         return result
+
+    def _write_episode_index(self) -> None:
+        """Put the episode boundaries next to the stream they cut."""
+        payload = {
+            "session_id": self.session_id,
+            "stream": f"{self.session_id}.rt.csv",
+            "clock_link": f"{self.session_id}.sync.csv",
+            "note": (
+                "t_*_wall_s are Thor wall-clock seconds taken from the camera "
+                "episode's own t0. Cut the stream with the QPC <-> "
+                "CLOCK_MONOTONIC fit in metrology.laser_tracker_clock."
+            ),
+            "episodes": [asdict(r) for r in self._episodes],
+        }
+        local = Path(f"/tmp/{self.session_id}.episodes.json")
+        local.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        key = str(Path(self.cfg.ssh_key).expanduser())
+        dest = f"{self.cfg.win_host}:{self.win_dir.replace(chr(92), '/')}/{self.session_id}.episodes.json"
+        subprocess.run(["scp", "-i", key, *_SSH_BASE, str(local), dest],
+                       capture_output=True, timeout=120)
+        local.unlink(missing_ok=True)
+
+    def _teardown_logger(self) -> None:
+        if self._logger_proc is None:
+            return
+        try:
+            self._run(f'type nul > "{self.logger_stop_file}"')
+            try:
+                self._logger_proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self._logger_proc.terminate()
+                self.last_error = "tracker logger did not stop within 60 s; terminated"
+        except Exception as exc:
+            self.last_error = f"logger teardown failed: {type(exc).__name__}: {exc}"
+        finally:
+            self._logger_proc = None
 
     def _teardown_probe(self) -> None:
         if self._probe is None:
@@ -365,7 +526,7 @@ class LaserTrackerSession:
                 self._probe.terminate()
                 self.last_error = "clock probe did not stop within 30 s; terminated"
         except Exception as exc:
-            self.last_error = f"probe teardown failed: {exc}"
+            self.last_error = f"probe teardown failed: {type(exc).__name__}: {exc}"
         finally:
             self._probe = None
 
@@ -378,19 +539,20 @@ class LaserTrackerSession:
         # is an unhelpful "connection unexpectedly closed".
         res = subprocess.run(
             ["scp", "-i", key, *_SSH_BASE, "-r", src, str(dest_root)],
-            capture_output=True, text=True, timeout=1800,
+            capture_output=True, timeout=1800,
         )
         if res.returncode != 0:
-            self.last_error = f"landing failed: {(res.stderr or res.stdout).strip()[:300]}"
+            detail = (_decode(res.stderr or b"") or _decode(res.stdout or b"")).strip()
+            self.last_error = f"landing failed: {detail[:300]}"
             return ""
         landed = dest_root / self.session_id
-        verifier = Path(__file__).resolve().parents[3] / (
+        verifier = self.repo_root / (
             "third_party/opencv_kalibr/metrology/laser_tracker/session_manifest.py"
         )
         if verifier.exists():
             check = subprocess.run(
                 ["python3", str(verifier), "verify", str(landed)],
-                capture_output=True, text=True, timeout=600,
+                capture_output=True, text=True, errors="replace", timeout=600,
             )
             if check.returncode != 0:
                 # A truncated copy fails verify rather than being analysed --

@@ -1357,7 +1357,9 @@ def main(argv: list[str] | None = None) -> int:
     # The tracker lives on another machine and is booked by other people, so it
     # must never stop nine cameras from recording: start() returns False instead
     # of raising, and every use below is guarded by the flag.
-    tracker = lts.LaserTrackerSession(lt_cfg)
+    # The recorder already knows where the repo is; handing it over beats the
+    # driver guessing from its own __file__.
+    tracker = lts.LaserTrackerSession(lt_cfg, repo_root=args.repo_root)
     tracker_started = tracker.start()
     if lt_cfg.enabled and not tracker_started:
         _emit(f"WARNING: laser tracker unavailable, recording without it: {tracker.last_error}")
@@ -1914,11 +1916,9 @@ def main(argv: list[str] | None = None) -> int:
             # samples themselves are stamped by the controller and married to
             # Thor's monotonic clock offline.
             if tracker_started:
-                if not tracker.start_recording(ep_idx, t_start):
-                    _emit(
-                        f"WARNING: laser tracker did not start for episode {ep_idx} "
-                        f"({tracker.last_error}); this episode has no tracker data"
-                    )
+                # Bookkeeping only: the stream has been running since Connect,
+                # so this cannot block the cameras and cannot fail slowly.
+                tracker.start_recording(ep_idx, t_start)
             box_snapshots: list[dict[str, Any]] = []
             episode_time_s = _next_episode_length_s(pending_episode_time_s, cfg.episode_time_s)
             pending_episode_time_s = 0.0
@@ -1990,8 +1990,13 @@ def main(argv: list[str] | None = None) -> int:
                 tracker_record = tracker.stop_recording()
                 if tracker_record.get("error"):
                     _emit(f"WARNING: laser tracker episode {ep_idx}: {tracker_record['error']}")
-                elif tracker_record.get("rt_rows"):
-                    _emit(f"Laser tracker: {tracker_record['rt_rows']} samples for episode {ep_idx}")
+                elif tracker_record.get("stream_advanced"):
+                    # The session total, not this episode's -- the per-episode
+                    # slice is taken offline by timestamp. Worded to match.
+                    _emit(
+                        f"Laser tracker streaming ({tracker_record['rt_rows_total_at_stop']} "
+                        f"samples so far this session)"
+                    )
 
             pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)

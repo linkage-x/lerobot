@@ -260,7 +260,9 @@ laser_tracker:
   # Backstops only; the stop-file ends both in normal operation. They exist so a
   # gateway that died without cleaning up cannot strand a process over there.
   session_cap_s: 86400
-  episode_cap_s: 3600
+  # The SDK handshake alone measured 15-16 s on 2026-09-20, which is why one
+  # stream spans the whole Connect window instead of one per episode.
+  logger_ready_timeout_s: 60
   # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
   # against its manifest before the recorder exits.
   land: true
