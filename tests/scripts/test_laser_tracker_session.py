@@ -96,19 +96,54 @@ def test_a_stalled_stream_is_caught_at_episode_stop() -> None:
     session._connected = True
     session._rows_mark = 5000
     session._count_rows = lambda _name: 5000  # type: ignore[method-assign]
+    session.beam_quality = lambda **_k: (1.0, 1.0)  # type: ignore[method-assign]
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
     assert rec["stream_advanced"] is False
-    assert "beam" in rec["error"]
+    assert "did not advance" in rec["error"]
 
-    # And an advancing stream is quiet.
+    # And an advancing, locked-on stream is quiet.
     session._count_rows = lambda _name: 9000  # type: ignore[method-assign]
     session.start_recording(1, 2.0)
     rec = session.stop_recording()
     assert rec["stream_advanced"] is True
     assert rec["error"] == ""
     assert rec["rt_rows_total_at_stop"] == 9000
+
+
+def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
+    """81343 rows, 0 dropped, and not one measurement -- the first real session.
+
+    Row count says the plumbing works. Only valid/tracking says the instrument
+    could see anything, and with no SMR in the beam the tracker still streams a
+    full 1 kHz of valid=0 tracking=0 dist=0.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 0
+    session._count_rows = lambda _name: 81343  # type: ignore[method-assign]
+    session.beam_quality = lambda **_k: (0.0, 0.0)  # type: ignore[method-assign]
+
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    assert rec["stream_advanced"] is True          # rows advanced ...
+    assert rec["beam_tracking_fraction"] == 0.0    # ... and measured nothing
+    assert "not locked on a target" in rec["error"]
+
+
+def test_describe_names_the_instrument_from_the_instrument() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+    # Before the logger has spoken, fall back to addresses rather than invent.
+    assert "192.168.0.168" in session.describe()
+
+    session.device_info = {
+        "model": "Radian Pro", "sn": "65201", "fw": "7.402", "accessory": "none"
+    }
+    described = session.describe()
+    assert "Radian Pro" in described
+    assert "S/N 65201" in described
+    assert "no accessory" in described
 
 
 def test_status_is_renderable_before_anything_happens() -> None:
@@ -208,3 +243,25 @@ def test_windows_oem_output_never_breaks_a_connect() -> None:
     # Anything at all decodes rather than raising -- latin-1 terminates the chain.
     assert lts._decode(bytes(range(256)))
     assert lts._decode(b"\xd5\x00\xff")
+
+
+def test_a_connect_warning_survives_a_successful_connect() -> None:
+    """The beam warning is the whole point of checking at Connect.
+
+    start() used to clear last_error on success, which erased the one message
+    that could still be acted on: acquire the SMR before recording.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session._ensure_responder = lambda: None  # type: ignore[method-assign]
+    session._spawn_probe = lambda: True  # type: ignore[method-assign]
+    session._spawn_logger = lambda: None  # type: ignore[method-assign]
+    session._await_probe = lambda: True  # type: ignore[method-assign]
+
+    def _await_logger() -> bool:
+        session.beam_valid_fraction = session.beam_tracking_fraction = 0.0
+        session.last_error = "tracker is streaming but NOT locked on a target"
+        return True
+
+    session._await_logger = _await_logger  # type: ignore[method-assign]
+    assert session.start() is True
+    assert "NOT locked" in session.last_error

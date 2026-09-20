@@ -367,7 +367,9 @@ export function LiveRecordPage({
       <span>激光跟踪仪</span>
       <small>
         {recorderConnected
-          ? snapshot.recording.laserTrackerDetail || (laserTracker ? "本次会话已启用" : "本次会话未启用")
+          ? snapshot.recording.laserTrackerDevice
+            || snapshot.recording.laserTrackerDetail
+            || (laserTracker ? "本次会话已启用" : "本次会话未启用")
           : "共享设备，同一时刻只能一个客户端；连不上不会阻塞录制"}
       </small>
     </label>

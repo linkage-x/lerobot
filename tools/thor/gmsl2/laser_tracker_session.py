@@ -49,6 +49,7 @@ session before they were understood (see
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import subprocess
@@ -56,6 +57,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,9 @@ class EpisodeRecord:
     # Named so nobody reads it as the latter.
     rt_rows_total_at_stop: int = 0
     stream_advanced: bool = True
+    # -1 when it could not be read; 0.0 is a real answer and a bad one.
+    beam_valid_fraction: float = -1.0
+    beam_tracking_fraction: float = -1.0
     error: str = ""
 
 
@@ -177,6 +182,11 @@ class LaserTrackerStatus:
     probe_running: bool = False
     sync_rows: int = 0
     last_error: str = ""
+    # Read from the instrument, never from config: see WriteMeta in
+    # collector_win/lt_realtime_logger.cpp.
+    device: dict[str, str] = field(default_factory=dict)
+    beam_valid_fraction: float = -1.0
+    beam_tracking_fraction: float = -1.0
     episodes: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -199,6 +209,10 @@ class LaserTrackerSession:
         self._episode: EpisodeRecord | None = None
         self._episodes: list[EpisodeRecord] = []
         self._rows_mark = 0
+        self.device_info: dict[str, str] = {}
+        self.beam_valid_fraction = -1.0
+        self.beam_tracking_fraction = -1.0
+        self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
     # ---------------------------------------------------------------- ssh --
@@ -253,6 +267,11 @@ class LaserTrackerSession:
         """Connect: responder up, session directory made, probe streaming."""
         if not self.cfg.enabled:
             return False
+        # Cleared here, not on success: _await_logger sets a warning for a
+        # tracker that is streaming but locked on nothing, and clearing at the
+        # end of a successful connect wiped exactly the message the operator
+        # needed before recording anything.
+        self.last_error = ""
         try:
             self._ensure_responder()
             if not self._spawn_probe():
@@ -266,7 +285,6 @@ class LaserTrackerSession:
                 self._teardown_probe()
                 return False
             self._connected = True
-            self.last_error = ""
             logger.info("laser tracker session %s connected (%s)", self.session_id, self.win_dir)
             return True
         except Exception as exc:  # never break Connect for the other devices
@@ -316,6 +334,33 @@ class LaserTrackerSession:
             f'--stop-file "{self.logger_stop_file}"'
         )
         self._logger_proc = self._spawn(cmd)
+        Thread(target=self._read_logger_stdout, args=(self._logger_proc,),
+               daemon=True, name="lt-logger-stdout").start()
+
+    def _read_logger_stdout(self, proc: subprocess.Popen[str]) -> None:
+        """Own the logger's stdout so the identity line is not lost.
+
+        `GetDeviceInformation()` is announced once, right after connecting, and
+        only on stdout -- the meta.json that also carries it is not written
+        until the session stops, which is far too late to put in a device row.
+        """
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            self._logger_tail.append(line)
+            if line.startswith("device:"):
+                fields = {}
+                for token in line[len("device:"):].strip().split():
+                    key, sep, value = token.partition("=")
+                    if sep:
+                        fields[key] = value
+                # The model name is the leading words before the first key=value.
+                head = line[len("device:"):].strip().split(" sn=")[0].strip()
+                self.device_info = {"model": head, **fields}
+                logger.info("tracker identified: %s", self.device_info)
 
     def _await_probe(self) -> bool:
         # The probe is its own link check: if rows are landing, the responder is
@@ -360,9 +405,9 @@ class LaserTrackerSession:
         while time.monotonic() < deadline:
             time.sleep(2.0)
             if self._logger_proc is not None and self._logger_proc.poll() is not None:
-                tail = (self._logger_proc.stdout.read() if self._logger_proc.stdout else "").strip()
                 # Commonest cause by far: the tracker admits one client and SA
                 # has it. Say that rather than printing an SDK ordinal.
+                tail = " | ".join(self._logger_tail)
                 self.last_error = f"tracker logger exited: {tail[:300]}"
                 self._logger_proc = None
                 return False
@@ -377,10 +422,53 @@ class LaserTrackerSession:
             return False
         self._rows_mark = rows
         logger.info("tracker stream alive: %d samples", rows)
+        # Streaming is not the same as measuring. Said here so the SMR can be
+        # acquired before anything is recorded, rather than discovered in the
+        # data afterwards.
+        valid, tracking = self.beam_quality()
+        self.beam_valid_fraction, self.beam_tracking_fraction = valid, tracking
+        if 0.0 <= tracking < 0.5:
+            self.last_error = (
+                f"tracker is streaming but NOT locked on a target "
+                f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%) -- "
+                "acquire the SMR before recording, or this session measures nothing"
+            )
         return True
 
     def sync_rows(self) -> int:
         return self._count_rows(f"{self.session_id}.sync.csv")
+
+    def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:
+        """Fraction of recent samples that are ``valid`` and ``tracking``.
+
+        Row count alone says nothing about whether the tracker can see anything:
+        with no SMR in the beam it still streams a full 1 kHz of
+        ``valid=0 tracking=0 dist=0``, which is exactly what the first real
+        session produced -- 81343 rows, 0 dropped, and not one measurement.
+        Only the tail is read, so the cost does not grow with session length.
+        """
+        code = (
+            "import sys;"
+            "f=open(sys.argv[1],'rb');"
+            "f.seek(0,2);n=f.tell();f.seek(max(0,n-int(sys.argv[2])));"
+            "ls=f.read().decode('ascii','replace').splitlines()[1:];"
+            "rs=[l.split(',') for l in ls if l.count(',')>=16];"
+            "v=sum(1 for r in rs if r[9].strip() in ('1','true'));"
+            "t=sum(1 for r in rs if r[10].strip() in ('1','true'));"
+            "print(len(rs),v,t)"
+        )
+        res = self._run(
+            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{code}" '
+            f'{self.session_id}.rt.csv {sample_bytes}',
+            timeout_s=30,
+        )
+        try:
+            total, valid, tracking = (int(x) for x in res.stdout.strip().splitlines()[-1].split())
+        except (ValueError, IndexError):
+            return (-1.0, -1.0)
+        if total <= 0:
+            return (-1.0, -1.0)
+        return (valid / total, tracking / total)
 
     def _count_rows(self, filename: str) -> int:
         code = "import sys;print(sum(1 for _ in open(sys.argv[1]))-1)"
@@ -426,8 +514,19 @@ class LaserTrackerSession:
             # stalled or lost the beam -- the one failure this can catch now,
             # while the rig is still set up.
             rec.stream_advanced = total > self._rows_mark
+            valid, tracking = self.beam_quality()
+            rec.beam_valid_fraction = valid
+            rec.beam_tracking_fraction = tracking
             if not rec.stream_advanced:
-                rec.error = "tracker stream did not advance during this episode (beam lost?)"
+                rec.error = "tracker stream did not advance during this episode"
+                self.last_error = rec.error
+            elif 0.0 <= tracking < 0.5:
+                # The failure that looks like success: a full-rate stream of
+                # nothing at all.
+                rec.error = (
+                    f"tracker not locked on a target during this episode "
+                    f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%)"
+                )
                 self.last_error = rec.error
             self._rows_mark = max(total, self._rows_mark)
         except Exception as exc:
@@ -562,6 +661,21 @@ class LaserTrackerSession:
 
     # ------------------------------------------------------------- status --
 
+    def describe(self) -> str:
+        """One line naming the instrument this session is being taken with."""
+        d = self.device_info
+        if not d:
+            return f"{self.cfg.tracker_ip} via {self.cfg.win_host}"
+        parts = [d.get("model", "tracker")]
+        if d.get("sn"):
+            parts.append(f"S/N {d['sn']}")
+        if d.get("fw"):
+            parts.append(f"fw {d['fw']}")
+        acc = d.get("accessory", "none")
+        parts.append(f"accessory {acc}" if acc != "none" else "no accessory")
+        parts.append(f"1 kHz @ {self.cfg.tracker_ip}")
+        return ", ".join(parts)
+
     def status(self) -> LaserTrackerStatus:
         return LaserTrackerStatus(
             enabled=self.cfg.enabled,
@@ -572,5 +686,8 @@ class LaserTrackerSession:
             probe_running=self._probe is not None and self._probe.poll() is None,
             sync_rows=0,
             last_error=self.last_error,
+            device=dict(self.device_info),
+            beam_valid_fraction=self.beam_valid_fraction,
+            beam_tracking_fraction=self.beam_tracking_fraction,
             episodes=[asdict(r) for r in self._episodes],
         )

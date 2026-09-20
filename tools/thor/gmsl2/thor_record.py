@@ -1364,7 +1364,12 @@ def main(argv: list[str] | None = None) -> int:
     if lt_cfg.enabled and not tracker_started:
         _emit(f"WARNING: laser tracker unavailable, recording without it: {tracker.last_error}")
     elif tracker_started:
+        # The instrument names itself; nothing here is transcribed from config.
+        _emit(f"Laser tracker: {tracker.describe()}")
         _emit(f"Laser tracker session {tracker.session_id} -> {tracker.win_dir}")
+        if tracker.last_error:
+            # Streaming but blind is the failure that looks like success.
+            _emit(f"WARNING: laser tracker: {tracker.last_error}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)

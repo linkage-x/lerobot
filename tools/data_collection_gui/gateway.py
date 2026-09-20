@@ -180,6 +180,10 @@ class RecordingStatus:
     laserTracker: bool = False
     laserTrackerState: str = "idle"
     laserTrackerDetail: str = ""
+    # What the instrument said it is (model, serial, firmware), read once at
+    # Connect via the SDK's GetDeviceInformation() -- not transcribed from a
+    # config file that can drift away from the hardware it names.
+    laserTrackerDevice: str = ""
 
 
 @dataclass
@@ -11559,6 +11563,9 @@ def _connect_recorder(
     # let a stale "pass" vouch for data it never saw.
     state.recording.syncStatus = "unknown"
     state.recording.syncSummary = ""
+    state.recording.laserTrackerDevice = ""
+    state.recording.laserTrackerDetail = ""
+    state.recording.laserTrackerState = "idle"
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -12345,20 +12352,28 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
     # itself still reaches the log.
     if "laser tracker" in output.lower():
         low = output.lower()
-        if low.startswith("warning:"):
-            # "unavailable" is the session-level failure (Connect); the rest are
-            # per-episode and leave the session itself still up.
+        # The identity line is reported once, at Connect, and must survive every
+        # status line that follows -- which instrument took the data is a
+        # property of the session, not its latest event.
+        if output.startswith("Laser tracker: ") and "session" not in low and not low.startswith("warning"):
+            state.recording.laserTrackerDevice = output[len("Laser tracker: "):].strip()[:200]
+        elif low.startswith("warning:"):
             state.recording.laserTrackerState = "error"
             state.recording.laserTrackerDetail = output.split(":", 1)[-1].strip()[:200]
-            _set_device_state(state, "laser_tracker", "error", state.recording.laserTrackerDetail)
         elif "landed" in low:
             state.recording.laserTrackerState = "idle"
             state.recording.laserTrackerDetail = output.strip()[:200]
-            _set_device_state(state, "laser_tracker", "idle", state.recording.laserTrackerDetail)
         else:
             state.recording.laserTrackerState = "running"
             state.recording.laserTrackerDetail = output.strip()[:200]
-            _set_device_state(state, "laser_tracker", "running", state.recording.laserTrackerDetail)
+        device = state.recording.laserTrackerDevice
+        detail = state.recording.laserTrackerDetail
+        _set_device_state(
+            state,
+            "laser_tracker",
+            state.recording.laserTrackerState,
+            " — ".join(p for p in (device, detail) if p)[:400],
+        )
         # fall through: the line is still logged like any other recorder output
     if output.startswith("BOX_LIVE "):
         try:

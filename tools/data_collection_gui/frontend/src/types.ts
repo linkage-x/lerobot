@@ -123,6 +123,8 @@ export type RecordingStatus = {
   laserTracker?: boolean;
   laserTrackerState?: string;
   laserTrackerDetail?: string;
+  // Model / serial / firmware as the instrument reported them.
+  laserTrackerDevice?: string;
 };
 
 export type MarkerTcpSample = {
