@@ -136,6 +136,61 @@ TERMINAL_SERVO_RETREAT_M = 0.08
 TERMINAL_SERVO_MIN_Z_M = 0.030
 
 
+def classify_terminal_servo_descent(
+    *,
+    above_target_mm: float,
+    settle_mm: float,
+    seated_mm: float = 1000.0 * TERMINAL_SERVO_SEARCH_SEATED_M,
+    slip_mm: float = 1000.0 * TERMINAL_SERVO_SEARCH_SLIP_M,
+    standing_mm: float | None = None,
+) -> str:
+    """What one descent says happened to the peg: ``slip``, ``seated`` or ``standing``.
+
+    The rule the search loop already applied and `terminal_trials.classify_stop` had a second
+    copy of, in the lowest module the three callers share. Two copies of a threshold are two
+    thresholds, and these two would have drifted the first time either was retuned.
+
+    ``standing_mm`` opens a fourth answer. The search does not want one -- it is deciding
+    whether to fly to the next landing, and "not seated" is the whole of what it needs -- so it
+    passes nothing and everything above ``seated_mm`` reads as standing. An offset sweep does
+    want one: its job is to find where the boundary is, and a descent that stopped between the
+    two clusters is evidence that the boundary is there rather than evidence of either side, so
+    it names that band ``ambiguous`` instead of rounding it into a verdict.
+
+    Creep is tested before depth, and that order is the whole lesson of 2026-09-10: two runs
+    reached the seated depth and were graded misses because the peg had slid up between the
+    fingers while the arm leaned, so the tool arrived where the hole is and the peg did not.
+
+    The 2026-09-10 card lists *four* signatures; this returns three verdicts. Its first two --
+    "converged inside 0.1 s" and "never converged but stopped shallow and laterally held" --
+    were both insertions and both graded success, so they are one verdict here and a reader who
+    wants them apart has ``settleSeconds``. What the card cannot be ported from directly is its
+    time axis: it measured slips at 8.1 s and 18.1 s against a settle window that was still the
+    full 20 s timeout, and that window is now ``TERMINAL_SERVO_SETTLE_S`` = 0.5 s. A slip today
+    cannot show up as a long settle because nothing is allowed to settle that long -- it shows
+    up as distance travelled after the setpoint parked, which is what ``settleMm`` measures and
+    why the threshold here is a length and not a duration.
+
+    Provisional, and it should be read as such: the four signatures were fitted on nine descents
+    and matched the operator's grade 9/9, which is agreement on the set they were drawn from,
+    not validation. The reason to write them down is that the next batch then *tests* this
+    function instead of re-deriving it -- which is also why the GUI keeps the operator's grade in
+    its own column rather than letting this one stand in for it.
+    """
+
+    # Millimetres on both sides of both comparisons. The thresholds are declared in metres and
+    # scaled here rather than the measurements being divided back down, because scaling both
+    # sides by the same factor cannot change which way a comparison goes and a round trip
+    # through the other unit can: 1000 * 0.0042 / 1000 is not 0.0042.
+    if settle_mm >= slip_mm:
+        return "slip"
+    if above_target_mm <= seated_mm:
+        return "seated"
+    if standing_mm is None or above_target_mm >= standing_mm:
+        return "standing"
+    return "ambiguous"
+
+
 class TerminalServoError(SceneResetError):
     """A terminal-servo request that must not be sent to the arm."""
 
@@ -563,6 +618,10 @@ def search_for_seat(
     landing = (x, y, z)
     previous = landing
     verdict = "exhausted"
+    # Initialised for the same reason `descent` is: the loop below always runs at least once
+    # (`terminal_servo_search_offsets` never returns empty), and a reader should not have to
+    # prove that to know what the return statement refers to.
+    reading = "standing"
     index = 0
     for index, (dx, dy) in enumerate(offsets):
         landing = (x + dx, y + dy, z)
@@ -574,7 +633,12 @@ def search_for_seat(
                       rotvec, gripper, tolerance_m=request.stepToleranceM)
         descent = descend_until_refused(robot, request, landing, rotvec, gripper)
         above_target_m = float(descent["stoppedAtXyz"][2]) - z
-        slipped = descent["settleMm"] / 1000.0 >= request.searchSlipM
+        reading = classify_terminal_servo_descent(
+            above_target_mm=1000.0 * above_target_m,
+            settle_mm=descent["settleMm"],
+            seated_mm=1000.0 * request.searchSeatedM,
+            slip_mm=1000.0 * request.searchSlipM,
+        )
         attempts.append(
             {
                 "index": index,
@@ -584,6 +648,7 @@ def search_for_seat(
                 "aboveTargetMm": 1000.0 * above_target_m,
                 "settleSeconds": descent["settleSeconds"],
                 "settleMm": descent["settleMm"],
+                "verdict": reading,
             }
         )
         if len(offsets) > 1:
@@ -599,16 +664,20 @@ def search_for_seat(
         # fingers while the arm leaned, so the tool arrived where the hole is and the peg did
         # not. Depth alone cannot tell those from an insertion -- 0.7 and 1.4 mm above target,
         # squarely in the seated cluster -- and the only column that can is how long the last
-        # millimetres took, 8.1 s and 18.1 s against 0.1 s for a real one.
-        if slipped:
-            verdict = "slip"
-            break
-        if above_target_m <= request.searchSeatedM:
-            verdict = "seated"
+        # millimetres took, 8.1 s and 18.1 s against 0.1 s for a real one. Both tests live in
+        # `classify_terminal_servo_descent`, which keeps that order.
+        if reading in ("slip", "seated"):
+            verdict = reading
             break
         previous = landing
     return {
         **descent,
+        # What the last descent says happened to the peg, as opposed to why the *search* stopped:
+        # with the ring off (E5) the loop runs once and reports `exhausted`, which is a true
+        # statement about the search and says nothing about whether the peg went in. A reader
+        # asking "did it seat" should not have to know that `exhausted` means `standing` here
+        # and "ran out of landings" there.
+        "verdict": reading,
         "searchStoppedOn": verdict,
         "searchIndex": index,
         "searchLandings": len(offsets),
@@ -715,6 +784,9 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
         }
         print(
             f"[INFO] terminal_servo=done request_id={request.requestId} "
+            # The conclusion first, because it is what a reader wants and what the page records;
+            # the columns after it are how it was reached.
+            f"verdict={result['verdict']} "
             f"stopped_on={result['stoppedOn']} "
             f"stopped_z={stopped_at[2]:.4f} above_target_mm={result['seatedDepthErrorMm']:+.1f} "
             f"lateral_mm={result['lateralErrorMm']:.1f} held_up_mm={result['heldUpMm']:+.1f} "

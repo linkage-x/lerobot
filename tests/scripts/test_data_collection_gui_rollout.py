@@ -2497,7 +2497,16 @@ def test_one_blocker_is_still_written_as_a_list(tmp_path: Path):
     assert entry["blockers"] == ["object_pose_offset"]
 
 
-def test_the_same_reason_ticked_twice_is_recorded_once(tmp_path: Path):
+def test_the_same_reason_twice_is_two_takeovers_not_one(tmp_path: Path):
+    """Reversed on 2026-09-20, and the old behaviour was losing data.
+
+    This list is one entry per takeover span, in order -- that is what makes "the first one"
+    mean the same thing as the stage the rollout is graded at. Dropping repeats broke both
+    things the field is for: a failure-mode distribution built from it undercounted whichever
+    reason recurred, which is the most common one, and the positional alignment the page asks
+    the operator for stopped holding as soon as two spans shared a reason. Three spans went in
+    and two entries came out, with nothing saying anything had been lost.
+    """
     _write_ladder(tmp_path, _DEMO_LADDER)
 
     entry = checkpoint_backend.append_rollout_outcome(
@@ -2510,7 +2519,9 @@ def test_the_same_reason_ticked_twice_is_recorded_once(tmp_path: Path):
         },
     )
 
-    assert entry["blockers"] == ["operator_stop", "object_pose_offset"]
+    assert entry["blockers"] == ["operator_stop", "object_pose_offset", "operator_stop"]
+    # Still the first one, which is the one the funnel is about.
+    assert entry["blocker"] == "operator_stop"
 
 
 def test_a_primary_blocker_that_is_not_the_first_of_the_list_is_refused(tmp_path: Path):
@@ -3409,3 +3420,337 @@ def test_corrections_land_where_the_export_page_can_find_them(tmp_path: Path):
 
     assert root.parent == tmp_path / "outputs" / "datasets"
     assert root.name.startswith(rollout_backend.DAGGER_PREFIX)
+
+
+# ------------------------------------------ what produced the number, and what it concluded ---
+# Two things were settable from this page, reachable by the runtime, and then absent from the
+# record the page writes: which arm ran, and what the rig itself concluded about the descent.
+# A comparison whose arms are distinguishable only by which log file a reader opened is not a
+# comparison, and a machine verdict that only exists in a log file cannot be checked against
+# the operator who was standing there.
+
+_DONE_LINE = (
+    "[INFO] terminal_servo=done request_id=terminal_servo_17 verdict=seated stopped_on=contact "
+    "stopped_z=0.0530 above_target_mm=+0.7 lateral_mm=2.1 held_up_mm=+5.2 growth_mm=+4.1 "
+    "peak_growth_mm=+4.7 lag_mm=+2.2 descent_mm=61.0 descent_s=3.4 settle_s=0.10 "
+    "settle_mm=+0.2 search=seated search_index=3/8 search_offset_mm=7.0"
+)
+
+
+def test_the_control_arm_announces_itself_too():
+    """`--action-samples 1` is E3's control arm, and until 2026-09-20 it printed nothing.
+
+    An arm that leaves no line in the log is one whose rollouts cannot afterwards be told from
+    any other run's, which is the whole difficulty a three-arm comparison exists to avoid.
+    """
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] action_samples=1 aggregate=medoid selection_horizon=16 lateral=None gripper=None"
+    )
+
+    assert parsed["policyArm"] == {
+        "actionSamples": 1,
+        "actionAggregate": "medoid",
+        "selectionHorizon": 16,
+    }
+
+
+def test_the_terminal_descent_reaches_the_page_as_fields_not_as_a_sentence():
+    parsed = rollout_backend.parse_rollout_line(_DONE_LINE)
+
+    result = parsed["lastRolloutTerminalServo"]
+    assert result["verdict"] == "seated"
+    assert result["aboveTargetMm"] == 0.7
+    assert result["lateralErrorMm"] == 2.1
+    assert result["settleMm"] == 0.2
+    # Which landing answered, out of how many there were. `3/8` is the search earning its place.
+    assert result["searchIndex"] == 3
+    assert result["searchLandings"] == 9
+
+
+def test_a_peak_growth_column_is_not_read_as_a_growth_column():
+    parsed = rollout_backend.parse_rollout_line(_DONE_LINE)
+
+    result = parsed["lastRolloutTerminalServo"]
+    assert result["heldUpGrowthMm"] == 4.1
+    assert result["peakGrowthMm"] == 4.7
+
+
+def test_a_descent_whose_runtime_named_no_verdict_is_not_classified_by_the_page():
+    """The thresholds belong to the runtime. Re-deriving them at this crossing is how the page
+    and the rig come to disagree about what `seated` means, so an older line parses without a
+    verdict rather than acquiring a second opinion."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] terminal_servo=done request_id=terminal_servo_2 stopped_on=contact "
+        "stopped_z=0.0530 above_target_mm=+0.7 settle_mm=+0.2"
+    )
+
+    result = parsed["lastRolloutTerminalServo"]
+    assert result["aboveTargetMm"] == 0.7
+    assert "verdict" not in result
+
+
+def test_the_terminal_descent_does_not_open_the_grading_prompt():
+    """It ends inside a rollout that is still running -- the arm has still to release, retreat
+    and hand back. Prompting here would grade a rollout index the runtime has not closed."""
+    parsed = rollout_backend.parse_rollout_line(_DONE_LINE)
+
+    assert "pendingOutcomeFor" not in parsed
+    assert "state" not in parsed
+
+
+def test_a_new_rollout_forgets_the_previous_descent():
+    parsed = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_start index=7")
+
+    assert parsed["lastRolloutTerminalServo"] == {}
+
+
+def test_the_arm_on_a_grade_comes_from_the_runtime_not_from_the_page(tmp_path: Path):
+    """Same provenance rule as the landing point and the takeover count. A page that could file
+    its own arm could file a rollout under the arm it meant to run."""
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        step=214,
+        pendingOutcomeFor=1,
+        policyArm={"actionSamples": 8, "actionAggregate": "medoid", "selectionHorizon": 16},
+        terminalServoConfig={
+            "terminalServoXyz": [0.3599, -0.1333, 0.0523],
+            "terminalServoSearchRingM": 0.007,
+            "terminalServoSearchLandings": 9,
+        },
+    )
+
+    entry = gateway._record_rollout_outcome(
+        state,
+        {"outcome": "success", "arm": {"actionSamples": 1, "actionAggregate": "mean"}},
+    )["entry"]
+
+    assert entry["arm"]["actionSamples"] == 8
+    assert entry["arm"]["actionAggregate"] == "medoid"
+    # Both halves of the configuration, because no rollout can have run one without the other.
+    assert entry["arm"]["terminalServoSearchLandings"] == 9
+    assert entry["arm"]["terminalServoXyz"] == [0.3599, -0.1333, 0.0523]
+
+
+def test_the_rigs_verdict_and_the_operators_grade_stay_two_columns(tmp_path: Path):
+    """Their agreement is the acceptance criterion for every unattended loop on this rig, and a
+    single reconciled column cannot report it. This is the disagreeing case on purpose."""
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        pendingOutcomeFor=1,
+        lastRolloutTerminalServo={"verdict": "standing", "aboveTargetMm": 5.2},
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "success"})["entry"]
+
+    assert entry["outcome"] == "success"
+    assert entry["terminalServo"]["verdict"] == "standing"
+
+
+def test_an_arm_cannot_name_an_aggregate_the_runtime_would_refuse(tmp_path: Path):
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "arm": {"actionSamples": 8, "actionAggregate": "whatever_looked_best"},
+        },
+    )
+
+    arm = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]["arm"]
+    assert arm["actionSamples"] == 8
+    assert "actionAggregate" not in arm
+
+
+def test_a_verdict_this_rig_does_not_use_is_refused(tmp_path: Path):
+    """The vocabulary is the runtime's. A word outside it is one no analysis will know to look
+    for, which is worse than the field being absent."""
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "terminalServo": {"verdict": "nearly", "aboveTargetMm": 5.2},
+        },
+    )
+
+    servo = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]["terminalServo"]
+    assert "verdict" not in servo
+    assert servo["aboveTargetMm"] == 5.2
+
+
+def test_a_rollout_nobody_measured_records_no_arm_and_no_verdict(tmp_path: Path):
+    """Absent rather than defaulted, like the grade and the landing point: an empty object in
+    the log would read as a measurement that came back empty."""
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000", mode="real", pendingOutcomeFor=1
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+
+    assert "arm" not in entry
+    assert "terminalServo" not in entry
+
+
+# ------------------------------------------------------ one record per reach-in (P1-9) ---
+# A takeover has two halves that only different parties can supply: what the arm was doing,
+# which only the runtime knows exactly, and why a human judged it had to stop, which only the
+# human knows. They are two fields, and they are lined up by span so a distribution can be
+# counted off them.
+
+_SPAN_LINE = (
+    "[INFO] expert_span index=0 first=41 last=58 step=41 xyz=0.3601,-0.1345,0.1123 "
+    "policy_status=step_limited steps_left=220 reference_xyz=0.3599,-0.1333,0.0523"
+)
+
+
+def test_a_takeover_is_recorded_as_a_pose_and_a_reference_not_as_a_residual():
+    """Every reference on this rig is absent, drifting or floored, and the measurement is the
+    clean half. Subtracting at write time bakes a number that expires into a log that cannot be
+    rewritten -- and this project has twice re-read a finished table by changing one threshold
+    over the raw quantities."""
+    parsed = rollout_backend.parse_rollout_line(_SPAN_LINE)
+
+    detail = parsed["takeoverDetail"]
+    assert detail["xyz"] == [0.3601, -0.1345, 0.1123]
+    assert detail["referenceXyz"] == [0.3599, -0.1333, 0.0523]
+    assert not any("residual" in key.lower() for key in detail)
+
+
+def test_the_machine_half_of_why_the_operator_reached_in_is_the_guards_last_policy_step():
+    parsed = rollout_backend.parse_rollout_line(_SPAN_LINE)
+
+    assert parsed["takeoverDetail"]["policyStatus"] == "step_limited"
+    assert parsed["takeoverDetail"]["stepsLeft"] == 220
+
+
+def test_a_span_that_starts_at_step_zero_reports_no_trigger():
+    """There is no policy step before it to read. Absent rather than `pass`, which would put a
+    measurement where nobody took one."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] expert_span index=0 first=0 last=12 step=0 xyz=0.3100,-0.0024,0.3979"
+    )
+
+    assert "policyStatus" not in parsed["takeoverDetail"]
+
+
+def test_the_takeover_lines_do_not_open_the_grading_prompt():
+    parsed = rollout_backend.parse_rollout_line(_SPAN_LINE)
+
+    assert "pendingOutcomeFor" not in parsed
+    assert "state" not in parsed
+
+
+def test_takeover_lines_accumulate_instead_of_replacing_each_other(tmp_path: Path):
+    """One line per span. Assigning would leave the status holding only the last one."""
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(checkpointId="job_a/020000", mode="real")
+
+    gateway._apply_rollout_output(state, _SPAN_LINE)
+    gateway._apply_rollout_output(
+        state,
+        "[INFO] expert_span index=1 first=120 last=133 step=120 xyz=0.3610,-0.1350,0.0700",
+    )
+
+    assert sorted(state.rollout.lastRolloutTakeovers) == [0, 1]
+    assert state.rollout.lastRolloutTakeovers[1]["first"] == 120
+
+
+def test_each_takeover_carries_the_reason_given_for_that_takeover(tmp_path: Path):
+    """Positionally, which is what the page asks the operator for and what the blocker list has
+    always been defined as."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blockers": ["operator_stop", "object_pose_offset"],
+            "intervention": {"intervened": True, "expertSteps": 32, "spans": [[41, 58], [120, 133]]},
+            "takeoverDetails": {
+                0: {"index": 0, "first": 41, "last": 58, "step": 41, "xyz": [0.36, -0.13, 0.11],
+                    "policyStatus": "step_limited"},
+                1: {"index": 1, "first": 120, "last": 133, "step": 120, "xyz": [0.36, -0.13, 0.07]},
+            },
+        },
+    )
+
+    assert [row["blocker"] for row in entry["takeovers"]] == [
+        "operator_stop",
+        "object_pose_offset",
+    ]
+    assert entry["takeovers"][0]["policyStatus"] == "step_limited"
+    assert entry["takeovers"][1]["xyz"] == [0.36, -0.13, 0.07]
+    assert "takeoverBlockerMismatch" not in entry
+
+
+def test_a_missing_span_line_leaves_a_hole_rather_than_shifting_the_rest(tmp_path: Path):
+    """A truncated log must not renumber the takeovers after the line it lost."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blockers": ["operator_stop", "object_pose_offset"],
+            "intervention": {"intervened": True, "expertSteps": 32, "spans": [[41, 58], [120, 133]]},
+            "takeoverDetails": {
+                1: {"index": 1, "first": 120, "last": 133, "step": 120, "xyz": [0.36, -0.13, 0.07]}
+            },
+        },
+    )
+
+    rows = entry["takeovers"]
+    assert [row["first"] for row in rows] == [41, 120]
+    assert "xyz" not in rows[0]
+    assert rows[1]["xyz"] == [0.36, -0.13, 0.07]
+    assert [row["blocker"] for row in rows] == ["operator_stop", "object_pose_offset"]
+
+
+def test_a_reason_count_that_does_not_match_the_spans_is_recorded_not_refused(tmp_path: Path):
+    """A grade is perishable -- the operator is standing at the rig -- so refusing loses the
+    rollout's evidence permanently, while a grade carrying the mismatch is still usable for
+    everything except the per-span split. Same rule as P0-0: make the defect visible rather
+    than let it block the path."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blockers": ["operator_stop"],
+            "intervention": {"intervened": True, "expertSteps": 32, "spans": [[41, 58], [120, 133]]},
+        },
+    )
+
+    assert entry["takeoverBlockerMismatch"] == {"spans": 2, "blockers": 1}
+    assert [row.get("blocker") for row in entry["takeovers"]] == ["operator_stop", None]
+
+
+def test_an_assisted_rollout_that_reached_the_end_is_not_flagged(tmp_path: Path):
+    """Nothing blocked it, so it has no reasons, and a warning on every assisted success is a
+    warning nobody reads."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 3,
+            "intervention": {"intervened": True, "expertSteps": 12, "spans": [[41, 58]]},
+        },
+    )
+
+    assert "takeoverBlockerMismatch" not in entry
+

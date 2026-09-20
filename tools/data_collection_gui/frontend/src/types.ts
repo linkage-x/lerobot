@@ -1245,6 +1245,107 @@ export type RolloutRun = {
   /** Whether a human drove part of the last finished rollout. Empty until one has finished,
    *  and on a runtime too old to report it. */
   lastRolloutIntervention?: RolloutIntervention;
+  /** How the last finished rollout's terminal descent ended, as the runtime read it. Empty
+   *  until one has finished, and on a rollout with no terminal servo pose configured. */
+  lastRolloutTerminalServo?: TerminalServoResult;
+  /** The measured half of each takeover in the last finished rollout, keyed by span index.
+   *  Keyed rather than a list so a line lost to a truncated log leaves a hole instead of
+   *  renumbering the spans after it. */
+  lastRolloutTakeovers?: Record<number, TakeoverDetail>;
+  /** Which draw the policy is executing this session (E3). Announced once at startup by the
+   *  runtime, so it is the arm that actually ran rather than the one the page asked for. */
+  policyArm?: RolloutArm;
+  /** Where the last centimetres are driven to, and whether the search ring is on (E5 / E7-C).
+   *  Absent when no terminal servo pose was configured, which means the policy owns the
+   *  descent. */
+  terminalServoConfig?: RolloutArm;
+};
+
+/** What the runtime measured at one takeover.
+ *
+ *  A pose, never a residual. Every reference on this rig is missing (no terminal servo pose
+ *  configured), drifting (the fixture creeps within a session) or floored (the demonstration
+ *  cloud carries ~3.5 mm of its own scatter), so the subtraction is left to the reader and
+ *  `referenceXyz` is carried beside the measurement when one was in force.
+ */
+export type TakeoverDetail = {
+  index: number;
+  /** Inclusive `[first, last]` of the span, in the same numbering as `expertSpans`. */
+  first: number;
+  last: number;
+  /** The trace CSV's step number at the span's first row — the join key into that file, kept
+   *  because the traces are per-launch directories and a graded batch has lost its own. */
+  step?: number;
+  xyz?: [number, number, number];
+  /** The command guard's verdict on the last *policy* step before the span: the machine's half
+   *  of "why did the operator reach in". Absent when the span starts at step 0. */
+  policyStatus?: string;
+  /** Steps left of the budget when the operator took over. A rescue at 780 of 800 is a
+   *  different event from the same rescue at 80. */
+  stepsLeft?: number;
+  referenceXyz?: [number, number, number];
+};
+
+/** One takeover as it reaches the log: what the rig measured, and the reason the operator gave
+ *  for that same span. Lined up by position, which is what the per-span reason list is for. */
+export type Takeover = TakeoverDetail & {
+  blocker?: string;
+};
+
+/** The configuration a rollout ran under: the draw the policy executed and the pose the last
+ *  centimetres were driven to.
+ *
+ *  One type for both halves because they are two settings of one configuration, and every
+ *  comparison on this rig is between arms rather than between rollouts. Every field optional:
+ *  a runtime announces only what applies to it, and an absent field means "not configured",
+ *  never zero.
+ */
+export type RolloutArm = {
+  actionSamples?: number;
+  actionAggregate?: RolloutActionAggregate;
+  /** Steps of the chunk the draws are compared over before one is executed. */
+  selectionHorizon?: number;
+  terminalServoXyz?: [number, number, number];
+  terminalServoHandoffZ?: number;
+  terminalServoMaxSpeedMs?: number;
+  terminalServoSearchRingM?: number;
+  /** Landings the search may use, counting the nominal pose. 1 means the search is off, which
+   *  is E5's control arm exactly. */
+  terminalServoSearchLandings?: number;
+};
+
+/** What the rig concluded about the terminal descent, from its own `terminal_servo=done` line.
+ *
+ *  Recorded beside the operator's grade and never instead of it: the agreement between the two
+ *  is the measurement, and the four signatures behind `verdict` were fitted on nine descents.
+ *  `verdict` is absent on a runtime older than the field — the page does not classify, because
+ *  the thresholds belong to the rig.
+ */
+export type TerminalServoResult = {
+  verdict?: "seated" | "standing" | "slip";
+  /** Why the descent stopped: `contact`, `target` or the stall backstop. */
+  stoppedOn?: string;
+  /** Why the *search* stopped, which is a different question: with the ring off it always
+   *  reads `exhausted`, and that says nothing about the peg. */
+  searchStoppedOn?: string;
+  stoppedZ?: number;
+  /** Height above the seated depth where it stopped. The two clusters measured on 2026-09-10
+   *  do not overlap: 1.1–2.5 mm went in, 4.9–5.6 mm stood on the fixture face. */
+  aboveTargetMm?: number;
+  lateralErrorMm?: number;
+  heldUpMm?: number;
+  heldUpGrowthMm?: number;
+  peakGrowthMm?: number;
+  lagMm?: number;
+  descentMm?: number;
+  descentSeconds?: number;
+  settleSeconds?: number;
+  /** How far the tool travelled after the setpoint parked. The only column that sees a peg
+   *  sliding in the jaws, and so the one the slip verdict is read from. */
+  settleMm?: number;
+  searchIndex?: number;
+  searchLandings?: number;
+  searchOffsetMm?: number;
 };
 
 /** Whose hand drove the rollout that is about to be graded.
@@ -1429,6 +1530,18 @@ export type RolloutOutcomeEntry = {
   expertSpans?: [number, number][];
   /** Whether the attempt was inside what the demonstrations cover. */
   inDistribution?: boolean;
+  /** Which arm produced this rollout. Absent on records written before the runtime announced
+   *  it — which, since 2026-09-20, means an older runtime and not a default. */
+  arm?: RolloutArm;
+  /** What the rig concluded about the descent, kept in its own column beside `outcome` so the
+   *  agreement between the two can be counted. */
+  terminalServo?: TerminalServoResult;
+  /** One row per takeover: the measurement and the reason, aligned by position. */
+  takeovers?: Takeover[];
+  /** Present when the operator gave reasons but not one per span. Recorded rather than
+   *  refused: a grade is perishable and a refusal loses the rollout's evidence, while this
+   *  record is still usable for everything except the per-span split. */
+  takeoverBlockerMismatch?: { spans: number; blockers: number };
 };
 
 export type RolloutRtcMode = "auto" | "enabled" | "disabled";

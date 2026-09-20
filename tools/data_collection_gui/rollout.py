@@ -485,6 +485,21 @@ class RolloutStatus:
     # marker, and the page collects the grade before anything else could fetch it -- but kept a
     # separate field because it qualifies the grade rather than describing where the arm went.
     lastRolloutIntervention: dict[str, Any] = field(default_factory=dict)
+    # How the last finished rollout's terminal descent ended, from the runtime's own
+    # `terminal_servo=done` line. Per rollout and cleared with the geometry, unlike the two
+    # fields below it -- the descent happens once inside each rollout, the configuration is
+    # announced once for the session.
+    lastRolloutTerminalServo: dict[str, Any] = field(default_factory=dict)
+    # One entry per takeover in the last finished rollout, keyed by span index. Per rollout and
+    # cleared with the geometry. Keyed rather than a list because the lines arrive one at a time
+    # and a log that lost one must leave a hole rather than shift every span after it.
+    lastRolloutTakeovers: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # The arm this session is running: which draw the policy executes (E3) and where the last
+    # centimetres are driven to (E5 / E7-C). Session-scoped because the runtime announces both
+    # at startup and neither can change without restarting it. Kept on the status so the grade
+    # of every rollout in the session can be filed against the configuration that produced it.
+    policyArm: dict[str, Any] = field(default_factory=dict)
+    terminalServoConfig: dict[str, Any] = field(default_factory=dict)
 
 
 def build_rollout_command(
@@ -632,6 +647,55 @@ _EXPERT_STEPS_RE = re.compile(r"\bexpert_steps=(\d+)")
 # total, which is the number that cannot answer "how many separate times did you reach in".
 _EXPERT_SPANS_RE = re.compile(r"\bexpert_spans=((?:\d+-\d+)(?:;\d+-\d+)*)")
 _GEOMETRY_COUNT_RE = re.compile(r"\b(samples|held_steps|closed)=(\d+)")
+# The sampling arm the runtime announced for itself at startup (E3). Read from the runtime's
+# announce rather than from the launch request, for the reason the outcome record gives for the
+# geometry: a page that files its own numbers can file an arm the process never ran.
+_POLICY_ARM_RE = re.compile(
+    r"\baction_samples=(\d+)\s+aggregate=(\S+)\s+selection_horizon=(\d+)"
+)
+# E5 / E7-C. Printed once, only when a terminal servo pose is configured, so absence means the
+# rollout ended wherever the policy left it.
+_TERMINAL_SERVO_CONFIGURED_RE = re.compile(
+    r"terminal_servo=configured xyz=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
+    r"\s+handoff_z=(-?[\d.]+)\s+max_speed_ms=([\d.]+)"
+    r"\s+search_ring_m=([\d.]+)\s+search_landings=(\d+)"
+)
+_TERMINAL_SERVO_DONE_RE = re.compile(r"terminal_servo=done\b")
+_TERMINAL_SERVO_WORD_RE = re.compile(r"\b(verdict|stopped_on|search)=(\w+)")
+_TERMINAL_SERVO_NUMBER_RE = re.compile(
+    r"\b(stopped_z|above_target_mm|lateral_mm|held_up_mm|growth_mm|peak_growth_mm|lag_mm"
+    r"|descent_mm|descent_s|settle_s|settle_mm|search_offset_mm)=([+-]?[\d.]+)"
+)
+_TERMINAL_SERVO_INDEX_RE = re.compile(r"\bsearch_index=(\d+)/(\d+)")
+# P1-9. One line per takeover, emitted just before the end marker. The pose is a measurement and
+# the reference is beside it; the subtraction is left to the reader for the reason the runtime's
+# own docstring gives.
+_EXPERT_SPAN_RE = re.compile(
+    r"expert_span\s+index=(\d+)\s+first=(\d+)\s+last=(\d+)\s+step=(\d+)"
+    r"\s+xyz=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
+)
+_EXPERT_SPAN_STATUS_RE = re.compile(r"\bpolicy_status=(\w+)")
+_EXPERT_SPAN_BUDGET_RE = re.compile(r"\bsteps_left=(\d+)")
+_EXPERT_SPAN_REFERENCE_RE = re.compile(
+    r"\breference_xyz=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
+)
+_TERMINAL_SERVO_FIELD_NAMES = {
+    "verdict": "verdict",
+    "stopped_on": "stoppedOn",
+    "search": "searchStoppedOn",
+    "stopped_z": "stoppedZ",
+    "above_target_mm": "aboveTargetMm",
+    "lateral_mm": "lateralErrorMm",
+    "held_up_mm": "heldUpMm",
+    "growth_mm": "heldUpGrowthMm",
+    "peak_growth_mm": "peakGrowthMm",
+    "lag_mm": "lagMm",
+    "descent_mm": "descentMm",
+    "descent_s": "descentSeconds",
+    "settle_s": "settleSeconds",
+    "settle_mm": "settleMm",
+    "search_offset_mm": "searchOffsetMm",
+}
 # The runtime writes these as log fields; the page reads them as JSON. Renamed at this single
 # crossing so neither side has to carry the other's convention.
 _GEOMETRY_FIELD_NAMES = {
@@ -793,6 +857,8 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # the one now running.
         parsed["lastRolloutGeometry"] = {}
         parsed["lastRolloutIntervention"] = {}
+        parsed["lastRolloutTerminalServo"] = {}
+        parsed["lastRolloutTakeovers"] = {}
         parsed["message"] = f"Rollout {start_match.group(1)} running."
         return parsed
 
@@ -812,6 +878,58 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         parsed["lastRolloutGeometry"] = parse_rollout_geometry(stripped)
         parsed["lastRolloutIntervention"] = parse_rollout_intervention(stripped)
         parsed["message"] = f"Rollout {end_match.group(1)} ended ({end_match.group(2)})."
+        return parsed
+
+    arm = parse_policy_arm(stripped)
+    if arm:
+        parsed["policyArm"] = arm
+        # Named the way the control arm deserves. "the medoid of 1 draw" is arithmetically true
+        # and reads as a configuration nobody chose; a single draw is what every sampling result
+        # is measured against, and the bar should say so.
+        parsed["message"] = (
+            "Executing a single draw per inference."
+            if arm["actionSamples"] <= 1
+            else (
+                f"Executing the {arm['actionAggregate']} of {arm['actionSamples']} draws "
+                f"over {arm['selectionHorizon']} steps."
+            )
+        )
+        return parsed
+
+    servo_config = parse_terminal_servo_config(stripped)
+    if servo_config:
+        parsed["terminalServoConfig"] = servo_config
+        landings = servo_config["terminalServoSearchLandings"]
+        parsed["message"] = (
+            "Terminal servo configured: "
+            + ("one descent at the fixed pose." if landings <= 1 else f"{landings} landings.")
+        )
+        return parsed
+
+    span_detail = parse_expert_span(stripped)
+    if span_detail:
+        # Reported for the caller to merge rather than assigned, the same way the DAgger
+        # per-rollout counts are: one line carries one span, and assigning here would leave the
+        # status holding only the last one.
+        parsed["takeoverDetail"] = span_detail
+        parsed["message"] = (
+            f"Takeover {span_detail['index'] + 1}: steps "
+            f"{span_detail['first']}–{span_detail['last']} at z={span_detail['xyz'][2]:.3f}."
+        )
+        return parsed
+
+    servo_result = parse_terminal_servo_result(stripped)
+    if servo_result:
+        parsed["lastRolloutTerminalServo"] = servo_result
+        verdict = servo_result.get("verdict", "?")
+        above = servo_result.get("aboveTargetMm")
+        # Deliberately no state. The descent ends inside a rollout that is still running -- the
+        # arm still has to release, retreat and hand back -- and reporting `finishing` here would
+        # re-open the grading prompt against a rollout index the runtime has not closed yet.
+        parsed["message"] = (
+            f"Terminal descent: {verdict}"
+            + ("" if above is None else f", {above:+.1f} mm above the seated depth.")
+        )
         return parsed
 
     if "scene_reset=start" in stripped:
@@ -910,6 +1028,116 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         return parsed
 
     return parsed
+
+
+def parse_policy_arm(text: str) -> dict[str, Any]:
+    """Which draw the runtime is executing, and how it chose it.
+
+    E3 compares medoid against mean against a single draw, and E8 would add a fourth arm on the
+    same mechanism. The three numbers that name the arm were settable from the page and reachable
+    by the runtime, and then present in neither the status nor the outcome log -- so two arms of
+    the same comparison were distinguishable only by which log file a reader happened to open.
+    Parsed from the runtime's announce rather than echoed back from the launch request, the same
+    provenance rule the landing points follow.
+    """
+    match = _POLICY_ARM_RE.search(text)
+    if not match:
+        return {}
+    return {
+        "actionSamples": int(match.group(1)),
+        "actionAggregate": match.group(2),
+        "selectionHorizon": int(match.group(3)),
+    }
+
+
+def parse_terminal_servo_config(text: str) -> dict[str, Any]:
+    """The fixed pose the last centimetres are driven to, and whether the search ring is on.
+
+    `searchLandings` rather than the ring radius alone, because the radius is not the arm: a
+    7 mm ring with one landing and a 7 mm ring with nine cover different discs, and the runtime
+    is the only party that has applied its own refusals to the pair.
+    """
+    match = _TERMINAL_SERVO_CONFIGURED_RE.search(text)
+    if not match:
+        return {}
+    return {
+        "terminalServoXyz": [float(match.group(index)) for index in (1, 2, 3)],
+        "terminalServoHandoffZ": float(match.group(4)),
+        "terminalServoMaxSpeedMs": float(match.group(5)),
+        "terminalServoSearchRingM": float(match.group(6)),
+        "terminalServoSearchLandings": int(match.group(7)),
+    }
+
+
+def parse_terminal_servo_result(text: str) -> dict[str, Any]:
+    """What the terminal descent did, as fields rather than as a sentence in the log.
+
+    The four signatures on the 2026-09-10 card matched the operator's grade on all nine descents
+    they were drawn from, which makes this the rig's one machine-readable statement about how a
+    rollout ended -- and it was being written to a log file and thrown away. Recorded beside the
+    operator's grade, never instead of it: the agreement between the two is the measurement, and
+    a column that has replaced the thing it was supposed to be checked against cannot report it.
+
+    `verdict` comes from the runtime, which owns the thresholds
+    (`classify_terminal_servo_descent`). A line from a runtime older than that field parses
+    without one rather than being classified here, because re-deriving it at this crossing is
+    how the page and the rig come to disagree about what "seated" means.
+    """
+    if not _TERMINAL_SERVO_DONE_RE.search(text):
+        return {}
+    result: dict[str, Any] = {}
+    for match in _TERMINAL_SERVO_WORD_RE.finditer(text):
+        result[_TERMINAL_SERVO_FIELD_NAMES[match.group(1)]] = match.group(2)
+    for match in _TERMINAL_SERVO_NUMBER_RE.finditer(text):
+        try:
+            result[_TERMINAL_SERVO_FIELD_NAMES[match.group(1)]] = float(match.group(2))
+        except ValueError:
+            continue
+    index_match = _TERMINAL_SERVO_INDEX_RE.search(text)
+    if index_match:
+        # Which landing answered, out of how many were available. `3/8` on a seated verdict is
+        # the search earning its place; `0/0` is the control arm.
+        result["searchIndex"] = int(index_match.group(1))
+        result["searchLandings"] = int(index_match.group(2)) + 1
+    return result
+
+
+def parse_expert_span(text: str) -> dict[str, Any]:
+    """One takeover: which steps it covered, where the arm was, and what held there.
+
+    The pose rather than a residual, and the reference as its own field when one exists. Every
+    candidate reference on this rig is absent, drifting or floored -- the fixture creeps within a
+    session -- so a difference computed at write time is a number that expires inside a log that
+    cannot be rewritten. Both halves are kept and the subtraction is a read-time operation, which
+    is what lets a corrected reference re-read finished records instead of invalidating them.
+
+    `policyStatus` is the machine's half of "why did the operator reach in", read from the last
+    policy step before the span. It is absent when the span starts at step 0, because then there
+    is no policy step to read and the honest answer is that nobody asked.
+    """
+    match = _EXPERT_SPAN_RE.search(text)
+    if not match:
+        return {}
+    detail: dict[str, Any] = {
+        "index": int(match.group(1)),
+        "first": int(match.group(2)),
+        "last": int(match.group(3)),
+        # The trace CSV's own step number. Equal to `first` unless a sample was dropped, and
+        # carried separately because this record exists precisely for the case where the trace
+        # is gone -- one browser session overwrote a graded batch's traces on 2026-09-01.
+        "step": int(match.group(4)),
+        "xyz": [float(match.group(index)) for index in (5, 6, 7)],
+    }
+    status = _EXPERT_SPAN_STATUS_RE.search(text)
+    if status:
+        detail["policyStatus"] = status.group(1)
+    budget = _EXPERT_SPAN_BUDGET_RE.search(text)
+    if budget:
+        detail["stepsLeft"] = int(budget.group(1))
+    reference = _EXPERT_SPAN_REFERENCE_RE.search(text)
+    if reference:
+        detail["referenceXyz"] = [float(reference.group(index)) for index in (1, 2, 3)]
+    return detail
 
 
 def is_noise(line: str) -> bool:

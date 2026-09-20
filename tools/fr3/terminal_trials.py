@@ -68,6 +68,7 @@ from tools.fr3.scene_reset import (
 from tools.fr3.terminal_servo import (
     TERMINAL_SERVO_SEARCH_RING_M,
     TerminalServoRequest,
+    classify_terminal_servo_descent,
     execute_terminal_servo,
     terminal_servo_search_offsets,
     validate_terminal_servo_trajectory,
@@ -272,15 +273,20 @@ def classify_stop(
     depth and were misses, because the peg had slid up between the fingers while the arm leaned.
     Depth alone cannot tell those apart -- 0.7 and 1.4 mm above target, squarely inside the
     seated cluster -- and the column that can is how long the last millimetres took.
+
+    The rule itself lives in `terminal_servo`, which is the module that produces the two numbers
+    and the one the GUI also reads a verdict from. This wrapper stays because this module's
+    callers name a standing threshold and pass positionally, and because an offset sweep asking
+    "what happened" is a different question from a servo asking "fly to the next landing?".
     """
 
-    if settle_mm >= slip_mm:
-        return "slip"
-    if above_target_mm <= seated_mm:
-        return "seated"
-    if above_target_mm >= standing_mm:
-        return "standing"
-    return "ambiguous"
+    return classify_terminal_servo_descent(
+        above_target_mm=above_target_mm,
+        settle_mm=settle_mm,
+        seated_mm=seated_mm,
+        slip_mm=slip_mm,
+        standing_mm=standing_mm,
+    )
 
 
 def tool_axis_tilt_deg(rotvec: tuple[float, float, float]) -> float:

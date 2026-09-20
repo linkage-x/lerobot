@@ -330,9 +330,16 @@ def _normalize_blockers(payload: dict[str, Any], ladder: Ladder) -> tuple[str, .
     defined as the primary one, and a payload where the two disagree is a payload whose author
     believed something this function does not.
 
-    Order is kept and duplicates are dropped. With one blocker per takeover span the order is
-    the order they happened in, which is what makes "the first one" mean the same thing as the
-    stage the rollout is graded at.
+    Order and multiplicity are both kept. With one blocker per takeover span the order is the
+    order they happened in, which is what makes "the first one" mean the same thing as the stage
+    the rollout is graded at -- and the repeats are the common case, not an input error: a
+    rollout rescued three times for the same reason has that reason three times.
+
+    Duplicates used to be dropped here. That silently broke both things this field is for: a
+    failure-mode distribution built from it undercounted whichever reason recurred, and the
+    positional alignment the page asks the operator for ("第 1 个对应上面那一阶段") stopped
+    holding as soon as two spans shared a reason -- three spans went in and two entries came
+    out, with no indication that anything had been lost.
     """
     raw = payload.get("blockers")
     primary = payload.get("blocker")
@@ -349,8 +356,7 @@ def _normalize_blockers(payload: dict[str, Any], ladder: Ladder) -> tuple[str, .
         if blocker not in ladder.blockers:
             known = ", ".join(ladder.blockers)
             raise LadderError(f"Blocker {blocker!r} is not one of: {known}.")
-        if blocker not in ordered:
-            ordered.append(blocker)
+        ordered.append(blocker)
 
     if primary not in (None, "") and ordered and str(primary).strip() != ordered[0]:
         raise LadderError(

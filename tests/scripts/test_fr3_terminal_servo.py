@@ -18,6 +18,7 @@ from tools.fr3.scene_reset import SceneResetError
 from tools.fr3.terminal_servo import (
     TerminalServoError,
     TerminalServoRequest,
+    classify_terminal_servo_descent,
     execute_terminal_servo,
     parse_terminal_servo_pose,
     terminal_servo_arming,
@@ -635,3 +636,105 @@ def test_a_negative_regrip_drop_is_refused_because_a_released_peg_does_not_rise(
     result = execute_terminal_servo(_descending(0.118), _request(regripDropM=-0.001))
     assert result["ok"] is False
     assert "regripDropM" in result["error"]
+
+
+# ------------------------------------------------------------------- the verdict ---
+# One descent, three things it can mean. The rule was being applied inside the search loop and
+# nowhere else, so the control arm -- which is the descent this whole comparison is measured
+# against -- produced numbers and no conclusion.
+
+
+def test_creep_is_read_before_depth():
+    """The lesson of 2026-09-10, now a property of the function rather than of one call site.
+
+    Two runs reached the seated depth and were graded misses: the peg had slid up between the
+    fingers, so the tool arrived where the hole is and the peg did not. A classifier that asked
+    about depth first would call both of them insertions.
+    """
+    assert (
+        classify_terminal_servo_descent(above_target_mm=0.7, settle_mm=4.0, slip_mm=3.0)
+        == "slip"
+    )
+    assert (
+        classify_terminal_servo_descent(above_target_mm=0.7, settle_mm=0.1, slip_mm=3.0)
+        == "seated"
+    )
+
+
+def test_the_two_clusters_on_either_side_of_the_seated_threshold():
+    """1.1-2.5 mm went in, 4.9-5.6 mm stood on the face, and nothing was measured between."""
+    assert classify_terminal_servo_descent(above_target_mm=2.5, settle_mm=0.0) == "seated"
+    assert classify_terminal_servo_descent(above_target_mm=4.9, settle_mm=0.0) == "standing"
+
+
+def test_the_band_between_the_two_clusters_is_named_only_when_somebody_asks_for_it():
+    """The search does not want a fourth answer -- it is deciding whether to fly to the next
+    landing, and "not seated" is the whole of what it needs. An offset sweep does: its job is to
+    find where the boundary is, so a stop between the clusters is evidence about the boundary
+    rather than evidence for either side of it."""
+    between = {"above_target_mm": 4.0, "settle_mm": 0.0}
+
+    assert classify_terminal_servo_descent(**between) == "standing"
+    assert classify_terminal_servo_descent(**between, standing_mm=4.9) == "ambiguous"
+
+
+def test_a_slip_is_a_distance_not_a_duration():
+    """The card measured slips at 8.1 s and 18.1 s against a settle window that was the full
+    20 s timeout. That window is now 0.5 s, so no descent can ever creep for eight seconds
+    again -- it can only travel while it creeps, which is the column this reads."""
+    assert (
+        classify_terminal_servo_descent(above_target_mm=6.0, settle_mm=3.0, slip_mm=3.0)
+        == "slip"
+    )
+
+
+def test_the_verdict_says_what_happened_to_the_peg_not_why_the_search_stopped():
+    """With the ring off the loop always reports `exhausted`, which is true of the search and
+    silent about the peg. E5 is exactly this arm, so it is the one that most needs the answer."""
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + 0.030, SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+
+    result = execute_terminal_servo(robot, _request())
+
+    assert result["searchStoppedOn"] == "exhausted"
+    assert result["verdict"] == "standing"
+
+
+def test_a_seated_descent_says_so_in_both_words():
+    robot = FakeHoleRobot(hole_xy=(SEATED[0], SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+
+    result = execute_terminal_servo(robot, _searching())
+
+    assert result["searchStoppedOn"] == "seated"
+    assert result["verdict"] == "seated"
+
+
+def test_the_done_line_leads_with_the_verdict(capsys):
+    """It is what the page records and what a reader skims for; the columns after it are how it
+    was reached."""
+    robot = FakeHoleRobot(hole_xy=(SEATED[0], SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+
+    execute_terminal_servo(robot, _request())
+
+    done = [line for line in capsys.readouterr().out.splitlines() if "terminal_servo=done" in line]
+    assert len(done) == 1
+    assert "verdict=seated" in done[0]
+
+
+def test_every_landing_carries_its_own_verdict():
+    """A nine-landing search that ends `exhausted` is nine readings, and the table of them is
+    what says whether the ring was ever near the hole."""
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + 0.030, SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+
+    result = execute_terminal_servo(robot, _searching())
+
+    assert len(result["searchAttempts"]) == 9
+    assert {attempt["verdict"] for attempt in result["searchAttempts"]} == {"standing"}
+

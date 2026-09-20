@@ -4565,6 +4565,16 @@ button.danger {
   margin: 6px 0;
 }
 
+/* One row per takeover span. `max-height` above keeps a rollout with many rescues from pushing
+   the Record button off the card, which is the one control that cannot be filled in later. */
+.blocker-choices .field {
+  margin: 8px 0;
+}
+
+.blocker-choices .field .hint {
+  margin-bottom: 2px;
+}
+
 .checkbox,
 .field-inline {
   align-items: flex-start;

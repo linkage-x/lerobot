@@ -5972,6 +5972,12 @@ def _apply_rollout_output(state: GatewayState, line: str) -> None:
     dropped_written = int(parsed.pop("daggerDroppedFramesWritten", 0) or 0)
     status.daggerEpisodes += episodes_written
     status.daggerDroppedFrames += dropped_written
+    # Merged rather than assigned: the runtime prints one line per takeover, and each carries
+    # its own index. Keyed by that index so a line lost to a truncated log leaves a hole instead
+    # of renumbering every span after it.
+    takeover = parsed.pop("takeoverDetail", None)
+    if isinstance(takeover, dict) and "index" in takeover:
+        status.lastRolloutTakeovers[int(takeover["index"])] = takeover
     for key, value in parsed.items():
         if key == "state":
             # A stop the operator already asked for is not undone by a line the runtime wrote
@@ -6539,6 +6545,22 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
         # steps off its own per-step trace, so a page cannot file a rollout it drove by hand as
         # one the policy did alone.
         "intervention": dict(state.rollout.lastRolloutIntervention or {}),
+        # Which arm this rollout ran. Both halves come from the runtime's startup announce, and
+        # they are merged here because a reader asking "what produced this number" is asking one
+        # question: the draw that was executed and the pose the last centimetres were driven to
+        # are two settings of one configuration, and no rollout can have one without the other.
+        "arm": {
+            **dict(state.rollout.policyArm or {}),
+            **dict(state.rollout.terminalServoConfig or {}),
+        },
+        # The rig's own verdict on the descent, recorded next to the grade the operator is about
+        # to give and never merged with it. The agreement between the two is what the unattended
+        # loops are accepted on, so they have to stay two columns.
+        "terminalServo": dict(state.rollout.lastRolloutTerminalServo or {}),
+        # P1-9. The measured half of each takeover. Sent as the runtime reported it; the grade's
+        # own reasons are lined up against it in `append_rollout_outcome`, which is where the
+        # blockers have been normalised and can be counted.
+        "takeoverDetails": dict(state.rollout.lastRolloutTakeovers or {}),
     }
     # Forwarded only when the page actually sent them, so an ungraded rollout reaches the log
     # as one instead of as stage 0 -- which is a real grade meaning "never reached the object".

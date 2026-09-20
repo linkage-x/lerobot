@@ -2593,6 +2593,94 @@ class RolloutGeometryTrace:
         )
         return result
 
+    def expert_span_details(
+        self,
+        *,
+        max_steps: int | None = None,
+        reference_xyz: tuple[float, float, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """One record per stretch the operator drove: where the arm was, and what held there.
+
+        P1-9 asked for a reason and a `(xy residual, z)` pair per span. What is recorded here is
+        the *pose*, not a residual, and the reference beside it when one exists. A residual is a
+        measurement minus a reference, and on this rig every candidate reference is either
+        absent (no terminal servo pose configured), drifting (the fixture creeps within a
+        session: r=+0.64, p=0.002, and two re-reads fifteen minutes apart differed by 5.87 mm)
+        or floored (the demonstration cloud carries ~3.5 mm of its own scatter). The
+        measurement, by contrast, is clean. Subtracting at write time would bake a number that
+        expires into a log that cannot be rewritten -- and this project has twice re-read a
+        finished table by changing one threshold over the raw quantities, which is only possible
+        because the raw quantities were kept. `terminal_trials` already writes its rows this way
+        (`referenceXyz` and the measured stop, never their difference).
+
+        The machine half of "why did the operator reach in" is read from the last *policy* step
+        before the span, not from the first expert step: at the first expert step the command
+        guard is reporting on the operator's own command. A span that starts at the very first
+        step has no such step, and the field is then absent rather than guessed.
+        """
+
+        if not self._rows:
+            return []
+        sources = [row[7] for row in self._rows]
+        details: list[dict[str, Any]] = []
+        for index, (first, last) in enumerate(expert_spans(sources)):
+            row = self._rows[first]
+            detail: dict[str, Any] = {
+                'index': index,
+                'first': first,
+                'last': last,
+                # The trace's own step number, which is the join key into the CSV. Equal to
+                # `first` unless a sample was dropped, and stated rather than assumed because
+                # the whole value of this record is that it survives the trace being deleted.
+                'step': int(row[0]),
+                'xyz': [float(row[1]), float(row[2]), float(row[3])],
+            }
+            if first > 0:
+                detail['policy_status'] = str(self._rows[first - 1][6])
+            if max_steps:
+                # What was left of the budget. A takeover at step 780 of 800 is a different
+                # event from the same takeover at step 80, and neither the span nor the pose
+                # says which one happened.
+                detail['steps_left'] = max(int(max_steps) - int(row[0]), 0)
+            if reference_xyz is not None:
+                detail['reference_xyz'] = [float(value) for value in reference_xyz]
+            details.append(detail)
+        return details
+
+    def expert_span_log_lines(
+        self,
+        *,
+        max_steps: int | None = None,
+        reference_xyz: tuple[float, float, float] | None = None,
+    ) -> list[str]:
+        """The per-span records as log lines, one per span.
+
+        Their own lines rather than more fields on the end marker: the marker is one line per
+        rollout and this is one record per takeover, so folding them together would need a
+        nested encoding inside a flat `key=value` line, which is the point at which a log stops
+        being greppable.
+        """
+
+        lines: list[str] = []
+        for detail in self.expert_span_details(max_steps=max_steps, reference_xyz=reference_xyz):
+            fields = [
+                f"index={detail['index']}",
+                f"first={detail['first']}",
+                f"last={detail['last']}",
+                f"step={detail['step']}",
+                'xyz=' + ','.join(f'{value:.4f}' for value in detail['xyz']),
+            ]
+            if 'policy_status' in detail:
+                fields.append(f"policy_status={detail['policy_status']}")
+            if 'steps_left' in detail:
+                fields.append(f"steps_left={detail['steps_left']}")
+            if 'reference_xyz' in detail:
+                fields.append(
+                    'reference_xyz=' + ','.join(f'{value:.4f}' for value in detail['reference_xyz'])
+                )
+            lines.append('[INFO] expert_span ' + ' '.join(fields))
+        return lines
+
     def summary_log_fields(self) -> str:
         """The summary as `key=value` fields appended to the rollout's end marker.
 
@@ -4613,23 +4701,28 @@ def run_inference(args: argparse.Namespace) -> int:
     delta_reconstructor = build_delta_action_reconstructor(action_names)
     lateral_action_indices, gripper_action_index = resolve_sampling_action_indices(action_names)
     action_samples = max(1, int(args.action_samples))
-    if action_samples > 1:
-        if lateral_action_indices is None:
-            raise SystemExit(
-                f'--action-samples {action_samples} needs lateral delta columns to select among the '
-                f'draws, and this action contract has none: {action_names}. Run with '
-                '--action-samples 1, or point at a delta-EE view.'
-            )
-        print(
-            '[INFO] action_samples=%d aggregate=%s selection_horizon=%s lateral=%s gripper=%s'
-            % (
-                action_samples,
-                args.action_aggregate,
-                int(args.action_sample_horizon) or int(args.rtc_execution_horizon),
-                [action_names[i] for i in lateral_action_indices],
-                None if gripper_action_index is None else action_names[gripper_action_index],
-            )
+    if action_samples > 1 and lateral_action_indices is None:
+        raise SystemExit(
+            f'--action-samples {action_samples} needs lateral delta columns to select among the '
+            f'draws, and this action contract has none: {action_names}. Run with '
+            '--action-samples 1, or point at a delta-EE view.'
         )
+    # Announced whether or not the sampling is on, which it was not until 2026-09-20. E3 is a
+    # three-arm comparison and `--action-samples 1` is its control arm, so a run that prints
+    # nothing is the arm whose rollouts cannot afterwards be told from any other run's. Silence
+    # is not a record of the default; it is a record of a runtime too old to have the field.
+    print(
+        '[INFO] action_samples=%d aggregate=%s selection_horizon=%s lateral=%s gripper=%s'
+        % (
+            action_samples,
+            args.action_aggregate,
+            int(args.action_sample_horizon) or int(args.rtc_execution_horizon),
+            None
+            if lateral_action_indices is None
+            else [action_names[i] for i in lateral_action_indices],
+            None if gripper_action_index is None else action_names[gripper_action_index],
+        )
+    )
     # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
     # is a startup error, not something discovered with a peg in the gripper 12 cm above the
     # fixture. The reach check is not run yet -- it needs the arm -- so this is the deterministic
@@ -5879,6 +5972,15 @@ def run_inference(args: argparse.Namespace) -> int:
                     expert_takeover=expert_takeover,
                     dagger_buffer=dagger_buffer,
                 )
+                # Before the end marker, because the marker is what raises the grading prompt
+                # and the page attaches these to the rollout it is about to grade.
+                for span_line in trace.expert_span_log_lines(
+                    max_steps=args.max_steps,
+                    reference_xyz=(
+                        terminal_servo_request.xyz if terminal_servo_request is not None else None
+                    ),
+                ):
+                    print(span_line)
                 print(
                     f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status} '
                     + trace.summary_log_fields()

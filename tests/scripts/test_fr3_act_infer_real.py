@@ -2331,3 +2331,87 @@ def test_a_single_sample_needs_no_lateral_columns():
     assert parsed.action_samples == 1
     assert parsed.action_aggregate == 'medoid'
     assert parsed.action_sample_horizon == 0
+
+
+# ------------------------------------------------- what the runtime knows about a takeover ---
+# P1-9's machine half. The operator's half is a reason recorded at grading time; this is the
+# part only the runtime can supply, and it is supplied as measurements rather than as a
+# conclusion drawn from them.
+
+
+def _takeover_trace(sources, *, statuses=None):
+    trace = fr3_act_infer_real_runtime.RolloutGeometryTrace(1)
+    for step, source in enumerate(sources):
+        trace.sample(
+            step_idx=step,
+            position_xyz=np.asarray([0.36, -0.13, 0.30 - step * 0.001], dtype=np.float64),
+            gripper_command=1.0,
+            gripper_raw=1.0,
+            command_status="pass" if statuses is None else statuses[step],
+            source=source,
+        )
+    return trace
+
+
+def test_a_takeover_records_the_pose_and_the_reference_separately():
+    """Never their difference. Every reference on this rig is absent, drifting or floored -- the
+    fixture creeps within a session -- so a residual computed at write time is a number that
+    expires inside a log that cannot be rewritten. Keeping both halves is what let this project
+    re-read a finished table twice by changing one threshold."""
+    trace = _takeover_trace(["policy"] * 41 + ["expert"] * 18)
+
+    detail = trace.expert_span_details(reference_xyz=(0.3599, -0.1333, 0.0523))[0]
+
+    assert detail["first"] == 41 and detail["last"] == 58
+    assert detail["xyz"] == [0.36, -0.13, pytest.approx(0.259)]
+    assert detail["reference_xyz"] == [0.3599, -0.1333, 0.0523]
+
+
+def test_the_trigger_is_read_from_the_last_policy_step_not_the_first_expert_one():
+    """At the first expert step the command guard is reporting on the *operator's* command. One
+    step earlier is the last thing the policy did before a human decided to stop it, which is
+    the question this field is asking."""
+    sources = ["policy"] * 41 + ["expert"] * 18
+    statuses = ["pass"] * 59
+    statuses[40] = "step_limited"
+
+    detail = _takeover_trace(sources, statuses=statuses).expert_span_details()[0]
+
+    assert detail["policy_status"] == "step_limited"
+
+
+def test_a_takeover_from_the_first_step_reports_no_trigger():
+    """There is no policy step to read, and the honest answer is that nobody asked."""
+    detail = _takeover_trace(["expert"] * 5 + ["policy"] * 5).expert_span_details()[0]
+
+    assert "policy_status" not in detail
+
+
+def test_a_takeover_records_what_was_left_of_the_budget():
+    """A rescue at step 780 of 800 is a different event from the same rescue at step 80, and
+    neither the span nor the pose says which one happened."""
+    detail = _takeover_trace(["policy"] * 41 + ["expert"] * 18).expert_span_details(
+        max_steps=800
+    )[0]
+
+    assert detail["steps_left"] == 759
+
+
+def test_every_takeover_gets_its_own_line():
+    """One record per reach-in. Folding them into the end marker would need a nested encoding
+    inside a flat key=value line, which is where a log stops being greppable."""
+    trace = _takeover_trace(
+        ["policy"] * 41 + ["expert"] * 18 + ["policy"] * 61 + ["expert"] * 14
+    )
+
+    lines = trace.expert_span_log_lines()
+
+    assert len(lines) == 2
+    assert lines[0].startswith("[INFO] expert_span index=0 first=41 last=58 step=41 xyz=")
+    assert "index=1 first=120 last=133" in lines[1]
+
+
+def test_a_rollout_nobody_took_over_emits_nothing():
+    assert _takeover_trace(["policy"] * 20).expert_span_log_lines() == []
+    assert fr3_act_infer_real_runtime.RolloutGeometryTrace(1).expert_span_details() == []
+

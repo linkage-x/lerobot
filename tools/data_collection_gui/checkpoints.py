@@ -584,6 +584,38 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
                 for span in spans
                 if isinstance(span, (list, tuple)) and len(span) == 2
             ]
+    # P1-9. One row per takeover: the runtime's measurement of it and the operator's reason for
+    # it, lined up by position. Built here rather than in the gateway because this is where the
+    # blockers have been normalised against the ladder, and the alignment is the whole point.
+    takeovers, mismatch = _align_takeovers(
+        record.get("intervention"), record.get("takeoverDetails"), entry.get("blockers")
+    )
+    if takeovers:
+        entry["takeovers"] = takeovers
+    if mismatch is not None:
+        # Recorded, not refused. A grade is perishable -- the operator is standing at the rig,
+        # and a refusal loses a rollout's evidence permanently -- while a grade carrying a count
+        # mismatch is still usable for everything except the per-span split. Same rule as P0-0:
+        # make the defect visible rather than let it block the path.
+        entry["takeoverBlockerMismatch"] = mismatch
+    # Which arm produced this rollout: the draw the policy executed (E3) and where the last
+    # centimetres were driven to (E5 / E7-C). Written from what the runtime announced, so a log
+    # filtered to one arm holds only rollouts that actually ran it. Absent when the runtime said
+    # nothing -- which, since 2026-09-20, means a runtime older than the announce and not a
+    # default, because the default arm now announces itself too.
+    arm = record.get("arm")
+    if isinstance(arm, dict) and arm:
+        clean_arm = _sanitize_rollout_arm(arm)
+        if clean_arm:
+            entry["arm"] = clean_arm
+    # The rig's own reading of how the descent ended, beside the operator's grade rather than in
+    # place of it. Keeping both is the point: their agreement rate is the acceptance criterion
+    # for every unattended loop on this rig, and a single reconciled column cannot report it.
+    terminal_servo = record.get("terminalServo")
+    if isinstance(terminal_servo, dict) and terminal_servo:
+        clean_servo = _sanitize_terminal_servo(terminal_servo)
+        if clean_servo:
+            entry["terminalServo"] = clean_servo
     path = rollout_log_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -597,6 +629,162 @@ _GEOMETRY_SCALAR_FIELDS = ("apexZ", "liftM", "descentM")
 # place the answer means anything: a landing point is evidence about whoever produced it.
 _GEOMETRY_DRIVER_FIELDS = ("graspBy", "releaseBy", "approachBy")
 _GEOMETRY_DRIVERS = ("policy", "expert")
+
+
+_TAKEOVER_INT_FIELDS = ("index", "first", "last", "step", "stepsLeft")
+_TAKEOVER_POINT_FIELDS = ("xyz", "referenceXyz")
+
+
+def _align_takeovers(
+    intervention: Any, details: Any, blockers: Any
+) -> tuple[list[dict[str, Any]], dict[str, int] | None]:
+    """One row per takeover span, carrying its measurement and its reason.
+
+    The span list from the runtime decides how many rows there are. The details are merged in by
+    index, so a line lost to a truncated log leaves a row without a pose rather than shifting
+    every row after it, and the reasons are zipped positionally -- which is exactly what the
+    page asks the operator for and what `_normalize_blockers` now preserves.
+
+    Never a residual. The pose and the reference are separate columns because every reference on
+    this rig either drifts or is missing, and a difference taken at write time cannot be redone
+    when the reference is corrected.
+
+    The mismatch return is a count, not a refusal. With one or more spans there should be one
+    reason each; with none there is at most one, which is the field's older meaning -- why the
+    rollout stopped where its stage says it stopped. It stays silent when there are no reasons
+    at all: a rollout graded at its terminal stage has nothing blocking it, and an assisted
+    success is the ordinary way to reach that state, so flagging it would put a warning on every
+    one of them.
+    """
+    spans: list[Any] = []
+    if isinstance(intervention, dict):
+        raw_spans = intervention.get("spans")
+        if isinstance(raw_spans, list):
+            spans = [
+                span for span in raw_spans if isinstance(span, (list, tuple)) and len(span) == 2
+            ]
+    reasons = [str(value) for value in blockers] if isinstance(blockers, list) else []
+    if not spans:
+        return [], ({"spans": 0, "blockers": len(reasons)} if len(reasons) > 1 else None)
+    expect_reasons = bool(reasons)
+
+    by_index: dict[int, dict[str, Any]] = {}
+    if isinstance(details, dict):
+        for key, value in details.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                by_index[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+
+    rows: list[dict[str, Any]] = []
+    for index, span in enumerate(spans):
+        row: dict[str, Any] = {"index": index}
+        try:
+            row["first"], row["last"] = int(span[0]), int(span[1])
+        except (TypeError, ValueError):
+            continue
+        detail = by_index.get(index, {})
+        for key in _TAKEOVER_INT_FIELDS:
+            value = detail.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and key not in row:
+                row[key] = value
+        for key in _TAKEOVER_POINT_FIELDS:
+            value = detail.get(key)
+            if isinstance(value, (list, tuple)) and len(value) == 3:
+                try:
+                    row[key] = [round(float(component), 5) for component in value]
+                except (TypeError, ValueError):
+                    continue
+        status = detail.get("policyStatus")
+        if isinstance(status, str) and status:
+            row["policyStatus"] = status[:32]
+        if index < len(reasons):
+            row["blocker"] = reasons[index]
+        rows.append(row)
+
+    mismatch = (
+        {"spans": len(spans), "blockers": len(reasons)}
+        if expect_reasons and len(reasons) != len(spans)
+        else None
+    )
+    return rows, mismatch
+
+
+_ARM_INT_FIELDS = ("actionSamples", "selectionHorizon", "terminalServoSearchLandings")
+_ARM_SCALAR_FIELDS = (
+    "terminalServoHandoffZ",
+    "terminalServoMaxSpeedMs",
+    "terminalServoSearchRingM",
+)
+# The aggregates the runtime will accept (`--action-aggregate`). An arm named anything else is a
+# caller inventing one, and an invented arm in a comparison is worse than a missing one.
+_ARM_AGGREGATES = ("medoid", "mean")
+
+
+def _sanitize_rollout_arm(arm: dict[str, Any]) -> dict[str, Any]:
+    """Keep the fields that name an arm, and nothing a caller invented."""
+    clean: dict[str, Any] = {}
+    for key in _ARM_INT_FIELDS:
+        value = arm.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            clean[key] = value
+    for key in _ARM_SCALAR_FIELDS:
+        value = arm.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            clean[key] = round(float(value), 5)
+    if arm.get("actionAggregate") in _ARM_AGGREGATES:
+        clean["actionAggregate"] = arm["actionAggregate"]
+    xyz = arm.get("terminalServoXyz")
+    if isinstance(xyz, (list, tuple)) and len(xyz) == 3:
+        try:
+            clean["terminalServoXyz"] = [round(float(component), 5) for component in xyz]
+        except (TypeError, ValueError):
+            pass
+    return clean
+
+
+# What the descent concluded. The vocabulary is the runtime's
+# (`terminal_servo.classify_terminal_servo_descent`); this end refuses anything outside it
+# rather than storing a word no analysis will know to look for.
+_TERMINAL_SERVO_VERDICTS = ("seated", "standing", "slip")
+_TERMINAL_SERVO_WORD_FIELDS = ("stoppedOn", "searchStoppedOn")
+_TERMINAL_SERVO_NUMBER_FIELDS = (
+    "stoppedZ",
+    "aboveTargetMm",
+    "lateralErrorMm",
+    "heldUpMm",
+    "heldUpGrowthMm",
+    "peakGrowthMm",
+    "lagMm",
+    "descentMm",
+    "descentSeconds",
+    "settleSeconds",
+    "settleMm",
+    "searchOffsetMm",
+)
+_TERMINAL_SERVO_INT_FIELDS = ("searchIndex", "searchLandings")
+
+
+def _sanitize_terminal_servo(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the descent's own columns, and refuse a verdict this rig does not use."""
+    clean: dict[str, Any] = {}
+    if result.get("verdict") in _TERMINAL_SERVO_VERDICTS:
+        clean["verdict"] = result["verdict"]
+    for key in _TERMINAL_SERVO_WORD_FIELDS:
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            clean[key] = value[:32]
+    for key in _TERMINAL_SERVO_NUMBER_FIELDS:
+        value = result.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            clean[key] = round(float(value), 5)
+    for key in _TERMINAL_SERVO_INT_FIELDS:
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            clean[key] = value
+    return clean
 
 
 def _sanitize_rollout_geometry(geometry: dict[str, Any]) -> dict[str, Any]:

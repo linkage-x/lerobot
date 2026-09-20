@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
+import { describeArm, verdictAgreement } from "./rolloutArms";
+import { blockersToSend, mismatchCount, reasonSlots, slotLabel } from "./takeoverReasons";
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
 import { carriedOverNotice } from "./rolloutCarryover";
 import { LIVE_STATES, sessionAvailability, sessionNote } from "./rolloutSessionControls";
@@ -278,6 +280,21 @@ export function RolloutPage() {
     [history, run?.checkpointId]
   );
 
+  // How often the rig's own verdict has matched the operator's grade, over this checkpoint's
+  // records rather than the whole log: the four signatures behind the verdict were fitted on one
+  // configuration of this rig, and pooling checkpoints would hide the run where they stopped
+  // holding. This is the number the unattended loops are accepted on, and it exists only
+  // because the two readings are stored as separate columns.
+  const agreement = useMemo(
+    () =>
+      verdictAgreement(
+        history.filter(
+          (entry) => !run?.checkpointId || entry.checkpointId === run.checkpointId
+        )
+      ),
+    [history, run?.checkpointId]
+  );
+
   // The log is served newest first, and the rows that answer "did that last run go in" are the
   // ones at the top. The rest stays one click away rather than several screens down.
   const visibleHistory = useMemo(
@@ -536,6 +553,15 @@ export function RolloutPage() {
   // takeover, and an operator asked to remember where that was, twenty minutes into a batch,
   // will grade against the last one instead.
   const takeoverSpans = run?.lastRolloutIntervention?.spans ?? [];
+  // The arm this session is running, both halves of it. From the runtime's announce, so what
+  // is on screen is what the process did rather than what the form asked for.
+  const armLabel = describeArm({ ...(run?.policyArm ?? {}), ...(run?.terminalServoConfig ?? {}) });
+  const lastServo = run?.lastRolloutTerminalServo;
+  // One reason per takeover, or one for the rollout when nobody reached in. The count comes
+  // from the runtime's span list, so the form cannot ask for a reason belonging to a takeover
+  // that did not happen.
+  const takeoverDetails = run?.lastRolloutTakeovers ?? {};
+  const reasonCount = reasonSlots(takeoverSpans.length);
   const terminalWasOperators = terminalEventDriver(run?.lastRolloutGeometry) === "expert";
   const successBlocked = assistedSuccessBlocked(run?.lastRolloutGeometry, assistedSuccessAck);
 
@@ -550,8 +576,14 @@ export function RolloutPage() {
         note,
         ...(ladder && gradedStage ? { taskLadder: ladder.task, stageId: gradedStage.id } : {}),
         // Only meaningful on a shortfall: the terminal stage did not stop anywhere.
-        ...(ladder && gradedStage && outcomeBlockers.length && gradedStage.ordinal < ladder.terminal
-          ? { blockers: outcomeBlockers }
+        ...(ladder && gradedStage && gradedStage.ordinal < ladder.terminal
+          ? (() => {
+              // Sent whole once anything is picked, holes included: the positions are the
+              // alignment to the spans, and a list with a gap removed points every later reason
+              // at the wrong takeover.
+              const blockers = blockersToSend(outcomeBlockers, takeoverSpans.length);
+              return blockers.length ? { blockers } : {};
+            })()
           : {}),
         // Sent only when it is not derivable. `aborted` is the one outcome a stage cannot
         // imply -- it says the round is not evidence about the policy at all.
@@ -614,6 +646,15 @@ export function RolloutPage() {
                 that takes a minute, and the two in which the arm is already carrying out a
                 command of its own. */}
             {sessionNote(run) && <span className="hint">{sessionNote(run)}</span>}
+            {/* Which arm is running, from the runtime's own announce. On screen because the
+                arms of these comparisons differ by two form fields and nothing else, and a
+                session left on last night's configuration looks exactly like one set up for
+                today's. */}
+            {armLabel && (
+              <span className="hint" title="The arm the runtime announced at startup.">
+                arm: {armLabel}
+              </span>
+            )}
             {/* A refusal has to arrive where the button was pressed. The banner carrying the
                 whole of it is at the top of the page, which is exactly where the operator is
                 not standing once these controls stopped living there. */}
@@ -730,6 +771,23 @@ export function RolloutPage() {
                 Recorded against {run.checkpointId}. This is the only thing that lets two
                 checkpoints be compared honestly later.
               </p>
+              {/* What the rig read off its own descent, shown before the operator grades and
+                  stored in its own column afterwards. Deliberately not pre-filling the grade:
+                  the agreement between the two is the measurement, and a prompt that filled
+                  itself in would be measuring how often the operator accepts a default. */}
+              {lastServo?.verdict && (
+                <p className="hint">
+                  机器判读：<strong>{lastServo.verdict}</strong>
+                  {lastServo.aboveTargetMm !== undefined
+                    ? `（离坐底 ${lastServo.aboveTargetMm.toFixed(1)} mm`
+                    : ""}
+                  {lastServo.settleMm !== undefined
+                    ? `，到位后又走了 ${lastServo.settleMm.toFixed(1)} mm`
+                    : ""}
+                  {lastServo.aboveTargetMm !== undefined ? "）" : ""}
+                  。这是仪器的读数，不是评分 —— 按你看到的填，两列不一致本身就是要记录的东西。
+                </p>
+              )}
               {run.lastRolloutIntervention?.intervened && (
                 <p className="hint warn">
                   这一轮你接管过 {run.lastRolloutIntervention.expertSteps ?? 0} 步
@@ -800,42 +858,49 @@ export function RolloutPage() {
                   </label>
                   {gradedStage && gradedStage.ordinal < ladder.terminal && (
                     <div className="field">
-                      <span>卡在哪{takeoverSpans.length > 1 ? "（每段接管一个，按发生顺序）" : ""}</span>
-                      {/* Checkboxes rather than a multiple <select>: this is filled in at the
-                          rig, often with one hand, and a ctrl-click list is the control that
-                          silently discards the previous choice when someone clicks without the
-                          modifier. Order follows the order they were ticked, so the first one is
-                          the reason belonging to the graded stage. */}
+                      <span>卡在哪{takeoverSpans.length > 1 ? "（每段接管一个）" : ""}</span>
+                      {/* One control per takeover, not a set of checkboxes over all of them.
+                          A checkbox set cannot say "policy_action twice": ticking a box again
+                          unticks it, so a rollout rescued three times for the same reason could
+                          only ever report it once -- which is the most common case and the one
+                          the failure-mode distribution most needs. One row per span also makes
+                          the alignment structural instead of a sentence asking the operator to
+                          keep the order straight, and it can name the reach-in being labelled,
+                          which is what makes the label accurate. */}
                       <div className="blocker-choices">
-                        {ladder.blockers
-                          .filter((blocker) => blocker.id !== "unknown")
-                          .map((blocker) => (
-                            <label key={blocker.id} className="checkbox">
-                              <input
-                                type="checkbox"
-                                checked={outcomeBlockers.includes(blocker.id)}
-                                onChange={() =>
-                                  setOutcomeBlockers((current) =>
-                                    current.includes(blocker.id)
-                                      ? current.filter((id) => id !== blocker.id)
-                                      : [...current, blocker.id]
-                                  )
-                                }
-                              />
-                              <span>
-                                {outcomeBlockers.indexOf(blocker.id) >= 0
-                                  ? `${outcomeBlockers.indexOf(blocker.id) + 1}. `
-                                  : ""}
-                                {blocker.label}
-                                {blocker.instance ? ` — ${blocker.instance}` : ""}
-                              </span>
-                            </label>
-                          ))}
+                        {Array.from({ length: reasonCount }, (_, slot) => (
+                          <label key={slot} className="field">
+                            <span className="hint">{slotLabel(slot, takeoverDetails[slot])}</span>
+                            <select
+                              value={outcomeBlockers[slot] ?? ""}
+                              onChange={(event) =>
+                                setOutcomeBlockers((current) => {
+                                  const next = Array.from(
+                                    { length: reasonCount },
+                                    (_, index) => current[index] ?? ""
+                                  );
+                                  next[slot] = event.target.value;
+                                  return next;
+                                })
+                              }
+                            >
+                              <option value="">未判明</option>
+                              {ladder.blockers
+                                .filter((blocker) => blocker.id !== "unknown")
+                                .map((blocker) => (
+                                  <option key={blocker.id} value={blocker.id}>
+                                    {blocker.label}
+                                    {blocker.instance ? ` — ${blocker.instance}` : ""}
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+                        ))}
                       </div>
                       <p className="hint">
-                        {outcomeBlockers.length === 0
-                          ? "一个都不勾 = 未判明。"
-                          : `第 1 个（${outcomeBlockers[0]}）记作主因，对应上面那一阶段；其余按顺序一起存。`}
+                        {outcomeBlockers.some((blocker) => blocker)
+                          ? `第 1 个（${outcomeBlockers[0] || "未判明"}）记作主因，对应上面那一阶段；其余按段一起存。`
+                          : "一个都不选 = 未判明。"}
                       </p>
                     </div>
                   )}
@@ -1491,6 +1556,27 @@ export function RolloutPage() {
             Refresh
           </button>
         </div>
+        {/* Grades whose reasons did not line up with their takeovers. Recorded rather than
+            refused -- a grade is perishable -- which only helps if the count is somewhere a
+            person sees it. */}
+        {mismatchCount(history) > 0 && (
+          <p className="hint warn">
+            {mismatchCount(history)} 条记录的「卡在哪」条数与接管段数对不上 —— 它们仍然可用，
+            但不进按段分组的统计。
+          </p>
+        )}
+        {/* The rig against the operator, over this checkpoint. `aborted` rollouts are left out:
+            an abort is a statement about the session, not about the peg. */}
+        {agreement.compared > 0 && (
+          <p className="hint">
+            机器判读与人工评分一致 {agreement.agreed}/{agreement.compared}（
+            {Math.round((agreement.rate ?? 0) * 100)}%）
+            {agreement.disagreed.length
+              ? `，不一致的是 rollout ${agreement.disagreed.join("、")}`
+              : ""}
+            。无人值守回路的验收判据是 ≥95%，样本少时这一行只是提示，不是判读。
+          </p>
+        )}
         {history.length === 0 ? (
           <p className="hint">No rollouts recorded yet.</p>
         ) : (
