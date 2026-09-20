@@ -96,7 +96,7 @@ def test_a_stalled_stream_is_caught_at_episode_stop() -> None:
     session._connected = True
     session._rows_mark = 5000
     session._count_rows = lambda _name: 5000  # type: ignore[method-assign]
-    session.beam_quality = lambda **_k: (1.0, 1.0)  # type: ignore[method-assign]
+    session.beam_stats = lambda **_k: {"rows": 20000, "valid": 1.0, "tracking": 1.0, "dist_min_mm": 400.0, "dist_max_mm": 1800.0}  # type: ignore[method-assign]
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
@@ -123,7 +123,7 @@ def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
     session._connected = True
     session._rows_mark = 0
     session._count_rows = lambda _name: 81343  # type: ignore[method-assign]
-    session.beam_quality = lambda **_k: (0.0, 0.0)  # type: ignore[method-assign]
+    session.beam_stats = lambda **_k: {"rows": 20000, "valid": 0.0, "tracking": 0.0, "dist_min_mm": -1.0, "dist_max_mm": -1.0}  # type: ignore[method-assign]
     # op_mode 2 throughout, which is what the first real session recorded.
     session.gimbal_mode = "Position"
 
@@ -135,6 +135,74 @@ def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
     # Naming the mode is the point: "Position" says an SMR in the beam would
     # still not be acquired, which "0% tracking" alone does not.
     assert "Position" in rec["error"]
+
+
+def test_tracking_without_measuring_is_caught() -> None:
+    """2026-09-20's two lost episodes, as a test.
+
+    The gimbal follows the SMR, az/el/dist keep updating, the beam marker says
+    acquired and the device row is green -- and x/y/z are zeroed for every
+    sample away from the nest, because the distance reference Home left behind
+    does not survive a beam break and no measurement routine was running to
+    rebuild it. Every liveness check we had passed.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 0
+    session._count_rows = lambda _name: 35322  # type: ignore[method-assign]
+    session.beam_stats = lambda **_k: {  # type: ignore[method-assign]
+        "rows": 20000, "valid": 0.465, "tracking": 0.861,
+        "dist_min_mm": 157.7, "dist_max_mm": 158.9,
+    }
+
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    assert rec["stream_advanced"] is True
+    assert "tracked but did not measure" in rec["error"]
+    # Name the fix, not just the symptom.
+    assert "measure-ms" in rec["error"]
+
+
+def test_a_motionless_target_is_not_a_trajectory() -> None:
+    """Valid, dense, and all at one distance: the SMR never left the nest."""
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 0
+    session._count_rows = lambda _name: 20000  # type: ignore[method-assign]
+    session.beam_stats = lambda **_k: {  # type: ignore[method-assign]
+        "rows": 20000, "valid": 1.0, "tracking": 1.0,
+        "dist_min_mm": 157.7, "dist_max_mm": 158.2,
+    }
+
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    assert "did not move" in rec["error"]
+    # A dwell recording looks exactly like this and is correct, so the wording
+    # has to say which one it is rather than call it a fault.
+    assert "dwell" in rec["error"]
+    assert rec["beam_dist_min_mm"] == 157.7
+
+
+def test_episode_stats_cover_the_episode_not_the_tail() -> None:
+    """The window asked for is the episode's duration in milliseconds."""
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 0
+    session._count_rows = lambda _name: 35322  # type: ignore[method-assign]
+    seen = {}
+
+    def _stats(*, last_rows=0, **_k):
+        seen["last_rows"] = last_rows
+        return {"rows": last_rows, "valid": 1.0, "tracking": 1.0,
+                "dist_min_mm": 400.0, "dist_max_mm": 1800.0}
+
+    session.beam_stats = _stats  # type: ignore[method-assign]
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    # 20 s of episode is 20000 rows at the stream's hard 1 kHz.
+    expected = int(round((rec["t_end_wall_s"] - rec["t_start_wall_s"]) * 1000.0))
+    assert seen["last_rows"] == expected
+    assert rec["beam_window_rows"] == expected
 
 
 def test_position_mode_gets_its_own_instruction() -> None:
@@ -290,6 +358,49 @@ def test_beam_transitions_are_read_from_the_logger() -> None:
     session._read_logger_stdout(_Proc(["beam: lost\n"]))
     assert session.beam_ready is False
     assert "reacquiring" in session.beam_summary()
+
+
+def test_a_marker_glued_to_the_progress_counter_is_still_read() -> None:
+    """The logger's progress counter shares stdout and writes no newline.
+
+    Every marker after the first therefore arrives with the counter stuck to
+    its front. Parsing with `startswith` read the SMR as missing while the
+    tracker was locked on it and the device row stayed amber -- 2026-09-20,
+    with the operator looking at a green light on the instrument itself.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc([
+        "rows 12000  dropped 0   beam: acquired\n",
+    ]))
+    assert session.beam_ready is True
+
+    session._read_logger_stdout(_Proc(["rows 24000  dropped 0   beam: lost\n"]))
+    assert session.beam_ready is False
+
+    # And the identity line, which arrives the same way.
+    session._read_logger_stdout(_Proc([
+        "rows 100  dropped 0   device: model=Radian_Pro sn=65201 fw=7.402\n",
+    ]))
+    assert session.device_info.get("sn") == "65201"
+
+
+def test_the_progress_counter_never_crowds_out_a_real_error() -> None:
+    """The tail is what an operator is shown when the logger dies."""
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    lines = ["connection failed: CommunicationFailed (13)\n"]
+    lines += [f"rows {i * 1000}  dropped 0\n" for i in range(200)]
+    session._read_logger_stdout(_Proc(lines))
+    assert any("CommunicationFailed" in line for line in session._logger_tail)
 
 
 def test_the_empty_nest_message_tells_the_operator_what_to_do() -> None:

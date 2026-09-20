@@ -273,6 +273,13 @@ laser_tracker:
   #
   # smr_size is required whenever home_on_connect is true and is NEVER guessed:
   # homing against the wrong nominal radius is a metrology error, not a crash.
+  # The routine that enables the tracker's optical switch. Without it the only
+  # valid samples a session produces are the ones Home left behind while the SMR
+  # was still in the nest: lift it, break the beam once, and az/el/dist keep
+  # updating while x/y/z are zeroed for as long as you care to wave it. That
+  # cost two whole episodes on 2026-09-20. 1 ms is the SDK maximum and matches
+  # the 1 kHz feed; 0 disables it, for A/B only.
+  measure_ms: 1
   home_on_connect: true
   smr_size: '1.5'         # '1.5' | '0.5' | '7/8'  -- REQUIRED, never guessed
   adm_offset_mm: 0.0      # only for a solid SMR
