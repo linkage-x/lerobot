@@ -124,12 +124,23 @@ def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
     session._rows_mark = 0
     session._count_rows = lambda _name: 81343  # type: ignore[method-assign]
     session.beam_quality = lambda **_k: (0.0, 0.0)  # type: ignore[method-assign]
+    # op_mode 2 throughout, which is what the first real session recorded.
+    session.gimbal_mode = "Position"
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
     assert rec["stream_advanced"] is True          # rows advanced ...
     assert rec["beam_tracking_fraction"] == 0.0    # ... and measured nothing
-    assert "not locked on a target" in rec["error"]
+    assert "not measuring" in rec["error"]
+    # Naming the mode is the point: "Position" says an SMR in the beam would
+    # still not be acquired, which "0% tracking" alone does not.
+    assert "Position" in rec["error"]
+
+
+def test_position_mode_gets_its_own_instruction() -> None:
+    assert lts._OP_MODES[2] == "Position"
+    assert lts._OP_MODES[1] == "Tracking"
+    assert lts._OP_MODES[3] == "TrackIdle"
 
 
 def test_describe_names_the_instrument_from_the_instrument() -> None:
@@ -245,23 +256,118 @@ def test_windows_oem_output_never_breaks_a_connect() -> None:
     assert lts._decode(b"\xd5\x00\xff")
 
 
-def test_a_connect_warning_survives_a_successful_connect() -> None:
-    """The beam warning is the whole point of checking at Connect.
+def test_an_empty_home_nest_is_a_state_not_a_failure() -> None:
+    """The nest being empty is something the operator is about to change.
 
-    start() used to clear last_error on success, which erased the one message
-    that could still be acted on: acquire the SMR before recording.
+    Failing Connect for it would make them reconnect for a condition that the
+    tracker's own home-retry timer clears in ten seconds.
     """
     session = lts.LaserTrackerSession(_cfg())
-    session._ensure_responder = lambda: None  # type: ignore[method-assign]
-    session._spawn_probe = lambda: True  # type: ignore[method-assign]
-    session._spawn_logger = lambda: None  # type: ignore[method-assign]
-    session._await_probe = lambda: True  # type: ignore[method-assign]
+    session._logger_tail.append("home failed: NoSmrAtHomePosition (21)")
+    session._logger_proc = None
+    session._count_rows = lambda _name: 5000  # type: ignore[method-assign]
+    session.beam_quality = lambda **_k: (0.0, 0.0)  # type: ignore[method-assign]
 
-    def _await_logger() -> bool:
-        session.beam_valid_fraction = session.beam_tracking_fraction = 0.0
-        session.last_error = "tracker is streaming but NOT locked on a target"
-        return True
+    assert session._await_logger() is True       # Connect succeeds ...
+    assert session.beam_ready is False           # ... and says it is not ready
+    assert "waiting for the SMR" in session.beam_summary()
 
-    session._await_logger = _await_logger  # type: ignore[method-assign]
-    assert session.start() is True
-    assert "NOT locked" in session.last_error
+
+def test_beam_transitions_are_read_from_the_logger() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc([
+        "beam: waiting (NoSmrAtHomePosition)\n",
+        "beam: acquired\n",
+    ]))
+    assert session.beam_ready is True
+    assert session.beam_summary() == "locked on the SMR"
+
+    session._read_logger_stdout(_Proc(["beam: lost\n"]))
+    assert session.beam_ready is False
+    assert "reacquiring" in session.beam_summary()
+
+
+def test_the_empty_nest_message_tells_the_operator_what_to_do() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+    session.beam_status = "waiting (NoSmrAtHomePosition)"
+    summary = session.beam_summary()
+    assert "home nest" in summary
+    assert "retries automatically" in summary
+
+
+
+def test_a_busy_tracker_is_named_as_such() -> None:
+    """The SDK reports "one client already has it" as CommunicationFailed.
+
+    That reads like a network fault and sends people to check cables, when the
+    fix is to close SA. Observed 2026-09-20 while the tracker was being Homed
+    from RadianCAL.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session._logger_tail.append("connection failed: CommunicationFailed (13)")
+
+    class _Dead:
+        stdout = None
+
+        def poll(self):
+            return 1
+
+    session._logger_proc = _Dead()  # type: ignore[assignment]
+    session._count_rows = lambda _name: 0  # type: ignore[method-assign]
+    assert session._await_logger() is False
+    assert "one client at a time" in session.last_error
+    assert "close SA" in session.last_error
+
+
+def test_homing_is_off_unless_asked_for() -> None:
+    """Driving a shared precision instrument is never a default."""
+    cfg = lts.config_from_yaml_dict({"win_host": "u@h", "enabled": True})
+    assert cfg.home_on_connect is False
+    assert cfg.smr_size == ""
+
+
+def test_home_without_a_declared_smr_size_is_refused_not_guessed() -> None:
+    """1.5" and 7/8" are both plausible; the wrong one homes on the wrong radius."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size=""))
+    sent = []
+
+    class _Proc:
+        stdout = None
+
+        def poll(self):
+            return None
+
+    session._run = lambda cmd, **k: sent.append(cmd)  # type: ignore[method-assign]
+    session._spawn = lambda cmd: (sent.append(cmd), _Proc())[1]  # type: ignore[method-assign]
+
+    session._spawn_logger()
+    logger_cmd = next(c for c in sent if "lt_realtime_logger" in c)
+    assert "--home" not in logger_cmd
+    assert "smr_size is empty" in session.last_error
+
+
+def test_a_declared_smr_size_reaches_the_logger() -> None:
+    session = lts.LaserTrackerSession(
+        _cfg(home_on_connect=True, smr_size="1.5", adm_offset_mm=0.25)
+    )
+    sent = []
+
+    class _Proc:
+        stdout = None
+
+        def poll(self):
+            return None
+
+    session._run = lambda cmd, **k: sent.append(cmd)  # type: ignore[method-assign]
+    session._spawn = lambda cmd: (sent.append(cmd), _Proc())[1]  # type: ignore[method-assign]
+
+    session._spawn_logger()
+    logger_cmd = next(c for c in sent if "lt_realtime_logger" in c)
+    assert "--home 1.5" in logger_cmd
+    assert "--adm-offset 0.25" in logger_cmd
+    assert session.last_error == ""

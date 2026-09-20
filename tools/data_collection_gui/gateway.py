@@ -184,6 +184,9 @@ class RecordingStatus:
     # Connect via the SDK's GetDeviceInformation() -- not transcribed from a
     # config file that can drift away from the hardware it names.
     laserTrackerDevice: str = ""
+    # Whether the beam is actually on the SMR. Gates Start Episode: an episode
+    # recorded while the tracker is blind looks complete and measures nothing.
+    laserTrackerReady: bool = False
 
 
 @dataclass
@@ -11566,6 +11569,7 @@ def _connect_recorder(
     state.recording.laserTrackerDevice = ""
     state.recording.laserTrackerDetail = ""
     state.recording.laserTrackerState = "idle"
+    state.recording.laserTrackerReady = False
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -11643,6 +11647,18 @@ def _start_episode(
     process = _ensure_recorder_running(state)
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
+
+    # An episode recorded while the tracker is blind is structurally complete and
+    # metrologically empty -- 81343 rows, 0 dropped, not one measurement, which
+    # is how 2026-09-20's first session went. The tracker re-homes on a timer, so
+    # this clears itself as soon as the SMR is in the nest.
+    if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        raise RuntimeError(
+            "激光跟踪仪尚未锁定 SMR："
+            f"{state.recording.laserTrackerDetail or '等待中'}。"
+            "把 SMR 放进鸟巢窝，设备行变绿后再 StartEpisode"
+            "（跟踪仪会自动重试 Home，不需要重新 Connect）。"
+        )
 
     if _state_is_gmsl2(state):
         # Sent only when it would actually change something. The recorder echoes
@@ -12346,6 +12362,23 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
+    if output.startswith("LT_BEAM "):
+        raw = output.removeprefix("LT_BEAM ").strip()
+        flag, _, summary = raw.partition("|")
+        ready = flag.strip() == "ready"
+        state.recording.laserTrackerReady = ready
+        state.recording.laserTrackerState = "running" if ready else "warning"
+        state.recording.laserTrackerDetail = summary.strip()[:200]
+        _set_device_state(
+            state,
+            "laser_tracker",
+            state.recording.laserTrackerState,
+            " — ".join(
+                p for p in (state.recording.laserTrackerDevice, summary.strip()) if p
+            )[:400],
+        )
+        return
+
     # Laser tracker: the recorder speaks about it in plain sentences rather than
     # a JSON channel, because every one of these is something an operator has to
     # read anyway. Parsed here only to colour the device row -- the sentence

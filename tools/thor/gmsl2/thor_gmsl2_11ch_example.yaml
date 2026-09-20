@@ -263,6 +263,19 @@ laser_tracker:
   # The SDK handshake alone measured 15-16 s on 2026-09-20, which is why one
   # stream spans the whole Connect window instead of one per episode.
   logger_ready_timeout_s: 60
+  # Connect homes the tracker itself, so nobody has to open SA/RadianCAL first.
+  # Homing is the ONLY way out of Position mode -- that mode holds the gimbal and
+  # cannot track, so an SMR placed in the beam is not acquired while it lasts.
+  #
+  # Precondition: the SMR must be sitting in the home nest when Connect is
+  # pressed. If it is not, Home fails with NoSmrAtHomePosition, the recorder
+  # says so, and the cameras still record.
+  #
+  # smr_size is required whenever home_on_connect is true and is NEVER guessed:
+  # homing against the wrong nominal radius is a metrology error, not a crash.
+  home_on_connect: true
+  smr_size: '1.5'         # '1.5' | '0.5' | '7/8'  -- REQUIRED, never guessed
+  adm_offset_mm: 0.0      # only for a solid SMR
   # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
   # against its manifest before the recorder exits.
   land: true

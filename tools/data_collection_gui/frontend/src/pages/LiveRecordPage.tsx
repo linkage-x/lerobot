@@ -199,6 +199,11 @@ export function RecordingPanel({
   laserTrackerToggle?: React.ReactNode;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
+  // Only while the tracker is actually switched on for this session: an episode
+  // recorded with a blind tracker looks complete and measures nothing, and the
+  // tracker re-homes on a timer, so this clears itself once the SMR is in place.
+  const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
+  const trackerBlockReason = status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
@@ -225,12 +230,23 @@ export function RecordingPanel({
       </div>
       {isGmsl && <CameraEncodingInfo config={config} />}
       {laserTrackerToggle}
+      {trackerBlocking && (
+        <p className="tracker-wait-banner">
+          ⏳ {trackerBlockReason}
+        </p>
+      )}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
         <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
-        <button disabled={busy || !canStartEpisode} onClick={onStart} title="Shortcut: E">StartEpisode <kbd>E</kbd></button>
+        <button
+          disabled={busy || !canStartEpisode || trackerBlocking}
+          onClick={onStart}
+          title={trackerBlocking ? trackerBlockReason : "Shortcut: E"}
+        >
+          StartEpisode <kbd>E</kbd>
+        </button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
         <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
@@ -321,7 +337,8 @@ export function LiveRecordPage({
           supportsBackendChoice ? selectedBackend : undefined,
           hasLaserTracker ? laserTracker : undefined,
         );
-      } else if (key === "e" && controls.canStartEpisode) {
+      } else if (key === "e" && controls.canStartEpisode
+                 && !(snapshot.recording.laserTracker && !snapshot.recording.laserTrackerReady)) {
         event.preventDefault();
         onStart();
       } else if (key === "s" && controls.canResolveEpisode) {

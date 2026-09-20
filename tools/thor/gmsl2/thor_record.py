@@ -1368,8 +1368,10 @@ def main(argv: list[str] | None = None) -> int:
         _emit(f"Laser tracker: {tracker.describe()}")
         _emit(f"Laser tracker session {tracker.session_id} -> {tracker.win_dir}")
         if tracker.last_error:
-            # Streaming but blind is the failure that looks like success.
             _emit(f"WARNING: laser tracker: {tracker.last_error}")
+        # A machine-readable line so the gateway can colour the row and gate the
+        # Start button; the human sentence rides along after the pipe.
+        _emit(f"LT_BEAM {'ready' if tracker.beam_ready else 'waiting'}|{tracker.beam_summary()}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)
@@ -1851,8 +1853,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         return stream_errs
 
+    tracker_beam_was = None
+
+    def _tick_tracker_beam() -> None:
+        # Pushed by the logger over stdout, so this only forwards a change --
+        # no ssh round trip, and the row turns green within one tick of the
+        # operator dropping the SMR into the nest.
+        nonlocal tracker_beam_was
+        if not tracker_started:
+            return
+        now = tracker.beam_ready
+        if now != tracker_beam_was:
+            tracker_beam_was = now
+            _emit(f"LT_BEAM {'ready' if now else 'waiting'}|{tracker.beam_summary()}")
+
     def _tick_connected_idle() -> None:
         nonlocal last_box_live_at, last_warmup_roll_at
+        _tick_tracker_beam()
         _poll_stream_health(context="idle")
         # Bound the throwaway warmup stream while we sit armed but not recording.
         # splitmuxsink never auto-rotates (max-size-time=0), so the open warmup

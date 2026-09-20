@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 
 _SSH_BASE = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new")
 
+# api::lt::OperationMode, in declaration order.  Reported by name because the
+# ordinal hides the one distinction that matters: `Position` holds the gimbal
+# and *cannot* track, so an SMR placed in the beam would still not be acquired.
+_OP_MODES = ("Idle", "Tracking", "Position", "TrackIdle", "Searching", "Internal")
+
 
 def _decode(raw: bytes) -> str:
     """Decode whatever the Windows console said, without ever raising.
@@ -119,6 +124,14 @@ class LaserTrackerConfig:
     session_cap_s: float = 24 * 3600.0
     # Generous: the SDK handshake alone measured 15-16 s.
     logger_ready_timeout_s: float = 60.0
+    # Homing is the only way out of Position mode, which holds the gimbal and
+    # cannot track. It drives a shared precision instrument, so it happens only
+    # when asked for -- and only with a declared SMR size, because homing
+    # against the wrong nominal radius is a metrology error, not a crash.
+    home_on_connect: bool = False
+    smr_size: str = ""          # "1.5" | "0.5" | "7/8"
+    adm_offset_mm: float = 0.0
+    home_retry_s: float = 10.0
     land: bool = True
     note: str = ""
 
@@ -187,6 +200,9 @@ class LaserTrackerStatus:
     device: dict[str, str] = field(default_factory=dict)
     beam_valid_fraction: float = -1.0
     beam_tracking_fraction: float = -1.0
+    gimbal_mode: str = ""
+    beam_ready: bool = False
+    beam_status: str = "unknown"
     episodes: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -212,6 +228,11 @@ class LaserTrackerSession:
         self.device_info: dict[str, str] = {}
         self.beam_valid_fraction = -1.0
         self.beam_tracking_fraction = -1.0
+        self.gimbal_mode = ""
+        # Live, pushed by the logger rather than polled: 'waiting' is a state
+        # the operator is actively changing, not a verdict on the session.
+        self.beam_ready = False
+        self.beam_status = "unknown"
         self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
@@ -327,11 +348,26 @@ class LaserTrackerSession:
         """One stream for the whole Connect window. See the module docstring."""
         self._run(f'del /q "{self.logger_stop_file}"')
         note = self.cfg.note or f"{self.session_id} (gateway session)"
+        home = ""
+        if self.cfg.home_on_connect:
+            if self.cfg.smr_size:
+                home = (
+                    f" --home {self.cfg.smr_size}"
+                    f" --adm-offset {self.cfg.adm_offset_mm:g}"
+                    f" --home-retry-s {self.cfg.home_retry_s:g}"
+                )
+            else:
+                # Refused rather than guessed: 1.5" and 7/8" are both plausible
+                # and the wrong one homes against the wrong nominal radius.
+                self.last_error = (
+                    "home_on_connect is set but smr_size is empty -- declare the SMR "
+                    "diameter (1.5 / 0.5 / 7/8) in the laser_tracker config"
+                )
         cmd = (
             f'cd /d {self.cfg.win_root} && "{self.cfg.logger_exe}" '
             f'--ip {self.cfg.tracker_ip} --out "{self.win_dir}" --session {self.session_id} '
             f'--note "{note}" --duration {self.cfg.session_cap_s:g} '
-            f'--stop-file "{self.logger_stop_file}"'
+            f'--stop-file "{self.logger_stop_file}"{home}'
         )
         self._logger_proc = self._spawn(cmd)
         Thread(target=self._read_logger_stdout, args=(self._logger_proc,),
@@ -351,6 +387,16 @@ class LaserTrackerSession:
             if not line:
                 continue
             self._logger_tail.append(line)
+            if line.startswith("beam:"):
+                what = line[len("beam:"):].strip()
+                if what.startswith("acquired"):
+                    self.beam_ready, self.beam_status = True, "acquired"
+                elif what.startswith("lost"):
+                    self.beam_ready, self.beam_status = False, "lost"
+                elif what.startswith("waiting"):
+                    self.beam_ready = False
+                    self.beam_status = what  # carries the SDK's reason in brackets
+                logger.info("tracker beam: %s", self.beam_status)
             if line.startswith("device:"):
                 fields = {}
                 for token in line[len("device:"):].strip().split():
@@ -405,10 +451,18 @@ class LaserTrackerSession:
         while time.monotonic() < deadline:
             time.sleep(2.0)
             if self._logger_proc is not None and self._logger_proc.poll() is not None:
-                # Commonest cause by far: the tracker admits one client and SA
-                # has it. Say that rather than printing an SDK ordinal.
                 tail = " | ".join(self._logger_tail)
-                self.last_error = f"tracker logger exited: {tail[:300]}"
+                # Commonest cause by far: the tracker admits ONE client, so SA
+                # or RadianCAL being open is enough to refuse us -- and the SDK
+                # reports that as a generic communication failure, which reads
+                # like a network fault and sends people to check cables.
+                hint = ""
+                if "CommunicationFailed" in tail or "DeviceAlreadyConnected" in tail:
+                    hint = (
+                        " -- the tracker admits one client at a time; close SA / "
+                        "RadianCAL / Tracker Studio and reconnect"
+                    )
+                self.last_error = f"tracker logger exited: {tail[:300]}{hint}"
                 self._logger_proc = None
                 return False
             rows = self._count_rows(f"{self.session_id}.rt.csv")
@@ -427,18 +481,19 @@ class LaserTrackerSession:
         # data afterwards.
         valid, tracking = self.beam_quality()
         self.beam_valid_fraction, self.beam_tracking_fraction = valid, tracking
-        if 0.0 <= tracking < 0.5:
-            self.last_error = (
-                f"tracker is streaming but NOT locked on a target "
-                f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%) -- "
-                "acquire the SMR before recording, or this session measures nothing"
-            )
+        if tracking >= 0.5:
+            self.beam_ready, self.beam_status = True, "acquired"
+        # Not an error any more. The tracker keeps homing on a timer, so an empty
+        # nest resolves itself the moment the operator puts the SMR in it; the
+        # recorder shows the wait and refuses to start an episode until it ends.
+        # Failing Connect here would make the operator reconnect for something
+        # that fixes itself in ten seconds.
         return True
 
     def sync_rows(self) -> int:
         return self._count_rows(f"{self.session_id}.sync.csv")
 
-    def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:
+    def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:  # noqa: D401
         """Fraction of recent samples that are ``valid`` and ``tracking``.
 
         Row count alone says nothing about whether the tracker can see anything:
@@ -455,7 +510,9 @@ class LaserTrackerSession:
             "rs=[l.split(',') for l in ls if l.count(',')>=16];"
             "v=sum(1 for r in rs if r[9].strip() in ('1','true'));"
             "t=sum(1 for r in rs if r[10].strip() in ('1','true'));"
-            "print(len(rs),v,t)"
+            "import collections;"
+            "m=collections.Counter(r[12].strip() for r in rs).most_common(1);"
+            "print(len(rs),v,t,m[0][0] if m else -1)"
         )
         res = self._run(
             f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{code}" '
@@ -463,11 +520,12 @@ class LaserTrackerSession:
             timeout_s=30,
         )
         try:
-            total, valid, tracking = (int(x) for x in res.stdout.strip().splitlines()[-1].split())
+            total, valid, tracking, mode = (int(x) for x in res.stdout.strip().splitlines()[-1].split())
         except (ValueError, IndexError):
             return (-1.0, -1.0)
         if total <= 0:
             return (-1.0, -1.0)
+        self.gimbal_mode = _OP_MODES[mode] if 0 <= mode < len(_OP_MODES) else f"mode {mode}"
         return (valid / total, tracking / total)
 
     def _count_rows(self, filename: str) -> int:
@@ -524,7 +582,8 @@ class LaserTrackerSession:
                 # The failure that looks like success: a full-rate stream of
                 # nothing at all.
                 rec.error = (
-                    f"tracker not locked on a target during this episode "
+                    f"tracker not measuring during this episode: gimbal in "
+                    f"{self.gimbal_mode or 'unknown mode'} "
                     f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%)"
                 )
                 self.last_error = rec.error
@@ -676,6 +735,24 @@ class LaserTrackerSession:
         parts.append(f"1 kHz @ {self.cfg.tracker_ip}")
         return ", ".join(parts)
 
+    def beam_summary(self) -> str:
+        """What the beam is doing, in the words an operator needs."""
+        if self.beam_ready:
+            return "locked on the SMR"
+        if self.beam_status.startswith("waiting"):
+            # Exactly one layer of brackets: the SDK's reason carries its own
+            # numeric code in brackets, so strip(" ()") would eat that one too
+            # and hand the operator "NoSmrAtHomePosition (21".
+            reason = self.beam_status[len("waiting"):].strip()
+            if reason.startswith("(") and reason.endswith(")"):
+                reason = reason[1:-1]
+            if reason.startswith("NoSmrAtHomePosition"):
+                return "waiting for the SMR — put it in the home nest, homing retries automatically"
+            return f"waiting for the SMR ({reason}) — homing retries automatically"
+        if self.beam_status == "lost":
+            return "beam lost — reacquiring"
+        return "waiting for the SMR — homing retries automatically"
+
     def status(self) -> LaserTrackerStatus:
         return LaserTrackerStatus(
             enabled=self.cfg.enabled,
@@ -689,5 +766,8 @@ class LaserTrackerSession:
             device=dict(self.device_info),
             beam_valid_fraction=self.beam_valid_fraction,
             beam_tracking_fraction=self.beam_tracking_fraction,
+            gimbal_mode=self.gimbal_mode,
+            beam_ready=self.beam_ready,
+            beam_status=self.beam_status,
             episodes=[asdict(r) for r in self._episodes],
         )

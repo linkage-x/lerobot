@@ -4352,3 +4352,14 @@ button.danger {
 .laser-tracker-toggle input:disabled + span {
   opacity: 0.6;
 }
+
+/* Why Start Episode is unavailable, said out loud. A disabled button with no
+   reason is the same bug as a silent failure, just quieter. */
+.tracker-wait-banner {
+  background: #fff4d6;
+  border-left: 3px solid #d79b00;
+  border-radius: 4px;
+  color: #6b4e00;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+}

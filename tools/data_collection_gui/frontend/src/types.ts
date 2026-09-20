@@ -125,6 +125,8 @@ export type RecordingStatus = {
   laserTrackerDetail?: string;
   // Model / serial / firmware as the instrument reported them.
   laserTrackerDevice?: string;
+  // Whether the beam is on the SMR. Start Episode is gated on it.
+  laserTrackerReady?: boolean;
 };
 
 export type MarkerTcpSample = {
