@@ -25,6 +25,21 @@ DEFAULT_BINARY_PATH = Path("/tmp/lerobot_argus_online_sync_video_recorder")
 DEFAULT_PREVIEW_FRAME_BUS_DIR = Path("/dev/shm/lerobot_online_sync_preview")
 
 
+def _argus_recorder_env() -> dict[str, str]:
+    """Return an environment suitable for Thor's headless EGL recorder.
+
+    A host-launched operator UI may use ``ssh -Y`` so OpenCV can display on
+    the host.  That forwarded X11 ``DISPLAY`` is not a valid local EGL display
+    for ``NvBufSurfaceMapEglImage`` on Thor.  Keep the parent environment
+    untouched for the UI, but make recorder subprocesses use EGL's headless
+    default exactly as the normal gateway/service path does.
+    """
+    env = os.environ.copy()
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    return env
+
+
 class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
     """Session wrapper around ``argus_online_sync_video_recorder``.
 
@@ -238,6 +253,7 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
             proc = subprocess.Popen(
                 cmd,
                 cwd=self.repo_root,
+                env=_argus_recorder_env(),
                 text=True,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -504,6 +520,7 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
             cmd,
             text=True,
             cwd=cwd,
+            env=_argus_recorder_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,

@@ -1035,3 +1035,42 @@ StartEpisode 时 recorder 没有进入录制，前端看起来像卡死。
 
 备注:
 thor的isp文件路径/var/nvidia/nvcam/settings/camera_overrides.isp(从驱动sdk拷过去)
+
+# Standalone current-FR3-base camera calibration over X11
+
+`tools/thor/run_p0_two_marker_calibration.sh` uses `ssh -Y` only for its Tk/Pillow
+operator window. The Argus online-sync recorder must remain headless: its
+subprocess environment removes `DISPLAY` and `WAYLAND_DISPLAY` before calling
+`eglGetDisplay(EGL_DEFAULT_DISPLAY)`. If every camera is dropped in order with
+`Could not get EGL display` / `NvBufSurfaceMapEglImage failed`, do not diagnose
+that sequence as seven bad cameras; verify that the deployed recorder contains
+the headless subprocess environment fix.
+The automatic/manual `recover_argus.sh` path also clears these display
+variables before its `nvarguscamerasrc` probes.
+
+The standalone flow detects current MAX96726 locked ids rather than using a
+frozen `sensor_ids` list. Camera identity is still tied to the physical
+`cam_XX` name. After an unplug/replug changes runtime numbering,
+pass a verified mapping such as `--camera-alias cam_05=cam_06`; never infer it
+from enumeration order alone.
+
+The FR3 virtual environment contains OpenCV with `GUI: NONE`. The standalone
+calibration therefore renders its annotated mosaic through Tk/Pillow, while
+retaining OpenCV for image processing. Window creation and a second fresh
+synchronized cluster are required before the robot enters teaching mode.
+During capture, a stream stale for more than one second disables Enter.
+`cam_02` is the UMI camera and is always excluded only from this standalone
+workflow. The calibration reuses the existing
+`thor_gmsl2_selfcal_0804_fisheye_intrinsics/summary.json`: each camera uses its
+same-name entry except that `cam_03` temporarily uses `cam_13` intrinsics.
+`cam_03` still gets an independently solved `T_base_camera` from its own image
+observations. The output world frame is the current FR3 base at calibration
+time. Other confirmed failing runtime links may additionally be omitted with,
+for example, `--exclude-camera cam_07`.
+
+For a libfranka `communication_constraints_violation`, use
+`--robot-only-test-seconds 20` with the normal execute confirmation to run the
+same zero-stiffness controller without Argus, AprilTag, Tk, or X11 work. This
+still controls real hardware and requires an operator supporting the arm with
+the physical E-stop ready. The full flow defaults to two detection workers and
+publishes a preview cluster every 15 camera frames to reduce peak CPU load.

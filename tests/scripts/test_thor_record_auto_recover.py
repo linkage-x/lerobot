@@ -205,12 +205,16 @@ def _make_repo_with_script(tmp_path) -> Path:
     return tmp_path
 
 
-def test_run_recover_argus_returns_true_on_zero_rc(tmp_path):
+def test_run_recover_argus_returns_true_on_zero_rc(tmp_path, monkeypatch):
     repo = _make_repo_with_script(tmp_path)
     runner_calls: list[list[str]] = []
+    runner_kwargs: list[dict] = []
+    monkeypatch.setenv("DISPLAY", "localhost:10.0")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "forwarded")
 
     def runner(cmd, **kwargs):
         runner_calls.append(cmd)
+        runner_kwargs.append(kwargs)
         assert "--sdk" in cmd
         return _fake_completed(rc=0, stdout="RECOVER_OK_SIDS=0,2,3\n")
 
@@ -223,6 +227,8 @@ def test_run_recover_argus_returns_true_on_zero_rc(tmp_path):
     assert runner_calls[0][0] == "bash"
     assert runner_calls[0][runner_calls[0].index("--sdk") + 1] == "/some/sdk"
     assert "--skip-kill" in runner_calls[0]
+    assert "DISPLAY" not in runner_kwargs[0]["env"]
+    assert "WAYLAND_DISPLAY" not in runner_kwargs[0]["env"]
 
 
 def test_run_recover_argus_returns_false_on_nonzero_rc(tmp_path):

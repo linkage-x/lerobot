@@ -24,6 +24,14 @@ Common calibration options:
       Keep the passing active calibration and exit without connecting hardware.
   --existing recalibrate --execute --confirmation P0_TWO_MARKER_TEACHING
       Start a new manual teaching-mode capture.
+  --camera-alias CURRENT=CALIBRATED
+      Map a changed runtime cam id to its physical/calibration identity.
+  --exclude-camera CAMERA
+      Exclude an additional runtime camera. cam_02 (UMI) is always excluded.
+  --intrinsics-summary PATH
+      Existing OpenCV-fisheye summary. cam_03 temporarily uses cam_13's entry.
+  --robot-only-test-seconds N
+      Run only the zero-stiffness FR3 controller for N seconds; no cameras/UI.
 
 Environment:
   THOR       SSH target (default: nvidia@192.168.111.122)

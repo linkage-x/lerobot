@@ -264,6 +264,60 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     driver.disconnect()
 
 
+def test_pandapy_arm_driver_uses_native_teaching_mode_and_exits_on_disconnect(monkeypatch):
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+            )
+            self.teaching_calls = []
+            self.stop_calls = 0
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            del controller
+
+        def stop_controller(self):
+            self.stop_calls += 1
+
+        def teaching_mode(self, active, damping=None):
+            self.teaching_calls.append(
+                (bool(active), None if damping is None else np.asarray(damping).copy())
+            )
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    driver.enter_teaching_mode([0.0] * 7)
+
+    panda = DummyPanda.instances[-1]
+    assert panda.stop_calls == 1
+    assert panda.teaching_calls[0][0] is True
+    np.testing.assert_array_equal(panda.teaching_calls[0][1], np.zeros(7))
+
+    driver.disconnect()
+    assert panda.teaching_calls[-1] == (False, None)
+
+
 @pytest.mark.parametrize(
     ("mode_name", "expected_message"),
     [

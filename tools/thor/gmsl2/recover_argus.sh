@@ -14,6 +14,12 @@
 
 set -euo pipefail
 
+# This script is often reached from an operator session started with `ssh -Y`.
+# nvarguscamerasrc must use Thor's headless EGL path; a forwarded X11 display
+# (for example localhost:10.0) cannot provide the NVIDIA EGL display required
+# by its FrameConsumer.
+unset DISPLAY WAYLAND_DISPLAY
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SETUP_SYNC="${SCRIPT_DIR}/setup_sync.sh"

@@ -49,6 +49,8 @@ rsync -avz --itemize-changes --delete-delay \
   --exclude='*.egg-info/' \
   --exclude='outputs/' \
   --exclude='notes/' \
+  --exclude='tools/thor/gmsl2/records/' \
+  --exclude='tools/thor/gmsl2/world/world_registration.json' \
   --exclude='.claude/' \
   --exclude='core' \
   --exclude='run/run_gateway.sh' \

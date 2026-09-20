@@ -1019,7 +1019,13 @@ def _run_recover_argus(
     cmd = ["bash", str(script), "--sdk", str(sdk_dir), "--skip-kill"]
     runner = _runner or subprocess.run
     try:
-        r = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = runner(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=aos._argus_recorder_env(),
+        )
     except subprocess.TimeoutExpired:
         return False, f"recover_argus.sh timed out after {timeout_s:.0f}s"
     except Exception as exc:

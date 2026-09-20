@@ -169,6 +169,7 @@ class PandaPyArmDriver:
         self._controllers = controllers
         self._robot = None
         self._controller = None
+        self._teaching_mode_active = False
         self._state_lock = threading.Lock()
         self._state_reader_stop = threading.Event()
         self._state_reader_thread: threading.Thread | None = None
@@ -230,6 +231,8 @@ class PandaPyArmDriver:
     def _start_controller(self, state: Any | None = None) -> None:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active:
+            self.exit_teaching_mode()
         self._controller = self._controllers.JointPosition()
         if self.damping is not None:
             self._controller.set_damping(self.damping)
@@ -245,6 +248,27 @@ class PandaPyArmDriver:
         if self._robot is not None and self._controller is not None:
             self._robot.stop_controller()
             self._controller = None
+
+    def enter_teaching_mode(self, damping: list[float] | None = None) -> None:
+        """Use panda_py's native compliant-teaching controller.
+
+        A zero-gain JointPosition controller is not the teaching-mode API and
+        can obscure controller/transport failures. Keep this transition in the
+        hardware adapter so callers do not manipulate panda_py internals.
+        """
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        values = np.zeros(7, dtype=np.float64) if damping is None else np.asarray(damping, dtype=np.float64)
+        if values.shape != (7,) or not np.isfinite(values).all():
+            raise ValueError("Teaching-mode damping must contain seven finite values.")
+        self._stop_controller()
+        self._robot.teaching_mode(True, values)
+        self._teaching_mode_active = True
+
+    def exit_teaching_mode(self) -> None:
+        if self._robot is not None and self._teaching_mode_active:
+            self._robot.teaching_mode(False)
+            self._teaching_mode_active = False
 
     def _refresh_joint_positions_cache(self, state: Any | None = None) -> np.ndarray:
         """Seed the cache from ``state`` when the caller already has one, else read a fresh one."""
@@ -310,8 +334,14 @@ class PandaPyArmDriver:
             self._state_reader_thread = None
         self._state_reader_stop.clear()
         if self._robot is not None:
-            self._stop_controller()
-            self._robot = None
+            try:
+                self.exit_teaching_mode()
+            finally:
+                try:
+                    self._stop_controller()
+                finally:
+                    self._teaching_mode_active = False
+                    self._robot = None
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None

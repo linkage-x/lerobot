@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive two-marker FR3-base calibration for Thor GMSL2 cameras.
+"""Interactive single-tag camera calibration in the current FR3 base frame.
 
 This process is intentionally independent of the data-collection GUI.  It is
 started from the host through ``run_p0_two_marker_calibration.sh`` but runs on
@@ -7,8 +7,8 @@ Thor, where both the Argus cameras and FR3 are connected.  The live viewer
 reads the recorder-owned synchronized frame bus, so it never opens a second
 camera session.
 
-Controls in the OpenCV window:
-    Enter  capture the displayed synchronized camera cluster + measured FR3 pose
+Controls in the operator window:
+    Enter  capture tag-6 corners + the measured FR3 pose
     q      finish and solve (only after the minimum observation gate is ready)
     f      force a solve attempt before the readiness gate
     Esc    abort without replacing the active calibration
@@ -17,6 +17,7 @@ Controls in the OpenCV window:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -53,27 +55,14 @@ from tools.thor.gmsl2.online_sync_frame_client import (  # noqa: E402
     OnlineSyncCluster,
     ThorOnlineSyncFrameClient,
 )
-from tools.thor.p1_eye_hand_core import (  # noqa: E402
-    EyeHandObservation,
-    assess_solution,
-    matrix_payload,
-    solve_base_with_fixed_tcp_tags,
-    solve_eye_hand,
-)
+from tools.thor.p1_eye_hand_core import matrix_payload  # noqa: E402
 from tools.thor.p1_simple_eye_hand_calibration import (  # noqa: E402
-    BACKING_SIZE_M,
-    DEFAULT_EXTRINSICS,
-    DEFAULT_INTRINSICS,
-    DEFAULT_P0_SOURCE,
-    DEFAULT_ROOT,
-    TAG_IDS,
-    TAG_SIZE_M,
-    _intrinsics_index,
     _sha256,
-    _tag_pose,
-    _world_cameras,
     _write_json,
-    create_retargeted_p0_plan,
+)
+from tools.thor.single_tag_camera_calibration import (  # noqa: E402
+    calibrate_and_write,
+    load_existing_fisheye_intrinsics,
 )
 
 DEFAULT_RECORDER_CONFIG = (
@@ -83,19 +72,112 @@ DEFAULT_URDF = (
     REPO_ROOT
     / "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf"
 )
-WINDOW_NAME = "P0 two-marker calibration (Enter=capture, q=solve, Esc=abort)"
-MIN_ROBOT_POSES = 15
-MIN_POSES_PER_TAG = 8
+DEFAULT_ROOT = REPO_ROOT / "outputs/calibration/p0_single_tag_camera_calibration"
+DEFAULT_INTRINSICS = Path(
+    "/home/nvidia/lerobot/outputs/calibration/"
+    "thor_gmsl2_selfcal_0804_fisheye_intrinsics/summary.json"
+)
+WINDOW_NAME = "FR3-base camera calibration: tag36h11 ID 6, 160 mm"
+TAG_IDS = (6,)
+TAG_SIZE_M = 0.16
+MIN_EXTRINSIC_FRAMES = 20
 MIN_CAMERAS = 2
+# cam_02 is the UMI camera and is intentionally outside this fixed-camera
+# calibration. Keep this policy local to the standalone workflow;
+# normal Thor recording still discovers and uses it.
+DEFAULT_EXCLUDED_SENSOR_IDS = frozenset({2})
 
 
 @dataclass
 class CameraResult:
     camera: str
+    calibration_camera: str
     image_bgr: np.ndarray
     annotated_bgr: np.ndarray
     detections: list[dict[str, Any]]
     error: str = ""
+
+
+def _operator_key(keysym: str, char: str) -> int | None:
+    if keysym in {"Return", "KP_Enter"}:
+        return 13
+    if keysym == "Escape":
+        return 27
+    value = (char or "").lower()
+    if value in {"q", "f"}:
+        return ord(value)
+    return None
+
+
+class OperatorWindow:
+    """Tk viewer used because Thor's FR3 venv ships headless OpenCV."""
+
+    def __init__(self, title: str, width: int = 1440, height: int = 900):
+        try:
+            import tkinter as tk
+            from PIL import Image, ImageTk
+        except ImportError as exc:
+            raise RuntimeError("operator window requires tkinter and Pillow") from exc
+        try:
+            self._root = tk.Tk()
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to create operator window; verify host X server and ssh -Y forwarding"
+            ) from exc
+        self._tk = tk
+        self._image_module = Image
+        self._image_tk_module = ImageTk
+        self._keys: deque[int] = deque()
+        self._photo: Any | None = None
+        self._closed = False
+        self._root.title(title)
+        self._root.geometry(f"{width}x{height}")
+        self._label = tk.Label(self._root, bg="black")
+        self._label.pack(fill=tk.BOTH, expand=True)
+        self._root.bind("<KeyPress>", self._on_key)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._pump()
+
+    def _on_key(self, event: Any) -> None:
+        key = _operator_key(str(event.keysym), str(event.char))
+        if key is not None:
+            self._keys.append(key)
+
+    def _on_close(self) -> None:
+        self._keys.append(27)
+
+    def _pump(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._root.update_idletasks()
+            self._root.update()
+        except self._tk.TclError:
+            self._closed = True
+            self._keys.append(27)
+
+    def show(self, image_bgr: np.ndarray) -> None:
+        if self._closed:
+            return
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        self._photo = self._image_tk_module.PhotoImage(
+            image=self._image_module.fromarray(image_rgb)
+        )
+        self._label.configure(image=self._photo)
+        self._pump()
+
+    def poll_key(self) -> int:
+        self._pump()
+        return self._keys.popleft() if self._keys else -1
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._root.destroy()
+        except self._tk.TclError:
+            pass
 
 
 def _utc_stamp() -> str:
@@ -115,13 +197,10 @@ def _load_active(root: Path) -> tuple[Path, dict[str, Any], dict[str, Any]] | No
         return None
     active = json.loads(active_path.read_text(encoding="utf-8"))
     calibration_path = Path(str(active.get("calibration_path", "")))
-    plan_path = Path(str(active.get("plan_path", "")))
-    if not calibration_path.is_file() or not plan_path.is_file():
+    if not calibration_path.is_file():
         raise FileNotFoundError(f"Active calibration references missing files: {active_path}")
     if active.get("calibration_sha256") and _sha256(calibration_path) != active["calibration_sha256"]:
         raise ValueError(f"Active calibration SHA-256 mismatch: {calibration_path}")
-    if active.get("plan_sha256") and _sha256(plan_path) != active["plan_sha256"]:
-        raise ValueError(f"Active P0 plan SHA-256 mismatch: {plan_path}")
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     if calibration.get("status") != "passed":
         raise ValueError(f"Active calibration is not passing: {calibration_path}")
@@ -135,11 +214,11 @@ def _choose_existing(mode: str, active: tuple[Path, dict[str, Any], dict[str, An
             raise FileNotFoundError("--existing reuse requested, but no active calibration exists")
         return False
     path, calibration, _ = active
-    quality = calibration.get("quality", {})
+    cameras = calibration.get("joint_solution", {}).get("cameras", {})
     print(
         f"[EXISTING] {path}\n"
         f"  created={calibration.get('created_utc', 'unknown')} "
-        f"poses={quality.get('num_robot_poses', '?')} cameras={quality.get('num_cameras', '?')}",
+        f"frame={calibration.get('world', {}).get('world_frame_id', '?')} cameras={len(cameras)}",
         flush=True,
     )
     if mode == "reuse":
@@ -163,15 +242,46 @@ def _activate_teaching_mode(robot: Any) -> None:
     stop_otg = getattr(robot, "_stop_otg_loop", None)
     if callable(stop_otg):
         stop_otg()
-    arm.damping = [0.0] * 7
-    arm.stiffness = [0.0] * 7
-    stop_controller = getattr(arm, "_stop_controller", None)
-    start_controller = getattr(arm, "_start_controller", None)
-    if callable(stop_controller):
-        stop_controller()
-    if callable(start_controller):
-        start_controller()
-    print("[ROBOT] teaching mode active: all joint stiffness/damping = 0", flush=True)
+    enter_teaching_mode = getattr(arm, "enter_teaching_mode", None)
+    if not callable(enter_teaching_mode):
+        raise RuntimeError("FR3 arm backend does not provide native teaching mode")
+    enter_teaching_mode([0.0] * 7)
+    print("[ROBOT] panda_py native teaching mode active: joint damping = 0", flush=True)
+
+
+def _run_robot_only_control_test(robot: Any, duration_s: float) -> None:
+    """Exercise the same teaching controller without cameras, detection, or UI."""
+    arm = getattr(robot, "_arm", None)
+    panda = getattr(arm, "_robot", None)
+    if panda is None:
+        raise RuntimeError("FR3 panda backend is unavailable for control test")
+    rates: list[float] = []
+    deadline = time.monotonic() + duration_s
+    next_report = time.monotonic()
+    while time.monotonic() < deadline:
+        # panda_py controllers run asynchronously. The installed high-level
+        # Panda API exposes async failures through raise_error(); unlike the
+        # lower-level native wrapper, it has no control_thread_active().
+        panda.raise_error()
+        state = panda.get_state()
+        rate = float(state.control_command_success_rate)
+        if np.isfinite(rate):
+            rates.append(rate)
+        now = time.monotonic()
+        if now >= next_report:
+            mode = getattr(getattr(state, "robot_mode", None), "name", "unknown")
+            print(f"[ROBOT-ONLY TEST] mode={mode} success_rate={rate:.6f}", flush=True)
+            next_report = now + 1.0
+        time.sleep(0.02)
+    panda.raise_error()
+    if not rates:
+        raise RuntimeError("FR3 control test returned no finite command-success samples")
+    print(
+        "[ROBOT-ONLY TEST] passed "
+        f"duration={duration_s:.1f}s min={min(rates):.6f} "
+        f"mean={float(np.mean(rates)):.6f} final={rates[-1]:.6f}",
+        flush=True,
+    )
 
 
 def _make_robot(robot_ip: str, urdf: Path) -> Any:
@@ -193,11 +303,22 @@ def _make_robot(robot_ip: str, urdf: Path) -> Any:
     return make_robot_from_config(cfg)
 
 
-def _make_recorder_config(template: Path, run_dir: Path, frame_bus_dir: Path, every_n: int) -> Path:
+def _make_recorder_config(
+    template: Path,
+    run_dir: Path,
+    frame_bus_dir: Path,
+    every_n: int,
+    sensor_ids: list[int] | None = None,
+) -> Path:
     payload = yaml.safe_load(template.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Recorder config root must be a mapping: {template}")
     cameras = payload.setdefault("sensors", {}).setdefault("cameras", {})
+    # GMSL2 logical ids can change after links are unplugged/replugged.  Always
+    # discover the currently locked links; calibration identity is handled
+    # separately through --camera-alias rather than by freezing device ids.
+    cameras["detect_all"] = sensor_ids is None
+    cameras["sensor_ids"] = [] if sensor_ids is None else sensor_ids
     cameras.setdefault("defaults", {})["recorder_backend"] = "argus_online_sync"
     online = cameras.setdefault("online_sync", {})
     online["enabled"] = True
@@ -207,7 +328,7 @@ def _make_recorder_config(template: Path, run_dir: Path, frame_bus_dir: Path, ev
     dataset = payload.setdefault("dataset", {})
     dataset["root"] = str(run_dir / "unused_recorder_dataset")
     dataset["num_episodes"] = 0
-    dataset["single_task"] = "P0 interactive two-marker calibration"
+    dataset["single_task"] = "current-FR3-base camera extrinsics from tag36h11 ID 6"
     config_dir = Path(tempfile.mkdtemp(prefix="p0_two_marker_cfg_", dir="/tmp"))
     path = config_dir / "recorder.yaml"
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -247,13 +368,85 @@ def _new_detector() -> Any:
     return (dictionary, parameters)
 
 
+def _normalize_camera_name(raw: str) -> str:
+    value = str(raw).strip()
+    if value.isdigit():
+        return f"cam_{int(value):02d}"
+    if value.lower().startswith("cam_") and value[4:].isdigit():
+        return f"cam_{int(value[4:]):02d}"
+    if not value:
+        raise ValueError("camera name must not be empty")
+    return value
+
+
+def _camera_id(raw: str) -> int:
+    camera = _normalize_camera_name(raw)
+    if not camera.startswith("cam_") or not camera[4:].isdigit():
+        raise ValueError(f"camera must be a numeric id such as cam_02, got {raw!r}")
+    return int(camera[4:])
+
+
+def _excluded_sensor_ids(extra_cameras: list[str]) -> list[int]:
+    return sorted(DEFAULT_EXCLUDED_SENSOR_IDS | {_camera_id(value) for value in extra_cameras})
+
+
+def _select_sensor_ids(
+    locked_sensor_ids: list[int],
+    excluded_sensor_ids: list[int],
+) -> tuple[list[int], dict[str, str]]:
+    excluded = set(excluded_sensor_ids)
+    selected: list[int] = []
+    ignored: dict[str, str] = {}
+    for sensor_id in locked_sensor_ids:
+        current = f"cam_{sensor_id:02d}"
+        if sensor_id in excluded:
+            ignored[current] = "excluded by P0 policy"
+            continue
+        selected.append(sensor_id)
+    return selected, ignored
+
+
+def _locked_sensor_ids(
+    repo_root: Path = REPO_ROOT,
+    *,
+    _runner: Any = subprocess.run,
+) -> list[int]:
+    script = repo_root / "tools/thor/gmsl2/check_max96726_locks.sh"
+    result = _runner([str(script)], capture_output=True, text=True, timeout=30)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"MAX96726 lock check failed rc={result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    for line in result.stdout.splitlines():
+        if line.startswith("LOCKED_VIDEO_IDS="):
+            value = line.split("=", 1)[1].strip()
+            return [int(item) for item in value.split(",") if item.strip()]
+    raise RuntimeError("MAX96726 lock check did not emit LOCKED_VIDEO_IDS=")
+
+
+def _parse_camera_aliases(values: list[str]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for raw in values:
+        if "=" not in raw:
+            raise ValueError(f"camera alias must be CURRENT=CALIBRATED, got {raw!r}")
+        current_raw, calibrated_raw = raw.split("=", 1)
+        current = _normalize_camera_name(current_raw)
+        calibrated = _normalize_camera_name(calibrated_raw)
+        if current in aliases and aliases[current] != calibrated:
+            raise ValueError(f"camera {current} has conflicting aliases")
+        aliases[current] = calibrated
+    targets = list(aliases.values())
+    if len(set(targets)) != len(targets):
+        raise ValueError("two current cameras cannot alias the same calibrated camera")
+    return aliases
+
+
 def _detect_camera(
     camera: str,
+    calibration_camera: str,
     image_bgr: np.ndarray,
-    intrinsics: dict[str, Any],
-    T_world_camera: np.ndarray,
     detection_scale: float,
-    max_rmse_px: float,
 ) -> CameraResult:
     if 0.0 < detection_scale < 1.0:
         work = cv2.resize(image_bgr, None, fx=detection_scale, fy=detection_scale, interpolation=cv2.INTER_AREA)
@@ -273,60 +466,58 @@ def _detect_camera(
             marker_id = int(marker_id_raw)
             if marker_id not in TAG_IDS:
                 continue
-            pose = _tag_pose(marker_corners, intrinsics, gray.shape)
-            if pose is None:
-                continue
-            T_camera_tag, rmse = pose
-            if rmse > max_rmse_px:
-                continue
+            corners_px = np.asarray(marker_corners, dtype=np.float64).reshape(4, 2)
+            if 0.0 < detection_scale < 1.0:
+                corners_px = corners_px / detection_scale
+            full_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            refined = corners_px.astype(np.float32).reshape(-1, 1, 2)
+            cv2.cornerSubPix(
+                full_gray,
+                refined,
+                (5, 5),
+                (-1, -1),
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01),
+            )
+            corners_px = refined.reshape(4, 2).astype(np.float64)
             detections.append(
                 {
                     "tag_id": marker_id,
-                    "reprojection_rmse_px": float(rmse),
-                    "T_camera_tag": matrix_payload(T_camera_tag),
-                    "T_world_tag": matrix_payload(T_world_camera @ T_camera_tag),
+                    "corners_px": corners_px.tolist(),
+                    "image_width": int(image_bgr.shape[1]),
+                    "image_height": int(image_bgr.shape[0]),
                 }
             )
-    return CameraResult(camera, image_bgr, annotated, detections)
+    return CameraResult(camera, calibration_camera, image_bgr, annotated, detections)
 
 
 def _process_cluster(
     cluster: OnlineSyncCluster,
-    intrinsics: dict[str, dict[str, Any]],
-    world_cameras: dict[str, np.ndarray],
     pool: ThreadPoolExecutor,
+    camera_aliases: dict[str, str],
     detection_scale: float,
-    max_rmse_px: float,
 ) -> dict[str, CameraResult]:
     cameras = sorted(cluster.frames)
 
     def task(camera: str) -> CameraResult:
         try:
             image_bgr = cv2.cvtColor(cluster.frames[camera].as_rgb(), cv2.COLOR_RGB2BGR)
-            missing = []
-            if camera not in intrinsics:
-                missing.append("intrinsics")
-            if camera not in world_cameras:
-                missing.append("extrinsics")
-            if missing:
-                return CameraResult(
-                    camera,
-                    image_bgr,
-                    image_bgr.copy(),
-                    [],
-                    "missing " + "/".join(missing),
-                )
+            calibration_camera = camera_aliases.get(camera, camera)
             return _detect_camera(
                 camera,
+                calibration_camera,
                 image_bgr,
-                intrinsics[camera],
-                world_cameras[camera],
                 detection_scale,
-                max_rmse_px,
             )
         except Exception as exc:  # keep one camera failure visible without killing the viewer
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
-            return CameraResult(camera, blank, blank.copy(), [], str(exc))
+            return CameraResult(
+                camera,
+                camera_aliases.get(camera, camera),
+                blank,
+                blank.copy(),
+                [],
+                str(exc),
+            )
 
     return {result.camera: result for result in pool.map(task, cameras)}
 
@@ -355,7 +546,7 @@ def _draw_mosaic(
     )
     cv2.putText(
         canvas,
-        "GREEN=56+57  YELLOW=one marker  RED=no valid marker",
+        "GREEN=tag 6 detected  RED=no valid tag 6",
         (12, 52),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
@@ -377,12 +568,17 @@ def _draw_mosaic(
         result = results[camera]
         tile = cv2.resize(result.annotated_bgr, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
         tag_ids = {int(item["tag_id"]) for item in result.detections}
-        color = (0, 200, 0) if tag_ids == set(TAG_IDS) else ((0, 210, 255) if tag_ids else (0, 0, 220))
+        color = (0, 200, 0) if tag_ids == set(TAG_IDS) else (0, 0, 220)
         y0 = header_h + (index // cols) * tile_h
         x0 = (index % cols) * tile_w
         canvas[y0 : y0 + tile_h, x0 : x0 + tile_w] = tile
         cv2.rectangle(canvas, (x0 + 2, y0 + 2), (x0 + tile_w - 3, y0 + tile_h - 3), color, 5)
-        label = f"{camera} tags={sorted(tag_ids)} valid={counts.get(camera, 0)}/{target}"
+        identity = (
+            camera
+            if result.calibration_camera == camera
+            else f"{camera}->{result.calibration_camera}"
+        )
+        label = f"{identity} tags={sorted(tag_ids)} valid={counts.get(camera, 0)}/{target}"
         cv2.rectangle(canvas, (x0 + 4, y0 + 4), (x0 + tile_w - 4, y0 + 34), (0, 0, 0), -1)
         cv2.putText(canvas, label, (x0 + 10, y0 + 27), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2)
         if result.error:
@@ -408,38 +604,16 @@ def _robot_sample(robot: Any, settle_s: float, max_joint_delta_rad: float) -> tu
     return T_base_tcp, q2.tolist()
 
 
-def _observations_from_records(records: list[dict[str, Any]]) -> list[EyeHandObservation]:
-    observations: list[EyeHandObservation] = []
-    for record in records:
-        T_base_tcp = _matrix_from_payload(record["T_base_tcp"], "T_base_tcp")
-        for camera, camera_record in record.get("cameras", {}).items():
-            for detection in camera_record.get("detections", []):
-                observations.append(
-                    EyeHandObservation(
-                        pose_index=int(record["capture_index"]),
-                        camera=str(camera),
-                        tag_id=int(detection["tag_id"]),
-                        T_base_tcp=T_base_tcp,
-                        T_world_tag=_matrix_from_payload(detection["T_world_tag"], "T_world_tag"),
-                        reprojection_rmse_px=float(detection["reprojection_rmse_px"]),
-                    )
-                )
-    return observations
-
-
-def _ready(observations: list[EyeHandObservation]) -> tuple[bool, str]:
-    poses = len({obs.pose_index for obs in observations})
-    cameras = len({obs.camera for obs in observations})
-    per_tag = {
-        tag_id: len({obs.pose_index for obs in observations if obs.tag_id == tag_id})
-        for tag_id in TAG_IDS
+def _capture_readiness(
+    counts: dict[str, int], expected_cameras: list[str], target_per_camera: int
+) -> tuple[bool, str]:
+    missing = {
+        camera: max(0, int(target_per_camera) - int(counts.get(camera, 0)))
+        for camera in expected_cameras
+        if counts.get(camera, 0) < target_per_camera
     }
-    ready = (
-        poses >= MIN_ROBOT_POSES
-        and cameras >= MIN_CAMERAS
-        and min(per_tag.values(), default=0) >= MIN_POSES_PER_TAG
-    )
-    return ready, f"poses={poses}/{MIN_ROBOT_POSES}, cameras={cameras}/{MIN_CAMERAS}, tag poses={per_tag}"
+    ready = len(expected_cameras) >= MIN_CAMERAS and not missing
+    return ready, f"valid per camera={counts}; remaining={missing}"
 
 
 def _save_capture(
@@ -452,7 +626,7 @@ def _save_capture(
     max_joint_delta_rad: float,
 ) -> dict[str, Any]:
     if not any(result.detections for result in results.values()):
-        raise RuntimeError("no valid tag 56/57 detection in the displayed cluster")
+        raise RuntimeError("no valid tag36h11 ID 6 detection in the displayed cluster")
     T_base_tcp, joints = _robot_sample(robot, settle_s, max_joint_delta_rad)
     capture_index = len(records)
     image_dir = run_dir / "captures" / f"capture_{capture_index:03d}"
@@ -469,6 +643,7 @@ def _save_capture(
             ):
                 raise RuntimeError(f"failed to save {image_path}")
             camera_payload[camera] = {
+                "calibration_camera": result.calibration_camera,
                 "image": str(image_path),
                 "valid": bool(result.detections),
                 "detections": result.detections,
@@ -492,7 +667,14 @@ def _save_capture(
         "cameras": camera_payload,
     }
     records.append(record)
-    _write_json(run_dir / "captures.json", {"schema": "p0_two_marker_captures/v1", "records": records})
+    _write_json(
+        run_dir / "captures.json",
+        {
+            "schema": "fr3_base_single_tag_camera_captures/v1",
+            "marker": {"family": "tag36h11", "id": 6, "marker_size_m": TAG_SIZE_M},
+            "records": records,
+        },
+    )
     return record
 
 
@@ -500,100 +682,36 @@ def _solve_and_activate(
     run_dir: Path,
     root: Path,
     records: list[dict[str, Any]],
-    world_id: str,
     intrinsics_summary: Path,
-    extrinsics_summary: Path,
-    p0_source: Path,
-    fixed_tcp: dict[int, np.ndarray] | None,
-    fixed_tcp_source: Path | None,
-    solver_workers: int,
 ) -> Path:
-    observations = _observations_from_records(records)
-    if fixed_tcp:
-        print("[SOLVE] reusing fixed marker->EE transforms; solving only T_world_base", flush=True)
-        solution = solve_base_with_fixed_tcp_tags(observations, fixed_tcp, workers=solver_workers)
-        solve_mode = "fixed_marker_to_ee"
-    else:
-        print("[SOLVE] first run: jointly solving T_world_base and marker->EE transforms", flush=True)
-        solution = solve_eye_hand(observations)
-        solve_mode = "joint_base_and_marker_to_ee"
-    passed, reasons = assess_solution(solution)
-    T_world_base = solution.pop("T_world_base")
-    T_tcp_tags = solution.pop("T_tcp_tags")
-    calibration_path = run_dir / "calibration.json"
-    payload = {
-        "schema": "p0_two_marker_calibration/v1",
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "status": "passed" if passed else "failed_quality_gate",
-        "world_frame_id": world_id,
-        "frame_equation": "T_world_tag = T_world_base @ T_base_tcp @ T_tcp_tag",
-        "tcp_frame": "fr3_ee",
-        "solve_mode": solve_mode,
-        "marker": {
-            "family": "tag36h11",
-            "ids": list(TAG_IDS),
-            "marker_size_m": TAG_SIZE_M,
-            "backing_size_m": BACKING_SIZE_M,
-        },
-        "inputs": {
-            "captures_json": str(run_dir / "captures.json"),
-            "intrinsics_summary": str(intrinsics_summary),
-            "intrinsics_sha256": _sha256(intrinsics_summary),
-            "extrinsics_summary": str(extrinsics_summary),
-            "extrinsics_sha256": _sha256(extrinsics_summary),
-            "fixed_marker_to_ee_source": str(fixed_tcp_source) if fixed_tcp_source else None,
-            "fixed_marker_to_ee_source_sha256": (
-                _sha256(fixed_tcp_source) if fixed_tcp_source else None
-            ),
-        },
-        "T_world_base": matrix_payload(T_world_base),
-        "T_tcp_tag": {str(tag_id): matrix_payload(T) for tag_id, T in T_tcp_tags.items()},
-        "quality": solution,
-        "quality_gate_reasons": reasons,
-        "valid_captures_per_camera": {
-            camera: sum(
-                bool(record.get("cameras", {}).get(camera, {}).get("valid")) for record in records
-            )
-            for camera in sorted(
-                {
-                    camera
-                    for record in records
-                    for camera in record.get("cameras", {})
-                }
-            )
-        },
-    }
-    _write_json(calibration_path, payload)
-    if not passed:
-        raise RuntimeError("calibration quality gate failed: " + "; ".join(reasons))
-
-    candidate_path = run_dir / "p0_relocalized_timed_plan.json"
-    create_retargeted_p0_plan(p0_source, T_world_base, candidate_path, calibration_path)
+    print(
+        f"[SOLVE] using existing fisheye intrinsics: {intrinsics_summary} "
+        "(cam_03 temporarily uses cam_13 intrinsics)",
+        flush=True,
+    )
+    calibration_path, calibration = calibrate_and_write(
+        records,
+        run_dir / "camera_calibration",
+        intrinsics_summary,
+        marker_size_m=TAG_SIZE_M,
+        min_frames=MIN_EXTRINSIC_FRAMES,
+    )
     _write_json(
         root / "active.json",
         {
-            "schema": "p1_simple_eye_hand_active/v1",
-            "producer": "p0_two_marker_calibration",
+            "schema": "fr3_base_single_tag_camera_calibration_active/v1",
+            "producer": "p0_single_tag_fixed_camera_calibration",
             "activated_utc": datetime.now(timezone.utc).isoformat(),
             "run_dir": str(run_dir),
             "calibration_path": str(calibration_path),
             "calibration_sha256": _sha256(calibration_path),
-            "plan_path": str(candidate_path),
-            "plan_sha256": _sha256(candidate_path),
+            "intrinsics_summary": str(intrinsics_summary.resolve()),
+            "intrinsics_summary_sha256": _sha256(intrinsics_summary),
+            "world_frame_id": calibration["world"]["world_frame_id"],
         },
     )
-    print(f"[DONE] passing calibration activated: {calibration_path}", flush=True)
+    print(f"[DONE] current-FR3-base camera calibration activated: {calibration_path}", flush=True)
     return calibration_path
-
-
-def _fixed_tcp_from_active(active: tuple[Path, dict[str, Any], dict[str, Any]] | None) -> dict[int, np.ndarray] | None:
-    if active is None:
-        return None
-    raw = active[1].get("T_tcp_tag", {})
-    if not isinstance(raw, dict):
-        return None
-    result = {int(tag_id): _matrix_from_payload(value, f"T_tcp_tag[{tag_id}]") for tag_id, value in raw.items()}
-    return result if set(TAG_IDS).issubset(result) else None
 
 
 def main() -> int:
@@ -609,20 +727,44 @@ def main() -> int:
     parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--recorder-config", type=Path, default=DEFAULT_RECORDER_CONFIG)
     parser.add_argument("--intrinsics-summary", type=Path, default=DEFAULT_INTRINSICS)
-    parser.add_argument("--extrinsics-summary", type=Path, default=DEFAULT_EXTRINSICS)
-    parser.add_argument("--p0-source", type=Path, default=DEFAULT_P0_SOURCE)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_ROOT)
-    parser.add_argument("--target-per-camera", type=int, default=15)
-    parser.add_argument("--detection-workers", type=int, default=7)
-    parser.add_argument("--solver-workers", type=int, default=7)
-    parser.add_argument("--frame-bus-every-n", type=int, default=6)
+    parser.add_argument("--target-per-camera", type=int, default=30)
+    parser.add_argument("--detection-workers", type=int, default=2)
+    parser.add_argument("--frame-bus-every-n", type=int, default=15)
     parser.add_argument("--detection-scale", type=float, default=0.5)
-    parser.add_argument("--max-reprojection-rmse-px", type=float, default=3.0)
+    parser.add_argument(
+        "--robot-only-test-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "run the same zero-stiffness FR3 controller for this duration without cameras, "
+            "AprilTag detection, or a window, then exit"
+        ),
+    )
     parser.add_argument("--settle-time-s", type=float, default=0.12)
     parser.add_argument("--max-settle-joint-delta-rad", type=float, default=0.003)
+    parser.add_argument(
+        "--camera-alias",
+        action="append",
+        default=[],
+        metavar="CURRENT=CALIBRATED",
+        help="map a runtime camera id to its calibrated identity; accepts cam_05=cam_06 or 5=6",
+    )
+    parser.add_argument(
+        "--exclude-camera",
+        action="append",
+        default=[],
+        metavar="CAMERA",
+        help="exclude an additional runtime camera id; cam_02 (UMI) is always excluded",
+    )
     parser.add_argument("--enable-hardware-sync", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    try:
+        camera_aliases = _parse_camera_aliases(args.camera_alias)
+        excluded_camera_ids = _excluded_sensor_ids(args.exclude_camera)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     root = args.output_root.expanduser().resolve()
     active = _load_active(root)
@@ -635,10 +777,15 @@ def main() -> int:
                 {
                     "would_recalibrate": True,
                     "output_root": str(root),
-                    "fixed_marker_to_ee_available": _fixed_tcp_from_active(active) is not None,
                     "recorder_config": str(args.recorder_config.expanduser().resolve()),
                     "intrinsics_summary": str(args.intrinsics_summary.expanduser().resolve()),
-                    "extrinsics_summary": str(args.extrinsics_summary.expanduser().resolve()),
+                    "intrinsics_policy": {"default": "same camera", "cam_03": "cam_13"},
+                    "robot_only_test_seconds": args.robot_only_test_seconds,
+                    "marker": "tag36h11 id=6 size=0.16m",
+                    "camera_model": "opencv_fisheye",
+                    "output_frame": "current fr3_base",
+                    "camera_aliases": camera_aliases,
+                    "excluded_camera_ids": excluded_camera_ids,
                 },
                 indent=2,
             )
@@ -646,41 +793,122 @@ def main() -> int:
         return 0
     if not args.execute or args.confirmation != "P0_TWO_MARKER_TEACHING":
         parser.error("recalibration requires --execute --confirmation P0_TWO_MARKER_TEACHING")
-    if args.target_per_camera <= 0 or args.detection_workers <= 0 or args.solver_workers <= 0:
-        parser.error("target/count worker options must be positive")
+    if args.target_per_camera < MIN_EXTRINSIC_FRAMES or args.detection_workers <= 0:
+        parser.error(
+            f"--target-per-camera must be at least {MIN_EXTRINSIC_FRAMES}; "
+            "--detection-workers must be positive"
+        )
+    if args.robot_only_test_seconds < 0.0:
+        parser.error("--robot-only-test-seconds must be non-negative")
+    if args.robot_only_test_seconds > 0.0:
+        print(
+            "[SAFETY] ROBOT-ONLY TEST: no cameras/UI will start, but FR3 will enter the same "
+            "zero-stiffness teaching controller. Support the arm and keep the E-stop ready.",
+            flush=True,
+        )
+        robot = _make_robot(args.robot_ip, args.urdf.expanduser().resolve())
+        try:
+            robot.connect()
+            _activate_teaching_mode(robot)
+            _run_robot_only_control_test(robot, args.robot_only_test_seconds)
+        finally:
+            if robot.is_connected:
+                robot.disconnect()
+        return 0
+    intrinsics_summary = args.intrinsics_summary.expanduser().resolve()
+    if not intrinsics_summary.is_file():
+        parser.error(f"existing fisheye intrinsics summary not found: {intrinsics_summary}")
+    try:
+        existing_intrinsics = load_existing_fisheye_intrinsics(intrinsics_summary)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        parser.error(f"invalid existing fisheye intrinsics: {exc}")
 
     print(
         "[SAFETY] FR3 will enter zero-stiffness teaching mode. Move it by hand, stop completely, "
         "then press Enter in the camera window. Keep the physical E-stop ready.",
         flush=True,
     )
+    locked_sensor_ids = _locked_sensor_ids()
+    selected_sensor_ids, ignored_cameras = _select_sensor_ids(
+        locked_sensor_ids,
+        excluded_camera_ids,
+    )
+    if len(selected_sensor_ids) < MIN_CAMERAS:
+        parser.error(
+            f"only {len(selected_sensor_ids)} locked non-UMI camera(s) remain; "
+            f"locked={locked_sensor_ids}, ignored={ignored_cameras}"
+        )
+    print(
+        f"[CAMERAS] locked={locked_sensor_ids}; selected={selected_sensor_ids}; "
+        f"ignored={ignored_cameras}",
+        flush=True,
+    )
     run_dir = root / f"manual_run_{_utc_stamp()}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    frame_bus_dir = Path(f"/dev/shm/p0_two_marker_{os.getpid()}")
+    frame_bus_dir = Path(f"/dev/shm/fr3_base_single_tag_{os.getpid()}")
     recorder_config = _make_recorder_config(
-        args.recorder_config.expanduser().resolve(), run_dir, frame_bus_dir, args.frame_bus_every_n
+        args.recorder_config.expanduser().resolve(),
+        run_dir,
+        frame_bus_dir,
+        args.frame_bus_every_n,
+        selected_sensor_ids,
     )
-    intrinsics_summary = args.intrinsics_summary.expanduser().resolve()
-    extrinsics_summary = args.extrinsics_summary.expanduser().resolve()
-    intrinsics = _intrinsics_index(intrinsics_summary)
-    world_id, world_cameras = _world_cameras(extrinsics_summary)
-    fixed_tcp = _fixed_tcp_from_active(active)
     robot = _make_robot(args.robot_ip, args.urdf.expanduser().resolve())
     recorder: ThorRecorderClient | None = None
     records: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     should_solve = False
+    window: OperatorWindow | None = None
     try:
         recorder = _start_recorder(recorder_config, skip_hardware_sync=not args.enable_hardware_sync)
         frame_client = ThorOnlineSyncFrameClient(frame_bus_dir)
         cluster = frame_client.get_latest(timeout_s=30.0)
         if cluster is None:
             raise RuntimeError(f"no synchronized frame cluster appeared under {frame_bus_dir}")
+        fresh_cluster = frame_client.get_latest(
+            timeout_s=2.5,
+            min_publish_seq=cluster.publish_seq + 1,
+        )
+        if fresh_cluster is None:
+            raise RuntimeError(
+                "camera stream stalled before robot connection; no second synchronized cluster "
+                "arrived within 2.5s. Check the timed-out camera in the [THOR] log, recover it, "
+                "or rerun with --exclude-camera cam_XX"
+            )
+        cluster = fresh_cluster
+        resolved_cameras = {
+            camera: camera_aliases.get(camera, camera) for camera in sorted(cluster.frames)
+        }
+        duplicated_targets = sorted(
+            {
+                calibrated
+                for calibrated in resolved_cameras.values()
+                if list(resolved_cameras.values()).count(calibrated) > 1
+            }
+        )
+        if duplicated_targets:
+            raise RuntimeError(
+                "multiple live cameras resolve to the same calibrated identity: "
+                + ", ".join(duplicated_targets)
+            )
+        missing_intrinsics = sorted(
+            camera
+            for camera in resolved_cameras.values()
+            if ("cam_13" if camera == "cam_03" else camera) not in existing_intrinsics
+        )
+        if missing_intrinsics:
+            raise RuntimeError(
+                "no existing fisheye intrinsics for calibrated camera identities: "
+                + ", ".join(missing_intrinsics)
+            )
+        expected_live_cameras = sorted(resolved_cameras)
+        print(f"[CAMERAS] live -> calibrated identities: {resolved_cameras}", flush=True)
+        window = OperatorWindow(WINDOW_NAME)
         robot.connect()
         _activate_teaching_mode(robot)
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, 1440, 900)
-        last_seq = -1
+        last_seq = cluster.publish_seq
+        last_fresh_frame_at = time.monotonic()
+        last_capture_seq = -1
         results: dict[str, CameraResult] = {}
         ui_message = "Move FR3 by hand, stop completely, then press Enter"
         with ThreadPoolExecutor(
@@ -691,23 +919,31 @@ def main() -> int:
                 if next_cluster is not None:
                     cluster = next_cluster
                     last_seq = cluster.publish_seq
+                    last_fresh_frame_at = time.monotonic()
                     results = _process_cluster(
                         cluster,
-                        intrinsics,
-                        world_cameras,
                         pool,
+                        camera_aliases,
                         args.detection_scale,
-                        args.max_reprojection_rmse_px,
                     )
                     for camera in results:
                         counts.setdefault(camera, 0)
                 if results:
-                    cv2.imshow(
-                        WINDOW_NAME,
-                        _draw_mosaic(results, counts, args.target_per_camera, ui_message),
+                    if time.monotonic() - last_fresh_frame_at > 1.0:
+                        ui_message = "STREAM STALLED: capture disabled; check [THOR] camera timeout"
+                    window.show(
+                        _draw_mosaic(results, counts, args.target_per_camera, ui_message)
                     )
-                key = cv2.waitKey(1) & 0xFF
+                key = window.poll_key()
                 if key in (10, 13):
+                    if time.monotonic() - last_fresh_frame_at > 1.0:
+                        ui_message = "REJECTED: synchronized camera stream is stalled"
+                        print(f"[REJECTED] {ui_message}", flush=True)
+                        continue
+                    if cluster.publish_seq == last_capture_seq:
+                        ui_message = "REJECTED: no new synchronized frame since last capture"
+                        print(f"[REJECTED] {ui_message}", flush=True)
+                        continue
                     try:
                         record = _save_capture(
                             run_dir,
@@ -721,8 +957,10 @@ def main() -> int:
                         valid = [camera for camera, item in record["cameras"].items() if item["valid"]]
                         for camera in valid:
                             counts[camera] += 1
-                        observations = _observations_from_records(records)
-                        _, readiness = _ready(observations)
+                        last_capture_seq = cluster.publish_seq
+                        _, readiness = _capture_readiness(
+                            counts, expected_live_cameras, args.target_per_camera
+                        )
                         ui_message = f"Captured #{len(records)}: {readiness}"
                         print(
                             f"[CAPTURE {len(records):03d}] valid cameras={valid}; counts={counts}; {readiness}",
@@ -732,7 +970,9 @@ def main() -> int:
                         ui_message = f"REJECTED: {exc}"
                         print(f"[REJECTED] {exc}", flush=True)
                 elif key == ord("q"):
-                    ready, readiness = _ready(_observations_from_records(records))
+                    ready, readiness = _capture_readiness(
+                        counts, expected_live_cameras, args.target_per_camera
+                    )
                     if ready:
                         print(f"[READY] {readiness}", flush=True)
                         should_solve = True
@@ -748,7 +988,8 @@ def main() -> int:
                     break
     finally:
         try:
-            cv2.destroyAllWindows()
+            if window is not None:
+                window.close()
         except Exception:
             pass
         try:
@@ -768,13 +1009,7 @@ def main() -> int:
         run_dir,
         root,
         records,
-        world_id,
         intrinsics_summary,
-        extrinsics_summary,
-        args.p0_source.expanduser().resolve(),
-        fixed_tcp,
-        active[0] if fixed_tcp and active is not None else None,
-        args.solver_workers,
     )
     return 0
 

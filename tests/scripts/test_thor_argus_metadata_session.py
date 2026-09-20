@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -184,6 +185,19 @@ class _ExitedTextProc:
 
 def test_camera_defaults_select_argus_online_sync_backend() -> None:
     assert gr.CameraDefaults().recorder_backend == "argus_online_sync"
+
+
+def test_argus_recorder_env_removes_forwarded_graphical_displays(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", "localhost:10.0")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-forwarded")
+    monkeypatch.setenv("KEEP_ME", "yes")
+
+    env = aos._argus_recorder_env()
+
+    assert "DISPLAY" not in env
+    assert "WAYLAND_DISPLAY" not in env
+    assert env["KEEP_ME"] == "yes"
+    assert os.environ["DISPLAY"] == "localhost:10.0"
 
 
 def test_camera_defaults_still_accept_argus_metadata_fallback() -> None:
