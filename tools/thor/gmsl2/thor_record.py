@@ -86,6 +86,7 @@ from tools.thor.gmsl2 import argus_video_materialize as avm  # noqa: E402
 from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
+from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -1252,6 +1253,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="trust the MAX96726 lock list verbatim")
     ap.add_argument("--no-box", action="store_true",
                     help="ignore the YAML box_collection block (camera-only)")
+    # Tri-state: neither flag defers to the yaml.  The GUI sends one explicitly
+    # so an operator's per-session choice is never silently overridden by a file
+    # they did not open.
+    ap.add_argument("--laser-tracker", action="store_true",
+                    help="record the laser tracker this session (overrides the config)")
+    ap.add_argument("--no-laser-tracker", action="store_true",
+                    help="do not record the laser tracker this session (overrides the config)")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="disable the automatic recover_argus.sh round triggered "
                          "by a wedged nvargus-daemon (default: enabled)")
@@ -1272,6 +1280,11 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    # Tri-state on purpose: the yaml declares the hardware and defaults to off,
+    # --laser-tracker / --no-laser-tracker is the GUI toggle for this session,
+    # and "neither flag" means "whatever the file says".
+    lt_override = True if args.laser_tracker else (False if args.no_laser_tracker else None)
+    lt_cfg = lts.config_from_yaml_dict(raw_yaml.get("laser_tracker"), enabled_override=lt_override)
     auto_cfg = _auto_recover_from_yaml(raw_yaml.get("auto_recover"))
     if args.no_auto_recover:
         auto_cfg.enabled = False
@@ -1341,6 +1354,15 @@ def main(argv: list[str] | None = None) -> int:
     # incoming UDP packet (see tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
+    # The tracker lives on another machine and is booked by other people, so it
+    # must never stop nine cameras from recording: start() returns False instead
+    # of raising, and every use below is guarded by the flag.
+    tracker = lts.LaserTrackerSession(lt_cfg)
+    tracker_started = tracker.start()
+    if lt_cfg.enabled and not tracker_started:
+        _emit(f"WARNING: laser tracker unavailable, recording without it: {tracker.last_error}")
+    elif tracker_started:
+        _emit(f"Laser tracker session {tracker.session_id} -> {tracker.win_dir}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)
@@ -1887,6 +1909,16 @@ def main(argv: list[str] | None = None) -> int:
                         "power-cycle the box, and reconnect."
                     )
                 box.start_recording(t_start)
+            # Anchored to the same t_start the cameras use, so the tracker's
+            # episode and the video share one wall-clock origin even though the
+            # samples themselves are stamped by the controller and married to
+            # Thor's monotonic clock offline.
+            if tracker_started:
+                if not tracker.start_recording(ep_idx, t_start):
+                    _emit(
+                        f"WARNING: laser tracker did not start for episode {ep_idx} "
+                        f"({tracker.last_error}); this episode has no tracker data"
+                    )
             box_snapshots: list[dict[str, Any]] = []
             episode_time_s = _next_episode_length_s(pending_episode_time_s, cfg.episode_time_s)
             pending_episode_time_s = 0.0
@@ -1953,6 +1985,13 @@ def main(argv: list[str] | None = None) -> int:
                 recorded_samples = box.stop_recording()
             else:
                 recorded_samples = {}
+            tracker_record: dict[str, Any] = {}
+            if tracker_started:
+                tracker_record = tracker.stop_recording()
+                if tracker_record.get("error"):
+                    _emit(f"WARNING: laser tracker episode {ep_idx}: {tracker_record['error']}")
+                elif tracker_record.get("rt_rows"):
+                    _emit(f"Laser tracker: {tracker_record['rt_rows']} samples for episode {ep_idx}")
 
             pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
@@ -2030,6 +2069,20 @@ def main(argv: list[str] | None = None) -> int:
                     annotations["argus_frame_sync"] = frame_sync_payload
                 if online_sync_payload is not None:
                     annotations["online_sync"] = online_sync_payload
+                # Recorded even when it failed, and even when it was off: an
+                # episode that is silent about the tracker cannot be told apart
+                # later from one where the tracker was asked for and did not
+                # answer, and those two need opposite handling.
+                annotations["laser_tracker"] = (
+                    {
+                        "enabled": True,
+                        "session_id": tracker.session_id,
+                        "win_session_dir": tracker.win_dir,
+                        **tracker_record,
+                    }
+                    if tracker_started
+                    else {"enabled": bool(lt_cfg.enabled), "error": tracker.last_error}
+                )
                 _annotate_episode_meta(meta_path, annotations)
                 has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
                 if has_recorded_samples:
@@ -2152,6 +2205,15 @@ def main(argv: list[str] | None = None) -> int:
             box.stop()
         except Exception as exc:
             logger.warning("box.stop on shutdown: %s", exc)
+        if tracker_started:
+            try:
+                summary = tracker.stop(land_to=Path(cfg.dataset_root) / "laser_tracker")
+                if summary.get("landed_to"):
+                    _emit(f"Laser tracker session landed: {summary['landed_to']}")
+                elif summary.get("last_error"):
+                    _emit(f"WARNING: laser tracker: {summary['last_error']}")
+            except Exception as exc:
+                logger.warning("laser tracker stop on shutdown: %s", exc)
         _emit("Recording stopped")
     return rc
 

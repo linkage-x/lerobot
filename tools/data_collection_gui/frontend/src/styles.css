@@ -4324,3 +4324,31 @@ button.danger {
   margin: 10px 0 0;
   word-break: break-all;
 }
+
+/* Laser tracker: a per-session opt-in, not a rig property. Rendered as a quiet
+   row rather than a button pair because the answer is "no" on most days, and
+   the sentence under it is the part an operator actually needs. */
+.laser-tracker-toggle {
+  align-items: center;
+  background: #e9eff2;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto auto 1fr;
+  margin: 10px 0 2px;
+  padding: 8px 10px;
+}
+
+.laser-tracker-toggle span {
+  font-weight: 600;
+}
+
+.laser-tracker-toggle small {
+  color: #5b6875;
+  justify-self: end;
+  text-align: right;
+}
+
+.laser-tracker-toggle input:disabled + span {
+  opacity: 0.6;
+}

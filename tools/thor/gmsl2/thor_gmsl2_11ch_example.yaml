@@ -231,6 +231,40 @@ auto_recover:
   max_attempts: 1
   timeout_s: 300
 
+# Laser tracker (API Radian Pro), driven by Connect / Start Episode like any
+# other device. It is not on Thor: the vendor SDK runs on the Windows capture PC
+# and the two clocks are married offline by the QPC <-> CLOCK_MONOTONIC fit, so
+# this block is an ssh target rather than a device address.
+#
+# `enabled: false` is the right default. The tracker is a shared instrument that
+# admits ONE client at a time, so most sessions must not touch it -- the GUI's
+# per-session toggle is what turns it on for a GT run, and it overrides this.
+# When it is on and the instrument is unavailable, Connect still succeeds and
+# the cameras still record; the tracker row goes red and each episode warns.
+#
+# Requires Thor to hold an authorised key for the capture PC
+# (~/.ssh/id_ed25519_lt -> C:\ProgramData\ssh\administrators_authorized_keys).
+laser_tracker:
+  enabled: false
+  win_host: 18713@192.168.147.72
+  ssh_key: ~/.ssh/id_ed25519_lt
+  # Where the staged python tools and the sessions live ON THE CAPTURE PC.
+  # Note this is D:, not the C:\lt that deploy_windows.sh defaults to.
+  win_root: 'D:\lt'
+  logger_exe: 'D:\sdk\collector_win\bin\lt_realtime_logger.exe'
+  tracker_ip: 192.168.0.168
+  # What the capture PC probes back to for the clock link.
+  thor_host: 192.168.111.122
+  responder_port: 17123
+  probe_interval_s: 0.01
+  # Backstops only; the stop-file ends both in normal operation. They exist so a
+  # gateway that died without cleaning up cannot strand a process over there.
+  session_cap_s: 86400
+  episode_cap_s: 3600
+  # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
+  # against its manifest before the recorder exits.
+  land: true
+
 dataset:
   repo_id: local/thor_gmsl2_Nch_v1
   single_task: Thor GMSL2 detected-camera capture

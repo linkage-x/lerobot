@@ -173,6 +173,13 @@ class RecordingStatus:
     syncSummary: str = ""
     syncReportPath: str = ""
     syncWarnings: list[str] = field(default_factory=list)
+    # Whether this Connect asked for the laser tracker. The instrument is shared
+    # and booked by other people, so this is a per-session choice rather than a
+    # property of the rig, and the UI has to be able to turn it off on the days
+    # it is someone else's.
+    laserTracker: bool = False
+    laserTrackerState: str = "idle"
+    laserTrackerDetail: str = ""
 
 
 @dataclass
@@ -913,6 +920,28 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
             box_entries = [box_cfg]
         for box in box_entries:
             devices.extend(_box_collection_devices(box))
+
+    # One row whenever the block exists, even with enabled: false -- the row is
+    # how the operator sees that this rig *can* carry the tracker and that this
+    # session is not. A row that appeared only when enabled would make "off" and
+    # "not installed" look identical, and those want different reactions.
+    lt_cfg = config.get("laser_tracker")
+    if isinstance(lt_cfg, dict) and lt_cfg.get("win_host"):
+        devices.append(
+            {
+                "id": "laser_tracker",
+                "kind": "laser_tracker",
+                "label": "Laser tracker",
+                "state": "idle",
+                "fps": 1000,
+                "latencyMs": 0,
+                "detail": (
+                    f"{lt_cfg.get('tracker_ip', '')} via {lt_cfg.get('win_host', '')}"
+                    " (shared instrument; one client at a time)"
+                ),
+                "config": lt_cfg,
+            }
+        )
     return devices
 
 
@@ -11182,6 +11211,22 @@ def _serve_teleop_camera_snapshot(
         pass
 
 
+def _set_device_state(
+    state: GatewayState, device_id: str, device_state: str, detail: str = ""
+) -> None:
+    """Update one device row by id, if it is configured.
+
+    A no-op when the row is absent, so a recorder that talks about a device the
+    config never declared cannot invent a row the operator did not ask for.
+    """
+    for device in state.devices:
+        if device.get("id") == device_id:
+            device["state"] = device_state
+            if detail:
+                device["detail"] = detail
+            return
+
+
 def _set_all_device_states(state: GatewayState, device_state: str) -> None:
     for device in state.devices:
         device["state"] = device_state
@@ -11436,7 +11481,12 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
+def _connect_recorder(
+    state: GatewayState,
+    *,
+    backend: str | None = None,
+    laser_tracker: bool | None = None,
+) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
@@ -11465,6 +11515,12 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+        # Only the GMSL2 recorder knows the flag. Sent explicitly (never
+        # omitted) once the operator has expressed a preference, so the choice
+        # they made in the UI is not quietly overridden by the yaml.
+        if laser_tracker is not None:
+            command.append("--laser-tracker" if laser_tracker else "--no-laser-tracker")
+        state.recording.laserTracker = bool(laser_tracker)
     env = _recorder_env(state.repo_root)
     if is_workstation:
         command.append(f"--backend={state.recording.backend}")
@@ -12283,6 +12339,27 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
+    # Laser tracker: the recorder speaks about it in plain sentences rather than
+    # a JSON channel, because every one of these is something an operator has to
+    # read anyway. Parsed here only to colour the device row -- the sentence
+    # itself still reaches the log.
+    if "laser tracker" in output.lower():
+        low = output.lower()
+        if low.startswith("warning:"):
+            # "unavailable" is the session-level failure (Connect); the rest are
+            # per-episode and leave the session itself still up.
+            state.recording.laserTrackerState = "error"
+            state.recording.laserTrackerDetail = output.split(":", 1)[-1].strip()[:200]
+            _set_device_state(state, "laser_tracker", "error", state.recording.laserTrackerDetail)
+        elif "landed" in low:
+            state.recording.laserTrackerState = "idle"
+            state.recording.laserTrackerDetail = output.strip()[:200]
+            _set_device_state(state, "laser_tracker", "idle", state.recording.laserTrackerDetail)
+        else:
+            state.recording.laserTrackerState = "running"
+            state.recording.laserTrackerDetail = output.strip()[:200]
+            _set_device_state(state, "laser_tracker", "running", state.recording.laserTrackerDetail)
+        # fall through: the line is still logged like any other recorder output
     if output.startswith("BOX_LIVE "):
         try:
             payload = json.loads(output.removeprefix("BOX_LIVE ").strip())
@@ -13756,6 +13833,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # except remembered to cover.
             state = self.server.state
             requested_backend = (query.get("backend", [""])[0] or "").strip().lower() or None
+            # Tri-state: absent means "whatever the config says", so an older
+            # frontend that does not send the toggle keeps the file's behaviour
+            # instead of silently turning the tracker off.
+            raw_lt = (query.get("laser_tracker", [""])[0] or "").strip().lower()
+            requested_laser_tracker = (
+                True if raw_lt in ("1", "true", "on", "yes")
+                else False if raw_lt in ("0", "false", "off", "no")
+                else None
+            )
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
@@ -13769,7 +13855,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state, backend=requested_backend)
+                        _connect_recorder(
+                            state,
+                            backend=requested_backend,
+                            laser_tracker=requested_laser_tracker,
+                        )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001

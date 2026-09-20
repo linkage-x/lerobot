@@ -7,7 +7,7 @@ export type DeploymentProfile = {
   defaultRoute: string;
 };
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator";
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator" | "laser_tracker";
 
 export type DeviceStatus = {
   id: string;
@@ -118,6 +118,11 @@ export type RecordingStatus = {
   syncSummary?: string;
   syncReportPath?: string;
   syncWarnings?: string[];
+  // Whether this Connect asked for the laser tracker. A per-session choice, not
+  // a property of the rig: the instrument is shared and admits one client.
+  laserTracker?: boolean;
+  laserTrackerState?: string;
+  laserTrackerDetail?: string;
 };
 
 export type MarkerTcpSample = {

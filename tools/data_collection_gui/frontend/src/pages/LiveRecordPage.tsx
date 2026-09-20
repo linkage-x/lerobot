@@ -185,7 +185,8 @@ export function RecordingPanel({
   onStart,
   onStop,
   logLines,
-  backendPicker
+  backendPicker,
+  laserTrackerToggle
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -195,6 +196,7 @@ export function RecordingPanel({
   onStop: (action: "save" | "discard" | "exit") => void;
   logLines?: string[];
   backendPicker?: React.ReactNode;
+  laserTrackerToggle?: React.ReactNode;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
@@ -222,6 +224,7 @@ export function RecordingPanel({
         <Metric label="Encoding" value={`${config.vcodec || "raw"}${config.streamingEncoding ? ", streaming" : ""}`} />
       </div>
       {isGmsl && <CameraEncodingInfo config={config} />}
+      {laserTrackerToggle}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
@@ -264,7 +267,7 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: (backend?: RecordingBackend) => void;
+  onConnect: (backend?: RecordingBackend, laserTracker?: boolean) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onOpenInReplay: () => void;
@@ -273,6 +276,11 @@ export function LiveRecordPage({
   onClearActiveTask: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  // The row exists whenever the rig *can* carry the tracker; the toggle decides
+  // whether this session does. Separate concepts: on the days the instrument is
+  // booked by someone else the row is still there and the answer is still no.
+  const hasLaserTracker = snapshot.devices.some((d) => d.kind === "laser_tracker");
+  const [laserTracker, setLaserTracker] = useState(false);
   // Only the FR3 workstation has two robots behind one recorder; Thor's rig is singular and
   // must keep sending Connect with no backend at all.
   const supportsBackendChoice = snapshot.deployment?.profile === "workstation";
@@ -309,7 +317,10 @@ export function LiveRecordPage({
       const key = event.key.toLowerCase();
       if (key === "c" && controls.canConnect) {
         event.preventDefault();
-        onConnect(supportsBackendChoice ? selectedBackend : undefined);
+        onConnect(
+          supportsBackendChoice ? selectedBackend : undefined,
+          hasLaserTracker ? laserTracker : undefined,
+        );
       } else if (key === "e" && controls.canStartEpisode) {
         event.preventDefault();
         onStart();
@@ -326,7 +337,7 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend]);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, hasLaserTracker, laserTracker]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -335,6 +346,32 @@ export function LiveRecordPage({
       setSelectedBackend(snapshot.recording.backend);
     }
   }, [recorderConnected, snapshot.recording.backend]);
+
+  // Same reasoning as the backend picker: once a session is live the choice is
+  // fixed by the running recorder, and showing the operator's stale pick would
+  // misreport what is being recorded.
+  useEffect(() => {
+    if (recorderConnected) {
+      setLaserTracker(Boolean(snapshot.recording.laserTracker));
+    }
+  }, [recorderConnected, snapshot.recording.laserTracker]);
+
+  const laserTrackerToggle = hasLaserTracker ? (
+    <label className="laser-tracker-toggle">
+      <input
+        type="checkbox"
+        checked={laserTracker}
+        disabled={busy || recorderConnected}
+        onChange={(event) => setLaserTracker(event.target.checked)}
+      />
+      <span>激光跟踪仪</span>
+      <small>
+        {recorderConnected
+          ? snapshot.recording.laserTrackerDetail || (laserTracker ? "本次会话已启用" : "本次会话未启用")
+          : "共享设备，同一时刻只能一个客户端；连不上不会阻塞录制"}
+      </small>
+    </label>
+  ) : undefined;
 
   const backendPicker = supportsBackendChoice ? (
     <div className="mujoco-mode-picker" role="group" aria-label="Recording backend">
@@ -384,7 +421,13 @@ export function LiveRecordPage({
           status={snapshot.recording}
           config={snapshot.configSummary}
           busy={busy}
-          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined)}
+          onConnect={() =>
+            onConnect(
+              supportsBackendChoice ? selectedBackend : undefined,
+              hasLaserTracker ? laserTracker : undefined,
+            )
+          }
+          laserTrackerToggle={laserTrackerToggle}
           onStart={onStart}
           onStop={onStop}
           logLines={logLines}
