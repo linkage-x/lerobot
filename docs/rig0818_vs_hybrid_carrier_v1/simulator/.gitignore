@@ -1,0 +1,12 @@
+# Generated reports, not evidence in themselves.
+#
+# Each is the deterministic output of a runner in this directory, rebuilt from
+# the frozen inputs/ (which ARE tracked, because they cannot be regenerated --
+# they came off the rig). Together they were ~10 MB of single-line JSON, and a
+# regeneration rewrote the whole blob, so tracking them cost the repository far
+# more than it bought. RESULTS.md carries the numbers that were read off them.
+#
+# Rebuild: see the "Run" section of README.md.
+l2_report.json
+l3_report.json
+l3_report_*.json

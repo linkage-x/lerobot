@@ -16,10 +16,13 @@ import type {
   IntrinsicsCoverageResponse,
   ProcessingItem,
   ProcessingStatus,
+  TrackingTarget,
   RecordedDataset,
   RecordingStatus,
   ReplayStatus,
   ReplayTimeline,
+  HandEyePlanResponse,
+  HandEyeSolveResponse,
   RigCheckResponse,
   WorldFrameResponse,
   MujocoCubeMode,
@@ -529,13 +532,16 @@ export class DataCollectionGuiApi {
   }
 
   async runCalibration(
-    options: { forceRedetect?: boolean; refitIntrinsics?: boolean } = {}
+    options: { forceRedetect?: boolean; refitIntrinsics?: boolean; experiment?: boolean } = {}
   ): Promise<GuiSnapshot> {
     // Detections are reused across attempts unless this says otherwise; see the
     // gateway's _reusable_detections for what counts as still valid.
     const params = new URLSearchParams();
     if (options.forceRedetect) params.set("force_redetect", "1");
     if (options.refitIntrinsics) params.set("refit_intrinsics", "1");
+    // Absent means export, so a caller that has never heard of experiment mode
+    // keeps the behaviour it had.
+    if (options.experiment) params.set("experiment", "1");
     const query = params.toString() ? `?${params}` : "";
     const remote = await this.postRemoteSnapshot(`/api/calibration/run${query}`);
     if (remote) {
@@ -570,8 +576,12 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async queueTrajGen(path: string, markerTcpCalibrationPath = ""): Promise<GuiSnapshot> {
-    const params = new URLSearchParams({ path });
+  async queueTrajGen(
+    path: string,
+    markerTcpCalibrationPath = "",
+    trackingTarget: TrackingTarget = "april_cube"
+  ): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({ path, tracking_target: trackingTarget });
     if (markerTcpCalibrationPath.trim()) {
       params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
     }
@@ -790,6 +800,45 @@ export class DataCollectionGuiApi {
     return this.calibrationSessionPost(`/api/calibration/session/record?action=${action}`);
   }
 
+  /**
+   * Write the reviewed runs into the tracking config -- the only thing that
+   * makes a solve take effect. Blockers come back in `blockers` and are cleared
+   * by naming their `kind` in `acknowledge`, so the risk is declined explicitly
+   * rather than by a checkbox that was already ticked before it was read.
+   */
+  async promoteCalibration(options: {
+    kinds: ("intrinsics" | "extrinsics")[];
+    acknowledge?: string[];
+    note?: string;
+  }): Promise<{ ok: boolean; error?: string; blockers?: { kind: string; message: string }[] }> {
+    const params = new URLSearchParams();
+    params.set("kind", options.kinds.join(","));
+    if (options.acknowledge?.length) params.set("acknowledge", options.acknowledge.join(","));
+    if (options.note) params.set("note", options.note);
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/promote?${params}`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        error?: string;
+        blockers?: { kind: string; message: string }[];
+        calibration?: unknown;
+      };
+      if (response.ok && payload.ok !== false) {
+        // The gateway answers a successful promotion with a whole snapshot, so
+        // adopting it here is what makes the panel show the new pointer without
+        // waiting for the next poll to come round.
+        this.snapshot = { ...this.snapshot, ...(payload as unknown as Partial<GuiSnapshot>) };
+        return { ok: true };
+      }
+      return { ok: false, error: payload.error, blockers: payload.blockers };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
   async calibrationStepSkip(): Promise<{ ok: boolean; error?: string }> {
     return this.calibrationSessionPost("/api/calibration/session/skip");
   }
@@ -865,6 +914,57 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  // Hand-eye (AX=XB). Both of these return the tool's own report verbatim,
+  // including a non-zero returncode, because a refusal ("not observable",
+  // "mis-associated") is the answer the panel has to show -- flattening it into
+  // ok/failed would be how a refused solve turns back into a confident number.
+  async runHandEyeSolve(params: {
+    pairsPath: string;
+    tFlangeBoxPath?: string;
+    leverMm?: string;
+    pairing?: "all" | "consecutive";
+  }): Promise<HandEyeSolveResponse> {
+    const query = new URLSearchParams({ pairs_path: params.pairsPath });
+    if (params.tFlangeBoxPath?.trim()) query.set("t_flange_box_path", params.tFlangeBoxPath.trim());
+    if (params.leverMm?.trim()) query.set("lever_mm", params.leverMm.trim());
+    if (params.pairing) query.set("pairing", params.pairing);
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/calibration/hand-eye/solve?${query.toString()}`,
+        { method: "POST", headers: { Accept: "application/json" } }
+      );
+      const payload = (await response.json()) as HandEyeSolveResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null, returncode: -1 };
+    }
+  }
+
+  async runHandEyePlan(params: {
+    poses?: string;
+    poseNoiseDeg?: string;
+    poseNoiseMm?: string;
+    trials?: string;
+    leverMm?: string;
+  }): Promise<HandEyePlanResponse> {
+    const query = new URLSearchParams();
+    if (params.poses?.trim()) query.set("poses", params.poses.trim());
+    if (params.poseNoiseDeg?.trim()) query.set("pose_noise_deg", params.poseNoiseDeg.trim());
+    if (params.poseNoiseMm?.trim()) query.set("pose_noise_mm", params.poseNoiseMm.trim());
+    if (params.trials?.trim()) query.set("trials", params.trials.trim());
+    if (params.leverMm?.trim()) query.set("lever_mm", params.leverMm.trim());
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/calibration/hand-eye/plan?${query.toString()}`,
+        { method: "POST", headers: { Accept: "application/json" } }
+      );
+      const payload = (await response.json()) as HandEyePlanResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), plan: null };
     }
   }
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import threading
@@ -191,8 +193,14 @@ def _calibration_gateway_state(tmp_path: Path) -> gateway.GatewayState:
     return state
 
 
-def _open_calibration_segment(state: gateway.GatewayState, monkeypatch) -> None:
-    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+def _open_calibration_segment(
+    state: gateway.GatewayState, monkeypatch, calls: list[dict] | None = None
+) -> None:
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **kwargs
+    ) -> None:
+        if calls is not None:
+            calls.append({"episode_time_s": episode_time_s, **kwargs})
         fake_state.recording.state = "recording"
         fake_state.recording.frameIndex = 0
 
@@ -213,6 +221,69 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     monkeypatch.setattr(gateway, "_ensure_recorder_running", lambda _state: object())
     monkeypatch.setattr(gateway, "_write_recorder_stdin", lambda _proc, text: written.append(text))
     return written
+
+
+def test_start_episode_sends_a_calibration_sweep_somewhere_else(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "calib_1" / "intrinsics"
+    state.recording.captureRoot = str(capture_root)  # already acknowledged
+
+    gateway._start_episode(
+        state, 30, capture_root=capture_root, capture_intent={"target_camera": "cam_06"}
+    )
+
+    # Destination and intent both have to land before the start newline: after it
+    # the episode is already recording somewhere.
+    assert written == [
+        'capture_intent:{"target_camera":"cam_06"}\n',
+        "episode_time:30\n",
+        "\n",
+    ]
+
+
+def test_start_episode_refuses_a_redirect_the_recorder_never_confirmed(tmp_path, monkeypatch):
+    # A recorder built before capture_root existed logs the line as unrecognised
+    # and keeps writing to the session dataset. Believing the redirect took is
+    # exactly how a board sweep ends up in the training set anyway, so the
+    # acknowledgement is a precondition, not a nicety.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_CAPTURE_ROOT_ACK_TIMEOUT_S", 0.05)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "calib_1" / "intrinsics"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state, 30, capture_root=capture_root, require_capture_root_ack=True)
+
+    assert "deploy" in str(excinfo.value)
+    # It asked, then stopped: no episode was started anywhere.
+    assert written == [f"capture_root:{capture_root}\n"]
+    assert state.recording.state == "armed"
+
+
+def test_start_episode_puts_an_abandoned_calibration_redirect_back(tmp_path, monkeypatch):
+    # The wizard clears the redirect when it ends, but a gateway that never got
+    # there would leave the recorder pointed at the calibration tree. Live Record
+    # states its own destination rather than inheriting that.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.captureRoot = str(tmp_path / "outputs" / "calibration_captures" / "calib_1")
+
+    gateway._start_episode(state)
+
+    assert written == ["capture_root:\n", "\n"]
+
+
+def test_start_episode_says_nothing_about_the_capture_root_when_nothing_moved(tmp_path, monkeypatch):
+    # The recorder echoes every redirect, so restating an unchanged destination
+    # would put a line in the operator's log before each capture.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.captureRoot = state.recording.datasetRoot
+
+    gateway._start_episode(state)
+
+    assert written == ["\n"]
 
 
 def test_start_episode_asks_the_gmsl2_recorder_for_a_specific_length(tmp_path, monkeypatch):
@@ -293,7 +364,9 @@ def test_calibration_start_asks_the_recorder_for_the_session_length(tmp_path, mo
     state = _calibration_gateway_state(tmp_path)
     seen: list[float | None] = []
 
-    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **_kwargs
+    ) -> None:
         seen.append(episode_time_s)
         fake_state.recording.state = "recording"
 
@@ -303,6 +376,81 @@ def test_calibration_start_asks_the_recorder_for_the_session_length(tmp_path, mo
     assert gateway._calibration_step_record(state, "start")["ok"] is True
 
     assert seen == [45.0]
+
+
+def test_calibration_records_into_its_own_tree_not_the_task_dataset(tmp_path, monkeypatch):
+    # A board sweep landing in the task's dataset was counted as task progress
+    # and merged into the v3 export. The wizard owns its destination now, and
+    # states it per segment rather than inheriting whatever the recorder was
+    # pointed at when it was spawned at Connect.
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    captures_root = tmp_path / "outputs" / "calibration_captures"
+    session = state.calibration_session
+    assert Path(session.captureRoot).parent == captures_root
+    assert session.captureRoot != state.recording.datasetRoot
+
+    # Intrinsics and extrinsics cannot share a capture, so they do not share a
+    # directory either -- the two trees are the two solve pointers.
+    assert calls[0]["capture_root"] == Path(session.captureRoot) / "intrinsics"
+    # The recorder is required to confirm the redirect; assuming it took is how a
+    # segment would silently end up in the training dataset anyway.
+    assert calls[0]["require_capture_root_ack"] is True
+
+    intent = calls[0]["capture_intent"]
+    assert intent["purpose"] == "calibration_intrinsics"
+    # The one thing the videos cannot tell you afterwards: which camera this
+    # sweep was for. Eleven full-rig segments look identical on disk.
+    assert intent["target_camera"] == "cam_06"
+    assert intent["session_id"] == session.datasetName
+
+
+def test_a_sweep_asks_for_pruning_by_saying_nothing_about_it(tmp_path, monkeypatch):
+    # The recorder prunes the cameras a sweep was not for once the sync gate has
+    # used them, so the default intent carries no opinion: absent means prune.
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    assert "keep_all_cameras" not in calls[0]["capture_intent"]
+
+
+def test_keeping_every_camera_is_a_config_decision_carried_in_the_intent(tmp_path, monkeypatch):
+    # The way back to the raw evidence. It travels with the segment so its own
+    # meta.json records that the choice was made, rather than looking like a
+    # capture from before pruning existed.
+    state = _calibration_gateway_state(tmp_path)
+    state.config["calibration"] = {"keep_all_cameras": True}
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    assert calls[0]["capture_intent"]["keep_all_cameras"] is True
+
+
+def test_calibration_extrinsics_goes_to_a_different_tree_than_intrinsics(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **kwargs
+    ) -> None:
+        calls.append({"episode_time_s": episode_time_s, **kwargs})
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    assert gateway._start_calibration_session(state)["ok"] is True
+    # Skip straight past the per-camera sweeps to the shared rig one.
+    for _ in range(len(state.calibration_session.steps) - 1):
+        assert gateway._calibration_step_skip(state)["ok"] is True
+    assert state.calibration_session.steps[-1].kind == "extrinsics"
+
+    assert gateway._calibration_step_record(state, "start")["ok"] is True
+
+    session = state.calibration_session
+    assert calls[-1]["capture_root"] == Path(session.captureRoot) / "extrinsics"
+    assert calls[-1]["capture_intent"]["purpose"] == "calibration_extrinsics"
 
 
 def test_calibration_save_ends_a_live_segment_early(tmp_path, monkeypatch):
@@ -321,10 +469,14 @@ def test_calibration_save_ends_a_live_segment_early(tmp_path, monkeypatch):
     assert step.status == "captured"
     assert step.episodeIndex == 2
     assert state.calibration_session.currentIndex == 1
-    # The solve has to run over the dataset the recorder is writing into, not the
-    # calib_<ts> label the session made up before knowing it.
-    assert state.calibration_session.datasetRoot == state.recording.datasetRoot
-    assert state.calibration_session.datasetName == "thor_gmsl2_Nch_v1"
+    # Each half of the solve follows its own capture tree. This used to read the
+    # path back off the recorder, because the wizard did not own where its
+    # segments landed and its own calib_<ts> name was a label, not a path.
+    session = state.calibration_session
+    assert state.calibration.intrinsicsDatasetRoot == str(Path(session.captureRoot) / "intrinsics")
+    # An intrinsics sweep says nothing about where the cameras are relative to
+    # each other, so it must not become the extrinsics capture.
+    assert state.calibration.solveDatasetRoot == ""
 
 
 def test_calibration_save_registers_a_segment_the_recorder_already_auto_saved(tmp_path, monkeypatch):
@@ -468,6 +620,12 @@ def test_marker_tcp_sample_records_box_id_target(tmp_path, monkeypatch):
 def test_marker_tcp_registers_static_transforms_and_writes_report(tmp_path, monkeypatch):
     state = _marker_tcp_gateway_state(tmp_path)
     monkeypatch.syspath_prepend(str(Path.cwd() / "third_party" / "opencv_kalibr"))
+    # The report is computed by metrology.cli.marker_tcp_repeatability, which
+    # needs scipy. The gateway turns any import failure into {"ok": False} --
+    # correct behaviour, and indistinguishable here from the bug this test is
+    # for -- so say out loud that the dependency is what is missing instead of
+    # reporting a red test on every checkout that lacks it.
+    pytest.importorskip("scipy", reason="metrology.cli.marker_tcp_repeatability needs scipy")
     assert gateway._start_marker_tcp_session(state)["ok"] is True
     a = _write_static_transform(tmp_path / "a" / "static_transform.json", x_m=0.0)
     b = _write_static_transform(tmp_path / "b" / "static_transform.json", x_m=0.001)
@@ -740,6 +898,77 @@ def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
     check = next(check for check in qc["checks"] if check["name"] == "online_sync_manifest")
     assert check["status"] == "pass"
     assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
+
+
+def _episode_dir_with_videos(dataset_root: Path, episode: int, cameras: tuple[str, ...] = ("cam_00", "cam_01")):
+    ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    for camera in cameras:
+        (ep_dir / f"{camera}.mkv").write_bytes(b"")
+    return ep_dir
+
+
+@pytest.mark.parametrize("missing_episode", [0, 2])
+def test_qc_warns_when_an_episode_has_video_but_no_parquet_rows(tmp_path, missing_episode):
+    """BOX absence leaves video-only episodes; tracking skips them by episode ID.
+
+    Cover an initial missing episode (the Thor capture) and a trailing one.
+    """
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    if missing_episode == 0:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = dataset_root / "data" / "chunk-000" / "file-000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("episode_index"),
+            "episode_index",
+            pa.array([index + 1 for index in table["episode_index"].to_pylist()], type=pa.int64()),
+        )
+        pq.write_table(table, path)
+    for episode in (0, 1, 2):
+        _episode_dir_with_videos(dataset_root, episode)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "warn"
+    assert f"[{missing_episode}] have video but no parquet rows" in check["message"]
+    assert "pairs the 2 parquet episodes by episode number" in check["message"]
+    assert "missing sensor observations are not reconstructed" in check["message"]
+    assert qc["status"] == "warn"
+    assert len(list((dataset_root / "episodes").glob("episode_*"))) == 3
+
+
+def test_qc_passes_when_every_episode_directory_has_rows(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    for episode in (0, 1):
+        _episode_dir_with_videos(dataset_root, episode)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "pass"
+
+
+@pytest.mark.parametrize("extra_video_episode", [False, True])
+def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path, extra_video_episode):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    _episode_dir_with_videos(dataset_root, 0)
+    if extra_video_episode:
+        _episode_dir_with_videos(dataset_root, 2)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "fail"
+    assert "[1] have parquet rows but no video" in check["message"]
+    assert "cannot align frames to rows" in check["message"]
+    assert qc["status"] == "fail"
 
 
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
@@ -3230,6 +3459,14 @@ def test_detection_output_is_read_as_one_unit_per_video():
     assert done is False
     assert detail.startswith("sync frames")
 
+    # What the intent filter excluded is announced before the table. It names an
+    # episode and a camera, so it has to stay unreadable as a video row -- a
+    # line counted here would move the bar for work that is not happening.
+    done, _detail = gateway._solve_progress_line("intent: episode_000000 -> cam_05 (10 other cameras skipped)")
+    assert done is False
+    done, _detail = gateway._solve_progress_line("intent: 11/12 episodes restricted, 110 videos skipped")
+    assert done is False
+
 
 def test_the_detection_bar_is_scaled_by_the_videos_it_will_open(tmp_path):
     dataset = _charuco_capture(tmp_path, episodes=3, cameras=4)
@@ -3242,6 +3479,43 @@ def test_the_detection_bar_is_scaled_by_the_videos_it_will_open(tmp_path):
     (flat / "cam_06.mkv").write_bytes(b"")
     (flat / "cam_07.mp4").write_bytes(b"")
     assert gateway._charuco_video_count(flat) == 2
+
+
+def test_only_the_camera_a_sweep_was_for_is_counted_and_detected(tmp_path):
+    # The rig records all eleven cameras through every sweep. Counting them all
+    # would size the bar for 132 videos while the detector opens 22, and -- the
+    # part that matters -- would look for npz that are never written, so a
+    # finished detection pass could never be reused.
+    episodes = tmp_path / "episodes"
+    for index, target in enumerate(("cam_05", "cam_06")):
+        directory = episodes / f"episode_{index:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(11):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        (directory / "meta.json").write_text(
+            json.dumps({"capture_intent": {"purpose": "calibration_intrinsics", "target_camera": target}})
+        )
+
+    assert gateway._charuco_video_count(episodes) == 2
+    assert [stem for stem, _video in gateway._capture_videos(episodes)] == [
+        "episode_000000__cam_05",
+        "episode_000001__cam_06",
+    ]
+
+
+def test_an_extrinsics_segment_is_still_counted_on_every_camera(tmp_path):
+    # The joint fit is about the cameras that saw the board at the same instant,
+    # so this half of a session declares no target camera and keeps all of them.
+    episodes = tmp_path / "episodes"
+    directory = episodes / "episode_000000"
+    directory.mkdir(parents=True)
+    for camera in range(4):
+        (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+    (directory / "meta.json").write_text(
+        json.dumps({"capture_intent": {"purpose": "calibration_extrinsics", "target_camera": ""}})
+    )
+
+    assert gateway._charuco_video_count(episodes) == 4
 
 
 def test_a_solve_step_reports_its_output_while_it_is_still_running(tmp_path):
@@ -3452,37 +3726,129 @@ def test_the_bar_walks_all_three_steps_of_a_real_solve(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_a_failed_solve_can_be_retried_on_the_same_capture(tmp_path):
-    """The 2026-08-20 dead end: the wizard records into a dataset named after
-    the rig (thor_gmsl2_10ch_v1_...), the solve failed, and the fallback scan
-    only finds directories with "calib" in the name -- so an intact 11-episode
-    capture became unreachable the moment its first solve failed."""
+def _wizard_capture(tmp_path: Path, *, kind: str, episodes: int, cameras: int) -> Path:
+    """One half of a guided session's capture, in the layout the wizard writes.
+
+    Carries the per-episode meta.json a real recorder writes, including the
+    capture_intent block -- which is both what the dataset scan keys on and the
+    only record of which camera a sweep was for.
+    """
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_20260820_152528" / kind
+    for episode in range(episodes):
+        directory = capture / "episodes" / f"episode_{episode:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(cameras):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        (directory / "meta.json").write_text(
+            json.dumps(
+                {
+                    "episode_index": episode,
+                    "capture_intent": {
+                        "purpose": f"calibration_{kind}",
+                        "target_camera": f"cam_{episode:02d}" if kind == "intrinsics" else "",
+                        "session_id": "calib_20260820_152528",
+                    },
+                }
+            )
+        )
+    return capture
+
+
+def test_a_wizard_capture_is_classified_as_calibration_not_a_recording(tmp_path):
+    # This one classification is what keeps a board sweep out of task progress
+    # and out of the v3 export: both already skip anything whose kind is not
+    # "recorded", so neither had to learn about calibration separately.
     state = _solve_state(tmp_path)
-    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
-    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
-    dataset.rename(renamed)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=1, cameras=2)
+    ordinary = _charuco_capture(tmp_path, episodes=1, cameras=2)
+
+    assert gateway._dataset_kind(state, intrinsics) == "calibration"
+    assert gateway._dataset_kind(state, ordinary) == "recorded"
+
+
+def test_a_wizard_capture_is_offered_to_the_solve(tmp_path):
+    # Its own root would be a dead end if the scan stopped at the datasets root:
+    # the capture would be classified correctly and then be unselectable. The
+    # session directory groups the two captures and is not itself one, so the
+    # scan has to descend a level -- the same shape as training views.
+    state = _solve_state(tmp_path)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=1, cameras=2)
+    state.cached_recorded_datasets = gateway._recorded_dataset_items(state)
+
+    paths = [candidate["path"] for candidate in gateway._solve_candidates(state)]
+
+    assert str(intrinsics) in paths
+
+
+def test_a_wizard_capture_never_claims_to_be_the_latest_recording(tmp_path):
+    # "Latest" is what one-click actions follow (Live Record -> Open in Replay,
+    # and the dataset the Replay page opens on). A sweep is the newest directory
+    # on disk the moment a session ends and holds no demonstration at all, so
+    # letting it claim the slot would aim those actions at a board sweep until
+    # the next task recording happens to land.
+    state = _solve_state(tmp_path)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    ordinary = tmp_path / "outputs" / "datasets" / "pick_place_20260902_101500"
+    episode = ordinary / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    for camera in range(2):
+        (episode / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+    (episode / "meta.json").write_text(json.dumps({"episode_index": 0}))
+    older_ns = int((time.time() - 3600) * 1e9)
+    for path in (ordinary, *ordinary.rglob("*")):
+        os.utime(path, ns=(older_ns, older_ns))
+    sweep = _wizard_capture(tmp_path, kind="extrinsics", episodes=1, cameras=2)
+
+    items = {item["path"]: item for item in gateway._recorded_dataset_items(state)}
+
+    assert items[str(sweep)]["datasetKind"] == "calibration"
+    assert items[str(sweep)]["isLatest"] is False
+    assert items[str(ordinary)]["isLatest"] is True
+
+
+def test_a_failed_solve_can_be_retried_on_the_same_capture(tmp_path):
+    """The 2026-08-20 dead end: the solve failed and the fallback scan only
+    finds directories with "calib" in the name -- so an intact capture became
+    unreachable the moment its first solve failed. The wizard now names its own
+    tree, so the session still points at the capture after a failure."""
+    state = _solve_state(tmp_path)
+    extrinsics = _wizard_capture(tmp_path, kind="extrinsics", episodes=2, cameras=3)
     state.calibration_session = gateway.CalibrationSession(
-        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+        active=True,
+        stage="failed",
+        datasetName=extrinsics.parent.name,
+        datasetRoot=str(extrinsics.parent),
+        captureRoot=str(extrinsics.parent),
     )
 
     resolved, source = gateway._solve_dataset(state)
 
-    assert resolved == renamed
+    # The session directory only groups the two captures; the solvable one is
+    # the extrinsics tree under it.
+    assert resolved == extrinsics
     assert source == "session"
 
 
 def test_leaving_the_wizard_does_not_orphan_what_it_recorded(tmp_path):
     state = _solve_state(tmp_path)
-    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
-    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
-    dataset.rename(renamed)
+    extrinsics = _wizard_capture(tmp_path, kind="extrinsics", episodes=1, cameras=2)
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=2, cameras=2)
     state.calibration_session = gateway.CalibrationSession(
-        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+        active=True,
+        stage="failed",
+        datasetName=extrinsics.parent.name,
+        datasetRoot=str(extrinsics.parent),
+        captureRoot=str(extrinsics.parent),
     )
 
     assert gateway._cancel_calibration_session(state)["ok"] is True
 
-    assert gateway._solve_dataset(state) == (renamed, "manual")
+    assert gateway._solve_dataset(state) == (extrinsics, "manual")
+    # Both halves survive the wizard: re-solving needs the intrinsics capture
+    # too, and nothing else on disk says which tree it was.
+    assert state.calibration.intrinsicsDatasetRoot == str(intrinsics)
 
 
 def test_a_named_capture_is_never_silently_replaced_by_another(tmp_path):
@@ -3666,6 +4032,11 @@ def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypa
     def fake_step(_state, _python, args, *, label, timeout, on_line=None):
         module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
         steps.append((label, module))
+        if module.endswith("detect_charuco"):
+            # Every episode is read on the camera it declares. Without this the
+            # intrinsics half reads eleven videos per sweep, and each camera's
+            # fit quietly absorbs the ten sweeps that were not its own.
+            assert "--intent-manifest" in args
         if module.endswith("calibrate_intrinsics"):
             Path(args[args.index("--out") + 1]).write_text("{}", encoding="utf-8")
         if module.endswith("calibrate_extrinsics"):
@@ -3698,6 +4069,65 @@ def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypa
     assert state.calibration.state == "complete", state.calibration.message
     assert state.calibration.intrinsicsRun == "run_i_intrinsics"
     assert state.calibration.progress.stepCount == 5
+
+
+def _refit_and_capture_export_args(
+    tmp_path: Path, monkeypatch, run_name: str, production_run: str = ""
+) -> list[str]:
+    """Run a re-fit solve to completion and hand back the export's argv."""
+    state = _solve_state(tmp_path)
+    state.calibration.intrinsicsRun = production_run
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    extrinsics = _charuco_capture(tmp_path, episodes=1, cameras=3)
+    intrinsics = _charuco_capture(tmp_path / "i", episodes=2, cameras=3)
+    report = tmp_path / "outputs" / "metrology" / run_name / "extrinsics_report.json"
+    export_args: list[str] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        if module.endswith("calibrate_intrinsics"):
+            Path(args[args.index("--out") + 1]).write_text("{}", encoding="utf-8")
+        if module.endswith("calibrate_extrinsics"):
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}), encoding="utf-8")
+        if module.endswith("export_production_calibration"):
+            export_args.extend(args)
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(
+        state, extrinsics, run_name, Path(sys.executable), intrinsics_dataset=intrinsics
+    )
+    assert state.calibration.state == "complete", state.calibration.message
+    return export_args
+
+
+def test_a_refit_tells_the_exporter_to_keep_the_lenses_it_did_not_touch(tmp_path, monkeypatch):
+    """An intrinsics run is resolved by name and loaded whole.
+
+    A capture that swept two cameras produces a report about two cameras, so
+    without this the export puts production on a run holding two lenses -- the
+    other nine not stale but gone, which the promotion review then refuses as
+    `cameras_removed`. Re-fitting one camera would have meant re-fitting the rig.
+    """
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00", "cam_01"])
+
+    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_c", "prod_intrinsics")
+
+    assert "--carry-forward-intrinsics" in args
+    assert args[args.index("--carry-forward-intrinsics") + 1] == str(
+        tmp_path / "outputs" / "calibration" / "prod_intrinsics"
+    )
+
+
+def test_a_first_calibration_has_nothing_to_carry_forward(tmp_path, monkeypatch):
+    """The flag names a run to copy out of, and the exporter refuses one that
+    holds nothing. On a fresh rig there is no such run, so it must not be sent
+    -- the refusal would land on an export that is perfectly correct."""
+    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_d")
+
+    assert "--carry-forward-intrinsics" not in args
 
 
 def test_asking_to_refit_intrinsics_without_a_capture_is_refused_up_front(tmp_path, monkeypatch):
@@ -4273,3 +4703,741 @@ def test_marker_tcp_solve_rejects_a_bad_socket_offset_before_spawning_anything(t
 
     assert result["ok"] is False
     assert "必须是数字" in result["error"]
+
+
+# --- calibration pointer: what was solved vs what production loads -----------
+
+
+def _pointer_state(tmp_path: Path, *, config: str | None, solved_intr: str, solved_extr: str):
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.calibration.intrinsicsRun = solved_intr
+    state.calibration.extrinsicsRun = solved_extr
+    if config is not None:
+        path = tmp_path / gateway._TRACKING_CONFIG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(config, encoding="utf-8")
+    gateway._PRODUCTION_RUNS_CACHE.clear()
+    return state
+
+
+_POINTER_CONFIG = """
+calibration:
+  root_dir: outputs/calibration
+  intrinsics_run_name: intr_0804
+  fixed_camera_run_name: extr_0804
+"""
+
+
+def test_production_runs_are_read_from_the_config_not_from_memory(tmp_path):
+    """The two must come from different places or they cannot be compared.
+
+    `state.calibration.*Run` starts equal to the config and is then overwritten
+    by whatever a solve produced. Reading the file separately is the only way
+    the panel can tell "solved" from "live".
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_NEW", solved_extr="extr_NEW")
+
+    production = gateway._production_calibration_runs(state)
+
+    assert production["intrinsicsRun"] == "intr_0804"
+    assert production["extrinsicsRun"] == "extr_0804"
+    assert production["error"] == ""
+
+
+def test_pointer_mismatch_flags_the_run_that_drifted(tmp_path):
+    """The 2026-08-20 failure: new extrinsics solved, production never repointed."""
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+
+    mismatch = gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state))
+
+    assert [f["kind"] for f in mismatch["fields"]] == ["extrinsics"]
+    assert mismatch["fields"][0]["solved"] == "calib_0820_extrinsics"
+    assert mismatch["fields"][0]["production"] == "extr_0804"
+    # The message has to say the solve did not promote anything, not merely
+    # that two strings differ -- "they differ" reads as a display glitch.
+    assert "不会" in mismatch["message"]
+    assert str(gateway._TRACKING_CONFIG) in mismatch["message"]
+    assert mismatch["configPath"] == str(gateway._TRACKING_CONFIG)
+
+
+def test_pointer_mismatch_is_empty_when_they_agree(tmp_path):
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="extr_0804")
+
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state)) == {}
+
+
+def test_pointer_mismatch_is_silent_when_the_config_cannot_be_read(tmp_path):
+    """An unreadable config is not evidence of a mismatch.
+
+    We do not know what production loads, and asserting a disagreement we
+    cannot see would put a false alarm on top of a broken deployment.
+    """
+    state = _pointer_state(tmp_path, config=None, solved_intr="intr_NEW", solved_extr="extr_NEW")
+
+    production = gateway._production_calibration_runs(state)
+    assert production["error"]
+    assert gateway._calibration_pointer_mismatch(state, production) == {}
+
+
+def test_production_runs_follow_an_edit_rather_than_caching_boot_state(tmp_path):
+    """The pointer is edited by hand and rewritten by deploys.
+
+    A value cached at startup would keep reporting the old run as live, which
+    is precisely the class of error this comparison is meant to surface.
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state))
+
+    path = tmp_path / gateway._TRACKING_CONFIG
+    path.write_text(_POINTER_CONFIG.replace("extr_0804", "calib_0820_extrinsics"), encoding="utf-8")
+    os.utime(path, (time.time() + 1, time.time() + 1))
+
+    assert gateway._production_calibration_runs(state)["extrinsicsRun"] == "calib_0820_extrinsics"
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state)) == {}
+
+
+def test_calibration_payload_carries_both_pointers(tmp_path):
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+
+    payload = gateway._calibration_payload(state)
+
+    assert payload["extrinsicsRun"] == "calib_0820_extrinsics"
+    assert payload["production"]["extrinsicsRun"] == "extr_0804"
+    assert payload["pointerMismatch"]["fields"]
+
+
+def test_calibration_payload_omits_pointer_mismatch_when_they_agree(tmp_path):
+    """Absent, not an empty object.
+
+    `{}` is truthy in the browser, so a client testing for the key found a
+    "mismatch" with no `fields` and crashed the calibration page on the healthy
+    path. The key documents itself as present only on disagreement; send that.
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="extr_0804")
+
+    payload = gateway._calibration_payload(state)
+
+    assert "pointerMismatch" not in payload
+
+
+def _production_intrinsics_run(tmp_path: Path, name: str, cameras: list[str]) -> None:
+    """A run directory shaped the way export_production_calibration writes one."""
+    directory = tmp_path / "outputs" / "calibration" / name
+    (directory / "converted").mkdir(parents=True, exist_ok=True)
+    (directory / "summary.json").write_text(
+        json.dumps({"cameras": [{"camera_name": camera} for camera in cameras]}),
+        encoding="utf-8",
+    )
+
+
+def test_a_refit_that_cannot_survive_its_own_export_is_refused_before_the_decode(
+    tmp_path, monkeypatch
+):
+    """The exporter builds a whole intrinsics run from one report and cannot
+    carry a camera forward, so a camera in the capture that sees no board takes
+    the run down at the *last* step -- after both captures have been decoded.
+    The check is worth an hour every time it fires, so it happens at the click."""
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    gateway._set_solve_dataset(state, str(capture))
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    preflight = gateway._solve_payload(state)["intrinsicsPreflight"]
+    assert preflight["blocking"] is True
+    # Named, not counted: the operator has to know which cameras to deal with.
+    assert preflight["uncalibrated"] == ["cam_01", "cam_02"]
+
+    refused = gateway._start_extrinsics_calibration(state, refit_intrinsics=True)
+    assert refused["ok"] is False
+    assert "cam_01" in refused["error"] and "cam_02" in refused["error"]
+    assert "只解算，不导出" in refused["hint"]
+    assert state.calibration.state != "running"
+
+
+def test_experiment_mode_is_the_way_past_that_refusal(tmp_path, monkeypatch):
+    """Not an override: nothing gets exported, so the failure cannot occur."""
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    monkeypatch.setattr(gateway, "Thread", lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    gateway._set_solve_dataset(state, str(capture))
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    started = gateway._start_extrinsics_calibration(
+        state, refit_intrinsics=True, export_production=False
+    )
+    assert started["ok"] is True
+    # Four steps, not five: the export is gone rather than skipped at the end.
+    assert state.calibration.progress.stepCount == 4
+
+
+def _intrinsics_sweeps(tmp_path: Path, targets: list[str], *, declared: bool = True) -> Path:
+    """A wizard intrinsics capture: one sweep per camera, all eleven recorded."""
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_20260902_143012" / "intrinsics"
+    for index, target in enumerate(targets):
+        directory = capture / "episodes" / f"episode_{index:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(11):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        meta: dict = {"episode_index": index}
+        if declared:
+            meta["capture_intent"] = {"purpose": "calibration_intrinsics", "target_camera": target}
+        (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return capture
+
+
+def test_a_full_rig_capture_no_longer_claims_the_cameras_it_never_swept(tmp_path):
+    """That refusal was, in part, a product of the capture coupling.
+
+    The rig records all eleven cameras through every sweep, so a capture of
+    eleven sweeps held eleven cameras' video and the preflight above could never
+    pass on one. Those cameras were in its camera set only because the detector
+    read them; now that each episode is read on the camera it declares, the set
+    is the cameras that were actually swept.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["cameras"] == ["cam_05", "cam_06"]
+    assert preflight["uncalibrated"] == []
+    assert preflight["blocking"] is False
+
+
+def test_a_capture_that_declares_nothing_still_carries_every_camera_into_the_export(tmp_path):
+    # The counterfactual, and what older captures keep: with nothing declared
+    # there is no way to know which camera a segment was for, so all eleven are
+    # in the fit and the nine with no production lens block the export.
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"], declared=False)
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert len(preflight["cameras"]) == 11
+    assert preflight["blocking"] is True
+
+
+def test_the_preflight_names_the_lenses_the_export_will_carry_rather_than_lose(tmp_path):
+    """The other half of the same question, and it no longer blocks.
+
+    Nine of production's eleven lenses are not re-fitted by a two-camera sweep.
+    They used to leave production with the export; now they are copied into the
+    new run, so what is left is a statement -- "内参已更新" after a two-camera
+    sweep would otherwise read as a re-measurement of the whole rig.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(
+        tmp_path, "prod_intrinsics", [f"cam_{index:02d}" for index in range(11)]
+    )
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["cameras"] == ["cam_05", "cam_06"]
+    assert preflight["carriedForward"] == [
+        "cam_00", "cam_01", "cam_02", "cam_03", "cam_04", "cam_07", "cam_08", "cam_09", "cam_10",
+    ]
+    assert preflight["blocking"] is False
+
+
+def test_carrying_forward_cannot_rescue_a_camera_production_never_had(tmp_path):
+    """Why the refusal survives the exporter learning to carry cameras across.
+
+    cam_09 is swept here and has no production lens, so it has to come out of
+    *this* fit: there is nothing to carry in its place, and the export dies at
+    the last step if it saw no board.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == ["cam_09"]
+    assert preflight["carriedForward"] == ["cam_06"]
+    assert preflight["blocking"] is True
+    assert "cam_09" in gateway._preflight_message(preflight)
+
+
+def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):
+    """Blocking is about extending a set that exists. With no production
+    intrinsics there is nothing to lose and nothing to carry forward."""
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    assert gateway._solve_payload(state)["intrinsicsPreflight"]["blocking"] is False
+
+
+def test_skipping_the_export_drops_its_step_rather_than_leaving_a_gap(tmp_path):
+    """The bar must still reach 1.0 by finishing work, not by being set there."""
+    full = gateway._solve_weights([70, 10])
+    experiment = gateway._solve_weights([70, 10], export=False)
+
+    assert len(experiment) == len(full) - 1
+    assert sum(experiment) == pytest.approx(1.0)
+    # The detections still dominate; only the 0.02 export slice is redistributed.
+    assert experiment[0] > full[0]
+
+
+# --- Promoting a solved calibration into production ------------------------
+#
+# The gateway half of the promotion path: reading the tracking config, refusing
+# a write the operator has not been shown the risks of, and stopping trajectory
+# generation that would silently use a stale pointer. The comparison arithmetic
+# itself is covered in test_calibration_promotion.py.
+
+_TRACKING_CONFIG_TEXT = """calibration:
+  # Provenance note that a YAML round-trip would delete.
+  intrinsics_run_name: live_intrinsics
+  fixed_camera_run_name: live_extrinsics
+cube_tracker:
+  camera_model: opencv_fisheye
+"""
+
+
+def _promotion_state(tmp_path, *, live_world="world_a", candidate_world="world_a", candidate_state="CONTINUOUS"):
+    config_path = tmp_path / gateway._TRACKING_CONFIG
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(_TRACKING_CONFIG_TEXT, encoding="utf-8")
+
+    calibration_root = tmp_path / "outputs" / "calibration"
+
+    def write(name, world_id, world_state, x):
+        directory = calibration_root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "summary.json").write_text(
+            json.dumps(
+                {
+                    "bundle_rmse_px": 0.25,
+                    "joint_solution": {
+                        "cameras": {
+                            "cam_06": {
+                                "base_to_camera": {
+                                    "matrix_4x4": [
+                                        [1, 0, 0, 0.0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+                                    ]
+                                }
+                            },
+                            "cam_07": {
+                                "base_to_camera": {
+                                    "matrix_4x4": [
+                                        [1, 0, 0, x], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                    "world": {
+                        "world_frame_id": world_id,
+                        "world_continuity_state": world_state,
+                        "reason": "stable_cluster",
+                        "stable_cameras": ["cam_06", "cam_07"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    live = write("live_extrinsics", live_world, "CONTINUOUS", 1.0)
+    candidate = write("calib_20260902_103833_extrinsics", candidate_world, candidate_state, 1.001)
+    os.utime(live, (1_700_000_100, 1_700_000_100))
+    os.utime(candidate, (1_700_000_900, 1_700_000_900))
+
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+    gateway._PRODUCTION_RUNS_CACHE.clear()
+    gateway._load_active_calibration_runs(state)
+    return state, config_path
+
+
+def test_the_review_is_built_without_being_asked_for(tmp_path):
+    """A review behind a button is a review that gets skipped.
+
+    That is not a hunch: the step which was optional -- hand-editing the tracking
+    config -- is the exact step that went undone for seven days while production
+    loaded a calibration missing a moved camera.
+    """
+    state, _ = _promotion_state(tmp_path)
+    payload = gateway._calibration_payload(state)
+    review = payload["promotion"]
+    assert review["candidates"]["extrinsics"] == "calib_20260902_103833_extrinsics"
+    assert review["extrinsics"]["ok"] is True
+    assert review["extrinsics"]["cameras"][0]["camera"] in {"cam_06", "cam_07"}
+    assert review["extrinsicsBlockers"] == []
+
+
+def test_promotion_writes_the_pointer_and_keeps_the_comments(tmp_path):
+    state, config_path = _promotion_state(tmp_path)
+    result = gateway._promote_calibration(state, ["extrinsics"])
+    assert result["ok"] is True, result
+    text = config_path.read_text(encoding="utf-8")
+    assert "fixed_camera_run_name: calib_20260902_103833_extrinsics" in text
+    assert "Provenance note that a YAML round-trip would delete." in text
+    # Untouched, because only extrinsics was asked for.
+    assert "intrinsics_run_name: live_intrinsics" in text
+    # And the panel now agrees with the file, without waiting for a restart.
+    assert state.calibration.extrinsicsRun == "calib_20260902_103833_extrinsics"
+
+
+def test_promotion_leaves_an_audit_line_carrying_the_evidence(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    gateway._promote_calibration(state, ["extrinsics"], note="fresh calibration for today")
+    log = tmp_path / gateway._PROMOTION_LOG
+    record = json.loads(log.read_text(encoding="utf-8").strip())
+    assert record["note"] == "fresh calibration for today"
+    assert record["changes"][0]["to"] == "calib_20260902_103833_extrinsics"
+    assert "medianBaselineShiftMm" in record["evidence"]
+
+
+def test_a_world_change_stops_the_promotion_until_it_is_acknowledged(tmp_path):
+    """Silently moving the world frame makes old and new labels incomparable."""
+    state, config_path = _promotion_state(
+        tmp_path, candidate_world="world_b", candidate_state="RECONCILED"
+    )
+    refused = gateway._promote_calibration(state, ["extrinsics"])
+    assert refused["ok"] is False
+    kinds = {item["kind"] for item in refused["blockers"]}
+    assert "world_frame_changed" in kinds
+    assert "live_extrinsics" in config_path.read_text(encoding="utf-8")
+
+    allowed = gateway._promote_calibration(
+        state, ["extrinsics"], acknowledge=sorted(kinds)
+    )
+    assert allowed["ok"] is True, allowed
+    assert "calib_20260902_103833_extrinsics" in config_path.read_text(encoding="utf-8")
+
+
+def test_promoting_twice_is_refused_rather_than_logged_as_a_change(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._promote_calibration(state, ["extrinsics"])["ok"] is True
+    again = gateway._promote_calibration(state, ["extrinsics"])
+    assert again["ok"] is False
+    assert "已经是最新" in again["error"]
+
+
+def test_a_running_solve_blocks_promotion(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    state.calibration.state = "running"
+    result = gateway._promote_calibration(state, ["extrinsics"])
+    assert result["ok"] is False
+    assert "解算正在运行" in result["error"]
+
+
+def test_trajectory_generation_refuses_a_stale_calibration_pointer(tmp_path):
+    """The one check that fires with nobody watching.
+
+    Promotion is a button somebody has to press; this is what catches the case
+    where nobody did. Generating against the older calibration stays possible --
+    reproducing an earlier result needs it -- but only when asked for explicitly.
+    """
+    state, _ = _promotion_state(tmp_path)
+    gate = gateway._stale_calibration_gate(state)
+    assert "calib_20260902_103833_extrinsics" in gate["message"]
+    assert "live_extrinsics" in gate["message"]
+
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20260902_120000"
+    dataset_root.mkdir(parents=True)
+    with pytest.raises(gateway.StaleCalibrationError):
+        gateway._queue_traj_gen(state, dataset_root)
+    # Nothing was started, so nothing must be left marked as starting.
+    assert str(dataset_root) not in state.processing_starting
+
+
+def test_the_stale_gate_goes_quiet_once_the_run_is_promoted(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._stale_calibration_gate(state)
+    gateway._promote_calibration(state, ["extrinsics"])
+    assert gateway._stale_calibration_gate(state) == {}
+
+
+def test_the_job_record_says_which_calibration_produced_it(tmp_path):
+    """Months later this is the only thing that answers "before or after the repoint"."""
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20260902_120000"
+    dataset_root.mkdir(parents=True)
+    gateway._update_traj_gen_meta(
+        dataset_root,
+        job_id="traj-gen-1",
+        status="running",
+        command=["bash", "run.sh"],
+        message="running",
+        calibration={
+            "intrinsicsRun": "live_intrinsics",
+            "extrinsicsRun": "calib_20260902_103833_extrinsics",
+            "configPath": "config_thor/april.yaml",
+        },
+    )
+    # A later update that does not repeat the stamp must not drop it: the
+    # completion record is the one that lasts.
+    gateway._update_traj_gen_meta(
+        dataset_root, job_id="traj-gen-1", status="complete", message="done", exit_code=0
+    )
+    meta = gateway._load_processing_meta(dataset_root)
+    assert meta["current_job"]["calibration"]["extrinsicsRun"] == "calib_20260902_103833_extrinsics"
+
+
+def test_the_review_cache_notices_a_new_run_appearing(tmp_path):
+    """The review is cached because the panel polls, but a solve must show up.
+
+    A cache that outlived a new run would put the panel back in the state this
+    whole path exists to remove: production loading one calibration while the
+    screen implies another.
+    """
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260902_103833_extrinsics"
+    )
+    # Same inputs -> served from cache, and still a faithful copy rather than the
+    # cached object itself (mutating the payload must not poison the next read).
+    payload = gateway._calibration_payload(state)
+    payload["promotion"]["candidates"]["extrinsics"] = "mutated"
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260902_103833_extrinsics"
+    )
+
+    newer = tmp_path / "outputs" / "calibration" / "calib_20260903_090000_extrinsics"
+    newer.mkdir(parents=True)
+    shutil.copy(
+        tmp_path / "outputs" / "calibration" / "calib_20260902_103833_extrinsics" / "summary.json",
+        newer / "summary.json",
+    )
+    os.utime(newer, (1_700_001_500, 1_700_001_500))
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260903_090000_extrinsics"
+    )
+
+
+def test_hybrid_carrier_target_selects_dedicated_runner_config(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    dataset_root.mkdir(parents=True)
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    config_path = repo_root / gateway.HYBRID_CARRIER_EE_TRAJECTORY_CONFIG
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    config_path.write_text("calibration: {}\ncarrier: {}\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    command = gateway._ee_trajectory_command(
+        state,
+        dataset_root,
+        tracking_target="hybrid_carrier_v1",
+    )
+
+    assert command[command.index("--config") + 1] == str(config_path)
+    assert command[command.index("--tracking-target") + 1] == "hybrid_carrier_v1"
+    with pytest.raises(ValueError, match="cube-only"):
+        gateway._ee_trajectory_command(
+            state,
+            dataset_root,
+            tracking_target="hybrid_carrier_v1",
+            marker_to_tcp_calibration_path=repo_root / "cube_bundle.json",
+        )
+
+
+def test_tracking_detection_summary_reports_per_camera_evidence(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    tracking_run = repo_root / "outputs" / "tracking_analysis" / (
+        dataset_root.name + gateway.DEFAULT_TRACKING_RUN_SUFFIX
+    )
+    per_camera = tracking_run / "per_camera"
+    per_camera.mkdir(parents=True)
+    (tracking_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "active_streams": [
+                    {"serial": "S1", "stream_key": "cam_0", "camera_name": "cam_00"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "cube_detected": 1,
+            "cube_num_markers": 2,
+            "cube_reprojection_rmse_px": 1.0,
+            "num_edge_samples": 100,
+        },
+        {
+            "cube_detected": 0,
+            "cube_num_markers": 0,
+            "cube_reprojection_rmse_px": "",
+            "num_edge_samples": 0,
+        },
+        {
+            "cube_detected": 1,
+            "cube_num_markers": 3,
+            "cube_reprojection_rmse_px": 2.0,
+            "num_edge_samples": 140,
+        },
+    ]
+    with (per_camera / "camera_S1_records.csv").open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    result = gateway._tracking_detection_summary(state, dataset_root, "hybrid_carrier_v1")
+
+    assert result is not None
+    assert result["target"] == "hybrid_carrier_v1"
+    assert result["detectedViews"] == 2
+    assert result["detectionRatePct"] == pytest.approx(66.7)
+    assert result["perCamera"][0]["medianAnchors"] == pytest.approx(2.5)
+    assert result["perCamera"][0]["medianRmsePx"] == pytest.approx(1.5)
+    assert result["perCamera"][0]["medianEdgeSamples"] == pytest.approx(120.0)
+
+
+def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    tracking_run = repo_root / "outputs" / "tracking_analysis" / (
+        dataset_root.name + gateway.DEFAULT_TRACKING_RUN_SUFFIX
+    )
+    per_camera = tracking_run / "per_camera"
+    per_camera.mkdir(parents=True)
+    intrinsics = repo_root / "intrinsics.json"
+    intrinsics.write_text(
+        json.dumps(
+            {
+                "camera_matrix": [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
+                "dist_coeffs": [0.0, 0.0, 0.0, 0.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    descriptor = repo_root / "carrier.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "schema": "hybrid_carrier_cad/v1",
+                "carrier_id": "carrier_test",
+                "units": "m",
+                "anchors": [
+                    {
+                        "name": "a30",
+                        "marker_id": 30,
+                        "marker_corners": [
+                            [-0.05, -0.05, 0.0],
+                            [0.05, -0.05, 0.0],
+                            [0.05, 0.05, 0.0],
+                            [-0.05, 0.05, 0.0],
+                        ],
+                    }
+                ],
+                "facets": [
+                    {
+                        "name": "red_front",
+                        "colour": "red",
+                        "use_for_pose": True,
+                        "normal": [0.0, 0.0, -1.0],
+                        "polygon": [
+                            [-0.1, -0.1, 0.0],
+                            [0.1, -0.1, 0.0],
+                            [0.0, 0.1, 0.0],
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = repo_root / "carrier.yaml"
+    config_path.write_text("carrier:\n  model_path: carrier.json\n", encoding="utf-8")
+    (tracking_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "config": str(config_path),
+                "calibration_inputs": {"fixed_camera_summary": ""},
+                "cube_tracker": {
+                    "pose_estimation_mode": "hybrid_carrier",
+                    "camera_model": "rational",
+                },
+                "active_streams": [
+                    {
+                        "stream_key": "cam_0",
+                        "camera_name": "cam_00",
+                        "serial": "S1",
+                        "intrinsics_path": str(intrinsics),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed = [{"marker_id": 30, "points": [[101.0, 102.0], [151.0, 102.0], [151.0, 152.0], [101.0, 152.0]]}]
+    row = {
+        "episode_index": 1,
+        "frame_index": 7,
+        "cube_detected": 1,
+        "cube_num_markers": 1,
+        "detected_marker_ids": "30",
+        "detected_marker_corners_px": json.dumps(observed),
+        "num_edge_samples": 42,
+        "cube_reprojection_rmse_px": 1.25,
+        "used_for_fusion": 1,
+        "cube_cam_x_m": 0.0,
+        "cube_cam_y_m": 0.0,
+        "cube_cam_z_m": 1.0,
+        "cube_cam_qx": 0.0,
+        "cube_cam_qy": 0.0,
+        "cube_cam_qz": 0.0,
+        "cube_cam_qw": 1.0,
+    }
+    with (per_camera / "camera_S1_records.csv").open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    overlays = gateway._read_video_cube_overlays(state, dataset_root, episode=1)
+    overlay = overlays[7]["observation.images.cam_0"][0]
+
+    assert overlay["kind"] == "hybrid_carrier"
+    assert overlay["markerIds"] == [30]
+    assert overlay["numEdgeSamples"] == 42
+    anchor = next(polygon for polygon in overlay["polygons"] if polygon["role"] == "anchor")
+    facet = next(polygon for polygon in overlay["polygons"] if polygon["role"] == "facet")
+    assert anchor["points"] == observed[0]["points"]
+    assert facet["color"] == "#ef4444"
+    assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])

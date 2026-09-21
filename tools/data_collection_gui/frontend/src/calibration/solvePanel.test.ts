@@ -5,7 +5,13 @@ import type {
   CalibrationSolve,
   CalibrationStatus,
 } from "../types";
-import { captureTally, intrinsicsNote, solveButtonView, solveTargetView } from "./solvePanel";
+import {
+  captureTally,
+  intrinsicsNote,
+  preflightView,
+  solveButtonView,
+  solveTargetView,
+} from "./solvePanel";
 
 function status(
   state: CalibrationStatus["state"],
@@ -167,9 +173,91 @@ describe("intrinsics note", () => {
     expect(note).toContain("覆盖");
   });
 
+  it("says which lenses a partial re-sweep keeps rather than replaces", () => {
+    // An intrinsics run is loaded whole, so "内参已更新" after a two-camera
+    // sweep would read as a re-measurement of the rig. Nine of them are the
+    // same files production was already serving.
+    const note = intrinsicsNote(
+      {
+        ...(CAPTURE as CalibrationSolve),
+        candidates: [],
+        intrinsicsDatasetRoot: "/data/i",
+        intrinsicsDatasetName: "calib_20260902_143012",
+        intrinsicsEpisodes: 2,
+        intrinsicsRun: "thor_gmsl2_selfcal_0804_fisheye_intrinsics",
+        intrinsicsPreflight: {
+          cameras: ["cam_05", "cam_06"],
+          production: ["cam_05", "cam_06", "cam_09"],
+          uncalibrated: [],
+          carriedForward: ["cam_09"],
+          blocking: false,
+        },
+      },
+      true,
+    );
+    expect(note).toContain("只重拟 2 台");
+    expect(note).toContain("cam_09");
+    expect(note).toContain("不会从生产里消失");
+  });
+
+  it("says nothing about carrying forward when the sweep covers everything", () => {
+    const note = intrinsicsNote(
+      {
+        ...(CAPTURE as CalibrationSolve),
+        candidates: [],
+        intrinsicsDatasetRoot: "/data/i",
+        intrinsicsDatasetName: "calib_20260902_143012",
+        intrinsicsEpisodes: 11,
+        intrinsicsRun: "thor_gmsl2_selfcal_0804_fisheye_intrinsics",
+        intrinsicsPreflight: {
+          cameras: ["cam_05"],
+          production: ["cam_05"],
+          uncalibrated: [],
+          carriedForward: [],
+          blocking: false,
+        },
+      },
+      true,
+    );
+    expect(note).not.toContain("承接");
+  });
+
   it("asks for the capture when the box is ticked without one", () => {
     const note = intrinsicsNote({ ...(CAPTURE as CalibrationSolve), candidates: [] }, true);
     expect(note).toContain("还没选内参采集");
     expect(note).toContain("四角");
+  });
+});
+
+describe("preflightView", () => {
+  const preflight = {
+    cameras: ["cam_01", "cam_02", "cam_06"],
+    production: ["cam_06", "cam_07"],
+    uncalibrated: ["cam_01", "cam_02"],
+    blocking: true,
+  };
+
+  it("stays quiet when intrinsics are not being re-fitted", () => {
+    expect(preflightView(preflight, false, false).blocking).toBe(false);
+  });
+
+  it("blocks a re-fit that would export, naming the cameras", () => {
+    const view = preflightView(preflight, true, false);
+    expect(view.blocking).toBe(true);
+    expect(view.message).toContain("cam_01");
+    expect(view.message).toContain("cam_02");
+    // Says why carrying forward does not save these two: production has no
+    // lens for them either, so this fit is the only thing that can supply one.
+    expect(view.message).toContain("承接");
+    expect(view.hint).toContain("只解算，不导出");
+  });
+
+  it("lets experiment mode through, because nothing gets exported", () => {
+    expect(preflightView(preflight, true, true).blocking).toBe(false);
+  });
+
+  it("does not block a fresh rig, which has no production set to lose", () => {
+    const fresh = { cameras: ["cam_01"], production: [], uncalibrated: [], blocking: false };
+    expect(preflightView(fresh, true, false).blocking).toBe(false);
   });
 });

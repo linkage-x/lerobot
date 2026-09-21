@@ -66,7 +66,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # pyarrow-only helpers shared with the recorder's box v3 writer.
-from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
+from tools.thor.gmsl2 import (  # noqa: E402
+    thor_lerobot_v3 as lr3,
+    world_provenance as wp,
+)
 
 _CHUNKS_SIZE = 1000
 _DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
@@ -867,6 +870,7 @@ class _V3Writer:
         pose_columns: list[_PoseColumn] | None = None,
         touch_columns: tuple[tuple[str, str, str], ...] | None = None,
         touch_width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
+        world_frame: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -887,6 +891,7 @@ class _V3Writer:
         self.pose_columns = list(pose_columns or [])
         self.touch_columns = list(touch_columns or [])
         self.touch_width = int(touch_width)
+        self.world_frame = dict(world_frame) if world_frame else None
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -1078,6 +1083,15 @@ class _V3Writer:
             "data_path": _DATA_PATH,
             "video_path": _VIDEO_PATH if self.video_keys else None,
             "features": self._features(),
+            "world_frame": self.world_frame or {
+                "world_frame_id": "",
+                "status": "unstamped",
+                "note": (
+                    "every source episode predates world provenance; absolute poses "
+                    "in this dataset cannot be declared comparable with any other "
+                    "dataset's"
+                ),
+            },
         }
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
@@ -1194,6 +1208,28 @@ def export_task_to_v3(
         f"({touch_model or 'unrecognised pad'})"
     )
 
+    # One dataset, one world. Absolute poses from two coordinate systems
+    # concatenated into one training set are wrong in a way no downstream check
+    # can see, so this refuses *before* a byte is written rather than leaving a
+    # half-exported dataset behind. An episode named here that would have been
+    # skipped later (camera-set mismatch, unreadable frame counts) still counts:
+    # exclude it from the selection rather than relaxing the gate.
+    source_worlds = [
+        (f"{src.session_dir.name}/{src.ep_dir.name}", _load_meta(src.ep_dir).get("world_frame"))
+        for src in episodes
+    ]
+    world_frame_id = wp.assert_single_world(source_worlds)
+    source_world_frame = next(
+        (block for _, block in source_worlds if wp.world_frame_id_of(block)), None
+    )
+    if world_frame_id:
+        _emit(f"World frame: {world_frame_id} (all {len(episodes)} source episode(s))")
+    else:
+        _emit(
+            "WARNING: no source episode carries a world frame id; these predate world "
+            "provenance and their absolute poses are not comparable across sessions"
+        )
+
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
@@ -1209,6 +1245,7 @@ def export_task_to_v3(
         pose_columns=pose_columns,
         touch_columns=_TOUCH_ARRAY_COLUMNS,
         touch_width=touch_width,
+        world_frame=source_world_frame,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -1318,6 +1355,7 @@ def export_task_to_v3(
                 "session": src.session_dir.name,
                 "source_episode": src.ep_dir.name,
                 "frames": n_frames,
+                "world_frame_id": wp.world_frame_id_of(meta.get("world_frame")),
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",

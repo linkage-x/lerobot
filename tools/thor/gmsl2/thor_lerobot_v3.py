@@ -972,6 +972,7 @@ class Lr3Writer:
         repo_id: str,
         task: str,
         fps: int,
+        world_frame: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -980,6 +981,12 @@ class Lr3Writer:
         self.repo_id = repo_id
         self.task = task
         self.fps = int(fps)
+        # Which world the poses derived from this dataset will live in. Written
+        # straight through to meta/info.json; see tools/thor/gmsl2/world_provenance.py
+        # for why the recorder resolves it rather than being told. None only for
+        # callers outside the recorder (tests, one-off conversions), where it is
+        # recorded as an explicit "unstamped" rather than omitted.
+        self.world_frame = dict(world_frame) if world_frame else None
         self.pa = pa
         self.pq = pq
         self.data_dir = dataset_root / "data" / "chunk-000"
@@ -1157,6 +1164,11 @@ class Lr3Writer:
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
             "features": _box_features(self.state_names, self.ts_names),
+            "world_frame": self.world_frame or {
+                "world_frame_id": "",
+                "status": "unstamped",
+                "note": "writer was constructed without world provenance",
+            },
         }
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
@@ -1179,9 +1191,12 @@ def open_box_lerobot_v3_writer(
     repo_id: str,
     task: str,
     fps: int,
+    world_frame: dict[str, Any] | None = None,
 ) -> Lr3Writer | None:
     try:
-        return Lr3Writer(dataset_root, repo_id=repo_id, task=task, fps=fps)
+        return Lr3Writer(
+            dataset_root, repo_id=repo_id, task=task, fps=fps, world_frame=world_frame,
+        )
     except ImportError:
         return None
 

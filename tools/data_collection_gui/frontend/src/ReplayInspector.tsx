@@ -200,8 +200,32 @@ function CubeOverlayCanvas({
 
     for (const overlay of overlays) {
       const corners = overlay.corners.map(scalePoint);
-      for (const [a, b] of cubeEdges) {
-        drawLine(corners[a], corners[b], overlay.color, 2);
+      if (overlay.polygons?.length) {
+        for (const polygon of overlay.polygons) {
+          const points = polygon.points.map(scalePoint);
+          if (points.length < 3 || points.some((point) => point == null)) {
+            continue;
+          }
+          const finite = points as [number, number][];
+          ctx.save();
+          ctx.strokeStyle = polygon.color;
+          ctx.fillStyle = polygon.color;
+          ctx.globalAlpha = polygon.role === "anchor" ? 0.95 : 0.72;
+          ctx.lineWidth = polygon.role === "anchor" ? 3 : 1.5;
+          ctx.setLineDash(polygon.role === "anchor" ? [7, 3] : []);
+          ctx.beginPath();
+          ctx.moveTo(finite[0][0], finite[0][1]);
+          finite.slice(1).forEach((point) => ctx.lineTo(point[0], point[1]));
+          ctx.closePath();
+          ctx.stroke();
+          ctx.globalAlpha = polygon.role === "anchor" ? 0.08 : 0.05;
+          ctx.fill();
+          ctx.restore();
+        }
+      } else {
+        for (const [a, b] of cubeEdges) {
+          drawLine(corners[a], corners[b], overlay.color, 2);
+        }
       }
       const origin = scalePoint(overlay.axes.origin);
       drawLine(origin, scalePoint(overlay.axes.x), "#ef4444", 2.5);
@@ -209,7 +233,10 @@ function CubeOverlayCanvas({
       drawLine(origin, scalePoint(overlay.axes.z), "#3b82f6", 2.5);
       const label = scalePoint(overlay.label);
       if (label) {
-        const text = `${overlay.cubeName} m=${overlay.numMarkers} rmse=${overlay.rmsePx == null ? "-" : overlay.rmsePx.toFixed(1)} ${overlay.usedForFusion ? "in" : "out"}`;
+        const evidence = overlay.kind === "hybrid_carrier"
+          ? `ids=[${(overlay.markerIds ?? []).join(",")}] edges=${overlay.numEdgeSamples ?? 0}`
+          : `markers=${overlay.numMarkers}`;
+        const text = `${overlay.cubeName} ${evidence} rmse=${overlay.rmsePx == null ? "-" : overlay.rmsePx.toFixed(1)} ${overlay.usedForFusion ? "in" : "out"}`;
         ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
         const metrics = ctx.measureText(text);
         const x = Math.max(4, Math.min(width - metrics.width - 10, label[0]));
