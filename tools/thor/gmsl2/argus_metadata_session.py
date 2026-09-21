@@ -235,6 +235,12 @@ class ArgusMetadataCameraSession:
             str(int(self._common_stream_value("control_rate", streams))),
             "--sensor-mode",
             str(int(self._common_stream_value("sensor_mode", streams))),
+            # 0 keeps Argus auto-exposure, which is the historical behaviour.
+            # A non-zero value pins it, which is what a laser-tracker validation
+            # session wants: auto-exposure moves the SOF -> mid-exposure offset
+            # with scene brightness, and that is a pose-correlated timing bias.
+            "--exposure-us",
+            str(int(self._common_stream_value("exposure_us", streams))),
             "--name-prefix",
             self._name_prefix_for_streams(streams),
         ]

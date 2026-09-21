@@ -553,3 +553,120 @@ def test_camera_frame_times_rel_fallbacks(tmp_path):
     assert lr3.camera_frame_times_rel(tmp_path, 0.0) is None
     # No sidecar in the directory → None.
     assert lr3.camera_frame_times_rel(tmp_path / "no_such_ep", 6782.98) is None
+
+
+# --------------------------------------------------------------------------
+# 8b. The SOF -> mid-exposure correction.  SOF is the start of integration, so
+#     the scene was sampled about half an exposure later; under auto-exposure
+#     that half-exposure moves with the scene, which is why it has to ride on
+#     the frame rather than on the episode.
+# --------------------------------------------------------------------------
+
+def _write_sidecar_with_exposure(ep_dir, cam, t0_mono, frame0_skew_s, exposures_us):
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    header = ("camera,logical_frame_index,local_frame_number,sensor_timestamp_ns,"
+              "sof_tsc_ns,eof_tsc_ns,internal_frame_count,"
+              "sensor_exposure_time_ns,sensor_analog_gain\n")
+    lines = [header]
+    for i, exp_us in enumerate(exposures_us):
+        sens_ns = int((t0_mono + frame0_skew_s + i / FPS) * 1e9)
+        sof_ns = sens_ns + 26_600_000_000
+        lines.append(
+            f"{cam},{i},{i + 33},{sens_ns},{sof_ns},{sof_ns + 14_000},{i + 62},"
+            f"{int(exp_us * 1000)},1.0\n"
+        )
+    (ep_dir / f"{cam}.argus_frame_metadata.csv").write_text("".join(lines))
+
+
+def test_exposure_centre_shifts_each_frame_by_half_its_own_exposure(tmp_path):
+    t0_mono = 6782.984511942
+    # A locked exposure would be flat; this one wanders the way Argus AE does.
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [4000, 12000, 4000])
+
+    # Asked for explicitly: the default applies nothing until the sign is known.
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert ft is not None and len(ft) == 3
+    # Each frame moves by half of *its own* exposure, not by an episode mean.
+    assert ft[0] == pytest.approx(0.0 + 0.002, abs=1e-9)
+    assert ft[1] == pytest.approx(1 / FPS + 0.006, abs=1e-9)
+    assert ft[2] == pytest.approx(2 / FPS + 0.002, abs=1e-9)
+
+
+def test_exposure_wander_is_what_the_correction_removes(tmp_path):
+    """The correction has to change frame *spacing*, not just shift the episode.
+
+    A constant offset is harmless -- T3c absorbs it.  The reason this term is
+    worth carrying per frame is that a 4->12 ms exposure swing moves successive
+    labels relative to each other, and that is what shows up as position error.
+    """
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [4000, 12000])
+
+    corrected = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    raw = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.0)
+
+    raw_gap = raw[1] - raw[0]
+    corrected_gap = corrected[1] - corrected[0]
+    # Half of the 8 ms exposure swing, i.e. 4 ms of inter-frame spacing that
+    # the uncorrected labels get wrong.
+    assert corrected_gap - raw_gap == pytest.approx(0.004, abs=1e-9)
+    # At the rig's p95 hand speed that is millimetres, not microns -- the whole
+    # reason this is not filed under "small fixed offset".
+    assert (corrected_gap - raw_gap) * 680.0 == pytest.approx(2.72, abs=0.01)
+
+
+def test_missing_exposure_column_leaves_frame_times_exactly_as_they_were(tmp_path):
+    """Pre-lock episodes must reload bit-identical, not silently shifted.
+
+    Asserted with the correction turned *on*, because that is the case worth
+    pinning: a sidecar with no exposure column must read as "no exposure", not
+    as "exposure zero is close enough to guess from the neighbours".
+    """
+    t0_mono = 6782.984511942
+    _write_sidecar(tmp_path, "cam_00", t0_mono, -0.0535, 4)
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert ft[0] == pytest.approx(-0.0535, abs=1e-9)
+
+
+def test_readout_offset_shifts_without_deforming(tmp_path):
+    """It is a constant, so it may move the trajectory but never bend it."""
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [5000, 5000, 5000])
+    base = lr3.camera_frame_times_rel(tmp_path, t0_mono)
+    shifted = lr3.camera_frame_times_rel(tmp_path, t0_mono, readout_offset_s=0.0031)
+    assert all(s - b == pytest.approx(0.0031, abs=1e-9) for b, s in zip(base, shifted))
+
+
+def test_readout_offset_default_is_uncalibrated_zero(tmp_path):
+    """Zero here means 'nobody has measured it yet'.
+
+    If it ever acquires a non-zero default, that default came from the T3c LED
+    sweep and this test should be updated to say so -- the point is that the
+    number is never allowed to appear without a provenance.
+    """
+    assert lr3.READOUT_OFFSET_S == 0.0
+
+
+def test_exposure_centre_is_recorded_but_not_applied_by_default(tmp_path):
+    """The shipped default must leave the labels on the stamp the hardware gave.
+
+    Both candidate signs are one whole exposure apart, so applying the wrong one
+    doubles the pose-correlated error that applying the right one removes --
+    same expected cost as doing nothing, twice the worst case. Until
+    resolve_frame_time_semantics has been run on a recording that carries the
+    exposure column, the honest default is to carry the column and apply none of
+    it. If this assertion is ever changed to +/-0.5, the commit that changes it
+    should cite that script's output.
+    """
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [4000, 12000])
+
+    assert lr3.EXPOSURE_CENTER_FRACTION == 0.0
+    default = lr3.camera_frame_times_rel(tmp_path, t0_mono)
+    raw = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.0)
+    assert default == raw
+    # And the exposure really was there to be applied, so this is a decision
+    # about the default rather than a test that passes because the fixture is
+    # missing the column.
+    applied = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert applied[1] - raw[1] == pytest.approx(0.006, abs=1e-9)

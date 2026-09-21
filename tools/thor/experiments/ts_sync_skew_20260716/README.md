@@ -146,7 +146,7 @@ gripper NN pick 改变帧数: 147/578
 
 1. **消除 sidecar 短尾/空洞的静默基准拼接**:原实现对缺失帧回退 `N/fps`,会在尾部把两套时间基准拼出隐蔽跳变。改为按已知 SOF 的**线性拟合外推**（SOF 线性到 ~µs）,全 episode 单一基准;外推帧数 `logger.warning`;整段无可用 SOF 才统一回退 `N/fps`。
 2. **术语与成因**:`sensor_timestamp_ns` 明确为**硬件帧时间戳(SOF)**而非「真实曝光时刻」（可能残留一个**固定** exposure/readout offset,不影响逐 episode 变化的 skew）;并修正 δ 负号的成因表述（frame 0 的 SOF 早于 `t0`,因软件接收/gate 时序 + 管线缓存,而非「START 后丢帧」）。
-3. **可审计**:对齐摘要写入 `meta.json.box_camera_alignment`（`mode`/`mean_skew_ms`/`skew_jitter_ms`/`frames_with_sof`），修正不再只藏于代码。
+3. **可审计**:对齐摘要写入 `meta.json.box_camera_alignment`（`mode`/`reference`/`mean_skew_ms`/`skew_jitter_ms`/`frames_with_sof`），修正不再只藏于代码。后续加入曝光中心修正后，同一个块还记 `exposure_fraction`/`readout_offset_s`/`exposure_correction_ms`——公式和它在本 episode 实际移动的毫秒数一起落盘。当前 `exposure_fraction` 默认 **0.0**（只记录曝光列、不施加），因为符号尚未实测；待 `resolve_frame_time_semantics.py` 判定后再改成 ±0.5，已录数据可凭该块加逐帧曝光离线补修，不必重录。
 4. **全模态审计**（§6.1）:确认本 pipeline 无被漏掉的滞后模态。
 5. **口径收紧**:「必须逐帧」改为「不能用全局常数;最稳健是逐帧 SOF,不完整时退化为每 episode 拟合(offset+slope),而非全局固定 offset」;短尾/空洞回退给出优先级阶梯（§6）。
 

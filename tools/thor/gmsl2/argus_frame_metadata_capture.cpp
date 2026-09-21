@@ -64,6 +64,14 @@ struct FrameMetadata {
     uint64_t sof_tsc_ns = 0;
     uint64_t eof_tsc_ns = 0;
     uint64_t internal_frame_count = 0;
+    // The SOF label is not the instant the scene was sampled: mid-exposure sits
+    // roughly exposure/2 before end-of-integration, so any downstream alignment
+    // that treats SOF as the sample time carries that offset.  Under Argus
+    // auto-exposure the offset is not even constant -- it tracks scene
+    // brightness, which tracks pose, so it does not average out.  Recording it
+    // per frame is what turns an unknown bias into a correctable one.
+    uint64_t sensor_exposure_time_ns = 0;
+    float sensor_analog_gain = 0.0f;
 };
 
 struct CamCtx {
@@ -243,7 +251,8 @@ bool init_camera(
         return false;
     }
     cam->csv << "camera,encoded_frame_index,local_frame_number,sensor_timestamp_ns,"
-             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count\n";
+             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count,"
+             << "sensor_exposure_time_ns,sensor_analog_gain\n";
     return true;
 }
 
@@ -281,6 +290,8 @@ bool acquire_metadata(CamCtx* cam, uint64_t encoded_frame_index, FrameMetadata* 
     out->sof_tsc_ns = i_tsc ? i_tsc->getSensorSofTimestampTsc() : 0;
     out->eof_tsc_ns = i_tsc ? i_tsc->getSensorEofTimestampTsc() : 0;
     out->internal_frame_count = i_internal ? i_internal->getInternalFrameCount() : 0;
+    out->sensor_exposure_time_ns = i_meta ? i_meta->getSensorExposureTime() : 0;
+    out->sensor_analog_gain = i_meta ? i_meta->getSensorAnalogGain() : 0.0f;
     return true;
 }
 
@@ -291,7 +302,9 @@ void write_metadata(CamCtx* cam, const FrameMetadata& meta) {
              << meta.sensor_timestamp_ns << ","
              << meta.sof_tsc_ns << ","
              << meta.eof_tsc_ns << ","
-             << meta.internal_frame_count << "\n";
+             << meta.internal_frame_count << ","
+             << meta.sensor_exposure_time_ns << ","
+             << meta.sensor_analog_gain << "\n";
 }
 
 }  // namespace

@@ -253,7 +253,7 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={(backend) => run(() => api.connectRecording(backend))}
+        onConnect={(backend, laserTracker) => run(() => api.connectRecording(backend, laserTracker))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
