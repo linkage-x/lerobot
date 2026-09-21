@@ -1,0 +1,347 @@
+{
+  "layout_id": "cadprior_no09_10",
+  "units": "m",
+  "schema": "marker_layout/measured_v1",
+  "generated_utc": "2026-08-18T05:08:13Z",
+  "source": {
+    "detections": "/home/nvidia/lerobot/outputs/metrology/newrig_20260818_115119/detections_ep012.npz",
+    "dataset_root": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260818_115119",
+    "episodes": [
+      0,
+      1,
+      2
+    ],
+    "dictionary": "DICT_6X6_50",
+    "cameras": [
+      "cam_06",
+      "cam_07",
+      "cam_08",
+      "cam_12",
+      "cam_13",
+      "cam_14"
+    ],
+    "calibration": {
+      "world_frame": "robot_base",
+      "extrinsics_summary": "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_extrinsics/summary.json",
+      "extrinsics_source": "joint_solution",
+      "intrinsics_dir": "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics",
+      "cameras": [
+        "cam_06",
+        "cam_07",
+        "cam_08",
+        "cam_09",
+        "cam_12",
+        "cam_13",
+        "cam_14"
+      ],
+      "file_sha256": {
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_extrinsics/summary.json": "d0932c337be0b0e3c4525965145b48589d053f21f5b0f40bd1a11b8fb772484d",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_06_H120K-I05130029/intrinsics_producer.json": "27bb91afd5e852e10d017bf21f20f6e4bfefb240e9a3f13f6e9313c0c0ca995e",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_07_H120K-I05130066/intrinsics_producer.json": "99fd89fe4dbe3834921bcedd08625535396d48e0e62e34022070fc2638393486",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_08_H120K-I05130024/intrinsics_producer.json": "f652ccad0983816d3573e1da7b50e3661fa3076b80d27dd910d83c96ca6630ce",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_09_H120K-I05130058/intrinsics_producer.json": "df67f7c1f995accf9d6914ed5f2a0db4d426d721c86bcc7db80134ace8029624",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_12_H120K-I05130067/intrinsics_producer.json": "c9894c68e57594c8a1f2926a43e517ecc7dbeea5e6785febbfb5556adb2f51bb",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_13_H120K-I05130031/intrinsics_producer.json": "8927df0c1b98f59c09ae37b0248aaebee82f7724d061e42e8d1dac07758b3723",
+        "/home/nvidia/lerobot/outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_14_H120K-I05130057/intrinsics_producer.json": "5eebef5cd9f37dc83a447e8654704b47bc9eef9077a4923e7358d0c87eafaf39"
+      }
+    },
+    "stage": "cad_prior_bundle_adjustment",
+    "frames_used": 367
+  },
+  "frame_convention": "CAD part-studio frame; origin = pivot socket sphere centre, so a pivot fit on this layout has 0 as its known answer",
+  "markers": [
+    {
+      "id": 7,
+      "corners_rig": [
+        [
+          0.15040960497368655,
+          0.09619221171930319,
+          0.028548489239609696
+        ],
+        [
+          0.0896864892576493,
+          0.09651940708973994,
+          0.030455328035812235
+        ],
+        [
+          0.08778332540734686,
+          0.09718591947820517,
+          -0.03026512652328435
+        ],
+        [
+          0.1485064411233841,
+          0.09685872410776841,
+          -0.032171965319486885
+        ]
+      ],
+      "centre_m": [
+        0.1190964651905167,
+        0.09668906559875418,
+        -0.0008583186418373249
+      ],
+      "normal": [
+        0.005726945259008776,
+        0.9999253169594037,
+        0.010796416147804407
+      ],
+      "edges_mm": [
+        60.75392887104824,
+        60.75392887104823,
+        60.753928871048224,
+        60.75392887104824
+      ],
+      "diagonals_mm": [
+        85.91903017688676,
+        85.91903017688675
+      ],
+      "planarity_rms_mm": 2.0121980390105515e-17
+    },
+    {
+      "id": 12,
+      "corners_rig": [
+        [
+          0.08827852002216025,
+          0.030579904703549026,
+          0.07677557043903407
+        ],
+        [
+          0.14891669804144358,
+          0.030451355688145335,
+          0.07598929064994346
+        ],
+        [
+          0.1487770200280976,
+          -0.030185819142284794,
+          0.07513085434431055
+        ],
+        [
+          0.08813884200881425,
+          -0.030057270126881103,
+          0.07591713413340116
+        ]
+      ],
+      "centre_m": [
+        0.11852777002512893,
+        0.00019704278063211594,
+        0.07595321239167231
+      ],
+      "normal": [
+        0.012934286302714057,
+        -0.014184116731352949,
+        0.9998157405594247
+      ],
+      "edges_mm": [
+        60.643411795960084,
+        60.64341179596008,
+        60.643411795960084,
+        60.64341179596008
+      ],
+      "diagonals_mm": [
+        85.76273543042329,
+        85.76273543042329
+      ],
+      "planarity_rms_mm": 1.7916784519261627e-16
+    },
+    {
+      "id": 14,
+      "corners_rig": [
+        [
+          0.03205612640996498,
+          -0.02845699165006714,
+          0.07094194972988935
+        ],
+        [
+          0.08174016887430567,
+          -0.05330915112575599,
+          0.09507246036971279
+        ],
+        [
+          0.08149697365858666,
+          -0.09575047279711069,
+          0.051862617500086874
+        ],
+        [
+          0.03181293119424597,
+          -0.07089831332142184,
+          0.02773210686026343
+        ]
+      ],
+      "centre_m": [
+        0.05677655003427582,
+        -0.062103732223588906,
+        0.06140228361498811
+      ],
+      "normal": [
+        -0.5719059628612403,
+        -0.5836228945402859,
+        0.5764615222303878
+      ],
+      "edges_mm": [
+        60.56744546323637,
+        60.56744546323637,
+        60.56744546323637,
+        60.56744546323637
+      ],
+      "diagonals_mm": [
+        85.65530281240167,
+        85.65530281240166
+      ],
+      "planarity_rms_mm": 3.2937846370508344e-15
+    },
+    {
+      "id": 16,
+      "corners_rig": [
+        [
+          0.08163544028312805,
+          0.09562991431314366,
+          0.05281745755882344
+        ],
+        [
+          0.08241054481554955,
+          0.05223644220442465,
+          0.09503542176960308
+        ],
+        [
+          0.03267715869405819,
+          0.02770307079591408,
+          0.07073203305502765
+        ],
+        [
+          0.0319020541616367,
+          0.07109654290463309,
+          0.028514068844248
+        ]
+      ],
+      "centre_m": [
+        0.05715629948859312,
+        0.06166649255452887,
+        0.061774745306925546
+      ],
+      "normal": [
+        -0.5702088165767073,
+        0.5676030074513154,
+        0.5938760236197559
+      ],
+      "edges_mm": [
+        60.547094982245234,
+        60.547094982245234,
+        60.547094982245234,
+        60.54709498224523
+      ],
+      "diagonals_mm": [
+        85.62652288618318,
+        85.62652288618317
+      ],
+      "planarity_rms_mm": 4.963754860572494e-15
+    },
+    {
+      "id": 17,
+      "corners_rig": [
+        [
+          0.08823374243361785,
+          -0.09768510014245252,
+          0.029933548965096906
+        ],
+        [
+          0.14864779893446003,
+          -0.09752789114129287,
+          0.029210450392047498
+        ],
+        [
+          0.14792324450887412,
+          -0.09695686745035118,
+          -0.03120109454707892
+        ],
+        [
+          0.08750918800803192,
+          -0.09711407645151082,
+          -0.03047799597402951
+        ]
+      ],
+      "centre_m": [
+        0.11807849347124598,
+        -0.09732098379640185,
+        -0.0006337727909910074
+      ],
+      "normal": [
+        0.0024885814611732885,
+        -0.9999519517594131,
+        -0.009481620897898205
+      ],
+      "edges_mm": [
+        60.418588274663804,
+        60.418588274663804,
+        60.41858827466382,
+        60.418588274663804
+      ],
+      "diagonals_mm": [
+        85.44478695746562,
+        85.44478695746561
+      ],
+      "planarity_rms_mm": 1.8425085076994308e-17
+    }
+  ],
+  "cad_comparison": {
+    "cad_json": "/home/nvidia/lerobot/third_party/opencv_kalibr/metrology/fixtures/cad/marker_rig_20260818_cad.json",
+    "pivot_in_cad_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "seed_assignment": {
+      "7": 4,
+      "12": 2,
+      "14": 1,
+      "16": 0,
+      "17": 3
+    },
+    "seed_centre_rms_mm": 4.546841380529536e-13,
+    "assignment_marker_to_plate": {
+      "7": 4,
+      "12": 2,
+      "14": 1,
+      "16": 0,
+      "17": 3
+    },
+    "centre_residual_mm": [
+      1.23165468968105,
+      0.502137208318828,
+      0.9403576431026937,
+      0.8542837397006344,
+      1.1379784378080475
+    ],
+    "centre_rms_mm": 0.9672831209492025,
+    "T_cad_from_rig": [
+      [
+        0.9999825132818492,
+        -0.003729000546835616,
+        -0.004589954840597923,
+        0.00023666644806563664
+      ],
+      [
+        0.003727360697841747,
+        0.9999929864721098,
+        -0.0003657715400090988,
+        -0.00016122036332174149
+      ],
+      [
+        0.00459128661109361,
+        0.0003486567265875858,
+        0.999989399206683,
+        -0.00027875644662314625
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "pivot_predicted_in_rig_m": [
+      -0.00023478153235908944,
+      0.00016219895222267607,
+      0.0002797808100720028
+    ],
+    "lever_arm_predicted_mm": 0.39963504566486935
+  }
+}

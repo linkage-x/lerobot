@@ -342,7 +342,10 @@ export type CollectionTask = {
   updatedAt: string;
 };
 
-export type DatasetKind = "recorded" | "exported" | "training_view";
+// "calibration" is a board sweep recorded by the guided wizard, not a
+// demonstration: it never counts towards a task's episode budget and is never
+// merged into a v3 export.
+export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration";
 
 export type RecordedDataset = {
   path: string;
@@ -474,6 +477,23 @@ export type CalibrationSolve = {
   intrinsicsEpisodes?: number;
   /** The production intrinsics run reused when they are not re-fitted. */
   intrinsicsRun?: string;
+  /** Whether re-fitting from that capture could survive its own export. */
+  intrinsicsPreflight?: IntrinsicsPreflight;
+};
+
+/** Which cameras a re-fit would have to produce a lens for, which of them
+ * production has no lens for today, and which of production's lenses this
+ * capture does not re-fit. The last group is carried into the new run by the
+ * exporter, so it is a note; the middle one still blocks, because a camera in
+ * the capture that fails its fit takes the export down at the last step and
+ * there is nothing in production to put in its place. */
+export type IntrinsicsPreflight = {
+  cameras: string[];
+  production: string[];
+  uncalibrated: string[];
+  /** Kept from the production run because this capture never swept them. */
+  carriedForward?: string[];
+  blocking: boolean;
 };
 
 export type CalibrationStatus = {
@@ -485,10 +505,101 @@ export type CalibrationStatus = {
   outputPath: string;
   progress?: CalibrationProgress;
   solve?: CalibrationSolve;
-  // Which calibration runs production is pointed at, read from the tracking
-  // config rather than tracked separately so the two cannot drift.
+  /**
+   * The last run the gateway *knows about*: the tracking config's value at
+   * startup, overwritten in memory by whatever a solve produces.
+   *
+   * The comment that used to sit here said these were read from the tracking
+   * config "so the two cannot drift". They do drift, and that is the whole
+   * point of `production` below: nothing writes the run names back to the
+   * config, so a finished solve leaves these two naming a calibration that
+   * production will not load.
+   */
   intrinsicsRun?: string;
   extrinsicsRun?: string;
+  /** What the tracking config says right now — what production actually loads. */
+  production?: CalibrationProduction;
+  /** Present only when the last solve and the production pointer disagree. */
+  pointerMismatch?: CalibrationPointerMismatch;
+  /**
+   * The mandatory review: what promoting the newest run would change. Absent
+   * when production already loads the newest run, which is the ordinary case.
+   */
+  promotion?: CalibrationPromotionReview;
+};
+
+/** Per-camera difference between two extrinsics runs, in gauge-free terms. */
+export type PromotionCameraRow = {
+  camera: string;
+  medianBaselineShiftMm: number;
+  maxBaselineShiftMm: number;
+  medianRotationDeg: number;
+  maxRotationDeg: number;
+};
+
+export type PromotionWorld = {
+  worldFrameId: string;
+  referenceWorldFrameId: string;
+  continuityState: string;
+  reason: string;
+  stableCameras: string[];
+};
+
+export type PromotionBlocker = { kind: string; message: string; target?: string };
+
+export type ExtrinsicsComparison = {
+  ok: boolean;
+  error?: string;
+  live: string;
+  candidate: string;
+  cameras?: PromotionCameraRow[];
+  addedCameras?: string[];
+  removedCameras?: string[];
+  pairCount?: number;
+  medianBaselineShiftMm?: number;
+  medianRotationDeg?: number;
+  worstPair?: { a: string; b: string; liveMm: number; candidateMm: number; shiftMm: number; rotationDeg: number };
+  liveWorld?: PromotionWorld;
+  candidateWorld?: PromotionWorld;
+  /** Shown, never ranked on: this number picked the wrong run in August. */
+  liveRmsePx?: number | null;
+  candidateRmsePx?: number | null;
+};
+
+export type IntrinsicsComparison = {
+  ok: boolean;
+  error?: string;
+  live: string;
+  candidate: string;
+  cameras?: string[];
+  model?: string;
+  mixedModels?: string[];
+  trackerModel?: string;
+  addedCameras?: string[];
+  removedCameras?: string[];
+};
+
+export type CalibrationPromotionReview = {
+  candidates: { intrinsics?: string; extrinsics?: string };
+  configPath: string;
+  extrinsics?: ExtrinsicsComparison;
+  extrinsicsBlockers?: PromotionBlocker[];
+  intrinsics?: IntrinsicsComparison;
+  intrinsicsBlockers?: PromotionBlocker[];
+};
+
+export type CalibrationProduction = {
+  configPath: string;
+  intrinsicsRun: string;
+  extrinsicsRun: string;
+  /** Non-empty when the config could not be read or parsed. */
+  error: string;
+};
+
+export type CalibrationPointerMismatch = {
+  fields: { kind: "intrinsics" | "extrinsics"; label: string; solved: string; production: string }[];
+  configPath: string;
+  message: string;
 };
 
 export type EePose = {
@@ -539,6 +650,16 @@ export type ReplayTimelineFrame = {
 };
 
 export type CubeVideoOverlay = {
+  kind?: "cube" | "hybrid_carrier";
+  polygons?: Array<{
+    role: "anchor" | "facet";
+    label: string;
+    color: string;
+    points: Array<[number, number] | null>;
+  }>;
+  markerIds?: number[];
+  numEdgeSamples?: number;
+  message?: string;
   cubeName: string;
   color: string;
   corners: Array<[number, number] | null>;
@@ -553,6 +674,27 @@ export type CubeVideoOverlay = {
   numMarkers: number;
   rmsePx: number | null;
   usedForFusion: boolean;
+};
+
+export type TrackingTarget = "april_cube" | "hybrid_carrier_v1";
+
+export type TrackingDetectionSummary = {
+  target: TrackingTarget;
+  label: string;
+  totalViews: number;
+  detectedViews: number;
+  detectionRatePct: number;
+  overlayAvailable: boolean;
+  perCamera: Array<{
+    camera: string;
+    streamKey: string;
+    totalViews: number;
+    detectedViews: number;
+    detectionRatePct: number;
+    medianAnchors: number | null;
+    medianRmsePx: number | null;
+    medianEdgeSamples: number | null;
+  }>;
 };
 
 export type ReplayTimeline = {
@@ -579,6 +721,8 @@ export type ReplayTimeline = {
 export type ProcessingItem = {
   path: string;
   name: string;
+  trackingTarget?: TrackingTarget;
+  detectionSummary?: TrackingDetectionSummary | null;
   status: ProcessingStatus;
   trajectoryVersion: string | null;
   qcSummary: string;
@@ -680,6 +824,105 @@ export type RigCheckReport = {
   thresholds_px: { warn: number; fail: number };
   cameras: Record<string, RigCheckCamera>;
   baseline?: RigCheckBaseline;
+};
+
+// --- hand-eye (AX = XB), the rotation half of marker rig -> TCP -------------
+// Mirrors metrology/cli/hand_eye_calibration.py. `verdict.status` is the field
+// to branch on, not `ok`: "not_observable", "mis_associated" and
+// "no_uncertainty_estimate" are all successful *runs* that refuse to produce a
+// constant, and each needs a different thing from the operator.
+export type HandEyeVerdictStatus =
+  | "ok"
+  | "not_observable"
+  | "mis_associated"
+  | "insufficient_motions"
+  | "solved_but_out_of_budget"
+  | "no_uncertainty_estimate";
+
+export type HandEyeReport = {
+  input?: { path?: string; sha256?: string; num_poses?: number; pose_names?: string[] };
+  motions?: {
+    num_poses?: number;
+    num_motions?: number;
+    num_candidate_pairs?: number;
+    pairing?: string;
+    dropped?: Record<string, number>;
+    worst_angle_disagreement_deg?: number;
+    motion_angle_deg?: { p05?: number; p50?: number; p95?: number };
+  };
+  observability?: {
+    ok?: boolean;
+    rotation_axis_rank_ratio?: number;
+    translation_rank_ratio?: number;
+    reasons?: string[];
+  };
+  solution?: {
+    T_flange_rig?: number[][];
+    rotation_vector_deg?: number[];
+    translation_mm?: number[];
+    num_motions_used?: number;
+    num_motions_rejected?: number;
+    residual_rotation_deg?: { p50: number; p95: number; max: number };
+    residual_translation_mm?: { p50: number; p95: number; max: number };
+  };
+  holdout?: {
+    num_folds?: number;
+    note?: string;
+    solution_shift_rotation_deg?: { p50: number; p95: number; max: number };
+  };
+  bootstrap?: { num_resamples?: number; sigma_deg?: number | null; note?: string };
+  rotation_sigma_deg?: number | null;
+  lever_equivalent_mm?: number;
+  lever_mm?: number;
+  against_budget?: {
+    target_deg: number;
+    acceptable_deg: number;
+    meets_target: boolean;
+    meets_acceptable: boolean;
+    replaces_declared_deg: number;
+    replaces_declared_mm: number;
+  };
+  T_box_rig?: { status?: string; why?: string; note?: string; matrix?: number[][] };
+  production?: {
+    wired_in?: boolean;
+    note?: string;
+    marker_rig_to_tcp_patch?: { rotation_source: string; rotation_sigma_deg: number } | null;
+  };
+  verdict?: { status?: HandEyeVerdictStatus; why?: string; note?: string };
+  validated?: boolean;
+};
+
+export type HandEyeSolveResponse = {
+  ok: boolean;
+  returncode?: number;
+  error?: string;
+  verdict?: { status?: HandEyeVerdictStatus; why?: string; note?: string };
+  report: HandEyeReport | null;
+  reportPath?: string;
+  stdout?: string;
+  stderr?: string;
+};
+
+export type HandEyePlanRow = {
+  num_poses: number;
+  num_trials: number;
+  rotation_error_p50_deg?: number;
+  rotation_error_p95_deg?: number;
+  lever_equivalent_p95_mm?: number;
+  meets_target?: boolean;
+  meets_acceptable?: boolean;
+};
+
+export type HandEyePlanResponse = {
+  ok: boolean;
+  error?: string;
+  plan: {
+    assumptions?: Record<string, number>;
+    lever_mm?: number;
+    rows?: HandEyePlanRow[];
+  } | null;
+  planPath?: string;
+  stdout?: string;
 };
 
 export type RigCheckResponse = {

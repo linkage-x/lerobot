@@ -149,21 +149,22 @@ def _write_online_sync_manifest(ep_dir: Path, cams: tuple[str, ...] | list[str],
     )
 
 
-def _make_video_session(root: Path, name: str, ep_frames: dict[int, int], *, cams, w, h, fps, with_box):
+def _make_video_session(
+    root: Path, name: str, ep_frames: dict[int, int], *, cams, w, h, fps, with_box,
+    world_frame_id: str | None = None,
+):
     session = root / name
     for ep, n in ep_frames.items():
         ep_dir = session / "episodes" / f"episode_{ep:06d}"
         ep_dir.mkdir(parents=True)
-        (ep_dir / "meta.json").write_text(
-            json.dumps(
-                {
-                    "duration_s": n / fps,
-                    "video": {"fps": fps, "width": w, "height": h, "codec": "h264", "replay_warmup_s": 0.0},
-                    "cameras": [{"name": c, "file": f"{c}.mkv"} for c in cams],
-                }
-            ),
-            encoding="utf-8",
-        )
+        meta = {
+            "duration_s": n / fps,
+            "video": {"fps": fps, "width": w, "height": h, "codec": "h264", "replay_warmup_s": 0.0},
+            "cameras": [{"name": c, "file": f"{c}.mkv"} for c in cams],
+        }
+        if world_frame_id is not None:
+            meta["world_frame"] = {"world_frame_id": world_frame_id, "status": "ok"}
+        (ep_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
         for c in cams:
             _write_mkv(ep_dir / f"{c}.mkv", n, w, h, fps)
         _write_online_sync_manifest(ep_dir, cams, n_frames=n)
@@ -186,8 +187,8 @@ def test_export_task_to_v3_produces_loadable_dataset(tmp_path, with_box):
     exports = tmp_path / "exports"
     datasets.mkdir()
     cams = ("cam_00", "cam_01")
-    _make_video_session(datasets, "pick_and_place_20260601_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=with_box)
-    _make_video_session(datasets, "pick_and_place_20260601_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=with_box)
+    _make_video_session(datasets, "pick_and_place_20260601_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=with_box, world_frame_id="world_20260819_031843")
+    _make_video_session(datasets, "pick_and_place_20260601_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=with_box, world_frame_id="world_20260819_031843")
 
     out = export_v3.export_task_to_v3(
         datasets_root=datasets,
@@ -215,7 +216,14 @@ def test_export_task_to_v3_produces_loadable_dataset(tmp_path, with_box):
     item = ds[0]
     assert tuple(item["observation.images.cam_00"].shape)[-2:] == (64, 64)
 
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_20260819_031843"
+
     sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert [e["world_frame_id"] for e in sources["episodes"]] == [
+        "world_20260819_031843",
+        "world_20260819_031843",
+    ]
     assert [e["frames"] for e in sources["episodes"]] == [5, 4]
     assert [e["session"] for e in sources["episodes"]] == [
         "pick_and_place_20260601_101046",
@@ -639,3 +647,55 @@ def test_align_touch_rows_keeps_the_detected_width(tmp_path):
     for column, _, _ in export_v3._TOUCH_ARRAY_COLUMNS:
         assert len(rows[column]) == 3
         assert all(len(row) == 9 for row in rows[column])
+
+
+def test_export_refuses_to_mix_two_world_frames(tmp_path):
+    # Absolute poses from two coordinate systems concatenated into one training
+    # set are wrong in a way no downstream check can see, so the export has to
+    # stop before it writes anything.
+    pytest.importorskip("pyarrow")
+    from tools.thor.gmsl2 import world_provenance as wp
+
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    cams = ("cam_00",)
+    _make_video_session(datasets, "pick_and_place_20260601_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id="world_20260819_031843")
+    _make_video_session(datasets, "pick_and_place_20260601_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id="world_20260901_120000")
+
+    with pytest.raises(wp.MixedWorldError) as excinfo:
+        export_v3.export_task_to_v3(
+            datasets_root=datasets,
+            exports_root=exports,
+            base_name="local/pick_and_place",
+            repo_id="local/pick_and_place",
+            task="pick the cube",
+        )
+
+    assert "world_20260819_031843" in str(excinfo.value)
+    assert "world_20260901_120000" in str(excinfo.value)
+    # Nothing written: the refusal must not leave a half-exported dataset.
+    assert not (exports / "pick_and_place" / "data").exists()
+
+
+def test_export_refuses_stamped_mixed_with_legacy_unstamped(tmp_path):
+    pytest.importorskip("pyarrow")
+    from tools.thor.gmsl2 import world_provenance as wp
+
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    cams = ("cam_00",)
+    _make_video_session(datasets, "pick_and_place_20260601_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id="world_20260819_031843")
+    _make_video_session(datasets, "pick_and_place_20260601_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=False)
+
+    with pytest.raises(wp.MixedWorldError) as excinfo:
+        export_v3.export_task_to_v3(
+            datasets_root=datasets,
+            exports_root=exports,
+            base_name="local/pick_and_place",
+            repo_id="local/pick_and_place",
+            task="pick the cube",
+        )
+
+    assert "<unstamped>" in str(excinfo.value)
