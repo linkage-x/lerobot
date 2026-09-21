@@ -5256,6 +5256,599 @@ def _run_hand_eye_plan(
     }
 
 
+_TRACKER_MOUNT_SUBDIR = Path("outputs") / "laser_tracker"
+
+
+def _tracker_mount_output_root(state: GatewayState) -> Path:
+    root = state.repo_root / _TRACKER_MOUNT_SUBDIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _run_tracker_mount_command(
+    state: GatewayState, args: list[str], *, timeout_s: int = 1800
+) -> dict[str, Any]:
+    """Run ``metrology.cli.fit_tracker_mount`` and hand back its exit code.
+
+    The interpreter probe is the hand-eye one because the requirement is the
+    same: this CLI reads CSV sidecars and a tracker session with numpy and the
+    standard library, nothing else, which is what lets it run on the machine
+    holding the data.
+
+    Exit codes are carried rather than collapsed. ``2`` is a finding about the
+    setup (no dwell survived, the capture cannot determine ``c``), ``1`` is a
+    finding about the fit (it ran, it does not certify) and only ``0`` is
+    "solved and fit to use". A panel that knew only ok/failed would turn the
+    first two into the third.
+    """
+    python = _hand_eye_python(state)
+    command = [str(python), "-m", "metrology.cli.fit_tracker_mount", *args]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        cwd=str(state.repo_root),
+        env=_marker_tcp_tool_env(state),
+        check=False,
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "")[-20000:],
+        "stderr": (proc.stderr or "")[-8000:],
+        "command": command,
+    }
+
+
+def _tracker_mount_rows(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """The capture rows a fit is built from, validated as a group.
+
+    One row is one parked-pose recording: a landed tracker session, the dataset
+    and episode the cameras wrote, and the mount id. The mount id is not
+    cosmetic -- ``fit_station`` pairs poses *within* a mount, because two poses
+    taken across a re-bolting have different lever arms and differencing them
+    constrains nothing. Getting it wrong does not fail loudly; it inflates the
+    apparent conditioning with pairs that carry no information.
+    """
+    raw = payload.get("rows")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("需要至少一行采集：tracker session + 数据集 + episode + mount id")
+    rows: list[dict[str, str]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"第 {i + 1} 行不是对象")
+        session = str(item.get("session") or "").strip()
+        dataset = str(item.get("dataset") or "").strip()
+        episode = str(item.get("episode") or "").strip()
+        mount_id = str(item.get("mountId") or item.get("mount_id") or "").strip()
+        if not session or not dataset or not episode or not mount_id:
+            raise ValueError(f"第 {i + 1} 行缺字段（session / dataset / episode / mountId 都必填）")
+        try:
+            episode_index = int(episode)
+        except ValueError as exc:
+            raise ValueError(f"第 {i + 1} 行 episode 不是整数: {episode!r}") from exc
+        rows.append(
+            {
+                "session": session,
+                "dataset": dataset,
+                "episode": str(episode_index),
+                "mountId": mount_id,
+                "sessionId": str(item.get("sessionId") or item.get("session_id") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _tracker_mount_capture_args(state: GatewayState, rows: list[dict[str, str]]) -> list[str]:
+    args: list[str] = []
+    has_session_ids = any(row["sessionId"] for row in rows)
+    for row in rows:
+        session = _resolve_user_path(state, row["session"])
+        if not session.is_dir():
+            raise FileNotFoundError(f"tracker session 目录不存在: {session}")
+        dataset = _resolve_user_path(state, row["dataset"])
+        if not dataset.is_dir():
+            raise FileNotFoundError(f"数据集目录不存在: {dataset}")
+        args += [
+            "--session", str(session),
+            "--dataset", str(dataset),
+            "--episode", row["episode"],
+            "--mount-id", row["mountId"],
+        ]
+        # --session-id is repeat-once-per-session or absent entirely; a partial
+        # list is refused by the CLI, so fill the blanks rather than send some.
+        if has_session_ids:
+            args += ["--session-id", row["sessionId"] or Path(row["session"]).name]
+    return args
+
+
+def _tracker_mount_result(
+    state: GatewayState, run: dict[str, Any], out_path: Path, *, kind: str
+) -> dict[str, Any]:
+    report: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            report = json.loads(out_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = None
+    tail = (run["stderr"] or "").strip().splitlines()
+    error = "" if run["returncode"] == 0 else (tail[-1] if tail else "tracker mount 解算失败")
+    return {
+        "ok": run["returncode"] == 0,
+        "returncode": run["returncode"],
+        "kind": kind,
+        "report": report,
+        "reportPath": str(out_path) if out_path.is_file() else "",
+        "summary": tail[0] if tail else "",
+        "stdout": run["stdout"],
+        "stderr": run["stderr"],
+        "error": error,
+    }
+
+
+def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit ``T_WG`` across sessions, one lever arm per session.
+
+    This is the fit that needs rotation about two non-parallel axes: differencing
+    two poses removes ``t_WG`` and leaves ``(R_i - R_j) @ c``, so a pure
+    translation pair says nothing about ``c`` at all. The CLI refuses rather than
+    returning a confident-looking answer, and the refusal names the missing
+    motion -- which is why it is surfaced verbatim instead of being reworded.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        args = _tracker_mount_capture_args(state, rows)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"station_{stamp}.json"
+    args = ["station", *args, "--out", str(out_path)]
+    for flag, key in (("--world-frame-id", "worldFrameId"), ("--tracker-station-id", "trackerStationId")):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            args += [flag, value]
+    target = str(payload.get("target") or "").strip()
+    if target:
+        args += ["--target", target]
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    return _tracker_mount_result(state, run, out_path, kind="station")
+
+
+def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit ``c`` alone against a frozen station.
+
+    With ``T_WG`` known the problem is linear and needs no rotation at all, which
+    is what makes a fixed-attitude session usable. ``holdout`` is not decoration:
+    the poses it excludes are scored afterwards, and that held-out score is the
+    only thing separating a lever arm that predicts from one that was fitted to
+    its own noise.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        if len(rows) != 1:
+            raise ValueError("lever-arm 一次只吃一个 session")
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError("需要一个已冻结的 station JSON 路径")
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        args = _tracker_mount_capture_args(state, rows)
+        holdout = int(str(payload.get("holdout") or "0").strip() or "0")
+        if holdout < 0:
+            raise ValueError("holdout 不能为负")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"mount_{stamp}.json"
+    args = ["lever-arm", *args, "--station", str(station), "--out", str(out_path)]
+    if holdout:
+        args += ["--holdout", str(holdout)]
+    target = str(payload.get("target") or "").strip()
+    if target:
+        args += ["--target", target]
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    result = _tracker_mount_result(state, run, out_path, kind="lever_arm")
+    result["stationPath"] = str(station)
+    return result
+
+
+_TRACKER_MOUNT_CAPTURE_KIND = "tracker_mount"
+
+
+def _tracker_mount_capture_root(state: GatewayState, session_name: str) -> Path:
+    """Where parked-pose episodes for a mount fit are written.
+
+    Its own tree under the calibration captures root, for the same reason
+    intrinsics and extrinsics have separate ones: these episodes are a *dwell*
+    capture and are useless as training data, so letting them land in the
+    session dataset would put a minute of a stationary rig into whatever is
+    being collected that day.
+    """
+    return _calibration_captures_root(state) / session_name / _TRACKER_MOUNT_CAPTURE_KIND
+
+
+def _tracker_mount_capture_intent(session_name: str, pose_label: str, seconds: float) -> dict[str, Any]:
+    """Why this episode exists, written where it survives a gateway restart.
+
+    On disk a parked-pose segment and a trajectory segment are the same nine
+    videos. ``purpose`` is what lets the mount fit find its own captures later
+    without the operator remembering which episode index was which.
+    """
+    return {
+        "purpose": "calibration_tracker_mount",
+        "session_id": session_name,
+        "pose_label": pose_label,
+        "protocol": "smr_parked_pose_dwell",
+        "segment_seconds": seconds,
+    }
+
+
+def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Record one parked-pose dwell from the calibration page.
+
+    Deliberately one episode per press rather than a scripted sweep: between
+    dwells a person physically re-orients the rig, and that is the part that
+    determines whether ``c`` is observable at all. A timer that moved on by
+    itself would produce the one failure this fit cannot detect from its own
+    residual -- poses that all look alike.
+    """
+    if state.recording.state in {"idle", "error"}:
+        return {
+            "ok": False,
+            "error": "录制器还没连接。先点上面的「Connect（带跟踪仪）」，等相机和跟踪仪都就绪。",
+        }
+    session_name = str(payload.get("sessionName") or "").strip()
+    if not session_name:
+        return {"ok": False, "error": "缺少 session 名"}
+    pose_label = str(payload.get("poseLabel") or "").strip()
+    try:
+        seconds = float(payload.get("seconds") or 6.0)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "每段时长必须是正数秒"}
+
+    capture_root = _tracker_mount_capture_root(state, session_name)
+    try:
+        _start_episode(
+            state,
+            seconds,
+            capture_root=capture_root,
+            capture_intent=_tracker_mount_capture_intent(session_name, pose_label, seconds),
+            require_capture_root_ack=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "captureRoot": str(capture_root),
+        "episodeIndex": int(state.recording.savedEpisodes),
+        "seconds": seconds,
+    }
+
+
+def _tracker_session_dir_for(dataset: Path, session_id: str) -> Path:
+    """Where the recorder lands a tracker session.
+
+    ``thor_record`` calls ``tracker.stop(land_to=<dataset_root>/laser_tracker)``
+    and the session lands as ``<that>/<session_id>``. Deriving it is the whole
+    reason the calibration panel does not ask anyone to type a path.
+    """
+    return dataset / "laser_tracker" / session_id
+
+
+def _tracker_mount_capture_candidates(state: GatewayState) -> list[Path]:
+    """Datasets that might hold parked-pose episodes, newest first."""
+    roots: list[Path] = []
+    calib_root = _calibration_captures_root(state)
+    if calib_root.is_dir():
+        for session_dir in calib_root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            candidate = session_dir / _TRACKER_MOUNT_CAPTURE_KIND
+            if _is_dataset_root(candidate):
+                roots.append(candidate)
+    if state.datasets_root and state.datasets_root.is_dir():
+        roots.extend(path for path in state.datasets_root.iterdir() if _is_dataset_root(path))
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in roots:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return unique[:40]
+
+
+def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
+    """Every recorded episode that carries a tracker session, with its paths resolved.
+
+    This replaces typing four paths into a form. It reads each episode's own
+    ``meta.json`` rather than a directory convention, because the tracker is
+    enabled per Connect and an episode that is silent about it cannot be told
+    apart later from one where the tracker was asked for and did not answer.
+
+    ``landed`` is the field that decides whether the solve can run at all. The
+    session seals and lands at **Disconnect**, not at the end of an episode, so
+    between the last dwell and Disconnect every row here is correct and none of
+    them is usable -- which is exactly the state an operator needs told.
+    """
+    rows: list[dict[str, Any]] = []
+    for dataset in _tracker_mount_capture_candidates(state):
+        episodes_dir = dataset / "episodes"
+        if not episodes_dir.is_dir():
+            continue
+        for ep_dir in sorted(episodes_dir.iterdir()):
+            meta_path = ep_dir / "meta.json"
+            if not meta_path.is_file():
+                continue
+            meta = _read_json_file(meta_path)
+            if not meta:
+                continue
+            tracker = meta.get("laser_tracker") or {}
+            if not isinstance(tracker, dict) or not tracker.get("enabled"):
+                continue
+            session_id = str(tracker.get("session_id") or "")
+            session_dir = _tracker_session_dir_for(dataset, session_id) if session_id else None
+            intent = meta.get("capture_intent") or {}
+            rows.append(
+                {
+                    "dataset": str(dataset),
+                    "datasetName": dataset.name,
+                    "episode": int(meta.get("episode_index") or 0),
+                    "episodeDir": str(ep_dir),
+                    "sessionId": session_id,
+                    "sessionPath": str(session_dir) if session_dir else "",
+                    # The solve cannot run until Disconnect has sealed and landed
+                    # the session; surfaced rather than discovered as a failure.
+                    "landed": bool(session_dir and session_dir.is_dir()),
+                    "poseLabel": str(intent.get("pose_label") or ""),
+                    "purpose": str(intent.get("purpose") or ""),
+                    "beamValidFraction": float(tracker.get("beam_valid_fraction", -1.0)),
+                    "streamAdvanced": bool(tracker.get("stream_advanced", True)),
+                    "trackerError": str(tracker.get("error") or ""),
+                    "modifiedUnixS": meta_path.stat().st_mtime,
+                }
+            )
+    rows.sort(key=lambda row: row["modifiedUnixS"], reverse=True)
+    return {"ok": True, "episodes": rows[:60]}
+
+
+def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit the mount and grade a trajectory with it, in one press.
+
+    The two steps are chained rather than merged: the fit has to be run on
+    parked poses that are *not* the trajectory being graded, so this passes the
+    fit's own artifact to the comparison instead of sharing state between them.
+    If the fit refuses, the comparison is not attempted -- grading a trajectory
+    against a registration that was declined is how a refusal turns back into a
+    number.
+    """
+    mode = str(payload.get("mode") or "station").strip()
+    if mode == "station":
+        fit = _run_tracker_mount_station(state, payload)
+    elif mode == "lever-arm":
+        fit = _run_tracker_mount_lever_arm(state, payload)
+    else:
+        return {"ok": False, "error": f"未知模式 {mode!r}", "returncode": 2}
+
+    result: dict[str, Any] = {"ok": fit.get("ok", False), "fit": fit, "validate": None}
+    if not fit.get("ok") or not fit.get("reportPath"):
+        result["error"] = fit.get("error") or "拟合没有通过，未继续做 GT 比较"
+        return result
+
+    validate_request = payload.get("validate")
+    if not isinstance(validate_request, dict) or not validate_request:
+        return result
+
+    # A station artifact is a transform, not a lever arm; only a lever-arm fit
+    # can be handed to the comparison as --mount-fit.
+    mount_fit = fit["reportPath"] if mode == "lever-arm" else str(validate_request.get("mountFit") or "")
+    validate = _run_tracker_validate(state, {**validate_request, "mountFit": mount_fit})
+    result["validate"] = validate
+    result["ok"] = bool(fit.get("ok") and validate.get("ok"))
+    if not validate.get("ok"):
+        result["error"] = validate.get("error") or "GT 比较没有通过"
+    return result
+
+
+def _production_exposure_fraction() -> float:
+    """What the recorder actually applied -- not what the CLI defaults to.
+
+    ``validate_against_tracker`` defaults ``--exposure-fraction`` to 0.5, while
+    the recorder ships ``EXPOSURE_CENTER_FRACTION = 0.0`` because the sign has
+    never been measured. Grading at 0.5 would score a trajectory that was never
+    produced: the whole point of this comparison is the labels production wrote,
+    so the default here follows the recorder and is read from the recorder's own
+    module rather than copied, which is how the two would drift apart silently.
+    """
+    try:
+        from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+        return float(lr3.EXPOSURE_CENTER_FRACTION)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _tracker_validate_episode_dir(dataset: Path, episode: int) -> Path | None:
+    """The episode directory holding the Argus sidecars, if it is where it should be.
+
+    Worth auto-filling because leaving it out is not a small degradation: the
+    camera times then come from the dataset's nominal ``N/fps`` grid, which is
+    episode-local and sits up to 55 ms from the hardware SOF. That is a different
+    time base, not a slightly worse one, and a residual computed on it is not
+    comparable with one that used the sidecars.
+    """
+    candidate = dataset / "episodes" / f"episode_{int(episode):06d}"
+    return candidate if candidate.is_dir() else None
+
+
+def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Compare one episode's camera trajectory against the tracker session.
+
+    The artifact lands inside the session directory as
+    ``alignment_ep<N>.json`` -- which is where :func:`_tracker_alignment_payload`
+    already looks -- so running this from the calibration page is what makes the
+    comparison appear on the replay page. Writing it anywhere else would produce
+    a result that exists and cannot be found.
+
+    The response carries the verdict and drops the plot series: the artifact
+    holds up to 4000 points of two trajectories, none of which this panel draws,
+    and the replay page reads the file directly.
+    """
+    try:
+        dataset_raw = str(payload.get("dataset") or "").strip()
+        session_raw = str(payload.get("session") or "").strip()
+        if not dataset_raw or not session_raw:
+            raise ValueError("需要数据集目录和 tracker session 目录")
+        dataset = _resolve_user_path(state, dataset_raw)
+        if not dataset.is_dir():
+            raise FileNotFoundError(f"数据集目录不存在: {dataset}")
+        session = _resolve_user_path(state, session_raw)
+        if not session.is_dir():
+            raise FileNotFoundError(f"tracker session 目录不存在: {session}")
+        episode = int(str(payload.get("episode") or "").strip())
+        mount_fit_raw = str(payload.get("mountFit") or "").strip()
+        mount_fit = None
+        if mount_fit_raw:
+            mount_fit = _resolve_user_path(state, mount_fit_raw)
+            if not mount_fit.is_file():
+                raise FileNotFoundError(f"mount-fit JSON 不存在: {mount_fit}")
+        episode_dir_raw = str(payload.get("episodeDir") or "").strip()
+        if episode_dir_raw:
+            episode_dir = _resolve_user_path(state, episode_dir_raw)
+            if not episode_dir.is_dir():
+                raise FileNotFoundError(f"episode 目录不存在: {episode_dir}")
+        else:
+            episode_dir = _tracker_validate_episode_dir(dataset, episode)
+        exposure_fraction = payload.get("exposureFraction")
+        fraction = (
+            _production_exposure_fraction()
+            if exposure_fraction in (None, "")
+            else float(exposure_fraction)
+        )
+        readout_offset_s = float(payload.get("readoutOffsetS") or 0.0)
+        min_coverage = float(payload.get("minCoverage") or 0.8)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    out_path = session / f"alignment_ep{episode}.json"
+    args = [
+        "--dataset", str(dataset),
+        "--episode", str(episode),
+        "--session", str(session),
+        "--min-coverage", str(min_coverage),
+        "--exposure-fraction", str(fraction),
+        "--readout-offset-s", str(readout_offset_s),
+        "--out", str(out_path),
+    ]
+    target = str(payload.get("target") or "").strip()
+    if target:
+        args += ["--target", target]
+    if mount_fit is not None:
+        args += ["--mount-fit", str(mount_fit)]
+    if episode_dir is not None:
+        args += ["--episode-dir", str(episode_dir)]
+
+    python = _hand_eye_python(state)
+    command = [str(python), "-m", "metrology.cli.validate_against_tracker", *args]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    report: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            report = json.loads(out_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = None
+    if report is not None:
+        report.pop("series", None)
+
+    stderr = (proc.stderr or "")[-8000:]
+    tail = stderr.strip().splitlines()
+    return {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "kind": "validate",
+        "report": report,
+        "reportPath": str(out_path) if out_path.is_file() else "",
+        "summary": tail[0] if tail else "",
+        "episodeDir": str(episode_dir) if episode_dir else "",
+        "exposureFraction": fraction,
+        "stdout": "",  # the artifact is the output; stdout is only "wrote <path>"
+        "stderr": stderr,
+        "error": "" if proc.returncode == 0 else (tail[-1] if tail else "GT 比较失败"),
+    }
+
+
+def _tracker_mount_artifact_summary(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload.pop("capture", None)  # per-dwell diagnostics; large and not for the panel
+    return {
+        "path": str(path),
+        "name": path.name,
+        "modifiedUnixS": path.stat().st_mtime,
+        "report": payload,
+    }
+
+
+def _tracker_mount_payload(state: GatewayState) -> dict[str, Any]:
+    """The artifacts on disk, newest first, so the panel opens with a state.
+
+    Listed rather than remembered in process memory: these fits outlive the
+    gateway, a station is explicitly meant to be reused across sessions, and a
+    panel that forgot them on restart would invite refitting a constant of the
+    room for no reason.
+    """
+    root = state.repo_root / _TRACKER_MOUNT_SUBDIR
+    stations: list[dict[str, Any]] = []
+    mounts: list[dict[str, Any]] = []
+    if root.is_dir():
+        for path in sorted(root.glob("station_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                stations.append(summary)
+        for path in sorted(root.glob("mount_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                mounts.append(summary)
+    stations.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    mounts.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    return {
+        "ok": True,
+        "root": str(root),
+        "stations": stations[:20],
+        "mounts": mounts[:20],
+    }
+
+
 def _newest_calibration_dataset(state: GatewayState) -> Path | None:
     """Most recent extrinsics sweep, newest layout first.
 
@@ -13590,6 +14183,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
             return
+        if path == "/api/calibration/tracker-mount":
+            _json_response(self, HTTPStatus.OK, _tracker_mount_payload(self.server.state))
+            return
+        if path == "/api/calibration/tracker-mount/captures":
+            _json_response(self, HTTPStatus.OK, _tracker_mount_discover(self.server.state))
+            return
         if path == "/api/calibration/marker-tcp":
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, {"ok": True, "markerTcp": _marker_tcp_session_payload(self.server.state)})
@@ -14201,6 +14800,30 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     # A refusal is a real answer here, not a server error: the
                     # report is written either way and the panel renders the
                     # verdict, so this stays 200 and carries returncode.
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/station":
+                    result = _run_tracker_mount_station(self.server.state, _read_json_body(self))
+                    # A refusal is an answer about the capture, not a server
+                    # fault: the panel renders which refusal it was, so the
+                    # returncode has to survive the transport.
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/lever-arm":
+                    result = _run_tracker_mount_lever_arm(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/record":
+                    result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/tracker-mount/chain":
+                    result = _run_tracker_mount_chain(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/validate":
+                    result = _run_tracker_validate(self.server.state, _read_json_body(self))
                     _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/calibration/hand-eye/plan":

@@ -7,6 +7,8 @@
 > 2026-07-13 按最近 8 次同步相关改动校订：生产默认相机路径切到 `argus_online_sync`，SOF full-cluster 在 encoder 前对齐；新增 online frame bus / preview bus / replay 多视频同步说明。
 > 2026-07-29 实施 IMU 姿态去冗余（§9.1.1 / 原 §10 P2）：删 `rpy`、quat 改 xyzw，`observation.state` 31 → 28 维；四元数半球用 213 条真机 IMU 流实测后决定**不强制**。同日核对后关闭原 §10 P0（replay 修复的 Thor 部署）。
 > 2026-08-25 新增 §5.5（BOX↔相机残余偏移首次实测 +4.4 ms，gyro↔vision 互相关；同时更正当前固件的传感器实际速率为 520/244/120/60 Hz）；§5.2 的 MCU→host 回归改为去均值形式（原写法在真实量级上有 0.107 ms RMS 的数值误差）
+> 2026-09-21 `camera_frame_times_rel` 的曝光项改为**逐帧跨相机中位数**（原先取 glob 排序第一台相机的曝光,等于让文件名顺序决定共享时间线;本 rig 排最前的 cam_01/02/03 恰好有流但未标定）。残差地板由新的 `camera_exposure_spread` 写进 `meta.json.box_camera_alignment.cross_camera_exposure`。见 §5.4 时间线框图。
+> 2026-09-21 订正 §3「注意事项」的曝光-周期约束：约束项是 `exposure_us` 单项，不含读出时间（AR0234C 全局快门 + 存储节点，读出与下一帧积分重叠；实测 readout 14.68 ms 与 AE 曝光 8.7 ms 之和已超周期而帧率不掉）。同步订正 `gmsl2/README.md`、`gmsl2_record.py`。
 
 ## 1. 系统总览
 
@@ -109,7 +111,9 @@ hardware_sync:
 
 ### 注意事项
 
-- **曝光时间约束**：slave mode 下 `exposure_us + readout_time` 必须 < PWM 周期，否则 AR0234 回退到 ~0.8fps。录制器自动 clamp 到 `0.85 × (1e6 / fps)` = 14,166 μs
+- **曝光时间约束**：slave mode 下 `exposure_us` 必须 < PWM 周期，否则 AR0234 回退到 ~0.8 fps。录制器自动 clamp 到 `0.85 × (1e6 / fps)` = 14,166 μs。
+  - **约束项里没有读出时间**（2026-09-21 订正，原文写的是 `exposure_us + readout_time < 周期`）。AR0234C 是全局快门、带独立存储节点，读出与下一帧积分流水线重叠：实测 `EOF − SOF` = 14.677–14.686 ms（九路相机逐帧恒定，曝光变它不变，所以它是读出/CSI 传输而非积分窗口），而 AE 实际曝光 ≈ 8.7 ms（2026-09-11 运动模糊反推）下帧率稳定 60 fps。两者之和 23.4 ms 已远超 16.67 ms 周期 —— 若约束真是 `exposure + readout`，任何 > 2 ms 的曝光都该掉速。原写法是当时为「15000 µs 掉到 0.8 fps」现象编的解释（见 `gmsl2/EXPERIMENT_LOG.md` E22 的「不足行扫描读出时间」），不是实测，且与实测的读出时长自相矛盾。
+  - **边界本身仍未测**：已知 `exposure_us=9999` 稳定 60 fps、`exposure_us=15000` 掉到 ~0.8 fps，阈值落在 10–15 ms 之间某处。14,166 µs 的 clamp 正落在这段未测区间内，是留余量选的数，不是算出来的界。
 - **spawn stagger / legacy 路径**：旧 `gstreamer_splitmux` 路径中，11 路 `nvarguscamerasrc` 同时初始化会触发 Argus ISP 的 NVMM buffer 分配竞争（`NvBufSurfaceFromFd Failed`），需错开 1.0s 逐路启动。这不影响 PWM 物理触发，只影响各路开始落盘的起始帧。生产默认 `argus_online_sync` 改为 recorder 内部统一打开 Argus stream，并以 SOF full cluster 作为保存边界。
 
 ### 3.2 Encoder 前 SOF full-cluster gate（生产默认）
@@ -412,18 +416,29 @@ Stop / auto-duration
        ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
        ├─ parquet timestamp 网格 = logical_frame_index / fps（loader 共享网格,不变）
        ├─ BOX 最近邻查找目标 = 每帧采样时刻
-       │    = (sensor_timestamp_ns/1e9 + exposure_fraction×sensor_exposure_time_ns/1e9
+       │    = (sensor_timestamp_ns/1e9 + exposure_fraction×E_median[N]
        │       + readout_offset_s) − t0_mono_s
        │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4;
        │      SOF 不是曝光中点,但符号未测定 → exposure_fraction **默认 0.0:只记录曝光列,不施加**。
        │      符号错会把姿态相关残差从 0.5·δE 放大到 1.0·δE,和"不修"同期望、双倍最坏;
        │      用 resolve_frame_time_semantics.py 对一段普通 AE 录制回归出符号后再改成 ±0.5）
+       │    E_median[N] = 该帧**跨相机曝光中位数**（2026-09-21;原先取 glob 排序第一台相机的曝光）。
+       │      一条融合位姿只带一个时间,所以逐帧只能有一个曝光项代表全部相机,各相机必留
+       │      fraction×(E_median − E_k) 残差 —— 但用哪台代表是个选择,不该由文件名顺序决定
+       │      （本 rig 的 cam_01/02/03 有流但未标定,不产出位姿,恰好排在最前）。中位数对单台
+       │      AE 抖动鲁棒且最小化残差和。SOF 锚点仍取单台 sidecar:PWM slave 下跨相机 SOF
+       │      锁在亚微秒,谁来定帧时刻都一样,相机之间只有曝光不同。
+       │      exposure_fraction=0 时跳过读全部 sidecar（该项恒为 0,不花这个钱）。
        │    sidecar 空洞/短尾按 SOF 线性拟合外推（单一时间基准,不与 N/fps 拼接,外推帧数会 warn）
-       │    无 exposure 列的旧 sidecar 读 0,逐帧结果与修正前逐位相同
+       │    无 exposure 列的旧 sidecar 读 0,逐帧结果与修正前逐位相同;某台没有该列不会把中位数拉向 0
        ├─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
        └─ meta.json.box_camera_alignment 记 mode / reference / exposure_fraction /
             readout_offset_s / exposure_correction_ms / mean_skew_ms / skew_jitter_ms /
             frames_with_sof（可审计:公式与它在本 episode 实际移动了多少 ms 都在里面）
+            + cross_camera_exposure（camera_exposure_spread:逐帧 |E_median − E_k| 的
+            p50/p95/max,单位 ms,**未乘 fraction**）。这一项不是"还没施加的修正"而是**地板**:
+            它不是时钟误差,再怎么对时也够不着,只有把各相机曝光拉齐才消得掉。趁 sidecar 还在
+            逐 episode 量下来,免得进了档案之后被默认当作"很小"。
 ```
 
 保存 gate：`online_sync_manifest.ok` 必须为 true，且所有 active camera 的 `frame_count_by_camera` 一致；`missing_frame_policy=fail_episode` 时 recording window 内缺 full cluster 会丢弃该 episode。

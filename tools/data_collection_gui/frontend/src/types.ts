@@ -1202,3 +1202,220 @@ export type TrackerAlignment =
         observability?: { fixed_attitude?: boolean; rotation_span_deg?: number } | null;
       } | null;
     };
+
+// --- Laser tracker station + SMR lever arm (metrology.tracker_mount_fit) ---
+//
+// The shapes mirror the solver's artifacts rather than flattening them, because
+// what the panel has to render is *which* claim a fit is entitled to make, and
+// that lives in the nested observability / sigma / attitude blocks.
+
+export type TrackerMountObservability = {
+  n_poses: number;
+  station_frozen: boolean;
+  ok: boolean;
+  rotation_span_deg: number;
+  fixed_attitude: boolean;
+  c_gain_min: number;
+  c_gain_max: number;
+  c_gain_min_equiv_deg: number;
+  c_sigma_amplification: number;
+  planarity: number | null;
+  extent_m: number | null;
+  reasons: string[];
+};
+
+export type TrackerMountSigma = {
+  num_resamples: number;
+  c_sigma_mm: number[] | null;
+  c_sigma_norm_mm: number | null;
+  rotation_sigma_deg: number | null;
+  translation_sigma_mm: number | null;
+  note: string;
+};
+
+/** Structure of the per-pose lever arms in attitude -- the mount-rigidity check. */
+export type TrackerAttitudeDependence = {
+  n_poses: number;
+  explained_frac: number;
+  null_explained_frac: number;
+  slope_mm_per_deg: number;
+  rotation_span_deg: number;
+  structured: boolean;
+};
+
+export type TrackerStationSession = {
+  session_id: string;
+  mount_id: string;
+  c_m: number[];
+  lever_arm_mm: number;
+  attitude: TrackerAttitudeDependence | null;
+};
+
+export type TrackerStationReport = {
+  T_world_tracker: number[][];
+  world_frame_id: string;
+  tracker_station_id: string;
+  sessions: TrackerStationSession[];
+  n_poses_total: number;
+  iterations: number;
+  rms_mm: number;
+  registration_rms_mm: number;
+  leave_one_out_max_mm: number;
+  attitude_structured: boolean | null;
+  scale_diagnostic: number;
+  scale_error_ppm: number;
+  scale_applied: boolean;
+  observability: TrackerMountObservability;
+  sigma: TrackerMountSigma;
+  certifies_marker_to_tcp: boolean;
+};
+
+export type TrackerMountReport = {
+  mount_id: string;
+  session_id: string;
+  c_m: number[];
+  lever_arm_mm: number;
+  rotation_sensitivity_mm_per_deg: number;
+  T_world_tracker: number[][];
+  station_fitted: boolean;
+  n_poses: number;
+  rms_mm: number;
+  max_mm: number;
+  holdout_rms_mm: number | null;
+  per_pose_c_spread_mm: number;
+  attitude: TrackerAttitudeDependence | null;
+  observability: TrackerMountObservability;
+  sigma: TrackerMountSigma;
+  absorbed_modes: string[];
+  certifies: boolean;
+  certifies_marker_to_tcp: boolean;
+};
+
+export type TrackerMountArtifact = {
+  path: string;
+  name: string;
+  modifiedUnixS: number;
+  report: TrackerStationReport | TrackerMountReport;
+};
+
+export type TrackerMountListResponse = {
+  ok: boolean;
+  root?: string;
+  stations?: TrackerMountArtifact[];
+  mounts?: TrackerMountArtifact[];
+  error?: string;
+};
+
+export type TrackerMountCaptureRow = {
+  session: string;
+  dataset: string;
+  episode: string;
+  mountId: string;
+  sessionId?: string;
+};
+
+export type TrackerMountSolveResponse = {
+  ok: boolean;
+  returncode?: number;
+  kind?: "station" | "lever_arm";
+  report?: TrackerStationReport | TrackerMountReport | null;
+  reportPath?: string;
+  stationPath?: string;
+  summary?: string;
+  stdout?: string;
+  stderr?: string;
+  error?: string;
+};
+
+// --- GT comparison: camera trajectory vs tracker (validate_against_tracker) ---
+
+export type TrackerErrorStats = {
+  count: number;
+  mean_mm?: number;
+  rms_mm?: number;
+  p50_mm?: number;
+  p95_mm?: number;
+  max_mm?: number;
+};
+
+export type TrackerValidateSummary = {
+  n_paired: number;
+  n_camera_frames: number;
+  coverage: number;
+  residual_mm: TrackerErrorStats;
+  /** Split by speed, because that is the axis a timing error lives on. */
+  strata: Record<string, TrackerErrorStats>;
+  clock: Record<string, unknown>;
+  registration: { source?: string; absorbed_modes?: string[]; certifies_space?: boolean };
+  lever_arm_mm: number[];
+  rotation_sensitivity_mm_per_deg: number;
+  interp_error_mm_bound: number;
+  time_crosscheck_s: number | null;
+  certifies_space: boolean;
+};
+
+export type TrackerValidateReport = {
+  dataset: string;
+  episode: number;
+  target: string;
+  sidecar: string;
+  summary: TrackerValidateSummary;
+  min_coverage: number;
+  lever_arm_m: number[];
+  mount_fit: Record<string, unknown> | null;
+  /** "argus_sidecar_sof_plus_exposure" or "dataset_nfps_grid_episode_local". */
+  camera_time_base: string;
+};
+
+export type TrackerValidateResponse = {
+  ok: boolean;
+  returncode?: number;
+  kind?: "validate";
+  report?: TrackerValidateReport | null;
+  reportPath?: string;
+  summary?: string;
+  episodeDir?: string;
+  exposureFraction?: number;
+  stderr?: string;
+  error?: string;
+};
+
+// --- One-click tracker-mount capture: record -> discover -> solve -----------
+
+export type TrackerMountCapture = {
+  dataset: string;
+  datasetName: string;
+  episode: number;
+  episodeDir: string;
+  sessionId: string;
+  sessionPath: string;
+  /** The session seals and lands at Disconnect, not at the end of an episode. */
+  landed: boolean;
+  poseLabel: string;
+  purpose: string;
+  beamValidFraction: number;
+  streamAdvanced: boolean;
+  trackerError: string;
+  modifiedUnixS: number;
+};
+
+export type TrackerMountCaptureListResponse = {
+  ok: boolean;
+  episodes?: TrackerMountCapture[];
+  error?: string;
+};
+
+export type TrackerMountRecordResponse = {
+  ok: boolean;
+  captureRoot?: string;
+  episodeIndex?: number;
+  seconds?: number;
+  error?: string;
+};
+
+export type TrackerMountChainResponse = {
+  ok: boolean;
+  fit?: TrackerMountSolveResponse | null;
+  validate?: TrackerValidateResponse | null;
+  error?: string;
+};

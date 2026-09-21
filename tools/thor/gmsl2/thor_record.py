@@ -603,6 +603,7 @@ def _box_camera_alignment_summary(
     raw_frame_times_s: list[float | None] | None = None,
     exposure_fraction: float = lr3.EXPOSURE_CENTER_FRACTION,
     readout_offset_s: float = lr3.READOUT_OFFSET_S,
+    exposure_spread: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Episode-level record of how BOX state was time-aligned to the cameras.
 
@@ -625,6 +626,14 @@ def _box_camera_alignment_summary(
     makes it reversible in either direction: an episode recorded under a default
     that later turns out to be wrong can be re-derived from this block plus the
     per-frame exposures in its sidecars, without re-recording.
+
+    ``exposure_spread`` (:func:`lr3.camera_exposure_spread`) is the part that
+    re-deriving cannot fix.  The exposure term is one number per frame for a
+    timeline the cameras share, so it is taken as their per-frame median and each
+    camera keeps ``fraction * (E_median - E_k)``.  That is a floor rather than a
+    correction waiting to be applied, and a floor is exactly the kind of thing
+    that gets assumed small once the episode is in the archive -- so it is
+    measured here, per episode, while the sidecars are still at hand.
     """
     if not frame_times_s:
         return {
@@ -641,12 +650,13 @@ def _box_camera_alignment_summary(
         return {"mode": "n_over_fps_grid", "frames_with_sof": 0}
     mean = sum(deltas) / len(deltas)
     jitter = (sum((d - mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
-    return {
+    summary: dict[str, Any] = {
         "mode": "sensor_timestamp_sof",
         "reference": (
-            "(sensor_timestamp_ns/1e9 + exposure_fraction*sensor_exposure_time_ns/1e9"
+            "(sensor_timestamp_ns/1e9 + exposure_fraction*median_k(sensor_exposure_time_ns[k])/1e9"
             " + readout_offset_s) - t0_mono_s; sensor_timestamp_ns is the hardware SOF"
-            " (CLOCK_MONOTONIC)"
+            " (CLOCK_MONOTONIC) and the exposure is the per-frame median across cameras,"
+            " since one fused pose carries one time"
         ),
         "exposure_fraction": float(exposure_fraction),
         "readout_offset_s": float(readout_offset_s),
@@ -656,6 +666,9 @@ def _box_camera_alignment_summary(
         "frames_with_sof": len(deltas),
         "frames_total": len(frame_times_s),
     }
+    if exposure_spread is not None:
+        summary["cross_camera_exposure"] = exposure_spread
+    return summary
 
 
 def _exposure_correction_ms(
@@ -2152,7 +2165,9 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup_duration_s": cleanup_duration_s,
                     "split_emit_ms": split_emit_ms,
                     "box_camera_alignment": _box_camera_alignment_summary(
-                        frame_times, cfg.cameras.fps, raw_frame_times_s=raw_frame_times
+                        frame_times, cfg.cameras.fps,
+                        raw_frame_times_s=raw_frame_times,
+                        exposure_spread=lr3.camera_exposure_spread(ep_dir),
                     ),
                 }
                 if frame_sync_payload is not None:

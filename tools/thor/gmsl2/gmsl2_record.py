@@ -638,9 +638,18 @@ def _resolve_sdk_path(sdk_dir: str, repo_root: Path) -> Path:
 def _clamp_exposure_for_pwm_period(cfg: RecorderConfig) -> None:
     """Cap ``cameras.exposure_us`` so the sensor doesn't miss PWM triggers.
 
-    AR0234 in slave mode (`trig_mode=1`) requires `exposure + readout` to fit
-    within one PWM period. Going over makes the sensor drop to ~0.8 fps. We
-    clamp to `exposure_period_fraction_max * period_us` and warn loudly.
+    AR0234 in slave mode (`trig_mode=1`) requires the *exposure* to fit within
+    one PWM period. Going over makes the sensor drop to ~0.8 fps. We clamp to
+    `exposure_period_fraction_max * period_us` and warn loudly.
+
+    Readout is not part of that budget (corrected 2026-09-21; this docstring
+    used to say `exposure + readout`). AR0234C is global shutter with a storage
+    node, so readout overlaps the next frame's integration: `EOF - SOF` measures
+    14.68 ms and is flat while auto-exposure swings, and an ~8.7 ms AE exposure
+    still holds 60 fps -- 8.7 + 14.68 = 23.4 ms, well past the 16.67 ms period.
+    The cap is a margin, not a derived bound: 9999 us is known good, 15000 us is
+    known bad, and 0.85 * period = 14166 us sits in that untested gap. See
+    `README.md` (Exposure-vs-period constraint) and `../ts_sync.md` section 3.
 
     No-op in free-run mode -- the sensor uses its own internal timing.
     """

@@ -731,6 +731,106 @@ EXPOSURE_CENTER_FRACTION = 0.0
 READOUT_OFFSET_S = 0.0
 
 
+def _median(values: list[float]) -> float:
+    """Median of a non-empty list; even counts average the two middle values."""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _percentile(ordered: list[float], q: float) -> float:
+    """Nearest-rank percentile of an already-sorted list."""
+    if not ordered:
+        return 0.0
+    k = int(math.ceil(q * len(ordered))) - 1
+    return ordered[max(0, min(len(ordered) - 1, k))]
+
+
+def _exposures_by_frame_s(ep_dir: Path) -> dict[int, list[float]]:
+    """Every camera's exposure for each ``logical_frame_index``, in seconds.
+
+    Non-positive, absent and unparseable exposures are *dropped* rather than
+    read as zero.  A sidecar written before the exposure column existed must not
+    pull the cross-camera median toward zero for the cameras that do carry one:
+    "this camera did not say" and "this camera integrated for 0 s" are different
+    facts, and only the second one belongs in a median.
+    """
+    by_frame: dict[int, list[float]] = {}
+    for path in sorted(ep_dir.glob("cam_*.argus_frame_metadata.csv")):
+        try:
+            with path.open(newline="") as f:
+                for row in csv.DictReader(f):
+                    try:
+                        n = int(row["logical_frame_index"])
+                        exposure_ns = float(row.get("sensor_exposure_time_ns") or 0.0)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if exposure_ns > 0.0:
+                        by_frame.setdefault(n, []).append(exposure_ns / 1e9)
+        except (OSError, csv.Error):
+            continue
+    return by_frame
+
+
+def camera_exposure_spread(ep_dir: Path) -> dict[str, Any] | None:
+    """The residual the cross-camera median exposure cannot remove, in ms.
+
+    One fused pose carries one time, so the shared BOX timeline gets exactly one
+    exposure term per frame and :func:`camera_frame_times_rel` takes the
+    per-frame cross-camera *median* for it.  Every camera then keeps a
+    ``exposure_fraction * (E_median - E_k)`` residual.  That residual is a floor:
+    it is not a clock error, so no clock work reaches it, and only equalising the
+    exposures removes it.
+
+    This reports ``|E_median - E_k|`` *before* the fraction, so the number stays
+    meaningful while ``EXPOSURE_CENTER_FRACTION`` is still 0.0 -- it is what a
+    future non-zero fraction would leave behind, recorded now, per episode, so it
+    can be priced from the archive instead of assumed small.  Multiplying it by
+    ``fraction * speed`` turns it into millimetres; ``check_exposure_timing.py``
+    does that interactively with a speed attached, and also covers the blur and
+    within-window terms that this one deliberately does not.
+
+    ``None`` when no sidecar in the directory carries an exposure column, which
+    is the pre-column / legacy case rather than a finding.
+    """
+    by_frame = _exposures_by_frame_s(ep_dir)
+    if not by_frame:
+        return None
+    devs_ms: list[float] = []
+    medians_ms: list[float] = []
+    for exposures in by_frame.values():
+        med = _median(exposures)
+        medians_ms.append(med * 1000.0)
+        devs_ms.append(max(abs(e - med) for e in exposures) * 1000.0)
+    devs_ms.sort()
+    medians_ms.sort()
+    return {
+        "note": (
+            "one fused pose carries one time: the shared timeline is corrected by the"
+            " per-frame cross-camera median exposure, so camera k keeps"
+            " exposure_fraction*(E_median - E_k). Reported before the fraction."
+        ),
+        "frames": len(by_frame),
+        "cameras_per_frame": {
+            "min": min(len(v) for v in by_frame.values()),
+            "max": max(len(v) for v in by_frame.values()),
+        },
+        "median_exposure_ms": {
+            "p50": round(_percentile(medians_ms, 0.50), 3),
+            "min": round(medians_ms[0], 3),
+            "max": round(medians_ms[-1], 3),
+        },
+        "abs_dev_from_median_ms": {
+            "p50": round(_percentile(devs_ms, 0.50), 3),
+            "p95": round(_percentile(devs_ms, 0.95), 3),
+            "max": round(devs_ms[-1], 3),
+        },
+    }
+
+
 def camera_frame_times_rel(
     ep_dir: Path,
     t0_mono_s: float | None,
@@ -744,8 +844,12 @@ def camera_frame_times_rel(
     same ``time.monotonic()`` origin)::
 
         time[N] = (sensor_timestamp_ns[N] / 1e9
-                   + exposure_fraction * sensor_exposure_time_ns[N] / 1e9
+                   + exposure_fraction * exposure_s[N]
                    + readout_offset_s) - t0_mono_s
+
+    where ``exposure_s[N]`` is the cross-camera *median* exposure of frame ``N``
+    when ``camera is None`` (the shared-timeline case, see below) and that one
+    camera's own exposure when a ``camera`` is named.
 
     ``sensor_timestamp_ns`` is the Argus/V4L2 kernel **start-of-frame (SOF)**
     timestamp (``getSensorTimestamp``, CLOCK_MONOTONIC) — the same clock as the
@@ -767,10 +871,29 @@ def camera_frame_times_rel(
     ``exposure_fraction`` defaults to :data:`EXPOSURE_CENTER_FRACTION`, which is
     ``0.0``: the exposure is recorded, the shift is not applied, and the caller
     has to ask for it.  See that constant for why applying an unmeasured sign is
-    worse than applying nothing.  Note also that with ``camera=None`` this reads
-    whichever sidecar sorts first, so the correction it would apply is *that*
-    camera's exposure on every frame of the shared BOX timeline; under
-    auto-exposure the others keep a ``fraction * (E_first - E_k)`` residual.
+    worse than applying nothing.
+
+    With ``camera=None`` the exposure term is the per-frame *median* across every
+    sidecar in the episode, not the one camera that happens to sort first.  There
+    is one BOX timeline and one fused pose carries one time, so some single
+    exposure per frame has to stand for all of them and each camera keeps a
+    ``fraction * (E_median - E_k)`` residual either way -- but which value stands
+    for them is a choice, and glob order is the wrong one to make it with.  The
+    median is robust to one camera's AE spiking (a single outlier moves it by
+    nothing), it minimises the summed residual, and it does not hand the shared
+    timeline to ``cam_01``, which on this rig is one of the three cameras that
+    stream but are not calibrated and so contribute no pose at all.  The SOF
+    anchor still comes from a single sidecar, which costs nothing: PWM slave mode
+    locks the cameras' SOF to sub-microsecond, so any of them dates the frame
+    equally well -- it is only the exposure that differs between them.
+    :func:`camera_exposure_spread` measures the residual that is left, and the
+    recorder writes it into the episode's ``meta.json``.
+
+    Naming a ``camera`` keeps that camera's own exposure: an explicit request is
+    a question about that camera, not about the shared timeline.  Reading every
+    sidecar is skipped entirely when ``exposure_fraction`` is 0, where the term
+    is zero however it is computed -- which is today's shipped default, so this
+    changes no production read until the sign is measured.
 
     Frames whose sidecar carries no exposure column read 0 and are therefore
     left exactly where they were, so pre-column episodes load unchanged.
@@ -792,6 +915,15 @@ def camera_frame_times_rel(
     """
     if not t0_mono_s:
         return None
+    # The exposure term belongs to the timeline, not to whichever sidecar sorts
+    # first, so it is taken across all of them.  Guarded on a non-zero fraction:
+    # at 0.0 the term vanishes whatever it is, and reading 9 sidecars to
+    # multiply them by zero is pure cost.
+    median_exposure_s: dict[int, float] | None = None
+    if camera is None and exposure_fraction:
+        median_exposure_s = {
+            n: _median(v) for n, v in _exposures_by_frame_s(ep_dir).items()
+        }
     candidates: list[Path] = []
     if camera is not None:
         candidates.append(ep_dir / f"{camera}.argus_frame_metadata.csv")
@@ -815,9 +947,17 @@ def camera_frame_times_rel(
                     except (ValueError, TypeError):
                         exposure_ns = 0.0
                     if sof > 0:
+                        # A frame absent from the median map (no camera reported
+                        # an exposure for it) reads 0.0 and stays exactly where
+                        # it was, same as the pre-column case just above.
+                        exposure_s = (
+                            max(exposure_ns, 0.0) / 1e9
+                            if median_exposure_s is None
+                            else median_exposure_s.get(n, 0.0)
+                        )
                         by_frame[n] = (
                             sof / 1e9
-                            + exposure_fraction * max(exposure_ns, 0.0) / 1e9
+                            + exposure_fraction * exposure_s
                             + readout_offset_s
                             - float(t0_mono_s)
                         )

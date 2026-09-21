@@ -5441,3 +5441,493 @@ def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(
     assert anchor["points"] == observed[0]["points"]
     assert facet["color"] == "#ef4444"
     assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])
+
+
+# --------------------------------------------------------------------------- #
+# tracker mount: T_WG + the SMR lever arm c, surfaced in the calibration centre
+# --------------------------------------------------------------------------- #
+
+
+def _tracker_mount_state(tmp_path: Path) -> gateway.GatewayState:
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+
+
+def _tracker_mount_row(tmp_path: Path, *, mount_id: str = "plate_v1", episode: int = 3) -> dict:
+    session = tmp_path / "outputs" / "laser_tracker" / f"sess_{mount_id}"
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    session.mkdir(parents=True, exist_ok=True)
+    dataset.mkdir(parents=True, exist_ok=True)
+    return {
+        "session": str(session),
+        "dataset": str(dataset),
+        "episode": episode,
+        "mountId": mount_id,
+    }
+
+
+def test_tracker_mount_rows_refuse_a_row_that_cannot_name_its_mount(tmp_path):
+    """The mount id is load-bearing, not a label.
+
+    ``fit_station`` pairs poses within a mount because two poses taken across a
+    re-bolting have different lever arms, so differencing them constrains
+    nothing. A blank id does not fail loudly later -- it silently inflates the
+    apparent conditioning with pairs that carry no information.
+    """
+    row = _tracker_mount_row(tmp_path)
+    row["mountId"] = ""
+    with pytest.raises(ValueError, match="mountId"):
+        gateway._tracker_mount_rows({"rows": [row]})
+
+
+def test_tracker_mount_rows_refuse_an_empty_capture(tmp_path):
+    with pytest.raises(ValueError, match="至少一行"):
+        gateway._tracker_mount_rows({"rows": []})
+
+
+def test_tracker_mount_rows_refuse_a_non_integer_episode(tmp_path):
+    row = _tracker_mount_row(tmp_path)
+    row["episode"] = "latest"
+    with pytest.raises(ValueError, match="episode"):
+        gateway._tracker_mount_rows({"rows": [row]})
+
+
+def test_tracker_mount_args_repeat_every_flag_once_per_row(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    rows = gateway._tracker_mount_rows(
+        {"rows": [_tracker_mount_row(tmp_path, mount_id="a"), _tracker_mount_row(tmp_path, mount_id="b")]}
+    )
+    args = gateway._tracker_mount_capture_args(state, rows)
+    assert args.count("--session") == 2
+    assert args.count("--dataset") == 2
+    assert args.count("--episode") == 2
+    assert args.count("--mount-id") == 2
+    assert "a" in args and "b" in args
+
+
+def test_tracker_mount_session_ids_are_all_or_nothing(tmp_path):
+    """The CLI refuses a partial ``--session-id`` list, so a half-filled form
+    must not produce one. Filling the blank from the directory name keeps the
+    repeat count right without inventing an identity."""
+    state = _tracker_mount_state(tmp_path)
+    first = _tracker_mount_row(tmp_path, mount_id="a")
+    first["sessionId"] = "20260921_a"
+    second = _tracker_mount_row(tmp_path, mount_id="b")
+    rows = gateway._tracker_mount_rows({"rows": [first, second]})
+    args = gateway._tracker_mount_capture_args(state, rows)
+    assert args.count("--session-id") == 2
+    assert "20260921_a" in args
+    assert "sess_b" in args  # filled from the directory name, not left blank
+
+    plain = gateway._tracker_mount_rows({"rows": [_tracker_mount_row(tmp_path, mount_id="c")]})
+    assert "--session-id" not in gateway._tracker_mount_capture_args(state, plain)
+
+
+def test_tracker_mount_station_refuses_a_missing_session_without_running(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+    row["session"] = str(tmp_path / "outputs" / "laser_tracker" / "no_such_session")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the CLI must not be started for an input error")
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", _boom)
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert result["ok"] is False
+    # 2 is "a finding about the setup", which is what a missing directory is.
+    assert result["returncode"] == 2
+    assert "不存在" in result["error"]
+
+
+def test_tracker_mount_carries_the_refusal_code_instead_of_collapsing_it(tmp_path, monkeypatch):
+    """1 and 2 mean different things and the panel has to be able to say which.
+
+    2 is "this capture cannot determine c" -- go rotate about a second axis. 1 is
+    "it fitted and does not certify" -- the numbers are there to read. Collapsing
+    both into ok=false would send an operator to re-record data that is fine.
+    """
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_command",
+        lambda *a, **k: {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "station over 1 session(s), 18 poses; rms 0.412 mm\n",
+            "command": [],
+        },
+    )
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert result["ok"] is False
+    assert result["returncode"] == 1
+    assert "rms 0.412" in result["summary"]
+
+
+def test_tracker_mount_payload_lists_artifacts_newest_first_without_the_dwell_dump(tmp_path):
+    """The per-dwell diagnostics stay on disk.
+
+    They are the biggest part of the artifact and none of it is what a panel
+    shows; shipping them would make every poll of the calibration page carry a
+    capture log.
+    """
+    state = _tracker_mount_state(tmp_path)
+    root = tmp_path / "outputs" / "laser_tracker"
+    root.mkdir(parents=True)
+    (root / "station_20260920_120000.json").write_text(
+        json.dumps({"rms_mm": 0.08, "capture": [{"windows_found": 40}]})
+    )
+    (root / "station_20260921_090000.json").write_text(json.dumps({"rms_mm": 0.05}))
+    (root / "mount_20260921_093000.json").write_text(json.dumps({"lever_arm_mm": 161.0}))
+    os.utime(root / "station_20260920_120000.json", (1_700_000_000, 1_700_000_000))
+    os.utime(root / "station_20260921_090000.json", (1_700_100_000, 1_700_100_000))
+
+    payload = gateway._tracker_mount_payload(state)
+    assert payload["ok"] is True
+    assert [item["name"] for item in payload["stations"]] == [
+        "station_20260921_090000.json",
+        "station_20260920_120000.json",
+    ]
+    assert "capture" not in payload["stations"][1]["report"]
+    assert payload["stations"][1]["report"]["rms_mm"] == 0.08
+    assert [item["name"] for item in payload["mounts"]] == ["mount_20260921_093000.json"]
+
+
+def test_tracker_mount_payload_is_empty_not_broken_before_any_fit(tmp_path):
+    payload = gateway._tracker_mount_payload(_tracker_mount_state(tmp_path))
+    assert payload == {
+        "ok": True,
+        "root": str(tmp_path / "outputs" / "laser_tracker"),
+        "stations": [],
+        "mounts": [],
+    }
+
+
+def _validate_payload(tmp_path: Path, **over) -> dict:
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    (dataset / "episodes" / "episode_000012").mkdir(parents=True, exist_ok=True)
+    session = tmp_path / "outputs" / "laser_tracker" / "20260921_a"
+    session.mkdir(parents=True, exist_ok=True)
+    return {"dataset": str(dataset), "session": str(session), "episode": 12, **over}
+
+
+def _capture_validate_command(monkeypatch) -> list[list[str]]:
+    seen: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "wrote x\n"
+        stderr = "paired 900/1000 (90.0% coverage)  residual p95 0.812 mm\n"
+
+    def _run(command, **kwargs):
+        seen.append(list(command))
+        return _Proc()
+
+    monkeypatch.setattr(gateway.subprocess, "run", _run)
+    monkeypatch.setattr(gateway, "_hand_eye_python", lambda state: Path(sys.executable))
+    return seen
+
+
+def test_gt_comparison_grades_the_exposure_fraction_production_actually_used(tmp_path, monkeypatch):
+    """The CLI defaults --exposure-fraction to 0.5; the recorder ships 0.0.
+
+    Grading at 0.5 would score a trajectory that was never produced. The whole
+    point of the comparison is the labels production wrote, so the default has
+    to follow the recorder -- and be read from it, not copied.
+    """
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    monkeypatch.setattr(gateway, "_production_exposure_fraction", lambda: 0.0)
+
+    result = gateway._run_tracker_validate(state, _validate_payload(tmp_path))
+    assert result["ok"] is True
+    command = seen[0]
+    assert command[command.index("--exposure-fraction") + 1] == "0.0"
+    assert result["exposureFraction"] == 0.0
+
+
+def test_gt_comparison_still_lets_the_operator_override_the_fraction(tmp_path, monkeypatch):
+    """Running the same episode at -0.5 / 0 / +0.5 is how the sign gets measured:
+    a wrong time base shows up as a speed-proportional residual, which the
+    artifact's speed strata already separate."""
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    gateway._run_tracker_validate(state, _validate_payload(tmp_path, exposureFraction=-0.5))
+    command = seen[0]
+    assert command[command.index("--exposure-fraction") + 1] == "-0.5"
+
+
+def test_gt_comparison_auto_fills_the_episode_dir_so_the_time_base_is_the_hardware_one(
+    tmp_path, monkeypatch
+):
+    """Without --episode-dir the camera times fall back to the nominal N/fps
+    grid, which is episode-local and up to 55 ms from the hardware SOF. That is a
+    different time base, not a slightly worse one, so a residual computed on it
+    is not comparable with one that used the sidecars."""
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    result = gateway._run_tracker_validate(state, _validate_payload(tmp_path))
+    command = seen[0]
+    assert "--episode-dir" in command
+    assert command[command.index("--episode-dir") + 1].endswith("episode_000012")
+    assert result["episodeDir"].endswith("episode_000012")
+
+
+def test_gt_comparison_says_so_when_there_is_no_episode_dir_to_use(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path, episode=77)  # no episodes/episode_000077
+    result = gateway._run_tracker_validate(state, payload)
+    assert "--episode-dir" not in seen[0]
+    assert result["episodeDir"] == ""
+
+
+def test_gt_comparison_writes_where_the_replay_page_already_looks(tmp_path, monkeypatch):
+    """Otherwise the comparison exists and cannot be found.
+
+    ``_tracker_alignment_payload`` globs ``<root>/*/alignment_ep<N>.json``, so
+    the artifact has to land inside the session directory under
+    ``outputs/laser_tracker`` -- that is the whole of "running this from the
+    calibration page makes it show up on the replay page".
+    """
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path)
+    gateway._run_tracker_validate(state, payload)
+    out = Path(seen[0][seen[0].index("--out") + 1])
+    assert out.name == "alignment_ep12.json"
+    assert out.parent == Path(payload["session"])
+    root = Path(state.repo_root) / gateway.TRACKER_ALIGNMENT_ROOT
+    assert out.parent.parent == root
+
+
+def test_gt_comparison_drops_the_plot_series_from_the_response(tmp_path, monkeypatch):
+    """Up to 4000 points of two trajectories, none of which this panel draws --
+    and the replay page reads the file directly."""
+    state = _tracker_mount_state(tmp_path)
+    _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path)
+    out = Path(payload["session"]) / "alignment_ep12.json"
+    out.write_text(
+        json.dumps(
+            {
+                "summary": {"coverage": 0.9, "certifies_space": True},
+                "series": {"residual_mm": list(range(4000))},
+            }
+        )
+    )
+    result = gateway._run_tracker_validate(state, payload)
+    assert "series" not in (result["report"] or {})
+    assert result["report"]["summary"]["coverage"] == 0.9
+
+
+def test_gt_comparison_refuses_a_missing_mount_fit_instead_of_silently_dropping_it(
+    tmp_path, monkeypatch
+):
+    """Without the mount fit the run is shape-only and certifies nothing. A typo
+    in the path must not quietly become that run."""
+    state = _tracker_mount_state(tmp_path)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not start the CLI on an input error")
+
+    monkeypatch.setattr(gateway.subprocess, "run", _boom)
+    result = gateway._run_tracker_validate(
+        state, _validate_payload(tmp_path, mountFit=str(tmp_path / "nope.json"))
+    )
+    assert result["ok"] is False
+    assert result["returncode"] == 2
+    assert "mount-fit" in result["error"]
+
+
+# --------------------------------------------------------------------------- #
+# tracker mount: record -> discover -> solve, without typing a path
+# --------------------------------------------------------------------------- #
+
+
+def _write_tracker_episode(
+    dataset: Path,
+    episode: int,
+    *,
+    session_id: str = "20260921_a",
+    enabled: bool = True,
+    land: bool = True,
+    pose_label: str = "p0",
+) -> Path:
+    ep_dir = dataset / "episodes" / f"episode_{episode:06d}"
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    tracker = (
+        {"enabled": True, "session_id": session_id, "beam_valid_fraction": 0.91, "stream_advanced": True}
+        if enabled
+        else {"enabled": False, "error": "tracker offline"}
+    )
+    (ep_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "episode_index": episode,
+                "laser_tracker": tracker,
+                "capture_intent": {"purpose": "calibration_tracker_mount", "pose_label": pose_label},
+            }
+        )
+    )
+    if land:
+        (dataset / "laser_tracker" / session_id).mkdir(parents=True, exist_ok=True)
+    return ep_dir
+
+
+def test_discovery_resolves_the_session_path_so_nobody_types_it(tmp_path):
+    """The recorder lands at <dataset>/laser_tracker/<session_id>; deriving that
+    is the whole reason the panel has no path box."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 3)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+    assert len(rows) == 1
+    assert rows[0]["episode"] == 3
+    assert rows[0]["sessionPath"] == str(dataset / "laser_tracker" / "20260921_a")
+    assert rows[0]["landed"] is True
+    assert rows[0]["poseLabel"] == "p0"
+
+
+def test_discovery_marks_a_session_that_has_not_landed_yet(tmp_path):
+    """The session seals and lands at Disconnect, not at the end of an episode.
+
+    Between the last dwell and Disconnect every row is correct and none is
+    usable -- which is exactly the state an operator needs told, rather than
+    discovering it as a solver failure two clicks later.
+    """
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0, land=False)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+    assert rows[0]["landed"] is False
+    assert rows[0]["sessionPath"].endswith("20260921_a")
+
+
+def test_discovery_skips_episodes_the_tracker_was_not_running_for(tmp_path):
+    """An episode that says the tracker was off is not a candidate, and is not
+    the same thing as one that is silent about it."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0, enabled=False)
+    (dataset / "episodes" / "episode_000001").mkdir(parents=True)
+    (dataset / "episodes" / "episode_000001" / "meta.json").write_text(json.dumps({"episode_index": 1}))
+
+    assert gateway._tracker_mount_discover(state)["episodes"] == []
+
+
+def test_recording_a_dwell_refuses_before_connect_with_the_next_action(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "idle"
+    result = gateway._start_tracker_mount_episode(state, {"sessionName": "s", "seconds": 6})
+    assert result["ok"] is False
+    assert "Connect" in result["error"]
+
+
+def test_a_dwell_goes_to_its_own_capture_tree_not_the_session_dataset(tmp_path, monkeypatch):
+    """Parked poses are useless as training data: a minute of a stationary rig
+    landing in whatever is being collected that day is a silent contamination."""
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict[str, object] = {}
+
+    def _fake_start(_state, seconds, *, capture_root, capture_intent, require_capture_root_ack):
+        seen["root"] = capture_root
+        seen["intent"] = capture_intent
+        seen["ack"] = require_capture_root_ack
+
+    monkeypatch.setattr(gateway, "_start_episode", _fake_start)
+    result = gateway._start_tracker_mount_episode(
+        state, {"sessionName": "tm_20260921", "poseLabel": "p3", "seconds": 8}
+    )
+    assert result["ok"] is True
+    assert Path(str(seen["root"])).name == "tracker_mount"
+    assert seen["intent"]["purpose"] == "calibration_tracker_mount"
+    assert seen["intent"]["pose_label"] == "p3"
+    # The wizard's own rule: refuse rather than let a segment go somewhere the
+    # recorder did not confirm.
+    assert seen["ack"] is True
+
+
+def test_the_chain_does_not_grade_a_trajectory_against_a_refused_fit(tmp_path, monkeypatch):
+    """A refusal that gets followed by a comparison turns back into a number."""
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_lever_arm",
+        lambda *a, **k: {"ok": False, "returncode": 2, "error": "no dwell survived", "reportPath": ""},
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not grade against a fit that was declined")
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _boom)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "lever-arm", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is False
+    assert result["validate"] is None
+    assert "no dwell survived" in result["error"]
+
+
+def test_the_chain_hands_the_lever_arm_artifact_to_the_comparison(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_lever_arm",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/mount_x.json"},
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_validate(_state, payload):
+        seen.update(payload)
+        return {"ok": True, "returncode": 0}
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _fake_validate)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "lever-arm", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is True
+    assert seen["mountFit"] == "/out/mount_x.json"
+
+
+def test_a_station_fit_is_not_passed_off_as_a_lever_arm(tmp_path, monkeypatch):
+    """A station artifact is a transform, not a lever arm. Handing it to
+    --mount-fit would be a different file than the flag means."""
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_station",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/station_x.json"},
+    )
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        gateway, "_run_tracker_validate", lambda _s, payload: (seen.update(payload), {"ok": True})[1]
+    )
+    gateway._run_tracker_mount_chain(
+        state,
+        {"mode": "station", "validate": {"dataset": "d", "session": "s", "episode": 1, "mountFit": ""}},
+    )
+    assert seen["mountFit"] == ""
+
+
+def test_the_chain_stops_at_the_fit_when_no_comparison_was_asked_for(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_station",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/station_x.json"},
+    )
+    monkeypatch.setattr(gateway, "_run_tracker_validate", lambda *a, **k: pytest.fail("not asked for"))
+    result = gateway._run_tracker_mount_chain(state, {"mode": "station"})
+    assert result["ok"] is True
+    assert result["validate"] is None

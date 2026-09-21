@@ -670,3 +670,132 @@ def test_exposure_centre_is_recorded_but_not_applied_by_default(tmp_path):
     # missing the column.
     applied = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
     assert applied[1] - raw[1] == pytest.approx(0.006, abs=1e-9)
+
+
+# --------------------------------------------------------------------------
+# 8c. Which camera's exposure stands for the shared timeline.  BOX state is
+#     aligned to one timeline and a fused pose carries one time, so the
+#     exposure term is one number per frame for all of them.  Taking it from
+#     whichever sidecar sorts first makes glob order a physical parameter; the
+#     per-frame cross-camera median makes it a choice with a reason.
+# --------------------------------------------------------------------------
+
+def test_exposure_term_is_the_cross_camera_median_not_glob_order(tmp_path):
+    t0_mono = 100.0
+    # PWM slave mode: same SOF per logical frame, different AE per camera.
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [2000])
+    _write_sidecar_with_exposure(tmp_path, "cam_06", t0_mono, 0.0, [8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_07", t0_mono, 0.0, [10000])
+
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    # median(2, 8, 10) = 8 ms -> half of it.
+    assert ft[0] == pytest.approx(0.004, abs=1e-9)
+    # cam_00 sorts first and would have given 1 ms.  That it does not is the
+    # whole point: the shared timeline must not depend on filename order, and
+    # on this rig cam_01/02/03 stream without being calibrated, so glob order
+    # hands it to a camera that contributes no pose at all.
+    assert ft[0] != pytest.approx(0.001, abs=1e-9)
+
+
+def test_one_camera_ae_spike_does_not_move_the_shared_timeline(tmp_path):
+    """Why the median and not the mean: one camera looking at a lamp is not a
+    fact about when the other eight sampled."""
+    t0_mono = 100.0
+    for cam in ("cam_00", "cam_06", "cam_07", "cam_08"):
+        _write_sidecar_with_exposure(tmp_path, cam, t0_mono, 0.0, [8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_09", t0_mono, 0.0, [30000])
+
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert ft[0] == pytest.approx(0.004, abs=1e-9)   # median stays at 8 ms
+    assert ft[0] != pytest.approx(0.0062, abs=1e-9)  # the mean would be 12.4 ms
+
+
+def test_named_camera_keeps_its_own_exposure(tmp_path):
+    """Naming a camera is a question about that camera, not about the timeline."""
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [2000])
+    _write_sidecar_with_exposure(tmp_path, "cam_06", t0_mono, 0.0, [8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_07", t0_mono, 0.0, [10000])
+
+    ft = lr3.camera_frame_times_rel(
+        tmp_path, t0_mono, camera="cam_00", exposure_fraction=0.5
+    )
+    assert ft[0] == pytest.approx(0.001, abs=1e-9)
+
+
+def test_cameras_without_the_column_do_not_drag_the_median_to_zero(tmp_path):
+    """"Did not report" and "integrated for 0 s" are different facts.
+
+    Only the second one belongs in a median.  The anchor camera here is the one
+    *without* the column, so this also pins that the SOF anchor and the exposure
+    term are allowed to come from different sidecars.
+    """
+    t0_mono = 100.0
+    _write_sidecar(tmp_path, "cam_00", t0_mono, 0.0, 1)                  # no column
+    _write_sidecar_with_exposure(tmp_path, "cam_06", t0_mono, 0.0, [8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_07", t0_mono, 0.0, [8000])
+
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert ft[0] == pytest.approx(0.004, abs=1e-9)
+
+
+def test_frames_no_camera_reported_stay_exactly_where_they_were(tmp_path):
+    """A frame with no exposure anywhere is left alone, not interpolated."""
+    t0_mono = 100.0
+    _write_sidecar(tmp_path, "cam_00", t0_mono, 0.0, 3)
+    _write_sidecar(tmp_path, "cam_06", t0_mono, 0.0, 3)
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert ft == [pytest.approx(i / FPS, abs=1e-9) for i in range(3)]
+
+
+def test_exposure_fraction_zero_reads_only_one_sidecar(tmp_path, monkeypatch):
+    """The shipped default must not pay for a correction it does not apply.
+
+    Guards the short-circuit rather than the arithmetic: at fraction 0 the term
+    is zero however it is computed, so reading every sidecar per episode would
+    be pure cost on the production path.
+    """
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_06", t0_mono, 0.0, [2000])
+
+    calls: list[object] = []
+    real = lr3._exposures_by_frame_s
+    monkeypatch.setattr(
+        lr3, "_exposures_by_frame_s",
+        lambda ep: (calls.append(ep), real(ep))[1],
+    )
+    assert lr3.EXPOSURE_CENTER_FRACTION == 0.0
+    lr3.camera_frame_times_rel(tmp_path, t0_mono)
+    assert calls == []
+    lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
+    assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------
+# 8d. camera_exposure_spread: the residual the median cannot remove.  It is a
+#     floor, not a pending correction, which is exactly why it gets written
+#     into the episode instead of being assumed small later.
+# --------------------------------------------------------------------------
+
+def test_camera_exposure_spread_reports_the_residual(tmp_path):
+    t0_mono = 100.0
+    _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [2000, 2000])
+    _write_sidecar_with_exposure(tmp_path, "cam_06", t0_mono, 0.0, [8000, 8000])
+    _write_sidecar_with_exposure(tmp_path, "cam_07", t0_mono, 0.0, [10000, 10000])
+
+    spread = lr3.camera_exposure_spread(tmp_path)
+    assert spread is not None
+    assert spread["frames"] == 2
+    assert spread["cameras_per_frame"] == {"min": 3, "max": 3}
+    assert spread["median_exposure_ms"]["p50"] == pytest.approx(8.0, abs=1e-6)
+    # Worst camera is 6 ms from the median, and that is reported before the
+    # fraction -- at fraction 0.5 it is 3 ms of label error this cannot fix.
+    assert spread["abs_dev_from_median_ms"]["max"] == pytest.approx(6.0, abs=1e-6)
+
+
+def test_camera_exposure_spread_is_none_without_the_column(tmp_path):
+    """Pre-column episodes are a legacy case, not a finding."""
+    _write_sidecar(tmp_path, "cam_00", 100.0, 0.0, 3)
+    assert lr3.camera_exposure_spread(tmp_path) is None
+    assert lr3.camera_exposure_spread(tmp_path / "no_such_ep") is None
