@@ -5725,14 +5725,39 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
     }
 
 
-def _tracker_session_dir_for(dataset: Path, session_id: str) -> Path:
-    """Where the recorder lands a tracker session.
+def _tracker_session_dir_for(
+    state: GatewayState, dataset: Path, session_id: str
+) -> Path | None:
+    """Where the recorder landed a tracker session, or None if it has not.
 
     ``thor_record`` calls ``tracker.stop(land_to=<dataset_root>/laser_tracker)``
-    and the session lands as ``<that>/<session_id>``. Deriving it is the whole
-    reason the calibration panel does not ask anyone to type a path.
+    and the session lands as ``<that>/<session_id>``. ``<dataset_root>`` is the
+    recorder's **own session dataset**, which for a redirected capture is not
+    where the episodes went: a tracker-mount capture writes its episodes under
+    ``calibration_captures/<session>/tracker_mount`` while the stream lands under
+    ``datasets/<recorder session>/laser_tracker``. Looking only beside the
+    episodes is why a landed session read as "待 Disconnect" forever on
+    2026-09-21, on a capture that had in fact landed and was ready to solve.
+
+    So: beside the episodes first (an un-redirected capture), then across the
+    datasets root. Returning None rather than a non-existent path keeps
+    "not landed yet" and "landed somewhere else" from looking alike.
     """
-    return dataset / "laser_tracker" / session_id
+    if not session_id:
+        return None
+    beside = dataset / "laser_tracker" / session_id
+    if beside.is_dir():
+        return beside
+    root = state.datasets_root
+    if root and root.is_dir():
+        try:
+            candidates = sorted(root.glob(f"*/laser_tracker/{session_id}"))
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+    return None
 
 
 def _tracker_mount_capture_candidates(state: GatewayState) -> list[Path]:
@@ -5788,7 +5813,13 @@ def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
             if not isinstance(tracker, dict) or not tracker.get("enabled"):
                 continue
             session_id = str(tracker.get("session_id") or "")
-            session_dir = _tracker_session_dir_for(dataset, session_id) if session_id else None
+            session_dir = _tracker_session_dir_for(state, dataset, session_id)
+            # Where it is if it landed, where it would be if it has not. The
+            # path is useful either way; "landed" is the field that decides
+            # whether the solve can run.
+            session_path = session_dir or (
+                dataset / "laser_tracker" / session_id if session_id else None
+            )
             intent = meta.get("capture_intent") or {}
             rows.append(
                 {
@@ -5797,10 +5828,10 @@ def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
                     "episode": int(meta.get("episode_index") or 0),
                     "episodeDir": str(ep_dir),
                     "sessionId": session_id,
-                    "sessionPath": str(session_dir) if session_dir else "",
+                    "sessionPath": str(session_path) if session_path else "",
                     # The solve cannot run until Disconnect has sealed and landed
                     # the session; surfaced rather than discovered as a failure.
-                    "landed": bool(session_dir and session_dir.is_dir()),
+                    "landed": session_dir is not None,
                     "poseLabel": str(intent.get("pose_label") or ""),
                     "purpose": str(intent.get("purpose") or ""),
                     "beamValidFraction": float(tracker.get("beam_valid_fraction", -1.0)),

@@ -5942,6 +5942,34 @@ def test_a_dwell_goes_to_its_own_capture_tree_not_the_session_dataset(tmp_path, 
     assert seen["ack"] is True
 
 
+def test_a_redirected_capture_finds_its_stream_in_the_recorder_dataset(tmp_path):
+    # The episodes go to calibration_captures/<session>/tracker_mount while the
+    # tracker stream lands under datasets/<recorder session>/laser_tracker. On
+    # 2026-09-21 a capture of 15 clean poses read "待 Disconnect" forever
+    # because discovery only looked beside the episodes -- the one field that
+    # decides whether the solve can run at all.
+    state = _tracker_mount_state(tmp_path)
+    capture = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+    ep = capture / "episodes" / "episode_000000"
+    ep.mkdir(parents=True)
+    (ep / "meta.json").write_text(
+        json.dumps({
+            "episode_index": 0,
+            "laser_tracker": {"enabled": True, "session_id": "lt_1", "beam_valid_fraction": 1.0},
+            "capture_intent": {"purpose": "calibration_tracker_mount"},
+        }),
+        encoding="utf-8",
+    )
+    landed = tmp_path / "outputs" / "datasets" / "rig_20260921" / "laser_tracker" / "lt_1"
+    landed.mkdir(parents=True)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+
+    assert len(rows) == 1
+    assert rows[0]["landed"] is True
+    assert rows[0]["sessionPath"] == str(landed)
+
+
 def test_the_session_name_is_minted_by_the_gateway_not_the_browser(tmp_path):
     # It used to live in the calibration page's React state, so a reload renamed
     # the session mid-capture and orphaned every dwell already on disk under the
