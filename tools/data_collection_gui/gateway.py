@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import BoundedSemaphore, Lock, Thread, Timer
+from threading import BoundedSemaphore, Condition, Lock, Thread, Timer
 from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
@@ -359,6 +359,42 @@ class CalibrationSession:
 
 
 @dataclass
+class TrackerMountSession:
+    """Who owns the recorder while parked poses for a mount fit are collected.
+
+    This used to live in the calibration page's React state, which made it
+    invisible to everything else, and every consequence of that bit us:
+
+    * a browser reload renamed the session mid-capture, orphaning the dwells
+      already on disk under the old name;
+    * Live Record had no way to know a mount capture was in progress, so
+      StartEpisode there would queue a task episode into the middle of one --
+      and, because the redirect resets when no capture root is given, write it
+      into the task dataset while the operator was standing at the tracker;
+    * nothing recorded *which* tracker session the dwells belong to, so the
+      solve had to guess it back from a dataset name.
+
+    Landing is the stage that matters. The tracker seals and lands its stream at
+    Disconnect, not at the end of an episode, so between the last dwell and
+    Disconnect every dwell on disk is correct and none of them is solvable.
+    """
+
+    active: bool = False
+    stage: str = "idle"  # idle | capture | landed | failed
+    sessionName: str = ""
+    captureRoot: str = ""
+    # Filled in from the recorder's own sentences rather than derived from a
+    # naming convention: the tracker is enabled per Connect, and a session that
+    # was asked for and did not answer must not be indistinguishable from one
+    # that ran.
+    trackerSessionId: str = ""
+    landedPath: str = ""
+    dwellsStarted: int = 0
+    message: str = ""
+    startedAt: str = ""
+
+
+@dataclass
 class MarkerTcpSample:
     id: str
     side: str
@@ -403,6 +439,7 @@ class GatewayState:
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
+    tracker_mount_session: TrackerMountSession = field(default_factory=TrackerMountSession)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -469,6 +506,18 @@ class GatewayState:
     # recorder + camera worker subprocesses. A dedicated consumer thread applies
     # them under `lock`.
     recorder_output_queue: "queue.Queue[tuple[Any, str]]" = field(default_factory=queue.Queue)
+    # Notified by that consumer, under `lock`, after each line is applied.
+    #
+    # It exists because the POST routes run inside one coarse `with state.lock`,
+    # so a handler that waits for something the consumer must apply -- the
+    # capture-root acknowledgement is the only one -- waits while holding the
+    # lock the consumer needs. That is a deadlock for exactly the length of the
+    # timeout, and it presented as "the recorder is slow": on 2026-09-21 the ack
+    # was applied 5.28 s after the recorder wrote it against a 5 s budget, then
+    # 19.6 s against a 20 s budget. Raising the budget only made it fail slower.
+    # Waiting on this condition releases `lock` while blocked, which is the whole
+    # point.
+    recorder_output_applied: Condition = field(init=False)
     # Cached results of the expensive dataset filesystem scan (298G / 600+
     # episodes on Thor takes 4-12s). A background thread refreshes these OFF the
     # lock; `_snapshot` only reads the cache, so it never walks the dataset tree
@@ -489,6 +538,11 @@ class GatewayState:
     # trajectory. Trajectory scans are expensive; processing status changes often
     # during EE generation and must not force a full dataset/trajectory rescan.
     processing_scan_signature: tuple = ()
+
+    def __post_init__(self) -> None:
+        # Bound to `lock`, so waiting on it releases exactly the lock the
+        # recorder-output consumer needs in order to satisfy the wait.
+        self.recorder_output_applied = Condition(self.lock)
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -5494,6 +5548,127 @@ def _tracker_mount_capture_intent(session_name: str, pose_label: str, seconds: f
     }
 
 
+# The recorder names its tracker session in several different sentences -- at
+# Connect ("Laser tracker session lt_... -> D:\lt\lt_..."), in the beam-status
+# summaries, and at Disconnect ("Laser tracker session landed: <path>/lt_..."),
+# and it is the only identifier that ties a run of dwells to the stream they get
+# cut out of. Matching the id itself rather than any one sentence's shape.
+_TRACKER_SESSION_ID_RE = re.compile(r"\blt_\d{8}_\d{6}\b")
+
+
+def _tracker_session_id_from_detail(detail: str) -> str:
+    match = _TRACKER_SESSION_ID_RE.search(str(detail or ""))
+    return match.group(0) if match else ""
+
+
+def _note_tracker_mount_landing(state: GatewayState, output: str) -> None:
+    """Record where the tracker stream landed, and that the dwells are solvable.
+
+    Until this line arrives every dwell on disk is correct and none of them can
+    be read, because the stream they index into is still open. That is the one
+    distinction the calibration panel exists to make visible, so it is taken from
+    the recorder's own sentence rather than inferred from the recorder exiting.
+    """
+    session = state.tracker_mount_session
+    if not session.active:
+        return
+    path = output.split("landed:", 1)[-1].strip()
+    session.landedPath = path[:400]
+    session.trackerSessionId = _tracker_session_id_from_detail(path) or session.trackerSessionId
+    session.stage = "landed"
+    session.message = f"跟踪仪 session 已落地，{_tracker_mount_dwells_on_disk(session)} 段停驻可以解算了。"
+
+
+def _tracker_mount_dwells_on_disk(session: TrackerMountSession) -> int:
+    """How many dwells the recorder actually wrote under this session's root.
+
+    Counted from the episode directories rather than tracked in memory: a dwell
+    the operator discarded, and one the recorder auto-saved when its timer ran
+    out while the page was closed, both have to end up on the same number as
+    what the solve will read.
+    """
+    if not session.captureRoot:
+        return 0
+    episodes = Path(session.captureRoot) / "episodes"
+    try:
+        return sum(1 for d in episodes.iterdir() if (d / "meta.json").is_file())
+    except OSError:
+        return 0
+
+
+def _tracker_mount_session_payload(state: GatewayState) -> dict[str, Any]:
+    session = state.tracker_mount_session
+    return {
+        "active": session.active,
+        "stage": session.stage,
+        "sessionName": session.sessionName,
+        "captureRoot": session.captureRoot,
+        "trackerSessionId": session.trackerSessionId,
+        "landedPath": session.landedPath,
+        "dwellsStarted": session.dwellsStarted,
+        "dwellsOnDisk": _tracker_mount_dwells_on_disk(session),
+        "message": session.message,
+        "startedAt": session.startedAt,
+        # Both pages render off this snapshot, so the recorder's own state has to
+        # travel with the session -- otherwise each page derives "can I record?"
+        # from a different source and they disagree on screen, which is exactly
+        # what happened on 2026-09-21.
+        "recorderState": state.recording.state,
+        "episodeInFlight": state.recording.state in _EPISODE_OPEN_STATES,
+    }
+
+
+def _start_tracker_mount_session(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Claim the recorder for a run of parked-pose dwells.
+
+    The name is minted here, not in the browser, so that it survives a reload
+    and so that Live Record can see who holds the recorder.
+    """
+    if state.tracker_mount_session.active:
+        return {
+            "ok": False,
+            "error": f"已有进行中的站位采集 {state.tracker_mount_session.sessionName}",
+            "session": _tracker_mount_session_payload(state),
+        }
+    if state.calibration_session.active:
+        return {
+            "ok": False,
+            "error": "多相机标定会话正在占用录制器，先结束它。",
+            "session": _tracker_mount_session_payload(state),
+        }
+    name = str(payload.get("sessionName") or "").strip() or f"tm_{time.strftime('%Y%m%d_%H%M%S')}"
+    capture_root = _tracker_mount_capture_root(state, name)
+    state.tracker_mount_session = TrackerMountSession(
+        active=True,
+        stage="capture",
+        sessionName=name,
+        captureRoot=str(capture_root),
+        # Carried over rather than re-read later: a Connect that happened before
+        # this session started is still the Connect whose tracker stream these
+        # dwells will be cut out of.
+        trackerSessionId=_tracker_session_id_from_detail(state.recording.laserTrackerDetail),
+        message="连上录制器后录若干段停驻；每段内部至少 3 个停驻姿态。",
+        startedAt=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    state.log("info", f"Tracker-mount session {name} started")
+    return {"ok": True, "session": _tracker_mount_session_payload(state)}
+
+
+def _cancel_tracker_mount_session(state: GatewayState) -> dict[str, Any]:
+    """Release the recorder. Does not delete anything already recorded.
+
+    Said explicitly because the dwells stay on disk and stay solvable: the
+    session object is a claim on the recorder, not the data.
+    """
+    session = state.tracker_mount_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的站位采集"}
+    name = session.sessionName
+    state.tracker_mount_session = TrackerMountSession()
+    state.log("info", f"Tracker-mount session {name} released")
+    return {"ok": True, "session": _tracker_mount_session_payload(state)}
+
+
 def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     """Record one parked-pose dwell from the calibration page.
 
@@ -5508,9 +5683,10 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
             "ok": False,
             "error": "录制器还没连接。先点上面的「Connect（带跟踪仪）」，等相机和跟踪仪都就绪。",
         }
-    session_name = str(payload.get("sessionName") or "").strip()
-    if not session_name:
-        return {"ok": False, "error": "缺少 session 名"}
+    session = state.tracker_mount_session
+    if not session.active:
+        return {"ok": False, "error": "还没开始一次站位采集。先点「开始一次站位采集」。"}
+    session_name = session.sessionName
     pose_label = str(payload.get("poseLabel") or "").strip()
     try:
         seconds = float(payload.get("seconds") or 6.0)
@@ -5519,7 +5695,7 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
     except (TypeError, ValueError):
         return {"ok": False, "error": "每段时长必须是正数秒"}
 
-    capture_root = _tracker_mount_capture_root(state, session_name)
+    capture_root = Path(session.captureRoot)
     try:
         _start_episode(
             state,
@@ -5529,12 +5705,23 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
             require_capture_root_ack=True,
         )
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
+        session.message = str(exc)
+        return {"ok": False, "error": str(exc), "session": _tracker_mount_session_payload(state)}
+    session.dwellsStarted += 1
+    # A dwell started before the tracker id was known still belongs to whatever
+    # session this Connect opened, so fill it in at the first chance instead of
+    # leaving the field empty for the whole run.
+    if not session.trackerSessionId:
+        session.trackerSessionId = _tracker_session_id_from_detail(
+            state.recording.laserTrackerDetail
+        )
+    session.message = f"第 {session.dwellsStarted} 段正在录，{seconds:g}s 后自动收尾。"
     return {
         "ok": True,
         "captureRoot": str(capture_root),
         "episodeIndex": int(state.recording.savedEpisodes),
         "seconds": seconds,
+        "session": _tracker_mount_session_payload(state),
     }
 
 
@@ -11401,6 +11588,17 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         # acknowledgement is no longer a fact about anything. Leaving it set
         # would let the next recorder inherit a claim it never made.
         state.recording.captureRoot = ""
+        # A mount capture that is still in "capture" when the recorder is gone
+        # never saw its tracker stream land, and its dwells cannot be solved no
+        # matter how many of them are on disk. Saying so beats leaving the panel
+        # showing a capture in progress against a recorder that exited.
+        mount_session = state.tracker_mount_session
+        if mount_session.active and mount_session.stage == "capture":
+            mount_session.stage = "failed"
+            mount_session.message = (
+                "录制器已退出，但跟踪仪 session 没有落地——"
+                f"这 {_tracker_mount_dwells_on_disk(mount_session)} 段停驻没有可以对齐的跟踪仪流。"
+            )
         _set_all_device_states(
             state,
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
@@ -11530,6 +11728,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "annotation": _active_annotation(state),
         "calibration": _calibration_payload(state),
         "calibrationSession": _calibration_session_payload(state),
+        "trackerMountSession": _tracker_mount_session_payload(state),
         "markerTcp": _marker_tcp_session_payload(state),
         "recordedDatasets": recorded_datasets,
         "processing": list(state.cached_processing_items),
@@ -12188,7 +12387,14 @@ def _connect_recorder(
     _start_output_reader(state, state.process)
 
 
-_CAPTURE_ROOT_ACK_TIMEOUT_S = 5.0
+# The round trip is the recorder's stdin thread, its stdout pipe, the gateway
+# reader thread and the output consumer, and it measures in the low hundreds of
+# milliseconds. This budget is therefore not about latency -- it is how long an
+# operator waits with the panel greyed before a recorder that will never answer
+# is declared silent. It was 5 s, then 20 s, while the real problem was that the
+# wait deadlocked the consumer; with that fixed, a long budget buys nothing and
+# costs a frozen page.
+_CAPTURE_ROOT_ACK_TIMEOUT_S = 8.0
 
 
 def _await_capture_root(state: GatewayState, expected: Path, timeout_s: float) -> bool:
@@ -12200,15 +12406,27 @@ def _await_capture_root(state: GatewayState, expected: Path, timeout_s: float) -
     redirect exists to end -- so a caller that depends on the redirect has to see
     the acknowledgement before it records anything.
 
-    Polled without ``state.lock`` on purpose: the output consumer thread needs
-    that lock to apply the very line being waited for.
+    Waits on ``recorder_output_applied`` rather than polling, because both
+    callers reach here from a POST route that holds ``state.lock``, and the
+    consumer thread needs that same lock to apply the acknowledgement. Polling
+    here could therefore never succeed: the ack was applied the instant the wait
+    gave up and released the lock, which read from outside as a recorder that
+    answered a few hundred milliseconds too late -- twice, at two different
+    budgets. ``Condition.wait`` releases the lock while blocked, which is the
+    only thing that makes this a wait rather than a deadlock.
     """
     wanted = str(expected)
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if state.recording.captureRoot == wanted:
-            return True
-        time.sleep(0.05)
+    while state.recording.captureRoot != wanted:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            state.recorder_output_applied.wait(remaining)
+        except RuntimeError:
+            # Called without ``state.lock`` held. Nothing is being starved in
+            # that case, so plain polling is correct.
+            time.sleep(min(0.05, remaining))
     return state.recording.captureRoot == wanted
 
 
@@ -12241,6 +12459,20 @@ def _start_episode(
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
 
+    # A task episode started from Live Record while a mount capture holds the
+    # recorder does two kinds of damage at once, and neither announces itself:
+    # it clears the calibration redirect (capture_root=None below), so the
+    # segment lands in the task dataset with a stationary rig in it, and it puts
+    # a stretch of *motion* into the middle of a tracker stream whose episode
+    # boundaries the mount fit will later cut parked poses out of.
+    mount_session = state.tracker_mount_session
+    if capture_root is None and mount_session.active and mount_session.stage == "capture":
+        raise RuntimeError(
+            f"跟踪仪站位采集 {mount_session.sessionName} 正在占用录制器。"
+            "要录任务数据，先到「标定」页结束这次站位采集"
+            "（已经录下的停驻段不会被删）。"
+        )
+
     # An episode recorded while the tracker is blind is structurally complete and
     # metrologically empty -- 81343 rows, 0 dropped, not one measurement, which
     # is how 2026-09-20's first session went. The tracker re-homes on a timer, so
@@ -12272,10 +12504,27 @@ def _start_episode(
             if capture_root is None:
                 raise RuntimeError("Cannot require a capture-root acknowledgement without a root.")
             if not _await_capture_root(state, capture_root, _CAPTURE_ROOT_ACK_TIMEOUT_S):
+                # Which silence it was decides what the operator should do, and
+                # the two have opposite fixes. Saying "deploy and reconnect" for
+                # a recorder that is merely slow throws away a working session.
+                reported = state.recording.captureRoot
+                if not reported:
+                    detail = (
+                        "它一个字都没回。多半是 Thor 上的录制器还是旧版本（不认识 capture_root）："
+                        "先 deploy，再到「采集」页重新 Connect。"
+                    )
+                else:
+                    # Deliberately not "go record a plain episode in Live
+                    # Record": while a mount session holds the recorder that is
+                    # refused, so the old advice sent the operator into a loop.
+                    detail = (
+                        f"它报告的仍是 {reported}，上一次采集的重定向还没换过来。"
+                        "再点一次「录一段停驻姿态」通常就好了；还不行就「结束采集」后重新 Connect。"
+                    )
                 raise RuntimeError(
-                    f"录制器没有确认采集目录 {capture_root}"
-                    f"（它报告的是 {state.recording.captureRoot or '（无）'}）。"
-                    "多半是 Thor 上的录制器还是旧版本：先 deploy，再到「采集」页重新 Connect。"
+                    f"等了 {_CAPTURE_ROOT_ACK_TIMEOUT_S:g}s，录制器没有确认采集目录 {capture_root}。"
+                    + detail
+                    + "本段没有开始录，跟踪仪 session 仍在跑，可以直接重试。"
                 )
         if capture_intent:
             _write_recorder_stdin(
@@ -12349,6 +12598,9 @@ def _consume_recorder_output(state: GatewayState) -> None:
                 if state.process is not process:
                     continue  # line from an already-replaced recorder
                 _apply_recorder_output(state, output)
+                # Wakes any request handler blocked on something this line may
+                # have just supplied -- see GatewayState.recorder_output_applied.
+                state.recorder_output_applied.notify_all()
         except Exception as exc:  # never let the consumer thread die
             state.log("warn", f"recorder output consumer error: {exc}")
 
@@ -12989,6 +13241,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         elif "landed" in low:
             state.recording.laserTrackerState = "idle"
             state.recording.laserTrackerDetail = output.strip()[:200]
+            _note_tracker_mount_landing(state, output)
         else:
             state.recording.laserTrackerState = "running"
             state.recording.laserTrackerDetail = output.strip()[:200]
@@ -14812,6 +15065,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/calibration/tracker-mount/lever-arm":
                     result = _run_tracker_mount_lever_arm(self.server.state, _read_json_body(self))
                     _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/session":
+                    result = _start_tracker_mount_session(
+                        self.server.state, _read_json_body(self)
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/tracker-mount/session/cancel":
+                    result = _cancel_tracker_mount_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
                 if path == "/api/calibration/tracker-mount/record":
                     result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))

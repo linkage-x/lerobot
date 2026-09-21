@@ -1382,6 +1382,38 @@ export type TrackerValidateResponse = {
 
 // --- One-click tracker-mount capture: record -> discover -> solve -----------
 
+/**
+ * Who owns the recorder while parked poses are collected.
+ *
+ * Minted and kept by the gateway, not by this page: the session name used to
+ * live in React state, so a reload renamed the run in flight and orphaned every
+ * dwell already on disk, and Live Record had no way to know a mount capture was
+ * under way. Both pages read this one object instead.
+ */
+export type TrackerMountSession = {
+  active: boolean;
+  /** idle | capture | landed | failed. `landed` is the only solvable one. */
+  stage: string;
+  sessionName: string;
+  captureRoot: string;
+  trackerSessionId: string;
+  landedPath: string;
+  /** Presses. Diverges from `dwellsOnDisk` when a take was discarded. */
+  dwellsStarted: number;
+  /** Episode directories actually written -- what the solve will read. */
+  dwellsOnDisk: number;
+  message: string;
+  startedAt: string;
+  recorderState: string;
+  episodeInFlight: boolean;
+};
+
+export type TrackerMountSessionResponse = {
+  ok: boolean;
+  error?: string;
+  session?: TrackerMountSession;
+};
+
 export type TrackerMountCapture = {
   dataset: string;
   datasetName: string;

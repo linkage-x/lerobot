@@ -212,7 +212,7 @@ export function CalibrationPage({
           bolted this time. Sits after the marker->TCP pair deliberately -- this
           fit absorbs exactly that constant, so it can measure everything about
           the cube pose *except* the thing those two panels are for. */}
-      <TrackerMountPanel api={api} busy={busy} />
+      <TrackerMountPanel api={api} busy={busy} snapshot={snapshot} />
 
       {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
       {boxGroups.map((group) => (

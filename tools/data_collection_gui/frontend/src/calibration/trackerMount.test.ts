@@ -308,6 +308,7 @@ describe("speed strata split geometry from timing", () => {
 // --- one-click capture readiness --------------------------------------------
 
 import type { TrackerMountCapture } from "../types";
+import type { RecorderLiveState } from "./trackerMount";
 import {
   DWELLS_PER_EPISODE_MIN,
   POSES_TO_CERTIFY,
@@ -335,31 +336,136 @@ function capture(over: Partial<TrackerMountCapture> = {}): TrackerMountCapture {
   };
 }
 
+const OFFLINE: RecorderLiveState = {
+  connected: false,
+  trackerEnabled: false,
+  trackerReady: false,
+  trackerDetail: "",
+  episodeInFlight: false,
+  sessionActive: false,
+  sessionName: "",
+};
+// Connected, beam locked, and the gateway is holding a session for this page --
+// the state every "can I record now" question is asked from.
+const LOCKED: RecorderLiveState = {
+  connected: true,
+  trackerEnabled: true,
+  trackerReady: true,
+  trackerDetail: "locked on the SMR",
+  episodeInFlight: false,
+  sessionActive: true,
+  sessionName: "tm_1",
+};
+
+describe("who owns the recorder", () => {
+  it("will not record a dwell before a session has been claimed", () => {
+    // The gateway refuses it anyway; greying out the button is how that stops
+    // being a surprise the operator meets after摆好姿势.
+    const r = captureReadiness([], { ...LOCKED, sessionActive: false, sessionName: "" });
+    expect(r.blocker).toBe("no_session");
+    expect(r.canRecord).toBe(false);
+    expect(r.canStartSession).toBe(true);
+  });
+
+  it("names the session it is recording into", () => {
+    // The name is the gateway's, not this page's: a reload used to mint a new
+    // one and orphan every dwell already on disk under the old name.
+    const r = captureReadiness([], LOCKED);
+    expect(r.blocker).toBe("ready_to_record");
+    expect(r.title).toContain("tm_1");
+    expect(r.canRecord).toBe(true);
+    expect(r.canStartSession).toBe(false);
+  });
+
+  it("does not let the claim be released mid-take", () => {
+    // Releasing it would let Live Record queue a task episode into the middle
+    // of this one -- the exact interleaving the claim exists to prevent.
+    const r = captureReadiness([], { ...LOCKED, episodeInFlight: true });
+    expect(r.canEndSession).toBe(false);
+    expect(r.canSave).toBe(true);
+  });
+
+  it("still allows ending a session that recorded nothing", () => {
+    // Otherwise an abandoned capture holds the recorder until the gateway is
+    // restarted, and Live Record stays blocked with no way out on screen.
+    const r = captureReadiness([], LOCKED);
+    expect(r.canEndSession).toBe(true);
+  });
+});
+
 describe("what is blocking the solve, said before the solver fails", () => {
   it("names Disconnect when nothing has landed yet", () => {
     // The session seals at Disconnect, not at the end of an episode. Without
     // this the operator meets it as a solver error two clicks later.
-    const r = captureReadiness([capture({ landed: false })]);
+    const r = captureReadiness([capture({ landed: false })], LOCKED);
     expect(r.blocker).toBe("not_landed");
     expect(r.detail).toContain("Disconnect");
     expect(r.usable).toHaveLength(0);
   });
 
-  it("separates 'nothing recorded' from 'recorded but not landed'", () => {
-    expect(captureReadiness([]).blocker).toBe("nothing_recorded");
-  });
-
   it("calls out a landed session the tracker never contributed to", () => {
-    const r = captureReadiness([capture({ streamAdvanced: false, beamValidFraction: 0 })]);
+    const r = captureReadiness([capture({ streamAdvanced: false, beamValidFraction: 0 })], LOCKED);
     expect(r.blocker).toBe("tracker_silent");
     expect(r.dot).toBe("error");
   });
 
   it("passes when at least one landed capture has a live beam", () => {
-    const r = captureReadiness([capture({ streamAdvanced: false, beamValidFraction: 0 }), capture()]);
+    const r = captureReadiness(
+      [capture({ streamAdvanced: false, beamValidFraction: 0 }), capture()],
+      LOCKED,
+    );
     expect(r.blocker).toBe("none");
     expect(r.usable).toHaveLength(2);
     expect(r.detail).toContain(String(DWELLS_PER_EPISODE_MIN));
+  });
+});
+
+describe("the panel and Live Record cannot disagree about the tracker", () => {
+  it("does not tell a connected, beam-locked rig to Connect", () => {
+    // The bug this pins: readiness read only the captures, so with nothing
+    // recorded yet it said "先 Connect" while Live Record showed armed, 9/9
+    // cameras and the beam locked on the SMR.
+    const r = captureReadiness([], LOCKED);
+    expect(r.blocker).toBe("ready_to_record");
+    expect(r.dot).toBe("running");
+    expect(r.detail).not.toContain("先 Connect");
+    expect(r.canConnect).toBe(false);
+    expect(r.canRecord).toBe(true);
+  });
+
+  it("asks for Connect only when the recorder really is down", () => {
+    const r = captureReadiness([], OFFLINE);
+    expect(r.blocker).toBe("not_connected");
+    expect(r.canConnect).toBe(true);
+    expect(r.canRecord).toBe(false);
+    expect(r.canDisconnect).toBe(false);
+  });
+
+  it("separates 'connected without the tracker' from 'not connected'", () => {
+    // Recording now would produce episodes with no session at all, and the way
+    // out is a reconnect -- not something a 'please Connect' would have said.
+    const r = captureReadiness([], { ...LOCKED, trackerEnabled: false, trackerReady: false });
+    expect(r.blocker).toBe("tracker_off");
+    expect(r.dot).toBe("error");
+    expect(r.detail).toContain("重新 Connect");
+  });
+
+  it("shows the recorder's own sentence while the beam is still homing", () => {
+    const r = captureReadiness([], {
+      ...LOCKED,
+      trackerReady: false,
+      trackerDetail: "waiting for the SMR — put it in the home nest, homing retries automatically",
+    });
+    expect(r.blocker).toBe("beam_waiting");
+    expect(r.detail).toContain("home nest");
+  });
+
+  it("lets recorded work decide the next action even though the rig is connected", () => {
+    // After the last dwell the recorder is still up, but the next action is
+    // Disconnect. Live state must not override work already done.
+    const r = captureReadiness([capture({ landed: false })], LOCKED);
+    expect(r.blocker).toBe("not_landed");
+    expect(r.canDisconnect).toBe(true);
   });
 });
 
@@ -375,5 +481,41 @@ describe("the recording protocol follows the solver's own floors", () => {
     expect(captureLabel(capture())).toContain("光束有效 90%");
     expect(captureLabel(capture({ landed: false }))).toContain("未落地");
     expect(captureLabel(capture({ beamValidFraction: -1 }))).toContain("光束未知");
+  });
+});
+
+describe("Disconnect must not eat the take that is being recorded", () => {
+  const RECORDING: RecorderLiveState = { ...LOCKED, episodeInFlight: true };
+
+  it("closes off Disconnect while an episode is in flight", () => {
+    // Observed 2026-09-21: the operator parked through several poses, pressed
+    // Disconnect to land the session, and got nothing -- the gateway sends `q`
+    // to a recording recorder, which discards. The tracker session sealed with
+    // "episodes": [] and Saved stayed 0.
+    const r = captureReadiness([], RECORDING);
+    expect(r.blocker).toBe("recording_in_flight");
+    expect(r.canDisconnect).toBe(false);
+    expect(r.detail).toContain("丢掉");
+  });
+
+  it("offers Save instead, which is the only way to end a take early and keep it", () => {
+    const r = captureReadiness([], RECORDING);
+    expect(r.canSave).toBe(true);
+    expect(r.canRecord).toBe(false);
+  });
+
+  it("re-opens Disconnect once the take is no longer in flight", () => {
+    const r = captureReadiness([], LOCKED);
+    expect(r.canDisconnect).toBe(true);
+    expect(r.canSave).toBe(false);
+  });
+
+  it("keeps the guard even when earlier takes are already landed", () => {
+    // The landed ones are still listed as usable; the in-flight one still must
+    // not be thrown away to get at them.
+    const r = captureReadiness([capture()], RECORDING);
+    expect(r.blocker).toBe("recording_in_flight");
+    expect(r.usable).toHaveLength(1);
+    expect(r.canDisconnect).toBe(false);
   });
 });

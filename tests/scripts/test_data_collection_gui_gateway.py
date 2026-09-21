@@ -261,6 +261,78 @@ def test_start_episode_refuses_a_redirect_the_recorder_never_confirmed(tmp_path,
     assert state.recording.state == "armed"
 
 
+def test_a_recorder_that_is_merely_slow_is_not_told_to_redeploy(tmp_path, monkeypatch):
+    # The two silences have opposite fixes. On 2026-09-21 a tracker-mount dwell
+    # was refused because the echo landed 5.28 s after the recorder wrote it --
+    # the redirect had taken effect, the gateway had just stopped waiting -- and
+    # the operator was told to deploy and reconnect, which would have thrown away
+    # a live tracker session. A recorder still reporting the *previous* root is a
+    # real mismatch and gets the reset instruction instead.
+    state = _calibration_gateway_state(tmp_path)
+    _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_CAPTURE_ROOT_ACK_TIMEOUT_S", 0.05)
+    stale = tmp_path / "outputs" / "calibration_captures" / "calib_0" / "intrinsics"
+    state.recording.captureRoot = str(stale)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state, 30, capture_root=capture_root, require_capture_root_ack=True)
+
+    message = str(excinfo.value)
+    assert "deploy" not in message
+    assert str(stale) in message
+    # The take was never started, so retrying costs nothing -- say so, because
+    # the operator's alternative is to Disconnect, which seals an empty session.
+    assert "重试" in message
+    assert state.recording.state == "armed"
+
+
+def test_waiting_for_the_ack_does_not_deadlock_the_thread_that_delivers_it(
+    tmp_path, monkeypatch
+):
+    # The POST routes run inside one coarse `with state.lock`, and the recorder
+    # output consumer needs that same lock to apply the acknowledgement. Polling
+    # for it therefore could never succeed: on 2026-09-21 the ack was applied
+    # 5.28 s after the recorder wrote it against a 5 s budget, then 19.6 s
+    # against a 20 s budget -- the lag was the budget, because the consumer got
+    # in only once the wait gave up. Raising the number made it fail slower.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+
+    def _consumer():
+        # Exactly what _consume_recorder_output does: take the lock, apply the
+        # line, notify. It cannot run at all while the waiter holds the lock.
+        for _ in range(200):
+            with state.lock:
+                if written:
+                    state.recording.captureRoot = str(capture_root)
+                    state.recorder_output_applied.notify_all()
+                    return
+            time.sleep(0.005)
+
+    thread = threading.Thread(target=_consumer, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    with state.lock:  # the route handler's lock, held across the whole call
+        gateway._start_episode(
+            state, 30, capture_root=capture_root, require_capture_root_ack=True
+        )
+    thread.join(timeout=5)
+
+    assert state.recording.state == "recording"
+    # Delivered promptly, not at the timeout. The old code returned only when
+    # the budget ran out, so this is the assertion that separates them.
+    assert time.monotonic() - started < gateway._CAPTURE_ROOT_ACK_TIMEOUT_S / 2
+    assert written[-1] == "\n"
+
+
+def test_the_ack_budget_is_about_a_silent_recorder_not_about_latency():
+    # With the wait event-driven the round trip is sub-second, so a long budget
+    # buys nothing and costs a page frozen with every button greyed.
+    assert gateway._CAPTURE_ROOT_ACK_TIMEOUT_S <= 10.0
+
+
 def test_start_episode_puts_an_abandoned_calibration_redirect_back(tmp_path, monkeypatch):
     # The wizard clears the redirect when it ends, but a gateway that never got
     # there would leave the recorder pointed at the calibration tree. Live Record
@@ -2878,6 +2950,19 @@ class _FakeStdin:
 
     def flush(self):
         pass
+
+
+class _ExitedRecorderProcess:
+    """A recorder that has already exited, for the cleanup _snapshot does."""
+
+    pid = 4321
+    stdin = None
+
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
 
 
 class _FakeRecorderProcess:
@@ -5846,9 +5931,8 @@ def test_a_dwell_goes_to_its_own_capture_tree_not_the_session_dataset(tmp_path, 
         seen["ack"] = require_capture_root_ack
 
     monkeypatch.setattr(gateway, "_start_episode", _fake_start)
-    result = gateway._start_tracker_mount_episode(
-        state, {"sessionName": "tm_20260921", "poseLabel": "p3", "seconds": 8}
-    )
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_20260921"})
+    result = gateway._start_tracker_mount_episode(state, {"poseLabel": "p3", "seconds": 8})
     assert result["ok"] is True
     assert Path(str(seen["root"])).name == "tracker_mount"
     assert seen["intent"]["purpose"] == "calibration_tracker_mount"
@@ -5856,6 +5940,138 @@ def test_a_dwell_goes_to_its_own_capture_tree_not_the_session_dataset(tmp_path, 
     # The wizard's own rule: refuse rather than let a segment go somewhere the
     # recorder did not confirm.
     assert seen["ack"] is True
+
+
+def test_the_session_name_is_minted_by_the_gateway_not_the_browser(tmp_path):
+    # It used to live in the calibration page's React state, so a reload renamed
+    # the session mid-capture and orphaned every dwell already on disk under the
+    # old name. Nothing that both pages have to agree on can live in one of them.
+    state = _tracker_mount_state(tmp_path)
+
+    result = gateway._start_tracker_mount_session(state, {})
+
+    assert result["ok"] is True
+    name = result["session"]["sessionName"]
+    assert name.startswith("tm_")
+    assert result["session"]["captureRoot"].endswith(f"{name}/tracker_mount")
+    assert result["session"]["stage"] == "capture"
+    # A second claim is refused rather than silently renaming the run in flight.
+    again = gateway._start_tracker_mount_session(state, {})
+    assert again["ok"] is False
+    assert name in again["error"]
+
+
+def test_live_record_cannot_queue_a_task_episode_into_a_mount_capture(tmp_path, monkeypatch):
+    # Two kinds of damage at once, neither of which announces itself: the task
+    # episode clears the calibration redirect and lands a stationary rig in the
+    # training dataset, and it puts a stretch of motion into the middle of the
+    # tracker stream the mount fit will cut parked poses out of.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state)
+
+    assert "tm_1" in str(excinfo.value)
+    # Nothing was said to the recorder, so the capture in progress is untouched.
+    assert written == []
+    assert state.recording.state == "armed"
+
+
+def test_a_mount_capture_does_not_block_its_own_dwells(tmp_path, monkeypatch):
+    # The guard keys on "no capture root given", which is what Live Record sends
+    # and what the dwell path never sends. Pinned because the obvious sloppier
+    # guard -- refuse whenever a session is active -- would block the session
+    # from recording anything at all.
+    state = _calibration_gateway_state(tmp_path)
+    _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_await_capture_root", lambda *a, **k: True)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 8})
+
+    assert result["ok"] is True
+    assert result["session"]["dwellsStarted"] == 1
+
+
+def test_a_dwell_needs_a_session_before_it_needs_a_name(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 6})
+
+    assert result["ok"] is False
+    assert "站位采集" in result["error"]
+
+
+def test_dwells_are_counted_off_disk_not_off_the_button(tmp_path):
+    # A dwell the operator discarded, and one the recorder auto-saved when its
+    # timer ran out while the page was closed, both have to end up on the same
+    # number the solve will read.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.dwellsStarted = 7
+    episodes = Path(session.captureRoot) / "episodes"
+    for index in range(3):
+        ep = episodes / f"episode_{index:06d}"
+        ep.mkdir(parents=True)
+        (ep / "meta.json").write_text("{}", encoding="utf-8")
+    (episodes / "episode_000009").mkdir()  # started, never written
+
+    payload = gateway._tracker_mount_session_payload(state)
+
+    assert payload["dwellsStarted"] == 7
+    assert payload["dwellsOnDisk"] == 3
+
+
+def test_the_session_is_solvable_only_once_the_tracker_stream_lands(tmp_path):
+    # Between the last dwell and Disconnect every dwell on disk is correct and
+    # none of them can be read, because the stream they index into is still open.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    assert state.tracker_mount_session.stage == "capture"
+
+    gateway._apply_recorder_output(
+        state,
+        "Laser tracker session landed: /data/rig/laser_tracker/lt_20260921_053335",
+    )
+
+    session = state.tracker_mount_session
+    assert session.stage == "landed"
+    assert session.trackerSessionId == "lt_20260921_053335"
+    assert session.landedPath.endswith("lt_20260921_053335")
+
+
+def test_a_recorder_that_exits_without_landing_fails_the_session(tmp_path):
+    # The failure this must not render as "capture in progress": on 2026-09-21 a
+    # Disconnect sealed a session with zero episode boundaries, and the dwells --
+    # had there been any -- would have had no stream to be cut out of.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    state.process = _ExitedRecorderProcess(0)
+    state.recording.state = "armed"
+
+    gateway._snapshot(state)
+
+    assert state.tracker_mount_session.stage == "failed"
+    assert "没有落地" in state.tracker_mount_session.message
+
+
+def test_cancelling_a_session_keeps_what_was_recorded(tmp_path):
+    # The session object is a claim on the recorder, not the data.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    episodes = Path(state.tracker_mount_session.captureRoot) / "episodes" / "episode_000000"
+    episodes.mkdir(parents=True)
+    (episodes / "meta.json").write_text("{}", encoding="utf-8")
+
+    result = gateway._cancel_tracker_mount_session(state)
+
+    assert result["ok"] is True
+    assert state.tracker_mount_session.active is False
+    assert (episodes / "meta.json").is_file()
 
 
 def test_the_chain_does_not_grade_a_trajectory_against_a_refused_fit(tmp_path, monkeypatch):

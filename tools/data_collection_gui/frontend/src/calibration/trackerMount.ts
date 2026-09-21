@@ -394,7 +394,16 @@ export const DWELLS_PER_EPISODE_MIN = 3;
 export const POSES_TO_CERTIFY = 15;
 export const DWELL_SECONDS_MIN = 2.0;
 
-export type CaptureBlocker = "none" | "nothing_recorded" | "not_landed" | "tracker_silent";
+export type CaptureBlocker =
+  | "none"
+  | "not_connected"
+  | "tracker_off"
+  | "beam_waiting"
+  | "no_session"
+  | "ready_to_record"
+  | "recording_in_flight"
+  | "not_landed"
+  | "tracker_silent";
 
 export type CaptureReadiness = {
   blocker: CaptureBlocker;
@@ -402,11 +411,53 @@ export type CaptureReadiness = {
   title: string;
   detail: string;
   usable: TrackerMountCapture[];
+  /** Which of the capture buttons this state allows. */
+  canConnect: boolean;
+  canStartSession: boolean;
+  canRecord: boolean;
+  canSave: boolean;
+  canDisconnect: boolean;
+  canEndSession: boolean;
+};
+
+/** The recorder state this panel has to agree with, as Live Record renders it. */
+export type RecorderLiveState = {
+  /** The recorder is up and devices are open (anything but idle/error). */
+  connected: boolean;
+  /** The tracker was asked for on *this* Connect. */
+  trackerEnabled: boolean;
+  /** The beam is locked on the SMR. */
+  trackerReady: boolean;
+  /** The recorder's own sentence about the beam; shown verbatim. */
+  trackerDetail: string;
+  /** An episode is being recorded or is awaiting save/discard. */
+  episodeInFlight: boolean;
+  /**
+   * A gateway-held mount session owns the recorder.
+   *
+   * Not derived from anything on this page: it is the same flag Live Record
+   * reads to know why its StartEpisode is refused, so the two cannot disagree
+   * about who holds the recorder.
+   */
+  sessionActive: boolean;
+  /** The gateway's name for the run in flight; "" when none. */
+  sessionName: string;
 };
 
 /**
- * Why the solve cannot run yet, decided from the captures rather than from a
- * failed run.
+ * Why the solve cannot run yet -- from the captures **and** the live recorder.
+ *
+ * Reading only the captures is what made this panel contradict Live Record:
+ * with nothing recorded yet it said "先 Connect" while the recorder was armed
+ * with the beam locked, because "no episodes on disk" and "not connected" are
+ * different facts and only the first one was in scope. The live half is the
+ * same `recording.laserTrackerReady` the other page renders, so the two cannot
+ * disagree any more.
+ *
+ * Disk state wins when it is decisive, because it describes work already done:
+ * once dwells are recorded the next action is Disconnect, not Connect, and at
+ * that moment the recorder is still connected. Only when the captures have
+ * nothing to say does the live state decide what to do next.
  *
  * The one that costs a session if it is not said out loud is ``not_landed``:
  * the tracker session seals and lands at **Disconnect**, not when an episode
@@ -414,14 +465,95 @@ export type CaptureReadiness = {
  * none of them is usable, and a solver error two clicks later does not explain
  * that.
  */
-export function captureReadiness(captures: TrackerMountCapture[]): CaptureReadiness {
-  if (!captures.length) {
+export function captureReadiness(
+  captures: TrackerMountCapture[],
+  live: RecorderLiveState,
+): CaptureReadiness {
+  const buttons = {
+    // Mirrors Live Record, where Connect greys out once the recorder is up.
+    canConnect: !live.connected,
+    canStartSession: !live.sessionActive,
+    // A dwell needs somewhere to go and a name to go under, and the gateway
+    // holds both. Without the session the press is refused server-side anyway;
+    // greying it out is how that stops being a surprise.
+    canRecord: live.connected && live.sessionActive && !live.episodeInFlight,
+    canSave: live.connected && live.episodeInFlight,
+    // Disconnect **discards** an episode in flight: the gateway sends `q` to a
+    // recording recorder and `n\nexit` to one awaiting review, both of which
+    // throw the take away, and the tracker session then seals with no episode
+    // boundaries at all. So it is closed off until the take has been saved --
+    // this is not a style choice, it is the difference between a session and
+    // nothing.
+    canDisconnect: live.connected && !live.episodeInFlight,
+    // Releasing the claim mid-take would let Live Record queue a task episode
+    // into the middle of this one.
+    canEndSession: live.sessionActive && !live.episodeInFlight,
+  };
+  if (live.connected && live.episodeInFlight) {
     return {
-      blocker: "nothing_recorded",
-      dot: "idle",
-      title: "还没有带跟踪仪的录制",
-      detail: "先 Connect（带跟踪仪），再录一段停驻姿态。",
+      blocker: "recording_in_flight",
+      dot: "warning",
+      title: "正在录这一段",
+      detail:
+        "摆完最后一个姿态后点「保存本段」，或者等计时自己收尾。" +
+        "现在点 Disconnect 会把这一段**丢掉**——录制器收到的是 q/n，不是保存，" +
+        "而且 tracker session 照样会 seal，只是里面一个 episode 边界都没有。",
+      usable: captures.filter((c) => c.landed),
+      ...buttons,
+    };
+  }
+  if (!captures.length) {
+    if (!live.connected) {
+      return {
+        blocker: "not_connected",
+        dot: "idle",
+        title: "还没连接",
+        detail: "先 Connect（带跟踪仪），连上之后跟踪仪要锁到 SMR 才能开录。",
+        usable: [],
+        ...buttons,
+      };
+    }
+    if (!live.trackerEnabled) {
+      return {
+        blocker: "tracker_off",
+        dot: "error",
+        title: "这次 Connect 没带跟踪仪",
+        detail:
+          "录制器连上了，但这一次没有启用跟踪仪，录出来的段不会有 session。" +
+          "先 Disconnect，再勾上跟踪仪重新 Connect。",
+        usable: [],
+        ...buttons,
+      };
+    }
+    if (!live.trackerReady) {
+      return {
+        blocker: "beam_waiting",
+        dot: "warning",
+        title: "跟踪仪还没锁上 SMR",
+        detail: live.trackerDetail || "光束还没锁定，homing 会自动重试。锁上之前录出来的段没有跟踪仪数据。",
+        usable: [],
+        ...buttons,
+      };
+    }
+    if (!live.sessionActive) {
+      return {
+        blocker: "no_session",
+        dot: "idle",
+        title: "还没开始一次站位采集",
+        detail:
+          "点「开始一次站位采集」。这一步是向网关认领录制器：session 名由网关生成并持有，" +
+          "刷新页面不会改名，采集页也会看到录制器被占用，不会把任务 episode 插进来。",
+        usable: [],
+        ...buttons,
+      };
+    }
+    return {
+      blocker: "ready_to_record",
+      dot: "running",
+      title: `已连接，跟踪仪已锁定 SMR（${live.sessionName}）`,
+      detail: `可以开录。${live.trackerDetail}`.trim(),
       usable: [],
+      ...buttons,
     };
   }
   const landed = captures.filter((c) => c.landed);
@@ -431,9 +563,10 @@ export function captureReadiness(captures: TrackerMountCapture[]): CaptureReadin
       dot: "warning",
       title: "录到了，但 session 还没落地",
       detail:
-        "跟踪仪 session 是在 **Disconnect** 时才 seal + land 的，不是每段结束就落。" +
-        "现在这些段本身没问题，只是还取不到数据——点下面的「Disconnect 并落地」。",
+        "跟踪仪 session 是在 Disconnect 时才 seal + land 的，不是每段结束就落。" +
+        "现在这些段本身没问题，只是还取不到数据——点「Disconnect 并落地」。",
       usable: [],
+      ...buttons,
     };
   }
   const silent = landed.filter((c) => !c.streamAdvanced || c.beamValidFraction === 0);
@@ -446,6 +579,7 @@ export function captureReadiness(captures: TrackerMountCapture[]): CaptureReadin
         "每段的流都没有推进，或者光束全程无效。多半是没锁上目标，或者 responder 这次没重启。" +
         "重录之前先确认跟踪仪确实锁在 SMR 上。",
       usable: landed,
+      ...buttons,
     };
   }
   return {
@@ -454,6 +588,7 @@ export function captureReadiness(captures: TrackerMountCapture[]): CaptureReadin
     title: `可用录制 ${landed.length} 段`,
     detail: `每段内部按停驻切分位姿，单段至少要 ${DWELLS_PER_EPISODE_MIN} 个停驻才收。`,
     usable: landed,
+    ...buttons,
   };
 }
 

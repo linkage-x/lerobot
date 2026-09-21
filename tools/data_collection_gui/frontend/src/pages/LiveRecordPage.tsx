@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
@@ -186,7 +186,8 @@ export function RecordingPanel({
   onStop,
   logLines,
   backendPicker,
-  laserTrackerToggle
+  laserTrackerToggle,
+  mountSession
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -197,6 +198,8 @@ export function RecordingPanel({
   logLines?: string[];
   backendPicker?: React.ReactNode;
   laserTrackerToggle?: React.ReactNode;
+  /** A calibration capture holding the recorder; see TrackerMountSession. */
+  mountSession?: TrackerMountSession;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   // Only while the tracker is actually switched on for this session: an episode
@@ -204,6 +207,15 @@ export function RecordingPanel({
   // tracker re-homes on a timer, so this clears itself once the SMR is in place.
   const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
   const trackerBlockReason = status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+  // The gateway refuses StartEpisode while a mount capture owns the recorder,
+  // because a task episode there does two invisible kinds of damage: it clears
+  // the calibration redirect and lands a stationary rig in the training set, and
+  // it puts motion into the middle of the tracker stream the mount fit will cut
+  // parked poses out of. Shown here so the refusal is not a surprise.
+  const mountHeld = Boolean(mountSession?.active) && mountSession?.stage === "capture";
+  const mountBlockReason = mountHeld
+    ? `跟踪仪站位采集 ${mountSession?.sessionName ?? ""} 正在占用录制器`
+    : "";
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
@@ -235,15 +247,21 @@ export function RecordingPanel({
           ⏳ {trackerBlockReason}
         </p>
       )}
+      {mountHeld && (
+        <p className="tracker-wait-banner">
+          🔒 {mountBlockReason}（已落盘 {mountSession?.dwellsOnDisk ?? 0} 段）。
+          要录任务数据，先到「标定」页结束这次站位采集——已经录下的停驻段不会被删。
+        </p>
+      )}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
         <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
         <button
-          disabled={busy || !canStartEpisode || trackerBlocking}
+          disabled={busy || !canStartEpisode || trackerBlocking || mountHeld}
           onClick={onStart}
-          title={trackerBlocking ? trackerBlockReason : "Shortcut: E"}
+          title={mountHeld ? mountBlockReason : trackerBlocking ? trackerBlockReason : "Shortcut: E"}
         >
           StartEpisode <kbd>E</kbd>
         </button>
@@ -451,6 +469,7 @@ export function LiveRecordPage({
           onStop={onStop}
           logLines={logLines}
           backendPicker={backendPicker}
+          mountSession={snapshot.trackerMountSession}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>

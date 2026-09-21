@@ -38,6 +38,8 @@ import type {
   TrackerMountSolveResponse,
   TrackerMountCaptureListResponse,
   TrackerMountRecordResponse,
+  TrackerMountSession,
+  TrackerMountSessionResponse,
   TrackerMountChainResponse,
   TrackerValidateResponse,
 } from "./types";
@@ -77,6 +79,7 @@ export type GuiSnapshot = {
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   calibrationSession?: CalibrationSession;
+  trackerMountSession?: TrackerMountSession;
   markerTcp?: MarkerTcpSession;
   datasetExport: DatasetExportStatus;
   recordedDatasets: RecordedDataset[];
@@ -949,9 +952,37 @@ export class DataCollectionGuiApi {
     }
   }
 
-  /** Record one parked-pose take into the mount fit's own capture tree. */
+  /** Claim the recorder for a run of parked-pose dwells; the gateway names it. */
+  async startTrackerMountSession(): Promise<TrackerMountSessionResponse> {
+    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session");
+  }
+
+  /** Release the recorder. Nothing already recorded is deleted. */
+  async cancelTrackerMountSession(): Promise<TrackerMountSessionResponse> {
+    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session/cancel");
+  }
+
+  private async trackerMountSessionPost(path: string): Promise<TrackerMountSessionResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      });
+      const payload = (await response.json()) as TrackerMountSessionResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /**
+   * Record one parked-pose take into the mount fit's own capture tree.
+   *
+   * No session name here on purpose -- the gateway holds it, so a reload cannot
+   * split one run of dwells across two names.
+   */
   async recordTrackerMountDwell(body: {
-    sessionName: string;
     poseLabel?: string;
     seconds: number;
   }): Promise<TrackerMountRecordResponse> {

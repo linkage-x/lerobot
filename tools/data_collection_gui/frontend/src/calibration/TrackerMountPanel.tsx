@@ -17,7 +17,7 @@
 //     size alone cannot separate a flexing plate from an attitude-dependent
 //     pipeline.
 import { useEffect, useState } from "react";
-import type { DataCollectionGuiApi } from "../api";
+import type { DataCollectionGuiApi, GuiSnapshot } from "../api";
 import type {
   TrackerMountArtifact,
   TrackerMountCaptureRow,
@@ -25,11 +25,13 @@ import type {
   TrackerMountSolveResponse,
   TrackerMountCapture,
   TrackerMountChainResponse,
+  TrackerMountSession,
   TrackerStationReport,
   TrackerValidateResponse,
 } from "../types";
 import { Metric, StatusDot } from "../shared/ui";
 import { Modal } from "./ConfirmModal";
+import type { RecorderLiveState } from "./trackerMount";
 import {
   DWELL_SECONDS_MIN,
   POSES_TO_CERTIFY,
@@ -465,11 +467,47 @@ function ValidateResult({ result }: { result: TrackerValidateResponse | null }) 
 }
 
 
+/**
+ * What the gateway is holding on this page's behalf.
+ *
+ * ``dwellsOnDisk`` is separated from ``dwellsStarted`` on purpose: a take the
+ * operator discarded, and one that never started because the redirect was not
+ * acknowledged, both leave the press count ahead of what the solve will read.
+ * On 2026-09-21 a whole capture was lost to exactly that gap, invisibly.
+ */
+function SessionLine({ session }: { session: TrackerMountSession }) {
+  const solvable = session.stage === "landed";
+  const dot = session.stage === "failed" ? "error" : solvable ? "running" : "warning";
+  return (
+    <div className="cali-result-box">
+      <div className="cali-result-box-head">
+        <StatusDot state={dot} />
+        <b>{session.sessionName}</b>
+        <span className="cali-muted">
+          {solvable ? "可解算" : session.stage === "failed" ? "无法解算" : "采集中"}
+        </span>
+      </div>
+      <p className="cali-muted">
+        已落盘 <b>{session.dwellsOnDisk}</b> 段
+        {session.dwellsStarted !== session.dwellsOnDisk && (
+          <>（按了 {session.dwellsStarted} 次——差额是没保存成的）</>
+        )}
+        ，距离认证还差 {Math.max(0, POSES_TO_CERTIFY - session.dwellsOnDisk)} 段的姿态量。
+        {session.trackerSessionId && <> 跟踪仪 session：{session.trackerSessionId}。</>}
+      </p>
+      {session.message && <p className="cali-muted">{session.message}</p>}
+      {session.landedPath && <p className="cali-muted">落地于 {session.landedPath}</p>}
+    </div>
+  );
+}
+
 function GuidedCapture({
   api,
   disabled,
   running,
   captures,
+  live,
+  session,
   onRefresh,
   setRunning,
 }: {
@@ -477,15 +515,19 @@ function GuidedCapture({
   disabled: boolean;
   running: string;
   captures: TrackerMountCapture[];
+  live: RecorderLiveState;
+  session: TrackerMountSession | undefined;
   onRefresh: () => void;
-  setRunning: (value: "" | "connect" | "record" | "disconnect") => void;
+  setRunning: (
+    value: "" | "connect" | "start" | "record" | "save" | "disconnect" | "end",
+  ) => void;
 }) {
-  const [sessionName] = useState(
-    () => `tm_${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}`,
-  );
   const [seconds, setSeconds] = useState(String(suggestedDwellSeconds()));
-  const [note, setNote] = useState("");
-  const readiness = captureReadiness(captures);
+  // A refused press and a started take are not the same news, and the first one
+  // used to be rendered in the same muted grey as the instructions -- which is
+  // how a lost take reads as "the button is just disabled".
+  const [note, setNote] = useState<{ text: string; bad: boolean } | null>(null);
+  const readiness = captureReadiness(captures, live);
 
   async function onConnect() {
     setRunning("connect");
@@ -493,14 +535,47 @@ function GuidedCapture({
     setRunning("");
   }
 
+  async function onStartSession() {
+    setRunning("start");
+    const result = await api.startTrackerMountSession();
+    setNote(
+      result.ok
+        ? { text: `站位采集 ${result.session?.sessionName ?? ""} 已开始`, bad: false }
+        : { text: result.error || "无法开始站位采集", bad: true },
+    );
+    setRunning("");
+    onRefresh();
+  }
+
+  async function onEndSession() {
+    // Releases the claim on the recorder. Nothing on disk is touched -- said on
+    // the button's own line, because "结束" reads like "discard".
+    setRunning("end");
+    await api.cancelTrackerMountSession();
+    setRunning("");
+    onRefresh();
+  }
+
   async function onRecord() {
     setRunning("record");
     const result = await api.recordTrackerMountDwell({
-      sessionName,
       seconds: Number(seconds) || suggestedDwellSeconds(),
     });
-    setNote(result.ok ? `已开始录制，${result.seconds}s 后自动收尾` : result.error || "录制失败");
+    setNote(
+      result.ok
+        ? { text: `已开始录制，${result.seconds}s 后自动收尾`, bad: false }
+        : { text: result.error || "录制失败：录制器没有接受这一段。", bad: true },
+    );
     setRunning("");
+  }
+
+  async function onSave() {
+    // The only way to end a take early and keep it. Without this button the
+    // sole control on this panel was Disconnect, which discards.
+    setRunning("save");
+    await api.stopRecording("save");
+    setRunning("");
+    onRefresh();
   }
 
   async function onDisconnect() {
@@ -523,21 +598,62 @@ function GuidedCapture({
       <p className="cali-muted">{readiness.detail}</p>
 
       <div className="cali-op-grid">
-        <button className="cali-mini-btn" disabled={disabled} onClick={onConnect}>
-          {running === "connect" ? "连接中…" : "Connect（带跟踪仪）"}
+        <button
+          className="cali-mini-btn"
+          disabled={disabled || !readiness.canConnect}
+          onClick={onConnect}
+        >
+          {running === "connect" ? "连接中…" : readiness.canConnect ? "Connect（带跟踪仪）" : "已连接"}
+        </button>
+        <button
+          className="cali-mini-btn"
+          disabled={disabled || !readiness.canStartSession}
+          onClick={onStartSession}
+        >
+          {running === "start" ? "开始中…" : "开始一次站位采集"}
         </button>
         <label className="cali-field">
           这一段录多久 (s)
           <input value={seconds} disabled={disabled} onChange={(e) => setSeconds(e.target.value)} />
         </label>
-        <button className="cali-btn-primary" disabled={disabled} onClick={onRecord}>
-          {running === "record" ? "录制中…" : "录一段停驻姿态"}
+        <button
+          className="cali-btn-primary"
+          disabled={disabled || !readiness.canRecord}
+          onClick={onRecord}
+        >
+          {/* Not "录制中": the press first has to get the recorder to confirm
+              where this segment goes, and saying "recording" during a handshake
+              that can still be refused is how a refused press reads as a take
+              that happened. */}
+          {running === "record" ? "正在确认采集目录…" : "录一段停驻姿态"}
         </button>
-        <button className="cali-mini-btn" disabled={disabled} onClick={onDisconnect}>
+        <button
+          className="cali-btn-primary"
+          disabled={disabled || !readiness.canSave}
+          onClick={onSave}
+        >
+          {running === "save" ? "保存中…" : "保存本段"}
+        </button>
+        <button
+          className="cali-mini-btn"
+          disabled={disabled || !readiness.canDisconnect}
+          onClick={onDisconnect}
+        >
           {running === "disconnect" ? "收尾中…" : "Disconnect 并落地 session"}
         </button>
+        <button
+          className="cali-mini-btn"
+          disabled={disabled || !readiness.canEndSession}
+          onClick={onEndSession}
+        >
+          {running === "end" ? "结束中…" : "结束采集（不删数据）"}
+        </button>
       </div>
-      {note && <p className="cali-muted">{note}</p>}
+      {note && (
+        <p className={note.bad ? "cali-warn" : "cali-muted"}>
+          {note.bad && <StatusDot state="error" />} {note.text}
+        </p>
+      )}
 
       <p className="cali-muted">
         <b>一段里停多个姿态，不是一个姿态录一段。</b>位姿是从<b>这一段内部</b>的跟踪仪流里按停驻切出来的，
@@ -550,8 +666,10 @@ function GuidedCapture({
       </p>
       <p className="cali-muted">
         跟踪仪 session 是<b>一次 Connect 一个</b>（logger 冷启动要 15–16 s，不可能每段重来），
-        并且在 <b>Disconnect 时才 seal + land</b>。所以顺序是：Connect → 录若干段 → Disconnect → 解算。
+        并且在 <b>Disconnect 时才 seal + land</b>。所以顺序是：
+        Connect → 开始站位采集 → 录若干段 → Disconnect → 解算。
       </p>
+      {session?.active && <SessionLine session={session} />}
 
       {captures.length > 0 && (
         <table className="metric-table">
@@ -589,7 +707,33 @@ function GuidedCapture({
 }
 
 
-export function TrackerMountPanel({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
+export function TrackerMountPanel({
+  api,
+  busy,
+  snapshot,
+}: {
+  api: DataCollectionGuiApi;
+  busy: boolean;
+  snapshot: GuiSnapshot;
+}) {
+  // The same fields Live Record renders. Derived here rather than re-probed, so
+  // the two pages cannot answer "is the tracker up" differently.
+  const recording = snapshot.recording;
+  const recorderState = String(recording?.state ?? "idle");
+  // Held by the gateway, not by this component. A reload used to mint a new
+  // session name and orphan the dwells already recorded under the old one.
+  const mountSession = snapshot.trackerMountSession;
+  const live: RecorderLiveState = {
+    connected: !["idle", "error"].includes(recorderState),
+    trackerEnabled: Boolean(recording?.laserTracker),
+    trackerReady: Boolean(recording?.laserTrackerReady),
+    trackerDetail: String(recording?.laserTrackerDetail ?? ""),
+    // "review" counts: an episode waiting for save/discard is still a take that
+    // Disconnect would throw away.
+    episodeInFlight: ["recording", "review", "saving", "discarding"].includes(recorderState),
+    sessionActive: Boolean(mountSession?.active),
+    sessionName: String(mountSession?.sessionName ?? ""),
+  };
   const [showUsage, setShowUsage] = useState(false);
   const [stationRows, setStationRows] = useState<TrackerMountCaptureRow[]>([{ ...EMPTY_ROW }]);
   const [leverRows, setLeverRows] = useState<TrackerMountCaptureRow[]>([{ ...EMPTY_ROW }]);
@@ -609,7 +753,9 @@ export function TrackerMountPanel({ api, busy }: { api: DataCollectionGuiApi; bu
   const [gtFraction, setGtFraction] = useState("");
   const [gtResult, setGtResult] = useState<TrackerValidateResponse | null>(null);
   const [captures, setCaptures] = useState<TrackerMountCapture[]>([]);
-  const [captureRunning, setCaptureRunning] = useState<"" | "connect" | "record" | "disconnect">("");
+  const [captureRunning, setCaptureRunning] = useState<
+    "" | "connect" | "start" | "record" | "save" | "disconnect" | "end"
+  >("");
   const [chainMode, setChainMode] = useState<"station" | "lever-arm">("station");
   const [chainPicked, setChainPicked] = useState<string[]>([]);
   const [chainGt, setChainGt] = useState("");
@@ -621,7 +767,7 @@ export function TrackerMountPanel({ api, busy }: { api: DataCollectionGuiApi; bu
   });
 
   const disabled = busy || running !== "" || captureRunning !== "";
-  const readiness = captureReadiness(captures);
+  const readiness = captureReadiness(captures, live);
 
   async function refresh() {
     const payload = await api.fetchTrackerMount();
@@ -746,6 +892,8 @@ export function TrackerMountPanel({ api, busy }: { api: DataCollectionGuiApi; bu
         disabled={disabled}
         running={captureRunning}
         captures={captures}
+        live={live}
+        session={mountSession}
         onRefresh={() => void refresh()}
         setRunning={setCaptureRunning}
       />
