@@ -411,11 +411,19 @@ Stop / auto-duration
   └─ 写 LeRobot v3 parquet
        ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
        ├─ parquet timestamp 网格 = logical_frame_index / fps（loader 共享网格,不变）
-       ├─ BOX 最近邻查找目标 = 每帧硬件 SOF 采集时刻 sensor_timestamp_ns/1e9 − t0_mono_s
-       │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4）
+       ├─ BOX 最近邻查找目标 = 每帧采样时刻
+       │    = (sensor_timestamp_ns/1e9 + exposure_fraction×sensor_exposure_time_ns/1e9
+       │       + readout_offset_s) − t0_mono_s
+       │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4;
+       │      SOF 不是曝光中点,但符号未测定 → exposure_fraction **默认 0.0:只记录曝光列,不施加**。
+       │      符号错会把姿态相关残差从 0.5·δE 放大到 1.0·δE,和"不修"同期望、双倍最坏;
+       │      用 resolve_frame_time_semantics.py 对一段普通 AE 录制回归出符号后再改成 ±0.5）
        │    sidecar 空洞/短尾按 SOF 线性拟合外推（单一时间基准,不与 N/fps 拼接,外推帧数会 warn）
+       │    无 exposure 列的旧 sidecar 读 0,逐帧结果与修正前逐位相同
        ├─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
-       └─ meta.json.box_camera_alignment 记 mode / mean_skew_ms / skew_jitter_ms / frames_with_sof（可审计）
+       └─ meta.json.box_camera_alignment 记 mode / reference / exposure_fraction /
+            readout_offset_s / exposure_correction_ms / mean_skew_ms / skew_jitter_ms /
+            frames_with_sof（可审计:公式与它在本 episode 实际移动了多少 ms 都在里面）
 ```
 
 保存 gate：`online_sync_manifest.ok` 必须为 true，且所有 active camera 的 `frame_count_by_camera` 一致；`missing_frame_policy=fail_episode` 时 recording window 内缺 full cluster 会丢弃该 episode。

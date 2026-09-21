@@ -30,6 +30,23 @@ class ArgusFrameMetadata:
     sof_tsc_ns: int
     eof_tsc_ns: int = 0
     internal_frame_count: int = 0
+    sensor_exposure_time_ns: int = 0
+    """Integration time Argus reported for this frame.
+
+    Defaults to 0 so sidecars written before the column existed still load.
+    It matters because the frame stamps are *not* the instant the scene was
+    sampled: the frame timeline is trigger -> integrate -> read out, so
+    mid-exposure sits about half an exposure *after* start-of-frame.  Under
+    auto-exposure that gap tracks scene brightness, which tracks pose, and a
+    pose-correlated timing bias does not average out.  Pin the exposure and the
+    gap becomes constant; record it per frame and the gap becomes correctable
+    (``thor_lerobot_v3.EXPOSURE_CENTER_FRACTION``) whether it was pinned or not.
+    Which edge the Tegra VI actually stamps is settled by the two-exposure
+    experiment described there, not by this comment."""
+    sensor_analog_gain: float = 0.0
+    """Recorded alongside exposure because auto-control trades one against the
+    other: gain moving while exposure sits still is the signature of a lock that
+    is holding."""
 
 
 @dataclass(frozen=True)
@@ -103,6 +120,8 @@ def write_frame_metadata_csv(path: Path, rows: Iterable[ArgusFrameMetadata]) -> 
         "sof_tsc_ns",
         "eof_tsc_ns",
         "internal_frame_count",
+        "sensor_exposure_time_ns",
+        "sensor_analog_gain",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -120,12 +139,23 @@ def read_frame_metadata_csv(path: Path, *, camera: str | None = None) -> list[Ar
             rows.append(
                 ArgusFrameMetadata(
                     camera=row_camera,
-                    encoded_frame_index=int(raw["encoded_frame_index"]),
+                    # The online-sync recorder calls this column
+                    # ``logical_frame_index`` -- same quantity, different name,
+                    # because there it is the cluster index rather than the
+                    # encoder's. Accept both so one reader covers both recorders
+                    # instead of the caller having to know which wrote the file.
+                    encoded_frame_index=int(
+                        raw.get("encoded_frame_index")
+                        if raw.get("encoded_frame_index") is not None
+                        else raw["logical_frame_index"]
+                    ),
                     local_frame_number=int(raw["local_frame_number"]),
                     sensor_timestamp_ns=int(raw.get("sensor_timestamp_ns") or 0),
                     sof_tsc_ns=int(raw["sof_tsc_ns"]),
                     eof_tsc_ns=int(raw.get("eof_tsc_ns") or 0),
                     internal_frame_count=int(raw.get("internal_frame_count") or 0),
+                    sensor_exposure_time_ns=int(raw.get("sensor_exposure_time_ns") or 0),
+                    sensor_analog_gain=float(raw.get("sensor_analog_gain") or 0.0),
                 )
             )
     return sorted(rows, key=lambda row: (row.sof_tsc_ns, row.encoded_frame_index))

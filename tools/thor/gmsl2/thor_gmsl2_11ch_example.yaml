@@ -231,6 +231,62 @@ auto_recover:
   max_attempts: 1
   timeout_s: 300
 
+# Laser tracker (API Radian Pro), driven by Connect / Start Episode like any
+# other device. It is not on Thor: the vendor SDK runs on the Windows capture PC
+# and the two clocks are married offline by the QPC <-> CLOCK_MONOTONIC fit, so
+# this block is an ssh target rather than a device address.
+#
+# `enabled: false` is the right default. The tracker is a shared instrument that
+# admits ONE client at a time, so most sessions must not touch it -- the GUI's
+# per-session toggle is what turns it on for a GT run, and it overrides this.
+# When it is on and the instrument is unavailable, Connect still succeeds and
+# the cameras still record; the tracker row goes red and each episode warns.
+#
+# Requires Thor to hold an authorised key for the capture PC
+# (~/.ssh/id_ed25519_lt -> C:\ProgramData\ssh\administrators_authorized_keys).
+laser_tracker:
+  enabled: false
+  win_host: 18713@192.168.147.72
+  ssh_key: ~/.ssh/id_ed25519_lt
+  # Where the staged python tools and the sessions live ON THE CAPTURE PC.
+  # Note this is D:, not the C:\lt that deploy_windows.sh defaults to.
+  win_root: 'D:\lt'
+  logger_exe: 'D:\sdk\collector_win\bin\lt_realtime_logger.exe'
+  tracker_ip: 192.168.0.168
+  # What the capture PC probes back to for the clock link.
+  thor_host: 192.168.111.122
+  responder_port: 17123
+  probe_interval_s: 0.01
+  # Backstops only; the stop-file ends both in normal operation. They exist so a
+  # gateway that died without cleaning up cannot strand a process over there.
+  session_cap_s: 86400
+  # The SDK handshake alone measured 15-16 s on 2026-09-20, which is why one
+  # stream spans the whole Connect window instead of one per episode.
+  logger_ready_timeout_s: 60
+  # Connect homes the tracker itself, so nobody has to open SA/RadianCAL first.
+  # Homing is the ONLY way out of Position mode -- that mode holds the gimbal and
+  # cannot track, so an SMR placed in the beam is not acquired while it lasts.
+  #
+  # Precondition: the SMR must be sitting in the home nest when Connect is
+  # pressed. If it is not, Home fails with NoSmrAtHomePosition, the recorder
+  # says so, and the cameras still record.
+  #
+  # smr_size is required whenever home_on_connect is true and is NEVER guessed:
+  # homing against the wrong nominal radius is a metrology error, not a crash.
+  # The routine that enables the tracker's optical switch. Without it the only
+  # valid samples a session produces are the ones Home left behind while the SMR
+  # was still in the nest: lift it, break the beam once, and az/el/dist keep
+  # updating while x/y/z are zeroed for as long as you care to wave it. That
+  # cost two whole episodes on 2026-09-20. 1 ms is the SDK maximum and matches
+  # the 1 kHz feed; 0 disables it, for A/B only.
+  measure_ms: 1
+  home_on_connect: true
+  smr_size: '1.5'         # '1.5' | '0.5' | '7/8'  -- REQUIRED, never guessed
+  adm_offset_mm: 0.0      # only for a solid SMR
+  # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
+  # against its manifest before the recorder exits.
+  land: true
+
 dataset:
   repo_id: local/thor_gmsl2_Nch_v1
   single_task: Thor GMSL2 detected-camera capture

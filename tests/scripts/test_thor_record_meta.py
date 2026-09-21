@@ -486,3 +486,58 @@ def test_what_was_pruned_is_merged_into_the_episode_meta(tmp_path: Path) -> None
     assert meta["camera_pruning"]["removed"] == ["cam_00.mkv"]
     assert meta["online_sync"] == {"cameras": 11}
     assert meta["episode_index"] == 3
+
+
+def _alignment_summary(thor_record, *, corrected, raw, fps=60):
+    return thor_record._box_camera_alignment_summary(
+        corrected, fps, raw_frame_times_s=raw
+    )
+
+
+def test_the_alignment_block_states_the_formula_that_was_actually_applied() -> None:
+    """The stamp has to name the exposure term, not only the SOF it started as.
+
+    An episode whose meta says "sensor_timestamp_ns - t0_mono_s" while its
+    numbers carry +exposure_fraction*exposure is worse than one that says
+    nothing: it is a claim of not-corrected on data that was corrected.
+    """
+    thor_record = _load_thor_record_module()
+    summary = _alignment_summary(
+        thor_record, corrected=[0.0, 1 / 60, 2 / 60], raw=[0.0, 1 / 60, 2 / 60]
+    )
+
+    assert "exposure_fraction*sensor_exposure_time_ns" in summary["reference"]
+    # 0.0 is the shipped default -- the exposure column is recorded, the shift
+    # is not applied -- and the block has to say so, because "not corrected" is
+    # exactly as much a claim about the data as "corrected by half an exposure".
+    assert summary["exposure_fraction"] == 0.0
+    assert summary["readout_offset_s"] == 0.0
+
+
+def test_the_alignment_block_says_how_far_the_correction_moved_this_episode() -> None:
+    """So a reader who learns the sign was backwards can undo it from meta alone."""
+    thor_record = _load_thor_record_module()
+    raw = [0.0, 1 / 60, 2 / 60]
+    corrected = [t + 0.002 for t in raw]  # a flat 4 ms exposure, half of it applied
+
+    summary = _alignment_summary(thor_record, corrected=corrected, raw=raw)
+
+    assert summary["exposure_correction_ms"] == {"mean": 2.0, "min": 2.0, "max": 2.0}
+
+
+def test_a_pre_column_episode_reports_zero_correction_not_an_absent_one() -> None:
+    """All-zero is a measurement: the sidecar had no exposure column."""
+    thor_record = _load_thor_record_module()
+    times = [0.0, 1 / 60, 2 / 60]
+
+    summary = _alignment_summary(thor_record, corrected=times, raw=list(times))
+
+    assert summary["exposure_correction_ms"] == {"mean": 0.0, "min": 0.0, "max": 0.0}
+
+
+def test_an_unmeasurable_correction_is_null_rather_than_a_reassuring_zero() -> None:
+    thor_record = _load_thor_record_module()
+
+    summary = _alignment_summary(thor_record, corrected=[0.0, 1 / 60], raw=None)
+
+    assert summary["exposure_correction_ms"] is None
