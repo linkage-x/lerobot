@@ -80,6 +80,8 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    arm_start_controller_on_connect: bool = True
+    arm_state_poll_frequency_hz: float = 200.0
     camera_max_age_ms: float = 100.0
     # Frames whose cameras disagree by more than this are refused outright -- and it aborts the
     # whole episode, not the frame. 20 ms rather than 15 is set by the *sim* twin, not by this
@@ -136,6 +138,8 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("camera_max_age_ms must be positive.")
         if self.camera_max_skew_ms < 0:
             raise ValueError("camera_max_skew_ms must be non-negative.")
+        if self.arm_state_poll_frequency_hz < 0:
+            raise ValueError("arm_state_poll_frequency_hz must be non-negative.")
         if self.das_baudrate <= 0:
             raise ValueError("das_baudrate must be positive.")
         if self.das_update_frequency_hz <= 0:

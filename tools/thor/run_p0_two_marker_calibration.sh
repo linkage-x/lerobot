@@ -30,6 +30,10 @@ Common calibration options:
       Exclude an additional runtime camera. cam_02 (UMI) is always excluded.
   --intrinsics-summary PATH
       Existing OpenCV-fisheye summary. cam_03 temporarily uses cam_13's entry.
+  --resume-run PATH|latest
+      Continue an interrupted run from its committed captures.json.
+  --solve-run PATH|latest
+      Offline solve/activate committed captures without cameras or FR3.
   --robot-only-test-seconds N
       Run only the zero-stiffness FR3 controller for N seconds; no cameras/UI.
 
@@ -84,7 +88,7 @@ for arg in "${remote_args[@]}"; do
   quoted_args+=" ${quoted_arg}"
 done
 remote_command=$(printf \
-  'cd %q && PYTHONPATH=src:. LD_LIBRARY_PATH=%q %q tools/thor/p0_two_marker_calibration.py%s' \
+  'cd %q && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=src:. LD_LIBRARY_PATH=%q %q tools/thor/p0_two_marker_calibration.py%s' \
   "${THOR_DIR}" \
   "/home/nvidia/lerobot/.venv-fr3/lib/python3.12/site-packages/cmeel.prefix/lib:/home/nvidia/Code/infer/.venv-fr3/lib/python3.12/site-packages/cmeel.prefix/lib:/usr/local/lib" \
   "${PYTHON_BIN:-/home/nvidia/Code/infer/.venv-fr3/bin/python3}" \

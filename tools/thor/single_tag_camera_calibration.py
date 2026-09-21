@@ -176,6 +176,64 @@ def fisheye_tag_pose(
     return T_camera_tag, rmse
 
 
+def _filter_joint_observation_outliers(
+    observations_by_camera: dict[str, list[dict[str, Any]]],
+    T_tcp_tag: np.ndarray,
+    camera_poses: dict[str, np.ndarray],
+    *,
+    max_rotation_deg: float,
+    max_translation_m: float,
+    min_samples: int,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Trim observations inconsistent with the shared rigid tag/camera model.
+
+    Reprojection error alone cannot reject planar-PnP pose flips: a wrong pose
+    can still explain four tag corners with a small pixel error, especially near
+    a fronto-parallel view.  The robot supplies an independent constraint, so
+    trim only after a robust initial joint solve and then solve once more.
+    """
+    filtered: dict[str, list[dict[str, Any]]] = {}
+    reports: dict[str, dict[str, Any]] = {}
+    for camera, samples in sorted(observations_by_camera.items()):
+        T_base_camera = camera_poses[camera]
+        kept = []
+        rejected = []
+        for sample in samples:
+            predicted = sample["T_b_tool"] @ T_tcp_tag
+            observed = T_base_camera @ sample["T_c_board"]
+            rotation_deg, translation_m = transform_residual(predicted, observed)
+            reasons = []
+            if rotation_deg > max_rotation_deg:
+                reasons.append("rotation")
+            if translation_m > max_translation_m:
+                reasons.append("translation")
+            if reasons:
+                rejected.append(
+                    {
+                        "capture_index": int(sample["frame_index"]),
+                        "reprojection_rmse_px": float(sample["reprojection_rmse_px"]),
+                        "rotation_residual_deg": float(rotation_deg),
+                        "translation_residual_m": float(translation_m),
+                        "reasons": reasons,
+                    }
+                )
+            else:
+                kept.append(sample)
+        if len(kept) < min_samples:
+            raise RuntimeError(
+                f"{camera}: robust filtering leaves {len(kept)} observations; "
+                f"need {min_samples} (input={len(samples)}, rejected={len(rejected)})"
+            )
+        filtered[camera] = kept
+        reports[camera] = {
+            "num_input_observations": len(samples),
+            "num_kept_observations": len(kept),
+            "num_rejected_outliers": len(rejected),
+            "rejected_outliers": rejected,
+        }
+    return filtered, reports
+
+
 def solve_fixed_camera_extrinsics(
     fits: dict[str, dict[str, Any]],
     *,
@@ -183,6 +241,8 @@ def solve_fixed_camera_extrinsics(
     max_tag_rmse_px: float = 2.0,
     min_samples: int = 20,
     max_nfev: int = 1200,
+    max_joint_rotation_residual_deg: float = 3.0,
+    max_joint_translation_residual_m: float = 0.020,
 ) -> dict[str, Any]:
     observations_by_camera: dict[str, list[dict[str, Any]]] = {}
     initial_camera_poses: dict[str, np.ndarray] = {}
@@ -231,19 +291,76 @@ def solve_fixed_camera_extrinsics(
     if len(initial_camera_poses) < 2:
         raise RuntimeError("need at least two cameras for joint fixed-camera calibration")
     initial_tool_tag = average_transform_least_squares(tool_tag_candidates)
-    T_tcp_tag, camera_poses, solver = estimate_joint_fixed_cameras_in_base(
+    T_tcp_tag, camera_poses, initial_joint_solver = estimate_joint_fixed_cameras_in_base(
         observations_by_camera, initial_tool_tag, initial_camera_poses, max_nfev=max_nfev
     )
+    filtered_observations, outlier_reports = _filter_joint_observation_outliers(
+        observations_by_camera,
+        T_tcp_tag,
+        camera_poses,
+        max_rotation_deg=max_joint_rotation_residual_deg,
+        max_translation_m=max_joint_translation_residual_m,
+        min_samples=min_samples,
+    )
+    num_rejected = sum(
+        report["num_rejected_outliers"] for report in outlier_reports.values()
+    )
+    if num_rejected:
+        T_tcp_tag, camera_poses, solver = estimate_joint_fixed_cameras_in_base(
+            filtered_observations,
+            T_tcp_tag,
+            camera_poses,
+            max_nfev=max_nfev,
+        )
+    else:
+        solver = dict(initial_joint_solver)
+    solver["robust_refinement"] = {
+        "applied": bool(num_rejected),
+        "max_rotation_residual_deg": float(max_joint_rotation_residual_deg),
+        "max_translation_residual_m": float(max_joint_translation_residual_m),
+        "num_input_observations": int(
+            sum(len(samples) for samples in observations_by_camera.values())
+        ),
+        "num_kept_observations": int(
+            sum(len(samples) for samples in filtered_observations.values())
+        ),
+        "num_rejected_outliers": int(num_rejected),
+        "initial_solver": dict(initial_joint_solver),
+    }
     all_residuals = []
     for camera, T_base_camera in camera_poses.items():
         residuals = []
-        for sample in observations_by_camera[camera]:
+        for sample in filtered_observations[camera]:
             predicted = sample["T_b_tool"] @ T_tcp_tag
             observed = T_base_camera @ sample["T_c_board"]
             residual = transform_residual(predicted, observed)
             residuals.append(residual)
             all_residuals.append(residual)
+        final_pairs = build_relative_pairs(
+            filtered_observations[camera],
+            [1, 3, 10, 20],
+            5.0,
+            0.01,
+        )
+        if len(final_pairs) < min_samples:
+            raise RuntimeError(
+                f"{camera}: robust filtering leaves {len(final_pairs)} motion pairs; "
+                f"need {min_samples}"
+            )
         camera_details[camera]["base_to_camera"] = transform_to_payload(T_base_camera)
+        camera_details[camera]["num_input_samples"] = outlier_reports[camera][
+            "num_input_observations"
+        ]
+        camera_details[camera]["num_samples"] = outlier_reports[camera][
+            "num_kept_observations"
+        ]
+        camera_details[camera]["num_motion_pairs"] = len(final_pairs)
+        camera_details[camera]["num_rejected_outliers"] = outlier_reports[camera][
+            "num_rejected_outliers"
+        ]
+        camera_details[camera]["rejected_outliers"] = outlier_reports[camera][
+            "rejected_outliers"
+        ]
         camera_details[camera]["sample_residuals"] = summarize_residuals(residuals)
     residual_summary = summarize_residuals(all_residuals)
     reasons = []
@@ -260,6 +377,7 @@ def solve_fixed_camera_extrinsics(
         "tool_to_board": transform_to_payload(T_tcp_tag),
         "cameras": camera_details,
         "solver": solver,
+        "robust_filter": solver["robust_refinement"],
         "sample_residuals": residual_summary,
     }
 
@@ -326,11 +444,15 @@ def calibrate_and_write(
             "frame_equation": extrinsics["frame_equation"],
             "tool_to_board": extrinsics["tool_to_board"],
             "solver": extrinsics["solver"],
+            "robust_filter": extrinsics["robust_filter"],
             "sample_residuals": extrinsics["sample_residuals"],
             "cameras": {
                 camera: {
                     "base_to_camera": detail["base_to_camera"],
                     "num_observations": detail["num_samples"],
+                    "num_input_observations": detail["num_input_samples"],
+                    "num_rejected_outliers": detail["num_rejected_outliers"],
+                    "rejected_outliers": detail["rejected_outliers"],
                     "num_motion_pairs": detail["num_motion_pairs"],
                     "sample_residuals": detail["sample_residuals"],
                     "intrinsics_source_camera": detail["intrinsics_source_camera"],

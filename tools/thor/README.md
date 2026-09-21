@@ -95,6 +95,82 @@ bash tools/thor/run_p0_two_marker_calibration.sh -- \
 相机/检测/显示负载是触发因素。完整标定现默认使用 2 个检测 worker，并将 frame-bus
 预览降为每 15 帧一次；可进一步临时使用
 `--detection-workers 1 --frame-bus-every-n 30 --detection-scale 0.25`。
+该标定入口使用专用的最小 FR3 连接：连接时不先启动普通 JointPosition controller，
+也不启动 200 Hz 后台 state reader；直接进入 panda_py 原生 teaching mode，并只在
+用户捕捉时同步读取新的 robot state。完整流程还会把 FR3 teaching controller 放在
+独立子进程：自动查找 robot NIC IRQ CPU，给 controller 保留相邻专用 CPU，并把
+Argus/OpenCV/UI 排除在这两个 CPU 之外。启动日志中的 `[CPU]` 和 `[ROBOT] isolated`
+行会显示实际 affinity。OpenCV 内部线程默认限制为 1；诊断时可分别用
+`--robot-control-cpu N`、`--no-cpu-isolation` 和 `--opencv-threads N` 覆盖。
+
+若希望完全去掉 SSH/X11 forwarding，请在 Thor 桌面会话中打开 terminal 并运行：
+
+```bash
+cd ~/lerobot
+bash tools/thor/run_p0_two_marker_calibration_local.sh \
+  --existing recalibrate \
+  --exclude-camera cam_03 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+本地入口直接使用 Thor 的 `DISPLAY`；它不会 SSH 回 host，也不会同步仓库。
+
+如果 FR3 safety/reflex 或其他意外让程序中断，已经显示 `[CAPTURE NNN]` 的记录不会
+丢失。恢复错误后，在下一次启动增加 `--resume-run latest`，程序会读取最近一次有
+`captures.json` 的 run，恢复各物理相机的有效数量，并从下一个 `capture_NNN`
+继续追加：
+
+```bash
+cd ~/lerobot
+bash tools/thor/run_p0_two_marker_calibration_local.sh \
+  --existing recalibrate \
+  --resume-run latest \
+  --exclude-camera cam_03 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+也可以把 `latest` 换成一个明确的 `manual_run_...` 目录。恢复时会验证 marker、内参
+文件哈希、相机物理身份、7 关节数据、`T_base_tcp` 以及所有已提交图片；不一致会在
+连接机器人前/启动 teaching 前拒绝混合。只有 FR3 base、固定相机位置和 EE 上的 tag
+安装均未改变时才可续采。临时 `.tmp` 或未写入 `captures.json` 的半次捕捉不会计入。
+
+若 captures 已经足够，但求解因为少数单 tag PnP 离群点未通过质量门，可以完全离线
+重算；该模式不会连接 Argus 或 FR3，也不需要 `--execute`：
+
+```bash
+cd ~/lerobot
+bash tools/thor/run_p0_two_marker_calibration_local.sh \
+  --existing recalibrate \
+  --solve-run latest
+```
+
+求解采用两阶段 robust refinement：先用 Huber loss 联合估计 `T_ee_tag` 与所有
+`T_base_camera`，再剔除与共同刚体模型相差超过 `3 deg` 或 `20 mm` 的观测并重新
+优化。单 tag 接近正对相机时也可能出现 planar-PnP 歧义，因此不能只按“大倾角”
+过滤。所有原始图片和 `captures.json` 都保持不变；被剔除的 capture index、像素
+重投影误差及几何残差会写入最终 summary。已有失败 summary 会归档到
+`camera_calibration/solve_attempts/` 后再生成新结果。
+
+可对 active calibration 生成 XY、XZ、YZ 和 XYZ 四联外参图。在 Thor 执行：
+
+```bash
+cd ~/lerobot
+summary=$(python3 -c 'import json; print(json.load(open("outputs/calibration/p0_single_tag_camera_calibration/active.json"))["calibration_path"])')
+MPLBACKEND=Agg /home/nvidia/Code/infer/.venv-fr3/bin/python3 \
+  tools/thor/visualize_p0_camera_extrinsics.py --summary "$summary"
+```
+
+默认写入 summary 同级的 `visualization/`，包含四联 PNG、机器可读可视化 JSON 和
+一份原始 calibration summary 副本。相机采用 OpenCV 轴约定：+X 向右、+Y 向下、
++Z 为光轴向前；所有坐标均表达在当前 FR3 base 中。
 
 standalone 启动器会保留 X11 给 OpenCV 窗口，但 Argus recorder 子进程会主动清除
 转发的 `DISPLAY/WAYLAND_DISPLAY`。否则 NVIDIA EGL 会把 `localhost:10.0` 当作

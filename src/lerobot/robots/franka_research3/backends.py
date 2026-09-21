@@ -155,6 +155,7 @@ class PandaPyArmDriver:
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
     state_poll_frequency_hz: float = 200.0
+    start_controller_on_connect: bool = True
 
     def __post_init__(self):
         try:
@@ -186,7 +187,9 @@ class PandaPyArmDriver:
         # only add latency to the connect path.
         state = self._robot.get_state()
         self._assert_arm_accepts_control(state)
-        self._start_controller(state)
+        self._refresh_joint_positions_cache(state)
+        if self.start_controller_on_connect:
+            self._start_controller(state)
         self._start_state_reader()
 
     # Modes libfranka's control loop cannot start from, and what the operator has to do about
@@ -264,6 +267,9 @@ class PandaPyArmDriver:
         self._stop_controller()
         self._robot.teaching_mode(True, values)
         self._teaching_mode_active = True
+        with self._state_lock:
+            self._cached_joint_positions = None
+            self._cached_joint_positions_at_s = None
 
     def exit_teaching_mode(self) -> None:
         if self._robot is not None and self._teaching_mode_active:
@@ -296,6 +302,13 @@ class PandaPyArmDriver:
         """
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active:
+            joint_positions = self._refresh_joint_positions_cache()
+            with self._state_lock:
+                sampled_at_s = self._cached_joint_positions_at_s
+            return joint_positions, float(
+                sampled_at_s if sampled_at_s is not None else time.perf_counter()
+            )
         with self._state_lock:
             cached = None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
             sampled_at_s = self._cached_joint_positions_at_s
@@ -349,6 +362,8 @@ class PandaPyArmDriver:
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active:
+            return self._refresh_joint_positions_cache()
         with self._state_lock:
             cached_joint_positions = (
                 None if self._cached_joint_positions is None else self._cached_joint_positions.copy()

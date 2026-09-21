@@ -1074,3 +1074,22 @@ same zero-stiffness controller without Argus, AprilTag, Tk, or X11 work. This
 still controls real hardware and requires an operator supporting the arm with
 the physical E-stop ready. The full flow defaults to two detection workers and
 publishes a preview cluster every 15 camera frames to reduce peak CPU load.
+The calibration-specific FR3 connection does not start the normal
+JointPosition controller or the 200 Hz background state reader before entering
+panda_py's native teaching mode. Robot state is sampled on demand at capture.
+The controller is owned by a spawned worker process with CPU affinity separate
+from Argus, OpenCV, and Tk. The runtime discovers the FR3 route/interface and
+its active IRQ CPU, reserves the following CPU for the controller, and excludes
+both reserved CPUs from the vision parent and recorder subprocess. A local Thor
+desktop entry point, `tools/thor/run_p0_two_marker_calibration_local.sh`, avoids
+SSH/X11 forwarding while retaining the same calibration CLI.
+Interrupted runs with committed captures can be continued with
+`--resume-run latest` or an explicit `manual_run_...` directory. Resume validates
+the marker contract, intrinsics hash, calibrated camera identities, robot pose
+shape, joint vector, and referenced image files before restoring per-camera
+counts and appending the next monotonically increasing capture index.
+`--solve-run latest` performs an offline solve without starting Argus or FR3.
+The single-tag solver first obtains a Huber joint solution, rejects observations
+whose shared-rigid-model residual exceeds 3 degrees or 20 mm, then refines once.
+Raw captures are immutable; rejection details are written to the calibration
+summary and any previous summary is archived under `solve_attempts/`.

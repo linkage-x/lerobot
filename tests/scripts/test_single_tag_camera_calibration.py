@@ -4,10 +4,58 @@ from pathlib import Path
 import numpy as np
 
 from tools.thor.single_tag_camera_calibration import (
+    _filter_joint_observation_outliers,
     _fit_for_views,
     load_existing_fisheye_intrinsics,
     tag_object_points,
 )
+
+
+def test_joint_rigid_consistency_filter_rejects_pose_outlier() -> None:
+    observations = {}
+    camera_poses = {}
+    for camera in ("cam_06", "cam_07"):
+        samples = []
+        for index in range(21):
+            samples.append(
+                {
+                    "frame_index": index,
+                    "T_b_tool": np.eye(4),
+                    "T_c_board": np.eye(4),
+                    "reprojection_rmse_px": 0.1,
+                }
+            )
+        outlier = np.eye(4)
+        angle = np.deg2rad(10.0)
+        outlier[:3, :3] = [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        samples.append(
+            {
+                "frame_index": 99,
+                "T_b_tool": np.eye(4),
+                "T_c_board": outlier,
+                "reprojection_rmse_px": 0.2,
+            }
+        )
+        observations[camera] = samples
+        camera_poses[camera] = np.eye(4)
+
+    filtered, reports = _filter_joint_observation_outliers(
+        observations,
+        np.eye(4),
+        camera_poses,
+        max_rotation_deg=3.0,
+        max_translation_m=0.02,
+        min_samples=20,
+    )
+
+    assert all(len(samples) == 21 for samples in filtered.values())
+    assert reports["cam_06"]["num_rejected_outliers"] == 1
+    assert reports["cam_06"]["rejected_outliers"][0]["capture_index"] == 99
+    assert reports["cam_06"]["rejected_outliers"][0]["reasons"] == ["rotation"]
 
 
 def _write_intrinsics_tree(tmp_path: Path, model: str = "opencv_fisheye") -> Path:

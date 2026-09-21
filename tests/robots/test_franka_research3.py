@@ -305,12 +305,17 @@ def test_pandapy_arm_driver_uses_native_teaching_mode_and_exits_on_disconnect(mo
         ),
     )
 
-    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=0.0,
+        start_controller_on_connect=False,
+    )
     driver.connect()
+    assert driver._controller is None
     driver.enter_teaching_mode([0.0] * 7)
 
     panda = DummyPanda.instances[-1]
-    assert panda.stop_calls == 1
+    assert panda.stop_calls == 0
     assert panda.teaching_calls[0][0] is True
     np.testing.assert_array_equal(panda.teaching_calls[0][1], np.zeros(7))
 
