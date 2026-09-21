@@ -173,6 +173,20 @@ class RecordingStatus:
     syncSummary: str = ""
     syncReportPath: str = ""
     syncWarnings: list[str] = field(default_factory=list)
+    # Whether this Connect asked for the laser tracker. The instrument is shared
+    # and booked by other people, so this is a per-session choice rather than a
+    # property of the rig, and the UI has to be able to turn it off on the days
+    # it is someone else's.
+    laserTracker: bool = False
+    laserTrackerState: str = "idle"
+    laserTrackerDetail: str = ""
+    # What the instrument said it is (model, serial, firmware), read once at
+    # Connect via the SDK's GetDeviceInformation() -- not transcribed from a
+    # config file that can drift away from the hardware it names.
+    laserTrackerDevice: str = ""
+    # Whether the beam is actually on the SMR. Gates Start Episode: an episode
+    # recorded while the tracker is blind looks complete and measures nothing.
+    laserTrackerReady: bool = False
 
 
 @dataclass
@@ -913,6 +927,28 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
             box_entries = [box_cfg]
         for box in box_entries:
             devices.extend(_box_collection_devices(box))
+
+    # One row whenever the block exists, even with enabled: false -- the row is
+    # how the operator sees that this rig *can* carry the tracker and that this
+    # session is not. A row that appeared only when enabled would make "off" and
+    # "not installed" look identical, and those want different reactions.
+    lt_cfg = config.get("laser_tracker")
+    if isinstance(lt_cfg, dict) and lt_cfg.get("win_host"):
+        devices.append(
+            {
+                "id": "laser_tracker",
+                "kind": "laser_tracker",
+                "label": "Laser tracker",
+                "state": "idle",
+                "fps": 1000,
+                "latencyMs": 0,
+                "detail": (
+                    f"{lt_cfg.get('tracker_ip', '')} via {lt_cfg.get('win_host', '')}"
+                    " (shared instrument; one client at a time)"
+                ),
+                "config": lt_cfg,
+            }
+        )
     return devices
 
 
@@ -2938,6 +2974,83 @@ def _intrinsics_coverage_payload(state: GatewayState) -> dict[str, Any]:
 
     payload["cameras"] = cameras
     return payload
+
+
+TRACKER_ALIGNMENT_ROOT = "outputs/laser_tracker"
+"""Where ``metrology.cli.validate_against_tracker`` drops its artifacts, one per
+landed session directory."""
+
+
+def _tracker_alignment_payload(state: GatewayState, dataset_root: Path, episode: int) -> dict[str, Any]:
+    """The laser-tracker comparison for one episode, or an honest absence.
+
+    The gateway reads a file and does not compute: the comparison needs a
+    registration, a lever arm and two clock fits, all of which have to be
+    auditable and none of which belong behind an HTTP request that a page refresh
+    would silently re-run with different inputs.  So the expensive step is the
+    offline CLI, and this is a lookup.
+
+    "No artifact" is a first-class answer rather than an error.  Most episodes
+    will never have one -- the tracker is a shared instrument and covers a
+    fraction of what gets recorded -- and a UI that shows a red failure for the
+    normal case teaches people to ignore it.
+    """
+    root = state.repo_root / TRACKER_ALIGNMENT_ROOT
+    if not root.is_dir():
+        return {"ok": True, "available": False, "reason": f"{TRACKER_ALIGNMENT_ROOT} does not exist"}
+
+    wanted = str(Path(dataset_root).resolve())
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for path in sorted(root.glob(f"*/alignment_ep{int(episode)}.json")):
+        payload = _read_json_file(path)
+        if not payload:
+            continue
+        # Match on the dataset the artifact says it came from, never on the file
+        # name. A session directory can hold artifacts for several datasets, and
+        # pairing by position is the mistake that put a whole run's episodes one
+        # directory out of step once already.
+        try:
+            same = Path(str(payload.get("dataset"))).resolve() == Path(wanted)
+        except OSError:
+            same = False
+        if same:
+            candidates.append((path.stat().st_mtime, path, payload))
+
+    if not candidates:
+        return {
+            "ok": True,
+            "available": False,
+            "reason": f"no alignment artifact for episode {episode} of {Path(dataset_root).name}",
+        }
+
+    mtime, path, payload = max(candidates, key=lambda item: item[0])
+    summary = payload.get("summary") or {}
+    registration = summary.get("registration") or {}
+    return {
+        "ok": True,
+        "available": True,
+        "artifact": str(path),
+        "generatedUtc": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        "episode": int(payload.get("episode") or episode),
+        "target": str(payload.get("target") or ""),
+        "session": payload.get("session") or {},
+        "summary": summary,
+        # Surfaced at the top level because they decide how the panel is read,
+        # and a UI that has to reach three levels down for "is this a
+        # measurement or a picture" will eventually stop reaching.
+        "certifiesSpace": bool(summary.get("certifies_space")),
+        "registrationSource": str(registration.get("source") or "unknown"),
+        "coverage": float(summary.get("coverage") or 0.0),
+        "series": payload.get("series") or {},
+        "dropoutsRelS": payload.get("dropouts_rel_s") or [],
+        "leverArmM": payload.get("lever_arm_m") or [0.0, 0.0, 0.0],
+        "minCoverage": float(payload.get("min_coverage") or 0.0),
+        # Provenance of a fitted lever arm.  Surfaced at the top level rather
+        # than left inside ``summary`` because the panel has to decide its
+        # verdict wording from it, and a field the UI must not miss should not
+        # be three levels down.
+        "mountFit": payload.get("mount_fit"),
+    }
 
 
 def _world_frame_payload(state: GatewayState) -> dict[str, Any]:
@@ -11105,6 +11218,22 @@ def _serve_teleop_camera_snapshot(
         pass
 
 
+def _set_device_state(
+    state: GatewayState, device_id: str, device_state: str, detail: str = ""
+) -> None:
+    """Update one device row by id, if it is configured.
+
+    A no-op when the row is absent, so a recorder that talks about a device the
+    config never declared cannot invent a row the operator did not ask for.
+    """
+    for device in state.devices:
+        if device.get("id") == device_id:
+            device["state"] = device_state
+            if detail:
+                device["detail"] = detail
+            return
+
+
 def _set_all_device_states(state: GatewayState, device_state: str) -> None:
     for device in state.devices:
         device["state"] = device_state
@@ -11359,7 +11488,12 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
+def _connect_recorder(
+    state: GatewayState,
+    *,
+    backend: str | None = None,
+    laser_tracker: bool | None = None,
+) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
@@ -11388,6 +11522,12 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+        # Only the GMSL2 recorder knows the flag. Sent explicitly (never
+        # omitted) once the operator has expressed a preference, so the choice
+        # they made in the UI is not quietly overridden by the yaml.
+        if laser_tracker is not None:
+            command.append("--laser-tracker" if laser_tracker else "--no-laser-tracker")
+        state.recording.laserTracker = bool(laser_tracker)
     env = _recorder_env(state.repo_root)
     if is_workstation:
         command.append(f"--backend={state.recording.backend}")
@@ -11426,6 +11566,10 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     # let a stale "pass" vouch for data it never saw.
     state.recording.syncStatus = "unknown"
     state.recording.syncSummary = ""
+    state.recording.laserTrackerDevice = ""
+    state.recording.laserTrackerDetail = ""
+    state.recording.laserTrackerState = "idle"
+    state.recording.laserTrackerReady = False
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -11503,6 +11647,18 @@ def _start_episode(
     process = _ensure_recorder_running(state)
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
+
+    # An episode recorded while the tracker is blind is structurally complete and
+    # metrologically empty -- 81343 rows, 0 dropped, not one measurement, which
+    # is how 2026-09-20's first session went. The tracker re-homes on a timer, so
+    # this clears itself as soon as the SMR is in the nest.
+    if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        raise RuntimeError(
+            "激光跟踪仪尚未锁定 SMR："
+            f"{state.recording.laserTrackerDetail or '等待中'}。"
+            "把 SMR 放进鸟巢窝，设备行变绿后再 StartEpisode"
+            "（跟踪仪会自动重试 Home，不需要重新 Connect）。"
+        )
 
     if _state_is_gmsl2(state):
         # Sent only when it would actually change something. The recorder echoes
@@ -12206,6 +12362,52 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
+    if output.startswith("LT_BEAM "):
+        raw = output.removeprefix("LT_BEAM ").strip()
+        flag, _, summary = raw.partition("|")
+        ready = flag.strip() == "ready"
+        state.recording.laserTrackerReady = ready
+        state.recording.laserTrackerState = "running" if ready else "warning"
+        state.recording.laserTrackerDetail = summary.strip()[:200]
+        _set_device_state(
+            state,
+            "laser_tracker",
+            state.recording.laserTrackerState,
+            " — ".join(
+                p for p in (state.recording.laserTrackerDevice, summary.strip()) if p
+            )[:400],
+        )
+        return
+
+    # Laser tracker: the recorder speaks about it in plain sentences rather than
+    # a JSON channel, because every one of these is something an operator has to
+    # read anyway. Parsed here only to colour the device row -- the sentence
+    # itself still reaches the log.
+    if "laser tracker" in output.lower():
+        low = output.lower()
+        # The identity line is reported once, at Connect, and must survive every
+        # status line that follows -- which instrument took the data is a
+        # property of the session, not its latest event.
+        if output.startswith("Laser tracker: ") and "session" not in low and not low.startswith("warning"):
+            state.recording.laserTrackerDevice = output[len("Laser tracker: "):].strip()[:200]
+        elif low.startswith("warning:"):
+            state.recording.laserTrackerState = "error"
+            state.recording.laserTrackerDetail = output.split(":", 1)[-1].strip()[:200]
+        elif "landed" in low:
+            state.recording.laserTrackerState = "idle"
+            state.recording.laserTrackerDetail = output.strip()[:200]
+        else:
+            state.recording.laserTrackerState = "running"
+            state.recording.laserTrackerDetail = output.strip()[:200]
+        device = state.recording.laserTrackerDevice
+        detail = state.recording.laserTrackerDetail
+        _set_device_state(
+            state,
+            "laser_tracker",
+            state.recording.laserTrackerState,
+            " — ".join(p for p in (device, detail) if p)[:400],
+        )
+        # fall through: the line is still logged like any other recorder output
     if output.startswith("BOX_LIVE "):
         try:
             payload = json.loads(output.removeprefix("BOX_LIVE ").strip())
@@ -13366,6 +13568,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             view_id = query.get("view", [""])[0]
             _serve_teleop_camera_snapshot(self, state=self.server.state, view_id=view_id)
             return
+        if path == "/api/tracker/alignment":
+            dataset_raw = query.get("dataset", [""])[0]
+            try:
+                episode = int(query.get("episode", ["0"])[0])
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "episode must be an integer"})
+                return
+            dataset_root = _resolve_dataset_root(self.server.state.repo_root, dataset_raw)
+            if dataset_root is None:
+                _json_response(self, HTTPStatus.OK, {"ok": True, "available": False, "reason": "no dataset selected"})
+                return
+            _json_response(self, HTTPStatus.OK, _tracker_alignment_payload(self.server.state, dataset_root, episode))
+            return
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
@@ -13666,6 +13881,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # except remembered to cover.
             state = self.server.state
             requested_backend = (query.get("backend", [""])[0] or "").strip().lower() or None
+            # Tri-state: absent means "whatever the config says", so an older
+            # frontend that does not send the toggle keeps the file's behaviour
+            # instead of silently turning the tracker off.
+            raw_lt = (query.get("laser_tracker", [""])[0] or "").strip().lower()
+            requested_laser_tracker = (
+                True if raw_lt in ("1", "true", "on", "yes")
+                else False if raw_lt in ("0", "false", "off", "no")
+                else None
+            )
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
@@ -13679,7 +13903,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state, backend=requested_backend)
+                        _connect_recorder(
+                            state,
+                            backend=requested_backend,
+                            laser_tracker=requested_laser_tracker,
+                        )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001

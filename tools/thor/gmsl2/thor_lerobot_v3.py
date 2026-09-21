@@ -670,24 +670,114 @@ def _nearest_sample_data(
     return samples[idx].get("data", {})
 
 
+#: Fraction of the integration window that separates ``sensor_timestamp_ns``
+#: from the instant the scene was actually sampled.
+#:
+#: **0.0 means the correction is recorded but not applied**, which is where this
+#: sits until the convention has been measured.  It is not a third model; it is
+#: the refusal to pick between the only two:
+#:
+#: * ``+0.5`` -- the stamp is the *start* of integration, mid-exposure is half
+#:   an exposure later.
+#: * ``-0.5`` -- the stamp is latched at the start of readout, i.e. the *end* of
+#:   integration, and mid-exposure is half an exposure *earlier*.
+#:
+#: Why not just pick the likely one.  Split the exposure into its mean and its
+#: wander, ``E = E_bar + dE``.  The ``E_bar`` half of the error is a constant
+#: offset and is absorbed downstream by any time-offset estimate (the T3c
+#: intercept, the camera<->IMU fit), so it costs nothing.  What cannot be
+#: absorbed is ``dE``: under auto-exposure the integration time tracks scene
+#: brightness, which tracks pose.  Against that pose-correlated residual the
+#: three options are
+#:
+#:     apply nothing      ->  0.5 * dE
+#:     apply, right sign  ->  0
+#:     apply, wrong sign  ->  1.0 * dE
+#:
+#: so applying is not "improve or break even", it is "cancel or double".  At an
+#: even prior it has the same expected error as doing nothing and twice the
+#: worst case, and it is only worth it once the sign is known.
+#:
+#: The prior is not even, and it does not favour the value this started at.
+#: SOF on MIPI CSI-2 is the sensor beginning to *transmit* line 1, which cannot
+#: happen before line 1 has finished integrating; the 2026-09-11 blur
+#: measurement recorded ``EOF - SOF`` as 14.677-14.686 ms across nine cameras
+#: and every frame, i.e. flat while the exposure was not, which is what two
+#: stamps bracketing *readout* look like; and that note's own conclusion was
+#: that an uncompensated SOF label sits *after* mid-exposure by about E/2.  All
+#: three point at ``-0.5``.  None of them is a measurement of this sensor's
+#: driver, which is the only thing that settles it.
+#:
+#: Settling it needs no new hardware and no locked-exposure session -- only one
+#: ordinary auto-exposure recording made by a recorder that writes the exposure
+#: column, which is what this module's caller now does::
+#:
+#:     python -m tools.thor.gmsl2.resolve_frame_time_semantics <episode_dir>
+#:
+#: It regresses ``EOF - SOF`` and ``SOF - sensor_timestamp`` against the
+#: exposure: slope ~ +1 means that interval *is* the integration window, slope
+#: ~ 0 means the two stamps bracket readout.  Set this to what it prints.
+#: Episodes recorded in the meantime lose nothing: every frame's exposure is in
+#: its sidecar and every episode's ``meta.json`` records the terms that were in
+#: force, so the correction can be applied offline, retroactively, once.
+EXPOSURE_CENTER_FRACTION = 0.0
+
+#: Fixed sensor->stamp latency, in seconds, on top of the exposure term.
+#:
+#: Zero means *uncalibrated*, not *measured to be zero*.  Unlike the exposure
+#: term this one is constant, so it is absorbed by the T3c intercept and does
+#: not move a trajectory's shape; it is exposed here so the T3c LED sweep has
+#: somewhere to put its answer.
+READOUT_OFFSET_S = 0.0
+
+
 def camera_frame_times_rel(
     ep_dir: Path,
     t0_mono_s: float | None,
     *,
     camera: str | None = None,
+    exposure_fraction: float = EXPOSURE_CENTER_FRACTION,
+    readout_offset_s: float = READOUT_OFFSET_S,
 ) -> list[float | None] | None:
     """Camera hardware frame time per online-sync ``logical_frame_index``, in
     the t0-relative domain shared with BOX ``t_rel_s`` (both anchored to the
     same ``time.monotonic()`` origin)::
 
-        time[N] = sensor_timestamp_ns[N] / 1e9 - t0_mono_s
+        time[N] = (sensor_timestamp_ns[N] / 1e9
+                   + exposure_fraction * sensor_exposure_time_ns[N] / 1e9
+                   + readout_offset_s) - t0_mono_s
 
     ``sensor_timestamp_ns`` is the Argus/V4L2 kernel **start-of-frame (SOF)**
     timestamp (``getSensorTimestamp``, CLOCK_MONOTONIC) — the same clock as the
     ``time.monotonic()`` latched into ``t0_mono_s`` at ``start_episode``.  It is
-    a hardware frame-time anchor, not a proven exposure-center; a small *fixed*
-    exposure/readout offset may remain, but being constant it does not affect
-    the per-episode-varying skew this corrects.  The idealized ``N/fps`` grid
+    a hardware frame-time anchor, not the exposure center.
+
+    The gap between the two is ``exposure_fraction * exposure``, and it is
+    *not* constant: under Argus auto-exposure the integration time tracks scene
+    brightness, which tracks pose, so the label's time offset varies with where
+    the rig is.  That is a pose-correlated timing bias -- it does not average
+    out, and no amount of clock work can find it, because both clocks are fine.
+    At this rig's p95 hand speed (680 mm/s) an exposure swinging 4-12 ms is
+    ~2.7 mm of position-label wander on its own.  Subtracting the term
+    per-frame is what turns that from a bias into a correction, so the exposure
+    does *not* have to be pinned -- it has to be *recorded*.  What the
+    correction cannot remove is cross-camera exposure differences, since one
+    fused pose carries one time; ``check_exposure_timing.py`` prices that.
+
+    ``exposure_fraction`` defaults to :data:`EXPOSURE_CENTER_FRACTION`, which is
+    ``0.0``: the exposure is recorded, the shift is not applied, and the caller
+    has to ask for it.  See that constant for why applying an unmeasured sign is
+    worse than applying nothing.  Note also that with ``camera=None`` this reads
+    whichever sidecar sorts first, so the correction it would apply is *that*
+    camera's exposure on every frame of the shared BOX timeline; under
+    auto-exposure the others keep a ``fraction * (E_first - E_k)`` residual.
+
+    Frames whose sidecar carries no exposure column read 0 and are therefore
+    left exactly where they were, so pre-column episodes load unchanged.
+
+    ``readout_offset_s`` is the remaining fixed latency and defaults to
+    *uncalibrated* zero; being constant it shifts a trajectory without
+    deforming it.  The idealized ``N/fps`` grid
     instead assumes frame 0 == t0 and exactly 60.000 Hz; on real Thor data it is
     offset from the SOF anchor by a per-episode fixed skew of ~10-55 ms
     (ts_sync.md §5.4 / experiments/ts_sync_skew_20260716/).  Using these times
@@ -718,8 +808,19 @@ def camera_frame_times_rel(
                         sof = float(row["sensor_timestamp_ns"])
                     except (KeyError, ValueError, TypeError):
                         continue
+                    # Absent / all-zero column == pre-lock sidecar: contribute
+                    # nothing rather than guess an exposure.
+                    try:
+                        exposure_ns = float(row.get("sensor_exposure_time_ns") or 0.0)
+                    except (ValueError, TypeError):
+                        exposure_ns = 0.0
                     if sof > 0:
-                        by_frame[n] = sof / 1e9 - float(t0_mono_s)
+                        by_frame[n] = (
+                            sof / 1e9
+                            + exposure_fraction * max(exposure_ns, 0.0) / 1e9
+                            + readout_offset_s
+                            - float(t0_mono_s)
+                        )
         except (OSError, csv.Error):
             continue
         if by_frame:

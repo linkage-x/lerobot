@@ -7,7 +7,7 @@ export type DeploymentProfile = {
   defaultRoute: string;
 };
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator";
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator" | "laser_tracker";
 
 export type DeviceStatus = {
   id: string;
@@ -118,6 +118,15 @@ export type RecordingStatus = {
   syncSummary?: string;
   syncReportPath?: string;
   syncWarnings?: string[];
+  // Whether this Connect asked for the laser tracker. A per-session choice, not
+  // a property of the rig: the instrument is shared and admits one client.
+  laserTracker?: boolean;
+  laserTrackerState?: string;
+  laserTrackerDetail?: string;
+  // Model / serial / firmware as the instrument reported them.
+  laserTrackerDevice?: string;
+  // Whether the beam is on the SMR. Start Episode is gated on it.
+  laserTrackerReady?: boolean;
 };
 
 export type MarkerTcpSample = {
@@ -1104,3 +1113,92 @@ export type IntrinsicsCoverageResponse = {
   foldMarginWarnDeg: number;
   cameras: IntrinsicsCoverageCamera[];
 };
+
+/**
+ * One episode's comparison against the laser tracker, as the offline CLI left
+ * it. The gateway reads the artifact and does not compute, so everything here
+ * is a fact about a file on disk rather than about the current session.
+ */
+export type TrackerAlignmentSeries = {
+  /** Seconds from the first paired frame, not from episode start. */
+  t_rel_s: number[];
+  /** Sidecar frame index, so the plot can align to the replay timeline. */
+  frame_index: number[];
+  residual_mm: number[];
+  speed_m_s: number[];
+  /** Camera prediction of the SMR centre, metres, in the camera world frame. */
+  camera_xyz_m: Array<[number, number, number]>;
+  /** Tracker measurement of the same point, mapped into the same frame. */
+  tracker_xyz_m: Array<[number, number, number]>;
+};
+
+export type TrackerAlignmentSummary = {
+  n_paired: number;
+  n_camera_frames: number;
+  coverage: number;
+  residual_mm: Record<string, number | null>;
+  strata: Record<string, Record<string, number | null>>;
+  clock: Record<string, number>;
+  registration: {
+    source: string;
+    certifies_space: boolean;
+    rms_mm: number | null;
+    scale_diagnostic: number | null;
+    /**
+     * Error modes the registration -- and the lever arm fitted beside it --
+     * removed before the residual was computed, so the residual is silent about
+     * them however small it is.
+     *
+     * Independence and absorption are different questions. `certifies_space`
+     * says the transform came from data other than this trajectory; this says
+     * which constant biases that independent fit still soaked up. A lever arm
+     * fitted from parked poses is independent *and* absorbs both body-frame
+     * constants, which together are the marker-to-TCP constant.
+     */
+    absorbed_modes?: string[];
+  };
+  lever_arm_mm: number;
+  /**
+   * Millimetres of residual one degree of orientation error would produce.
+   * Zero means the residual says nothing at all about rotation, which is a
+   * property of where the SMR sits, not of how good the pipeline is.
+   */
+  rotation_sensitivity_mm_per_deg: number;
+  interp_error_mm_bound: number;
+  /** Positive = the tracker leads the cameras. Null = the motion could not answer. */
+  time_crosscheck_s: number | null;
+  certifies_space: boolean;
+};
+
+export type TrackerAlignment =
+  | { ok: true; available: false; reason: string }
+  | {
+      ok: true;
+      available: true;
+      artifact: string;
+      generatedUtc: string;
+      episode: number;
+      target: string;
+      session: Record<string, unknown>;
+      summary: TrackerAlignmentSummary;
+      certifiesSpace: boolean;
+      registrationSource: string;
+      coverage: number;
+      series: TrackerAlignmentSeries;
+      /** Loss-of-lock windows, seconds relative to the first paired frame. */
+      dropoutsRelS: Array<[number, number]>;
+      leverArmM: [number, number, number];
+      minCoverage: number;
+      /** Provenance of the fitted lever arm, when one was used. */
+      mountFit: {
+        artifact?: string | null;
+        mount_id?: string | null;
+        session_id?: string | null;
+        station_artifact?: string | null;
+        n_poses?: number | null;
+        holdout_rms_mm?: number | null;
+        per_pose_c_spread_mm?: number | null;
+        sigma?: { c_sigma_norm_mm?: number | null } | null;
+        observability?: { fixed_attitude?: boolean; rotation_span_deg?: number } | null;
+      } | null;
+    };

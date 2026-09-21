@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
+import { TrackerAlignmentPanel } from "./TrackerAlignmentPanel";
 import type { DataCollectionGuiApi } from "./api";
-import type { CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
+import type { CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame, TrackerAlignment } from "./types";
 import { TouchHeatmapGrid, touchLayoutForSample, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
 
 const cubeColors: Record<string, number> = {
@@ -10,6 +11,11 @@ const cubeColors: Record<string, number> = {
   right: 0x0f766e,
   head: 0x2563eb
 };
+
+// Ground truth gets its own colour, deliberately not from cubeColors: on the
+// same axes as the estimates it has to be legible as a different *kind* of
+// thing, not as one more tracked object.
+const TRACKER_GT_COLOR = 0xf59e0b;
 
 const cubePoseDims = ["x", "y", "z", "qx", "qy", "qz", "qw"] as const;
 
@@ -293,6 +299,7 @@ export function ReplayInspector({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [mujocoPreview, setMujocoPreview] = useState<MujocoPreview | null>(null);
+  const [trackerAlignment, setTrackerAlignment] = useState<TrackerAlignment | null>(null);
   const [nativeVideoFailed, setNativeVideoFailed] = useState(false);
   const mujocoVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -335,6 +342,18 @@ export function ReplayInspector({
           setLoading(false);
         }
       });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, datasetPath, episode, revision]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTrackerAlignment(null);
+    if (!datasetPath) return;
+    api.fetchTrackerAlignment(datasetPath, episode).then((result) => {
+      if (!cancelled) setTrackerAlignment(result);
+    });
     return () => {
       cancelled = true;
     };
@@ -577,6 +596,57 @@ export function ReplayInspector({
         .map((entry) => [entry.x, entry.y, entry.z] as [number, number, number])
     }));
   }, [timeline, cubePoseNames]);
+  // Both trajectories already live in the camera world frame -- the offline step
+  // mapped the tracker into it -- so this is an overlay, not a second fit.
+  const trackerTrajectories = useMemo(() => {
+    if (!trackerAlignment?.available) return [];
+    const points = trackerAlignment.series.tracker_xyz_m;
+    if (!points?.length) return [];
+    return [
+      {
+        name: trackerAlignment.summary.certifies_space ? "laser tracker GT" : "laser tracker (shape only)",
+        color: TRACKER_GT_COLOR,
+        points: points as Array<[number, number, number]>
+      }
+    ];
+  }, [trackerAlignment]);
+
+  const viewerTrajectories = useMemo(
+    () => [...cubeTrajectories, ...trackerTrajectories],
+    [cubeTrajectories, trackerTrajectories]
+  );
+
+  // Residual is defined only on frames that had a trustworthy tracker sample
+  // under them. Unpaired frames return NaN rather than 0 so SeriesPlot leaves a
+  // gap: a flat zero line across a dropout would read as perfect agreement,
+  // which is the exact opposite of what happened there.
+  const residualByFrame = useMemo(() => {
+    const map = new Map<number, number>();
+    if (trackerAlignment?.available) {
+      const { frame_index: frames, residual_mm: residual } = trackerAlignment.series;
+      for (let i = 0; i < frames.length; i++) map.set(frames[i], residual[i]);
+    }
+    return map;
+  }, [trackerAlignment]);
+
+  const speedByFrame = useMemo(() => {
+    const map = new Map<number, number>();
+    if (trackerAlignment?.available) {
+      const { frame_index: frames, speed_m_s: speed } = trackerAlignment.series;
+      for (let i = 0; i < frames.length; i++) map.set(frames[i], speed[i]);
+    }
+    return map;
+  }, [trackerAlignment]);
+
+  const pickTrackerSeries = useCallback(
+    (frameIndex: number, dim: number) => {
+      const source = dim === 0 ? residualByFrame : speedByFrame;
+      const value = source.get(frameIndex);
+      return value === undefined ? Number.NaN : value;
+    },
+    [residualByFrame, speedByFrame]
+  );
+
   const currentCubePoses = useMemo(() => {
     return cubePoseNames.map((name, index) => ({
       name,
@@ -783,7 +853,7 @@ export function ReplayInspector({
           trajectory={trajectory}
           currentPose={pose}
           forceVector={forceVector}
-          extraTrajectories={cubeTrajectories}
+          extraTrajectories={viewerTrajectories}
           currentExtraPoses={currentCubePoses}
         />
       </section>
@@ -902,7 +972,19 @@ export function ReplayInspector({
             rowHeight={22}
           />
         ) : null}
+        {trackerAlignment?.available ? (
+          <SeriesPlot
+            title="laser tracker residual"
+            names={["residual_mm", "tracker_speed_m_s"]}
+            pickValue={pickTrackerSeries}
+            currentFrame={currentFrame}
+            totalFrames={totalFrames}
+            onSeek={seek}
+            rowHeight={22}
+          />
+        ) : null}
       </div>
+      <TrackerAlignmentPanel alignment={trackerAlignment} />
       {error ? <p className="panel-note error">{error}</p> : null}
     </section>
   );

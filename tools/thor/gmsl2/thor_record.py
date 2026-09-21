@@ -86,6 +86,7 @@ from tools.thor.gmsl2 import argus_video_materialize as avm  # noqa: E402
 from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
+from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -596,7 +597,12 @@ def _wallclock_utc_from_wall_s(wall_s: float) -> str:
 
 
 def _box_camera_alignment_summary(
-    frame_times_s: list[float | None] | None, fps: int
+    frame_times_s: list[float | None] | None,
+    fps: int,
+    *,
+    raw_frame_times_s: list[float | None] | None = None,
+    exposure_fraction: float = lr3.EXPOSURE_CENTER_FRACTION,
+    readout_offset_s: float = lr3.READOUT_OFFSET_S,
 ) -> dict[str, Any]:
     """Episode-level record of how BOX state was time-aligned to the cameras.
 
@@ -604,6 +610,21 @@ def _box_camera_alignment_summary(
     vs the idealized ``N/fps`` grid) into ``meta.json`` so the correction is
     auditable, not buried in code. See ts_sync.md §5.4 /
     experiments/ts_sync_skew_20260716/.
+
+    "Auditable" has to mean the whole formula, including the terms that are
+    currently zero. ``camera_frame_times_rel`` can add
+    ``exposure_fraction * exposure + readout_offset_s`` per frame, and ships
+    with ``exposure_fraction = 0.0`` -- the exposure is recorded, the shift is
+    not applied, because which edge the Tegra VI stamps has not been measured
+    and the wrong sign doubles the error the right one removes.
+
+    "Not corrected" is exactly as much a claim about the data as "corrected by
+    half an exposure", so both get written down. The terms in force are named
+    here, and ``raw_frame_times_s`` -- the same sidecar read with the correction
+    switched off -- says what they moved, in ms, on this episode. That is what
+    makes it reversible in either direction: an episode recorded under a default
+    that later turns out to be wrong can be re-derived from this block plus the
+    per-frame exposures in its sidecars, without re-recording.
     """
     if not frame_times_s:
         return {
@@ -622,11 +643,46 @@ def _box_camera_alignment_summary(
     jitter = (sum((d - mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
     return {
         "mode": "sensor_timestamp_sof",
-        "reference": "sensor_timestamp_ns/1e9 - t0_mono_s (hardware SOF, CLOCK_MONOTONIC)",
+        "reference": (
+            "(sensor_timestamp_ns/1e9 + exposure_fraction*sensor_exposure_time_ns/1e9"
+            " + readout_offset_s) - t0_mono_s; sensor_timestamp_ns is the hardware SOF"
+            " (CLOCK_MONOTONIC)"
+        ),
+        "exposure_fraction": float(exposure_fraction),
+        "readout_offset_s": float(readout_offset_s),
+        "exposure_correction_ms": _exposure_correction_ms(frame_times_s, raw_frame_times_s),
         "mean_skew_ms": round(mean * 1000.0, 3),
         "skew_jitter_ms": round(jitter * 1000.0, 3),
         "frames_with_sof": len(deltas),
         "frames_total": len(frame_times_s),
+    }
+
+
+def _exposure_correction_ms(
+    frame_times_s: list[float | None] | None,
+    raw_frame_times_s: list[float | None] | None,
+) -> dict[str, float] | None:
+    """How far the exposure-center correction actually moved this episode, in ms.
+
+    ``None`` when it could not be measured (no uncorrected read to compare
+    against). All-zero is a real answer and not the same thing: it says the
+    sidecars carry no exposure column, so the frames were left exactly where a
+    pre-correction recorder would have put them.
+    """
+    if not frame_times_s or not raw_frame_times_s:
+        return None
+    diffs = [
+        (corrected - raw) * 1000.0
+        for corrected, raw in zip(frame_times_s, raw_frame_times_s, strict=False)
+        if corrected is not None and raw is not None
+        and math.isfinite(corrected) and math.isfinite(raw)
+    ]
+    if not diffs:
+        return None
+    return {
+        "mean": round(sum(diffs) / len(diffs), 4),
+        "min": round(min(diffs), 4),
+        "max": round(max(diffs), 4),
     }
 
 
@@ -1252,6 +1308,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="trust the MAX96726 lock list verbatim")
     ap.add_argument("--no-box", action="store_true",
                     help="ignore the YAML box_collection block (camera-only)")
+    # Tri-state: neither flag defers to the yaml.  The GUI sends one explicitly
+    # so an operator's per-session choice is never silently overridden by a file
+    # they did not open.
+    ap.add_argument("--laser-tracker", action="store_true",
+                    help="record the laser tracker this session (overrides the config)")
+    ap.add_argument("--no-laser-tracker", action="store_true",
+                    help="do not record the laser tracker this session (overrides the config)")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="disable the automatic recover_argus.sh round triggered "
                          "by a wedged nvargus-daemon (default: enabled)")
@@ -1272,6 +1335,11 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    # Tri-state on purpose: the yaml declares the hardware and defaults to off,
+    # --laser-tracker / --no-laser-tracker is the GUI toggle for this session,
+    # and "neither flag" means "whatever the file says".
+    lt_override = True if args.laser_tracker else (False if args.no_laser_tracker else None)
+    lt_cfg = lts.config_from_yaml_dict(raw_yaml.get("laser_tracker"), enabled_override=lt_override)
     auto_cfg = _auto_recover_from_yaml(raw_yaml.get("auto_recover"))
     if args.no_auto_recover:
         auto_cfg.enabled = False
@@ -1341,6 +1409,24 @@ def main(argv: list[str] | None = None) -> int:
     # incoming UDP packet (see tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
+    # The tracker lives on another machine and is booked by other people, so it
+    # must never stop nine cameras from recording: start() returns False instead
+    # of raising, and every use below is guarded by the flag.
+    # The recorder already knows where the repo is; handing it over beats the
+    # driver guessing from its own __file__.
+    tracker = lts.LaserTrackerSession(lt_cfg, repo_root=args.repo_root)
+    tracker_started = tracker.start()
+    if lt_cfg.enabled and not tracker_started:
+        _emit(f"WARNING: laser tracker unavailable, recording without it: {tracker.last_error}")
+    elif tracker_started:
+        # The instrument names itself; nothing here is transcribed from config.
+        _emit(f"Laser tracker: {tracker.describe()}")
+        _emit(f"Laser tracker session {tracker.session_id} -> {tracker.win_dir}")
+        if tracker.last_error:
+            _emit(f"WARNING: laser tracker: {tracker.last_error}")
+        # A machine-readable line so the gateway can colour the row and gate the
+        # Start button; the human sentence rides along after the pipe.
+        _emit(f"LT_BEAM {'ready' if tracker.beam_ready else 'waiting'}|{tracker.beam_summary()}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)
@@ -1822,8 +1908,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         return stream_errs
 
+    tracker_beam_was = None
+
+    def _tick_tracker_beam() -> None:
+        # Pushed by the logger over stdout, so this only forwards a change --
+        # no ssh round trip, and the row turns green within one tick of the
+        # operator dropping the SMR into the nest.
+        nonlocal tracker_beam_was
+        if not tracker_started:
+            return
+        now = tracker.beam_ready
+        if now != tracker_beam_was:
+            tracker_beam_was = now
+            _emit(f"LT_BEAM {'ready' if now else 'waiting'}|{tracker.beam_summary()}")
+
     def _tick_connected_idle() -> None:
         nonlocal last_box_live_at, last_warmup_roll_at
+        _tick_tracker_beam()
         _poll_stream_health(context="idle")
         # Bound the throwaway warmup stream while we sit armed but not recording.
         # splitmuxsink never auto-rotates (max-size-time=0), so the open warmup
@@ -1887,6 +1988,14 @@ def main(argv: list[str] | None = None) -> int:
                         "power-cycle the box, and reconnect."
                     )
                 box.start_recording(t_start)
+            # Anchored to the same t_start the cameras use, so the tracker's
+            # episode and the video share one wall-clock origin even though the
+            # samples themselves are stamped by the controller and married to
+            # Thor's monotonic clock offline.
+            if tracker_started:
+                # Bookkeeping only: the stream has been running since Connect,
+                # so this cannot block the cameras and cannot fail slowly.
+                tracker.start_recording(ep_idx, t_start)
             box_snapshots: list[dict[str, Any]] = []
             episode_time_s = _next_episode_length_s(pending_episode_time_s, cfg.episode_time_s)
             pending_episode_time_s = 0.0
@@ -1953,6 +2062,18 @@ def main(argv: list[str] | None = None) -> int:
                 recorded_samples = box.stop_recording()
             else:
                 recorded_samples = {}
+            tracker_record: dict[str, Any] = {}
+            if tracker_started:
+                tracker_record = tracker.stop_recording()
+                if tracker_record.get("error"):
+                    _emit(f"WARNING: laser tracker episode {ep_idx}: {tracker_record['error']}")
+                elif tracker_record.get("stream_advanced"):
+                    # The session total, not this episode's -- the per-episode
+                    # slice is taken offline by timestamp. Worded to match.
+                    _emit(
+                        f"Laser tracker streaming ({tracker_record['rt_rows_total_at_stop']} "
+                        f"samples so far this session)"
+                    )
 
             pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
@@ -2019,17 +2140,39 @@ def main(argv: list[str] | None = None) -> int:
                 frame_times = lr3.camera_frame_times_rel(
                     ep_dir, getattr(handle, "t0_mono_s", None)
                 )
+                # The same sidecar read with the exposure-center correction off.
+                # Kilobytes, once per episode, and it is what lets meta.json say
+                # how many ms the correction moved this episode rather than only
+                # that it was configured.
+                raw_frame_times = lr3.camera_frame_times_rel(
+                    ep_dir, getattr(handle, "t0_mono_s", None),
+                    exposure_fraction=0.0, readout_offset_s=0.0,
+                )
                 annotations: dict[str, Any] = {
                     "cleanup_duration_s": cleanup_duration_s,
                     "split_emit_ms": split_emit_ms,
                     "box_camera_alignment": _box_camera_alignment_summary(
-                        frame_times, cfg.cameras.fps
+                        frame_times, cfg.cameras.fps, raw_frame_times_s=raw_frame_times
                     ),
                 }
                 if frame_sync_payload is not None:
                     annotations["argus_frame_sync"] = frame_sync_payload
                 if online_sync_payload is not None:
                     annotations["online_sync"] = online_sync_payload
+                # Recorded even when it failed, and even when it was off: an
+                # episode that is silent about the tracker cannot be told apart
+                # later from one where the tracker was asked for and did not
+                # answer, and those two need opposite handling.
+                annotations["laser_tracker"] = (
+                    {
+                        "enabled": True,
+                        "session_id": tracker.session_id,
+                        "win_session_dir": tracker.win_dir,
+                        **tracker_record,
+                    }
+                    if tracker_started
+                    else {"enabled": bool(lt_cfg.enabled), "error": tracker.last_error}
+                )
                 _annotate_episode_meta(meta_path, annotations)
                 has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
                 if has_recorded_samples:
@@ -2152,6 +2295,15 @@ def main(argv: list[str] | None = None) -> int:
             box.stop()
         except Exception as exc:
             logger.warning("box.stop on shutdown: %s", exc)
+        if tracker_started:
+            try:
+                summary = tracker.stop(land_to=Path(cfg.dataset_root) / "laser_tracker")
+                if summary.get("landed_to"):
+                    _emit(f"Laser tracker session landed: {summary['landed_to']}")
+                elif summary.get("last_error"):
+                    _emit(f"WARNING: laser tracker: {summary['last_error']}")
+            except Exception as exc:
+                logger.warning("laser tracker stop on shutdown: %s", exc)
         _emit("Recording stopped")
     return rc
 
