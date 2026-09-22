@@ -1,0 +1,131 @@
+{
+  "schema": "p0_replay_sync_diagnostics/v1",
+  "dataset_root": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918",
+  "output_dir": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics",
+  "gripper_source": "observation.state",
+  "gripper_feature": "box_gripper.distance_m",
+  "important": "The dataset contains measured gripper width, not a gripper action. Replay uses this measured width as the requested command.",
+  "sides": {
+    "left": {
+      "sidecar": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/april_cube_tracking_in_robot_base/state_action.left.csv",
+      "skipped_nonfinite_pose_rows": 0,
+      "episodes": {
+        "0": {
+          "frames": 531,
+          "duration_s": 8.833333015441895,
+          "start_xyz_m": [
+            0.5038595396820698,
+            0.025394663104736398,
+            0.15447491659751522
+          ],
+          "end_xyz_m": [
+            0.509680132833204,
+            0.03936167634395968,
+            0.20569205705746738
+          ],
+          "gripper_start_mm": 88.29768002033234,
+          "gripper_min_mm": 23.824414238333702,
+          "gripper_max_mm": 88.74030411243439,
+          "gripper_end_mm": 88.7398049235344,
+          "first_close_over_0p5mm_s": 0.6000000238418579,
+          "first_open_over_0p5mm_s": 3.4000000953674316,
+          "plot": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_000_left_time_xyz_gripper.png",
+          "csv": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_000_left_time_xyz_gripper.csv"
+        },
+        "1": {
+          "frames": 537,
+          "duration_s": 8.933333396911621,
+          "start_xyz_m": [
+            0.49983002860141035,
+            0.03036261316669126,
+            0.14171723330359218
+          ],
+          "end_xyz_m": [
+            0.5099064290888464,
+            0.048663377061197215,
+            0.18963392229414
+          ],
+          "gripper_start_mm": 45.71463167667389,
+          "gripper_min_mm": 41.615042835474014,
+          "gripper_max_mm": 88.74030411243439,
+          "gripper_end_mm": 88.7398049235344,
+          "first_close_over_0p5mm_s": null,
+          "first_open_over_0p5mm_s": 3.3333332538604736,
+          "plot": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_001_left_time_xyz_gripper.png",
+          "csv": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_001_left_time_xyz_gripper.csv"
+        },
+        "2": {
+          "frames": 421,
+          "duration_s": 7.0,
+          "start_xyz_m": [
+            0.4707378260034614,
+            0.02865800456269826,
+            0.15397928102043235
+          ],
+          "end_xyz_m": [
+            0.4759893049431408,
+            0.03948606378528703,
+            0.23045941473249387
+          ],
+          "gripper_start_mm": 52.224673330783844,
+          "gripper_min_mm": 49.37821254134178,
+          "gripper_max_mm": 88.74030411243439,
+          "gripper_end_mm": 88.7398049235344,
+          "first_close_over_0p5mm_s": 0.06666667014360428,
+          "first_open_over_0p5mm_s": 3.3333332538604736,
+          "plot": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_002_left_time_xyz_gripper.png",
+          "csv": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_002_left_time_xyz_gripper.csv"
+        },
+        "3": {
+          "frames": 442,
+          "duration_s": 7.349999904632568,
+          "start_xyz_m": [
+            0.46989644480932047,
+            0.024706883867046177,
+            0.15135237863036524
+          ],
+          "end_xyz_m": [
+            0.41243452688062243,
+            0.01233207931919005,
+            0.23033810451284606
+          ],
+          "gripper_start_mm": 71.0468739271164,
+          "gripper_min_mm": 49.708448350429535,
+          "gripper_max_mm": 88.74030411243439,
+          "gripper_end_mm": 88.7398049235344,
+          "first_close_over_0p5mm_s": 0.05000000074505806,
+          "first_open_over_0p5mm_s": 4.150000095367432,
+          "plot": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_003_left_time_xyz_gripper.png",
+          "csv": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_003_left_time_xyz_gripper.csv"
+        },
+        "4": {
+          "frames": 414,
+          "duration_s": 6.883333206176758,
+          "start_xyz_m": [
+            0.46533289696317687,
+            0.030950875278615494,
+            0.15819686561852675
+          ],
+          "end_xyz_m": [
+            0.4321944002837417,
+            0.01093758743518715,
+            0.25566649657002993
+          ],
+          "gripper_start_mm": 48.45714569091797,
+          "gripper_min_mm": 48.45714569091797,
+          "gripper_max_mm": 88.74030411243439,
+          "gripper_end_mm": 88.7398049235344,
+          "first_close_over_0p5mm_s": null,
+          "first_open_over_0p5mm_s": 3.549999952316284,
+          "plot": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_004_left_time_xyz_gripper.png",
+          "csv": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/p0_replay_sync_diagnostics/episode_004_left_time_xyz_gripper.csv"
+        }
+      }
+    },
+    "right": {
+      "sidecar": "/home/nvidia/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260921_163918/derived/april_cube_tracking_in_robot_base/state_action.right.csv",
+      "skipped_nonfinite_pose_rows": 2345,
+      "episodes": {}
+    }
+  }
+}
