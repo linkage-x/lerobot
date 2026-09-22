@@ -141,6 +141,29 @@ export type MarkerTcpSample = {
   staticTransformPath: string;
   note: string;
   createdAt: string;
+  /** This Connect had the laser tracker on: the sample doubles as an E1p capture. */
+  laserTracker?: boolean;
+  trackerSessionId?: string;
+};
+
+/** The last E1p run from the marker->TCP panel, as the gateway holds it. */
+export type MarkerTcpTrackerCheck = {
+  ok?: boolean;
+  returncode?: number;
+  error?: string;
+  summary?: string;
+  boxId?: string;
+  cube?: string;
+  condition?: string;
+  mountId?: string;
+  samples?: number;
+  notes?: string[];
+  stationPath?: string;
+  mountFitPath?: string;
+  markerTcpPath?: string;
+  reportPath?: string;
+  createdAt?: string;
+  report?: TrackerPivotReport | null;
 };
 
 export type MarkerTcpSession = {
@@ -156,6 +179,7 @@ export type MarkerTcpSession = {
   solveSummaryPath?: string;
   pivotReportPath?: string;
   trackingRunPath?: string;
+  trackerCheck?: MarkerTcpTrackerCheck;
 };
 
 export type RecordingBackend = "real" | "sim";
@@ -1317,10 +1341,11 @@ export type TrackerMountCaptureRow = {
 export type TrackerMountSolveResponse = {
   ok: boolean;
   returncode?: number;
-  kind?: "station" | "lever_arm";
-  report?: TrackerStationReport | TrackerMountReport | null;
+  kind?: "station" | "lever_arm" | "pivot";
+  report?: TrackerStationReport | TrackerMountReport | TrackerPivotReport | null;
   reportPath?: string;
   stationPath?: string;
+  markerTcpPath?: string;
   summary?: string;
   stdout?: string;
   stderr?: string;
@@ -1406,6 +1431,57 @@ export type TrackerMountSession = {
   startedAt: string;
   recorderState: string;
   episodeInFlight: boolean;
+  /** "dwell" (station + lever arm) or "pivot" (E1p, TCP pinned in the socket). */
+  kind?: "dwell" | "pivot";
+  /** Segments saved before they could hold a dwell; each needs re-recording. */
+  shortSegments?: number;
+  lastSegmentSeconds?: number;
+  segmentMinSeconds?: number;
+  segmentSuggestedSeconds?: number;
+};
+
+/** E1p: production's TCP against the pivot socket the tracker finds. */
+export type TrackerPivotReport = {
+  n_poses: number;
+  cube?: string;
+  mount_id?: string;
+  static_tcp_error_mm: { p95: number; rms: number; max: number; per_pose: number[] };
+  tcp_budget_mm: number;
+  static_p95_within_budget: boolean;
+  c_tcp_production_mm: number[];
+  c_tcp_measured_mm: number[];
+  c_tcp_error_mm: number[];
+  c_tcp_error_norm_mm: number;
+  d_cube_mm: number[];
+  split: null | {
+    cube_frame_constant_mm: number[];
+    world_frame_constant_mm: number[];
+    pose_dependent_rms_mm: number;
+    gain_min: number;
+  };
+  sphere: null | {
+    radius_mm: number;
+    rms_mm: number;
+    gain_min: number;
+    center_sigma_norm_mm: number | null;
+    center_sigma_weak_mm: number;
+  };
+  radius_check_mm: null | {
+    sphere_radius_mm: number;
+    socket_to_smr_from_camera_mm: number;
+    difference_mm: number;
+  };
+  certifies: boolean;
+  certify_reasons: string[];
+  cannot_see: string[];
+  /** SMR -> TCP in the cube frame, TCP end from the tracker; only with a lever-arm fit. */
+  smr_to_tcp_cube_mm?: number[];
+  smr_to_tcp_norm_mm?: number;
+  /** "tcp" when graded on production's own TCP labels, "cube" on cube poses. */
+  pose_frame?: string;
+  bundle_calibration_id?: string | null;
+  /** Samples of a sweep the operator never paused in; listed, not fatal. */
+  episodes_without_dwells?: { dataset: string; episode: number; why: string }[];
 };
 
 export type TrackerMountSessionResponse = {
@@ -1425,6 +1501,9 @@ export type TrackerMountCapture = {
   landed: boolean;
   poseLabel: string;
   purpose: string;
+  /** smr_parked_pose_dwell | tcp_pivot_dwell; empty on captures made before it existed. */
+  protocol?: string;
+  segmentSeconds?: number;
   beamValidFraction: number;
   streamAdvanced: boolean;
   trackerError: string;

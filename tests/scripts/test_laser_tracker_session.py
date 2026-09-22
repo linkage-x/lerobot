@@ -482,3 +482,100 @@ def test_a_declared_smr_size_reaches_the_logger() -> None:
     assert "--home 1.5" in logger_cmd
     assert "--adm-offset 0.25" in logger_cmd
     assert session.last_error == ""
+
+
+# --- cold start after a power cut (2026-09-21) --------------------------------
+
+
+def test_warmup_is_not_reported_as_an_smr_problem() -> None:
+    """TrackerNotWarmedUp was shown as "waiting for the SMR".
+
+    After the 2026-09-21 power cut that sentence sent the operator to the nest
+    while the only fix was to wait for the laser, and two Connects that had in
+    fact succeeded were abandoned as failures.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session.beam_status = "waiting (TrackerNotWarmedUp (22))"
+    summary = session.beam_summary()
+    assert "warming up" in summary
+    assert "SMR" not in summary
+    assert "retries automatically" in summary
+
+
+def test_an_unrecognised_home_error_does_not_blame_the_smr() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+    session.beam_status = "waiting (AdmLowIntensity (23))"
+    summary = session.beam_summary()
+    assert "AdmLowIntensity (23)" in summary
+    assert "for the SMR" not in summary
+
+
+def _dead_logger_session(tail_line: str):
+    session = lts.LaserTrackerSession(_cfg())
+    session._logger_tail.append(tail_line)
+
+    class _Dead:
+        stdout = None
+
+        def poll(self):
+            return 1
+
+    session._logger_proc = _Dead()  # type: ignore[assignment]
+    session._count_rows = lambda _name: 0  # type: ignore[method-assign]
+    return session
+
+
+def test_a_failed_index_search_points_at_the_servo_switch() -> None:
+    session = _dead_logger_session("connection failed: IndexSearchFailed (43)")
+    assert session._await_logger() is False
+    assert "index search" in session.last_error
+    assert "Servo" in session.last_error
+
+
+def test_communication_failure_also_names_a_booting_controller() -> None:
+    """Right after power-on the same code means "not up yet", not "busy"."""
+    session = _dead_logger_session("connection failed: CommunicationFailed (13)")
+    assert session._await_logger() is False
+    assert "still booting" in session.last_error
+    assert "one client at a time" in session.last_error
+
+
+def test_a_logger_that_never_streams_is_told_to_stop(monkeypatch) -> None:
+    """Giving up on Connect must not leave the logger holding the tracker.
+
+    The logger only checks its stop-file once connected, so one still in the
+    SDK handshake at the deadline would otherwise finish connecting later and
+    keep the instrument's single client slot for up to ``session_cap_s``.
+    """
+    import subprocess
+
+    session = lts.LaserTrackerSession(_cfg())
+    ran: list[str] = []
+
+    class _Stuck:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("ssh", timeout)
+
+        def terminate(self):
+            _Stuck.terminated = True
+
+    def _fake_run(cmd, **_k):
+        ran.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(session, "_ensure_responder", lambda: None)
+    monkeypatch.setattr(session, "_spawn_probe", lambda: True)
+    monkeypatch.setattr(session, "_spawn_logger", lambda: setattr(session, "_logger_proc", _Stuck()))
+    monkeypatch.setattr(session, "_await_probe", lambda: True)
+    monkeypatch.setattr(session, "_await_logger", lambda: False)
+    monkeypatch.setattr(session, "_run", _fake_run)
+
+    assert session.start() is False
+    assert any("type nul" in c and "STOP_LOGGER" in c for c in ran)
+    assert _Stuck.terminated
+    assert session._logger_proc is None

@@ -154,7 +154,7 @@
 <div class="wrap">
 
 <header class="hero">
-  <p class="crumb"><a href="box_umi_trajectory_gt_replay_roadmap.html">← 主 roadmap：BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay</a></p>
+  <p class="crumb"><a href="box_umi_trajectory_gt_replay_roadmap.html">← 主 roadmap：BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay</a> · 原理：<a href="box_umi_smr_lever_arm_theory.html">TCP 位置认证原理</a></p>
   <h1>激光跟踪仪独立 GT 验证 Roadmap</h1>
   <p class="lede">目标：用激光跟踪仪给多相机 TCP 轨迹 GT 一个<b>不经过相机</b>的参考，让误差预算表最后一行「独立 GT benchmark · 零测量」变成实测。本页是主 roadmap <b>Phase 7</b> 的执行拆分，同时为 Phase 9 / 11 / 12 准备 GT 基础设施。</p>
   <div class="pills">
@@ -166,24 +166,26 @@
     <span class="pill">靶标接法 2026-09-17 改版：SMR 常驻本体</span>
     <span class="pill">1.5″ SMR · 球心↔TCP 60 mm · 站位固定 1.5 m</span>
     <span class="pill">一键采集/解算已进标定页</span>
-    <span class="pill">本页 v1.4 · 2026-09-21</span>
+    <span class="pill">目标：TCP 位置 3 mm（2026-09-22 定，不含姿态）</span>
+    <span class="pill">本页 v1.5 · 2026-09-22</span>
   </div>
   <div class="readouts">
-    <div class="readout"><div class="label">GT 链自身预算 · <b>球心口径</b></div><div class="value">≤ 1.0 mm</div><div class="note">低于它才有资格裁决 3 mm。<b>TCP 口径另加未测的 9.1 mm</b></div></div>
+    <div class="readout"><div class="label">GT 链自身预算 · <b>球心口径</b></div><div class="value">≤ 1.0 mm</div><div class="note">低于它才有资格裁决 3 mm。TCP 位置的常量项<b>改由跟踪仪 pivot（E1p）直接测</b></div></div>
     <div class="readout"><div class="label">Δt 残差</div><div class="value">≤ 0.7 ms</div><div class="note">p95 680 mm/s 下 ≤ 0.5 mm</div></div>
     <div class="readout"><div class="label">前后视检查门限</div><div class="value">0.003°</div><div class="note">说明书 §2.5；3 m 处约 0.16 mm</div></div>
   </div>
   <nav class="toc" aria-label="本页目录">
-    <a href="#verdict">结论先行</a><a href="#first-parked-set">首批驻点集</a><a href="#facts">说明书读出的事实</a><a href="#sdk">SDK 与随机资料</a><a href="#fieldcard">首场现场卡</a><a href="#unknowns">到手先核对</a><a href="#clocks">三套时钟</a><a href="#smr-on-body">SMR 常驻本体</a><a href="#plan">工作分解</a><a href="#target-interface">靶标接口</a><a href="#config-decided">首个受检构型</a><a href="#budget">GT 链预算</a><a href="#experiments">认证实验</a><a href="#code">代码与工具</a><a href="#redlines">口径红线</a><a href="#inputs">需要你提供</a><a href="#mainline">与主 roadmap 的对应</a>
+    <a href="#verdict">结论先行</a><a href="#next">下一步</a><a href="#first-parked-set">首批驻点集</a><a href="#facts">说明书读出的事实</a><a href="#sdk">SDK 与随机资料</a><a href="#fieldcard">首场现场卡</a><a href="#unknowns">到手先核对</a><a href="#clocks">三套时钟</a><a href="#smr-on-body">SMR 常驻本体</a><a href="#plan">工作分解</a><a href="#target-interface">靶标接口</a><a href="#config-decided">首个受检构型</a><a href="#budget">GT 链预算</a><a href="#experiments">认证实验</a><a href="#code">代码与工具</a><a href="#redlines">口径红线</a><a href="#inputs">需要你提供</a><a href="#mainline">与主 roadmap 的对应</a>
   </nav>
 </header>
 
 <main class="stack">
 
 <section class="card" id="verdict">
-  <div class="section-title"><h2>结论先行</h2><span class="badge todo">9 条</span><span class="badge ok">第 9 条 2026-09-21 新增</span></div>
+  <div class="section-title"><h2>结论先行</h2><span class="badge todo">10 条</span><span class="badge ok">第 10 条 2026-09-22 新增</span></div>
   <ul class="verdict">
-    <li class="lead"><b>2026-09-21：驻点集这条路走通了，而且比预想的便宜。</b><a href="#first-parked-set">首批 15 个位姿</a>是<b>垫着摆、手离开</b>采的——不需要夹具，不需要 FR3，不需要 15 个支架；实测驻点 span 中位 0.067 mm，平均点自身不确定度 <b>0.83 µm</b>，点云直径 0.90 m、planarity 0.140 均过几何门槛。<b>三个拦路的全是代码缺陷，而且都伪装成「你的数据不行」</b>：一个锁竞争造成的握手死锁（滞后恒等于超时预算）、一个把「一段 episode」当成「一个 mount」的概念混淆（让 848 mm 的张开被判成 rotation diversity 不足）、一个找错落地路径的发现逻辑。均已修、均未部署。<b>唯一要改的操作习惯是每段停到 3.5–4 s</b>（一个驻点需要 2.6 s，这次中位只有 2.89 s，4/15 不够长）。现行驻点门槛比它实际守护的误差严约 50 倍，放宽与否见该节，<b>是待决定项不是已决定项</b>。</li>
+    <li class="lead"><b>2026-09-22：目标收窄为「认证 TCP 位置 3 mm」，姿态不再是必测量。</b>TCP 位置 = R<sub>i</sub>·c<sub>TCP</sub> + t<sub>i</sub>，TCP 的姿态不进式子，所以 bundle 的旋转只通过 c<sub>TCP</sub>（3 个数）起作用——<a href="#budget">表外 ①</a> 那 3.5–9.1 mm 在位置口径下<b>只是 c<sub>TCP</sub> 的一个误差来源</b>，可以不测旋转、直接在 TCP 处测。办法是<b>跟踪仪 pivot（新增 <a href="#experiments">E1p</a>）</b>：SMR 留在钢片上不动，TCP 卡进相机 pivot 标定用的同一个球窝里转，钢片球心落在以球窝中心为心的球面上，跟踪仪单独定出球窝中心，再用冻结站位与生产标签<b>逐位姿相减</b>。c<sub>TCP</sub> 原样代入、不拟合，所以常量误差与静态姿态相关误差都直接可见。顺带：left 的 pivot 平移第一次有独立核对、right 的拷贝平移（最坏 13 mm）直接实测、6.15 mm URDF 矛盾同场裁决。<b>T4b 三窝 / STS 从 3 mm 位置路径上移出</b>，只在要认证 TCP 姿态时再做。新增一个必须单独收紧的量：<b>球窝中心 → TCP 的定义偏距 d</b>——两边都加它、在比较里抵消，跟踪仪看不见；要 CAD / 卡尺量到约 0.3 mm，而生产 pivot 工具给它的默认 σ 是 5 mm。推导见 <a href="box_umi_smr_lever_arm_theory.html">TCP 位置认证原理</a>，待办见 <a href="#next">下一步</a>。</li>
+    <li><b>2026-09-21：驻点集这条路走通了，而且比预想的便宜。</b><a href="#first-parked-set">首批 15 个位姿</a>是<b>垫着摆、手离开</b>采的——不需要夹具，不需要 FR3，不需要 15 个支架；实测驻点 span 中位 0.067 mm，平均点自身不确定度 <b>0.83 µm</b>，点云直径 0.90 m、planarity 0.140 均过几何门槛。<b>三个拦路的全是代码缺陷，而且都伪装成「你的数据不行」</b>：一个锁竞争造成的握手死锁（滞后恒等于超时预算）、一个把「一段 episode」当成「一个 mount」的概念混淆（让 848 mm 的张开被判成 rotation diversity 不足）、一个找错落地路径的发现逻辑。均已修、均未部署。<b>唯一要改的操作习惯是每段停到 3.5–4 s</b>（一个驻点需要 2.6 s，这次中位只有 2.89 s，4/15 不够长）。现行驻点门槛比它实际守护的误差严约 50 倍：<b>已定放宽到 span ≤ 0.30 / drift ≤ 0.15</b>（12/15 通过，σ_mean 上限 2.45 µm = 预算的 0.25%），并把 σ_mean 写成产物里的具名项。旧门槛只剩 3 个位姿，<b>三点必然共面</b>、planarity 精确为 0，会给出一个描述门槛而非描述采集的几何拒绝。</li>
     <li><b>仪器本身不是瓶颈。</b>激光跟踪仪自身误差以本机证书为准，通常在几十微米量级。GT 链那 1 mm 会花在四处：<b>球心 c 的拟合、跟踪仪系 ↔ 相机 world 的注册、时间对齐、失锁</b>，<a href="#smr-on-body">改版</a>后再加两条机械项（钢片刚度、窝内微动）。本页的工作量也集中在这几处。<b>注意这 1 mm 是「球心」的预算</b>，不是 TCP 的——两者相差 rig → TCP 旋转那一项，见 <a href="#budget">T6</a>。</li>
     <li><b>「原始数据只能在 Windows 拿」这个前提不成立，Trigger 口也不再是未知数。</b>随机 SDK（v7.18.0.0）官方支持 Windows / Linux / Mac，README 给了 <code>.deb</code> 安装路径并注明 ARM 架构不依赖 Qt6 —— 拿到 Linux 包，logger 可以跑在 Ubuntu 工作站甚至 Thor 上，少一跳主机钟。<b>但这条的权重取决于触发线</b>：TTL 接得上时对齐走脉冲索引、全程不涉及主机钟，跑在哪台机器就只剩运维差别；接不上时主机钟才重新变成唯一手段。Trigger 口是 <b>TTL 输入，Radian 上限 1000 Hz</b>（相机 60 Hz 只占 6%），<code>StartTTLMeasurement</code> 每个脉冲回一条带控制器时间戳的点。对齐方式随之从「求 Δt」升级成<b>脉冲索引对应</b>。见 <a href="#sdk">SDK 与随机资料</a>。</li>
     <li><b>先拿与时间无关的静态数字。</b>注册（T5）和静态精度图（E1）都只用静止位姿，不依赖时钟链。T0–T2 加 T4/T5 走完，就能给出「独立 GT benchmark」行的第一个数。时钟链同时并行打通。</li>
@@ -193,6 +195,43 @@
     <li><b>≥ 3 窝那条路没有被取消，只是被拆成了独立的一条线。</b>误差预算里最大的单项仍然是 rig → TCP 旋转（2° 声明 × 259.5 mm 力臂 = <b>9.1 mm</b>，至今零观测），而单光束跟踪仪一次只跟一颗球、一个窝只给一个点，姿态仍然只能靠 ≥ 3 个非共线窝 + <b>AX = XB</b>，或者靠 STS 直接量。<b>本次改版唯一必须现在拍的机加决定，就是把这块钢片做成将来能再钻两个窝的样子</b>：最大跨距 ≥ 120 mm（标度律给的 B ≈ 107 mm），留出两个窝位。加一块新板要重排机加并重做标定；在同一块板上加两个窝只是多钻两个孔。见 <a href="#target-interface">T4 详述</a> 与 <a href="#config-decided">首个受检构型</a>。</li>
     <li><b>厂家的 SA / RMS 流程只作对照，不进 GT 链。</b>它们的输出经过 best-fit；RMS 坐标系对齐「一般小于 2 mm」的门限，比整条 GT 链预算还宽一倍。</li>
   </ul>
+</section>
+
+<section class="card" id="next">
+  <div class="section-title"><h2>下一步 · 2026-09-22</h2><span class="badge warn">Thor 与采集机被同事占用</span><span class="badge ok">目标：TCP 位置 3 mm</span></div>
+  <p class="goal">按「谁能在不碰 Thor 的情况下做」拆成三组。Claude 一组全部在本机完成、带测试，<b>部署统一等 Thor 空出来</b>（deploy 会 kill 录制器，采集期间不部署）。</p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>#</th><th>Claude 可以做（本机，不碰 Thor / 跟踪仪）</th><th>产出</th></tr>
+    <tr class="lead"><td class="key">C1 <span class="badge ok">已做</span></td><td><b>E1p 解算：跟踪仪 pivot + TCP 逐位姿比较。</b>球面拟合（线性初值 + 高斯–牛顿、bootstrap σ、球冠弱方向报告，条件不够时拒绝并说明该往哪转）；读入站位 json、marker→TCP bundle 与 d，输出逐位姿 e<sub>TCP</sub>、常量 / 随姿态拆分、p95、ρ 一致性检查。合成数据单测：注入 c<sub>TCP</sub> 常量误差、right 拷贝 13 mm、相机 cube 系旋转偏差，断言全部可见；d 注入后断言抵消。</td><td><code>metrology/tracker_pivot.py</code> + <code>fit_tracker_mount pivot</code> 子命令 + 测试</td></tr>
+    <tr><td class="key">C2 <span class="badge ok">已做</span></td><td><b>TCP 位置口径的 3 mm 预算表</b>（见 <a href="#budget-tcp">T6 下方</a>；动态链按 0.5° 假设平方和 1.03 mm，超 1 mm）。在 T6 旁新增一张「TCP 位置」表，行结构按原理文档 §11（静态 TCP / 动态增量 / 转移①② / d / GT 链），写明分配、出处、合成方式（默认线性和）。</td><td>本页 T6 更新</td></tr>
+    <tr><td class="key">C3 <span class="badge ok">已做</span></td><td><b>采集提示进标定页。</b>查出段长偏短的根因：面板默认段长仍是旧协议的 100 s、说明文字仍写「每段至少 3 个停驻」，操作员只能每个姿态提前保存（这 15 段的 <code>segment_seconds</code> 全是 100.0）。已改为一段一姿态、默认 4 s。另修 lever-arm「一次只吃一段」与 episode 0 解析。段长不足 3.5 s 保存时立即提示重录（本次 4/15 不够长）；pivot 采集模式与侧倾 / 前后倾角度提示。</td><td>前端 + 网关改动与测试，待部署</td></tr>
+    <tr><td class="key">C4 <span class="badge ok">已做</span></td><td><b>跟踪仪断电后 Connect 的三处修正。</b>预热中（<code>TrackerNotWarmedUp</code>）不再显示成「等 SMR」；<code>CommunicationFailed</code> / <code>IndexSearchFailed</code> 补上「控制器还在启动 / Servo 未开」的提示；logger 60 s 无样本超时后不回收远端进程（会占住唯一客户端名额最长 24 h）。</td><td><code>laser_tracker_session.py</code> + 测试，待部署</td></tr>
+    <tr><td class="key">C5 <span class="badge ok">已做</span></td><td><b>两处口径小修</b>（门槛不放宽，只把原因说出来；共面不退化有数值测试）。<code>certifies()</code> 的 ≥ 15 按拟合集计数，与 5 段留出冲突——协议写成 20 段或改门槛语义；<code>assess_geometry</code> 文档里「共面即退化」订正为「只有共线才退化，planarity 门槛是保守项」。</td><td>metrology 改动 + 测试</td></tr>
+    <tr><td class="key">C6 <span class="badge ok">已做</span></td><td><b>15 段相机半边的一键命令。</b>Thor 空闲时在仓库根目录执行：<br/><code>PYTHONPATH=third_party/opencv_kalibr third_party/opencv_kalibr/.venv/bin/python3 -m metrology.cli.solve_tracker_capture --capture outputs/calibration_captures/tm_20260921_145146/tracker_mount</code><br/>先加 <code>--dry-run</code> 看一眼命令。<b>离线评估结论：不建议在工作站跑</b>——本机没有生产外参 <code>calib_20260902_103833_extrinsics</code>、没装 <code>pupil_apriltags</code>，要从 Thor 拷外参、world 帧和视频，还容易用上与生产不一致的标定快照；等 Thor 空闲直接跑更稳。</td><td><code>solve_tracker_capture.py</code></td></tr>
+    <tr><td class="key">C7 <span class="badge ok">已做</span></td><td><b>E1p 可以直接在「UMI Marker→TCP」面板录。</b>相机 pivot 与 E1p 是同一个动作：Connect 时开跟踪仪、SMR 留在钢片上，扫动中在 ≥ 15 个姿态各静止 ≥ 3.5 s，一段样本同时服务两边——相机 pivot 读全部帧，E1p 只读停顿。Disconnect 后点「跑 E1p」：缺生产 EE 轨迹就先生成（同回放页的任务），再按「BOX + 条件」（一次夹持 = 一个球面）跑 <code>fit_tracker_mount pivot</code>；只比较、不写 bundle；选了同一钢片的 lever-arm 结果就同时给出 SMR→TCP 向量。采集顺序不限，跟踪仪不动即可。</td><td>网关 + 面板 + 测试，待部署（部署后再录，否则样本不带跟踪仪标记）</td></tr>
+  </table>
+  </div>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>#</th><th>需要你做（不需要 Thor）</th><th>卡住什么</th></tr>
+    <tr class="lead"><td class="key">U1</td><td><b>量准 d。</b>pivot 插件球心 → TCP 的偏距与方向，CAD / 卡尺 / 三坐标，目标约 ±0.3 mm；并确认生产用的 TCP 就是这个点。</td><td>3 mm 结论本身（跟踪仪看不见 d）</td></tr>
+    <tr><td class="key">U2</td><td><b>确认 pivot 工装能用于 E1p。</b>球窝能固定在跟踪仪视野内的桌面上；夹住插件后，钢片 SMR 在侧倾 ±45–60°、前后倾 ±25° 内不断光；磁吸窝有防脱。</td><td>E1p</td></tr>
+    <tr><td class="key">U3</td><td><b>回答 <a href="#inputs">⑦ ⑧</a>。</b>套筒是否占掉某台相机的位置；球心到安装面的悬伸。</td><td>|c|、球心 → TCP 距离、转移项</td></tr>
+    <tr><td class="key">U4</td><td><b>跟踪仪与工控机空闲时做 E0。</b>静载刚度 mm/N（弹簧秤 + 跟踪仪读位移）、接受角扫掠（绕两轴转到失锁记角度）。在工控机上直接跑 logger 或 RadianCAL 即可，不经过 GUI、不需要 Thor。</td><td>T6 钢片刚度行；E1p 可用的倾角</td></tr>
+    <tr><td class="key">U5</td><td><b>向 API 要三样</b>（按优先级）：Trigger 电气规格四项；<code>ltpy</code> 含 Linux / aarch64 构建；能否重新暴露触发计数器。</td><td>T3 硬触发</td></tr>
+    <tr><td class="key">U6</td><td><b>定结论口径。</b>3 mm 按 p95；速度档上限；动态姿态误差的假设上界 X°（转移项②）。</td><td>结论能不能写出来</td></tr>
+  </table>
+  </div>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>#</th><th>等 Thor 空出来</th><th>产出</th></tr>
+    <tr><td class="key">W1</td><td>部署 v1.4 以来已修未部署的代码与 C3 / C4；部署前确认没人在录。</td><td>—</td></tr>
+    <tr><td class="key">W2</td><td>15 段的相机半边（EE-pose sidecar），跑 station 拟合——C6 那条命令。注意这 15 段是旧协议提前保存的，预期只有一部分能出驻点。</td><td>第一次 (T<sub>WG</sub>, c) 实数</td></tr>
+    <tr class="lead"><td class="key">W3</td><td>同一站位下：驻点集重采 20 段（每段 3.5–4 s）+ left / right 各一场 E1p。</td><td><b>第一次 TCP 位置常量实测</b>（含 right 的 13 mm 风险与 6.15 mm 矛盾）</td></tr>
+    <tr><td class="key">W4</td><td>E3a 固定姿态动态，按速度档。</td><td>动态增量第一组数</td></tr>
+  </table>
+  </div>
 </section>
 
 <section class="card" id="first-parked-set">
@@ -232,12 +271,21 @@
     <tr><td><b>0.05 / 0.02（现行）</b></td><td><b>3 / 15</b></td></tr>
     <tr><td>0.10 / 0.05</td><td>9 / 15</td></tr>
     <tr><td>0.20 / 0.10</td><td>11 / 15</td></tr>
-    <tr class="lead"><td>0.30 / 0.15（建议）</td><td>12 / 15</td></tr>
+    <tr class="lead"><td><b>0.30 / 0.15（2026-09-21 已定）</b></td><td><b>12 / 15</b></td></tr>
     <tr><td>0.60 / 0.40</td><td>14 / 15</td></tr>
   </table>
   </div>
   <p class="goal">现行门槛的依据是「1 mm 预算的二十分之一」，但它卡的是 <b>span</b>，而 span 不是会传下去的量。真正进拟合的只有两项：平均点自身的 σ/√N = <b>0.83 µm</b>，以及净漂移 × 未知时间偏移 = 0.027 mm / 2 s × 5 ms ≈ <b>0.07 nm</b>。<b>span 是振荡（平均得掉），drift 是偏置（平均不掉）</b>，两者不该同等对待。</p>
-  <div class="callout warn"><p><b>待决定，不要默默改。</b>建议放宽到 span ≤ 0.3 / drift ≤ 0.15，<b>同时</b>把每个驻点的 σ_mean 作为具名项写进报告。松阈值可以，悄悄松不行——这条门槛是认证口径的一部分，改它等于改「什么算一次测量」。</p></div>
+  <div class="callout warn"><p><b>2026-09-21 已定：span ≤ 0.30 / drift ≤ 0.15，并把每个驻点的 σ_mean 作为具名项写进产物。</b>松阈值可以，悄悄松不行——这条门槛是认证口径的一部分。<code>--max-dwell-span-mm</code> / <code>--max-dwell-drift-mm</code> 已开成命令行参数，产物里多出 <code>capture[].dwell_budget</code>（<code>sigma_mean_mm_median</code> / <code>sigma_mean_mm_max</code> / 实测 span、drift 上限 / 当时生效的门槛），并且每次运行都往 stderr 打一行，<b>免得「σ_mean 比预算低三个数量级」这条理由躺在没人打开的 JSON 字段里</b>。</p></div>
+  <p class="goal"><b>放宽的直接后果，用同一批数据验过：</b></p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>门槛</th><th>通过</th><th>σ_mean 中位 / 最大</th><th>planarity</th><th>直径</th><th><code>is_well_conditioned</code></th></tr>
+    <tr><td>0.05 / 0.02（旧）</td><td>3 / 15</td><td>0.16 / 0.43 µm</td><td><b>0.000</b></td><td>0.392 m</td><td><b>False</b></td></tr>
+    <tr class="lead"><td>0.30 / 0.15（新）</td><td>12 / 15</td><td>0.82 / <b>2.45 µm</b></td><td>0.142</td><td>0.898 m</td><td><b>True</b></td></tr>
+  </table>
+  </div>
+  <p class="goal">旧门槛下只剩 3 个位姿，而<b>三个点必然共面</b>，planarity 精确为 0 —— 拟合会在几何条件上拒绝，给出一个<b>描述门槛而不是描述采集</b>的理由。代价是 σ_mean 上限从 0.43 µm 升到 <b>2.45 µm</b>，相对 1 mm 球心预算是 <b>0.25%</b>。</p>
 
   <h3 class="sub-h">四 · 操作口径（这次唯一要改的习惯）</h3>
   <ul>
@@ -995,7 +1043,7 @@
 <section class="card" id="budget">
   <div class="section-title"><h2>T6 · GT 链自身误差预算</h2><span class="badge warn">全部未测</span></div>
   <p class="goal">GT 链自身 ≤ 1 mm，才有资格裁决 3 mm。下表的分配是开工前的工程切分，<b>声明值不是测量</b>：每一行的出处必须换成实测或 CAD 构造。<b>2026-09-17 改版后这张表的适用对象变了</b>：它是「<b>SMR 球心</b>那一点」的预算，不是 TCP 的——两者相差一整项，而那一项现在被移到表外单列。</p>
-  <div class="callout warn"><p><b>先看这一句再看表：≤ 1 mm 这个结论现在只对球心成立。</b>TCP 误差 = 球心误差 + <b>rig → TCP 旋转 × 力臂</b>，第二项按现行 bundle 的 2° 声明是 <b>9.1 mm</b>，零观测，而<a href="#smr-on-body">新接法在结构上测不到它</a>（它被 c 的拟合整个吸收）。把它留在表内做平方和会得到一个漂亮但错误的 0.77——所以它单列在表外，直到 T4b 或 STS 把它测出来。</p></div>
+  <div class="callout warn"><p><b>先看这一句再看表：≤ 1 mm 这个结论现在只对球心成立。</b>TCP 误差 = 球心误差 + <b>rig → TCP 旋转 × 力臂</b>，第二项按现行 bundle 的 2° 声明是 <b>9.1 mm</b>，零观测，而<a href="#smr-on-body">新接法在结构上测不到它</a>（它被 c 的拟合整个吸收）。把它留在表内做平方和会得到一个漂亮但错误的 0.77——所以它单列在表外，直到 T4b 或 STS 把它测出来。</p><p><b>2026-09-22 起（目标 = TCP 位置 3 mm）：表外 ① 改由 <a href="#experiments">E1p 跟踪仪 pivot</a> 在 TCP 处直接测，不再等 T4b / STS。</b>位置口径下它就是 c<sub>TCP</sub> 的误差，pivot 逐位姿比较时 c<sub>TCP</sub> 不拟合，所以它不会被吸收。代价是新增表外 ③（定义偏距 d）。TCP 位置口径的完整拼法见 <a href="box_umi_smr_lever_arm_theory.html#s11">原理文档 §11</a>。</p></div>
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>项</th><th>工程分配 p95</th><th>出处</th><th>状态</th></tr>
@@ -1011,11 +1059,31 @@
     <tr><td class="key">空气折射与温度</td><td class="num">0.10 mm</td><td>Radian Pro 传感器插着即启用；<code>GetWeatherStationData</code> 逐 session 记 T/P/H（T0/T1）</td><td><span class="badge hold">未测</span></td></tr>
     <tr><td class="key">STS 载荷变形<br/><span class="small">仅 6D 场次，与 T4a 主路线无关</span></td><td class="num">待定</td><td><b>新增行。</b>1.36 kg 的 STS 挂在夹爪上会使 cube ↔ TCP 之间的链产生载荷相关变形，而这段链正是待测量。判据便宜：同一批静止位姿，装 STS 与不装 STS 各测一次 SMR 球心，差值就是它。<b>未并入下面的平方和</b>，因为它只出现在 STS 场次，且尚无任何测量。</td><td><span class="badge warn">未测 · 新识别</span></td></tr>
     <tr class="total"><td>合计（平方和）· <b>球心口径</b></td><td class="num">0.77 mm</td><td>≤ 1.0 mm，留约 0.64 mm 的平方余量给实测超支。<b>选 1.5″ 让这个数从 0.75 升到 0.77</b>——0.7% 的 3 mm，不是一个选型理由，见 <a href="#smr-on-body">靶球口径为什么不是精度问题</a>。<b>不含 STS 载荷变形行</b>（仅 6D 场次、尚无测量）。改版新增两行、c 那一行从 0.30 降到 0.20，两下抵消，合计几乎没动——<b>但适用对象从 TCP 缩到了球心</b>。</td><td></td></tr>
-    <tr class="total"><td><b>表外 ①</b>：rig → TCP 旋转 × 力臂<br/><span class="small">常量部分，被 c 吸收</span></td><td class="num">3.5 – 9.1 mm</td><td>2.0° 声明（从未观测）× cube ↔ TCP 力臂。<b>力臂本身待核</b>：|c| = 160 与 |c−c<sub>TCP</sub>| = 60 给出区间 [100, 220] mm（3.5–7.7 mm），本页别处沿用 259.5 mm（9.1 mm）。<b>无论取哪一端，它都是预算里最大的一项，而且新接法结构性地测不到</b>——不能并进平方和，也不能默认它小。</td><td><span class="badge warn">零观测</span></td></tr>
+    <tr class="total"><td><b>表外 ①</b>：rig → TCP 旋转 × 力臂<br/><span class="small">常量部分，被 c 吸收</span></td><td class="num">3.5 – 9.1 mm</td><td>2.0° 声明（从未观测）× cube ↔ TCP 力臂。<b>力臂本身待核</b>：|c| = 160 与 |c−c<sub>TCP</sub>| = 60 给出区间 [100, 220] mm（3.5–7.7 mm），本页别处沿用 259.5 mm（9.1 mm）。<b>无论取哪一端，它都是预算里最大的一项，而且新接法结构性地测不到</b>——不能并进平方和，也不能默认它小。</td><td><span class="badge warn">零观测</span><span class="badge ok">v1.5：E1p 直接测</span></td></tr>
     <tr class="total"><td><b>表外 ②</b>：球心 → TCP 转移<br/><span class="small">时变部分，随测随有</span></td><td class="num">1.05 mm/°</td><td>e<sub>TCP</sub> − e<sub>球心</sub> = δθ × (c<sub>TCP</sub> − c)，|c<sub>TCP</sub> − c| = <b>60 mm</b>。按现行 2° 声明是 <b>2.09 mm</b>；δθ 标到 0.5° 降到 0.52 mm，标到 0.22° 降到 0.23 mm。<b>球心装得离 TCP 只有 60 mm，是本次设计最省的一处</b>——老方案 B 的 250 mm 力臂这一项要 9 mm 量级。</td><td><span class="badge warn">随 ① 一起塌</span></td></tr>
+    <tr class="total"><td><b>表外 ③</b>：TCP 定义偏距 d<br/><span class="small">球窝中心 → TCP，v1.5 新增</span></td><td class="num">0.30 mm</td><td>E1p 里跟踪仪与生产标签两边都加同一个 d，它在比较里精确抵消，所以<b>跟踪仪看不见</b>——它决定「TCP 到底在哪」，只能 CAD / 卡尺 / 三坐标单独量。生产 pivot 工具默认 <code>--delta-sigma-mm 5.0</code>；这一项不收紧到约 0.3 mm，3 mm 无从谈起。</td><td><span class="badge hold">未测 · 新识别</span></td></tr>
   </table>
   </div>
   <p class="small">把球心与 TCP 分开写，还有一个操作上的好处：它把「钢片装在哪」从一个装配细节变成了一个有代价的选择。球心越靠近 TCP，上面那 9.1 mm 乘的力臂越短、结论越可直接引用；球心越靠近 cube，残差对相机姿态误差越灵敏但离 TCP 越远。<a href="#smr-on-body">改版那一节</a>算过：在 cube ↔ TCP 相距 247 mm 的这个几何下，<b>装在夹爪侧同时满足两条</b>。</p>
+
+  <h3 id="budget-tcp">TCP 位置口径 · GT 链预算 <span class="badge ok">v1.5 新增</span></h3>
+  <p class="small">上表是球心口径。目标定为「TCP 位置 3 mm」后，GT 链要在 TCP 那一点上 ≤ 1 mm。它分两条：<b>静态参考</b>来自 <a href="#experiments">E1p</a>（在 TCP 处直接比较），<b>动态参考</b>来自球心轨迹再搬到 TCP。<b>被测量本身</b>——生产标签的 TCP 位置误差——不在表里，它是要和 3 mm 比的那个数。原理与合成规则见 <a href="box_umi_smr_lever_arm_theory.html#s11">原理文档 §11</a>。</p>
+  <div class="table-scroll">
+  <table class="metric-table">
+    <tr><th>项</th><th>分配 p95</th><th>出处</th><th>静态 E1p</th><th>动态</th></tr>
+    <tr><td class="key">注册 T<sub>WG</sub></td><td class="num">0.50 mm</td><td>同上表；站位冻结自驻点集</td><td>✓</td><td>含在球心链内</td></tr>
+    <tr><td class="key">仪器 + 空气</td><td class="num">0.10 mm</td><td>同上表（仪器行；空气行在球心链内）</td><td>✓</td><td>含在球心链内</td></tr>
+    <tr><td class="key">球心口径 GT 链（上表合计）</td><td class="num">0.77 mm</td><td>上表</td><td>—</td><td>✓</td></tr>
+    <tr><td class="key">pivot 球窝中心拟合</td><td class="num">0.10 mm</td><td>仿真：σ<sub>p</sub> 0.02 mm、15 姿态、侧倾 ±60°。只前后倾 ±25° 时约 0.34 mm</td><td>✓</td><td>✓（c<sub>TCP</sub> 误差由它定）</td></tr>
+    <tr><td class="key">pivot 插件落座 / 重夹</td><td class="num">0.05 mm</td><td>新增行。E1p 同场重夹 ≥ 3 次取分散</td><td>✓</td><td>✓</td></tr>
+    <tr><td class="key">定义偏距 d</td><td class="num">0.30 mm</td><td>表外 ③，CAD / 卡尺 / 三坐标；跟踪仪看不见</td><td>✓</td><td>✓</td></tr>
+    <tr><td class="key">转移项 ①：时钟姿态滞后</td><td class="num">0.04 mm</td><td>ω·Δt × |c<sub>TCP</sub> − c|：2 rad/s × 0.3 ms × 70 mm，计算值</td><td>—</td><td>✓</td></tr>
+    <tr><td class="key">转移项 ②：其余动态姿态误差</td><td class="num">0.61 mm @ 0.5°<br/><span class="small">0.24 mm @ 0.2°</span></td><td>假设上界 × 实测距离（E1p 的球面半径给出 |c<sub>TCP</sub> − c|）。单点测不出，结论里必须写明假设</td><td>—</td><td>✓</td></tr>
+    <tr class="total"><td>合计 · 静态参考（E1p）</td><td class="num">0.60 mm（平方和）<br/><span class="small">1.05 mm（线性）</span></td><td>注册 + 仪器 + 球窝 + 落座 + d。注册那 0.50 占大头：它一旦实测变小，线性和也能进 1 mm</td><td></td><td></td></tr>
+    <tr class="total"><td>合计 · 动态参考</td><td class="num">1.03 mm @ 0.5°<br/><span class="small">0.87 mm @ 0.2°（平方和）</span></td><td>球心链 + 球窝 + 落座 + d + 转移①②。<b>按 0.5° 假设平方和就超 1 mm</b>；要进 1 mm，动态姿态误差需 ≲ 0.2°，或把钢片 SMR 装得离 TCP 更近（缩短 |c<sub>TCP</sub> − c|）。线性和分别为 1.87 / 1.50 mm</td><td></td><td></td></tr>
+  </table>
+  </div>
+  <p class="small"><b>读这张表的三条</b>：① 静态与动态分开认证，静态由 E1p 直接在 TCP 处给数，动态在同一姿态区间内减去静态水平得到增量（原理文档 §10）；② 默认按线性和保守合成，只有能说明独立时才用平方和，表里两者都给；③ 转移项 ② 是唯一靠假设的一行，它的上界要么来自相机侧的独立估计，要么缩短力臂把它压到可以忽略。</p>
 </section>
 
 <section class="card" id="experiments">
@@ -1026,6 +1094,7 @@
     <tr><th>实验</th><th>构型</th><th>依赖</th><th>裁决什么</th><th>回写</th></tr>
     <tr class="lead"><td class="key">E0 工装鉴定 + 姿态 → 覆盖率图 <span class="badge warn">新增 · 上线前必做</span></td><td>钢片装好、球装上，<b>不采任何评测数据</b>。三项工装检查（静载刚度、加速度扫掠下球不移位、跟踪开启不改变 marker 检出率）＋ 一次专门的姿态扫掠：绕两轴各慢慢转到失锁，记录失锁角。</td><td>T4a 装好即可</td><td>本机 1.5″ SMR 在本机站位下的<b>实际</b>接收边界 α（数据表标称值待查，通常 ±25°–30°）；钢片刚度的实测 mm/N（按 4–6 N 末端载荷校核）；加速度扫掠下球不移位、不脱落；跟踪仪是否干扰相机。</td><td>给操作者<b>一句可执行的话</b>（「窝法线保持在跟踪仪方向 ±X° 内」），以及 T6 两个新增行的实测值。<b>还决定站位要不要退后</b>：可用工作区半径 R ≈ r·tan(α − β)，现定 r = 1.5 m 时工作区自身就吃掉 ±18.4°，±30° 下只剩 11.6° 给姿态、±25° 下只剩 6.6°。<b>所以 E0 必须在定站位之前跑，不是之后。</b>没有这张图，E3 的 coverage 就只是个数字，没人知道怎么把它提高。</td></tr>
     <tr><td class="key">E1 静态空间精度图</td><td><b>受检构型 = 现有夹爪（cube）</b>。靶标静置 ≥ 30 个位姿，与驻点集不同；覆盖工作区与 2 / 3 / 4+ 台相机可见。<b>不再与 AX = XB 共用位姿</b>——那一场随 T4b 顺延。</td><td>T0–T2、T4a、T5；<b>不需要 T3</b></td><td><b>改版后它裁决的事窄了但没变假：</b>全场尺度（ppm）<b>仍然可测</b>（(1+s)t 既不是刚体映射也不是机体系常量，c 与 T<sub>WG</sub> 都吸收不了它）；相机误差的<b>空间分布</b>与相机数台阶仍可测；<b>不再能裁决「≈ 2.0 mm 系统偏置」中的常量部分</b>——那部分已被 c 与 T<sub>WG</sub> 吸收，要它必须走 T4b。</td><td>误差预算表「独立 GT benchmark」行的第一个数（静态口径，<b>球心</b>，模去常量 rig 系偏置与旋转）</td></tr>
+    <tr class="lead"><td class="key">E1p 跟踪仪 pivot · TCP 位置直测 <span class="badge ok">v1.5 新增 · 3 mm 主路径</span></td><td>SMR 留在钢片上（同一次安装），夹爪夹住与相机 pivot 标定相同的插件，插件球头落进固定在桌上的球窝。以球窝为支点转动：<b>绕光束方向侧倾 ±45–60°</b>（不受接受角限制）、<b>前后倾留在 ±25° 内</b>；≥ 15 个静止姿态，每个 ≥ 3.5 s。left / right 各一场，与驻点集<b>同一站位</b>。</td><td>T5 站位（驻点集）；d 已量</td><td>钢片球心落在以球窝中心 s 为心的球面上，<b>s 只由跟踪仪定</b>（仿真：σ<sub>p</sub> 0.02 mm、15 姿态、侧倾 ±60° 时 s 的 p95 ≈ 0.1 mm；只前后倾 ±25° 时 ≈ 0.34 mm，弱方向在球冠轴向）。逐位姿 e<sub>TCP,i</sub> = (R<sub>i</sub>c<sub>TCP</sub> + t<sub>i</sub>) − (R<sub>WG</sub>s + t<sub>WG</sub> + R<sub>i</sub>d)，c<sub>TCP</sub> 原样代入：均值 = c<sub>TCP</sub> 常量误差，散布 = 静态姿态相关误差。免费一致性检查：球面半径 ρ = |ĉ<sub>s</sub> − ĉ|。</td><td>静态 TCP 位置误差分布（两侧）；left pivot 平移的独立核对；right 拷贝平移的实测；6.15 mm URDF 矛盾的裁决。<b>不回答 TCP 姿态</b>。</td></tr>
     <tr><td class="key">E2 FR3 搭载动态</td><td>UMI 夹爪 + 靶标装在 FR3 上，FR3 只当运动源：直线 / 圆 / 8 字 × 速度档（≤ 100、100–300、300–700 mm/s），加限速重放真实人手轨迹。</td><td>+ T3</td><td>A′ 3.8–4.0 mm 估计与实测之差；速度相关项在标签口径下多大；sidecar σ 是否低估一个量级（|e|/σ 分布）；相机集合切换的台阶是不是真实标签误差；离线平滑器平滑前后各差多少。</td><td>σ 校准；平滑器重调的真值集（调参段与评测段分开）。结论只适用于 FR3 搭载构型。</td></tr>
     <tr class="lead"><td class="key">E3a 固定姿态动态 <span class="badge ok">新增 · 第一场</span></td><td>钢片 + 单窝，手持但<b>姿态钉死</b>（窝法线朝跟踪仪，允许 ±10° 摆动，可加简单限位或提示）。直线 / 圆 / 8 字 × 速度档，横向范围按上表控制在允许半径内。驻点集仍带转角。</td><td>T4a、T5、E0</td><td><b>位置链的干净判决</b>：注册、时钟链、插值、<b>速度相关项</b>（|v|·Δt，老静态方案原理上拿不到的那一项）。姿态误差全部退化成常量被 c 吸收，所以残差<b>就是</b>纯位置误差。</td><td>误差预算「独立 GT benchmark」行的<b>第一个动态数</b>。本场 coverage 应该很高——低了说明工装或站位有问题，而不是方法有问题。</td></tr>
     <tr class="lead"><td class="key">E3b 真实操作 <span class="badge ok">改版后可提前</span></td><td>钢片 + 单窝，真实操作动作、姿态自由；跟踪仪分次换站位覆盖不同朝向，<b>每个站位单独重采驻点集</b>。每场次按 <a href="#smr-on-body">「一次验证场次的顺序」</a> 走：驻点集 A → 评测 episode → 驻点集 B。</td><td>E3a 通过；<b>不再等 E2</b>（原因是机械的：两侧现在是同一块板）</td><td>真实姿态分布下的标签误差，<b>整段轨迹</b>。<b>与 E3a 同速度档的残差之差 = 姿态相关误差</b>，这是本页唯一能把它单独拿出来的办法。</td><td>每 episode 的 GT 覆盖帧比例 + 「窝法线 ↔ 视线夹角」分层残差。接收角造成的<b>姿态选择偏差</b>必须写进结论：没测到的姿态段不能外推。</td></tr>
@@ -1050,7 +1119,13 @@
     <tr><td><code>metrology/tracker_alignment.py</code></td><td>时钟链合成、失锁护带、逐帧配对、速度分层、运动互相关交叉检验。<code>SpatialRegistration</code> 只有两个构造器：<code>from_parked_poses()</code> 可认证，<code>shape_only()</code> <b>永远</b> <code>certifies_space = False</code>——红线用类型系统焊死，不靠注释。</td><td><code>metrics.py</code> 的 APE / RPE</td><td><span class="badge ok">已落地 · 19 单测</span></td></tr>
     <tr><td><code>metrology/time_offset.py</code>（改）</td><td>加 |v| 通道与子窗回归求 s；去掉 scipy 依赖（本机与 Thor 的 venv 都没有 scipy）。</td><td>现有 |ω| 两段式</td><td><span class="badge ok">可先写</span></td></tr>
     <tr><td><code>metrology/cli/fit_tracker_mount.py</code>（<b>新</b>）</td><td>两个子命令 <code>station</code> / <code>lever-arm</code>，直接从「跟踪仪会话 + episode」出数，<b>驻点由跟踪仪流自己分段</b>——1 kHz、且与注册/时钟/被检流水线无关，所以「哪一段是静止的」这个判断落在被检对象之外。每个候选窗口还要过 <code>check_dwell</code>。<b>两端各剪掉 0.3 s</b>：到位的沉降与离开的起步都够慢、都不是那个位姿，取进去会把均值拉向来的方向。<b>速度按 50 ms 窗口算而不是逐样本差分</b>：1 kHz 下逐样本差分是在测跟踪仪自己的噪声（几微米 ÷ 1 ms = 几 mm/s），阈值会永远不成立。</td><td><code>validate_against_tracker</code> 的 sidecar 读取；<code>check_dwell</code></td><td><span class="badge ok">已落地 · 端到端跑通</span><span class="badge warn">2026-09-21 改：按 mount_id 合并</span></td></tr>
-    <tr class="lead"><td><code>metrology/cli/fit_tracker_mount.py</code> · <code>_merge_by_mount()</code>（<b>2026-09-21 新</b>）</td><td>把每段 episode 产出的 <code>ParkedSet</code> 按 <code>mount_id</code> 合并，再判 ≥ 3。<b>修的是一个概念混淆</b>：<code>ParkedSet</code> 的定义是「共用同一个杠杆臂的位姿」，跨 mount 配对才没有约束力；而 CLI 把它实现成了「同一段 episode 的位姿」。后果是一批张开 848 mm 的采集被判成「rotation diversity too low」——<b>一个描述 CLI 记账方式、而不是描述采集的拒绝</b>。<code>--min-dwells-per-episode</code> 默认 1，因为引导采集就是<b>一段一个驻点</b>。</td><td>—</td><td><span class="badge ok">已落地 · 5 单测</span><span class="badge warn">未部署</span></td></tr>
+    <tr class="lead"><td><code>metrology/cli/fit_tracker_mount.py</code> · <code>_merge_by_mount()</code>（<b>2026-09-21 新</b>）</td><td>把每段 episode 产出的 <code>ParkedSet</code> 按 <code>mount_id</code> 合并，再判 ≥ 3。<b>修的是一个概念混淆</b>：<code>ParkedSet</code> 的定义是「共用同一个杠杆臂的位姿」，跨 mount 配对才没有约束力；而 CLI 把它实现成了「同一段 episode 的位姿」。后果是一批张开 848 mm 的采集被判成「rotation diversity too low」——<b>一个描述 CLI 记账方式、而不是描述采集的拒绝</b>。<code>--min-dwells-per-episode</code> 默认 1，因为引导采集就是<b>一段一个驻点</b>。</td><td>—</td><td><span class="badge ok">已落地 · 8 单测</span><span class="badge warn">未部署</span></td></tr>
+    <tr class="lead"><td><code>fit_tracker_mount.py</code> 驻点门槛 + <code>_dwell_budget()</code>（<b>2026-09-21 改</b>）</td><td><code>--max-dwell-span-mm</code> 0.05 → <b>0.30</b>、<code>--max-dwell-drift-mm</code> 0.02 → <b>0.15</b>，并把 <b>σ_mean = σ/√N</b>（拟合真正消费的那个平均点的不确定度）逐驻点记进 <code>capture[].dwell_budget</code>，同时打到 stderr。<b>span 是振荡、drift 是偏置</b>，所以两者不同比例放宽。理由见 <a href="#first-parked-set">首批驻点集</a> 第三节。</td><td><code>check_dwell</code> 的 <code>is_static()</code> 参数</td><td><span class="badge ok">已落地 · 3 单测</span><span class="badge warn">未部署</span></td></tr>
+    <tr class="lead"><td><code>metrology/tracker_pivot.py</code> + <code>fit_tracker_mount pivot</code>（<b>2026-09-22 新</b>）</td><td><b>E1p 解算</b>。<code>fit_sphere</code>：只用跟踪仪驻点定球窝中心（线性初值 + 高斯–牛顿、bootstrap σ、弱方向增益；单轴转动时拒绝，并点名「绕光束方向侧倾」）。<code>check_tcp</code>：冻结站位后与生产标签逐位姿相减，c<sub>TCP</sub> 原样代入不拟合；给出静态 TCP 误差 p95、c<sub>TCP</sub> 常量误差、cube 系 / world 系常量拆分、半径一致性检查。产物写明 <code>cannot_see</code>（定义偏距 d、TCP 姿态、动态误差）与 <code>certifies_tcp_orientation: false</code>。CLI 要求 sidecar 是 cube 位姿（TCP 位姿再套 c<sub>TCP</sub> 会加两遍）。</td><td><code>_rotation_gains</code>、驻点切分、<code>StationFit.from_dict</code>、生产 bundle</td><td><span class="badge ok">已落地 · 18 单测 · py3.10 验过</span><span class="badge warn">未部署</span></td></tr>
+    <tr><td><code>metrology/cli/solve_tracker_capture.py</code>（<b>2026-09-22 新</b>）</td><td><b>采集目录 → 拟合，一条命令</b>。读每段 meta.json 的跟踪仪 session 与协议，找已落地的流（含重定向到录制器 dataset 的情况），缺 sidecar 时先跑 AprilTag 追踪，再按协议选 station / pivot 把所有段拼成一次拟合；拒绝未落地、跨 Connect 混段；<code>--dry-run</code> 只打印命令。用本机保存的 15 段真实 meta 验过。</td><td><code>run_april_cube_tracking_local.sh</code>、<code>fit_tracker_mount</code></td><td><span class="badge ok">已落地 · 7 单测</span></td></tr>
+    <tr><td><code>MountFit.certify_reasons()</code>（<b>2026-09-22</b>）</td><td>不认证时说出原因；留出后拟合集不足 15 时明确写「要采 15 + 留出数」。<b>门槛本身没放宽</b>。CLI 在拟合前先提示。</td><td><code>certifies()</code></td><td><span class="badge ok">已落地 · 2 单测</span></td></tr>
+    <tr><td>网关 + 标定页 · 站位采集（<b>2026-09-22 改</b>）</td><td>① 协议改成「一段一个姿态」：默认段长 100 s → <b>4 s</b>，&lt; 2.6 s 在按钮处直接拒绝，提前「保存本段」且不足 2.6 s 时当场提示重录；旧的「每段至少 3 个停驻」文案全部改掉。② 新增 <b>pivot 采集类型</b>（写进每段的 <code>protocol</code>）与 pivot 解算模式（station / bundle / cube / 可选 lever-arm 做半径检查）。③ lever-arm 放开为「同一 mount 的多段」——原来限制一段，而一段现在只有一个位姿。④ 修 episode 0 被当成缺字段的解析。</td><td><code>TrackerMountSession</code>、<code>_default_marker_tcp_bundle_path</code></td><td><span class="badge ok">网关 +12 单测 · 前端 +7 单测</span><span class="badge warn">未部署</span></td></tr>
+    <tr><td><code>laser_tracker_session.py</code>（<b>2026-09-22 改</b>）</td><td>断电后 Connect：预热中不再显示成「等 SMR」；<code>CommunicationFailed</code> 补「控制器还在启动」、<code>IndexSearchFailed</code> 补「Servo 开关 / 先 Power 后 Servo」；logger 60 s 无样本超时后写 stop-file 回收远端进程（否则最长 24 h 占住唯一客户端名额）。</td><td>—</td><td><span class="badge ok">已落地 · +5 单测</span><span class="badge warn">未部署</span></td></tr>
     <tr><td><code>metrology/cli/validate_against_tracker.py</code></td><td>产出逐 episode 的 JSON 产物：verdict、逐帧残差、两条轨迹重采样到配对时刻。退出码 0/1/2 区分「数据的问题」与「装置的问题」。<b>新增 <code>--mount-fit</code></b>：注册、拟合出的 c、以及<b>被吸收的模式</b>三样<b>一起</b>读进来——拆成三个 flag 正是「站位配错 mount」和「把球心误差叫成 TCP 误差」这两个错误的发生方式。同时给 <code>--mount-fit</code> 和 <code>--lever-arm</code> 会被拒绝，而不是悄悄挑一个。</td><td><code>metrics.py</code> 的 APE / RPE</td><td><span class="badge ok">已接通</span></td></tr>
     <tr class="lead"><td>GUI：<code>gateway.py</code> <code>/api/calibration/tracker-mount/*</code> + <code>TrackerMountPanel.tsx</code>（<b>2026-09-21 新</b>）</td><td>把「录制页采数据 → 标定页填四个路径」合成<b>一条链</b>：认领录制器 → Connect（带跟踪仪） → 逐段录驻点 → 保存本段 → Disconnect 落地 → 解算 → 接 <code>validate_against_tracker</code>。<b>session 由网关持有</b>（<code>TrackerMountSession</code>，进 snapshot），所以刷新不改名、Live Record 看得见录制器被占用并拒绝把任务 episode 插进采集中间——这三件事之前各自出过一次事故。面板按「拒绝的种类」分档：exit 2 是采集的问题（去补转角），exit 1 是数据的问题（数值可读但不认证）。</td><td><code>calibration_session</code> 的 <code>capture_root</code> / <code>capture_intent</code> 模式</td><td><span class="badge ok">已落地</span><span class="badge warn">未部署</span></td></tr>
     <tr><td>GUI：<code>gateway.py</code> <code>/api/tracker/alignment</code> + <code>TrackerAlignmentPanel.tsx</code></td><td>Replay 界面里叠加 GT 轨迹、残差时序、分层表。<b>网关只读文件不算数</b>——注册、c、两个钟拟合都要可审计，不能藏在一次刷新就会用不同输入重跑的 HTTP 请求后面。<b>verdict 现在有五档</b>，按「最受限的那句真话」排序：图而已 → 覆盖率不足 → <b>位置测量（姿态钉死，旋转不可见）</b> → <b>球心测量，不是 TCP 误差</b> → 测量。被吸收的模式用大白话列在下面，不藏在 tooltip 里。另加两行：杠杆臂 σ、逐位姿 c 散布。</td><td><code>Pose3DViewer</code> / <code>SeriesPlot</code></td><td><span class="badge ok">已接通</span></td></tr>
@@ -1139,8 +1214,8 @@
     <tr><td>Phase 7.1 UMI Trajectory GT 认证</td><td>E1、E2、E3、E4</td><td>—</td></tr>
     <tr><td>Phase 7.2 FR3 Replay 独立 GT</td><td>T4 法兰工装、E5；STS 若在库走分支 B</td><td>—</td></tr>
     <tr><td>Phase 7.3 多相机 world ↔ GT world 注册</td><td>T5</td><td>—</td></tr>
-    <tr class="lead"><td><b>P0-Now ⑫ rig→TCP 旋转</b>（误差预算最大单项，2° → 9.1 mm）</td><td>解算侧已落地的 <code>hand_eye.py</code> 原样复用，<b>A 侧从 FR3 FK 换成跟踪仪</b>：不必等新夹爪–rig 方案、不必卸夹爪装法兰、不必相信 FK。<b>但 2026-09-17 改版把它推后了</b>：单窝接法在结构上测不到这一项（被 c 的拟合吸收），要它必须走 <a href="#target-interface">T4b</a> 在同一块钢片上加两个窝，或用 STS。见 <a href="#config-decided">首个受检构型</a></td><td>采集侧「随新夹爪方案顺延」→ 可立即开图采集 → <b>2026-09-17 改为随 T4b 顺延</b>；<b>轨迹验证不再被它挡住</b></td></tr>
-    <tr><td>Phase 3 marker → TCP 标定</td><td>同一场采集一并给平移（绕开 pivot 的 holdout 2.70 mm 与 <code>--delta-sigma-mm 5.0</code>）；right 的常量从「拷贝自 left」变成实测；N ≥ 5 次拆装重复性首次有数</td><td>平移实测 / 旋转继承 → 两者都可独立测</td></tr>
+    <tr class="lead"><td><b>P0-Now ⑫ rig→TCP 旋转</b>（误差预算最大单项，2° → 9.1 mm）</td><td>解算侧已落地的 <code>hand_eye.py</code> 原样复用，<b>A 侧从 FR3 FK 换成跟踪仪</b>：不必等新夹爪–rig 方案、不必卸夹爪装法兰、不必相信 FK。<b>但 2026-09-17 改版把它推后了</b>：单窝接法在结构上测不到这一项（被 c 的拟合吸收），要它必须走 <a href="#target-interface">T4b</a> 在同一块钢片上加两个窝，或用 STS。见 <a href="#config-decided">首个受检构型</a></td><td>采集侧「随新夹爪方案顺延」→ 可立即开图采集 → <b>2026-09-17 改为随 T4b 顺延</b>；<b>轨迹验证不再被它挡住</b>；<b>2026-09-22：目标 = TCP 位置 3 mm 后，它对位置的影响由 E1p 直接测，旋转本身只在认证 TCP 姿态时才需要</b></td></tr>
+    <tr><td>Phase 3 marker → TCP 标定</td><td>同一场采集一并给平移（绕开 pivot 的 holdout 2.70 mm 与 <code>--delta-sigma-mm 5.0</code>）；right 的常量从「拷贝自 left」变成实测；N ≥ 5 次拆装重复性首次有数</td><td>平移实测 / 旋转继承 → 两者都可独立测；<b>2026-09-22：位置口径由 E1p 直接测（两侧），不必等 T4b</b></td></tr>
     <tr><td>Phase 9 双 base 注册</td><td>E6</td><td>—</td></tr>
     <tr><td>Phase 11 FR3 intrinsic metrology</td><td>E5：e<sub>internal</sub> 现在就能做，本页补 e<sub>physical</sub> 一列</td><td>—</td></tr>
     <tr><td>Phase 1.2 Camera ↔ IMU 时间标定</td><td>T3c 的曝光窗实测，把 +4.4 ms 拆成两个绝对量</td><td>—</td></tr>
@@ -1152,7 +1227,7 @@
 
 </main>
 
-<p class="foot"><b>v1.4 · 2026-09-21：驻点集第一次真正采到，新增 <a href="#first-parked-set">首批驻点集</a> 一节。</b>15 个位姿、跟踪仪流 859.7 s / usable 79.0% / 每段光束 100%；点云 848×383×201 mm、直径 0.90 m、planarity 0.140（<code>is_well_conditioned</code> 通过）；驻点 span 中位 0.067 mm、drift 中位 0.024 mm，<b>平均点自身不确定度 0.83 µm</b>。<b>采集方式是垫着摆、手完全离开——不需要夹具，不需要 FR3，「15 个姿态要 15 个支架」这个担心不成立</b>；SMR 接受锥（roll 不限、tilt ±30°）本来就把姿态范围限成两根轴，而旋转多样性的地板 <code>min_c_gain=0.05</code> 只等效 2.9°。<b>三个拦路的全是代码缺陷，且都伪装成「你的数据不行」</b>：① POST 路由整体持 <code>state.lock</code>，而 <code>_await_capture_root</code> 等的值只有输出消费线程能写——<b>死锁，滞后恒等于超时预算</b>（5 s→5.28 s、20 s→19.6 s，提预算只是失败得更慢），改用绑在 <code>state.lock</code> 上的 <code>Condition</code>；② <code>ParkedSet</code> 被实现成「同一段 episode」而定义是「共用同一个杠杆臂」，一段一姿态 → <code>gain_min=0</code> → 848 mm 的张开被判 rotation diversity 不足，新增 <code>_merge_by_mount()</code> 并把 ≥3 门槛挪到合并之后；③ 发现逻辑找错落地路径，重定向采集的流落在录制器自己的 dataset 下，导致「已落地」与「待 Disconnect」同页矛盾。均已修、均<b>未部署</b>（同事在用 Thor）。另把站位采集 session 从前端 React state 搬进网关（<code>TrackerMountSession</code> 进 snapshot），并新增标定页一键链路。<b>两条待决定</b>：现行驻点门槛（span 0.05 / drift 0.02）只让 3/15 通过，而它比实际传递的误差严约 50 倍（真正进拟合的是 σ/√N=0.83 µm 与漂移×Δt≈0.07 nm）——建议放宽到 0.3/0.15 并把 σ_mean 作为具名项写进报告，<b>但这是认证口径，不默默改</b>；相机那一半（EE-pose sidecar）尚未生成，需在 Thor 上对 15×9 段视频跑 AprilTag 追踪，<b>在那之前 T5 出不了 (T<sub>WG</sub>, c) 的实数</b>。操作口径唯一要改的一条：<b>每段停到 3.5–4 s 再保存</b>（一个驻点需 2×0.3+2.0=2.6 s，本次中位 2.89 s，4/15 不够长）。教训一条：<b>采集期间不要 deploy</b>——deploy kill 录制器，而跟踪仪 session 只在 Disconnect 时 seal，当天因此丢了 2 段已录好的驻点。v1.3 · 2026-09-15（含当日追加 T3f）：读完 <code>~/下载/lasertracker</code> 全部资料（SDK v7.18.0.0 头文件与 sample、Programming Manual、OT Bridge、Radian Pro / STS / RMS 手册、公司内部 API_Tracker_Studio 源码、两份 PRM），新增 <a href="#sdk">SDK 与随机资料</a> 一节。四项推翻或坐实了原有判断：<b>① SDK 官方跨平台（含 Linux/ARM），「原始数据只能在 Windows 拿」的前提不成立</b>；<b>② Trigger 口确认为 TTL 输入、上限 1000 Hz，对齐方式从求 Δt 升级为脉冲索引对应</b>（T3 GATE 已改写）；<b>③ STS 在库（#6395、±0.010°、1.36 kg），直接打预算最大那一行，但与 TTL 互斥且带来一条新的载荷变形预算行</b>；<b>④ 内部已有的 API_Tracker_Studio 数据通路不能用于 GT</b>（6D 时间戳取 <code>GetTickCount()</code>、有效性标志硬编码、3-DoF 是 Sleep 轮询）。同时按随机手册订正了三条操作口径（热机改排 1.5 h、后视检查改按场次、新增 ADM 检查作为无证书时的自检），「到手先核对」9 项中 4 项已答。<b>追加「一补」两节</b>：Trigger 口接头由背板照片确认为 <b>BNC 母头</b>，但<b>电平门限/边沿/阻抗/隔离/延迟在全部资料里都查不到</b>（已列明查过哪些）；另查出官方 <b>Python 接口 <code>ltpy</code></b>（logger 不必写 C++）与 v7.18 刚修的「Trigger Counter 归零丢数据」bug（漏脉冲检测因此是必须项）。<b>追加 T3f</b>：脉冲索引对齐仍有一个整数歧义（index 0 从哪个脉冲数起），用 PWM 缺口或 ±8 ms 粗对钟解决——主机钟精度要求因此从 0.7 ms 放宽一个数量级；并据此下调「logger 跑在 Thor」的权重（触发线接得上时它只剩运维差别，且塞进 Thor 会扰动被测系统本身），优先级改为<b>先要 Trigger 电气规格，再要 Linux 包</b>。v1.2 · 2026-09-14：首个受检构型定为<b>现有夹爪（cube 构型）</b>，新增该节（账本、URDF 与 bundle 之间 6.15 mm 的可裁决矛盾、AX=XB 的 A 侧改用跟踪仪、被否的 Procrustes 结论按 σ<sub>Δp</sub> 等比重算、窝板装 BOX 本体基准面、采集协议）。v1.1 · 2026-09-14：补 T4 详述（受检构型怎么接 SMR、三条接法与开图前的八条约束、与 0.30 mm 预算行的冲突）；核实后把 carrier 转接件从「如果」改为必做；订正「cube 口径 marker → TCP 从未标定」——平移是实测的（holdout p95 2.70 mm），未测的是旋转与拆装重复性。v1 · 2026-09-11。依据：《激光跟踪仪使用及测试说明》（29 页）、主 roadmap 执行主线 P1-采购行与误差预算表、<code>third_party/opencv_kalibr/metrology</code> 现状、Thor GMSL2 同步配置。标「待确认」的规格均未在本机核实；链预算分配是开工前的切分，不是测量。</p>
+<p class="foot"><b>v1.5 · 2026-09-22：目标定为「认证 TCP 位置 3 mm」（不含姿态），新增 E1p 跟踪仪 pivot 与 <a href="#next">下一步</a> 一节，并新增原理文档 <a href="box_umi_smr_lever_arm_theory.html">TCP 位置认证原理</a>。</b>核心推理：TCP 位置 = R<sub>i</sub>c<sub>TCP</sub> + t<sub>i</sub>，bundle 旋转只经 c<sub>TCP</sub> 影响位置，所以表外 ① 在位置口径下就是 c<sub>TCP</sub> 的误差，可在 TCP 处直接测，不需要三窝 / STS。E1p：SMR 不挪、TCP 卡球窝转、跟踪仪单独拟合球窝中心、与生产标签逐位姿相减（c<sub>TCP</sub> 不拟合）；弱方向在球冠轴向，靠绕光束方向大角度侧倾消掉（仿真 p95 0.34 → 0.10 mm）。T6 新增表外 ③ 定义偏距 d（0.30 mm，跟踪仪看不见，须单独量）。另：驻点集建议 20 段（拟合集 ≥ 15 的认证门槛与 5 段留出冲突）。<b>同日追加：C1–C6 全部落地（均未部署，同事在用 Thor）</b>——E1p 解算与 CLI、一键 <code>solve_tracker_capture</code>、TCP 位置口径预算表、标定页改为一段一姿态（查出段长偏短是旧默认 100 s + 旧文案导致）、pivot 采集与解算模式、lever-arm 放开同 mount 多段、断电后 Connect 三处修正、<code>certify_reasons()</code>。metrology 659 / 网关 295 / 前端 189 测试全过。<b>v1.4 · 2026-09-21：驻点集第一次真正采到，新增 <a href="#first-parked-set">首批驻点集</a> 一节。</b>15 个位姿、跟踪仪流 859.7 s / usable 79.0% / 每段光束 100%；点云 848×383×201 mm、直径 0.90 m、planarity 0.140（<code>is_well_conditioned</code> 通过）；驻点 span 中位 0.067 mm、drift 中位 0.024 mm，<b>平均点自身不确定度 0.83 µm</b>。<b>采集方式是垫着摆、手完全离开——不需要夹具，不需要 FR3，「15 个姿态要 15 个支架」这个担心不成立</b>；SMR 接受锥（roll 不限、tilt ±30°）本来就把姿态范围限成两根轴，而旋转多样性的地板 <code>min_c_gain=0.05</code> 只等效 2.9°。<b>三个拦路的全是代码缺陷，且都伪装成「你的数据不行」</b>：① POST 路由整体持 <code>state.lock</code>，而 <code>_await_capture_root</code> 等的值只有输出消费线程能写——<b>死锁，滞后恒等于超时预算</b>（5 s→5.28 s、20 s→19.6 s，提预算只是失败得更慢），改用绑在 <code>state.lock</code> 上的 <code>Condition</code>；② <code>ParkedSet</code> 被实现成「同一段 episode」而定义是「共用同一个杠杆臂」，一段一姿态 → <code>gain_min=0</code> → 848 mm 的张开被判 rotation diversity 不足，新增 <code>_merge_by_mount()</code> 并把 ≥3 门槛挪到合并之后；③ 发现逻辑找错落地路径，重定向采集的流落在录制器自己的 dataset 下，导致「已落地」与「待 Disconnect」同页矛盾。均已修、均<b>未部署</b>（同事在用 Thor）。另把站位采集 session 从前端 React state 搬进网关（<code>TrackerMountSession</code> 进 snapshot），并新增标定页一键链路。<b>驻点门槛已定放宽</b>：旧值（span 0.05 / drift 0.02）只让 3/15 通过，而它比实际传递的误差严约 50 倍（真正进拟合的是 σ/√N = 0.83 µm 与漂移×Δt ≈ 0.07 nm）。<b>新值 span ≤ 0.30 / drift ≤ 0.15</b>，12/15 通过；同批数据验证：旧门槛下 3 个位姿 planarity 精确为 0（三点必共面）、<code>is_well_conditioned</code> 为 False，新门槛下 planarity 0.142、直径 0.898 m、通过，代价是 σ_mean 上限 0.43 → <b>2.45 µm</b>（预算的 0.25%）。门槛开成 CLI 参数，产物新增 <code>dwell_budget</code> 并每次运行打到 stderr。<b>剩一条待办</b>：相机那一半（EE-pose sidecar）尚未生成，需在 Thor 上对 15×9 段视频跑 AprilTag 追踪，<b>在那之前 T5 出不了 (T<sub>WG</sub>, c) 的实数</b>。操作口径唯一要改的一条：<b>每段停到 3.5–4 s 再保存</b>（一个驻点需 2×0.3+2.0=2.6 s，本次中位 2.89 s，4/15 不够长）。教训一条：<b>采集期间不要 deploy</b>——deploy kill 录制器，而跟踪仪 session 只在 Disconnect 时 seal，当天因此丢了 2 段已录好的驻点。v1.3 · 2026-09-15（含当日追加 T3f）：读完 <code>~/下载/lasertracker</code> 全部资料（SDK v7.18.0.0 头文件与 sample、Programming Manual、OT Bridge、Radian Pro / STS / RMS 手册、公司内部 API_Tracker_Studio 源码、两份 PRM），新增 <a href="#sdk">SDK 与随机资料</a> 一节。四项推翻或坐实了原有判断：<b>① SDK 官方跨平台（含 Linux/ARM），「原始数据只能在 Windows 拿」的前提不成立</b>；<b>② Trigger 口确认为 TTL 输入、上限 1000 Hz，对齐方式从求 Δt 升级为脉冲索引对应</b>（T3 GATE 已改写）；<b>③ STS 在库（#6395、±0.010°、1.36 kg），直接打预算最大那一行，但与 TTL 互斥且带来一条新的载荷变形预算行</b>；<b>④ 内部已有的 API_Tracker_Studio 数据通路不能用于 GT</b>（6D 时间戳取 <code>GetTickCount()</code>、有效性标志硬编码、3-DoF 是 Sleep 轮询）。同时按随机手册订正了三条操作口径（热机改排 1.5 h、后视检查改按场次、新增 ADM 检查作为无证书时的自检），「到手先核对」9 项中 4 项已答。<b>追加「一补」两节</b>：Trigger 口接头由背板照片确认为 <b>BNC 母头</b>，但<b>电平门限/边沿/阻抗/隔离/延迟在全部资料里都查不到</b>（已列明查过哪些）；另查出官方 <b>Python 接口 <code>ltpy</code></b>（logger 不必写 C++）与 v7.18 刚修的「Trigger Counter 归零丢数据」bug（漏脉冲检测因此是必须项）。<b>追加 T3f</b>：脉冲索引对齐仍有一个整数歧义（index 0 从哪个脉冲数起），用 PWM 缺口或 ±8 ms 粗对钟解决——主机钟精度要求因此从 0.7 ms 放宽一个数量级；并据此下调「logger 跑在 Thor」的权重（触发线接得上时它只剩运维差别，且塞进 Thor 会扰动被测系统本身），优先级改为<b>先要 Trigger 电气规格，再要 Linux 包</b>。v1.2 · 2026-09-14：首个受检构型定为<b>现有夹爪（cube 构型）</b>，新增该节（账本、URDF 与 bundle 之间 6.15 mm 的可裁决矛盾、AX=XB 的 A 侧改用跟踪仪、被否的 Procrustes 结论按 σ<sub>Δp</sub> 等比重算、窝板装 BOX 本体基准面、采集协议）。v1.1 · 2026-09-14：补 T4 详述（受检构型怎么接 SMR、三条接法与开图前的八条约束、与 0.30 mm 预算行的冲突）；核实后把 carrier 转接件从「如果」改为必做；订正「cube 口径 marker → TCP 从未标定」——平移是实测的（holdout p95 2.70 mm），未测的是旋转与拆装重复性。v1 · 2026-09-11。依据：《激光跟踪仪使用及测试说明》（29 页）、主 roadmap 执行主线 P1-采购行与误差预算表、<code>third_party/opencv_kalibr/metrology</code> 现状、Thor GMSL2 同步配置。标「待确认」的规格均未在本机核实；链预算分配是开工前的切分，不是测量。</p>
 
 </div>
 </body>

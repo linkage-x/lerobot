@@ -1,9 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { DataCollectionGuiApi, GuiSnapshot } from "../api";
-import type { MarkerTcpSample, MarkerTcpSession } from "../types";
+import type { MarkerTcpSample, MarkerTcpSession, MarkerTcpTrackerCheck, TrackerMountArtifact } from "../types";
 import { Metric, StatusDot, stateLabel } from "../shared/ui";
 import { deviceBoxIdentity } from "./adapters";
 import { Modal } from "./ConfirmModal";
+import { E1P_PAUSE_S, e1pChoices, e1pReadiness, trackerLink } from "./markerTcpTracker";
+import type { TrackerLink } from "./markerTcpTracker";
+import { TrackerPivotResult } from "./TrackerPivotResult";
 
 type BoxOption = { id: string; label: string };
 type FormatHelp = "cad" | "static";
@@ -207,6 +210,64 @@ function MarkerTcpCaptureGuide() {
   );
 }
 
+/**
+ * The same sweep, recorded with the SMR on its plate and the tracker on, is
+ * also an E1p capture. What it adds to the camera protocol: pauses long enough
+ * to be dwells, rotations the tracker can follow, and nothing moving between
+ * the pivot and the parked-pose set that gives the station.
+ */
+function TrackerCaptureGuide({ link }: { link: TrackerLink }) {
+  return (
+    <div className="callout marker-tcp-guide">
+      <b>
+        <StatusDot state={link.dot} /> 带跟踪仪录（E1p：用跟踪仪核验生产 TCP）
+      </b>
+      <p className="panel-note">{link.text}</p>
+      <ol>
+        <li>
+          SMR 留在钢片的窝里、插件卡在球窝里，同一个「条件」内都不动；跟踪仪也不能挪——E1p 要用同一站位下驻点集解出的
+          station（先录 pivot、后录驻点集也行）。
+        </li>
+        <li>
+          扫动中在 <b>≥ 15 个</b>不同姿态各<b>静止 ≥ {E1P_PAUSE_S}s</b>：只有停顿进 E1p，扫动本身只给相机 pivot 用。
+          一段样本里停几次都行，停够的总数才算数。
+        </li>
+        <li>
+          姿态怎么摆：<b>绕光束方向侧倾 ±45–60°</b>（不受 SMR 接受角限制，它决定球窝中心定得多准），
+          <b>前后倾留在 ±25° 内</b>。别断光——断了要把 SMR 放回鸟巢等设备行变绿、再沿光束带回钢片的同一个窝。
+        </li>
+        <li>一个条件 = 一次夹持 = 一个球面。松开重夹就换条件名，E1p 按条件分开解。</li>
+        <li>录完先到「采集」页 <b>Disconnect</b>（跟踪仪 session 那时才落地），再回来点「跑 E1p」。</li>
+      </ol>
+    </div>
+  );
+}
+
+function TrackerCheckLine({ check }: { check: MarkerTcpTrackerCheck }) {
+  const dot = !check.ok ? "error" : check.returncode === 0 ? "running" : "warning";
+  return (
+    <div className="cali-result-box">
+      <div className="cali-result-box-head">
+        <StatusDot state={dot} />
+        <b>
+          上次 E1p：{check.boxId} · {check.condition}
+        </b>
+        <span className="cali-muted">
+          {check.cube} · {check.samples ?? 0} 段样本{check.createdAt ? ` · ${check.createdAt.slice(0, 19).replace("T", " ")}` : ""}
+        </span>
+      </div>
+      {check.error && <p className="cali-warn">{check.error}</p>}
+      {(check.notes ?? []).map((note) => (
+        <p className="cali-muted" key={note}>
+          {note}
+        </p>
+      ))}
+      {check.reportPath && <p className="cali-muted">结果：{check.reportPath}</p>}
+      {check.markerTcpPath && <p className="cali-muted">比较的是这份 bundle 合成的生产 TCP：{check.markerTcpPath}</p>}
+    </div>
+  );
+}
+
 export function MarkerTcpPanel({
   snapshot,
   api,
@@ -224,6 +285,14 @@ export function MarkerTcpPanel({
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [formatHelp, setFormatHelp] = useState<FormatHelp | null>(null);
+  const [trackerArtifacts, setTrackerArtifacts] = useState<{
+    stations: TrackerMountArtifact[];
+    mounts: TrackerMountArtifact[];
+  }>({ stations: [], mounts: [] });
+  const [stationPath, setStationPath] = useState("");
+  const [mountFitPath, setMountFitPath] = useState("");
+  const [e1pBox, setE1pBox] = useState("");
+  const [e1pCondition, setE1pCondition] = useState("");
   const session = snapshot.markerTcp ?? EMPTY_SESSION;
   const pendingSample = session.samples.find((sample) => sample.id === session.pendingSampleId);
   const options = boxOptions(snapshot);
@@ -241,6 +310,42 @@ export function MarkerTcpPanel({
   );
   const canSolve = hasBoxOptions && savedForBox.length > 0 && !pendingSample;
   const canReport = session.samples.filter((sample) => sample.status === "registered" && sample.staticTransformPath).length >= 2;
+
+  const link = trackerLink(snapshot.recording);
+  const choices = e1pChoices(session.samples);
+  const e1pBoxChoice =
+    choices.find((choice) => choice.boxId === e1pBox) ??
+    choices.find((choice) => choice.boxId === selectedBoxId) ??
+    choices[0];
+  const e1pConditions = e1pBoxChoice?.conditions ?? [];
+  const e1pConditionChoice =
+    e1pConditions.find((item) => item.condition === e1pCondition) ??
+    e1pConditions.find((item) => item.condition === condition.trim()) ??
+    e1pConditions[e1pConditions.length - 1];
+  const e1p = e1pReadiness({
+    session,
+    boxId: e1pBoxChoice?.boxId ?? "",
+    condition: e1pConditionChoice?.condition ?? "",
+    stationPath,
+    recording: snapshot.recording,
+  });
+  const trackerCheck = session.trackerCheck;
+
+  async function refreshTrackerArtifacts() {
+    const payload = await api.fetchTrackerMount();
+    const stations = payload.stations ?? [];
+    const mounts = payload.mounts ?? [];
+    setTrackerArtifacts({ stations, mounts });
+    // The newest station is the common case: it is a constant of the room and
+    // meant to be reused, and retyping a path is how a stale one gets picked.
+    setStationPath((current) => current || stations[0]?.path || "");
+  }
+
+  useEffect(() => {
+    void refreshTrackerArtifacts();
+    // Once per mount of the panel; the refresh button covers a fit made since.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const call = async (fn: () => Promise<{ ok: boolean; error?: string }>) => {
     setPending(true);
@@ -283,6 +388,7 @@ export function MarkerTcpPanel({
           <p className="panel-note">{session.message}</p>
 
           <MarkerTcpCaptureGuide />
+          <TrackerCaptureGuide link={link} />
 
           <div className="marker-tcp-controls">
             <label>
@@ -387,6 +493,95 @@ export function MarkerTcpPanel({
             </span>
           </div>
 
+          <div className="marker-tcp-e1p">
+            <b>跟踪仪核验（E1p）</b>
+            <p className="panel-note">
+              用带跟踪仪录的 pivot 样本里的<b>停顿</b>：跟踪仪单独拟合出球窝中心，逐位姿减去生产 TCP。生产 c_TCP
+              原样代入、不拟合，所以它的错会直接显出来。只比较，<b>不写任何 bundle</b>；按「BOX + 条件」一次解一个夹持。
+              缺生产 EE 轨迹时会先自动生成（和回放页的「生成 EE 轨迹」是同一个任务）。
+            </p>
+            <div className="marker-tcp-controls">
+              <label>
+                BOX
+                <select
+                  value={e1pBoxChoice?.boxId ?? ""}
+                  disabled={disabled || !choices.length}
+                  onChange={(event) => setE1pBox(event.target.value)}
+                >
+                  {choices.length ? (
+                    choices.map((choice) => (
+                      <option value={choice.boxId} key={choice.boxId}>
+                        {choice.boxId}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">还没有带跟踪仪的样本</option>
+                  )}
+                </select>
+              </label>
+              <label>
+                条件（一次夹持）
+                <select
+                  value={e1pConditionChoice?.condition ?? ""}
+                  disabled={disabled || !e1pConditions.length}
+                  onChange={(event) => setE1pCondition(event.target.value)}
+                >
+                  {e1pConditions.map((item) => (
+                    <option value={item.condition} key={item.condition}>
+                      {item.condition}（{item.samples} 段）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                station（同一跟踪仪站位）
+                <select value={stationPath} disabled={disabled} onChange={(event) => setStationPath(event.target.value)}>
+                  <option value="">—</option>
+                  {trackerArtifacts.stations.map((item) => (
+                    <option value={item.path} key={item.path}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                同一钢片的 lever-arm（可选：给出 SMR→TCP，并做半径一致性检查）
+                <select value={mountFitPath} disabled={disabled} onChange={(event) => setMountFitPath(event.target.value)}>
+                  <option value="">不用</option>
+                  {trackerArtifacts.mounts.map((item) => (
+                    <option value={item.path} key={item.path}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="control-row">
+              <button
+                className="cali-btn-primary"
+                disabled={disabled || !e1p.canRun}
+                onClick={() =>
+                  call(() =>
+                    api.markerTcpTrackerCheck({
+                      boxId: e1pBoxChoice?.boxId ?? "",
+                      condition: e1pConditionChoice?.condition ?? "",
+                      station: stationPath,
+                      mountFit: mountFitPath,
+                    })
+                  )
+                }
+              >
+                跑 E1p
+              </button>
+              <button disabled={disabled} onClick={() => void refreshTrackerArtifacts()}>
+                刷新 station 列表
+              </button>
+              <span className="panel-note">{e1p.reason}</span>
+            </div>
+            {trackerCheck && trackerCheck.createdAt ? <TrackerCheckLine check={trackerCheck} /> : null}
+            {trackerCheck?.report ? <TrackerPivotResult report={trackerCheck.report} /> : null}
+          </div>
+
           <div className="marker-tcp-controls marker-tcp-register">
             <label>
               <span className="marker-tcp-label-row">
@@ -419,6 +614,7 @@ export function MarkerTcpPanel({
                   <strong>
                     <StatusDot state={sample.status === "discarded" ? "error" : sample.status === "recording" ? "recording" : "running"} />
                     {sample.boxId || sample.side || "BOX"} · {sample.condition}
+                    {sample.laserTracker ? " · 跟踪仪" : ""}
                   </strong>
                   <span>{sampleLabel(sample)}</span>
                   <em>{sample.status}</em>

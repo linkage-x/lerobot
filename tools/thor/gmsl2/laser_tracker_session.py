@@ -71,6 +71,31 @@ _SSH_BASE = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHost
 _PROGRESS_RE = re.compile(r"^\s*rows \d+\s+dropped \d+\s*$")
 _OP_MODES = ("Idle", "Tracking", "Position", "TrackIdle", "Searching", "Internal")
 
+# What a failure means right after the controller has been power-cycled, which
+# is exactly when these codes stop meaning what they usually mean.  2026-09-21,
+# after an unplanned power cut, four Connects in a row walked through the whole
+# cold start -- CommunicationFailed (controller still booting), IndexSearchFailed
+# (encoder index search on the first connect after power-on), then two Connects
+# that *succeeded* but reported TrackerNotWarmedUp -- and the operator, told to
+# close SA and to put the SMR in the nest, gave up on a tracker that only needed
+# fifteen minutes.
+_CONNECT_HINTS = {
+    "CommunicationFailed": (
+        " -- either another client holds it (the tracker admits one client at a time: "
+        "close SA / RadianCAL / Tracker Studio), or the controller is still booting "
+        "after a power cycle (wait until it answers, then reconnect)"
+    ),
+    "DeviceAlreadyConnected": (
+        " -- the tracker admits one client at a time; close SA / RadianCAL / "
+        "Tracker Studio and reconnect"
+    ),
+    "IndexSearchFailed": (
+        " -- the first connect after power-on runs an encoder index search, which "
+        "rotates the head about both axes: check the Servo switch is on (Power "
+        "first, then Servo) and nothing blocks the head, then reconnect"
+    ),
+}
+
 
 def _decode(raw: bytes) -> str:
     """Decode whatever the Windows console said, without ever raising.
@@ -326,6 +351,13 @@ class LaserTrackerSession:
             if not self._await_probe():
                 return False
             if not self._await_logger():
+                # A logger that is still alive here is almost always stuck in the
+                # SDK handshake, and one that finishes it later would hold the
+                # tracker's only client slot until session_cap_s -- so the next
+                # Connect would fail as "CommunicationFailed" with no logger in
+                # sight. The stop-file is what releases it: the logger checks it
+                # the moment it is connected.
+                self._teardown_logger(wait_s=5.0)
                 self._teardown_probe()
                 return False
             self._connected = True
@@ -334,6 +366,7 @@ class LaserTrackerSession:
         except Exception as exc:  # never break Connect for the other devices
             self.last_error = f"connect failed: {type(exc).__name__}: {exc}"
             logger.warning("laser tracker connect failed: %s", exc)
+            self._teardown_logger(wait_s=5.0)
             self._teardown_probe()
             return False
 
@@ -494,12 +527,7 @@ class LaserTrackerSession:
                 # or RadianCAL being open is enough to refuse us -- and the SDK
                 # reports that as a generic communication failure, which reads
                 # like a network fault and sends people to check cables.
-                hint = ""
-                if "CommunicationFailed" in tail or "DeviceAlreadyConnected" in tail:
-                    hint = (
-                        " -- the tracker admits one client at a time; close SA / "
-                        "RadianCAL / Tracker Studio and reconnect"
-                    )
+                hint = next((h for code, h in _CONNECT_HINTS.items() if code in tail), "")
                 self.last_error = f"tracker logger exited: {tail[:300]}{hint}"
                 self._logger_proc = None
                 return False
@@ -509,7 +537,8 @@ class LaserTrackerSession:
         if rows <= 0:
             self.last_error = (
                 f"tracker produced no samples in {self.cfg.logger_ready_timeout_s:g} s -- "
-                "is it warmed up, locked on an SMR, and not held by SA?"
+                "is the controller up (it takes a while after a power cycle), and is the "
+                "tracker not held by SA?"
             )
             return False
         self._rows_mark = rows
@@ -770,16 +799,26 @@ class LaserTrackerSession:
                        capture_output=True, timeout=120)
         local.unlink(missing_ok=True)
 
-    def _teardown_logger(self) -> None:
+    def _teardown_logger(self, *, wait_s: float = 60.0) -> None:
+        """Ask the logger to stop, then drop the ssh channel if it will not.
+
+        The stop-file is the part that actually works on the Windows side:
+        ``lt_realtime_logger`` polls it in its writer loop, i.e. from the moment
+        it is connected. Closing the local ssh channel is only a backstop --
+        whether that ends the remote process is up to the Windows OpenSSH
+        server, and nothing here relies on it. So on a failed Connect the
+        stop-file is left in place for a logger that has not connected yet.
+        """
         if self._logger_proc is None:
             return
         try:
             self._run(f'type nul > "{self.logger_stop_file}"')
             try:
-                self._logger_proc.wait(timeout=60)
+                self._logger_proc.wait(timeout=wait_s)
             except subprocess.TimeoutExpired:
                 self._logger_proc.terminate()
-                self.last_error = "tracker logger did not stop within 60 s; terminated"
+                if not self.last_error:
+                    self.last_error = f"tracker logger did not stop within {wait_s:g} s; terminated"
         except Exception as exc:
             self.last_error = f"logger teardown failed: {type(exc).__name__}: {exc}"
         finally:
@@ -862,7 +901,15 @@ class LaserTrackerSession:
                 reason = reason[1:-1]
             if reason.startswith("NoSmrAtHomePosition"):
                 return "waiting for the SMR — put it in the home nest, homing retries automatically"
-            return f"waiting for the SMR ({reason}) — homing retries automatically"
+            if reason.startswith("TrackerNotWarmedUp"):
+                # Nothing the operator does with the SMR changes this, and saying
+                # "waiting for the SMR" here is what made a healthy tracker look
+                # broken after the 2026-09-21 power cut.
+                return (
+                    "tracker still warming up — homing is refused until the laser is ready "
+                    "(at least 15 min after power-on, front LED steady); retries automatically"
+                )
+            return f"waiting ({reason}) — homing retries automatically"
         if self.beam_status == "lost":
             return "beam lost — reacquiring"
         return "waiting for the SMR — homing retries automatically"

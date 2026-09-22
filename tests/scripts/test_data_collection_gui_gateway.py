@@ -6175,3 +6175,396 @@ def test_the_chain_stops_at_the_fit_when_no_comparison_was_asked_for(tmp_path, m
     result = gateway._run_tracker_mount_chain(state, {"mode": "station"})
     assert result["ok"] is True
     assert result["validate"] is None
+
+
+# --- one pose per segment, pivot capture (2026-09-22) -------------------------
+
+
+def test_a_segment_too_short_to_hold_a_dwell_is_refused_before_recording(tmp_path, monkeypatch):
+    """2.0 s still plus 0.3 s trimmed at each end: under 2.6 s there is no dwell.
+
+    Refused at the button, where it costs nothing, instead of at solve time,
+    where the 2026-09-21 capture found 4 of its 15 poses too short.
+    """
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    monkeypatch.setattr(gateway, "_start_episode", lambda *a, **k: None)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 2.0})
+
+    assert result["ok"] is False
+    assert "2.6" in result["error"]
+    assert state.tracker_mount_session.dwellsStarted == 0
+
+
+def test_the_default_segment_is_one_pose_long_not_a_whole_session(tmp_path, monkeypatch):
+    # The panel used to default to ~100 s -- a long take holding every pose --
+    # which is what made operators save early at each pose once the protocol
+    # became one pose per segment.
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(
+        gateway, "_start_episode",
+        lambda _s, seconds, **k: seen.update(seconds=seconds, intent=k["capture_intent"]),
+    )
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {})
+
+    assert result["ok"] is True
+    assert seen["seconds"] == 4.0
+    assert seen["intent"]["segment_seconds"] == 4.0
+
+
+def test_a_segment_saved_before_it_can_hold_a_dwell_is_flagged_at_once(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.5
+
+    gateway._note_tracker_mount_segment_end(state, "save")
+
+    assert session.shortSegments == 1
+    assert "重录" in session.message
+    payload = gateway._tracker_mount_session_payload(state)
+    assert payload["shortSegments"] == 1
+    assert 1.4 <= payload["lastSegmentSeconds"] <= 2.0
+
+
+def test_a_full_length_or_discarded_segment_is_not_flagged(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 5.0
+    gateway._note_tracker_mount_segment_end(state, "save")
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.0
+    gateway._note_tracker_mount_segment_end(state, "discard")
+
+    assert session.shortSegments == 0
+    assert session.lastSegmentStartedMono == 0.0
+
+
+def test_a_pivot_session_says_what_it_is_in_every_episode(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(gateway, "_start_episode", lambda _s, _sec, **k: seen.update(k["capture_intent"]))
+
+    started = gateway._start_tracker_mount_session(state, {"sessionName": "tp_1", "kind": "pivot"})
+    gateway._start_tracker_mount_episode(state, {})
+
+    assert started["session"]["kind"] == "pivot"
+    assert "侧倾" in started["session"]["message"]
+    assert seen["protocol"] == "tcp_pivot_dwell"
+
+
+def test_an_unknown_capture_kind_is_refused(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    result = gateway._start_tracker_mount_session(state, {"kind": "sweep"})
+    assert result["ok"] is False
+    assert state.tracker_mount_session.active is False
+
+
+def _captured_cli(monkeypatch) -> list:
+    calls: list = []
+
+    def _fake(_state, args, **_k):
+        calls.append(list(args))
+        return {"returncode": 0, "stdout": "", "stderr": "ok\n", "command": args}
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", _fake)
+    return calls
+
+
+def test_lever_arm_takes_every_segment_of_one_mount(tmp_path, monkeypatch):
+    """One segment is one pose now, so "one session" meant "one pose"."""
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    rows = [_tracker_mount_row(tmp_path, mount_id="plate_v1", episode=i) for i in range(3)]
+
+    result = gateway._run_tracker_mount_lever_arm(state, {"rows": rows, "station": str(station)})
+
+    assert result["ok"] is True
+    assert calls[0].count("--episode") == 3
+
+
+def test_lever_arm_refuses_segments_from_two_mounts(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    rows = [_tracker_mount_row(tmp_path, mount_id="a"), _tracker_mount_row(tmp_path, mount_id="b")]
+
+    result = gateway._run_tracker_mount_lever_arm(state, {"rows": rows, "station": str(station)})
+
+    assert result["ok"] is False
+    assert "一个 mount" in result["error"]
+
+
+def test_the_pivot_solve_calls_the_cli_with_the_production_bundle(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    bundle = tmp_path / "marker_to_tcp.json"
+    bundle.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gateway, "_default_marker_tcp_bundle_path", lambda _s: bundle)
+    rows = [_tracker_mount_row(tmp_path, episode=i) for i in range(2)]
+
+    result = gateway._run_tracker_mount_pivot(
+        state, {"rows": rows, "station": str(station), "cube": "right"}
+    )
+
+    assert result["ok"] is True
+    assert result["kind"] == "pivot"
+    args = calls[0]
+    assert args[0] == "pivot"
+    assert args[args.index("--marker-tcp") + 1] == str(bundle)
+    assert args[args.index("--cube") + 1] == "right"
+    assert Path(args[args.index("--out") + 1]).name.startswith("pivot_right_")
+
+
+def test_the_pivot_solve_needs_to_be_told_which_cube(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+
+    result = gateway._run_tracker_mount_pivot(
+        state, {"rows": [_tracker_mount_row(tmp_path)], "station": str(station)}
+    )
+
+    assert result["ok"] is False
+    assert "cube" in result["error"]
+    assert calls == []
+
+
+def test_the_chain_never_grades_a_trajectory_against_a_pivot(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway, "_run_tracker_mount_pivot",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "p.json", "kind": "pivot"},
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("a static pivot has no trajectory to grade")
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _boom)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "pivot", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is True
+    assert result["validate"] is None
+
+
+def test_episode_zero_is_a_segment_not_a_missing_field(tmp_path):
+    rows = gateway._tracker_mount_rows({"rows": [_tracker_mount_row(tmp_path, episode=0)]})
+    assert rows[0]["episode"] == "0"
+
+
+# --- E1p from the marker->TCP panel ------------------------------------------
+
+E1P_SID = "lt_20260923_101500"
+
+
+def test_a_pivot_sample_recorded_with_the_tracker_says_so(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.config["recorder"] = {"script": "tools/thor/gmsl2/thor_record.py"}
+    state.recording.laserTracker = True
+    state.recording.laserTrackerDetail = f"session {E1P_SID} · beam on SMR"
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+    seen: dict = {}
+
+    def fake_start_episode(fake_state, episode_time_s=None, **kwargs):
+        seen.update(kwargs)
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    result = gateway._marker_tcp_record_sample(state, "start", box_id="box1672693301", condition="e1p_01")
+
+    assert result["ok"] is True
+    assert seen["capture_intent"]["protocol"] == "tcp_pivot_sweep"
+    assert seen["capture_intent"]["condition"] == "e1p_01"
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.laserTracker is True
+    assert sample.trackerSessionId == E1P_SID
+    assert "静止" in state.marker_tcp_session.message
+
+
+def _e1p_repo(tmp_path: Path, *, landed: bool = True, tracker: bool = True):
+    """The marker->TCP solve repo, with both samples as one clamping recorded with the tracker."""
+    state, dataset_root, bundle_path = _marker_tcp_solve_repo(tmp_path)
+    for sample in state.marker_tcp_session.samples:
+        sample.condition = "e1p_01"
+        sample.laserTracker = tracker
+        episode_dir = dataset_root / "episodes" / f"episode_{sample.episodeIndex:06d}"
+        (episode_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "episode_index": sample.episodeIndex,
+                    "laser_tracker": {"enabled": tracker, "session_id": E1P_SID if tracker else ""},
+                }
+            ),
+            encoding="utf-8",
+        )
+    if landed:
+        (dataset_root / "laser_tracker" / E1P_SID).mkdir(parents=True)
+    station = state.repo_root / "outputs" / "laser_tracker" / "station_1.json"
+    station.parent.mkdir(parents=True, exist_ok=True)
+    station.write_text("{}", encoding="utf-8")
+    return state, dataset_root, bundle_path, station
+
+
+def _stub_e1p(monkeypatch, dataset_root: Path, *, returncode: int = 0):
+    """Record traj-gen and fit calls; the fit writes an artifact like the CLI's."""
+    calls: dict = {"traj_gen": [], "fit": []}
+
+    def fake_queue(_state, dataset, **_k):
+        calls["traj_gen"].append(Path(dataset))
+        sidecar = gateway._marker_tcp_sidecar_path(Path(dataset), "left")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text("x", encoding="utf-8")
+
+    def fake_fit(_state, args, **_k):
+        calls["fit"].append(list(args))
+        out = Path(args[args.index("--out") + 1])
+        out.write_text(
+            json.dumps(
+                {
+                    "n_poses": 16,
+                    "cube": "left",
+                    "static_tcp_error_mm": {"p95": 1.4, "rms": 0.9, "max": 1.6, "per_pose": [0.9] * 16},
+                    "c_tcp_error_norm_mm": 1.1,
+                    "certifies": returncode == 0,
+                    "certify_reasons": [] if returncode == 0 else ["socket centre sigma 0.2 mm"],
+                    "capture": [{"dwells": ["a very long diagnostic"] * 50}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"returncode": returncode, "stdout": "", "stderr": "static TCP error p95 1.40 mm\n", "command": args}
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", fake_queue)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *_a, **_k: {"status": "complete"})
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", fake_fit)
+    return calls
+
+
+def test_e1p_grades_production_labels_on_the_pivot_samples(tmp_path, monkeypatch):
+    state, dataset_root, bundle_path, station = _e1p_repo(tmp_path)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True, result
+    # No sidecar yet: production's trajectory job runs first, on the samples' dataset.
+    assert calls["traj_gen"] == [dataset_root]
+    args = calls["fit"][0]
+    assert args[0] == "pivot"
+    assert args.count("--episode") == 2
+    assert {args[i + 1] for i, a in enumerate(args) if a == "--mount-id"} == {"box1672693301_e1p_01"}
+    assert args[args.index("--cube") + 1] == "left"
+    # Graded with the bundle the trajectory was composed with, not a new one.
+    assert args[args.index("--marker-tcp") + 1] == str(bundle_path)
+    assert "--skip-episodes-without-dwells" in args
+    assert args[args.index("--session") + 1] == str(dataset_root / "laser_tracker" / E1P_SID)
+    check = state.marker_tcp_session.trackerCheck
+    assert check["ok"] is True and check["returncode"] == 0
+    assert check["report"]["static_tcp_error_mm"]["p95"] == 1.4
+    # The snapshot carries the numbers, not the per-dwell diagnostics.
+    assert "capture" not in check["report"]
+    assert state.marker_tcp_session.stage == "capture"
+    assert state.marker_tcp_session.solvePath == ""
+
+
+def test_e1p_that_does_not_certify_is_a_finding_not_a_failure(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path)
+    _stub_e1p(monkeypatch, dataset_root, returncode=1)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True
+    check = state.marker_tcp_session.trackerCheck
+    assert check["returncode"] == 1
+    assert check["report"]["certify_reasons"] == ["socket centre sigma 0.2 mm"]
+
+
+def test_e1p_reuses_a_trajectory_newer_than_the_samples(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+    sidecar = gateway._marker_tcp_sidecar_path(dataset_root, "left")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text("x", encoding="utf-8")
+    later = max(p.stat().st_mtime for p in dataset_root.glob("episodes/*/meta.json")) + 10
+    os.utime(sidecar, (later, later))
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True
+    assert calls["traj_gen"] == []
+
+
+def test_e1p_waits_for_disconnect_before_anything_runs(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path, landed=False)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is False
+    assert "Disconnect" in result["error"]
+    assert calls == {"traj_gen": [], "fit": []}
+    assert state.marker_tcp_session.stage == "capture"
+
+
+def test_e1p_refuses_samples_recorded_without_the_tracker_or_a_station(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path, tracker=False)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+    request = {"boxId": "box1672693301", "condition": "e1p_01"}
+
+    no_station = gateway._run_marker_tcp_tracker_check(state, request, background=False)
+    no_tracker = gateway._run_marker_tcp_tracker_check(
+        state, {**request, "station": str(station)}, background=False
+    )
+
+    assert no_station["ok"] is False and "station" in no_station["error"]
+    assert no_tracker["ok"] is False and "跟踪仪" in no_tracker["error"]
+    assert calls == {"traj_gen": [], "fit": []}
+
+
+def test_waiting_for_the_trajectory_reads_the_final_status_not_just_the_process(tmp_path):
+    # The output reader releases the process a moment before it writes
+    # "complete"; returning on the release alone would read "running".
+    state = _marker_tcp_gateway_state(tmp_path)
+    dataset = tmp_path / "ds"
+    dataset.mkdir()
+    gateway._update_traj_gen_meta(dataset, job_id="j", status="running", message="tracking ep 3/5")
+    seen: list[str] = []
+
+    def progress(text: str) -> None:
+        seen.append(text)
+        gateway._update_traj_gen_meta(dataset, job_id="j", status="complete", message="done")
+
+    job = gateway._await_traj_gen(state, dataset, on_progress=progress, poll_s=0.0)
+
+    assert job["status"] == "complete"
+    assert seen == ["tracking ep 3/5"]

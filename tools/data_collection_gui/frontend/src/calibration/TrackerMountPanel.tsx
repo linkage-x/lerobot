@@ -26,16 +26,24 @@ import type {
   TrackerMountCapture,
   TrackerMountChainResponse,
   TrackerMountSession,
+  TrackerPivotReport,
   TrackerStationReport,
   TrackerValidateResponse,
 } from "../types";
 import { Metric, StatusDot } from "../shared/ui";
 import { Modal } from "./ConfirmModal";
+import { TrackerPivotResult } from "./TrackerPivotResult";
 import type { RecorderLiveState } from "./trackerMount";
 import {
   DWELL_SECONDS_MIN,
+  DWELL_TRIM_S,
   POSES_TO_CERTIFY,
+  SEGMENTS_SUGGESTED,
+  SEGMENT_MIN_S,
   absorbedNote,
+  earlySaveWarning,
+  protocolLabel,
+  segmentLengthVerdict,
   attitudeVerdict,
   captureLabel,
   captureReadiness,
@@ -484,6 +492,7 @@ function SessionLine({ session }: { session: TrackerMountSession }) {
         <StatusDot state={dot} />
         <b>{session.sessionName}</b>
         <span className="cali-muted">
+          {session.kind === "pivot" ? "pivot（E1p）" : "驻点集"} ·{" "}
           {solvable ? "可解算" : session.stage === "failed" ? "无法解算" : "采集中"}
         </span>
       </div>
@@ -495,6 +504,12 @@ function SessionLine({ session }: { session: TrackerMountSession }) {
         ，距离认证还差 {Math.max(0, POSES_TO_CERTIFY - session.dwellsOnDisk)} 段的姿态量。
         {session.trackerSessionId && <> 跟踪仪 session：{session.trackerSessionId}。</>}
       </p>
+      {(session.shortSegments ?? 0) > 0 && (
+        <p className="cali-warn">
+          <StatusDot state="warning" /> 有 {session.shortSegments} 段录得太短（&lt; {SEGMENT_MIN_S.toFixed(1)}s），
+          解算时会被丢掉，对应的姿态要重录。
+        </p>
+      )}
       {session.message && <p className="cali-muted">{session.message}</p>}
       {session.landedPath && <p className="cali-muted">落地于 {session.landedPath}</p>}
     </div>
@@ -523,6 +538,12 @@ function GuidedCapture({
   ) => void;
 }) {
   const [seconds, setSeconds] = useState(String(suggestedDwellSeconds()));
+  const [kind, setKind] = useState<"dwell" | "pivot">("dwell");
+  // When the take in flight started, so an early "save" can be called out
+  // while the rig is still standing where it was.
+  const [recordStartedAt, setRecordStartedAt] = useState<number | null>(null);
+  const lengthVerdict = segmentLengthVerdict(Number(seconds));
+  const activeKind = session?.active ? session.kind ?? "dwell" : kind;
   // A refused press and a started take are not the same news, and the first one
   // used to be rendered in the same muted grey as the instructions -- which is
   // how a lost take reads as "the button is just disabled".
@@ -537,7 +558,7 @@ function GuidedCapture({
 
   async function onStartSession() {
     setRunning("start");
-    const result = await api.startTrackerMountSession();
+    const result = await api.startTrackerMountSession(kind);
     setNote(
       result.ok
         ? { text: `站位采集 ${result.session?.sessionName ?? ""} 已开始`, bad: false }
@@ -563,9 +584,10 @@ function GuidedCapture({
     });
     setNote(
       result.ok
-        ? { text: `已开始录制，${result.seconds}s 后自动收尾`, bad: false }
+        ? { text: `已开始录制，${result.seconds}s 后自动收尾——静止到收尾，别提前保存`, bad: false }
         : { text: result.error || "录制失败：录制器没有接受这一段。", bad: true },
     );
+    setRecordStartedAt(result.ok ? Date.now() : null);
     setRunning("");
   }
 
@@ -573,7 +595,10 @@ function GuidedCapture({
     // The only way to end a take early and keep it. Without this button the
     // sole control on this panel was Disconnect, which discards.
     setRunning("save");
+    const early = recordStartedAt == null ? null : earlySaveWarning((Date.now() - recordStartedAt) / 1000);
+    setRecordStartedAt(null);
     await api.stopRecording("save");
+    if (early) setNote({ text: early, bad: true });
     setRunning("");
     onRefresh();
   }
@@ -605,16 +630,30 @@ function GuidedCapture({
         >
           {running === "connect" ? "连接中…" : readiness.canConnect ? "Connect（带跟踪仪）" : "已连接"}
         </button>
+        <label className="cali-field">
+          采集什么
+          <select
+            value={activeKind}
+            disabled={disabled || Boolean(session?.active)}
+            onChange={(e) => setKind(e.target.value as "dwell" | "pivot")}
+          >
+            <option value="dwell">驻点集（求站位 T_WG 与杠杆臂 c）</option>
+            <option value="pivot">pivot · E1p（TCP 卡球窝，测生产 TCP）</option>
+          </select>
+        </label>
         <button
           className="cali-mini-btn"
           disabled={disabled || !readiness.canStartSession}
           onClick={onStartSession}
         >
-          {running === "start" ? "开始中…" : "开始一次站位采集"}
+          {running === "start" ? "开始中…" : activeKind === "pivot" ? "开始一次 pivot 采集" : "开始一次站位采集"}
         </button>
         <label className="cali-field">
           这一段录多久 (s)
           <input value={seconds} disabled={disabled} onChange={(e) => setSeconds(e.target.value)} />
+          {lengthVerdict.level !== "ok" && (
+            <span className={lengthVerdict.level === "bad" ? "cali-warn" : "cali-muted"}>{lengthVerdict.text}</span>
+          )}
         </label>
         <button
           className="cali-btn-primary"
@@ -656,14 +695,22 @@ function GuidedCapture({
       )}
 
       <p className="cali-muted">
-        <b>一段里停多个姿态，不是一个姿态录一段。</b>位姿是从<b>这一段内部</b>的跟踪仪流里按停驻切出来的，
-        单段少于 {3} 个停驻会被直接拒绝。所以录一长段，中间反复「摆好—停住 ≥{DWELL_SECONDS_MIN}s—再换姿态」，
-        凑到 <b>{POSES_TO_CERTIFY}</b> 个以上才够认证。
+        <b>一段一个姿态。</b>摆好、手离开，点「录一段」，<b>静止到自动收尾</b>。一个驻点要 {DWELL_SECONDS_MIN}s 静止，
+        两端各裁 {DWELL_TRIM_S}s，所以每段至少 {SEGMENT_MIN_S.toFixed(1)}s——提前「保存本段」就会被丢掉。
+        拟合要 ≥ <b>{POSES_TO_CERTIFY}</b> 段，要留出复核就录 <b>{SEGMENTS_SUGGESTED}</b> 段。
       </p>
-      <p className="cali-muted">
-        换姿态时<b>要绕两根明显不平行的轴</b>：纯平移和单轴旋转都定不出 c，而且残差照样很小。
-        停的时候要真停住（&lt;2 mm/s），起止各 0.3 s 会被裁掉——那是上一次移动的余振，不是位姿。
-      </p>
+      {activeKind === "pivot" ? (
+        <p className="cali-muted">
+          <b>pivot（E1p）</b>：夹爪夹住相机 pivot 标定用的同一个插件，球头卡进固定在桌上的球窝，<b>SMR 留在钢片上不动</b>。
+          以球窝为支点转：<b>绕光束方向侧倾 ±45–60°</b>（不受接受角限制，它决定球窝中心能定多准），
+          前后倾留在 ±25° 内。左右两侧各一场，和驻点集用<b>同一个跟踪仪站位</b>。
+        </p>
+      ) : (
+        <p className="cali-muted">
+          换姿态时<b>要绕两根明显不平行的轴</b>：纯平移和单轴旋转都定不出 c，而且残差照样很小。
+          位置也要在三维里拉开（左右、前后、高低），停的时候要真停住（&lt;2 mm/s）。
+        </p>
+      )}
       <p className="cali-muted">
         跟踪仪 session 是<b>一次 Connect 一个</b>（logger 冷启动要 15–16 s，不可能每段重来），
         并且在 <b>Disconnect 时才 seal + land</b>。所以顺序是：
@@ -686,6 +733,7 @@ function GuidedCapture({
               <tr key={capture.episodeDir}>
                 <td>
                   {capture.datasetName} ep{capture.episode}
+                  {protocolLabel(capture) && <span className="cali-muted"> · {protocolLabel(capture)}</span>}
                 </td>
                 <td>{capture.sessionId || "—"}</td>
                 <td>
@@ -741,7 +789,7 @@ export function TrackerMountPanel({
   const [holdout, setHoldout] = useState("5");
   const [worldFrameId, setWorldFrameId] = useState("");
   const [trackerStationId, setTrackerStationId] = useState("");
-  const [running, setRunning] = useState<"" | "station" | "lever" | "validate">("");
+  const [running, setRunning] = useState<"" | "station" | "lever" | "pivot" | "validate">("");
   const [result, setResult] = useState<TrackerMountSolveResponse | null>(null);
   const [gtDataset, setGtDataset] = useState("");
   const [gtEpisode, setGtEpisode] = useState("");
@@ -756,7 +804,10 @@ export function TrackerMountPanel({
   const [captureRunning, setCaptureRunning] = useState<
     "" | "connect" | "start" | "record" | "save" | "disconnect" | "end"
   >("");
-  const [chainMode, setChainMode] = useState<"station" | "lever-arm">("station");
+  const [chainMode, setChainMode] = useState<"station" | "lever-arm" | "pivot">("station");
+  const [pivotCube, setPivotCube] = useState("left");
+  const [pivotBundle, setPivotBundle] = useState("");
+  const [pivotMountFit, setPivotMountFit] = useState("");
   const [chainPicked, setChainPicked] = useState<string[]>([]);
   const [chainGt, setChainGt] = useState("");
   const [chainResult, setChainResult] = useState<TrackerMountChainResponse | null>(null);
@@ -795,15 +846,19 @@ export function TrackerMountPanel({
   }
 
   async function onChain() {
-    setRunning(chainMode === "station" ? "station" : "lever");
+    setRunning(chainMode === "station" ? "station" : chainMode === "pivot" ? "pivot" : "lever");
     const picked = readiness.usable.filter((c) => chainPicked.includes(c.episodeDir));
-    const gt = readiness.usable.find((c) => c.episodeDir === chainGt);
+    // A pivot is static at the TCP: there is no trajectory to grade against it.
+    const gt = chainMode === "pivot" ? undefined : readiness.usable.find((c) => c.episodeDir === chainGt);
     setChainResult(
       await api.runTrackerMountChain({
         mode: chainMode,
         rows: picked.map(rowOf),
-        station: chainMode === "lever-arm" ? stationPath : undefined,
+        station: chainMode === "station" ? undefined : stationPath,
         holdout: chainMode === "lever-arm" ? Number(holdout) || 0 : undefined,
+        cube: chainMode === "pivot" ? pivotCube : undefined,
+        markerTcp: chainMode === "pivot" ? pivotBundle.trim() : undefined,
+        mountFit: chainMode === "pivot" ? pivotMountFit : undefined,
         worldFrameId: worldFrameId.trim(),
         trackerStationId: trackerStationId.trim(),
         validate: gt
@@ -910,13 +965,40 @@ export function TrackerMountPanel({
             <select
               value={chainMode}
               disabled={disabled}
-              onChange={(e) => setChainMode(e.target.value as "station" | "lever-arm")}
+              onChange={(e) => setChainMode(e.target.value as "station" | "lever-arm" | "pivot")}
             >
               <option value="station">station（连 T_WG 一起解；需要姿态多样性）</option>
               <option value="lever-arm">lever-arm（站位已冻结，只解 c；不需要旋转）</option>
+              <option value="pivot">pivot · E1p（在 TCP 处测生产 c_TCP；只认位置）</option>
             </select>
           </label>
-          {chainMode === "lever-arm" && (
+          {chainMode === "pivot" && (
+            <>
+              <label className="cali-field">
+                哪个 cube
+                <select value={pivotCube} disabled={disabled} onChange={(e) => setPivotCube(e.target.value)}>
+                  <option value="left">left</option>
+                  <option value="right">right</option>
+                </select>
+              </label>
+              <label className="cali-field">
+                marker→TCP bundle（留空 = 生产配置里那份）
+                <input value={pivotBundle} disabled={disabled} onChange={(e) => setPivotBundle(e.target.value)} placeholder="留空" />
+              </label>
+              <label className="cali-field">
+                同一钢片的 lever-arm 结果（可选，做半径一致性检查）
+                <select value={pivotMountFit} disabled={disabled} onChange={(e) => setPivotMountFit(e.target.value)}>
+                  <option value="">不做</option>
+                  {artifacts.mounts.map((item) => (
+                    <option key={item.path} value={item.path}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          )}
+          {chainMode !== "station" && (
             <>
               <label className="cali-field">
                 已冻结的 station
@@ -929,15 +1011,17 @@ export function TrackerMountPanel({
                   ))}
                 </select>
               </label>
-              <label className="cali-field">
-                holdout 位姿数
-                <input value={holdout} disabled={disabled} onChange={(e) => setHoldout(e.target.value)} />
-              </label>
+              {chainMode === "lever-arm" && (
+                <label className="cali-field">
+                  holdout 位姿数
+                  <input value={holdout} disabled={disabled} onChange={(e) => setHoldout(e.target.value)} />
+                </label>
+              )}
             </>
           )}
           <label className="cali-field">
-            顺便做 GT 比较（可不选）
-            <select value={chainGt} disabled={disabled} onChange={(e) => setChainGt(e.target.value)}>
+            顺便做 GT 比较（可不选；pivot 不做）
+            <select value={chainGt} disabled={disabled || chainMode === "pivot"} onChange={(e) => setChainGt(e.target.value)}>
               <option value="">不做</option>
               {readiness.usable.map((capture) => (
                 <option key={capture.episodeDir} value={capture.episodeDir}>
@@ -961,28 +1045,29 @@ export function TrackerMountPanel({
           <div className="cali-result-box-head">
             <b>用哪几段来拟合</b>
             <span className="cali-muted">
-              {chainMode === "lever-arm" ? "lever-arm 一次只吃一段" : "可多选，跨 session 累积"}
+              {chainMode === "station"
+                ? "可多选，跨 session 累积"
+                : "选同一个 mount 的所有段（一段一个姿态）"}
             </span>
           </div>
           {readiness.usable.length === 0 && <p className="cali-muted">还没有可用的录制。</p>}
           {readiness.usable.map((capture) => (
             <label key={capture.episodeDir} className="cali-field">
               <input
-                type={chainMode === "lever-arm" ? "radio" : "checkbox"}
+                type="checkbox"
                 name="tracker-mount-pick"
                 disabled={disabled}
                 checked={chainPicked.includes(capture.episodeDir)}
                 onChange={(e) =>
                   setChainPicked(
-                    chainMode === "lever-arm"
-                      ? [capture.episodeDir]
-                      : e.target.checked
-                        ? [...chainPicked, capture.episodeDir]
-                        : chainPicked.filter((dir) => dir !== capture.episodeDir),
+                    e.target.checked
+                      ? [...chainPicked, capture.episodeDir]
+                      : chainPicked.filter((dir) => dir !== capture.episodeDir),
                   )
                 }
               />
               {captureLabel(capture)}
+              {protocolLabel(capture) && <span className="cali-muted"> · {protocolLabel(capture)}</span>}
             </label>
           ))}
         </div>
@@ -992,11 +1077,12 @@ export function TrackerMountPanel({
           disabled={
             disabled ||
             chainPicked.length === 0 ||
-            (chainMode === "lever-arm" && (!stationPath || chainPicked.length !== 1))
+            (chainMode !== "station" && !stationPath) ||
+            (chainMode === "pivot" && !pivotCube)
           }
           onClick={onChain}
         >
-          {running !== "" ? "解算中…" : chainGt ? "解算 + GT 比较" : "解算"}
+          {running !== "" ? "解算中…" : chainGt && chainMode !== "pivot" ? "解算 + GT 比较" : "解算"}
         </button>
 
         <p className="cali-muted">
@@ -1188,6 +1274,9 @@ export function TrackerMountPanel({
       )}
       {chainResult?.fit?.kind === "station" && chainResult.fit.report && (
         <StationNumbers report={chainResult.fit.report as TrackerStationReport} />
+      )}
+      {chainResult?.fit?.kind === "pivot" && chainResult.fit.report && (
+        <TrackerPivotResult report={chainResult.fit.report as TrackerPivotReport} />
       )}
       <ValidateResult result={chainResult?.validate ?? gtResult} />
 

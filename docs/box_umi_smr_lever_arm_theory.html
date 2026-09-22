@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCP 位置认证原理</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&family=STIX+Two+Text:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F3F5F8; --surface:#FFFFFF; --ink:#18202C; --ink-2:#394455; --muted:#667085;
+  --rule:#D7DDE7; --soft:#E9EDF3;
+  --cam:#1D62B0; --cam-soft:#E2ECF8;
+  --trk:#C22A36; --trk-soft:#FAE6E8;
+  --warn:#8A5300; --warn-soft:#FDF1DA;
+  --ok:#1E7A4B; --ok-soft:#E1F3E9;
+  --focus:#1D62B0;
+  --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --serif:"Noto Serif SC","Songti SC","SimSun",serif;
+  --math:"STIX Two Text","Times New Roman",serif;
+  --mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E1218; --surface:#161B23; --ink:#E6EAF0; --ink-2:#C2C9D4; --muted:#8D97A7;
+    --rule:#2B333F; --soft:#1C232D;
+    --cam:#6EB0F4; --cam-soft:#15263B;
+    --trk:#FF6F79; --trk-soft:#361A1E;
+    --warn:#F2B650; --warn-soft:#2E2514;
+    --ok:#5ACB8C; --ok-soft:#14291D;
+    --focus:#6EB0F4;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E1218; --surface:#161B23; --ink:#E6EAF0; --ink-2:#C2C9D4; --muted:#8D97A7;
+  --rule:#2B333F; --soft:#1C232D;
+  --cam:#6EB0F4; --cam-soft:#15263B;
+  --trk:#FF6F79; --trk-soft:#361A1E;
+  --warn:#F2B650; --warn-soft:#2E2514;
+  --ok:#5ACB8C; --ok-soft:#14291D;
+  --focus:#6EB0F4;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--bg); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.85;
+  padding-inline:16px; padding-block:0 64px; margin:0;
+}
+.wrap{max-width:1080px; margin:0 auto; display:grid; grid-template-columns:1fr; gap:48px}
+@media (min-width:1040px){
+  .wrap{grid-template-columns:200px minmax(0,720px); justify-content:center}
+}
+
+/* ---------- header ---------- */
+header.masthead{padding-block:48px 12px; margin-bottom:28px}
+.eyebrow{font-size:13px; letter-spacing:.12em; color:var(--muted); font-weight:500}
+.eyebrow .dot{display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--trk); margin-right:8px; vertical-align:1px}
+h1{
+  font-family:var(--serif); font-weight:700; font-size:clamp(28px,4.6vw,40px); line-height:1.3;
+  margin:14px 0 12px; text-wrap:balance; letter-spacing:.01em;
+}
+.lede{font-size:17.5px; color:var(--ink-2); margin:0; max-width:40em}
+.meta{margin-top:18px; display:flex; flex-wrap:wrap; gap:8px 20px; font-size:13.5px; color:var(--muted)}
+.legend{display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:14px; font-size:13.5px; color:var(--ink-2)}
+.legend span{display:inline-flex; align-items:center; gap:7px}
+.sw{width:18px; height:3px; border-radius:2px; display:inline-block}
+.sw.cam{background:var(--cam)} .sw.trk{background:var(--trk)} .sw.unk{background:var(--ink); height:3px}
+
+/* ---------- toc ---------- */
+nav.toc{display:none}
+@media (min-width:1040px){
+  nav.toc{display:block; position:sticky; top:calc(env(safe-area-inset-top,0px) + 28px); margin-top:56px; align-self:start; font-size:13.5px; line-height:1.6}
+  nav.toc .t{font-size:12px; letter-spacing:.12em; color:var(--muted); margin-bottom:10px}
+  nav.toc ol{list-style:none; margin:0; padding:0; display:grid; gap:7px}
+  nav.toc a{color:var(--ink-2); text-decoration:none; display:grid; grid-template-columns:22px 1fr}
+  nav.toc a:hover{color:var(--cam)}
+  nav.toc a .n{color:var(--muted); font-variant-numeric:tabular-nums}
+}
+
+/* ---------- article ---------- */
+article{min-width:0}
+section{padding-top:8px; margin-top:44px}
+section:first-child{margin-top:0}
+h2{
+  font-family:var(--serif); font-weight:700; font-size:24px; line-height:1.4; margin:0 0 14px;
+  text-wrap:balance; display:flex; gap:12px; align-items:baseline;
+}
+h2 .n{font-family:var(--math); font-weight:600; color:var(--muted); font-size:22px; min-width:1.2em}
+h3{font-size:17px; font-weight:700; margin:28px 0 8px; text-wrap:balance}
+p{margin:0 0 14px}
+ul,ol{margin:0 0 14px; padding-left:1.4em}
+li{margin:4px 0}
+a{color:var(--cam)}
+strong{font-weight:700}
+.muted{color:var(--muted)}
+code,.code{font-family:var(--mono); font-size:.86em; background:var(--soft); padding:.08em .38em; border-radius:4px; white-space:nowrap}
+
+/* math */
+.m{font-family:var(--math); font-size:1.08em; white-space:nowrap}
+.m i{font-style:italic}
+.m b{font-weight:600; font-style:italic}
+.m sub,.m sup{font-size:.72em; line-height:0}
+.m sub{vertical-align:-.28em} .m sup{vertical-align:.5em}
+.m .up{font-style:normal}
+.eq{
+  display:grid; grid-template-columns:1fr auto; align-items:center; gap:12px;
+  margin:18px 0 20px; padding:14px 0;
+  border-top:1px solid var(--rule); border-bottom:1px solid var(--rule);
+  overflow-x:auto;
+}
+.eq .body{font-family:var(--math); font-size:19px; text-align:center; white-space:nowrap; line-height:1.9}
+.eq .body i{font-style:italic} .eq .body b{font-weight:600; font-style:italic}
+.eq .body sub,.eq .body sup{font-size:.7em; line-height:0}
+.eq .body sub{vertical-align:-.3em} .eq .body sup{vertical-align:.5em}
+.eq .body .gap{display:inline-block; width:1.6em}
+.eq .body .note{font-family:var(--sans); font-size:13.5px; color:var(--muted); margin-left:1.2em; font-style:normal}
+.eq .num{font-family:var(--math); color:var(--muted); font-size:16px}
+.eq .stack{display:inline-grid; gap:4px; text-align:left}
+.cam{color:var(--cam)} .trk{color:var(--trk)}
+
+/* abstract */
+.abstract{
+  background:var(--surface); border:1px solid var(--rule); border-radius:10px;
+  padding:22px 24px 10px; margin:4px 0 0;
+}
+.abstract .t{font-size:12.5px; letter-spacing:.14em; color:var(--muted); margin-bottom:8px}
+.abstract ol{padding-left:1.3em; margin:0 0 12px}
+.abstract li{margin:7px 0}
+
+/* asides */
+.aside{background:var(--soft); border-radius:8px; padding:14px 18px 4px; margin:18px 0}
+.aside .k{font-size:12.5px; letter-spacing:.12em; color:var(--muted); font-weight:500; margin-bottom:4px}
+.aside.warn{background:var(--warn-soft)}
+.aside.warn .k{color:var(--warn)}
+
+/* figures */
+figure{margin:26px 0}
+figure .frame{background:var(--surface); border:1px solid var(--rule); border-radius:10px; padding:12px; overflow-x:auto}
+figure svg{display:block; width:100%; height:auto; min-width:0}
+figcaption{font-size:13.5px; color:var(--muted); margin-top:10px; line-height:1.7}
+figcaption b{color:var(--ink-2); font-weight:700}
+svg text{font-family:var(--sans)}
+svg .mt{font-family:var(--math); font-style:italic}
+.s-ink{stroke:var(--ink)} .s-cam{stroke:var(--cam)} .s-trk{stroke:var(--trk)} .s-mut{stroke:var(--muted)} .s-rule{stroke:var(--rule)}
+.f-ink{fill:var(--ink)} .f-cam{fill:var(--cam)} .f-trk{fill:var(--trk)} .f-mut{fill:var(--muted)} .f-srf{fill:var(--surface)} .f-soft{fill:var(--soft)} .f-bg{fill:var(--bg)} .f-none{fill:none}
+.f-camsoft{fill:var(--cam-soft)} .f-trksoft{fill:var(--trk-soft)}
+
+/* tables */
+.tbl{overflow-x:auto; margin:16px 0 20px; border:1px solid var(--rule); border-radius:10px; background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:14.5px; line-height:1.65}
+th,td{padding:10px 14px; text-align:left; vertical-align:top; border-bottom:1px solid var(--rule)}
+tr:last-child td{border-bottom:none}
+th{font-weight:700; font-size:13px; color:var(--muted); letter-spacing:.04em; background:var(--soft)}
+td .m{font-size:1.02em}
+.pill{display:inline-block; font-size:12.5px; font-weight:500; padding:1px 9px; border-radius:999px; white-space:nowrap}
+.pill.bad{background:var(--trk-soft); color:var(--trk)}
+.pill.good{background:var(--ok-soft); color:var(--ok)}
+.pill.mid{background:var(--warn-soft); color:var(--warn)}
+
+/* algorithm */
+pre.algo{
+  font-family:var(--mono); font-size:13.5px; line-height:1.75; background:var(--surface);
+  border:1px solid var(--rule); border-radius:10px; padding:16px 18px; overflow-x:auto; margin:16px 0 20px; color:var(--ink);
+}
+pre.algo .c{color:var(--muted)}
+pre.algo .kw{color:var(--cam); font-weight:500}
+
+/* calculator */
+.calc{background:var(--surface); border:1px solid var(--rule); border-radius:10px; padding:18px 20px; margin:22px 0}
+.calc .hd{display:flex; flex-wrap:wrap; justify-content:space-between; gap:6px 16px; align-items:baseline; margin-bottom:12px}
+.calc .hd .t{font-weight:700}
+.calc .hd .s{font-size:13px; color:var(--muted)}
+.ctrls{display:grid; grid-template-columns:1fr; gap:12px 28px}
+@media (min-width:640px){ .ctrls{grid-template-columns:1fr 1fr} }
+.ctrl label{display:flex; justify-content:space-between; gap:12px; font-size:14px; color:var(--ink-2)}
+.ctrl label output{font-family:var(--mono); font-size:13.5px; color:var(--ink); font-variant-numeric:tabular-nums}
+.ctrl input[type=range]{width:100%; accent-color:var(--cam); margin:6px 0 0}
+input[type=range]:focus-visible{outline:2px solid var(--focus); outline-offset:3px; border-radius:4px}
+.readout{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--rule); border:1px solid var(--rule); border-radius:8px; overflow:hidden; margin-top:16px}
+@media (min-width:640px){ .readout{grid-template-columns:repeat(4,minmax(0,1fr))} }
+.readout div{background:var(--surface); padding:10px 12px}
+.readout .k{font-size:12.5px; color:var(--muted); line-height:1.5}
+.readout .v{font-family:var(--mono); font-size:18px; font-variant-numeric:tabular-nums; margin-top:2px}
+.verdict{margin-top:12px; font-size:14px; display:flex; gap:10px; align-items:baseline; flex-wrap:wrap}
+
+/* checklist */
+.check{list-style:none; padding:0; display:grid; gap:10px}
+.check li{display:grid; grid-template-columns:22px 1fr; gap:8px; margin:0}
+.check li::before{content:""; width:14px; height:14px; border:1.5px solid var(--muted); border-radius:3px; margin-top:.42em}
+.check .ref{font-size:13px; color:var(--muted); white-space:nowrap}
+
+footer{margin-top:48px; font-size:13px; color:var(--muted); border-top:1px solid var(--rule); padding-top:16px}
+@media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto!important} }
+html{scroll-behavior:smooth}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="目录">
+  <div class="t">目录</div>
+  <ol>
+    <li><a href="#abstract"><span class="n">·</span>摘要</a></li>
+    <li><a href="#s1"><span class="n">1</span>目标：只需要平移</a></li>
+    <li><a href="#s2"><span class="n">2</span>两台仪器，一个点</a></li>
+    <li><a href="#s3"><span class="n">3</span>为什么要静止</a></li>
+    <li><a href="#s4"><span class="n">4</span>什么时候解得出</a></li>
+    <li><a href="#s5"><span class="n">5</span>怎么解</a></li>
+    <li><a href="#s6"><span class="n">6</span>冻结站位，只解 c</a></li>
+    <li><a href="#s7"><span class="n">7</span>能信到什么程度</a></li>
+    <li><a href="#s8"><span class="n">8</span>c 会吸收什么</a></li>
+    <li><a href="#s9"><span class="n">9</span>在 TCP 处直接测</a></li>
+    <li><a href="#s10"><span class="n">10</span>动态部分与转移项</a></li>
+    <li><a href="#s11"><span class="n">11</span>3 mm 怎么拼出来</a></li>
+    <li><a href="#s12"><span class="n">12</span>采集口径</a></li>
+    <li><a href="#sym"><span class="n">·</span>符号表</a></li>
+  </ol>
+</nav>
+<article>
+<header class="masthead">
+  <div class="eyebrow"><span class="dot" aria-hidden="true"></span>激光跟踪仪 GT 链 · 技术报告 · 理论篇</div>
+  <h1>用激光跟踪仪认证 TCP 位置 3 mm</h1>
+  <p class="lede">目标是生产标签里 TCP 位置的误差不超过 3 mm。本文从测量模型讲起：怎么从静止片段求出 SMR 杠杆臂，为什么球心上的残差不能直接当成 TCP 的误差，以及怎样用一次跟踪仪 pivot 在 TCP 处直接测出最大的那一项。整条路径都不需要测旋转。</p>
+  <div class="meta"><span>v2 · 2026-09-22</span><span>只讲原理，不含实验数据</span></div>
+  <div class="legend" aria-label="图例">
+    <span><i class="sw cam" aria-hidden="true"></i>相机侧测量</span>
+    <span><i class="sw trk" aria-hidden="true"></i>跟踪仪侧测量</span>
+    <span><i class="sw unk" aria-hidden="true"></i>待求未知量</span>
+  </div>
+</header>
+
+<section id="abstract">
+  <div class="abstract">
+    <div class="t">摘要</div>
+    <ol>
+      <li>TCP 位置由 cube 位姿和一个 3 维常量 <span class="m"><b>c</b><sub>TCP</sub></span>（TCP 在 cube 系里的坐标）算出，TCP 的姿态不参与。所以“只认位置”时，要认证的是 <span class="m"><b>c</b><sub>TCP</sub></span> 和相机位姿序列，不需要任何旋转真值。</li>
+      <li>TCP 位置误差分三部分：常量（<span class="m"><b>c</b><sub>TCP</sub></span> 本身错了）、静态随姿态变化的部分、运动带来的动态增量。三部分由不同的实验测。</li>
+      <li>SMR 常驻夹爪钢片，跟踪仪只测得到它的球心。先用 15–20 个静止片段解出跟踪仪站位 <span class="m"><i>T</i><sub>WG</sub></span> 和 SMR 在 cube 系中的位置 <span class="m"><b>c</b></span>，共 9 个未知量。静止让时间从问题里消失。</li>
+      <li>解不解得出看转角，不看方程数：必须绕两根不平行的轴转。解法是交替最小二乘，两步都有闭式解；站位冻结后只解 <span class="m"><b>c</b></span>，线性、不需要转角，精度约好 4 倍。</li>
+      <li><span class="m"><b>c</b></span> 是拟合量，会吸收所有“在 cube 系里恒定”的相机误差。因此球心上的残差说明不了 <span class="m"><b>c</b><sub>TCP</sub></span> 对不对，也就是说明不了 TCP 位置的常量部分。</li>
+      <li>补上这一项的办法是<strong>跟踪仪 pivot</strong>：TCP 卡在球窝里转，钢片上的球心画出一个以球窝为中心的球面，跟踪仪单独定出球窝中心，再和生产标签逐位姿比较。<span class="m"><b>c</b><sub>TCP</sub></span> 不拟合、原样代入，常量和静态姿态相关误差都直接在 TCP 处测到。</li>
+      <li>动态部分从动态轨迹场的球心残差里拿，再加一个“运动时姿态误差 × 球心到 TCP 距离”的转移项。三窝 AX=XB 和 STS 只在认证 TCP 姿态时才需要，不在 3 mm 位置目标的路径上。</li>
+    </ol>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="n">1</span>目标：TCP 位置 3 mm，只需要平移</h2>
+  <p>目标是生产标签里 TCP 位置的误差不超过 3 mm（按 GT 链预算的 p95 口径），GT 链自身的误差要压在 1 mm 以内，才有资格裁决 3 mm。</p>
+  <p>生产管线这样算 TCP 位置：</p>
+  <div class="eq" role="math" aria-label="p_TCP,i 等于 R_i c_TCP 加 t_i">
+    <div class="body"><b>p</b><sub>TCP,<i>i</i></sub> = <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b><sub>TCP</sub> + <span class="cam"><b>t</b><sub><i>i</i></sub></span><span class="note">cube 位姿接上 TCP 在 cube 系里的坐标</span></div>
+    <div class="num">(1)</div>
+  </div>
+  <p><span class="m"><b>c</b><sub>TCP</sub></span> 是 3 个数，来自 marker → TCP 标定。TCP 的姿态不出现在式 (1) 里，所以标定结果里的旋转，只通过它对 <span class="m"><b>c</b><sub>TCP</sub></span> 的影响起作用。例如“标定旋转偏 2°、乘两百多毫米力臂、约 9 mm”那一项，在位置口径下就是 <span class="m"><b>c</b><sub>TCP</sub></span> 的一个误差来源。于是只认位置时，要认证的只有两样：<span class="m"><b>c</b><sub>TCP</sub></span> 和相机位姿序列 <span class="m">(<i>R</i><sub><i>i</i></sub>, <b>t</b><sub><i>i</i></sub>)</span>。两样都不需要旋转的真值。</p>
+  <p>但相机的旋转误差并没有因此变得无关：旋转错 <span class="m"><i>δθ</i></span>，TCP 就偏 <span class="m"><i>δθ</i> × <b>c</b><sub>TCP</sub></span>。它是一个位置误差，只是经力臂放大后进来的。所以 TCP 位置误差按来源分成三部分：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>部分</th><th>典型来源</th><th>由哪个实验测</th></tr></thead>
+    <tbody>
+      <tr><td><strong>常量</strong><br><span class="muted">每个位姿都一样（cube 系里）</span></td><td><span class="m"><b>c</b><sub>TCP</sub></span> 本身错了：pivot 平移误差、从另一侧拷贝、标定旋转 × 力臂</td><td>跟踪仪 pivot，§9</td></tr>
+      <tr><td><strong>静态、随姿态</strong><br><span class="muted">静止时就有</span></td><td>相机平移误差；相机旋转误差 × <span class="m">|<b>c</b><sub>TCP</sub>|</span>；可见相机组合变化</td><td>跟踪仪 pivot，与常量部分一起直接测，§9</td></tr>
+      <tr><td><strong>动态增量</strong><br><span class="muted">只在运动时出现</span></td><td>时钟偏差 <span class="m">|<b>v</b>|·Δ<i>t</i></span>、运动模糊、平滑器</td><td>动态轨迹场（球心）+ 转移项，§10</td></tr>
+    </tbody>
+  </table></div>
+  <p>三个实验共用一样东西：跟踪仪站位 <span class="m"><i>T</i><sub>WG</sub></span>。它和钢片上 SMR 的杠杆臂 <span class="m"><b>c</b></span>，都从 15–20 个静止片段里解出来，这就是 §2–§8 的内容。§9–§11 再讲怎么从球心走到 TCP，以及 3 mm 怎么拼出来。</p>
+</section>
+
+<section id="s2">
+  <h2><span class="n">2</span>两台仪器，一个点</h2>
+  <p><strong class="trk">跟踪仪给的是一个点。</strong>SMR 是装在钢球里的角锥棱镜，激光打进去沿原路返回，跟踪仪由此以 1 kHz 测出球心的三维坐标 <span class="m"><b>p</b></span>，表达在跟踪仪自己的坐标系 G 中。不论球怎么转，回光都一样，所以跟踪仪对姿态完全看不见。</p>
+  <p><strong class="cam">相机给的是一个位姿。</strong>多路相机看 cube 上的 AprilTag，解出 cube 坐标系 B 在相机 world 系 W 中的位姿 <span class="m">(<i>R</i>, <b>t</b>)</span>，6 个自由度，约 60 fps。</p>
+  <p>SMR 经磁吸窝固定在夹爪本体的钢片上，与 cube 构成刚体。于是在 cube 系里，球心的位置是一个常量，记作 <span class="m"><b>c</b></span>。这就是要求的“SMR 到 cube 中心的变换”。严格地说它只有平移：给一个点定义姿态没有意义，非要写成 4×4 矩阵，就是旋转取单位阵、平移取 <span class="m"><b>c</b></span>，旋转部分怎么取都不影响任何结果。</p>
+
+  <h3>同一个球心，两种说法</h3>
+  <p>在第 <span class="m"><i>i</i></span> 个静止位姿上，两台仪器各自说出球心在 world 系中的位置：</p>
+  <div class="eq" role="math" aria-label="相机：p hat 等于 R_i c 加 t_i；跟踪仪：p 等于 R_WG p_i 加 t_WG">
+    <div class="body"><span class="stack">
+      <span><span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b> + <span class="cam"><b>t</b><sub><i>i</i></sub></span><span class="note">相机说：cube 位姿把 <span class="m"><b>c</b></span> 搬进 W</span></span>
+      <span><i>R</i><sub>WG</sub> <span class="trk"><b>p</b><sub><i>i</i></sub></span> + <b>t</b><sub>WG</sub><span class="note">跟踪仪说：站位把 <span class="m"><b>p</b></span> 搬进 W</span></span>
+    </span></div>
+    <div class="num">(2)</div>
+  </div>
+  <p>两者说的是同一个球心，所以对每个位姿都应相等：</p>
+  <div class="eq" role="math" aria-label="R_WG p_i 加 t_WG 等于 R_i c 加 t_i，i 从 1 到 N">
+    <div class="body"><i>R</i><sub>WG</sub> <span class="trk"><b>p</b><sub><i>i</i></sub></span> + <b>t</b><sub>WG</sub> = <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b> + <span class="cam"><b>t</b><sub><i>i</i></sub></span><span class="gap"></span><i>i</i> = 1, …, <i>N</i></div>
+    <div class="num">(3)</div>
+  </div>
+  <p>黑色的是未知量：<span class="m"><b>c</b></span> 3 个，站位 <span class="m"><i>T</i><sub>WG</sub> = (<i>R</i><sub>WG</sub>, <b>t</b><sub>WG</sub>)</span> 6 个，共 9 个。我们本来只关心 <span class="m"><b>c</b></span>，但站位绕不开：两台仪器各说各的坐标系，不先把它们对上，<span class="m"><b>c</b></span> 就无从谈起。式 (3) 是求杠杆臂的出发点。</p>
+
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 680 320" role="img" aria-labelledby="f1t">
+        <title id="f1t">测量几何：相机测 cube 位姿，跟踪仪测球心，c 与站位 T_WG 是未知量</title>
+        <defs>
+          <marker id="ah-cam" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-cam"/></marker>
+          <marker id="ah-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-ink"/></marker>
+          <marker id="ah-trk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-trk"/></marker>
+          <marker id="ah-mut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-mut"/></marker>
+        </defs>
+        <!-- W frame -->
+        <g transform="translate(80,200)">
+          <line x1="0" y1="0" x2="46" y2="0" class="s-mut" stroke-width="1.6" marker-end="url(#ah-mut)"/>
+          <line x1="0" y1="0" x2="0" y2="-46" class="s-mut" stroke-width="1.6" marker-end="url(#ah-mut)"/>
+          <circle cx="0" cy="0" r="3.5" class="f-cam"/>
+          <text x="-22" y="30" font-size="14" class="f-cam" font-weight="700">W</text>
+          <text x="-22" y="48" font-size="12.5" class="f-mut">相机 world 系</text>
+        </g>
+        <!-- G frame + tracker -->
+        <g transform="translate(600,200)">
+          <line x1="0" y1="0" x2="-46" y2="0" class="s-mut" stroke-width="1.6" marker-end="url(#ah-mut)"/>
+          <line x1="0" y1="0" x2="0" y2="-46" class="s-mut" stroke-width="1.6" marker-end="url(#ah-mut)"/>
+          <rect x="-14" y="-14" width="28" height="28" rx="4" class="f-trksoft s-trk" stroke-width="1.5"/>
+          <circle cx="0" cy="0" r="3.5" class="f-trk"/>
+          <text x="-4" y="34" font-size="14" class="f-trk" font-weight="700">G</text>
+          <text x="-44" y="52" font-size="12.5" class="f-mut">跟踪仪系</text>
+        </g>
+        <!-- cube body -->
+        <g transform="translate(300,130) rotate(-12)">
+          <rect x="-44" y="-44" width="88" height="88" rx="6" class="f-camsoft s-cam" stroke-width="1.6"/>
+          <rect x="-26" y="-26" width="52" height="52" class="f-none s-cam" stroke-width="1.2" stroke-dasharray="3 3"/>
+          <line x1="0" y1="0" x2="30" y2="0" class="s-cam" stroke-width="1.4"/>
+          <line x1="0" y1="0" x2="0" y2="-30" class="s-cam" stroke-width="1.4"/>
+          <circle cx="0" cy="0" r="3.5" class="f-cam"/>
+          <!-- plate to SMR -->
+          <line x1="44" y1="-18" x2="104" y2="-40" class="s-mut" stroke-width="5" stroke-linecap="round"/>
+        </g>
+        <text x="226" y="214" font-size="13" class="f-cam" font-weight="700">B</text>
+        <text x="242" y="214" font-size="12.5" class="f-mut">cube 系（原点 = cube 中心）</text>
+        <!-- SMR -->
+        <circle cx="404" cy="80" r="15" class="f-srf s-trk" stroke-width="2"/>
+        <circle cx="404" cy="80" r="3" class="f-trk"/>
+        <text x="424" y="62" font-size="12.5" class="f-trk" font-weight="700">SMR 球心</text>
+        <!-- c vector -->
+        <line x1="300" y1="130" x2="398" y2="84" class="s-ink" stroke-width="2.4" marker-end="url(#ah-ink)"/>
+        <text x="330" y="96" font-size="17" class="f-ink mt" font-weight="600">c</text>
+        <!-- camera measurement W -> B -->
+        <path d="M86,196 C150,172 230,152 294,133" class="f-none s-cam" stroke-width="2" marker-end="url(#ah-cam)"/>
+        <text x="118" y="146" font-size="15" class="f-cam mt">R<tspan font-size="11" dy="4">i</tspan><tspan dy="-4">, t</tspan><tspan font-size="11" dy="4">i</tspan></text>
+        <text x="118" y="164" font-size="12" class="f-mut">相机测</text>
+        <!-- laser G -> SMR -->
+        <line x1="592" y1="192" x2="416" y2="90" class="s-trk" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#ah-trk)"/>
+        <text x="512" y="126" font-size="15" class="f-trk mt">p<tspan font-size="11" dy="4">i</tspan></text>
+        <text x="528" y="126" font-size="12" class="f-mut">跟踪仪测（激光）</text>
+        <!-- T_WG -->
+        <path d="M80,264 C220,310 460,310 600,264" class="f-none s-ink" stroke-width="1.8" stroke-dasharray="2 5" stroke-linecap="round" marker-end="url(#ah-ink)"/>
+        <text x="296" y="284" font-size="15" class="f-ink mt">T<tspan font-size="11" dy="4">WG</tspan></text>
+        <text x="326" y="284" font-size="12" class="f-mut">站位（未知）</text>
+      </svg>
+    </div>
+    <figcaption><b>图 1　测量几何。</b>蓝色路径（相机位姿接上 <span class="m"><b>c</b></span>）和红色路径（跟踪仪读数接上站位）必须落到同一个球心上，这就是式 (3)。图中的“cube 中心”指 cube 位姿所用坐标系 B 的原点；换一个 cube 模型（原点、边长、marker 表），<span class="m"><b>c</b></span> 就要重新拟合。</figcaption>
+  </figure>
+</section>
+
+<section id="s3">
+  <h2><span class="n">3</span>为什么要静止</h2>
+  <h3>静止让时间从问题里消失</h3>
+  <p>式 (3) 里没有时间。运动时情况不同：跟踪仪用控制器的钟打时间戳，相机用 Thor 的 <code>CLOCK_MONOTONIC</code>，两者差 <span class="m">Δ<i>t</i></span> 就会在残差里留下 <span class="m">|<b>v</b>|·Δ<i>t</i></span>，1 m/s 下差 5 ms 就是 5 mm。静止时 <span class="m"><b>v</b> = 0</span>，这一项恒为零，时钟对齐的问题整个从注册里拿掉了。驻点集只需要知道“哪些相机帧和哪些跟踪仪样本属于同一个驻点”，精度到段级就够。</p>
+
+  <h3>一个驻点，平均成一行</h3>
+  <p>2 秒的驻点里，跟踪仪约有 2000 个样本，相机约 120 帧。各自平均成一个数：</p>
+  <ul>
+    <li><span class="m trk"><b>p</b><sub><i>i</i></sub></span>：跟踪仪样本的算术平均。随机误差按 <span class="m"><i>σ</i>/√<i>N</i></span> 下降，2000 个样本约缩小 45 倍，只剩微米量级。</li>
+    <li><span class="m cam"><b>t</b><sub><i>i</i></sub></span>：相机平移的算术平均。</li>
+    <li><span class="m cam"><i>R</i><sub><i>i</i></sub></span>：相机旋转的<strong>弦平均</strong>。先把旋转矩阵逐元素相加取平均，再用 SVD 投影回最近的旋转矩阵（<span class="m"><i>M</i> = <i>U</i>Σ<i>V</i><sup>⊤</sup> → <i>UV</i><sup>⊤</sup></span>，行列式为负时翻转最后一列）。直接平均出来的矩阵不是旋转。驻点内姿态几乎不变，弦平均和测地平均的差别可以忽略。</li>
+  </ul>
+  <p>平均只能消掉抖动，消不掉偏差。相机若在某个姿态下系统性地偏 1 mm，平均 120 帧后还是偏 1 mm。这正是后面要测的东西。</p>
+
+  <h3>由谁判断“静止了”</h3>
+  <p>用跟踪仪判，不用相机。跟踪仪 1 kHz、微米级，它判断“动没动”不依赖注册、不依赖时钟链，也不依赖被检验的相机管线，判据不落在被判的东西身上。三个细节：</p>
+  <ol>
+    <li><strong>速度按 50 ms 窗口算，不按相邻样本差分。</strong>1 kHz 下相邻差分等于把几微米的噪声除以 1 ms，得到每秒几毫米，静止的球永远像在动。改成“窗口内位移 ÷ 窗口时长”，阈值 2 mm/s 才有它字面上的意思。</li>
+    <li><strong>两端各剪掉 0.3 s。</strong>刚停下时的回稳和准备离开时的起步都慢到能过阈值，但都不是这个位姿。剪完后至少剩 2.0 s 才算一个驻点，所以每段实际要静止 ≥ 2.6 s。操作上建议停 3.5–4 s。</li>
+    <li><strong>晃动和漂移分开对待。</strong>span 是驻点内各样本到均值距离的极差，代表来回晃，属于振荡，能被平均掉，门槛放宽到 0.30 mm。drift 是后三分之一均值相对前三分之一均值的净位移，属于偏置，平均不掉，门槛更紧，为 0.15 mm。同时要求驻点里至少有 30 帧相机数据。</li>
+  </ol>
+
+  <h3>15 段是一个集合，不是 15 个</h3>
+  <p>一段录一个位姿，段的边界就是驻点的边界。15 段来自同一次安装（同一个 <code>mount_id</code>），共享同一个 <span class="m"><b>c</b></span>，所以它们合成<strong>一个</strong>集合进入拟合。这不是记账细节：下一节的可观测性靠同一集合内的位姿两两相减，如果把 15 段当成 15 个单位姿集合，就一对也凑不出来，转角再大也会被判成“没有转动”。</p>
+</section>
+
+<section id="s4">
+  <h2><span class="n">4</span>什么时候解得出</h2>
+  <p>按方程计数，15 个位姿 × 3 = 45 个方程，9 个未知量，看起来绰绰有余。但方程数从来不是问题所在。把式 (3) 对两个位姿相减，<span class="m"><b>t</b><sub>WG</sub></span> 被消掉：</p>
+  <div class="eq" role="math" aria-label="(R_i 减 R_j) c 等于 R_WG (p_i 减 p_j) 减 (t_i 减 t_j)">
+    <div class="body">(<span class="cam"><i>R</i><sub><i>i</i></sub></span> − <span class="cam"><i>R</i><sub><i>j</i></sub></span>) <b>c</b> = <i>R</i><sub>WG</sub> (<span class="trk"><b>p</b><sub><i>i</i></sub></span> − <span class="trk"><b>p</b><sub><i>j</i></sub></span>) − (<span class="cam"><b>t</b><sub><i>i</i></sub></span> − <span class="cam"><b>t</b><sub><i>j</i></sub></span>)</div>
+    <div class="num">(4)</div>
+  </div>
+  <p>左边是关于 <span class="m"><b>c</b></span> 的全部信息，而它被 <span class="m"><i>R</i><sub><i>i</i></sub> − <i>R</i><sub><i>j</i></sub></span> 乘着。</p>
+
+  <div class="aside">
+    <div class="k">直觉 · 纯平移为什么没用</div>
+    <p>假设 15 个位姿姿态完全相同，都是 <span class="m"><i>R</i></span>。把 <span class="m"><b>c</b></span> 换成 <span class="m"><b>c</b> + <b>δ</b></span>，同时把 <span class="m"><b>t</b><sub>WG</sub></span> 换成 <span class="m"><b>t</b><sub>WG</sub> + <i>R</i><b>δ</b></span>，式 (3) 两边同时多出 <span class="m"><i>R</i><b>δ</b></span>，每个方程照样成立。<span class="m"><b>c</b></span> 和 <span class="m"><b>t</b><sub>WG</sub></span> 其实是同一个未知量的两个名字，数据分不开它们。</p>
+  </div>
+
+  <p><strong>只绕一根轴也不够。</strong>绕单位轴 <span class="m"><b>n</b></span> 转角 <span class="m"><i>θ</i></span> 时，<span class="m"><i>R</i> − <i>I</i></span> 的三个奇异值是 <span class="m">2 sin(<i>θ</i>/2)</span>、<span class="m">2 sin(<i>θ</i>/2)</span>、<span class="m">0</span>，零对应的方向正是 <span class="m"><b>n</b></span>。几何上看，cube 绕 <span class="m"><b>n</b></span> 转，球心在垂直于 <span class="m"><b>n</b></span> 的平面里画圆弧，沿 <span class="m"><b>n</b></span> 的分量纹丝不动，所以 <span class="m"><b>c</b></span> 沿转轴的那一分量看不见。结论：<strong>必须绕至少两根不平行的轴转动</strong>。这和手眼标定 <span class="m"><i>AX</i> = <i>XB</i></span> 要求的条件同源。</p>
+
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 680 270" role="img" aria-labelledby="f2t">
+        <title id="f2t">纯平移时 c 的误差是一个处处相同的平移，被站位吸收；转动时它随姿态改变方向，无法被吸收</title>
+        <defs>
+          <marker id="bh-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-ink"/></marker>
+        </defs>
+        <text x="20" y="28" font-size="14" font-weight="700" class="f-ink">(a) 纯平移</text>
+        <text x="360" y="28" font-size="14" font-weight="700" class="f-ink">(b) 绕 cube 中心转动</text>
+        <line x1="340" y1="44" x2="340" y2="250" class="s-rule" stroke-width="1"/>
+        <!-- (a) two translated cubes -->
+        <g>
+          <rect x="44" y="120" width="70" height="70" rx="5" class="f-camsoft s-cam" stroke-width="1.5"/>
+          <circle cx="79" cy="155" r="3" class="f-cam"/>
+          <circle cx="140" cy="100" r="9" class="f-srf s-trk" stroke-width="1.8"/>
+          <circle cx="160" cy="86" r="9" class="f-none s-ink" stroke-width="1.4" stroke-dasharray="3 3"/>
+          <line x1="143" y1="98" x2="155" y2="90" class="s-ink" stroke-width="1.6" marker-end="url(#bh-ink)"/>
+
+          <rect x="184" y="150" width="70" height="70" rx="5" class="f-camsoft s-cam" stroke-width="1.5"/>
+          <circle cx="219" cy="185" r="3" class="f-cam"/>
+          <circle cx="280" cy="130" r="9" class="f-srf s-trk" stroke-width="1.8"/>
+          <circle cx="300" cy="116" r="9" class="f-none s-ink" stroke-width="1.4" stroke-dasharray="3 3"/>
+          <line x1="283" y1="128" x2="295" y2="120" class="s-ink" stroke-width="1.6" marker-end="url(#bh-ink)"/>
+          <text x="162" y="72" font-size="14" class="f-ink mt">Rδ</text>
+          <text x="302" y="104" font-size="14" class="f-ink mt">Rδ</text>
+          <text x="20" y="244" font-size="12.5" class="f-mut">每个位姿都偏同一个向量 → 一个常量平移</text>
+          <text x="20" y="262" font-size="12.5" class="f-mut">站位 t<tspan font-size="9" dy="3">WG</tspan><tspan dy="-3"> 顺手吃掉，残差为零，c 定不下来</tspan></text>
+        </g>
+        <!-- (b) rotated cubes about common center -->
+        <g>
+          <g transform="translate(470,160) rotate(-28)">
+            <rect x="-35" y="-35" width="70" height="70" rx="5" class="f-none s-cam" stroke-width="1.2" opacity=".55"/>
+          </g>
+          <g transform="translate(470,160) rotate(0)">
+            <rect x="-35" y="-35" width="70" height="70" rx="5" class="f-none s-cam" stroke-width="1.2" opacity=".55"/>
+          </g>
+          <g transform="translate(470,160) rotate(28)">
+            <rect x="-35" y="-35" width="70" height="70" rx="5" class="f-camsoft s-cam" stroke-width="1.5"/>
+          </g>
+          <circle cx="470" cy="160" r="3" class="f-cam"/>
+          <!-- c = (70,-60) from the centre, rotated by -28 / 0 / +28 deg; |c| = 92.2 -->
+          <path d="M 503.6 74.2 A 92.2 92.2 0 0 1 560 139.9" class="f-none s-mut" stroke-width="1" stroke-dasharray="2 4"/>
+          <circle cx="503.6" cy="74.1" r="9" class="f-srf s-trk" stroke-width="1.8"/>
+          <circle cx="540" cy="100" r="9" class="f-srf s-trk" stroke-width="1.8"/>
+          <circle cx="560" cy="139.9" r="9" class="f-srf s-trk" stroke-width="1.8"/>
+          <!-- delta = (20,-14) rotated with pose: -28:(11.1,-21.8) 0:(20,-14) +28:(24.2,-3.0) -->
+          <line x1="506" y1="70" x2="514.7" y2="52.3" class="s-ink" stroke-width="1.6" marker-end="url(#bh-ink)"/>
+          <line x1="543" y1="98" x2="560" y2="86" class="s-ink" stroke-width="1.6" marker-end="url(#bh-ink)"/>
+          <line x1="563" y1="139.5" x2="584.2" y2="136.9" class="s-ink" stroke-width="1.6" marker-end="url(#bh-ink)"/>
+          <text x="520" y="50" font-size="14" class="f-ink mt">R<tspan font-size="10" dy="3">1</tspan><tspan dy="-3">δ</tspan></text>
+          <text x="566" y="84" font-size="14" class="f-ink mt">R<tspan font-size="10" dy="3">2</tspan><tspan dy="-3">δ</tspan></text>
+          <text x="590" y="134" font-size="14" class="f-ink mt">R<tspan font-size="10" dy="3">3</tspan><tspan dy="-3">δ</tspan></text>
+          <text x="360" y="244" font-size="12.5" class="f-mut">同一个 δ 随姿态指向不同方向 → 不是常量</text>
+          <text x="360" y="262" font-size="12.5" class="f-mut">站位吃不掉，残差会变大，c 被钉住（转轴方向除外）</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>图 2　转动是区分 c 和站位的唯一手段。</b>假设 <span class="m"><b>c</b></span> 猜错了 <span class="m"><b>δ</b></span>，球心预测在每个位姿上会偏 <span class="m"><i>R</i><sub><i>i</i></sub><b>δ</b></span>。姿态不变时这是同一个向量，站位的平移可以完全抵消；姿态变化时它跟着转，只有 <span class="m"><b>δ</b></span> 平行于转轴的那一分量躲得过去。</figcaption>
+  </figure>
+
+  <h3>把“转得够不够”变成一个数</h3>
+  <p>把同一集合内所有位姿对的 <span class="m"><i>R</i><sub><i>i</i></sub> − <i>R</i><sub><i>j</i></sub></span> 竖着堆起来，按位姿对数归一化后取最小奇异值，记为<strong>最弱增益</strong> <span class="m"><i>g</i><sub>min</sub></span>。它表示在最难观测的方向上，一对位姿平均能提供多少关于 <span class="m"><b>c</b></span> 的信息，可以直接和单轴的 <span class="m">2 sin(<i>θ</i>/2)</span> 比较。量级上：</p>
+  <div class="eq" role="math" aria-label="sigma_c 约等于 sigma_pose 除以 g_min 乘根号 N">
+    <div class="body"><i>σ</i><sub><b>c</b></sub> ≈ <i>σ</i><sub>pose</sub> ⁄ (<i>g</i><sub>min</sub> √<i>N</i>)<span class="note">联合求解站位与 c 时</span></div>
+    <div class="num">(5)</div>
+  </div>
+  <p>两条直接推论：</p>
+  <ul>
+    <li><strong>转角比位姿数值钱。</strong><span class="m"><i>g</i><sub>min</sub></span> 是一次方，<span class="m"><i>N</i></span> 在根号里。把第二根轴转开，远比多采几个位姿有用。</li>
+    <li><strong>转得少的那根轴说了算。</strong>把一根轴转到 90° 而另一根只转 5°，<span class="m"><i>g</i><sub>min</sub></span> 仍由 5° 那根决定。下面的计算器里可以直接看到。</li>
+  </ul>
+  <p>联合解的门槛是 <span class="m"><i>g</i><sub>min</sub> ≥ 0.05</span>，约等于单轴转 2.9°。这是“能不能解”的地板，不是质量目标；达不到时拟合直接拒绝，并在报错里说明该往哪根轴转。</p>
+
+  <div class="calc" id="calc">
+    <div class="hd"><span class="t">转角计算器</span><span class="s">姿态在两根轴的 ± 范围内均匀铺开，算法与 <code>_rotation_gains</code> 相同</span></div>
+    <div class="ctrls">
+      <div class="ctrl"><label for="axA">轴 1：绕光束方向滚转 ± <output id="axAv" for="axA">30°</output></label><input id="axA" type="range" min="0" max="90" step="1" value="30"></div>
+      <div class="ctrl"><label for="axB">轴 2：偏离光束的倾斜 ± <output id="axBv" for="axB">20°</output></label><input id="axB" type="range" min="0" max="45" step="1" value="20"></div>
+      <div class="ctrl"><label for="nPose">位姿数 N <output id="nPosev" for="nPose">15</output></label><input id="nPose" type="range" min="3" max="40" step="1" value="15"></div>
+      <div class="ctrl"><label for="sPose">单位姿误差 σ<sub>pose</sub>（每轴） <output id="sPosev" for="sPose">1.0 mm</output></label><input id="sPose" type="range" min="0.1" max="2" step="0.1" value="1.0"></div>
+    </div>
+    <div class="readout" aria-live="polite">
+      <div><div class="k">最弱增益 g<sub>min</sub></div><div class="v" id="oG">—</div></div>
+      <div><div class="k">等效单轴转角</div><div class="v" id="oEq">—</div></div>
+      <div><div class="k">联合解 σ<sub>c</sub>（粗估）</div><div class="v" id="oJ">—</div></div>
+      <div><div class="k">冻结站位 σ<sub>c</sub>（每轴）</div><div class="v" id="oF">—</div></div>
+    </div>
+    <div class="verdict"><span class="pill" id="oPill">—</span><span class="muted" id="oMsg"></span></div>
+  </div>
+  <p class="muted" style="font-size:14px">联合解一栏按式 (5) 粗估，偏乐观：联合解还要同时估站位的旋转，仿真中实际误差比这一栏再大约 1.4 倍。冻结站位一栏的公式见第 6 节。</p>
+
+  <h3>站位还需要点在空间里张开</h3>
+  <p>求 <span class="m"><i>R</i><sub>WG</sub></span> 需要 15 个球心在空间里散开。它们如果共线，绕这条线的旋转就没有约束。实现里要求点云的 planarity（中心化点云最小与最大奇异值之比）≥ 0.10，直径 ≥ 0.30 m。严格说只有共线才真正退化，共面的点本身能定旋转，所以这条门槛偏保守。保留它是因为多做一点高低差几乎不花成本。</p>
+
+  <h3>SMR 的接受角正好给了两根轴</h3>
+  <p>角锥棱镜对偏离光束的倾斜只接受约 ±30°，超出就断光。绕光束方向的滚转则不受限，因为棱镜绕自身光轴转动时回光不变。所以可用的转动恰好是“滚转 + 有限倾斜”两根不平行的轴。滚转过头时，重力会把球从磁吸窝里拽出来。</p>
+</section>
+
+<section id="s5">
+  <h2><span class="n">5</span>怎么解：交替最小二乘</h2>
+  <p>把式 (3) 两边之差的平方和作为代价：</p>
+  <div class="eq" role="math" aria-label="J 等于对 i 求和，R_WG p_i 加 t_WG 减 R_i c 减 t_i 的模的平方">
+    <div class="body"><i>J</i>(<i>R</i><sub>WG</sub>, <b>t</b><sub>WG</sub>, <b>c</b>) = <span class="up">∑</span><sub><i>i</i></sub> ‖ <i>R</i><sub>WG</sub> <span class="trk"><b>p</b><sub><i>i</i></sub></span> + <b>t</b><sub>WG</sub> − <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b> − <span class="cam"><b>t</b><sub><i>i</i></sub></span> ‖<sup>2</sup></div>
+    <div class="num">(6)</div>
+  </div>
+  <p>9 个未知量混在一起时，这是带旋转约束的非线性问题。但把未知量分成两块，每一块单独看都有闭式解。</p>
+
+  <h3>第一块：固定 c，求站位（Kabsch）</h3>
+  <p><span class="m"><b>c</b></span> 已知时，<span class="m"><b>q</b><sub><i>i</i></sub> = <i>R</i><sub><i>i</i></sub><b>c</b> + <b>t</b><sub><i>i</i></sub></span> 就是相机预测的球心。于是 <span class="m"><b>p</b><sub><i>i</i></sub></span> 与 <span class="m"><b>q</b><sub><i>i</i></sub></span> 是 15 对对应点，求站位就是经典的刚体点集配准：</p>
+  <div class="eq" role="math" aria-label="Kabsch 公式">
+    <div class="body"><span class="stack">
+      <span><i>H</i> = <span class="up">∑</span><sub><i>i</i></sub> (<b>p</b><sub><i>i</i></sub> − <b>p̄</b>)(<b>q</b><sub><i>i</i></sub> − <b>q̄</b>)<sup>⊤</sup> = <i>U</i> Σ <i>V</i><sup>⊤</sup></span>
+      <span><i>R</i><sub>WG</sub> = <i>V</i> diag(1, 1, <i>d</i>) <i>U</i><sup>⊤</sup>,<span class="gap"></span><i>d</i> = sign det(<i>VU</i><sup>⊤</sup>)</span>
+      <span><b>t</b><sub>WG</sub> = <b>q̄</b> − <i>R</i><sub>WG</sub> <b>p̄</b></span>
+    </span></div>
+    <div class="num">(7)</div>
+  </div>
+  <p>先对齐质心，再用 SVD 求最佳旋转。<span class="m"><i>d</i></span> 用来防止解出镜像。这一步对给定的 <span class="m"><b>c</b></span> 是全局最优。</p>
+
+  <h3>第二块：固定站位，求 c（一次平均）</h3>
+  <p>站位已知时，记 <span class="m"><b>y</b><sub><i>i</i></sub> = <i>R</i><sub>WG</sub><b>p</b><sub><i>i</i></sub> + <b>t</b><sub>WG</sub> − <b>t</b><sub><i>i</i></sub></span>，代价变成 <span class="m"><span class="up">∑</span> ‖<i>R</i><sub><i>i</i></sub><b>c</b> − <b>y</b><sub><i>i</i></sub>‖<sup>2</sup></span>，对 <span class="m"><b>c</b></span> 是线性的。因为 <span class="m"><i>R</i><sub><i>i</i></sub><sup>⊤</sup><i>R</i><sub><i>i</i></sub> = <i>I</i></span>，正规方程的系数矩阵恰好是 <span class="m"><i>N</i>·<i>I</i></span>，解就是一个平均：</p>
+  <div class="eq" role="math" aria-label="c 等于 c_i 的平均，c_i 等于 R_i 转置乘 (R_WG p_i 加 t_WG 减 t_i)">
+    <div class="body"><b>c</b> = <span class="up">(1/<i>N</i>) ∑</span><sub><i>i</i></sub> <b>c</b><sub><i>i</i></sub>,<span class="gap"></span><b>c</b><sub><i>i</i></sub> = <span class="cam"><i>R</i><sub><i>i</i></sub></span><sup>⊤</sup> (<i>R</i><sub>WG</sub> <span class="trk"><b>p</b><sub><i>i</i></sub></span> + <b>t</b><sub>WG</sub> − <span class="cam"><b>t</b><sub><i>i</i></sub></span>)</div>
+    <div class="num">(8)</div>
+  </div>
+  <p>这个结果很好解释。<span class="m"><b>c</b><sub><i>i</i></sub></span> 是把跟踪仪测到的球心搬回第 <span class="m"><i>i</i></span> 个位姿的 cube 系里，也就是这一个位姿自己对“球在 cube 上哪儿”的回答。最优的 <span class="m"><b>c</b></span> 就是 15 个回答的简单平均。这一块的系数矩阵是单位阵的倍数，永远良态，任何病态都来自第一块和两块之间的耦合，也就是第 4 节讲的转角。</p>
+
+  <h3>交替、单调、收敛</h3>
+  <p>两块轮流做。每一步都是在同一个代价 (6) 上对自己那一块求全局最优，所以 <span class="m"><i>J</i></span> 只降不升，迭代单调收敛。当一轮之间 <span class="m"><b>c</b></span> 的变化小于 1 nm，或满 50 轮时停止。</p>
+  <p><strong>初值不从 c = 0 出发。</strong>杠杆臂有十几厘米长时，从零出发可能落进一个浅的次优解。实现里先做一次<strong>线性松弛</strong>：式 (4) 对 <span class="m"><b>c</b></span>（3 个）和 <span class="m"><i>R</i><sub>WG</sub></span> 的 9 个元素是线性的，暂时丢掉“<span class="m"><i>R</i><sub>WG</sub></span> 必须是旋转”这一约束，对所有位姿对一次最小二乘解出 12 个数，再把 <span class="m"><i>R</i><sub>WG</sub></span> 投影回最近的旋转矩阵。这个初值已经离答案很近，后面的交替迭代只产生真正的旋转。</p>
+
+  <pre class="algo"><span class="c"># 输入：同一 mount 的 N 组 (p_i, R_i, t_i)</span>
+<span class="kw">0</span> 可观测性检查（联合解）：g_min ≥ 0.05，planarity ≥ 0.10，直径 ≥ 0.30 m
+  <span class="c">  不满足就拒绝出数，并说明缺哪根轴的转动</span>
+<span class="kw">1</span> 初值：按式 (4) 线性松弛解 c 与 R_WG（12 个未知量），R_WG 投影回 SO(3)
+<span class="kw">2</span> 至多 50 轮：
+      q_i   ← R_i c + t_i
+      R_WG, t_WG ← Kabsch(p_i → q_i)                    <span class="c"># 式 (7)</span>
+      c_new ← mean_i  R_iᵀ (R_WG p_i + t_WG − t_i)        <span class="c"># 式 (8)</span>
+      若 ‖c_new − c‖ &lt; 1 nm：停止
+      c ← c_new
+<span class="kw">3</span> 残差 r_i、姿态回归、Sim(3) 尺度诊断（只报告，不施加）
+<span class="kw">4</span> 对位姿有放回重采样 200 次，重复 1–2 → σ_c</pre>
+
+  <p><strong>只解刚体变换，不解尺度。</strong>站位用 SE(3) 而不是 Sim(3)。相机 world 系若有全场尺度误差，正是要暴露的共模误差，让拟合吸收掉就看不见了。尺度另外用 Sim(3) 拟合一次，以 ppm 报告，只作诊断，永不施加。</p>
+</section>
+
+<section id="s6">
+  <h2><span class="n">6</span>第二次起：冻结站位，只解 c</h2>
+  <p>9 个未知量里有两种寿命完全不同的常量：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>量</th><th>是谁的常量</th><th>什么时候失效</th></tr></thead>
+    <tbody>
+      <tr><td><span class="m"><i>T</i><sub>WG</sub></span> 站位</td><td>房间的常量</td><td>跟踪仪挪动，或相机外参重新标定（即 world 系变了）</td></tr>
+      <tr><td><span class="m"><b>c</b></span> 杠杆臂</td><td>这一次安装的常量</td><td>钢片或磁吸窝拆装一次，就是一个新的 <code>mount_id</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>每次都把两者一起从头解，等于每次都扔掉房间的常量，并且每次都要付转角的代价。所以求解拆成两个入口：</p>
+  <ul>
+    <li><strong>station 模式（第一次，或累积多场）。</strong>联合解：所有场次共用一个站位，每个 mount 各一个 <span class="m"><b>c</b></span>。<strong>只有这一步需要转角。</strong>场次越多，站位越准。</li>
+    <li><strong>lever-arm 模式（之后每一场）。</strong>站位冻结，只剩式 (8) 那一次平均：线性、每个位姿都直接贡献，<strong>完全不需要转角</strong>。整场姿态几乎不动的采集在这里也是合法输入。</li>
+  </ul>
+  <p><strong>精度差多少。</strong>冻结后 <span class="m"><b>c</b></span> 就是 <span class="m"><i>N</i></span> 个独立估计的平均，每个分量</p>
+  <div class="eq" role="math" aria-label="冻结站位时 sigma_c 每轴等于 sigma_pose 除以根号 N">
+    <div class="body"><i>σ</i><sub><b>c</b></sub> = <i>σ</i><sub>pose</sub> ⁄ √<i>N</i><span class="note">每轴，与转角无关</span></div>
+    <div class="num">(9)</div>
+  </div>
+  <p>联合解则要再乘上 <span class="m">1/<i>g</i><sub>min</sub></span>。在 ±30° 的接受锥里，最弱方向的增益大约只有 0.3–0.4，也就是约三倍放大；再加上同时估站位旋转的代价，仿真中两者之比稳定在约 4.4 倍，与噪声大小无关。靠加位姿追回 4.4 倍需要 4.4² ≈ 19 倍的位姿数。所以冻结站位不是运维上的方便，而是 <span class="m"><b>c</b></span> 能否达到 0.20 mm 预算的分水岭：按 (9)，<span class="m"><i>N</i> = 20</span> 时要求 <span class="m"><i>σ</i><sub>pose</sub></span> 不超过约 0.5 mm。这是一个可以直接去测的门限。</p>
+  <p><strong>白送的诊断。</strong>跨场次比较独立解出的站位，<span class="m">Δ<i>T</i><sub>WG</sub></span> 同时监视两件事：跟踪仪有没有被碰过，相机外参有没有漂。</p>
+</section>
+
+<section id="s7">
+  <h2><span class="n">7</span>解出来能信到什么程度</h2>
+  <p>每个位姿的残差是式 (3) 两边之差的长度。利用式 (8)，它还有一个等价写法：</p>
+  <div class="eq" role="math" aria-label="r_i 等于 R_WG p_i 加 t_WG 减 R_i c 减 t_i 的模，等于 c_i 减 c 的模">
+    <div class="body"><i>r</i><sub><i>i</i></sub> = ‖ <i>R</i><sub>WG</sub> <span class="trk"><b>p</b><sub><i>i</i></sub></span> + <b>t</b><sub>WG</sub> − <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b> − <span class="cam"><b>t</b><sub><i>i</i></sub></span> ‖ = ‖ <b>c</b><sub><i>i</i></sub> − <b>c</b> ‖</div>
+    <div class="num">(10)</div>
+  </div>
+  <p>即每个位姿的残差，恰好是它自己的回答 <span class="m"><b>c</b><sub><i>i</i></sub></span> 离平均值有多远。</p>
+
+  <h3>三种不确定度，回答三个不同的问题</h3>
+  <ul>
+    <li><strong>Bootstrap σ<sub>c</sub>：数据把答案钉得多紧。</strong>对位姿有放回地重采样 200 次、每次重解，<span class="m"><b>c</b></span> 的散布就是它的精密度。它看不见第 8 节那些被结构性吸收的偏差，所以是精密度，不是准确度。</li>
+    <li><strong>留出残差：模型能不能预测。</strong>挑几个位姿不参与拟合，解完再算它们的残差。拟合残差是模型给自己打分，只有留出残差说明预测能力。留出 RMS 明显大于拟合 RMS，说明拟合在迁就噪声。</li>
+    <li><strong>姿态回归：误差有没有结构。</strong>见下文。</li>
+  </ul>
+
+  <h3>认证门槛，以及一道 15 的算术题</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>门槛</th><th>要求</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>拟合位姿数</td><td>≥ 15</td><td>位姿太少时，bootstrap 与姿态回归都不可靠</td></tr>
+      <tr><td>可观测性</td><td>通过第 4 节检查</td><td>解不定的量不出数</td></tr>
+      <tr><td>σ<sub>c</sub>（bootstrap）</td><td>≤ 0.20 mm</td><td>GT 链预算给杠杆臂的份额</td></tr>
+      <tr><td>留出 RMS ÷ 拟合 RMS</td><td>≤ 2</td><td>预测不比自评差太多，即没有过拟合</td></tr>
+      <tr><td>残差本身</td><td><span class="pill mid">有意不设</span></td><td>静态残差正是要研究的相机误差；因为它大就拒绝拟合，等于把实验倒过来</td></tr>
+    </tbody>
+  </table></div>
+  <div class="aside warn">
+    <div class="k">注意 · 15 个片段够解，不够“认证 + 留出”</div>
+    <p>“≥ 15”数的是<strong>拟合集</strong>。15 段全部用于拟合，可以通过认证，但没有留出复核；留出 5 段，拟合集只剩 10，不满足门槛。两者都要，就采 20 段：15 段拟合，5 段留出。</p>
+  </div>
+
+  <h3>姿态回归：散布的大小没用，形状才有用</h3>
+  <p>看 15 个 <span class="m"><b>c</b><sub><i>i</i></sub></span> 散得多开，似乎能判断钢片是否随姿态变形。但按式 (10)，这个散布的 RMS 与残差 RMS 是同一个平方和写了两遍，精确相等，不是第二项检查。</p>
+  <p>能把“钢片随姿态变形 / 相机误差随姿态变化”与“随机噪声”分开的，是散布有没有<strong>结构</strong>。做法是把每个位姿的回答对它的姿态做线性回归：</p>
+  <div class="eq" role="math" aria-label="c_i 约等于 beta_0 加 B 乘 phi_i，phi_i 是相对平均姿态的旋转向量">
+    <div class="body"><b>c</b><sub><i>i</i></sub> ≈ <b>β</b><sub>0</sub> + <i>B</i> <b>φ</b><sub><i>i</i></sub>,<span class="gap"></span><b>φ</b><sub><i>i</i></sub> = log(<i>R</i><sub><i>i</i></sub> <i>R̄</i><sup>⊤</sup>)<span class="note">相对平均姿态的旋转向量</span></div>
+    <div class="num">(11)</div>
+  </div>
+  <p>看回归解释了多少方差（<span class="m"><i>R</i><sup>2</sup></span>），并与纯噪声下的期望比较：每个分量拟合 3 个斜率，纯噪声约能解释 <span class="m">3/(<i>N</i>−1)</span>，<span class="m"><i>N</i> = 15</span> 时约 0.21。当 <span class="m"><i>R</i><sup>2</sup></span> 超过 <span class="m">max(3 × 0.21, 0.05)</span> 时，提示存在姿态相关的结构。<span class="m"><i>B</i></span> 的最大奇异值换算成 mm/°，就是球心在 cube 系里随姿态“迁移”的速度。它是告诉你往哪看的指针，不是门槛：确认要靠去量钢片，或者去查某些姿态下 cube 的某个面是否被遮挡。</p>
+</section>
+
+<section id="s8">
+  <h2><span class="n">8</span>c 会吸收什么</h2>
+  <p>这是整套方法最需要说清楚的限制。最小二乘会顺手解释掉一切它能解释的相机误差。<span class="m"><b>c</b></span> 是拟合出来的，任何在 cube 系里恒定的误差都能被 <span class="m"><b>c</b></span> 原样吸收，于是在残差里恒为零。这不是测得小，而是结构上被消掉了。逐项看相机侧的几类偏差：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>相机侧偏差</th><th>数学形式</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>world 系常量平移</td><td><span class="m"><b>t̂</b><sub><i>i</i></sub> = <b>t</b><sub><i>i</i></sub> + <b>δ</b><sub>W</sub></span></td><td><span class="pill bad">联合解时吸收</span> 被 <span class="m"><b>t</b><sub>WG</sub></span> 吃掉；站位冻结后，只有相对建站那一场的<em>变化</em>可见</td></tr>
+      <tr><td>cube 系常量平移</td><td><span class="m"><b>t̂</b><sub><i>i</i></sub> = <b>t</b><sub><i>i</i></sub> + <i>R</i><sub><i>i</i></sub><b>δ</b><sub>B</sub></span></td><td><span class="pill bad">吸收</span> <span class="m"><b>ĉ</b> = <b>c</b> − <b>δ</b><sub>B</sub></span></td></tr>
+      <tr><td>cube 系常量旋转</td><td><span class="m"><i>R̂</i><sub><i>i</i></sub> = <i>R</i><sub><i>i</i></sub> <i>δR</i></span></td><td><span class="pill bad">吸收</span> <span class="m"><b>ĉ</b> = <i>δR</i><sup>⊤</sup><b>c</b></span>，且 <span class="m">|<b>ĉ</b>| = |<b>c</b>|</span></td></tr>
+      <tr><td>world 系常量旋转（只作用于姿态）</td><td><span class="m"><i>R̂</i><sub><i>i</i></sub> = <i>δR</i><sub>W</sub> <i>R</i><sub><i>i</i></sub></span></td><td><span class="pill good">可见</span> 误差 <span class="m">(<i>δR</i><sub>W</sub> − <i>I</i>)<i>R</i><sub><i>i</i></sub><b>c</b></span> 随姿态变，常量复现不出</td></tr>
+      <tr><td>全场尺度</td><td><span class="m"><b>t̂</b><sub><i>i</i></sub> = (1+<i>s</i>) <b>t</b><sub><i>i</i></sub></span></td><td><span class="pill good">可见</span> 既不是刚体映射，也不是 cube 系常量；Sim(3) 诊断报出 ppm</td></tr>
+      <tr><td>随姿态、随可见相机组合变化的误差</td><td>随 <span class="m"><i>i</i></span> 变</td><td><span class="pill good">可见</span> 并会出现在第 7 节的姿态回归里</td></tr>
+      <tr><td>与时间、速度相关的误差</td><td><span class="m">|<b>v</b>|·Δ<i>t</i></span></td><td><span class="pill mid">静态下为零</span> 驻点集原理上看不见，留给轨迹评测</td></tr>
+    </tbody>
+  </table></div>
+  <p>第二、三行的推导只有一行。以 cube 系平移为例：拟合要找 <span class="m"><b>ĉ</b></span> 使 <span class="m"><i>R</i><sub><i>i</i></sub><b>ĉ</b> + <b>t</b><sub><i>i</i></sub> + <i>R</i><sub><i>i</i></sub><b>δ</b><sub>B</sub></span> 等于真实球心 <span class="m"><i>R</i><sub><i>i</i></sub><b>c</b> + <b>t</b><sub><i>i</i></sub></span>，对所有 <span class="m"><i>i</i></span> 取 <span class="m"><b>ĉ</b> = <b>c</b> − <b>δ</b><sub>B</sub></span> 即可，残差为零。旋转那一行同理。</p>
+
+  <div class="aside warn">
+    <div class="k">结论 · 球心残差不能直接当成 TCP 位置误差</div>
+    <p>被吸收的第二、三行合起来，正好就是 marker → TCP 这个常量；对 TCP 位置而言，它就是 <span class="m"><b>c</b><sub>TCP</sub></span> 的误差。所以用驻点拟合出的 <span class="m"><b>c</b></span> 算出的球心残差，不论多小，都说明不了 <span class="m"><b>c</b><sub>TCP</sub></span> 对不对。这一项要在 TCP 处直接测，见 §9。实现里产物恒写 <code>certifies_marker_to_tcp: false</code>，就是把这句话写进了数据结构。</p>
+  </div>
+  <p>同一条性质也有好处。SMR 的光学中心相对钢球球心的偏差，在 cube 系里同样是常量，被 <span class="m"><b>c</b></span> 一并吸收，对残差没有贡献。所以这里不需要 precision 级的 SMR。</p>
+  <p>还有一个极端情形：如果整场姿态几乎不变（转角 &lt; 5°），所有旋转误差在这一场里都成了常量，全部被吸收，残差退化为纯位置测量，不带任何姿态信息。这种场次合法，但结论里必须写明。</p>
+  <p>由此还能推出一条纪律：<strong>驻点集和被评测的轨迹必须分开采。</strong>若在评测数据本身上拟合 <span class="m"><b>c</b></span>，评测想找的误差会先被 <span class="m"><b>c</b></span> 吸收掉一部分。</p>
+</section>
+
+<section id="s9">
+  <h2><span class="n">9</span>在 TCP 处直接测：跟踪仪 pivot</h2>
+  <p>§8 的结论是：球心上的残差看不见 <span class="m"><b>c</b><sub>TCP</sub></span> 的常量误差。要看见它，得在 TCP 那一点上直接比较，而且比较时不能再拟合任何 cube 系里的常量。跟踪仪 pivot 正好满足这两条，并且不用挪 SMR。</p>
+
+  <div class="aside">
+    <div class="k">直觉 · 为什么不直接比两条 TCP 轨迹</div>
+    <p>最朴素的想法是：从跟踪仪的球心轨迹 <span class="m trk"><b>q</b>(<i>t</i>)</span> 推出一条 TCP 轨迹，再和视觉的 TCP 轨迹对齐时间后相减。推 TCP 要用 <span class="m"><b>q</b>(<i>t</i>) + <i>R</i>(<i>t</i>)<b>u</b></span>，其中 <span class="m"><b>u</b></span> 是 SMR → TCP 的向量。跟踪仪不给姿态，<span class="m"><i>R</i>(<i>t</i>)</span> 只能借相机的 <span class="m cam"><i>R̂</i>(<i>t</i>)</span>。于是：</p>
+    <div class="eq" role="math" aria-label="两条 TCP 轨迹之差等于 q 减去 R hat 乘以 c_TCP 减 u 再加 t hat">
+      <div class="body">( <span class="trk"><b>q</b></span> + <span class="cam"><i>R̂</i></span><b>u</b> ) − ( <span class="cam"><i>R̂</i></span><b>c</b><sub>TCP</sub> + <span class="cam"><b>t̂</b></span> ) = <span class="trk"><b>q</b></span> − [ <span class="cam"><i>R̂</i></span> (<b>c</b><sub>TCP</sub> − <b>u</b>) + <span class="cam"><b>t̂</b></span> ]</div>
+      <div class="num"></div>
+    </div>
+    <p><span class="m"><i>R̂</i><b>u</b></span> 在两边各出现一次，抵消了。右边正好是“以 <span class="m"><b>c</b><sub>TCP</sub> − <b>u</b></span> 为杠杆臂”的球心比较。所以这场比较能看见什么，完全取决于 <span class="m"><b>u</b></span> 从哪来：</p>
+    <ul>
+      <li><strong>u 用相机数据标定</strong>（例如 <span class="m"><b>c</b><sub>TCP</sub> − <b>ĉ</b></span>）：<span class="m"><b>c</b><sub>TCP</sub></span> 错多少，<span class="m"><b>u</b></span> 就跟着错多少，在差值里消失，回到 §8 的吸收问题。</li>
+      <li><strong>u 用 CAD 量</strong>：<span class="m"><b>u</b></span> 要表达在相机的 cube 系里，这一步需要 cube 相对夹爪本体的旋转，正是没测过的那 2°；乘上几十毫米就是 2 mm 量级。</li>
+      <li><strong>u 由跟踪仪独立测出</strong>：<span class="m"><b>c</b><sub>TCP</sub></span> 的误差才会留在差值里。跟踪仪 pivot 做的就是这件事：TCP 钉在球窝里，不需要姿态，跟踪仪单独就能定出 TCP 在哪。SMR 始终留在钢片上。</li>
+    </ul>
+  </div>
+
+  <h3>做法</h3>
+  <p>把 pivot 球窝固定在桌上，夹爪夹住与相机 pivot 标定相同的插件，插件的球头落进球窝。SMR 留在钢片上不动（同一次安装、同一个 <span class="m"><b>c</b></span>）。以球窝为支点转动夹爪，每个姿态静止 3.5 s 以上，与驻点集用同一个跟踪仪站位。</p>
+
+  <h3>原理：球心在一个球面上</h3>
+  <p>夹爪绕球窝中心 <span class="m"><b>s</b></span> 转，钢片上的球心到 <span class="m"><b>s</b></span> 的距离不变。于是跟踪仪测到的全部球心都落在以 <span class="m"><b>s</b></span> 为心、半径为 <span class="m"><i>ρ</i></span> 的球面上：</p>
+  <div class="eq" role="math" aria-label="p_i 减 s 的模等于 rho">
+    <div class="body">‖ <span class="trk"><b>p</b><sub><i>i</i></sub></span> − <b>s</b><sub>G</sub> ‖ = <i>ρ</i><span class="gap"></span><span class="note">两边平方后对 (<b>s</b>, <i>ρ</i><sup>2</sup> − |<b>s</b>|<sup>2</sup>) 是线性的</span></div>
+    <div class="num">(12)</div>
+  </div>
+  <p>先对展开后的线性方程做一次最小二乘，再做几步高斯–牛顿细化。<span class="m"><b>s</b><sub>G</sub></span> 完全由跟踪仪读数决定，不经过相机，这正是它能当独立参考的原因。</p>
+
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 680 300" role="img" aria-labelledby="f3t">
+        <title id="f3t">跟踪仪 pivot 侧视图：TCP 卡在球窝里转动，钢片上的 SMR 球心沿以球窝中心为圆心的球面移动</title>
+        <defs>
+          <marker id="ch-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-ink"/></marker>
+          <marker id="ch-trk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="f-trk"/></marker>
+        </defs>
+        <line x1="40" y1="250" x2="470" y2="250" class="s-mut" stroke-width="1.5"/>
+        <path d="M226,250 A14 14 0 0 0 254,250" class="f-soft s-mut" stroke-width="1.5"/>
+        <!-- ghost poses -->
+        <g transform="rotate(-25 240 244)" opacity=".35">
+          <rect x="220" y="70" width="40" height="130" rx="5" class="f-none s-cam" stroke-width="1.3"/>
+          <rect x="232" y="200" width="16" height="40" rx="3" class="f-none s-cam" stroke-width="1.3"/>
+          <line x1="260" y1="140" x2="276" y2="133" class="s-mut" stroke-width="4" stroke-linecap="round"/>
+        </g>
+        <g transform="rotate(25 240 244)" opacity=".35">
+          <rect x="220" y="70" width="40" height="130" rx="5" class="f-none s-cam" stroke-width="1.3"/>
+          <rect x="232" y="200" width="16" height="40" rx="3" class="f-none s-cam" stroke-width="1.3"/>
+          <line x1="260" y1="140" x2="276" y2="133" class="s-mut" stroke-width="4" stroke-linecap="round"/>
+        </g>
+        <circle cx="228.5" cy="124.7" r="11" class="f-srf s-trk" stroke-width="1.4" opacity=".55"/>
+        <circle cx="324" cy="158.5" r="11" class="f-srf s-trk" stroke-width="1.4" opacity=".55"/>
+        <!-- current pose -->
+        <rect x="220" y="70" width="40" height="130" rx="5" class="f-camsoft s-cam" stroke-width="1.6"/>
+        <rect x="232" y="200" width="16" height="40" rx="3" class="f-camsoft s-cam" stroke-width="1.6"/>
+        <line x1="260" y1="140" x2="272" y2="134" class="s-mut" stroke-width="5" stroke-linecap="round"/>
+        <!-- sphere arc -->
+        <path d="M 228.5 124.7 A 120 120 0 0 1 324 158.5" class="f-none s-trk" stroke-width="1.4" stroke-dasharray="3 4"/>
+        <circle cx="280" cy="131" r="11" class="f-srf s-trk" stroke-width="2"/>
+        <circle cx="280" cy="131" r="2.5" class="f-trk"/>
+        <!-- rho -->
+        <line x1="240" y1="244" x2="274" y2="140" class="s-ink" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <text x="262" y="216" font-size="16" class="f-ink mt">ρ</text>
+        <!-- s and TCP -->
+        <circle cx="240" cy="244" r="3.5" class="f-ink"/>
+        <text x="258" y="272" font-size="13" class="f-ink mt" font-weight="600">s</text>
+        <text x="270" y="272" font-size="12.5" class="f-mut">球窝中心（支点）</text>
+        <circle cx="240" cy="226" r="3" class="f-cam"/>
+        <text x="120" y="222" font-size="12.5" class="f-cam">TCP = s + d</text>
+        <line x1="194" y1="226" x2="234" y2="226" class="s-cam" stroke-width="1"/>
+        <!-- tracker + beam -->
+        <rect x="592" y="120" width="30" height="30" rx="4" class="f-trksoft s-trk" stroke-width="1.5"/>
+        <text x="578" y="170" font-size="12.5" class="f-trk" font-weight="700">跟踪仪</text>
+        <line x1="590" y1="134" x2="294" y2="131" class="s-trk" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#ch-trk)"/>
+        <!-- annotations -->
+        <text x="360" y="208" font-size="12.5" class="f-mut">纸面内：前后倾，留在接受角 ±25° 内</text>
+        <text x="360" y="228" font-size="12.5" class="f-mut">垂直纸面：绕光束方向侧倾，可转 ±45–60°</text>
+        <text x="40" y="58" font-size="12.5" class="f-mut">夹爪（夹着 pivot 插件）</text>
+        <text x="400" y="116" font-size="12.5" class="f-trk">钢片上的 SMR</text>
+      </svg>
+    </div>
+    <figcaption><b>图 3　跟踪仪 pivot（侧视）。</b>TCP 卡在球窝里转，钢片上的球心始终在以 <span class="m"><b>s</b></span> 为心、半径 <span class="m"><i>ρ</i></span> 的球面上，跟踪仪只凭自己的读数就能定出 <span class="m"><b>s</b></span>。纸面内的前后倾会改变 SMR 相对光束的朝向，受接受角限制；绕光束方向的侧倾不改变这个朝向，可以转到大角度。</figcaption>
+  </figure>
+
+  <h3>逐位姿比较，不拟合 c<sub>TCP</sub></h3>
+  <p>用驻点集冻结下来的站位，把 <span class="m"><b>s</b></span> 搬进 world 系，再和生产标签给出的 TCP 逐位姿相减：</p>
+  <div class="eq" role="math" aria-label="e_TCP,i 等于 R_i c_TCP 加 t_i 减 R_WG s 加 t_WG 加 R_i d">
+    <div class="body"><b>e</b><sub>TCP,<i>i</i></sub> = ( <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>c</b><sub>TCP</sub> + <span class="cam"><b>t</b><sub><i>i</i></sub></span> ) − ( <i>R</i><sub>WG</sub> <b>s</b><sub>G</sub> + <b>t</b><sub>WG</sub> + <span class="cam"><i>R</i><sub><i>i</i></sub></span> <b>d</b> )</div>
+    <div class="num">(13)</div>
+  </div>
+  <p><span class="m"><b>d</b></span> 是球窝中心到 TCP 的偏距（cube 系里），与生产标定用的是同一个值。两边都加了同一个 <span class="m"><b>d</b></span>，它在差值里精确抵消。</p>
+  <p>关键在于这一步<strong>什么 cube 系常量都不拟合</strong>：<span class="m"><b>c</b><sub>TCP</sub></span> 生产用什么就代入什么，唯一拟合过的站位来自另一场采集，只吸收 world 系常量。于是 §8 表里被 <span class="m"><b>c</b></span> 吃掉的两行，在这里都以 <span class="m"><i>R</i><sub><i>i</i></sub><b>δ</b></span> 的形式出现，全部看得见。</p>
+  <ul>
+    <li><span class="m"><b>e</b><sub>TCP,<i>i</i></sub></span> 的平均值（换回 cube 系）就是 <span class="m"><b>c</b><sub>TCP</sub></span> 的常量误差。</li>
+    <li>它围绕平均值的散布，就是静态、随姿态变化的 TCP 误差。两者合起来，就是静止状态下 TCP 位置误差的分布，可以直接拿去和 3 mm 比较。</li>
+    <li>免费的一致性检查：半径 <span class="m"><i>ρ</i></span> 只来自跟踪仪；把 <span class="m"><b>s</b></span> 按式 (8) 换算到 cube 系得到 <span class="m"><b>ĉ</b><sub>s</sub></span>，<span class="m">|<b>ĉ</b><sub>s</sub> − <b>ĉ</b>|</span> 应该等于 <span class="m"><i>ρ</i></span>。对不上，说明站位或某一侧的拟合有问题。</li>
+  </ul>
+
+  <h3>怎么转，球心才定得准</h3>
+  <p>球面拟合有一个弱方向：转角小时，数据只覆盖一小块球冠，球心沿球冠对称轴（平均的“球窝 → SMR”方向）最难定。按单位姿误差 0.02 mm、<span class="m"><i>ρ</i></span> = 70 mm、15 个姿态估算：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>转法</th><th>弱方向 σ</th><th>球心误差 p95</th></tr></thead>
+    <tbody>
+      <tr><td>只在接受角内前后倾 ±25°</td><td>≈ 0.16 mm</td><td>≈ 0.34 mm</td></tr>
+      <tr><td>再加绕光束方向侧倾 ±45°</td><td>≈ 0.07 mm</td><td>≈ 0.14 mm</td></tr>
+      <tr><td>再加绕光束方向侧倾 ±60°</td><td>≈ 0.04 mm</td><td>≈ 0.10 mm</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted" style="font-size:14px">数值为仿真估计，用于定采集方法，不是实测。</p>
+  <p>侧倾之所以能转大，是因为 pivot 时“球窝 → SMR”大致竖直、光束大致水平，绕光束方向转不改变 SMR 相对光束的朝向（角锥棱镜绕自身光轴转，回光不变）。所以 pivot 要<strong>大角度侧倾、前后倾留在接受角内</strong>。侧倾过头时，重力会把 SMR 从磁吸窝里拽出来，要有防脱措施。</p>
+
+  <h3>顺带解决的三件事</h3>
+  <ul>
+    <li>left 的 pivot 平移（相机测，holdout p95 2.70 mm）第一次有独立核对。</li>
+    <li>right 的平移是从 left 拷贝的，最坏可能错 13 mm，这里直接测。</li>
+    <li>两侧 URDF 之间 6.15 mm 的矛盾：同一站位下两侧各做一次，取差值即可裁决。</li>
+  </ul>
+
+  <div class="aside warn">
+    <div class="k">看不见的一项 · TCP 的定义偏距 d</div>
+    <p><span class="m"><b>d</b></span> 在式 (13) 里抵消了，所以跟踪仪看不见它。它决定“TCP 到底在哪”，只能用 CAD、卡尺或三坐标单独量，需要量准到约 0.3 mm。生产 pivot 工具给它的默认不确定度是 5 mm；这一项不收紧，3 mm 就无从谈起。</p>
+  </div>
+  <p><strong>另一种做法（不推荐）：</strong>把 SMR 直接装到 TCP 处。这要换安装，钢片上的 <span class="m"><b>c</b></span> 随之作废，SMR 也离开了动态场的位置，pivot 和动态场就不再共用同一个 <span class="m"><b>c</b></span>。</p>
+</section>
+
+<section id="s10">
+  <h2><span class="n">10</span>动态部分与转移项</h2>
+  <p>pivot 只覆盖静止姿态。运动带来的额外误差要从动态轨迹场里拿：SMR 在钢片上，<span class="m"><b>c</b></span> 用冻结站位拟合，测到的是球心处的误差 <span class="m"><b>e</b><sub>ball</sub>(<i>t</i>)</span>。把它搬到 TCP：</p>
+  <div class="eq" role="math" aria-label="TCP 动态误差分解">
+    <div class="body"><span class="stack">
+      <span><b>e</b><sub>TCP</sub>(<i>t</i>) ≈ <b>e</b><sub>TCP,static</sub> + [ <b>e</b><sub>ball</sub>(<i>t</i>) − <b>e</b><sub>ball,static</sub> ] + <i>δθ</i><sub>dyn</sub>(<i>t</i>) × (<b>c</b><sub>TCP</sub> − <b>c</b>)</span>
+    </span></div>
+    <div class="num">(14)</div>
+  </div>
+  <ul>
+    <li><strong>第一项：</strong>静态 TCP 误差，由 §9 在同一姿态范围内直接测。</li>
+    <li><strong>第二项：</strong>运动造成的增量。在动态场里按速度分档，减去同一姿态区间的静态水平，剩下的就是运动带来的部分，如 <span class="m">|<b>v</b>|·Δ<i>t</i></span>、运动模糊、平滑器的影响。</li>
+    <li><strong>第三项（转移项）：</strong>运动时额外的姿态误差，乘以球心到 TCP 的距离。这段距离由 §9 实测（约为 <span class="m"><i>ρ</i></span> 加减 <span class="m">|<b>d</b>|</span>，几十毫米）。</li>
+  </ul>
+  <p>转移项有两个来源，处理方式不同：</p>
+  <ol>
+    <li><strong>时钟偏差造成的姿态滞后</strong> <span class="m"><i>ω</i>·Δ<i>t</i></span>：可以算。角速度 2 rad/s、时间偏差 0.3 ms、距离 70 mm 时约 0.04 mm，可以忽略。</li>
+    <li><strong>其余运动引起的姿态误差</strong>（运动模糊、跟踪滞后等）：只看一个点测不出来，只能给一个假设的上界，并写进结论。可以作为佐证的是：球心残差里含有 <span class="m"><i>δθ</i><sub>dyn</sub> × <b>c</b></span>，而 <span class="m">|<b>c</b>|</span> 比球心到 TCP 的距离大，所以球心动态增量小时，这一项通常更小。但单点上平移误差和旋转误差可能互相抵消，这不是严格上界。</li>
+  </ol>
+  <p>先做固定姿态的动态场次：姿态钉死时 <span class="m"><i>ω</i> ≈ 0</span>，第一种来源为零，第二项就是纯粹的位置链误差。再做真实操作场次，两者相减得到姿态相关的动态误差。</p>
+</section>
+
+<section id="s11">
+  <h2><span class="n">11</span>3 mm 怎么拼出来</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>项</th><th>由谁测</th><th>性质</th></tr></thead>
+    <tbody>
+      <tr><td>静态 TCP 误差（常量 + 随姿态）</td><td>跟踪仪 pivot，两侧各一场</td><td><span class="pill good">直接测</span></td></tr>
+      <tr><td>动态增量（随速度）</td><td>动态轨迹场，固定姿态 → 真实操作，按速度分档</td><td><span class="pill good">直接测</span></td></tr>
+      <tr><td>转移项①：时钟造成的姿态滞后</td><td>由时钟链实测的 Δt 与角速度计算</td><td><span class="pill good">可计算</span></td></tr>
+      <tr><td>转移项②：其余动态姿态误差</td><td>假设上界 × 实测距离</td><td><span class="pill mid">写明假设</span></td></tr>
+      <tr><td>TCP 定义偏距 d</td><td>CAD / 卡尺 / 三坐标</td><td><span class="pill mid">单独量，约 0.3 mm</span></td></tr>
+      <tr><td>GT 链自身</td><td>仪器、落座、钢片、站位、时间、插值；pivot 另加球心拟合（约 0.1 mm）</td><td><span class="pill mid">预算 ≤ 1 mm</span></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>合成。</strong>各项默认按线性相加，这是保守做法；只有在能说明各项相互独立时，才改用平方和。</p>
+  <p><strong>统计量用偏差本身，不用标准差。</strong>逐点算出 <span class="m">|<b>e</b>(<i>t</i>)|</span> 后，和 3 mm 比的是它的 p95（或 RMS），不是标准差。标准差先减掉了均值，而均值恰恰包含 <span class="m"><b>c</b><sub>TCP</sub></span> 的常量误差，可能有好几毫米。只报标准差，最大的一项就被悄悄删掉了。</p>
+  <p><strong>三条纪律，否则数字会偏乐观：</strong></p>
+  <ol>
+    <li><strong>参考不能在被评测的数据上拟合。</strong>站位、杠杆臂、时间偏差都要来自另外的采集（驻点集、pivot、时钟链）。在评测轨迹上拟合的任何量，都会吸收掉一部分真实误差。用两条轨迹做互相关来对齐时间尤其要避免：它会把所有随速度增长的误差一起吸收。</li>
+    <li><strong>按速度分档报，不报一个池化数。</strong>一条轨迹里大部分帧接近静止，池化后的 p95 会把高速段的误差淹没。每个速度档单独报，峰值速度那一档才是判据。</li>
+    <li><strong>写明覆盖率。</strong>只有跟踪仪有效的帧才进统计，而断光多发生在遮挡、大角度、快速运动这些最难的工况。结果只对被覆盖的帧成立，是全体误差的下界。</li>
+  </ol>
+  <p><strong>结论的写法。</strong>认证结论只对测到的范围成立，前提要写全，例如：</p>
+  <div class="aside">
+    <div class="k">结论模板</div>
+    <p>在已测的速度档（≤ … mm/s）与姿态范围（相对跟踪仪 …°）内，left / right 两侧 TCP 位置误差 p95 ≤ 3 mm。前提：TCP 定义偏距 d 按 ±0.3 mm；动态姿态误差按 ≤ …° 计；带 SMR 工装的构型。</p>
+  </div>
+  <p><strong>不在这条路径上的。</strong>三窝 AX=XB 与 STS 6D 靶测的是 TCP 的姿态。只认位置时，它们不是必需项；要认证 TCP 姿态时再做。</p>
+</section>
+
+<section id="s12">
+  <h2><span class="n">12</span>从理论推出的采集口径</h2>
+  <ul class="check">
+    <li><span><strong>驻点集采 20 段。</strong>15 段拟合、5 段留出；每段静止 3.5–4 s，手离开。<span class="ref">§3 §7</span></span></li>
+    <li><span><strong>驻点集绕两根不平行的轴转开，位置在三维里张开。</strong>滚转与倾斜都做；左右、前后、高低都拉开，直径 ≥ 0.3 m。<span class="ref">§4</span></span></li>
+    <li><span><strong>跟踪仪 pivot 两侧各做一场。</strong>每场 ≥ 15 个静止姿态；侧倾 ±45–60°，前后倾留在 ±25° 内；插件与相机 pivot 标定相同。<span class="ref">§9</span></span></li>
+    <li><span><strong>量准 d。</strong>球窝中心到 TCP 的偏距，CAD、卡尺或三坐标，约 0.3 mm。<span class="ref">§9</span></span></li>
+    <li><span><strong>动态场先固定姿态，再真实操作。</strong>按速度分档，峰值速度要覆盖生产速度。<span class="ref">§10</span></span></li>
+    <li><span><strong>全程光束锁定。</strong>断光的驻点直接作废，不要补。<span class="ref">§3</span></span></li>
+    <li><span><strong>所有场次同一站位、同一次安装。</strong>跟踪仪不挪，钢片与磁吸窝不碰；挪了或拆过，站位或 <span class="m"><b>c</b></span> 就要重做。<span class="ref">§6</span></span></li>
+    <li><span><strong>驻点集、pivot 与评测轨迹分开采。</strong><span class="ref">§8</span></span></li>
+  </ul>
+</section>
+
+<section id="sym">
+  <h2><span class="n">·</span>符号表</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>符号</th><th>含义</th><th>来源</th></tr></thead>
+    <tbody>
+      <tr><td>W, G, B</td><td>相机 world 系、跟踪仪系、cube 系（原点为 cube 中心）</td><td>—</td></tr>
+      <tr><td><span class="m"><b>p</b><sub><i>i</i></sub></span></td><td>第 <span class="m"><i>i</i></span> 个驻点上跟踪仪测得的球心均值，G 系</td><td class="trk">跟踪仪</td></tr>
+      <tr><td><span class="m"><i>R</i><sub><i>i</i></sub>, <b>t</b><sub><i>i</i></sub></span></td><td>第 <span class="m"><i>i</i></span> 个驻点上 cube 在 W 中的位姿均值</td><td class="cam">相机</td></tr>
+      <tr><td><span class="m"><b>c</b></span></td><td>钢片上 SMR 球心在 B 中的坐标（杠杆臂）</td><td>待求</td></tr>
+      <tr><td><span class="m"><i>T</i><sub>WG</sub> = (<i>R</i><sub>WG</sub>, <b>t</b><sub>WG</sub>)</span></td><td>跟踪仪站位：把 G 中的点变到 W</td><td>待求</td></tr>
+      <tr><td><span class="m"><b>c</b><sub>TCP</sub></span></td><td>生产标定给出的 TCP 在 B 中的坐标</td><td>生产标定</td></tr>
+      <tr><td><span class="m"><b>s</b>, <i>ρ</i></span></td><td>pivot 球窝中心（G 系）与钢片球心到它的距离</td><td class="trk">跟踪仪</td></tr>
+      <tr><td><span class="m"><b>d</b></span></td><td>球窝中心到 TCP 的偏距（B 系）</td><td>CAD / 实测</td></tr>
+      <tr><td><span class="m"><b>e</b><sub>TCP</sub>, <b>e</b><sub>ball</sub></span></td><td>TCP 处 / 球心处的位置误差</td><td>派生</td></tr>
+      <tr><td><span class="m"><b>c</b><sub><i>i</i></sub></span></td><td>单个位姿隐含的杠杆臂，式 (8)</td><td>派生</td></tr>
+      <tr><td><span class="m"><i>g</i><sub>min</sub></span></td><td>最弱增益：位姿对差分堆叠后的最小奇异值</td><td>派生</td></tr>
+      <tr><td><span class="m"><i>σ</i><sub>pose</sub></span></td><td>单个驻点上相机预测球心的误差（每轴）</td><td>—</td></tr>
+      <tr><td>span / drift</td><td>驻点内距均值的极差 / 前后三分之一均值的净位移</td><td class="trk">跟踪仪</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>
+  对应实现：杠杆臂与站位在 <code>metrology/tracker_mount_fit.py</code>（<code>fit_station</code> / <code>fit_lever_arm</code> / <code>assess_mount_observability</code>），驻点切分在 <code>metrology/cli/fit_tracker_mount.py</code>，驻点质量与几何条件在 <code>metrology/laser_tracker_registration.py</code>。跟踪仪 pivot（§9）与 TCP 逐位姿比较在 <code>metrology/tracker_pivot.py</code>（<code>fit_tracker_mount pivot</code>），从采集目录一键到拟合用 <code>metrology/cli/solve_tracker_capture.py</code>。本文只讲原理，不含实验数据。
+</footer>
+</article>
+</div>
+
+
+<script>
+(function () {
+  "use strict";
+  function halton(i, b) { var f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }
+  function mul(A, B) {
+    var C = [[0,0,0],[0,0,0],[0,0,0]];
+    for (var r = 0; r < 3; r++) for (var c = 0; c < 3; c++) { var s = 0; for (var k = 0; k < 3; k++) s += A[r][k] * B[k][c]; C[r][c] = s; }
+    return C;
+  }
+  function Rz(a) { var c = Math.cos(a), s = Math.sin(a); return [[c,-s,0],[s,c,0],[0,0,1]]; }
+  function Rx(a) { var c = Math.cos(a), s = Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+  // Eigenvalues of a symmetric 3x3 matrix by cyclic Jacobi rotations.
+  function eigSym3(M) {
+    var A = M.map(function (r) { return r.slice(); });
+    for (var sweep = 0; sweep < 60; sweep++) {
+      var off = Math.abs(A[0][1]) + Math.abs(A[0][2]) + Math.abs(A[1][2]);
+      if (off < 1e-15) break;
+      [[0,1],[0,2],[1,2]].forEach(function (pq) {
+        var p = pq[0], q = pq[1];
+        if (Math.abs(A[p][q]) < 1e-18) return;
+        var th = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+        var t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+        var c = 1 / Math.sqrt(t * t + 1), s = t * c, k, x, y;
+        for (k = 0; k < 3; k++) { x = A[k][p]; y = A[k][q]; A[k][p] = c * x - s * y; A[k][q] = s * x + c * y; }
+        for (k = 0; k < 3; k++) { x = A[p][k]; y = A[q][k]; A[p][k] = c * x - s * y; A[q][k] = s * x + c * y; }
+      });
+    }
+    return [A[0][0], A[1][1], A[2][2]].sort(function (a, b) { return a - b; });
+  }
+  // Same quantity as tracker_mount_fit._rotation_gains: singular values of the
+  // stacked pair differences (R_i - R_j), normalised by the number of pairs.
+  function gains(A_deg, B_deg, N) {
+    var R = [], i, j;
+    for (i = 0; i < N; i++) {
+      var a = (2 * halton(i + 1, 2) - 1) * A_deg * Math.PI / 180;
+      var b = (2 * halton(i + 1, 3) - 1) * B_deg * Math.PI / 180;
+      R.push(mul(Rz(a), Rx(b)));
+    }
+    var S = [[0,0,0],[0,0,0],[0,0,0]], P = 0;
+    for (i = 0; i < N - 1; i++) for (j = i + 1; j < N; j++) {
+      var D = [[0,0,0],[0,0,0],[0,0,0]], r, c, k;
+      for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) D[r][c] = R[i][r][c] - R[j][r][c];
+      for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) { var s = 0; for (k = 0; k < 3; k++) s += D[k][r] * D[k][c]; S[r][c] += s; }
+      P++;
+    }
+    if (P === 0) return 0;
+    for (var r2 = 0; r2 < 3; r2++) for (var c2 = 0; c2 < 3; c2++) S[r2][c2] /= P;
+    var ev = eigSym3(S);
+    return Math.sqrt(Math.max(ev[0], 0));
+  }
+  var $ = function (id) { return document.getElementById(id); };
+  function update() {
+    var A = +$("axA").value, B = +$("axB").value, N = +$("nPose").value, sp = +$("sPose").value;
+    $("axAv").textContent = A + "°";
+    $("axBv").textContent = B + "°";
+    $("nPosev").textContent = String(N);
+    $("sPosev").textContent = sp.toFixed(1) + " mm";
+    var g = gains(A, B, N);
+    var eq = 2 * Math.asin(Math.min(Math.max(g, 0), 2) / 2) * 180 / Math.PI;
+    $("oG").textContent = g < 5e-4 ? "0.000" : g.toFixed(3);
+    $("oEq").textContent = eq.toFixed(1) + "°";
+    $("oJ").textContent = g < 5e-4 ? "∞" : (sp / (g * Math.sqrt(N))).toFixed(2) + " mm";
+    $("oF").textContent = (sp / Math.sqrt(N)).toFixed(2) + " mm";
+    var pill = $("oPill"), msg = $("oMsg");
+    if (g < 0.05) {
+      pill.className = "pill bad"; pill.textContent = "联合解会拒绝";
+      msg.textContent = (A === 0 || B === 0) ? "只绕一根轴转：c 沿这根轴的分量看不见。" : "转角低于 2.9° 等效地板，c 与站位分不开。";
+    } else if (g < 0.2) {
+      pill.className = "pill mid"; pill.textContent = "可解，但放大明显";
+      msg.textContent = "误差放大 " + (1 / g).toFixed(1) + " 倍；优先把转得少的那根轴转开。";
+    } else {
+      pill.className = "pill good"; pill.textContent = "条件良好";
+      msg.textContent = "误差放大 " + (1 / g).toFixed(1) + " 倍。";
+    }
+  }
+  ["axA", "axB", "nPose", "sPose"].forEach(function (id) { $(id).addEventListener("input", update); });
+  update();
+})();
+</script>
+</body>
+</html>

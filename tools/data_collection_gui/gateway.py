@@ -392,6 +392,17 @@ class TrackerMountSession:
     dwellsStarted: int = 0
     message: str = ""
     startedAt: str = ""
+    # "dwell": parked poses for the station and the lever arm. "pivot": the TCP
+    # pinned in the pivot socket (E1p), the SMR still on its plate. Same capture
+    # tree and the same recorder calls; the protocol written into each episode
+    # is what lets the solve tell them apart later.
+    kind: str = "dwell"
+    # When the segment in flight was started, to catch a take that is saved
+    # before it can hold a dwell (2.0 s still + 0.3 s trimmed at each end). The
+    # 2026-09-21 capture lost 4 of 15 poses to exactly this.
+    lastSegmentStartedMono: float = 0.0
+    lastSegmentSeconds: float = 0.0
+    shortSegments: int = 0
 
 
 @dataclass
@@ -407,6 +418,12 @@ class MarkerTcpSample:
     staticTransformPath: str = ""
     note: str = ""
     createdAt: str = ""
+    # Whether this Connect had the laser tracker on, and the tracker session the
+    # sample's stream is in. A pivot sample recorded with the SMR on its plate is
+    # also an E1p capture; these say which ones are, without reopening meta.json
+    # on every snapshot. The solve reads meta.json itself.
+    laserTracker: bool = False
+    trackerSessionId: str = ""
 
 
 @dataclass
@@ -423,6 +440,9 @@ class MarkerTcpSession:
     solveSummaryPath: str = ""
     pivotReportPath: str = ""
     trackingRunPath: str = ""
+    # The last tracker check (E1p) run from this panel: production's TCP against
+    # the socket the tracker finds, on the same pivot samples.
+    trackerCheck: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -4064,6 +4084,15 @@ def _marker_tcp_root(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "metrology" / "marker_tcp_repeatability"
 
 
+# A pivot sample is a sweep about the socket with pauses in it: the camera pivot
+# fit uses every frame, the tracker check (E1p) only the pauses. 3.5 s is the
+# roadmap's per-pose hold -- a dwell needs 2.0 s still after 0.3 s is trimmed
+# from each end (2.6 s), and a hand-held pause settles less cleanly than a
+# parked one.
+_MARKER_TCP_PIVOT_PROTOCOL = "tcp_pivot_sweep"
+_MARKER_TCP_E1P_PAUSE_S = 3.5
+
+
 def _marker_tcp_session_path(state: GatewayState) -> Path | None:
     session = state.marker_tcp_session
     if not session.sessionRoot:
@@ -4691,7 +4720,23 @@ def _marker_tcp_record_sample(
                 return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
             if state.recording.state in {"idle", "error"}:
                 return {"ok": False, "error": "相机还没连接。请先到「采集」页 Connect，再回来采 marker→TCP 样本。"}
-            _start_episode(state)
+            if _state_is_gmsl2(state):
+                # Why this episode exists, in its own meta.json. On disk a pivot
+                # sample is nine videos like any other, and the tracker-mount
+                # discovery lists every tracker-carrying episode it finds.
+                _start_episode(
+                    state,
+                    capture_intent={
+                        "purpose": "calibration_marker_tcp",
+                        "session_id": session.sessionName,
+                        "box_id": box_id_norm,
+                        "condition": condition_text,
+                        "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
+                    },
+                )
+            else:
+                _start_episode(state)
+            tracker_on = bool(state.recording.laserTracker)
             sample = MarkerTcpSample(
                 id=f"sample_{len(session.samples) + 1:03d}",
                 side=target_label,
@@ -4702,10 +4747,18 @@ def _marker_tcp_record_sample(
                 datasetRoot=state.recording.datasetRoot,
                 episodeIndex=int(state.recording.episodeIndex),
                 createdAt=datetime.now(timezone.utc).isoformat(),
+                laserTracker=tracker_on,
+                trackerSessionId=(
+                    _tracker_session_id_from_detail(state.recording.laserTrackerDetail) if tracker_on else ""
+                ),
             )
             session.samples.append(sample)
             session.pendingSampleId = sample.id
-            session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。"
+            session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。" + (
+                f"跟踪仪在录：每个姿态静止 ≥ {_MARKER_TCP_E1P_PAUSE_S:g}s 才算一个 E1p 驻点，别断光。"
+                if tracker_on
+                else ""
+            )
         elif action in {"save", "discard"}:
             sample = _marker_tcp_pending_sample(state)
             if sample is None:
@@ -4720,10 +4773,16 @@ def _marker_tcp_record_sample(
                 _stop_recorder(state, action)
             sample.datasetRoot = state.recording.datasetRoot or sample.datasetRoot
             sample.episodeIndex = episode_index
+            if sample.laserTracker and not sample.trackerSessionId:
+                sample.trackerSessionId = _tracker_session_id_from_detail(state.recording.laserTrackerDetail)
             if action == "save":
                 sample.status = "saved"
                 sample.note = "raw recording saved; use solve to estimate marker rig->TCP, or register an external static_transform.json"
-                session.message = "样本已保存。可继续录制同一 BOX 的其它 pivot 段，或直接点击解算写入生产 bundle。"
+                session.message = "样本已保存。可继续录制同一 BOX 的其它 pivot 段，或直接点击解算写入生产 bundle。" + (
+                    "带跟踪仪的样本要等 Disconnect 之后才能跑 E1p：跟踪仪 session 那时才 seal + 落地。"
+                    if sample.laserTracker
+                    else ""
+                )
             else:
                 sample.status = "discarded"
                 sample.note = "discard requested; ignored by repeatability report"
@@ -5373,7 +5432,10 @@ def _tracker_mount_rows(payload: dict[str, Any]) -> list[dict[str, str]]:
             raise ValueError(f"第 {i + 1} 行不是对象")
         session = str(item.get("session") or "").strip()
         dataset = str(item.get("dataset") or "").strip()
-        episode = str(item.get("episode") or "").strip()
+        # Not ``or ""``: episode 0 is the first segment of every capture, and a
+        # numeric 0 is falsy.
+        raw_episode = item.get("episode")
+        episode = "" if raw_episode is None else str(raw_episode).strip()
         mount_id = str(item.get("mountId") or item.get("mount_id") or "").strip()
         if not session or not dataset or not episode or not mount_id:
             raise ValueError(f"第 {i + 1} 行缺字段（session / dataset / episode / mountId 都必填）")
@@ -5440,6 +5502,414 @@ def _tracker_mount_result(
     }
 
 
+def _require_one_mount(rows: list[dict[str, str]], mode: str) -> None:
+    """``lever-arm`` and ``pivot`` solve one plate: many segments, one mount id.
+
+    This used to read "one session" and allow exactly one row. Under the
+    one-pose-per-segment protocol a single row is a single pose, which the CLI
+    then refuses -- the same segment-versus-mount confusion that
+    ``_merge_by_mount`` fixed in the CLI, surviving one layer up.
+    """
+    mounts = sorted({row["mountId"] for row in rows})
+    if len(mounts) != 1:
+        raise ValueError(f"{mode} 一次只解一个 mount（选中的段来自 {', '.join(mounts)}）")
+
+
+def _note_tracker_mount_segment_end(state: GatewayState, action: str) -> None:
+    """Say so at once when a parked-pose segment is saved too short to be a dwell.
+
+    Found at solve time it costs a re-setup; said at the button it costs one
+    more press while the rig is still standing where it was.
+    """
+    session = state.tracker_mount_session
+    started = session.lastSegmentStartedMono
+    session.lastSegmentStartedMono = 0.0
+    if not session.active or started <= 0.0 or action != "save":
+        return
+    elapsed = time.monotonic() - started
+    session.lastSegmentSeconds = round(elapsed, 2)
+    if elapsed < _TRACKER_MOUNT_SEGMENT_MIN_S:
+        session.shortSegments += 1
+        session.message = (
+            f"这一段只录了 {elapsed:.1f}s，装不下一个驻点（至少 {_TRACKER_MOUNT_SEGMENT_MIN_S:g}s），"
+            "解算时会被丢掉——这个姿态请重录，并静止到自动收尾。"
+        )
+        state.log("warn", f"Tracker-mount segment saved after {elapsed:.1f}s, below the dwell floor")
+
+
+def _run_tracker_mount_pivot(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """E1p: production's TCP against the pivot socket the tracker finds.
+
+    The one solve that can see production's ``c_TCP`` -- nothing in the cube
+    frame is fitted, so a wrong constant is not absorbed. Position only, and the
+    socket-to-TCP offset cancels in it; the report says both.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        _require_one_mount(rows, "pivot")
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError("pivot 需要一个已冻结的 station JSON 路径（同一个跟踪仪站位）")
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        cube = str(payload.get("cube") or "").strip()
+        if not cube:
+            raise ValueError("pivot 需要指明 cube（left / right）")
+        bundle_raw = str(payload.get("markerTcp") or "").strip()
+        bundle = _resolve_user_path(state, bundle_raw) if bundle_raw else _default_marker_tcp_bundle_path(state)
+        if bundle is None or not bundle.is_file():
+            raise FileNotFoundError(f"marker→TCP bundle 不存在: {bundle}")
+        args = _tracker_mount_capture_args(state, rows)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"pivot_{cube}_{stamp}.json"
+    args = [
+        "pivot", *args, "--station", str(station), "--marker-tcp", str(bundle),
+        "--cube", cube, "--out", str(out_path),
+    ]
+    mount_fit = str(payload.get("mountFit") or "").strip()
+    if mount_fit:
+        args += ["--mount-fit", str(_resolve_user_path(state, mount_fit))]
+    budget = str(payload.get("tcpBudgetMm") or "").strip()
+    if budget:
+        args += ["--tcp-budget-mm", budget]
+    target = str(payload.get("target") or "").strip()
+    if target:
+        args += ["--target", target]
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    result = _tracker_mount_result(state, run, out_path, kind="pivot")
+    result["stationPath"] = str(station)
+    result["markerTcpPath"] = str(bundle)
+    return result
+
+
+# --- E1p from the marker->TCP panel: the camera pivot samples, read by the tracker
+
+# What the panel draws; the rest of the artifact (per-dwell diagnostics, the
+# session dicts) stays on disk behind ``reportPath``. The snapshot carries this
+# on every poll, so it is kept to the numbers a person reads.
+_E1P_REPORT_KEYS = (
+    "n_poses",
+    "cube",
+    "mount_id",
+    "static_tcp_error_mm",
+    "tcp_budget_mm",
+    "static_p95_within_budget",
+    "c_tcp_production_mm",
+    "c_tcp_measured_mm",
+    "c_tcp_error_mm",
+    "c_tcp_error_norm_mm",
+    "d_cube_mm",
+    "split",
+    "rotation_span_deg",
+    "sphere",
+    "radius_check_mm",
+    "certifies",
+    "certify_reasons",
+    "cannot_see",
+    "smr_to_tcp_cube_mm",
+    "smr_to_tcp_norm_mm",
+    "pose_frame",
+    "bundle_calibration_id",
+    "episodes_without_dwells",
+)
+_MARKER_TCP_TRAJ_GEN_TIMEOUT_S = 7200.0
+
+
+def _marker_tcp_sidecar_path(dataset: Path, cube: str) -> Path:
+    return dataset / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / f"state_action.{cube}.csv"
+
+
+def _marker_tcp_sidecar_is_current(dataset: Path, cube: str, episode_dirs: list[Path]) -> bool:
+    """Whether production's per-cube sidecar was written after these episodes were.
+
+    A sidecar from before the last sample was saved has no rows for it, and the
+    fit would then refuse that sample for "0 camera frames" -- a message about
+    the capture for what is only a stale file.
+    """
+    sidecar = _marker_tcp_sidecar_path(dataset, cube)
+    if not sidecar.is_file():
+        return False
+    stamps = [(d / "meta.json").stat().st_mtime for d in episode_dirs if (d / "meta.json").is_file()]
+    return not stamps or sidecar.stat().st_mtime >= max(stamps)
+
+
+def _traj_gen_bundle_path(state: GatewayState, dataset: Path) -> Path:
+    """The marker->TCP bundle the dataset's EE trajectory was composed with.
+
+    The sidecar holds TCP poses, and the fit converts what it finds back into
+    the cube frame with a bundle's ``T_cube_tcp`` -- right only if it is the one
+    the tracking composed. A trajectory generated with an override bundle
+    records it in the processing meta; otherwise it is the production default.
+    """
+    meta = _load_processing_meta(dataset) or {}
+    job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
+    raw = str(job.get("marker_to_tcp_calibration_path") or "").strip() if job.get("kind") == "traj-gen" else ""
+    path = _resolve_user_path(state, raw) if raw else _default_marker_tcp_bundle_path(state)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(f"找不到 {dataset.name} 的 EE 轨迹所用的 marker→TCP bundle：{path}")
+    return path
+
+
+def _await_traj_gen(
+    state: GatewayState,
+    dataset: Path,
+    *,
+    on_progress: Callable[[str], None],
+    timeout_s: float = _MARKER_TCP_TRAJ_GEN_TIMEOUT_S,
+    poll_s: float = 2.0,
+) -> dict[str, Any]:
+    """Wait for the dataset's trajectory job and return its final record.
+
+    Waits for the process to be released *and* the status to be final: the
+    output reader drops the process before it writes "complete", and reading
+    in between would see the job as still running or, worse, as the previous
+    job's "complete".
+    """
+    key = str(dataset)
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while True:
+        with state.lock:
+            busy = key in state.processing_starting or key in state.processing_processes
+        meta = _load_processing_meta(dataset) or {}
+        job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
+        if not busy and str(job.get("status") or "") in ("complete", "failed", "error"):
+            return job
+        message = str(job.get("message") or "")
+        if message and message != last:
+            on_progress(message)
+            last = message
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成 {timeout_s:g}s 内没有结束")
+        time.sleep(poll_s)
+
+
+def _marker_tcp_tracker_rows(
+    state: GatewayState, samples: list[MarkerTcpSample], mount_id: str
+) -> tuple[list[dict[str, str]], list[str], dict[str, list[Path]]]:
+    """Fit rows for the samples that carry a landed tracker stream.
+
+    Read from each episode's meta.json, not from the sample record: the recorder
+    writes what the tracker actually did, and "asked for and failed" has to stay
+    distinguishable from "not asked for". A sample whose stream has not landed
+    refuses the whole check -- solving on the rest would quietly drop poses.
+    """
+    rows: list[dict[str, str]] = []
+    notes: list[str] = []
+    episode_dirs: dict[str, list[Path]] = {}
+    for sample in samples:
+        dataset = _resolve_user_path(state, sample.datasetRoot)
+        ep_dir = dataset / "episodes" / f"episode_{int(sample.episodeIndex):06d}"
+        if not ep_dir.is_dir():
+            raise FileNotFoundError(f"{sample.id} 的 episode 目录不存在：{ep_dir}")
+        meta = _read_json_file(ep_dir / "meta.json") or {}
+        tracker = meta.get("laser_tracker") if isinstance(meta.get("laser_tracker"), dict) else {}
+        if not tracker.get("enabled"):
+            notes.append(f"{sample.id}（ep{sample.episodeIndex}）录制时没开跟踪仪，跳过")
+            continue
+        session_id = str(tracker.get("session_id") or "")
+        session_dir = _tracker_session_dir_for(state, dataset, session_id)
+        if session_dir is None:
+            raise RuntimeError(
+                f"{sample.id} 的跟踪仪 session {session_id or '（没有 id）'} 还没落地："
+                "它在 Disconnect 时才 seal + land。先到「采集」页 Disconnect，再跑 E1p。"
+            )
+        rows.append(
+            {
+                "session": str(session_dir),
+                "dataset": str(dataset),
+                "episode": str(int(sample.episodeIndex)),
+                "mountId": mount_id,
+                "sessionId": session_id,
+            }
+        )
+        episode_dirs.setdefault(str(dataset), []).append(ep_dir)
+    return rows, notes, episode_dirs
+
+
+def _run_marker_tcp_tracker_check(
+    state: GatewayState, payload: dict[str, Any], *, background: bool = True
+) -> dict[str, Any]:
+    """E1p on the camera pivot samples of one BOX and one clamping.
+
+    The same physical act as the camera pivot -- TCP insert seated in the
+    socket, gripper turned about it -- recorded with the SMR on its plate and
+    the tracker on. The camera pivot fit reads every frame; this reads only the
+    pauses, and it grades production's labels rather than fitting a new
+    constant: nothing is written to the bundle.
+
+    One condition at a time because one clamping is one sphere: re-clamping the
+    insert moves the socket in the cube frame, and merging two clampings would
+    fit one sphere to two.
+    """
+    session = state.marker_tcp_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    if session.pendingSampleId:
+        return {"ok": False, "error": "还有样本正在录制，请先保存或丢弃当前段"}
+    if session.stage == "solving":
+        return {"ok": False, "error": "已有解算在进行中，请等它结束"}
+    try:
+        box_id_norm, target_label = _marker_tcp_target_label(box_id=str(payload.get("boxId") or ""))
+        condition = str(payload.get("condition") or "").strip()
+        if not condition:
+            raise ValueError("要指明条件：一个条件 = 一次夹持 = 一个球面")
+        cube_name, _entry, _bundle = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError(
+                "E1p 需要同一跟踪仪站位的 station：先用驻点集解出来（跟踪仪不动的话，先录 pivot 后解站位也行）"
+            )
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        mount_fit_raw = str(payload.get("mountFit") or "").strip()
+        mount_fit = _resolve_user_path(state, mount_fit_raw) if mount_fit_raw else None
+        if mount_fit is not None and not mount_fit.is_file():
+            raise FileNotFoundError(f"lever-arm JSON 不存在: {mount_fit}")
+        samples = [s for s in _marker_tcp_saved_samples(session, box_id_norm) if s.condition == condition]
+        if not samples:
+            raise ValueError(f"{target_label} · {condition} 没有 saved 样本")
+        mount_id = _marker_tcp_slug(f"{box_id_norm}_{condition}")
+        rows, notes, episode_dirs = _marker_tcp_tracker_rows(state, samples, mount_id)
+        if not rows:
+            raise ValueError(
+                f"{target_label} · {condition} 的样本录制时都没开跟踪仪。"
+                "到「采集」页打开跟踪仪开关、重新 Connect，再录。"
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+
+    plan = {
+        "box_id_norm": box_id_norm,
+        "target_label": target_label,
+        "cube_name": cube_name,
+        "condition": condition,
+        "mount_id": mount_id,
+        "station": station,
+        "mount_fit": mount_fit,
+        "rows": rows,
+        "notes": notes,
+        "episode_dirs": episode_dirs,
+    }
+    if not background:
+        return _marker_tcp_tracker_check_worker(state, plan)
+
+    session.stage = "solving"
+    session.message = f"{target_label} · {condition}：E1p 已开始（{len(rows)} 段带跟踪仪的样本）…"
+    _save_marker_tcp_session(state)
+    Thread(
+        target=_marker_tcp_tracker_check_worker,
+        args=(state, plan),
+        daemon=True,
+        name=f"marker-tcp-e1p-{_marker_tcp_slug(box_id_norm)}",
+    ).start()
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _marker_tcp_tracker_check_worker(state: GatewayState, plan: dict[str, Any]) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    target_label = plan["target_label"]
+    cube = plan["cube_name"]
+    check: dict[str, Any] = {
+        "boxId": plan["box_id_norm"],
+        "cube": cube,
+        "condition": plan["condition"],
+        "mountId": plan["mount_id"],
+        "stationPath": str(plan["station"]),
+        "mountFitPath": "" if plan["mount_fit"] is None else str(plan["mount_fit"]),
+        "samples": len(plan["rows"]),
+        "notes": list(plan["notes"]),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        # 1. Production's own labels for these samples. E1p grades what
+        #    production writes, smoother included, so the sidecar is the one the
+        #    replay page shows -- generated through the same job, not a private
+        #    tracking run that could differ from it.
+        bundle: Path | None = None
+        for dataset_text, ep_dirs in plan["episode_dirs"].items():
+            dataset = Path(dataset_text)
+            if not _marker_tcp_sidecar_is_current(dataset, cube, ep_dirs):
+                session.message = f"{target_label}：E1p 先生成 {dataset.name} 的生产 EE 轨迹（{cube}）…"
+                _save_marker_tcp_session(state)
+                _queue_traj_gen(state, dataset)
+
+                def progress(text: str, name: str = dataset.name) -> None:
+                    session.message = f"{target_label}：E1p 生成 {name} 的 EE 轨迹：{text[:160]}"
+
+                job = _await_traj_gen(state, dataset, on_progress=progress)
+                if job.get("status") != "complete":
+                    raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
+                if not _marker_tcp_sidecar_is_current(dataset, cube, ep_dirs):
+                    raise RuntimeError(
+                        f"{dataset.name} 的 EE 轨迹生成完了，但没有覆盖这些样本的 "
+                        f"{_marker_tcp_sidecar_path(dataset, cube).name}"
+                    )
+            used = _traj_gen_bundle_path(state, dataset)
+            if bundle is not None and used != bundle:
+                raise RuntimeError(
+                    f"两个数据集的 EE 轨迹用了不同的 marker→TCP bundle（{bundle} / {used}），不能放进同一次 E1p"
+                )
+            bundle = used
+        assert bundle is not None
+        check["markerTcpPath"] = str(bundle)
+
+        # 2. The fit. Sweeps are allowed to contain samples with no pause at
+        #    all; those are listed in the artifact rather than failing the run.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = _tracker_mount_output_root(state) / f"pivot_{cube}_{stamp}.json"
+        args = [
+            "pivot",
+            *_tracker_mount_capture_args(state, plan["rows"]),
+            "--station", str(plan["station"]),
+            "--marker-tcp", str(bundle),
+            "--cube", cube,
+            "--skip-episodes-without-dwells",
+            "--out", str(out_path),
+        ]
+        if plan["mount_fit"] is not None:
+            args += ["--mount-fit", str(plan["mount_fit"])]
+        session.message = f"{target_label}：E1p 拟合球窝中心，逐位姿比较生产 TCP…"
+        _save_marker_tcp_session(state)
+        result = _tracker_mount_result(state, _run_tracker_mount_command(state, args), out_path, kind="pivot")
+        report = result.get("report") if isinstance(result.get("report"), dict) else None
+        check.update(
+            {
+                # 0 certifies, 1 ran and does not certify (a finding), 2 cannot run.
+                "ok": result["returncode"] in (0, 1) and report is not None,
+                "returncode": result["returncode"],
+                "reportPath": result["reportPath"],
+                "summary": result["summary"],
+                "error": result["error"] if result["returncode"] not in (0, 1) else "",
+                "report": None if report is None else {k: report[k] for k in _E1P_REPORT_KEYS if k in report},
+            }
+        )
+        if not check["ok"]:
+            raise RuntimeError(check["error"] or "E1p 没有给出结果")
+        session.trackerCheck = check
+        session.stage = "capture"
+        session.message = f"{target_label} · {plan['condition']}：E1p 完成（{result['summary'] or out_path.name}）"
+        state.log("info", f"Marker→TCP E1p written: {out_path}")
+    except Exception as exc:  # noqa: BLE001
+        check.update({"ok": False, "error": str(exc)})
+        session.trackerCheck = check
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
 def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     """Fit ``T_WG`` across sessions, one lever arm per session.
 
@@ -5484,8 +5954,7 @@ def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -
     """
     try:
         rows = _tracker_mount_rows(payload)
-        if len(rows) != 1:
-            raise ValueError("lever-arm 一次只吃一个 session")
+        _require_one_mount(rows, "lever-arm")
         station_raw = str(payload.get("station") or "").strip()
         if not station_raw:
             raise ValueError("需要一个已冻结的 station JSON 路径")
@@ -5519,6 +5988,29 @@ def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -
 
 _TRACKER_MOUNT_CAPTURE_KIND = "tracker_mount"
 
+# One parked pose per segment. A dwell is 2.0 s of stillness after 0.3 s is
+# trimmed off each end (``fit_tracker_mount --min-dwell-s / --settle-s``), so a
+# segment shorter than 2.6 s cannot yield one at all; 4 s leaves room for the
+# hand leaving the rig. These restate the solver's floor rather than invent one.
+_TRACKER_MOUNT_SEGMENT_MIN_S = 2.6
+_TRACKER_MOUNT_SEGMENT_SUGGESTED_S = 4.0
+_TRACKER_MOUNT_KINDS = {
+    "dwell": {
+        "protocol": "smr_parked_pose_dwell",
+        "message": (
+            "一段一个姿态：摆好、手离开，点「录一段」，静止到自动收尾。"
+            "拟合要 ≥ 15 段，要留出复核就录 20 段；姿态要绕两根不平行的轴转开。"
+        ),
+    },
+    "pivot": {
+        "protocol": "tcp_pivot_dwell",
+        "message": (
+            "pivot：插件球头卡在球窝里，SMR 留在钢片上。一段一个姿态，静止到自动收尾；"
+            "绕光束方向侧倾 ±45–60°，前后倾留在 ±25° 内；≥ 15 段，两侧各一场。"
+        ),
+    },
+}
+
 
 def _tracker_mount_capture_root(state: GatewayState, session_name: str) -> Path:
     """Where parked-pose episodes for a mount fit are written.
@@ -5532,7 +6024,9 @@ def _tracker_mount_capture_root(state: GatewayState, session_name: str) -> Path:
     return _calibration_captures_root(state) / session_name / _TRACKER_MOUNT_CAPTURE_KIND
 
 
-def _tracker_mount_capture_intent(session_name: str, pose_label: str, seconds: float) -> dict[str, Any]:
+def _tracker_mount_capture_intent(
+    session_name: str, pose_label: str, seconds: float, kind: str = "dwell"
+) -> dict[str, Any]:
     """Why this episode exists, written where it survives a gateway restart.
 
     On disk a parked-pose segment and a trajectory segment are the same nine
@@ -5543,7 +6037,7 @@ def _tracker_mount_capture_intent(session_name: str, pose_label: str, seconds: f
         "purpose": "calibration_tracker_mount",
         "session_id": session_name,
         "pose_label": pose_label,
-        "protocol": "smr_parked_pose_dwell",
+        "protocol": _TRACKER_MOUNT_KINDS.get(kind, _TRACKER_MOUNT_KINDS["dwell"])["protocol"],
         "segment_seconds": seconds,
     }
 
@@ -5609,6 +6103,11 @@ def _tracker_mount_session_payload(state: GatewayState) -> dict[str, Any]:
         "dwellsOnDisk": _tracker_mount_dwells_on_disk(session),
         "message": session.message,
         "startedAt": session.startedAt,
+        "kind": session.kind,
+        "shortSegments": session.shortSegments,
+        "lastSegmentSeconds": session.lastSegmentSeconds,
+        "segmentMinSeconds": _TRACKER_MOUNT_SEGMENT_MIN_S,
+        "segmentSuggestedSeconds": _TRACKER_MOUNT_SEGMENT_SUGGESTED_S,
         # Both pages render off this snapshot, so the recorder's own state has to
         # travel with the session -- otherwise each page derives "can I record?"
         # from a different source and they disagree on screen, which is exactly
@@ -5636,6 +6135,13 @@ def _start_tracker_mount_session(state: GatewayState, payload: dict[str, Any]) -
             "error": "多相机标定会话正在占用录制器，先结束它。",
             "session": _tracker_mount_session_payload(state),
         }
+    kind = str(payload.get("kind") or "dwell").strip() or "dwell"
+    if kind not in _TRACKER_MOUNT_KINDS:
+        return {
+            "ok": False,
+            "error": f"未知的采集类型 {kind!r}（只有 dwell / pivot）",
+            "session": _tracker_mount_session_payload(state),
+        }
     name = str(payload.get("sessionName") or "").strip() or f"tm_{time.strftime('%Y%m%d_%H%M%S')}"
     capture_root = _tracker_mount_capture_root(state, name)
     state.tracker_mount_session = TrackerMountSession(
@@ -5647,8 +6153,12 @@ def _start_tracker_mount_session(state: GatewayState, payload: dict[str, Any]) -
         # this session started is still the Connect whose tracker stream these
         # dwells will be cut out of.
         trackerSessionId=_tracker_session_id_from_detail(state.recording.laserTrackerDetail),
-        message="连上录制器后录若干段停驻；每段内部至少 3 个停驻姿态。",
+        # The old text here ("每段内部至少 3 个停驻姿态") described the protocol
+        # before segments were merged by mount, and is what taught operators to
+        # save a long take early at every pose.
+        message=_TRACKER_MOUNT_KINDS[kind]["message"],
         startedAt=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        kind=kind,
     )
     state.log("info", f"Tracker-mount session {name} started")
     return {"ok": True, "session": _tracker_mount_session_payload(state)}
@@ -5689,11 +6199,20 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
     session_name = session.sessionName
     pose_label = str(payload.get("poseLabel") or "").strip()
     try:
-        seconds = float(payload.get("seconds") or 6.0)
+        seconds = float(payload.get("seconds") or _TRACKER_MOUNT_SEGMENT_SUGGESTED_S)
         if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError
     except (TypeError, ValueError):
         return {"ok": False, "error": "每段时长必须是正数秒"}
+    if seconds < _TRACKER_MOUNT_SEGMENT_MIN_S:
+        return {
+            "ok": False,
+            "error": (
+                f"{seconds:g}s 装不下一个驻点：要 2.0 s 静止，两端还各裁掉 0.3 s，"
+                f"至少 {_TRACKER_MOUNT_SEGMENT_MIN_S:g}s，建议 {_TRACKER_MOUNT_SEGMENT_SUGGESTED_S:g}s。"
+            ),
+            "session": _tracker_mount_session_payload(state),
+        }
 
     capture_root = Path(session.captureRoot)
     try:
@@ -5701,13 +6220,17 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
             state,
             seconds,
             capture_root=capture_root,
-            capture_intent=_tracker_mount_capture_intent(session_name, pose_label, seconds),
+            capture_intent=_tracker_mount_capture_intent(
+                session_name, pose_label, seconds, session.kind
+            ),
             require_capture_root_ack=True,
         )
     except Exception as exc:  # noqa: BLE001
         session.message = str(exc)
         return {"ok": False, "error": str(exc), "session": _tracker_mount_session_payload(state)}
     session.dwellsStarted += 1
+    session.lastSegmentStartedMono = time.monotonic()
+    session.lastSegmentSeconds = 0.0
     # A dwell started before the tracker id was known still belongs to whatever
     # session this Connect opened, so fill it in at the first chance instead of
     # leaving the field empty for the whole run.
@@ -5715,7 +6238,9 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
         session.trackerSessionId = _tracker_session_id_from_detail(
             state.recording.laserTrackerDetail
         )
-    session.message = f"第 {session.dwellsStarted} 段正在录，{seconds:g}s 后自动收尾。"
+    session.message = (
+        f"第 {session.dwellsStarted} 段正在录，{seconds:g}s 后自动收尾——静止到收尾，别提前保存。"
+    )
     return {
         "ok": True,
         "captureRoot": str(capture_root),
@@ -5834,6 +6359,8 @@ def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
                     "landed": session_dir is not None,
                     "poseLabel": str(intent.get("pose_label") or ""),
                     "purpose": str(intent.get("purpose") or ""),
+                    "protocol": str(intent.get("protocol") or ""),
+                    "segmentSeconds": float(intent.get("segment_seconds") or 0.0),
                     "beamValidFraction": float(tracker.get("beam_valid_fraction", -1.0)),
                     "streamAdvanced": bool(tracker.get("stream_advanced", True)),
                     "trackerError": str(tracker.get("error") or ""),
@@ -5859,6 +6386,14 @@ def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> di
         fit = _run_tracker_mount_station(state, payload)
     elif mode == "lever-arm":
         fit = _run_tracker_mount_lever_arm(state, payload)
+    elif mode == "pivot":
+        # Static, at the TCP: there is no trajectory to grade against it, so the
+        # chain ends at the fit whatever ``validate`` asked for.
+        fit = _run_tracker_mount_pivot(state, payload)
+        pivot_result: dict[str, Any] = {"ok": bool(fit.get("ok")), "fit": fit, "validate": None}
+        if not fit.get("ok"):
+            pivot_result["error"] = fit.get("error") or "pivot 没有通过"
+        return pivot_result
     else:
         return {"ok": False, "error": f"未知模式 {mode!r}", "returncode": 2}
 
@@ -14372,6 +14907,8 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
 
     if action in ("save", "discard") and state.recording.state not in ("recording", "review"):
         raise RuntimeError(f"Cannot {action} while recorder is {state.recording.state}.")
+    if action in ("save", "discard"):
+        _note_tracker_mount_segment_end(state, action)
 
     if action == "save":
         try:
@@ -15071,6 +15608,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
+                if path == "/api/calibration/marker-tcp/tracker-check":
+                    result = _run_marker_tcp_tracker_check(
+                        self.server.state,
+                        {
+                            "boxId": (query.get("box_id", query.get("boxId", [""]))[0] or "").strip(),
+                            "condition": (query.get("condition", [""])[0] or "").strip(),
+                            "station": (query.get("station", [""])[0] or "").strip(),
+                            "mountFit": (query.get("mount_fit", query.get("mountFit", [""]))[0] or "").strip(),
+                        },
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
                 if path == "/api/calibration/hand-eye/solve":
                     result = _run_hand_eye_solve(
                         self.server.state,
@@ -15091,6 +15641,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     # A refusal is an answer about the capture, not a server
                     # fault: the panel renders which refusal it was, so the
                     # returncode has to survive the transport.
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/pivot":
+                    result = _run_tracker_mount_pivot(self.server.state, _read_json_body(self))
                     _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/calibration/tracker-mount/lever-arm":

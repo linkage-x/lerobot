@@ -389,10 +389,26 @@ export function coverageVerdict(report: TrackerValidateReport | null | undefined
 
 // --- One-click capture: what is blocking the solve, in the operator's terms --
 
-/** Hard floors from the solver, restated once so the UI cannot drift from them. */
-export const DWELLS_PER_EPISODE_MIN = 3;
+/**
+ * Hard floors from the solver, restated once so the UI cannot drift from them.
+ *
+ * One parked pose per segment: the CLI merges segments by mount before it
+ * counts poses (`_merge_by_mount`), so a segment needs one dwell, not three.
+ * The old value here (3) described the protocol before that fix and taught
+ * operators to hold every pose inside one long take -- then save it early.
+ */
+export const DWELLS_PER_EPISODE_MIN = 1;
 export const POSES_TO_CERTIFY = 15;
+/** Held out and scored afterwards; certifying counts the fit set only. */
+export const HOLDOUT_SUGGESTED = 5;
+export const SEGMENTS_SUGGESTED = POSES_TO_CERTIFY + HOLDOUT_SUGGESTED;
 export const DWELL_SECONDS_MIN = 2.0;
+/** Trimmed from each end of a dwell: settling in, and starting to leave. */
+export const DWELL_TRIM_S = 0.3;
+/** Shortest segment that can hold one dwell at all. */
+export const SEGMENT_MIN_S = DWELL_SECONDS_MIN + 2 * DWELL_TRIM_S;
+/** Room for the hand to leave the rig before the still part starts. */
+export const SEGMENT_SUGGESTED_S = 4;
 
 export type CaptureBlocker =
   | "none"
@@ -586,7 +602,9 @@ export function captureReadiness(
     blocker: "none",
     dot: "running",
     title: `可用录制 ${landed.length} 段`,
-    detail: `每段内部按停驻切分位姿，单段至少要 ${DWELLS_PER_EPISODE_MIN} 个停驻才收。`,
+    detail:
+      `一段一个姿态；同一个 mount 的段合起来解。拟合要 ≥ ${POSES_TO_CERTIFY} 段，` +
+      `要留出复核就录 ${SEGMENTS_SUGGESTED} 段。`,
     usable: landed,
     ...buttons,
   };
@@ -603,15 +621,105 @@ export function captureLabel(capture: TrackerMountCapture): string {
 }
 
 /**
- * How long one dwell recording has to be.
+ * How long one segment should run: one parked pose, not a session.
  *
- * Dwells are segmented *inside* one episode from the tracker stream, so the
- * poses come from pauses within a single recording rather than from separate
- * ones -- an episode holding a single dwell is refused outright. At
- * `DWELL_SECONDS_MIN` still per pose plus the trimmed settling and the time to
- * re-orient between them, certifying needs a couple of minutes in one take.
+ * This used to size a single take for all fifteen poses (~100 s). Once the
+ * protocol became one pose per segment, that default meant an operator had to
+ * press "save" early at every pose -- and the 2026-09-21 capture came back
+ * with segments of 0.6-3.6 s, four of them too short to hold a dwell.
  */
-export function suggestedDwellSeconds(poses = POSES_TO_CERTIFY): number {
-  const perPose = DWELL_SECONDS_MIN + 0.6 + 4.0; // still + trimmed ends + re-orient
-  return Math.ceil((poses * perPose) / 10) * 10;
+export function suggestedDwellSeconds(): number {
+  return SEGMENT_SUGGESTED_S;
+}
+
+export type SegmentLengthVerdict = { level: "ok" | "warn" | "bad"; text: string };
+
+/** Whether a segment of this length can hold a dwell, said before recording. */
+export function segmentLengthVerdict(seconds: number): SegmentLengthVerdict {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return { level: "bad", text: "时长要是正数秒。" };
+  }
+  if (seconds < SEGMENT_MIN_S) {
+    return {
+      level: "bad",
+      text:
+        `${seconds}s 装不下一个驻点：要 ${DWELL_SECONDS_MIN}s 静止，两端各裁 ${DWELL_TRIM_S}s，` +
+        `至少 ${SEGMENT_MIN_S.toFixed(1)}s。网关会拒绝。`,
+    };
+  }
+  if (seconds < SEGMENT_SUGGESTED_S) {
+    return {
+      level: "warn",
+      text: `够一个驻点，但手离开的时间也算在里面；建议 ${SEGMENT_SUGGESTED_S}s。`,
+    };
+  }
+  return { level: "ok", text: `一段一个姿态，静止到自动收尾，别提前保存。` };
+}
+
+/** Said when "save" is pressed early: the take cannot hold a dwell. */
+export function earlySaveWarning(elapsedS: number): string | null {
+  if (!Number.isFinite(elapsedS) || elapsedS <= 0 || elapsedS >= SEGMENT_MIN_S) return null;
+  return (
+    `这一段只录了 ${elapsedS.toFixed(1)}s，装不下一个驻点（至少 ${SEGMENT_MIN_S.toFixed(1)}s），` +
+    "解算时会被丢掉。这个姿态请重录，并静止到自动收尾。"
+  );
+}
+
+/** Which protocol a capture was recorded under, for the capture list. */
+export function protocolLabel(capture: { protocol?: string }): string {
+  if (capture.protocol === "tcp_pivot_dwell") return "pivot";
+  if (capture.protocol === "tcp_pivot_sweep") return "pivot 扫动（marker→TCP 面板）";
+  if (capture.protocol === "smr_parked_pose_dwell") return "驻点";
+  return "";
+}
+
+const CANNOT_SEE_LABELS: Record<string, string> = {
+  socket_to_tcp_definition_offset_d: "球窝中心 → TCP 的偏距 d（两边都加、互相抵消，要 CAD / 卡尺单独量）",
+  tcp_orientation: "TCP 姿态",
+  dynamic_speed_dependent_error: "运动带来的动态误差（要看轨迹场）",
+  world_frame_constants_absorbed_by_the_station: "被站位吸收的 world 系常量",
+};
+
+export function cannotSeeLabel(mode: string): string {
+  return CANNOT_SEE_LABELS[mode] ?? mode;
+}
+
+/**
+ * What an E1p result says about production's TCP, in the operator's terms.
+ *
+ * Certification here is about the *reference* (poses, socket sigma); the TCP
+ * error itself is the finding and is judged against the budget separately.
+ */
+export function pivotVerdict(report: {
+  static_tcp_error_mm: { p95: number };
+  tcp_budget_mm: number;
+  static_p95_within_budget: boolean;
+  c_tcp_error_norm_mm: number;
+  certifies: boolean;
+  certify_reasons: string[];
+} | null | undefined): { dot: "running" | "warning" | "error" | "idle"; title: string; detail: string } | null {
+  if (!report) return null;
+  const p95 = report.static_tcp_error_mm.p95;
+  const budget = report.tcp_budget_mm;
+  if (!report.certifies) {
+    return {
+      dot: "warning",
+      title: `静态 TCP 误差 p95 ${fmtMm(p95, 2)}，但参考没钉稳`,
+      detail: `这个数先别引用：${report.certify_reasons.join("；")}`,
+    };
+  }
+  if (report.static_p95_within_budget) {
+    return {
+      dot: "running",
+      title: `静态 TCP 误差 p95 ${fmtMm(p95, 2)} ≤ ${budget} mm`,
+      detail: `生产 c_TCP 的常量误差 ${fmtMm(report.c_tcp_error_norm_mm, 2)}。只是静态口径；动态增量看轨迹场。`,
+    };
+  }
+  return {
+    dot: "error",
+    title: `静态 TCP 误差 p95 ${fmtMm(p95, 2)} 超过 ${budget} mm`,
+    detail:
+      `其中生产 c_TCP 的常量误差 ${fmtMm(report.c_tcp_error_norm_mm, 2)}` +
+      "——这一项改标定常量就能消掉，先看它占了多少。",
+  };
 }

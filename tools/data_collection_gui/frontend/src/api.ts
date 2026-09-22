@@ -904,6 +904,22 @@ export class DataCollectionGuiApi {
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
 
+  /** E1p on the saved pivot samples of one BOX and one condition (one clamping). */
+  async markerTcpTrackerCheck(body: {
+    boxId: string;
+    condition: string;
+    station: string;
+    mountFit?: string;
+  }): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({
+      box_id: body.boxId,
+      condition: body.condition,
+      station: body.station,
+      mount_fit: body.mountFit ?? ""
+    });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/tracker-check?${params.toString()}`);
+  }
+
   async runMarkerTcpReport(): Promise<{ ok: boolean; error?: string }> {
     return this.calibrationSessionPost("/api/calibration/marker-tcp/report");
   }
@@ -953,8 +969,8 @@ export class DataCollectionGuiApi {
   }
 
   /** Claim the recorder for a run of parked-pose dwells; the gateway names it. */
-  async startTrackerMountSession(): Promise<TrackerMountSessionResponse> {
-    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session");
+  async startTrackerMountSession(kind: "dwell" | "pivot" = "dwell"): Promise<TrackerMountSessionResponse> {
+    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session", { kind });
   }
 
   /** Release the recorder. Nothing already recorded is deleted. */
@@ -962,12 +978,15 @@ export class DataCollectionGuiApi {
     return this.trackerMountSessionPost("/api/calibration/tracker-mount/session/cancel");
   }
 
-  private async trackerMountSessionPost(path: string): Promise<TrackerMountSessionResponse> {
+  private async trackerMountSessionPost(
+    path: string,
+    body: Record<string, unknown> = {},
+  ): Promise<TrackerMountSessionResponse> {
     try {
       const response = await fetch(`${this.apiBase}${path}`, {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: "{}"
+        body: JSON.stringify(body)
       });
       const payload = (await response.json()) as TrackerMountSessionResponse;
       return { ...payload, ok: response.ok && payload.ok !== false };
@@ -1001,10 +1020,15 @@ export class DataCollectionGuiApi {
 
   /** Fit the mount and, optionally, grade a trajectory with it, in one call. */
   async runTrackerMountChain(body: {
-    mode: "station" | "lever-arm";
+    mode: "station" | "lever-arm" | "pivot";
     rows: TrackerMountCaptureRow[];
     station?: string;
     holdout?: number;
+    /** pivot only: which cube in the marker->TCP bundle, and optionally which bundle. */
+    cube?: string;
+    markerTcp?: string;
+    mountFit?: string;
+    tcpBudgetMm?: number;
     worldFrameId?: string;
     trackerStationId?: string;
     validate?: {

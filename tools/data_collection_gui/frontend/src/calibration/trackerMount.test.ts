@@ -312,8 +312,14 @@ import type { RecorderLiveState } from "./trackerMount";
 import {
   DWELLS_PER_EPISODE_MIN,
   POSES_TO_CERTIFY,
+  SEGMENTS_SUGGESTED,
+  SEGMENT_MIN_S,
   captureLabel,
   captureReadiness,
+  earlySaveWarning,
+  pivotVerdict,
+  protocolLabel,
+  segmentLengthVerdict,
   suggestedDwellSeconds,
 } from "./trackerMount";
 
@@ -416,7 +422,10 @@ describe("what is blocking the solve, said before the solver fails", () => {
     );
     expect(r.blocker).toBe("none");
     expect(r.usable).toHaveLength(2);
-    expect(r.detail).toContain(String(DWELLS_PER_EPISODE_MIN));
+    // One pose per segment -- the old detail told operators three per take.
+    expect(r.detail).toContain("一段一个姿态");
+    expect(r.detail).toContain(String(POSES_TO_CERTIFY));
+    expect(r.detail).toContain(String(SEGMENTS_SUGGESTED));
   });
 });
 
@@ -470,11 +479,35 @@ describe("the panel and Live Record cannot disagree about the tracker", () => {
 });
 
 describe("the recording protocol follows the solver's own floors", () => {
-  it("sizes one take for the number of poses that certifies", () => {
-    // Dwells are segmented inside ONE episode, so the poses come from pauses in
-    // a single take -- an episode holding one dwell is refused outright.
-    expect(suggestedDwellSeconds(POSES_TO_CERTIFY)).toBeGreaterThanOrEqual(90);
-    expect(suggestedDwellSeconds(3)).toBeLessThan(suggestedDwellSeconds(15));
+  it("sizes one segment for one pose, not for the whole session", () => {
+    // The CLI merges segments by mount, so a segment needs one dwell. The old
+    // ~100 s default made operators save early at every pose, and the
+    // 2026-09-21 capture lost 4 of 15 poses to it.
+    expect(DWELLS_PER_EPISODE_MIN).toBe(1);
+    expect(suggestedDwellSeconds()).toBeGreaterThanOrEqual(SEGMENT_MIN_S);
+    expect(suggestedDwellSeconds()).toBeLessThanOrEqual(6);
+    expect(SEGMENT_MIN_S).toBeCloseTo(2.6, 5);
+    expect(SEGMENTS_SUGGESTED).toBe(POSES_TO_CERTIFY + 5);
+  });
+
+  it("judges a segment length before anything is recorded", () => {
+    expect(segmentLengthVerdict(2).level).toBe("bad");
+    expect(segmentLengthVerdict(2).text).toContain("2.6");
+    expect(segmentLengthVerdict(3).level).toBe("warn");
+    expect(segmentLengthVerdict(4).level).toBe("ok");
+    expect(segmentLengthVerdict(Number("abc")).level).toBe("bad");
+  });
+
+  it("calls out a take saved before it could hold a dwell", () => {
+    expect(earlySaveWarning(1.5)).toContain("重录");
+    expect(earlySaveWarning(3.0)).toBeNull();
+    expect(earlySaveWarning(Number.NaN)).toBeNull();
+  });
+
+  it("labels which protocol a capture was recorded under", () => {
+    expect(protocolLabel({ protocol: "tcp_pivot_dwell" })).toBe("pivot");
+    expect(protocolLabel({ protocol: "smr_parked_pose_dwell" })).toBe("驻点");
+    expect(protocolLabel({})).toBe("");
   });
 
   it("puts the tracker's own health in the row label", () => {
@@ -517,5 +550,41 @@ describe("Disconnect must not eat the take that is being recorded", () => {
     expect(r.blocker).toBe("recording_in_flight");
     expect(r.usable).toHaveLength(1);
     expect(r.canDisconnect).toBe(false);
+  });
+});
+
+
+describe("E1p pivot results are read as position-only, reference first", () => {
+  const base = {
+    static_tcp_error_mm: { p95: 1.2 },
+    tcp_budget_mm: 3,
+    static_p95_within_budget: true,
+    c_tcp_error_norm_mm: 0.8,
+    certifies: true,
+    certify_reasons: [] as string[],
+  };
+
+  it("reports a pass against the budget as static only", () => {
+    const v = pivotVerdict(base);
+    expect(v?.dot).toBe("running");
+    expect(v?.detail).toContain("静态");
+  });
+
+  it("points at the calibration constant when the budget is exceeded", () => {
+    const v = pivotVerdict({
+      ...base, static_tcp_error_mm: { p95: 13.4 }, static_p95_within_budget: false, c_tcp_error_norm_mm: 13.0,
+    });
+    expect(v?.dot).toBe("error");
+    expect(v?.detail).toContain("c_TCP");
+  });
+
+  it("refuses to let a weakly pinned reference be quoted, whatever the number", () => {
+    const v = pivotVerdict({ ...base, certifies: false, certify_reasons: ["socket weakly pinned"] });
+    expect(v?.dot).toBe("warning");
+    expect(v?.detail).toContain("socket weakly pinned");
+  });
+
+  it("is silent without a report", () => {
+    expect(pivotVerdict(null)).toBeNull();
   });
 });
