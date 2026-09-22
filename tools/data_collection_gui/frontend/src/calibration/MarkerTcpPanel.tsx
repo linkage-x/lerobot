@@ -4,7 +4,7 @@ import type { MarkerTcpSample, MarkerTcpSession, MarkerTcpTrackerCheck, TrackerM
 import { Metric, StatusDot, stateLabel } from "../shared/ui";
 import { deviceBoxIdentity } from "./adapters";
 import { Modal } from "./ConfirmModal";
-import { E1P_PAUSE_S, e1pChoices, e1pReadiness, trackerLink } from "./markerTcpTracker";
+import { e1pChoices, e1pReadiness, trackerLink } from "./markerTcpTracker";
 import type { TrackerLink } from "./markerTcpTracker";
 import { TrackerPivotResult } from "./TrackerPivotResult";
 
@@ -212,9 +212,10 @@ function MarkerTcpCaptureGuide() {
 
 /**
  * The same sweep, recorded with the SMR on its plate and the tracker on, is
- * also an E1p capture. What it adds to the camera protocol: pauses long enough
- * to be dwells, rotations the tracker can follow, and nothing moving between
- * the pivot and the parked-pose set that gives the station.
+ * also an E1p capture. What it adds to the camera protocol: the insert kept in
+ * its socket (a lift is what the tracker gates on), rotations the tracker can
+ * follow, and nothing moving between the pivot and the parked-pose set that
+ * gives the station. No pauses: E1p samples continuously.
  */
 function TrackerCaptureGuide({ link }: { link: TrackerLink }) {
   return (
@@ -229,8 +230,8 @@ function TrackerCaptureGuide({ link }: { link: TrackerLink }) {
           station（先录 pivot、后录驻点集也行）。
         </li>
         <li>
-          扫动中在 <b>≥ 15 个</b>不同姿态各<b>静止 ≥ {E1P_PAUSE_S}s</b>：只有停顿进 E1p，扫动本身只给相机 pivot 用。
-          一段样本里停几次都行，停够的总数才算数。
+          <b>连续扫动，不用停</b>：插件在窝里时每一帧都参与 E1p，手抖不要紧。要紧的是<b>插件别抬离球窝</b>——
+          跟踪仪看到 SMR 离开球面就判为抬起，那一段不比较；抬起方向若和「球窝→SMR」方向垂直它看不出来，结果卡片会报灵敏度。
         </li>
         <li>
           姿态怎么摆：<b>绕光束方向侧倾 ±45–60°</b>（不受 SMR 接受角限制，它决定球窝中心定得多准），
@@ -496,7 +497,8 @@ export function MarkerTcpPanel({
           <div className="marker-tcp-e1p">
             <b>跟踪仪核验（E1p）</b>
             <p className="panel-note">
-              用带跟踪仪录的 pivot 样本里的<b>停顿</b>：跟踪仪单独拟合出球窝中心，逐位姿减去生产 TCP。生产 c_TCP
+              用带跟踪仪录的 pivot 样本（<b>连续扫动</b>）：跟踪仪用所有光束有效、插件在窝内的点拟合出球窝中心，
+              逐帧减去生产 TCP，再按姿态分格汇总。生产 c_TCP
               原样代入、不拟合，所以它的错会直接显出来。只比较，<b>不写任何 bundle</b>；按「BOX + 条件」一次解一个夹持。
               缺生产 EE 轨迹时会先自动生成（和回放页的「生成 EE 轨迹」是同一个任务）。
             </p>

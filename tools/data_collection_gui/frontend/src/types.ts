@@ -1465,6 +1465,15 @@ export type TrackerPivotReport = {
     gain_min: number;
     center_sigma_norm_mm: number | null;
     center_sigma_weak_mm: number;
+    /** Continuous pivots only: what the sphere was fitted from. */
+    continuous?: {
+      n_points: number;
+      n_points_seated: number;
+      lifted_fraction: number | null;
+      n_direction_cells: number;
+      max_radial_mm: number;
+      radial_sigma_mm: number | null;
+    };
   };
   radius_check_mm: null | {
     sphere_radius_mm: number;
@@ -1480,8 +1489,23 @@ export type TrackerPivotReport = {
   /** "tcp" when graded on production's own TCP labels, "cube" on cube poses. */
   pose_frame?: string;
   bundle_calibration_id?: string | null;
-  /** Samples of a sweep the operator never paused in; listed, not fatal. */
+  /** Legacy dwell-based pivots: samples without a pause; listed, not fatal. */
   episodes_without_dwells?: { dataset: string; episode: number; why: string }[];
+  /** Continuous pivots: samples with no solved frame or no beam; listed, not fatal. */
+  episodes_skipped?: { dataset: string; episode: number; why: string }[];
+  /** Continuous pivots: every seated frame compared, pooled into attitude cells. */
+  sampling?: TrackerPivotSampling;
+};
+
+export type TrackerPivotSampling = {
+  mode: "continuous";
+  n_frames: number;
+  n_frames_seated: number;
+  n_attitudes: number;
+  attitude_cell_deg: number;
+  per_frame_error_mm: null | { n: number; p95: number; rms: number; max: number };
+  by_smr_speed: { smr_speed_mm_s: [number, number | null]; n: number; p95?: number; rms?: number; max?: number }[];
+  lift_sensitivity: null | { median: number; p10: number };
 };
 
 export type TrackerMountSessionResponse = {
@@ -1501,7 +1525,7 @@ export type TrackerMountCapture = {
   landed: boolean;
   poseLabel: string;
   purpose: string;
-  /** smr_parked_pose_dwell | tcp_pivot_dwell; empty on captures made before it existed. */
+  /** smr_parked_pose_dwell | tcp_pivot_sweep (tcp_pivot_dwell before 2026-09-22); empty on older captures. */
   protocol?: string;
   segmentSeconds?: number;
   beamValidFraction: number;

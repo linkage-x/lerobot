@@ -588,3 +588,22 @@ describe("E1p pivot results are read as position-only, reference first", () => {
     expect(pivotVerdict(null)).toBeNull();
   });
 });
+
+describe("pivot segments are continuous sweeps", () => {
+  it("suggests a sweep length, not a pose length", () => {
+    expect(suggestedDwellSeconds("pivot")).toBe(30);
+    expect(segmentLengthVerdict(30, "pivot").level).toBe("ok");
+    expect(segmentLengthVerdict(5, "pivot").level).toBe("warn");
+    expect(segmentLengthVerdict(2, "pivot").level).toBe("bad");
+  });
+
+  it("never calls an early save lost, because every seated frame counts", () => {
+    expect(earlySaveWarning(1.5, "pivot")).toBeNull();
+    expect(earlySaveWarning(1.5)).not.toBeNull();
+  });
+
+  it("labels the continuous protocol and still reads the old one", () => {
+    expect(protocolLabel({ protocol: "tcp_pivot_sweep" })).toBe("pivot 连续扫动");
+    expect(protocolLabel({ protocol: "tcp_pivot_dwell" })).toBe("pivot");
+  });
+});

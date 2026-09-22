@@ -4084,13 +4084,10 @@ def _marker_tcp_root(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "metrology" / "marker_tcp_repeatability"
 
 
-# A pivot sample is a sweep about the socket with pauses in it: the camera pivot
-# fit uses every frame, the tracker check (E1p) only the pauses. 3.5 s is the
-# roadmap's per-pose hold -- a dwell needs 2.0 s still after 0.3 s is trimmed
-# from each end (2.6 s), and a hand-held pause settles less cleanly than a
-# parked one.
+# A pivot sample is a continuous sweep about the socket, and both fits read every
+# frame of it: the camera pivot fit directly, the tracker check (E1p) every frame
+# the tracker says was seated (radial residual off its sphere). No pauses.
 _MARKER_TCP_PIVOT_PROTOCOL = "tcp_pivot_sweep"
-_MARKER_TCP_E1P_PAUSE_S = 3.5
 
 
 def _marker_tcp_session_path(state: GatewayState) -> Path | None:
@@ -4755,7 +4752,7 @@ def _marker_tcp_record_sample(
             session.samples.append(sample)
             session.pendingSampleId = sample.id
             session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。" + (
-                f"跟踪仪在录：每个姿态静止 ≥ {_MARKER_TCP_E1P_PAUSE_S:g}s 才算一个 E1p 驻点，别断光。"
+                "跟踪仪在录：连续扫动即可，不用停；插件别抬离球窝，别断光。"
                 if tracker_on
                 else ""
             )
@@ -5526,6 +5523,10 @@ def _note_tracker_mount_segment_end(state: GatewayState, action: str) -> None:
     session.lastSegmentStartedMono = 0.0
     if not session.active or started <= 0.0 or action != "save":
         return
+    if session.kind == "pivot":
+        # A pivot sweep is read frame by frame; stopping it early loses
+        # attitudes, not the take.
+        return
     elapsed = time.monotonic() - started
     session.lastSegmentSeconds = round(elapsed, 2)
     if elapsed < _TRACKER_MOUNT_SEGMENT_MIN_S:
@@ -5569,6 +5570,8 @@ def _run_tracker_mount_pivot(state: GatewayState, payload: dict[str, Any]) -> di
     args = [
         "pivot", *args, "--station", str(station), "--marker-tcp", str(bundle),
         "--cube", cube, "--out", str(out_path),
+        # Continuous: a segment with the beam off the SMR is listed, not fatal.
+        "--skip-episodes-without-dwells",
     ]
     mount_fit = str(payload.get("mountFit") or "").strip()
     if mount_fit:
@@ -5619,6 +5622,8 @@ _E1P_REPORT_KEYS = (
     "pose_frame",
     "bundle_calibration_id",
     "episodes_without_dwells",
+    "episodes_skipped",
+    "sampling",
 )
 _MARKER_TCP_TRAJ_GEN_TIMEOUT_S = 7200.0
 
@@ -5994,6 +5999,8 @@ _TRACKER_MOUNT_CAPTURE_KIND = "tracker_mount"
 # hand leaving the rig. These restate the solver's floor rather than invent one.
 _TRACKER_MOUNT_SEGMENT_MIN_S = 2.6
 _TRACKER_MOUNT_SEGMENT_SUGGESTED_S = 4.0
+# A pivot segment is a continuous sweep through both rotation axes, not a pose.
+_TRACKER_MOUNT_PIVOT_SUGGESTED_S = 30.0
 _TRACKER_MOUNT_KINDS = {
     "dwell": {
         "protocol": "smr_parked_pose_dwell",
@@ -6003,10 +6010,13 @@ _TRACKER_MOUNT_KINDS = {
         ),
     },
     "pivot": {
-        "protocol": "tcp_pivot_dwell",
+        # Continuous since 2026-09-22: the same protocol the marker->TCP panel
+        # records, because it is the same act. Older captures say
+        # tcp_pivot_dwell and still solve.
+        "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
         "message": (
-            "pivot：插件球头卡在球窝里，SMR 留在钢片上。一段一个姿态，静止到自动收尾；"
-            "绕光束方向侧倾 ±45–60°，前后倾留在 ±25° 内；≥ 15 段，两侧各一场。"
+            "pivot：插件球头卡在球窝里，SMR 留在钢片上。连续扫动，不用停；插件别抬离球窝、别断光。"
+            "绕光束方向侧倾 ±45–60°，前后倾留在 ±25° 内；一段 20–60 s，两侧各一场。"
         ),
     },
 }
@@ -6199,7 +6209,10 @@ def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -
     session_name = session.sessionName
     pose_label = str(payload.get("poseLabel") or "").strip()
     try:
-        seconds = float(payload.get("seconds") or _TRACKER_MOUNT_SEGMENT_SUGGESTED_S)
+        default_s = (
+            _TRACKER_MOUNT_PIVOT_SUGGESTED_S if session.kind == "pivot" else _TRACKER_MOUNT_SEGMENT_SUGGESTED_S
+        )
+        seconds = float(payload.get("seconds") or default_s)
         if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError
     except (TypeError, ValueError):

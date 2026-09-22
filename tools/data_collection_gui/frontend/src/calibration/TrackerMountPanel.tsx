@@ -37,6 +37,7 @@ import type { RecorderLiveState } from "./trackerMount";
 import {
   DWELL_SECONDS_MIN,
   DWELL_TRIM_S,
+  PIVOT_SWEEP_SUGGESTED_S,
   POSES_TO_CERTIFY,
   SEGMENTS_SUGGESTED,
   SEGMENT_MIN_S,
@@ -501,10 +502,12 @@ function SessionLine({ session }: { session: TrackerMountSession }) {
         {session.dwellsStarted !== session.dwellsOnDisk && (
           <>（按了 {session.dwellsStarted} 次——差额是没保存成的）</>
         )}
-        ，距离认证还差 {Math.max(0, POSES_TO_CERTIFY - session.dwellsOnDisk)} 段的姿态量。
+        {session.kind === "pivot"
+          ? "（pivot 按姿态格认证，解算后看结果卡片）。"
+          : `，距离认证还差 ${Math.max(0, POSES_TO_CERTIFY - session.dwellsOnDisk)} 段的姿态量。`}
         {session.trackerSessionId && <> 跟踪仪 session：{session.trackerSessionId}。</>}
       </p>
-      {(session.shortSegments ?? 0) > 0 && (
+      {session.kind !== "pivot" && (session.shortSegments ?? 0) > 0 && (
         <p className="cali-warn">
           <StatusDot state="warning" /> 有 {session.shortSegments} 段录得太短（&lt; {SEGMENT_MIN_S.toFixed(1)}s），
           解算时会被丢掉，对应的姿态要重录。
@@ -542,8 +545,12 @@ function GuidedCapture({
   // When the take in flight started, so an early "save" can be called out
   // while the rig is still standing where it was.
   const [recordStartedAt, setRecordStartedAt] = useState<number | null>(null);
-  const lengthVerdict = segmentLengthVerdict(Number(seconds));
   const activeKind = session?.active ? session.kind ?? "dwell" : kind;
+  const lengthVerdict = segmentLengthVerdict(Number(seconds), activeKind);
+  // A dwell segment is one pose (4 s); a pivot segment is a sweep (30 s).
+  useEffect(() => {
+    setSeconds(String(suggestedDwellSeconds(activeKind)));
+  }, [activeKind]);
   // A refused press and a started take are not the same news, and the first one
   // used to be rendered in the same muted grey as the instructions -- which is
   // how a lost take reads as "the button is just disabled".
@@ -580,11 +587,15 @@ function GuidedCapture({
   async function onRecord() {
     setRunning("record");
     const result = await api.recordTrackerMountDwell({
-      seconds: Number(seconds) || suggestedDwellSeconds(),
+      seconds: Number(seconds) || suggestedDwellSeconds(activeKind),
     });
+    const howTo =
+      activeKind === "pivot"
+        ? "连续扫动，插件别抬离球窝；扫够了可以提前保存"
+        : "静止到收尾，别提前保存";
     setNote(
       result.ok
-        ? { text: `已开始录制，${result.seconds}s 后自动收尾——静止到收尾，别提前保存`, bad: false }
+        ? { text: `已开始录制，${result.seconds}s 后自动收尾——${howTo}`, bad: false }
         : { text: result.error || "录制失败：录制器没有接受这一段。", bad: true },
     );
     setRecordStartedAt(result.ok ? Date.now() : null);
@@ -595,7 +606,8 @@ function GuidedCapture({
     // The only way to end a take early and keep it. Without this button the
     // sole control on this panel was Disconnect, which discards.
     setRunning("save");
-    const early = recordStartedAt == null ? null : earlySaveWarning((Date.now() - recordStartedAt) / 1000);
+    const early =
+      recordStartedAt == null ? null : earlySaveWarning((Date.now() - recordStartedAt) / 1000, activeKind);
     setRecordStartedAt(null);
     await api.stopRecording("save");
     if (early) setNote({ text: early, bad: true });
@@ -664,7 +676,7 @@ function GuidedCapture({
               where this segment goes, and saying "recording" during a handshake
               that can still be refused is how a refused press reads as a take
               that happened. */}
-          {running === "record" ? "正在确认采集目录…" : "录一段停驻姿态"}
+          {running === "record" ? "正在确认采集目录…" : activeKind === "pivot" ? "录一段扫动" : "录一段停驻姿态"}
         </button>
         <button
           className="cali-btn-primary"
@@ -694,22 +706,26 @@ function GuidedCapture({
         </p>
       )}
 
-      <p className="cali-muted">
-        <b>一段一个姿态。</b>摆好、手离开，点「录一段」，<b>静止到自动收尾</b>。一个驻点要 {DWELL_SECONDS_MIN}s 静止，
-        两端各裁 {DWELL_TRIM_S}s，所以每段至少 {SEGMENT_MIN_S.toFixed(1)}s——提前「保存本段」就会被丢掉。
-        拟合要 ≥ <b>{POSES_TO_CERTIFY}</b> 段，要留出复核就录 <b>{SEGMENTS_SUGGESTED}</b> 段。
-      </p>
       {activeKind === "pivot" ? (
         <p className="cali-muted">
           <b>pivot（E1p）</b>：夹爪夹住相机 pivot 标定用的同一个插件，球头卡进固定在桌上的球窝，<b>SMR 留在钢片上不动</b>。
-          以球窝为支点转：<b>绕光束方向侧倾 ±45–60°</b>（不受接受角限制，它决定球窝中心能定多准），
-          前后倾留在 ±25° 内。左右两侧各一场，和驻点集用<b>同一个跟踪仪站位</b>。
+          <b>连续扫动，不用停</b>：插件在窝里时每个跟踪仪点、每一帧都算数，手抖不要紧；跟踪仪看到 SMR 离开球面就判为抬起，
+          那一段不比较。以球窝为支点转：<b>绕光束方向侧倾 ±45–60°</b>（不受接受角限制，它决定球窝中心能定多准），
+          前后倾留在 ±25° 内。一段 {PIVOT_SWEEP_SUGGESTED_S}s 左右、扫够了可提前保存；认证按 5° 姿态格数，要 ≥{" "}
+          {POSES_TO_CERTIFY} 格。左右两侧各一场，和驻点集用<b>同一个跟踪仪站位</b>。
         </p>
       ) : (
-        <p className="cali-muted">
-          换姿态时<b>要绕两根明显不平行的轴</b>：纯平移和单轴旋转都定不出 c，而且残差照样很小。
-          位置也要在三维里拉开（左右、前后、高低），停的时候要真停住（&lt;2 mm/s）。
-        </p>
+        <>
+          <p className="cali-muted">
+            <b>一段一个姿态。</b>摆好、手离开，点「录一段」，<b>静止到自动收尾</b>。一个驻点要 {DWELL_SECONDS_MIN}s 静止，
+            两端各裁 {DWELL_TRIM_S}s，所以每段至少 {SEGMENT_MIN_S.toFixed(1)}s——提前「保存本段」就会被丢掉。
+            拟合要 ≥ <b>{POSES_TO_CERTIFY}</b> 段，要留出复核就录 <b>{SEGMENTS_SUGGESTED}</b> 段。
+          </p>
+          <p className="cali-muted">
+            换姿态时<b>要绕两根明显不平行的轴</b>：纯平移和单轴旋转都定不出 c，而且残差照样很小。
+            位置也要在三维里拉开（左右、前后、高低），停的时候要真停住（&lt;2 mm/s）。
+          </p>
+        </>
       )}
       <p className="cali-muted">
         跟踪仪 session 是<b>一次 Connect 一个</b>（logger 冷启动要 15–16 s，不可能每段重来），

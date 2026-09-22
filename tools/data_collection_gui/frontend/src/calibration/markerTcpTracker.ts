@@ -3,18 +3,16 @@
 //
 // A camera pivot sample and an E1p capture are the same physical act: the TCP
 // insert seated in the socket, the gripper turned about it. Recorded with the
-// SMR on its plate and the tracker on, one sweep serves both -- the camera fit
-// reads every frame, E1p only the pauses. What this module decides is whether
-// the pauses can be solved yet, and says why not in the operator's terms.
+// SMR on its plate and the tracker on, one sweep serves both, continuously: the
+// camera fit reads every frame, and E1p reads every frame the tracker says was
+// seated (the SMR on its sphere about the socket). No pauses. What this module
+// decides is whether the samples can be solved yet, and says why not in the
+// operator's terms.
 import type { MarkerTcpSample, MarkerTcpSession } from "../types";
 import { POSES_TO_CERTIFY } from "./trackerMount";
 
-/**
- * Hold per pose inside a sweep. A dwell is 2.0 s still after 0.3 s is trimmed
- * from each end; a hand-held pause settles less cleanly than a parked one, so
- * the panel asks for 3.5 s (the gateway's ``_MARKER_TCP_E1P_PAUSE_S``).
- */
-export const E1P_PAUSE_S = 3.5;
+/** Rotation cell E1p pools frames into; certification counts cells, not frames. */
+export const E1P_ATTITUDE_CELL_DEG = 5;
 
 const TRACKER_SESSION_ID = /\blt_\d{8}_\d{6}\b/;
 
@@ -135,8 +133,8 @@ export function e1pReadiness(args: {
   return {
     canRun: true,
     reason:
-      `将用 ${samples.length} 段样本里的停顿跑 E1p；` +
-      `认证要 ≥ ${POSES_TO_CERTIFY} 个停顿，没停够 ${E1P_PAUSE_S}s 的样本会被列出、不进拟合。`,
+      `将用 ${samples.length} 段样本的连续扫动跑 E1p：跟踪仪判定插件在窝内的帧都参与比较；` +
+      `认证要 ≥ ${POSES_TO_CERTIFY} 个 ${E1P_ATTITUDE_CELL_DEG}° 姿态格，全程断光的样本会被列出、不进比较。`,
     samples,
   };
 }

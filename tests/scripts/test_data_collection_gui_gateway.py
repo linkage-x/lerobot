@@ -6233,6 +6233,23 @@ def test_a_segment_saved_before_it_can_hold_a_dwell_is_flagged_at_once(tmp_path)
     assert 1.4 <= payload["lastSegmentSeconds"] <= 2.0
 
 
+def test_a_pivot_sweep_stopped_early_is_not_a_short_segment(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(gateway, "_start_episode", lambda _s, seconds, **_k: seen.update(seconds=seconds))
+    gateway._start_tracker_mount_session(state, {"sessionName": "tp_1", "kind": "pivot"})
+    gateway._start_tracker_mount_episode(state, {})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.5
+
+    gateway._note_tracker_mount_segment_end(state, "save")
+
+    # A sweep is read frame by frame: cutting it short costs attitudes, not the take.
+    assert seen["seconds"] == 30.0
+    assert session.shortSegments == 0
+
+
 def test_a_full_length_or_discarded_segment_is_not_flagged(tmp_path):
     state = _tracker_mount_state(tmp_path)
     gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
@@ -6257,7 +6274,8 @@ def test_a_pivot_session_says_what_it_is_in_every_episode(tmp_path, monkeypatch)
 
     assert started["session"]["kind"] == "pivot"
     assert "侧倾" in started["session"]["message"]
-    assert seen["protocol"] == "tcp_pivot_dwell"
+    # Continuous, the same protocol the marker->TCP panel records.
+    assert seen["protocol"] == "tcp_pivot_sweep"
 
 
 def test_an_unknown_capture_kind_is_refused(tmp_path):
@@ -6326,6 +6344,8 @@ def test_the_pivot_solve_calls_the_cli_with_the_production_bundle(tmp_path, monk
     assert args[args.index("--marker-tcp") + 1] == str(bundle)
     assert args[args.index("--cube") + 1] == "right"
     assert Path(args[args.index("--out") + 1]).name.startswith("pivot_right_")
+    # Continuous sweeps: one segment with the beam off is listed, not fatal.
+    assert "--skip-episodes-without-dwells" in args
 
 
 def test_the_pivot_solve_needs_to_be_told_which_cube(tmp_path, monkeypatch):
@@ -6392,7 +6412,7 @@ def test_a_pivot_sample_recorded_with_the_tracker_says_so(tmp_path, monkeypatch)
     sample = state.marker_tcp_session.samples[0]
     assert sample.laserTracker is True
     assert sample.trackerSessionId == E1P_SID
-    assert "静止" in state.marker_tcp_session.message
+    assert "连续扫动" in state.marker_tcp_session.message
 
 
 def _e1p_repo(tmp_path: Path, *, landed: bool = True, tracker: bool = True):
@@ -6441,6 +6461,7 @@ def _stub_e1p(monkeypatch, dataset_root: Path, *, returncode: int = 0):
                     "c_tcp_error_norm_mm": 1.1,
                     "certifies": returncode == 0,
                     "certify_reasons": [] if returncode == 0 else ["socket centre sigma 0.2 mm"],
+                    "sampling": {"mode": "continuous", "n_frames_seated": 900, "n_attitudes": 40},
                     "capture": [{"dwells": ["a very long diagnostic"] * 50}],
                 }
             ),
@@ -6481,6 +6502,7 @@ def test_e1p_grades_production_labels_on_the_pivot_samples(tmp_path, monkeypatch
     assert check["report"]["static_tcp_error_mm"]["p95"] == 1.4
     # The snapshot carries the numbers, not the per-dwell diagnostics.
     assert "capture" not in check["report"]
+    assert check["report"]["sampling"]["n_attitudes"] == 40
     assert state.marker_tcp_session.stage == "capture"
     assert state.marker_tcp_session.solvePath == ""
 

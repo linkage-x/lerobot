@@ -409,6 +409,15 @@ export const DWELL_TRIM_S = 0.3;
 export const SEGMENT_MIN_S = DWELL_SECONDS_MIN + 2 * DWELL_TRIM_S;
 /** Room for the hand to leave the rig before the still part starts. */
 export const SEGMENT_SUGGESTED_S = 4;
+/**
+ * A pivot segment is a continuous sweep, not a pose: long enough to roll about
+ * the beam and tilt fore-aft a few times (the gateway's
+ * ``_TRACKER_MOUNT_PIVOT_SUGGESTED_S``).
+ */
+export const PIVOT_SWEEP_SUGGESTED_S = 30;
+export const PIVOT_SWEEP_MIN_USEFUL_S = 10;
+
+export type CaptureKind = "dwell" | "pivot";
 
 export type CaptureBlocker =
   | "none"
@@ -628,16 +637,28 @@ export function captureLabel(capture: TrackerMountCapture): string {
  * press "save" early at every pose -- and the 2026-09-21 capture came back
  * with segments of 0.6-3.6 s, four of them too short to hold a dwell.
  */
-export function suggestedDwellSeconds(): number {
-  return SEGMENT_SUGGESTED_S;
+export function suggestedDwellSeconds(kind: CaptureKind = "dwell"): number {
+  return kind === "pivot" ? PIVOT_SWEEP_SUGGESTED_S : SEGMENT_SUGGESTED_S;
 }
 
 export type SegmentLengthVerdict = { level: "ok" | "warn" | "bad"; text: string };
 
-/** Whether a segment of this length can hold a dwell, said before recording. */
-export function segmentLengthVerdict(seconds: number): SegmentLengthVerdict {
+/** Whether a segment of this length can hold a dwell (or a sweep), said before recording. */
+export function segmentLengthVerdict(seconds: number, kind: CaptureKind = "dwell"): SegmentLengthVerdict {
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return { level: "bad", text: "时长要是正数秒。" };
+  }
+  if (kind === "pivot") {
+    if (seconds < SEGMENT_MIN_S) {
+      return { level: "bad", text: `网关不收短于 ${SEGMENT_MIN_S.toFixed(1)}s 的段。` };
+    }
+    if (seconds < PIVOT_SWEEP_MIN_USEFUL_S) {
+      return {
+        level: "warn",
+        text: `${seconds}s 扫不完两根轴；pivot 一段是连续扫动，建议 ${PIVOT_SWEEP_SUGGESTED_S}s。`,
+      };
+    }
+    return { level: "ok", text: "连续扫动，不用停；插件别抬离球窝、别断光。" };
   }
   if (seconds < SEGMENT_MIN_S) {
     return {
@@ -656,8 +677,9 @@ export function segmentLengthVerdict(seconds: number): SegmentLengthVerdict {
   return { level: "ok", text: `一段一个姿态，静止到自动收尾，别提前保存。` };
 }
 
-/** Said when "save" is pressed early: the take cannot hold a dwell. */
-export function earlySaveWarning(elapsedS: number): string | null {
+/** Said when "save" is pressed early: the take cannot hold a dwell. A pivot sweep can always stop. */
+export function earlySaveWarning(elapsedS: number, kind: CaptureKind = "dwell"): string | null {
+  if (kind === "pivot") return null;
   if (!Number.isFinite(elapsedS) || elapsedS <= 0 || elapsedS >= SEGMENT_MIN_S) return null;
   return (
     `这一段只录了 ${elapsedS.toFixed(1)}s，装不下一个驻点（至少 ${SEGMENT_MIN_S.toFixed(1)}s），` +
@@ -668,7 +690,7 @@ export function earlySaveWarning(elapsedS: number): string | null {
 /** Which protocol a capture was recorded under, for the capture list. */
 export function protocolLabel(capture: { protocol?: string }): string {
   if (capture.protocol === "tcp_pivot_dwell") return "pivot";
-  if (capture.protocol === "tcp_pivot_sweep") return "pivot 扫动（marker→TCP 面板）";
+  if (capture.protocol === "tcp_pivot_sweep") return "pivot 连续扫动";
   if (capture.protocol === "smr_parked_pose_dwell") return "驻点";
   return "";
 }
