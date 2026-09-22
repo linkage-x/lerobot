@@ -534,7 +534,10 @@ class CoreneticGripperHardwareDriver:
             remote_port=self.remote_port,
             sdk_dir=self.sdk_dir,
             urdf_relpath=self.urdf_relpath,
-            startup_mode=1,
+            # Read the physical opening before taking control.  Entering mode 1
+            # without a known hold target leaves the vendor firmware free to
+            # reuse a zero or stale clamp setpoint.
+            startup_mode=0,
             poll_interval_s=self.poll_interval_s,
             stale_threshold_s=self.stale_threshold_s,
             expected_devices=["box_gripper"],
@@ -548,13 +551,37 @@ class CoreneticGripperHardwareDriver:
         self._client = client
 
         deadline = time.perf_counter() + self.connect_timeout_s
+        initial_distance_m = None
         while True:
-            if self._latest_distance_m() is not None:
+            initial_distance_m = self._latest_distance_m()
+            if initial_distance_m is not None:
                 break
             if time.perf_counter() >= deadline:
                 self.disconnect()
                 raise TimeoutError("Corenetic gripper did not publish box_gripper.distance_m during connect.")
             time.sleep(0.01)
+
+        # Preload the measured opening while still in collection mode.  Current
+        # firmware documents clamp commands as effective only in control mode,
+        # but preloading is harmless there and lets firmware versions that latch
+        # the target early avoid a zero/stale transition target.
+        try:
+            client.set_clamp_pos(initial_distance_m)
+        except Exception:
+            pass
+        mode_rc = client.set_mode(1)
+        if mode_rc != 0:
+            self.disconnect()
+            raise RuntimeError(f"Corenetic gripper set_mode(1) failed with rc={mode_rc}.")
+        hold_rc = client.set_clamp_pos(initial_distance_m)
+        if hold_rc != 0:
+            self.disconnect()
+            raise RuntimeError(
+                f"Corenetic gripper initial hold at {initial_distance_m:.4f}m failed with rc={hold_rc}."
+            )
+        self._last_command_distance_m = initial_distance_m
+        self._last_command_time_s = time.perf_counter()
+        self._pending_command_distance_m = None
 
     def disconnect(self) -> None:
         if self._client is not None:

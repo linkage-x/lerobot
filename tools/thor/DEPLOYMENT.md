@@ -1,5 +1,8 @@
 # Thor 数据采集机部署清单
 
+现有设备的外参标定、轨迹生成和 P0 回放请参阅
+[Thor 外参标定与 P0 机器人回放操作指南](CALIBRATION_AND_REPLAY.md)。
+
 把 `tools/data_collection_gui` + `tools/thor/{gmsl2,box_sdk}` 这套（11 路
 GMSL2 + BOX 采集板）部署到一台新的 Thor / Jetson 主机时，按顺序跑完下面
 这份清单。**所有曾经踩过的坑都在这里**，目标是新机零踩坑。
