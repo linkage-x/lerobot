@@ -6304,7 +6304,7 @@ def _tracker_session_dir_for(
     return None
 
 
-def _tracker_mount_capture_candidates(state: GatewayState) -> list[Path]:
+def _tracker_mount_capture_candidates(state: GatewayState, limit: int | None = 40) -> list[Path]:
     """Datasets that might hold parked-pose episodes, newest first."""
     roots: list[Path] = []
     calib_root = _calibration_captures_root(state)
@@ -6325,7 +6325,7 @@ def _tracker_mount_capture_candidates(state: GatewayState) -> list[Path]:
             seen.add(key)
             unique.append(path)
     unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return unique[:40]
+    return unique if limit is None else unique[:limit]
 
 
 def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
@@ -6341,8 +6341,13 @@ def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
     between the last dwell and Disconnect every row here is correct and none of
     them is usable -- which is exactly the state an operator needs told.
     """
+    return {"ok": True, "episodes": _tracker_mount_capture_rows(state)[:60]}
+
+
+def _tracker_mount_capture_rows(state: GatewayState, limit: int | None = 40) -> list[dict[str, Any]]:
+    """Every tracker-enabled episode, newest first; ``limit`` caps the datasets scanned."""
     rows: list[dict[str, Any]] = []
-    for dataset in _tracker_mount_capture_candidates(state):
+    for dataset in _tracker_mount_capture_candidates(state, limit):
         episodes_dir = dataset / "episodes"
         if not episodes_dir.is_dir():
             continue
@@ -6387,7 +6392,105 @@ def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
                 }
             )
     rows.sort(key=lambda row: row["modifiedUnixS"], reverse=True)
-    return {"ok": True, "episodes": rows[:60]}
+    return rows
+
+
+def _delete_tracker_mount_captures(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Delete recorded tracker captures picked from the panel's list.
+
+    Only rows the discovery itself lists can be named, so a request cannot
+    reach an arbitrary path. The whole request is planned before anything is
+    removed: one refused row refuses the batch, rather than leaving half of it
+    deleted and the operator guessing which half.
+
+    Episodes are removed **without renumbering**. The survivors keep their
+    indices because the derived pose sidecars and every fit artifact already
+    written name episodes by index; renumbering would silently repoint them at
+    other poses. The fit reads episodes by explicit index, so a gap is harmless.
+
+    A recorder dataset (under the datasets root) is different: its parquet is
+    indexed by episode, and deleting some of its episode dirs would corrupt it.
+    Those can only go as a whole, and partial deletion stays with Replay.
+
+    A tracker stream is shared by every episode of its Connect; it is removed
+    only once no remaining episode anywhere refers to it.
+    """
+    raw = payload.get("episodeDirs")
+    if not isinstance(raw, list) or not raw:
+        return {"ok": False, "error": "没有选中要删除的录制"}
+    wanted = list(dict.fromkeys(str(item) for item in raw))
+    with state.lock:
+        recorder_state = state.recording.state
+        session = state.tracker_mount_session
+        active_root = session.captureRoot if session.active else ""
+    if recorder_state in {"recording", "review", "saving", "discarding"}:
+        return {"ok": False, "error": "正在录制/保存一段，等这一段结束后再删。"}
+    connected = recorder_state not in {"idle", "error"}
+
+    rows = _tracker_mount_capture_rows(state, limit=None)
+    by_dir = {row["episodeDir"]: row for row in rows}
+    unknown = [item for item in wanted if item not in by_dir]
+    if unknown:
+        return {"ok": False, "error": f"列表里没有这些录制（可能已被删除，刷新后再试）：{', '.join(unknown)}"}
+
+    calib_root = _calibration_captures_root(state).resolve()
+    active = Path(active_root).resolve() if active_root else None
+    chosen: dict[Path, list[dict[str, Any]]] = {}
+    for item in wanted:
+        row = by_dir[item]
+        chosen.setdefault(Path(row["dataset"]), []).append(row)
+
+    plan: list[tuple[Path, list[Path] | None]] = []  # (dataset, episode dirs | None = whole)
+    for dataset, picked in chosen.items():
+        resolved = dataset.resolve()
+        if active is not None and resolved == active:
+            return {"ok": False, "error": f"{dataset.parent.name} 是进行中的站位采集，先「结束采集」再删。"}
+        if connected and any(not row["landed"] for row in picked):
+            return {
+                "ok": False,
+                "error": f"{dataset.parent.name}/{dataset.name} 的跟踪仪 session 还没落地，录制器也还连着；"
+                "先 Disconnect 让它落地（或确认它不是这次连接的），再删。",
+            }
+        picked_dirs = {Path(row["episodeDir"]).resolve() for row in picked}
+        all_dirs = {ep.resolve() for ep in (dataset / "episodes").iterdir() if ep.is_dir()}
+        whole = all_dirs <= picked_dirs
+        in_calib = resolved.parent.parent == calib_root
+        if not in_calib and not whole:
+            return {
+                "ok": False,
+                "error": f"{dataset.name} 是录制器数据集，episode 按 parquet 编号，只删其中几段会把它弄坏。"
+                "要么全选它的所有录制整组删除，要么去回放页逐个删。",
+            }
+        plan.append((dataset, None if whole else sorted(picked_dirs)))
+
+    removed: list[str] = []
+    for dataset, episode_dirs in plan:
+        if episode_dirs is None:
+            # A mount capture's dataset is the only child of its tm_<ts> dir.
+            target = dataset.parent if dataset.resolve().parent.parent == calib_root else dataset
+            shutil.rmtree(target)
+            removed.append(str(target))
+        else:
+            for ep_dir in episode_dirs:
+                shutil.rmtree(ep_dir)
+                removed.append(str(ep_dir))
+
+    # Streams that no surviving episode refers to any more.
+    still_used = {row["sessionId"] for row in _tracker_mount_capture_rows(state, limit=None)}
+    removed_streams: list[str] = []
+    for item in wanted:
+        row = by_dir[item]
+        stream = Path(row["sessionPath"]) if row["sessionPath"] else None
+        if not row["sessionId"] or row["sessionId"] in still_used or stream is None:
+            continue
+        if stream.is_dir() and stream.parent.name == "laser_tracker" and stream.name == row["sessionId"]:
+            shutil.rmtree(stream)
+            removed_streams.append(str(stream))
+    state.log(
+        "warn",
+        f"Deleted {len(wanted)} tracker capture(s): {len(removed)} dir(s), {len(removed_streams)} tracker stream(s)",
+    )
+    return {"ok": True, "deleted": len(wanted), "removedDirs": removed, "removedStreams": removed_streams}
 
 
 def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
@@ -15695,6 +15798,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/calibration/tracker-mount/record":
                     result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/tracker-mount/captures/delete":
+                    result = _delete_tracker_mount_captures(self.server.state, _read_json_body(self))
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

@@ -4382,3 +4382,17 @@ button.danger {
   color: #b42318;
   font-weight: 600;
 }
+
+.tracker-capture-actions {
+  align-items: center;
+  margin-top: 8px;
+}
+
+.tracker-capture-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.tracker-capture-scroll tbody tr {
+  cursor: pointer;
+}

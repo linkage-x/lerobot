@@ -37,6 +37,7 @@ import type {
   TrackerMountListResponse,
   TrackerMountSolveResponse,
   TrackerMountCaptureListResponse,
+  TrackerMountCaptureDeleteResponse,
   TrackerMountRecordResponse,
   TrackerMountSession,
   TrackerMountSessionResponse,
@@ -965,6 +966,24 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), episodes: [] };
+    }
+  }
+
+  /**
+   * Delete recorded captures picked from the list. The gateway plans the whole
+   * batch first and refuses all of it if any row cannot go.
+   */
+  async deleteTrackerMountCaptures(episodeDirs: string[]): Promise<TrackerMountCaptureDeleteResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/captures/delete`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ episodeDirs })
+      });
+      const payload = (await response.json()) as TrackerMountCaptureDeleteResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
     }
   }
 

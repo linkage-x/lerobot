@@ -5943,6 +5943,98 @@ def test_discovery_skips_episodes_the_tracker_was_not_running_for(tmp_path):
     assert gateway._tracker_mount_discover(state)["episodes"] == []
 
 
+def _mount_capture(tmp_path: Path, name: str, episodes: list[int], session_id: str) -> Path:
+    """A mount capture as the recorder leaves it: episodes under the calibration
+    tree, the stream landed under the recorder's own dataset."""
+    dataset = tmp_path / "outputs" / "calibration_captures" / name / "tracker_mount"
+    for ep in episodes:
+        _write_tracker_episode(dataset, ep, session_id=session_id, land=False)
+    (tmp_path / "outputs" / "datasets" / f"rec_{name}" / "laser_tracker" / session_id).mkdir(parents=True)
+    return dataset
+
+
+def _ep(dataset: Path, ep: int) -> str:
+    return str(dataset / "episodes" / f"episode_{ep:06d}")
+
+
+def test_deleting_some_dwells_keeps_the_survivors_indices_and_the_shared_stream(tmp_path):
+    """Fits and pose sidecars name episodes by index; renumbering would repoint them."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1, 2], "lt_a")
+
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 1)]})
+
+    assert result["ok"] is True
+    assert sorted(p.name for p in (dataset / "episodes").iterdir()) == ["episode_000000", "episode_000002"]
+    assert result["removedStreams"] == []
+    assert (tmp_path / "outputs" / "datasets" / "rec_tm_a" / "laser_tracker" / "lt_a").is_dir()
+
+
+def test_deleting_every_dwell_removes_the_capture_and_its_orphaned_stream(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1], "lt_a")
+    other = _mount_capture(tmp_path, "tm_b", [0], "lt_b")
+
+    result = gateway._delete_tracker_mount_captures(
+        state, {"episodeDirs": [_ep(dataset, 0), _ep(dataset, 1)]}
+    )
+
+    assert result["ok"] is True
+    assert not dataset.parent.exists()
+    assert not (tmp_path / "outputs" / "datasets" / "rec_tm_a" / "laser_tracker" / "lt_a").exists()
+    assert other.is_dir()
+    assert (tmp_path / "outputs" / "datasets" / "rec_tm_b" / "laser_tracker" / "lt_b").is_dir()
+
+
+def test_delete_refuses_paths_the_list_does_not_show(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    victim = tmp_path / "outputs" / "important"
+    victim.mkdir(parents=True)
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [str(victim)]})
+    assert result["ok"] is False
+    assert victim.is_dir()
+
+
+def test_delete_refuses_the_capture_in_progress_and_deletes_nothing_else(tmp_path):
+    """One refused row refuses the batch, so nothing is left half-deleted."""
+    state = _tracker_mount_state(tmp_path)
+    live = _mount_capture(tmp_path, "tm_live", [0], "lt_live")
+    old = _mount_capture(tmp_path, "tm_old", [0], "lt_old")
+    state.tracker_mount_session = gateway.TrackerMountSession(
+        active=True, sessionName="tm_live", captureRoot=str(live)
+    )
+
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(old, 0), _ep(live, 0)]})
+
+    assert result["ok"] is False
+    assert "结束采集" in result["error"]
+    assert (old / "episodes" / "episode_000000").is_dir()
+
+
+def test_delete_refuses_part_of_a_recorder_dataset_but_takes_all_of_it(tmp_path):
+    """A recorder dataset's parquet is indexed by episode; only whole is safe here."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0)
+    _write_tracker_episode(dataset, 1)
+
+    partial = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0)]})
+    assert partial["ok"] is False
+    assert (dataset / "episodes" / "episode_000000").is_dir()
+
+    whole = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0), _ep(dataset, 1)]})
+    assert whole["ok"] is True
+    assert not dataset.exists()
+
+
+def test_delete_refuses_while_a_take_is_in_flight(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0], "lt_a")
+    state.recording.state = "recording"
+    assert gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0)]})["ok"] is False
+    assert (dataset / "episodes" / "episode_000000").is_dir()
+
+
 def test_recording_a_dwell_refuses_before_connect_with_the_next_action(tmp_path):
     state = _tracker_mount_state(tmp_path)
     state.recording.state = "idle"

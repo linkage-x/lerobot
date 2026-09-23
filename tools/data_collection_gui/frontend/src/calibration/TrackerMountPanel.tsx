@@ -519,6 +519,13 @@ function SessionLine({ session }: { session: TrackerMountSession }) {
   );
 }
 
+/** tm_<ts> for a mount capture (its dataset dir is always "tracker_mount"), else the dataset name. */
+function captureGroupLabel(capture: TrackerMountCapture): string {
+  if (capture.datasetName !== "tracker_mount") return capture.datasetName;
+  const parts = capture.dataset.split("/").filter(Boolean);
+  return parts[parts.length - 2] ?? capture.datasetName;
+}
+
 function GuidedCapture({
   api,
   disabled,
@@ -735,9 +742,113 @@ function GuidedCapture({
       {session?.active && <SessionLine session={session} />}
 
       {captures.length > 0 && (
+        <CaptureHistory api={api} disabled={disabled} captures={captures} onRefresh={onRefresh} />
+      )}
+    </div>
+  );
+}
+
+
+/**
+ * The recorded list, with batch delete. Deletion is the gateway's call: it
+ * plans the whole batch and refuses all of it if one row cannot go (a capture
+ * in progress, an un-landed session, part of a recorder dataset), so what the
+ * operator selected either goes or stays -- never half.
+ */
+function CaptureHistory({
+  api,
+  disabled,
+  captures,
+  onRefresh,
+}: {
+  api: DataCollectionGuiApi;
+  disabled: boolean;
+  captures: TrackerMountCapture[];
+  onRefresh: () => void;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [note, setNote] = useState<{ text: string; bad: boolean } | null>(null);
+
+  // A refreshed list may no longer hold a selected row; never delete what is not shown.
+  useEffect(() => {
+    const shown = new Set(captures.map((capture) => capture.episodeDir));
+    setSelected((prev) => {
+      const kept = [...prev].filter((dir) => shown.has(dir));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [captures]);
+
+  const allSelected = captures.length > 0 && captures.every((capture) => selected.has(capture.episodeDir));
+  const picked = captures.filter((capture) => selected.has(capture.episodeDir));
+  const groups = new Map<string, number>();
+  for (const capture of picked) {
+    const key = captureGroupLabel(capture);
+    groups.set(key, (groups.get(key) ?? 0) + 1);
+  }
+
+  function toggle(dir: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(dir)) next.delete(dir);
+      else next.add(dir);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? new Set() : new Set(captures.map((capture) => capture.episodeDir)));
+  }
+
+  async function onDelete() {
+    setConfirming(false);
+    setDeleting(true);
+    const result = await api.deleteTrackerMountCaptures(picked.map((capture) => capture.episodeDir));
+    setDeleting(false);
+    if (result.ok) {
+      const streams = result.removedStreams?.length ?? 0;
+      setNote({
+        text: `已删除 ${result.deleted ?? picked.length} 段录制${streams ? `，以及 ${streams} 个不再被引用的跟踪仪数据流` : ""}。`,
+        bad: false,
+      });
+      setSelected(new Set());
+    } else {
+      setNote({ text: result.error || "删除失败", bad: true });
+    }
+    onRefresh();
+  }
+
+  return (
+    <>
+      <div className="cali-op-grid tracker-capture-actions">
+        <span className="cali-muted">已录制 {captures.length} 段，选中 {picked.length} 段</span>
+        <button
+          className="cali-mini-btn danger"
+          disabled={disabled || deleting || picked.length === 0}
+          onClick={() => setConfirming(true)}
+        >
+          {deleting ? "删除中…" : `删除选中（${picked.length}）`}
+        </button>
+      </div>
+      {note && (
+        <p className={note.bad ? "cali-warn" : "cali-muted"}>
+          {note.bad && <StatusDot state="error" />} {note.text}
+        </p>
+      )}
+      <div className="tracker-capture-scroll">
         <table className="metric-table">
           <thead>
             <tr>
+              <th>
+                <input
+                  type="checkbox"
+                  aria-label="全选"
+                  checked={allSelected}
+                  disabled={disabled || deleting}
+                  onChange={toggleAll}
+                />
+              </th>
               <th>录制</th>
               <th>session</th>
               <th>落地</th>
@@ -745,10 +856,20 @@ function GuidedCapture({
             </tr>
           </thead>
           <tbody>
-            {captures.slice(0, 8).map((capture) => (
-              <tr key={capture.episodeDir}>
+            {captures.map((capture) => (
+              <tr key={capture.episodeDir} onClick={() => !disabled && !deleting && toggle(capture.episodeDir)}>
                 <td>
-                  {capture.datasetName} ep{capture.episode}
+                  <input
+                    type="checkbox"
+                    aria-label={`选中 ${captureGroupLabel(capture)} ep${capture.episode}`}
+                    checked={selected.has(capture.episodeDir)}
+                    disabled={disabled || deleting}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => toggle(capture.episodeDir)}
+                  />
+                </td>
+                <td>
+                  {captureGroupLabel(capture)} ep{capture.episode}
                   {protocolLabel(capture) && <span className="cali-muted"> · {protocolLabel(capture)}</span>}
                 </td>
                 <td>{capture.sessionId || "—"}</td>
@@ -765,11 +886,42 @@ function GuidedCapture({
             ))}
           </tbody>
         </table>
+      </div>
+      {confirming && (
+        <Modal
+          title="删除选中的录制"
+          onClose={() => setConfirming(false)}
+          footer={
+            <>
+              <button className="cali-mini-btn" onClick={() => setConfirming(false)}>
+                取消
+              </button>
+              <button className="cali-mini-btn danger" onClick={onDelete}>
+                永久删除 {picked.length} 段
+              </button>
+            </>
+          }
+        >
+          <p>
+            将从 Thor 磁盘上<b>永久删除</b>下面这些录制，不能恢复：
+          </p>
+          <ul>
+            {[...groups.entries()].map(([label, count]) => (
+              <li key={label}>
+                {label}：{count} 段
+              </li>
+            ))}
+          </ul>
+          <p className="cali-muted">
+            剩下的录制<b>保留原编号</b>（已有的解算结果按编号引用 episode，重编号会把它们指到别的姿态上）。
+            某次采集的录制全删光时整个采集目录一起删；某个跟踪仪数据流不再被任何录制引用时也一起删。
+            已经解出来的 T_WG / c 结果文件不受影响。
+          </p>
+        </Modal>
       )}
-    </div>
+    </>
   );
 }
-
 
 export function TrackerMountPanel({
   api,

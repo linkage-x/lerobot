@@ -1543,6 +1543,15 @@ export type TrackerMountCaptureListResponse = {
   error?: string;
 };
 
+export type TrackerMountCaptureDeleteResponse = {
+  ok: boolean;
+  deleted?: number;
+  removedDirs?: string[];
+  /** Tracker streams no surviving episode referred to any more. */
+  removedStreams?: string[];
+  error?: string;
+};
+
 export type TrackerMountRecordResponse = {
   ok: boolean;
   captureRoot?: string;
