@@ -653,3 +653,24 @@ def test_a_connect_that_does_not_home_says_why_it_never_gets_ready() -> None:
     session.beam_ready = True
     assert session.ready is False
     assert "home_on_connect is off" in session.beam_summary()
+
+
+def test_recovery_attempts_reach_the_recorder_log(caplog) -> None:
+    """They used to live only in the in-memory tail and die with the process."""
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    with caplog.at_level("INFO", logger=lts.logger.name):
+        session._read_logger_stdout(_Proc([
+            "rows 5  dropped 0   recover: re-range TargetNotFound (7)\n",
+            "recover: tracking at the home nest without a range -- homing\n",
+            "home: nest at az -28.41 el -20.09 deg\n",
+        ]))
+    text = caplog.text
+    assert "recover: re-range TargetNotFound (7)" in text
+    assert "at the home nest without a range" in text
+    assert "home: nest at az" in text
+    assert session.homed is False  # the nest line is not the home marker

@@ -482,6 +482,15 @@ class LaserTrackerSession:
                     self.beam_ready = False
                     self.beam_status = what  # carries the SDK's reason in brackets
                 logger.info("tracker beam: %s", self.beam_status)
+            # Recovery and search attempts go to the recorder log: on 2026-09-23 a
+            # session sat tracking with no distance for minutes and the only
+            # account of why -- what each re-range answered -- was in this tail,
+            # in memory, gone with the process.
+            for tag in ("recover:", "search:", "home: nest"):
+                at = line.find(tag)
+                if at >= 0:
+                    logger.info("tracker %s", line[at:])
+                    break
             if line.find("home: ok") >= 0:
                 self.homed = True
                 logger.info("tracker homed: the session has an absolute range")
