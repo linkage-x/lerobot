@@ -603,3 +603,25 @@ def test_a_ranged_lock_is_reported_with_the_step_it_moved() -> None:
     assert session.locks_ranged == 2 and session.locks_not_ranged == 1
     assert session.range_status == "2 NOT ranged (LaserBeamBroken)"
     assert session.status().range_status.startswith("2 NOT ranged")
+
+
+def test_a_session_that_never_homed_says_so() -> None:
+    """Locked-on is not homed.
+
+    W2 (2026-09-21) ran green from start to finish and never homed -- of its
+    679342 valid samples not one was at the home nest -- and every beam lock
+    inherited a range hundreds of mm off. The marker is separate for that
+    reason: "beam: acquired" must not be read as "this session has a range".
+    """
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["beam: acquired\n", "lock: 0 ranged, step 0 mm\n"]))
+    assert session.beam_ready is True
+    assert session.homed is False and session.status().homed is False
+
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.homed is True and session.status().homed is True

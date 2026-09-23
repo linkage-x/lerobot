@@ -257,6 +257,11 @@ class LaserTrackerStatus:
     range_status: str = ""
     locks_ranged: int = 0
     locks_not_ranged: int = 0
+    # Homing is what gives the session an absolute range, and "beam: acquired"
+    # does not imply it: W2 (2026-09-21) ran locked-on and green from start to
+    # finish without ever homing, and every lock carried a range hundreds of mm
+    # off. A session that has not homed is not ground truth.
+    homed: bool = False
     episodes: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -290,6 +295,7 @@ class LaserTrackerSession:
         self.range_status = ""
         self.locks_ranged = 0
         self.locks_not_ranged = 0
+        self.homed = False
         self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
@@ -476,6 +482,9 @@ class LaserTrackerSession:
                     self.beam_ready = False
                     self.beam_status = what  # carries the SDK's reason in brackets
                 logger.info("tracker beam: %s", self.beam_status)
+            if line.find("home: ok") >= 0:
+                self.homed = True
+                logger.info("tracker homed: the session has an absolute range")
             lock_at = line.find("lock:")
             if lock_at >= 0:
                 self.range_status = line[lock_at + len("lock:"):].strip()
@@ -948,6 +957,7 @@ class LaserTrackerSession:
             beam_ready=self.beam_ready,
             beam_status=self.beam_status,
             range_status=self.range_status,
+            homed=self.homed,
             locks_ranged=self.locks_ranged,
             locks_not_ranged=self.locks_not_ranged,
             episodes=[asdict(r) for r in self._episodes],
