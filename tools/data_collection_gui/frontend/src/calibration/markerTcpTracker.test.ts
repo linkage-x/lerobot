@@ -42,6 +42,7 @@ const LIVE = {
   state: "armed",
   laserTracker: true,
   laserTrackerReady: true,
+  laserTrackerHomed: true,
   laserTrackerDetail: "session lt_20260923_101500 · beam on SMR",
 };
 
@@ -68,6 +69,10 @@ describe("trackerLink", () => {
     expect(trackerLink({ state: "armed", laserTracker: false }).text).toContain("跟踪仪开关");
     expect(trackerLink({ ...LIVE, laserTrackerReady: false }).dot).toBe("warning");
     expect(trackerLink(LIVE).dot).toBe("running");
+    // Locked but never homed (W2): named as such, not as a beam problem.
+    const unhomed = trackerLink({ ...LIVE, laserTrackerHomed: false, laserTrackerReady: false });
+    expect(unhomed.dot).toBe("warning");
+    expect(unhomed.text).toContain("Home");
   });
 });
 

@@ -186,7 +186,13 @@ class RecordingStatus:
     laserTrackerDevice: str = ""
     # Whether the beam is actually on the SMR. Gates Start Episode: an episode
     # recorded while the tracker is blind looks complete and measures nothing.
+    # The recorder only says "ready" once the session has also homed.
     laserTrackerReady: bool = False
+    # Whether this session homed. Without it every beam lock carries a range
+    # inherited from whatever reference was left behind (W2, 2026-09-21: locked
+    # and green throughout, every range 337-440 mm off). Shown on its own so the
+    # operator can tell "not homed" from "beam not on the SMR".
+    laserTrackerHomed: bool = False
 
 
 @dataclass
@@ -12941,6 +12947,7 @@ def _connect_recorder(
     state.recording.laserTrackerDetail = ""
     state.recording.laserTrackerState = "idle"
     state.recording.laserTrackerReady = False
+    state.recording.laserTrackerHomed = False
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -13056,11 +13063,18 @@ def _start_episode(
     # metrologically empty -- 81343 rows, 0 dropped, not one measurement, which
     # is how 2026-09-20's first session went. The tracker re-homes on a timer, so
     # this clears itself as soon as the SMR is in the nest.
+    #
+    # "Ready" also requires that the session homed: a locked beam without a Home
+    # measures every distance against a stale reference (W2, 2026-09-21).
     if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        what = (
+            "尚未锁定 SMR" if state.recording.laserTrackerHomed
+            else "本次会话还没 Home 成功（没有绝对距离，录下的距离不可信）"
+        )
         raise RuntimeError(
-            "激光跟踪仪尚未锁定 SMR："
+            f"激光跟踪仪{what}："
             f"{state.recording.laserTrackerDetail or '等待中'}。"
-            "把 SMR 放进鸟巢窝，设备行变绿后再 StartEpisode"
+            "把 SMR 放进 home 窝，等 Home 成功、设备行变绿后再 StartEpisode"
             "（跟踪仪会自动重试 Home，不需要重新 Connect）。"
         )
 
@@ -13785,6 +13799,9 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("LT_HOMED "):
+        state.recording.laserTrackerHomed = output.removeprefix("LT_HOMED ").strip() == "1"
         return
     if output.startswith("LT_BEAM "):
         raw = output.removeprefix("LT_BEAM ").strip()

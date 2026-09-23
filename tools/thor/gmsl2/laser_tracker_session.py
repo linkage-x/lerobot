@@ -914,10 +914,31 @@ class LaserTrackerSession:
         parts.append(f"1 kHz @ {self.cfg.tracker_ip}")
         return ", ".join(parts)
 
+    @property
+    def ready(self) -> bool:
+        """Whether an episode recorded now would carry ground truth.
+
+        A locked beam is not enough: without a successful Home the session has
+        no absolute range, and every lock inherits whatever reference was left
+        behind -- W2 (2026-09-21) was locked and green throughout and every
+        range was 337-440 mm off.  This is what gates Start Episode.
+        """
+        return self.beam_ready and self.homed
+
     def beam_summary(self) -> str:
         """What the beam is doing, in the words an operator needs."""
+        if self.beam_ready and self.homed:
+            return "homed, locked on the SMR"
         if self.beam_ready:
-            return "locked on the SMR"
+            if not self.cfg.home_on_connect:
+                return (
+                    "locked on the SMR but NOT homed: this Connect does not home "
+                    "(home_on_connect is off), so the session has no absolute range"
+                )
+            return (
+                "locked on the SMR but NOT homed yet — put the SMR in the home nest "
+                "and wait for Home to succeed; homing retries automatically"
+            )
         if self.beam_status.startswith("waiting"):
             # Exactly one layer of brackets: the SDK's reason carries its own
             # numeric code in brackets, so strip(" ()") would eat that one too

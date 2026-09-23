@@ -125,8 +125,11 @@ export type RecordingStatus = {
   laserTrackerDetail?: string;
   // Model / serial / firmware as the instrument reported them.
   laserTrackerDevice?: string;
-  // Whether the beam is on the SMR. Start Episode is gated on it.
+  // Whether the beam is on the SMR *and* the session homed. Start Episode is gated on it.
   laserTrackerReady?: boolean;
+  // Whether this tracker session homed. Without it every range inherits a stale
+  // reference (W2, 2026-09-21: locked and green throughout, 337-440 mm off).
+  laserTrackerHomed?: boolean;
 };
 
 export type MarkerTcpSample = {

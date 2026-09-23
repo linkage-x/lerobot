@@ -1439,7 +1439,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"WARNING: laser tracker: {tracker.last_error}")
         # A machine-readable line so the gateway can colour the row and gate the
         # Start button; the human sentence rides along after the pipe.
-        _emit(f"LT_BEAM {'ready' if tracker.beam_ready else 'waiting'}|{tracker.beam_summary()}")
+        # "ready" means homed AND locked: see LaserTrackerSession.ready.  LT_HOMED
+        # goes first so the gateway never shows a ready row with a stale homed flag.
+        _emit(f"LT_HOMED {int(tracker.homed)}")
+        _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)
@@ -1930,10 +1933,13 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal tracker_beam_was
         if not tracker_started:
             return
-        now = tracker.beam_ready
+        # Both halves are tracked: Home succeeding while the beam stays locked
+        # changes the verdict without changing beam_ready.
+        now = (tracker.beam_ready, tracker.homed)
         if now != tracker_beam_was:
             tracker_beam_was = now
-            _emit(f"LT_BEAM {'ready' if now else 'waiting'}|{tracker.beam_summary()}")
+            _emit(f"LT_HOMED {int(tracker.homed)}")
+            _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
 
     def _tick_connected_idle() -> None:
         nonlocal last_box_live_at, last_warmup_roll_at

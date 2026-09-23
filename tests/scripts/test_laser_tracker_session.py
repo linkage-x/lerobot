@@ -353,7 +353,9 @@ def test_beam_transitions_are_read_from_the_logger() -> None:
         "beam: acquired\n",
     ]))
     assert session.beam_ready is True
-    assert session.beam_summary() == "locked on the SMR"
+    assert "NOT homed" in session.beam_summary()
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.beam_summary() == "homed, locked on the SMR"
 
     session._read_logger_stdout(_Proc(["beam: lost\n"]))
     assert session.beam_ready is False
@@ -625,3 +627,29 @@ def test_a_session_that_never_homed_says_so() -> None:
 
     session._read_logger_stdout(_Proc(["home: ok\n"]))
     assert session.homed is True and session.status().homed is True
+
+
+def test_start_is_gated_on_home_not_only_on_the_beam() -> None:
+    """`ready` is what the recorder sends as LT_BEAM ready, and so what gates Start."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["beam: acquired\n"]))
+    assert session.ready is False
+    assert "home nest" in session.beam_summary()
+
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.ready is True
+
+    session._read_logger_stdout(_Proc(["beam: lost\n"]))
+    assert session.ready is False  # homed stays, but a blind beam still blocks
+
+
+def test_a_connect_that_does_not_home_says_why_it_never_gets_ready() -> None:
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=False))
+    session.beam_ready = True
+    assert session.ready is False
+    assert "home_on_connect is off" in session.beam_summary()

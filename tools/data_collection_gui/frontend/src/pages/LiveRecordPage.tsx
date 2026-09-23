@@ -205,8 +205,13 @@ export function RecordingPanel({
   // Only while the tracker is actually switched on for this session: an episode
   // recorded with a blind tracker looks complete and measures nothing, and the
   // tracker re-homes on a timer, so this clears itself once the SMR is in place.
+  // Ready also means homed: a locked beam without a Home measures every distance
+  // against a stale reference, so "not homed" is named on its own.
   const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
-  const trackerBlockReason = status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+  const trackerNotHomed = Boolean(status.laserTracker) && !status.laserTrackerHomed;
+  const trackerBlockReason = trackerNotHomed
+    ? `激光跟踪仪还没 Home 成功，不能开录：把 SMR 放进 home 窝等待自动 Home（${status.laserTrackerDetail || "等待中"}）`
+    : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
   // The gateway refuses StartEpisode while a mount capture owns the recorder,
   // because a task episode there does two invisible kinds of damage: it clears
   // the calibration redirect and lands a stationary rig in the training set, and
@@ -242,6 +247,11 @@ export function RecordingPanel({
       </div>
       {isGmsl && <CameraEncodingInfo config={config} />}
       {laserTrackerToggle}
+      {status.laserTracker && isConnected && (
+        <p className="tracker-home-state" data-homed={status.laserTrackerHomed ? "yes" : "no"}>
+          跟踪仪 Home：{status.laserTrackerHomed ? "✅ 已 Home（有绝对距离）" : "❌ 未 Home"}
+        </p>
+      )}
       {trackerBlocking && (
         <p className="tracker-wait-banner">
           ⏳ {trackerBlockReason}

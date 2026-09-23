@@ -223,6 +223,39 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     return written
 
 
+def test_start_episode_refuses_a_tracker_session_that_never_homed(tmp_path, monkeypatch):
+    """Locked-on and green is not enough: W2 (2026-09-21) never homed.
+
+    The recorder only sends LT_BEAM ready once the session has homed as well,
+    and LT_HOMED lets the refusal say which of the two is missing.
+    """
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+
+    gateway._apply_recorder_output(state, "LT_HOMED 0")
+    gateway._apply_recorder_output(
+        state, "LT_BEAM waiting|locked on the SMR but NOT homed yet — put the SMR in the home nest"
+    )
+    assert state.recording.laserTrackerHomed is False
+    with pytest.raises(RuntimeError, match="还没 Home 成功"):
+        gateway._start_episode(state)
+    assert written == []
+
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+    assert state.recording.laserTrackerHomed is True
+    assert state.recording.laserTrackerReady is True
+    gateway._start_episode(state)
+    assert written  # the start went through
+
+    # Homed but the beam wandered off: still refused, and it says the beam.
+    gateway._apply_recorder_output(state, "LT_BEAM waiting|beam lost — reacquiring")
+    state.recording.state = "armed"
+    with pytest.raises(RuntimeError, match="尚未锁定 SMR"):
+        gateway._start_episode(state)
+
+
 def test_start_episode_sends_a_calibration_sweep_somewhere_else(tmp_path, monkeypatch):
     state = _calibration_gateway_state(tmp_path)
     written = _capture_recorder_stdin(monkeypatch)

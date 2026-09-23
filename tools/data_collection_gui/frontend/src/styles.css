@@ -4370,3 +4370,15 @@ button.danger {
   margin: 8px 0 0;
   padding: 8px 10px;
 }
+
+/* Homed is its own line: "not homed" and "beam off the SMR" need different
+   actions, and W2 looked green while never having homed. */
+.tracker-home-state {
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+
+.tracker-home-state[data-homed="no"] {
+  color: #b42318;
+  font-weight: 600;
+}

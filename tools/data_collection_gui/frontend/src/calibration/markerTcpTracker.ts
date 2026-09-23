@@ -62,6 +62,7 @@ type RecordingLike = {
   state: string;
   laserTracker?: boolean;
   laserTrackerReady?: boolean;
+  laserTrackerHomed?: boolean;
   laserTrackerDetail?: string;
 };
 
@@ -82,6 +83,12 @@ export function trackerLink(recording: RecordingLike): TrackerLink {
       dot: "idle",
       text:
         "这次 Connect 没开跟踪仪，样本只能做相机 pivot。要顺便测 E1p：Disconnect，打开跟踪仪开关，重新 Connect。",
+    };
+  }
+  if (!recording.laserTrackerHomed) {
+    return {
+      dot: "warning",
+      text: `跟踪仪这次会话还没 Home 成功（${recording.laserTrackerDetail || "等待中"}）。先把 SMR 放进 home 窝等 Home 成功，否则距离不可信，「录制样本」会被拒绝。`,
     };
   }
   if (!recording.laserTrackerReady) {
