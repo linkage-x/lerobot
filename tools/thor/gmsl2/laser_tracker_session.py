@@ -251,6 +251,12 @@ class LaserTrackerStatus:
     gimbal_mode: str = ""
     beam_ready: bool = False
     beam_status: str = "unknown"
+    # The logger ranges every beam lock absolutely before its samples count
+    # (2026-09-22). This is the last one it reported, step and all: the number
+    # an operator needs while judging whether a catch can be trusted.
+    range_status: str = ""
+    locks_ranged: int = 0
+    locks_not_ranged: int = 0
     episodes: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -281,6 +287,9 @@ class LaserTrackerSession:
         # the operator is actively changing, not a verdict on the session.
         self.beam_ready = False
         self.beam_status = "unknown"
+        self.range_status = ""
+        self.locks_ranged = 0
+        self.locks_not_ranged = 0
         self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
@@ -467,6 +476,14 @@ class LaserTrackerSession:
                     self.beam_ready = False
                     self.beam_status = what  # carries the SDK's reason in brackets
                 logger.info("tracker beam: %s", self.beam_status)
+            lock_at = line.find("lock:")
+            if lock_at >= 0:
+                self.range_status = line[lock_at + len("lock:"):].strip()
+                if "NOT ranged" in self.range_status:
+                    self.locks_not_ranged += 1
+                else:
+                    self.locks_ranged += 1
+                logger.info("tracker lock: %s", self.range_status)
             dev_at = line.find("device:")
             if dev_at >= 0:
                 fields = {}
@@ -930,5 +947,8 @@ class LaserTrackerSession:
             gimbal_mode=self.gimbal_mode,
             beam_ready=self.beam_ready,
             beam_status=self.beam_status,
+            range_status=self.range_status,
+            locks_ranged=self.locks_ranged,
+            locks_not_ranged=self.locks_not_ranged,
             episodes=[asdict(r) for r in self._episodes],
         )

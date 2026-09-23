@@ -579,3 +579,27 @@ def test_a_logger_that_never_streams_is_told_to_stop(monkeypatch) -> None:
     assert any("type nul" in c and "STOP_LOGGER" in c for c in ran)
     assert _Stuck.terminated
     assert session._logger_proc is None
+
+
+def test_a_ranged_lock_is_reported_with_the_step_it_moved() -> None:
+    """The operator needs the step while judging a catch, not after the session.
+
+    W2 (2026-09-22): a lock caught 337 mm long keeps it until the beam is lost,
+    so "ranged, step 337.2 mm" is the line that says this catch was bad and the
+    fit built on it would have been wrong.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc([
+        "beam: acquired\n",
+        "lock: 0 ranged, step 337.2 mm\n",
+        "rows 12000  dropped 0   lock: 1 ranged, step 0.01 mm (target was moving)\n",
+        "lock: 2 NOT ranged (LaserBeamBroken)\n",
+    ]))
+    assert session.locks_ranged == 2 and session.locks_not_ranged == 1
+    assert session.range_status == "2 NOT ranged (LaserBeamBroken)"
+    assert session.status().range_status.startswith("2 NOT ranged")
