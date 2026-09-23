@@ -209,9 +209,12 @@ export function RecordingPanel({
   // against a stale reference, so "not homed" is named on its own.
   const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
   const trackerNotHomed = Boolean(status.laserTracker) && !status.laserTrackerHomed;
+  const trackerBeamBroken = Boolean(status.laserTracker) && Boolean(status.laserTrackerBeamBroken);
   const trackerBlockReason = trackerNotHomed
     ? `激光跟踪仪还没 Home 成功，不能开录：把 SMR 放进 home 窝等待自动 Home（${status.laserTrackerDetail || "等待中"}）`
-    : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+    : trackerBeamBroken
+      ? "激光跟踪仪断过光，当前距离不是绝对的，不能开录：请把 SMR 放回 home 窝，会自动重新 Home"
+      : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
   // The gateway refuses StartEpisode while a mount capture owns the recorder,
   // because a task episode there does two invisible kinds of damage: it clears
   // the calibration redirect and lands a stationary rig in the training set, and
@@ -248,8 +251,16 @@ export function RecordingPanel({
       {isGmsl && <CameraEncodingInfo config={config} />}
       {laserTrackerToggle}
       {status.laserTracker && isConnected && (
-        <p className="tracker-home-state" data-homed={status.laserTrackerHomed ? "yes" : "no"}>
-          跟踪仪 Home：{status.laserTrackerHomed ? "✅ 已 Home（有绝对距离）" : "❌ 未 Home"}
+        <p
+          className="tracker-home-state"
+          data-homed={status.laserTrackerHomed && !status.laserTrackerBeamBroken ? "yes" : "no"}
+        >
+          跟踪仪 Home：
+          {!status.laserTrackerHomed
+            ? "❌ 未 Home"
+            : status.laserTrackerBeamBroken
+              ? "⚠️ 断过光，请把 SMR 放回窝里重新 Home（放回后自动 Home）"
+              : "✅ 已 Home（有绝对距离）"}
         </p>
       )}
       {trackerBlocking && (

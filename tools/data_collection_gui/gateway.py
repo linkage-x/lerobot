@@ -193,6 +193,8 @@ class RecordingStatus:
     # and green throughout, every range 337-440 mm off). Shown on its own so the
     # operator can tell "not homed" from "beam not on the SMR".
     laserTrackerHomed: bool = False
+    # Homed, but the beam broke since: the current lock's range is not absolute.
+    laserTrackerBeamBroken: bool = False
 
 
 @dataclass
@@ -13051,6 +13053,7 @@ def _connect_recorder(
     state.recording.laserTrackerState = "idle"
     state.recording.laserTrackerReady = False
     state.recording.laserTrackerHomed = False
+    state.recording.laserTrackerBeamBroken = False
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -13170,6 +13173,14 @@ def _start_episode(
     # "Ready" also requires that the session homed: a locked beam without a Home
     # measures every distance against a stale reference (W2, 2026-09-21).
     if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        if state.recording.laserTrackerBeamBroken:
+            # A catch after a break keeps whatever range the ADM handed back;
+            # pivot lt_20260923_062953 carried +4.3 mm that way, flagged good.
+            raise RuntimeError(
+                "激光跟踪仪 Home 之后断过光，当前这段锁光没有绝对距离，录下的距离不可信。"
+                "请把 SMR 放回 home 窝，跟踪仪会自动重新 Home，设备行变绿后再 StartEpisode。"
+                "之后移动 SMR 全程别挡光。"
+            )
         what = (
             "尚未锁定 SMR" if state.recording.laserTrackerHomed
             else "本次会话还没 Home 成功（没有绝对距离，录下的距离不可信）"
@@ -13902,6 +13913,9 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("LT_BEAM_BROKEN "):
+        state.recording.laserTrackerBeamBroken = output.removeprefix("LT_BEAM_BROKEN ").strip() == "1"
         return
     if output.startswith("LT_HOMED "):
         state.recording.laserTrackerHomed = output.removeprefix("LT_HOMED ").strip() == "1"

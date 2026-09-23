@@ -469,6 +469,12 @@ describe("the panel and Live Record cannot disagree about the tracker", () => {
     expect(r.detail).toContain("home nest");
   });
 
+  it("names a beam break since Home instead of reading as locked", () => {
+    const r = captureReadiness([], { ...LOCKED, trackerReady: false, trackerBeamBroken: true });
+    expect(r.blocker).toBe("beam_waiting");
+    expect(r.title).toContain("断过光");
+  });
+
   it("lets recorded work decide the next action even though the rig is connected", () => {
     // After the last dwell the recorder is still up, but the next action is
     // Disconnect. Live state must not override work already done.

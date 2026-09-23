@@ -648,6 +648,39 @@ def test_start_is_gated_on_home_not_only_on_the_beam() -> None:
     assert session.ready is False  # homed stays, but a blind beam still blocks
 
 
+def test_a_beam_break_after_home_blocks_start_until_the_nest_re_homes() -> None:
+    """Pivot lt_20260923_062953 re-caught 14 mm out of the nest carried +4.3 mm."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["home: ok\n", "range: lock 0 absolute (home)\n", "beam: acquired\n"]))
+    assert session.ready is True and session.beam_broken is False
+
+    session._read_logger_stdout(_Proc([
+        "beam: lost\n",
+        "rows 9000  dropped 0   range: lock 1 not absolute -- the beam broke; put the SMR "
+        "back in the home nest to re-home\n",
+        "beam: acquired\n",
+    ]))
+    assert session.beam_broken is True
+    assert session.ready is False
+    assert "home nest" in session.beam_summary()
+
+    session._read_logger_stdout(_Proc(["recover: re-home ok\n", "range: lock 2 absolute (home)\n"]))
+    assert session.ready is True and session.beam_broken is False
+
+
+def test_a_logger_that_does_not_report_absoluteness_is_gated_on_home_alone() -> None:
+    """An exe from before 2026-09-23 prints no `range:` lines; it must still turn green."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+    session.beam_ready, session.homed = True, True
+    assert session.range_absolute is None
+    assert session.ready is True
+
+
 def test_a_connect_that_does_not_home_says_why_it_never_gets_ready() -> None:
     session = lts.LaserTrackerSession(_cfg(home_on_connect=False))
     session.beam_ready = True

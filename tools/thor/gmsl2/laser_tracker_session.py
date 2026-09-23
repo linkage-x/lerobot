@@ -296,6 +296,10 @@ class LaserTrackerSession:
         self.locks_ranged = 0
         self.locks_not_ranged = 0
         self.homed = False
+        # Whether the current lock's range traces back to a Home without a beam
+        # break. None: the logger does not report it (an exe older than
+        # 2026-09-23), and then only `homed` is gated on.
+        self.range_absolute: bool | None = None
         self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
@@ -491,6 +495,14 @@ class LaserTrackerSession:
                 if at >= 0:
                     logger.info("tracker %s", line[at:])
                     break
+            range_at = line.find("range:")
+            if range_at >= 0:
+                what = line[range_at + len("range:"):].strip()
+                if "not absolute" in what:
+                    self.range_absolute = False
+                elif "absolute" in what:
+                    self.range_absolute = True
+                logger.info("tracker range: %s", what)
             if line.find("home: ok") >= 0:
                 self.homed = True
                 logger.info("tracker homed: the session has an absolute range")
@@ -932,10 +944,25 @@ class LaserTrackerSession:
         behind -- W2 (2026-09-21) was locked and green throughout and every
         range was 337-440 mm off.  This is what gates Start Episode.
         """
-        return self.beam_ready and self.homed
+        return self.beam_ready and self.homed and self.range_absolute is not False
+
+    @property
+    def beam_broken(self) -> bool:
+        """Homed, but the beam broke since: this lock's range is not absolute.
+
+        A catch after a break takes whatever range the ADM hands back, and a
+        single-point measurement only reports that back -- pivot
+        lt_20260923_062953 was caught 14 mm out of the nest and carried +4.3 mm.
+        """
+        return self.homed and self.range_absolute is False
 
     def beam_summary(self) -> str:
         """What the beam is doing, in the words an operator needs."""
+        if self.beam_ready and self.beam_broken:
+            return (
+                "the beam broke since Home, so this lock has no absolute range — put the "
+                "SMR back in the home nest; it re-homes automatically"
+            )
         if self.beam_ready and self.homed:
             return "homed, locked on the SMR"
         if self.beam_ready:

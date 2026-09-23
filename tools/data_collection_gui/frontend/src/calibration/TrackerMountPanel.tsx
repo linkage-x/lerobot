@@ -944,6 +944,7 @@ export function TrackerMountPanel({
     trackerEnabled: Boolean(recording?.laserTracker),
     trackerReady: Boolean(recording?.laserTrackerReady),
     trackerDetail: String(recording?.laserTrackerDetail ?? ""),
+    trackerBeamBroken: Boolean(recording?.laserTrackerBeamBroken),
     // "review" counts: an episode waiting for save/discard is still a take that
     // Disconnect would throw away.
     episodeInFlight: ["recording", "review", "saving", "discarding"].includes(recorderState),

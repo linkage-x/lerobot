@@ -455,6 +455,11 @@ export type RecorderLiveState = {
   trackerReady: boolean;
   /** The recorder's own sentence about the beam; shown verbatim. */
   trackerDetail: string;
+  /**
+   * Homed, but the beam broke since: the current lock has no absolute range.
+   * Optional so older callers read as "not broken".
+   */
+  trackerBeamBroken?: boolean;
   /** An episode is being recorded or is awaiting save/discard. */
   episodeInFlight: boolean;
   /**
@@ -546,6 +551,18 @@ export function captureReadiness(
         detail:
           "录制器连上了，但这一次没有启用跟踪仪，录出来的段不会有 session。" +
           "先 Disconnect，再勾上跟踪仪重新 Connect。",
+        usable: [],
+        ...buttons,
+      };
+    }
+    if (live.trackerBeamBroken) {
+      return {
+        blocker: "beam_waiting",
+        dot: "warning",
+        title: "断过光，请放回窝里重新 Home",
+        detail:
+          "Home 之后光束断过一次，现在这段锁光没有绝对距离（pivot lt_20260923_062953 就这样带了 +4.3 mm）。" +
+          "把 SMR 放回 home 窝，跟踪仪会自动重新 Home，变绿后再录；之后移动 SMR 全程别挡光。",
         usable: [],
         ...buttons,
       };

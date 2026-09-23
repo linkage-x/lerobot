@@ -130,6 +130,8 @@ export type RecordingStatus = {
   // Whether this tracker session homed. Without it every range inherits a stale
   // reference (W2, 2026-09-21: locked and green throughout, 337-440 mm off).
   laserTrackerHomed?: boolean;
+  /** Homed, but the beam broke since: the current lock has no absolute range. */
+  laserTrackerBeamBroken?: boolean;
 };
 
 export type MarkerTcpSample = {

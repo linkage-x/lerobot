@@ -1442,6 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
         # "ready" means homed AND locked: see LaserTrackerSession.ready.  LT_HOMED
         # goes first so the gateway never shows a ready row with a stale homed flag.
         _emit(f"LT_HOMED {int(tracker.homed)}")
+        _emit(f"LT_BEAM_BROKEN {int(tracker.beam_broken)}")
         _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
@@ -1933,12 +1934,14 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal tracker_beam_was
         if not tracker_started:
             return
-        # Both halves are tracked: Home succeeding while the beam stays locked
-        # changes the verdict without changing beam_ready.
-        now = (tracker.beam_ready, tracker.homed)
+        # All three are tracked: Home succeeding, or the beam breaking into a
+        # lock with no absolute range, changes the verdict without changing
+        # beam_ready.
+        now = (tracker.beam_ready, tracker.homed, tracker.range_absolute)
         if now != tracker_beam_was:
             tracker_beam_was = now
             _emit(f"LT_HOMED {int(tracker.homed)}")
+            _emit(f"LT_BEAM_BROKEN {int(tracker.beam_broken)}")
             _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
 
     def _tick_connected_idle() -> None:

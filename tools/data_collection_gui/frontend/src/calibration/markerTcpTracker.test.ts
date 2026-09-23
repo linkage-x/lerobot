@@ -73,6 +73,9 @@ describe("trackerLink", () => {
     const unhomed = trackerLink({ ...LIVE, laserTrackerHomed: false, laserTrackerReady: false });
     expect(unhomed.dot).toBe("warning");
     expect(unhomed.text).toContain("Home");
+    const broken = trackerLink({ ...LIVE, laserTrackerBeamBroken: true, laserTrackerReady: false });
+    expect(broken.dot).toBe("warning");
+    expect(broken.text).toContain("断过光");
   });
 });
 

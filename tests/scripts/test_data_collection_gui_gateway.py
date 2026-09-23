@@ -223,6 +223,26 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     return written
 
 
+def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
+    """Homed, then the beam broke: the lock's range is not absolute any more."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM_BROKEN 1")
+    gateway._apply_recorder_output(state, "LT_BEAM waiting|the beam broke since Home")
+    assert state.recording.laserTrackerBeamBroken is True
+    with pytest.raises(RuntimeError, match="断过光"):
+        gateway._start_episode(state)
+    assert written == []
+
+    gateway._apply_recorder_output(state, "LT_BEAM_BROKEN 0")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+    gateway._start_episode(state)
+    assert written
+
+
 def test_start_episode_refuses_a_tracker_session_that_never_homed(tmp_path, monkeypatch):
     """Locked-on and green is not enough: W2 (2026-09-21) never homed.
 

@@ -63,6 +63,7 @@ type RecordingLike = {
   laserTracker?: boolean;
   laserTrackerReady?: boolean;
   laserTrackerHomed?: boolean;
+  laserTrackerBeamBroken?: boolean;
   laserTrackerDetail?: string;
 };
 
@@ -89,6 +90,12 @@ export function trackerLink(recording: RecordingLike): TrackerLink {
     return {
       dot: "warning",
       text: `跟踪仪这次会话还没 Home 成功（${recording.laserTrackerDetail || "等待中"}）。先把 SMR 放进 home 窝等 Home 成功，否则距离不可信，「录制样本」会被拒绝。`,
+    };
+  }
+  if (recording.laserTrackerBeamBroken) {
+    return {
+      dot: "warning",
+      text: "跟踪仪 Home 之后断过光，当前距离不是绝对的：请把 SMR 放回 home 窝重新 Home（放回后自动 Home），否则「录制样本」会被拒绝。",
     };
   }
   if (!recording.laserTrackerReady) {
