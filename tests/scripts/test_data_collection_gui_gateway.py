@@ -5109,6 +5109,97 @@ def test_carrying_forward_cannot_rescue_a_camera_production_never_had(tmp_path):
     assert "cam_09" in gateway._preflight_message(preflight)
 
 
+def _fit_report(path: Path, lenses: dict[str, dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"cameras": {name: {"models": {"fisheye": block}} for name, block in lenses.items()}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+_GOOD_FISHEYE = {
+    "K": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    "D": [0.1, 0.0, 0.0, 0.0],
+    "monotonic_across_frame": True,
+    "corner_invertible": True,
+}
+
+
+def test_an_experiment_that_fitted_the_new_camera_unblocks_the_export(tmp_path):
+    """The refusal used to be permanent: a camera with no production lens could
+    never be exported, however well it fitted. An experiment solve on the same,
+    unchanged capture that produced an exportable lens for it rules out the
+    failure the refusal guards against."""
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_09": _GOOD_FISHEYE},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == ["cam_09"]
+    assert preflight["proven"] == ["cam_09"]
+    assert preflight["blocking"] is False
+
+    # Re-recording the sweep makes it a different capture: the record stops counting.
+    video = capture / "episodes" / "episode_000001" / "cam_09.mkv"
+    video.write_bytes(b"y" * 4096)
+    os.utime(video, ns=(1, 1))
+    assert gateway._intrinsics_preflight(state, capture)["blocking"] is True
+
+
+def test_a_folded_fit_does_not_count_as_proof(tmp_path):
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_09": {**_GOOD_FISHEYE, "monotonic_across_frame": False}},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["proven"] == []
+    assert preflight["blocking"] is True
+    assert "cam_09" in gateway._preflight_message(preflight)
+
+
+def test_a_production_camera_whose_refit_folds_blocks_the_export(tmp_path):
+    """cam_08, 2026-09-23: in production, re-swept without reaching the corners,
+    and fitted a model that folds at 78 deg. The exporter refuses the whole run
+    rather than falling back to the production lens, so this has to block too."""
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_08"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_08"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_08": {**_GOOD_FISHEYE, "monotonic_across_frame": False}},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == []
+    assert preflight["refusedFit"] == ["cam_08"]
+    assert preflight["blocking"] is True
+    assert "cam_08" in gateway._preflight_message(preflight)
+
+
 def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):
     """Blocking is about extending a set that exists. With no production
     intrinsics there is nothing to lose and nothing to carry forward."""

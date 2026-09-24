@@ -256,6 +256,34 @@ describe("preflightView", () => {
     expect(preflightView(preflight, true, true).blocking).toBe(false);
   });
 
+  it("stops blocking once an earlier solve fitted those cameras from this capture", () => {
+    const view = preflightView(
+      { ...preflight, proven: ["cam_01", "cam_02"], blocking: false },
+      true,
+      false,
+    );
+    expect(view.blocking).toBe(false);
+    expect(view.message).toContain("可以导出");
+  });
+
+  it("keeps blocking on the cameras the earlier fit did not deliver", () => {
+    const view = preflightView({ ...preflight, proven: ["cam_01"] }, true, false);
+    expect(view.blocking).toBe(true);
+    expect(view.message).toContain("cam_02");
+    expect(view.message).not.toContain("cam_01");
+  });
+
+  it("blocks on a camera whose earlier re-fit the exporter would refuse", () => {
+    const view = preflightView(
+      { cameras: ["cam_08"], production: ["cam_08"], uncalibrated: [], refusedFit: ["cam_08"], blocking: true },
+      true,
+      false,
+    );
+    expect(view.blocking).toBe(true);
+    expect(view.message).toContain("cam_08");
+    expect(view.hint).toContain("四角");
+  });
+
   it("does not block a fresh rig, which has no production set to lose", () => {
     const fresh = { cameras: ["cam_01"], production: [], uncalibrated: [], blocking: false };
     expect(preflightView(fresh, true, false).blocking).toBe(false);

@@ -148,17 +148,38 @@ export function preflightView(
   refit: boolean,
   experiment: boolean,
 ): PreflightView {
-  if (!refit || experiment || !preflight?.blocking) {
+  if (!refit || experiment || !preflight) {
     return { blocking: false, message: "", hint: "" };
   }
-  const names = preflight.uncalibrated.join("、");
+  const refused = preflight.refusedFit ?? [];
+  if (refused.length) {
+    return {
+      blocking: true,
+      message:
+        `上一轮从这份采集拟合出的 ${refused.join("、")} 模型在画面内折返（或角点反投影不出射线），` +
+        `导出器会拒绝整轮——在产内参也救不了，它不会回退。`,
+      hint: "通常是板子没走到画面四角：把这几台重录一段、板子走满四角，再解算。",
+    };
+  }
+  const proven = new Set(preflight.proven ?? []);
+  const unproven = preflight.uncalibrated.filter((name) => !proven.has(name));
+  if (!preflight.blocking || !unproven.length) {
+    // Not a warning: the experiment already showed these lenses come out usable.
+    if (!proven.size) return { blocking: false, message: "", hint: "" };
+    return {
+      blocking: false,
+      message: `${[...proven].join("、")} 没有在产内参，但上一轮解算已从这份采集拟合出可用模型，可以导出。`,
+      hint: "",
+    };
+  }
   return {
     blocking: true,
     message:
-      `${names} 没有在产内参，重算后必须各自拟合出可用模型才能导出——` +
-      `任何一台看不到板都会让整轮在最后一步作废，已解码的部分全部白跑。` +
-      `没重拟的相机会从在产 run 承接过来，但这几台在产 run 里本来就没有。`,
-    hint: "勾上「只解算，不导出」跑这一轮：BA 照常解出这些相机并给残差，只是不写进生产。",
+      `${unproven.join("、")} 没有在产内参，重算后必须各自拟合出可用模型才能导出——` +
+      `在产 run 里没有它们，承接不了；先确认它们拟合得出来，否则整轮会在最后一步作废。`,
+    hint:
+      "先勾「只解算，不导出」跑一轮：这几台拟合出可用模型后，取消勾选即可正式解算导出" +
+      "（角点检测会复用，不用再等一遍解码）。",
   };
 }
 

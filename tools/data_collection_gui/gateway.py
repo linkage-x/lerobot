@@ -6921,6 +6921,13 @@ def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[
 
     Blocking applies only when production already ships intrinsics: a first
     calibration of a fresh rig has nothing to extend and nothing to lose.
+
+    Nor does it outlive the evidence. Once an experiment solve has fitted this
+    very capture and every such camera came out with a lens the exporter takes,
+    the failure it guards against has been ruled out -- and the detections are
+    cached, so the export run does not decode anything again. Without this the
+    refusal was permanent: the only way to add a camera to production was a
+    capture that could never be exported.
     """
     production = _production_intrinsics_cameras(state)
     if intrinsics is None or not production:
@@ -6928,24 +6935,46 @@ def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[
             "cameras": [],
             "production": production,
             "uncalibrated": [],
+            "proven": [],
             "carriedForward": [],
+            "refusedFit": [],
             "blocking": False,
         }
     cameras = _capture_cameras(intrinsics)
     uncalibrated = [name for name in cameras if name not in set(production)]
-    return {
+    fitted, refused, report = _proven_intrinsics_fit(state, intrinsics)
+    proven = [name for name in uncalibrated if name in set(fitted)]
+    # A camera production does ship still takes the export down if its re-fit
+    # folds: the exporter refuses the whole run, it does not fall back to the
+    # production lens. Known only once a fit has run, and then it must block.
+    refused = [name for name in cameras if name in set(refused)]
+    payload = {
         "cameras": cameras,
         "production": production,
         "uncalibrated": uncalibrated,
+        # Already fitted from this capture, unchanged since, with a usable lens.
+        "proven": proven,
         # Not re-fitted by this capture, and kept by the export rather than lost.
         "carriedForward": [name for name in production if name not in set(cameras)],
-        "blocking": bool(uncalibrated),
+        "refusedFit": refused,
+        "blocking": len(proven) < len(uncalibrated) or bool(refused),
     }
+    if proven or refused:
+        payload["provenReport"] = report
+    return payload
 
 
 def _preflight_message(preflight: dict[str, Any]) -> str:
     """The refusal, naming the cameras and why carrying forward cannot save them."""
-    names = "、".join(preflight.get("uncalibrated") or [])
+    refused = preflight.get("refusedFit") or []
+    if refused:
+        return (
+            f"重算内参并导出会在最后一步失败：上一轮从这份采集拟合出的 {'、'.join(refused)} "
+            f"模型在画面内折返或角点反投影不出射线，导出器会拒绝整轮。"
+            f"通常是板子没走到画面四角——把这几台重录一段，板子走满四角后再解算。"
+        )
+    proven = set(preflight.get("proven") or [])
+    names = "、".join(name for name in preflight.get("uncalibrated") or [] if name not in proven)
     return (
         f"重算内参并导出会在最后一步失败：这份采集里 {names} 没有在产内参，"
         f"导出时它们必须各自拟合出可用的模型，任何一台看不到板都会让整轮作废（已解码的部分全部白跑）。"
@@ -7083,6 +7112,8 @@ def _solve_progress_line(line: str) -> tuple[bool, str]:
 # after the detection pass had already finished and been thrown away.
 _DETECTION_STRIDE = 2
 _DETECTION_MANIFEST = "manifest.json"
+# Beside the corners: which cameras a fit of them produced an exportable lens for.
+_INTRINSICS_FIT_RECORD = "intrinsics_fit.json"
 
 
 # The module ``detect_charuco`` plans with. Located from this file rather than
@@ -7184,11 +7215,79 @@ def _clear_detections(detections: Path) -> None:
     stale = [
         *detections.glob("*.npz"),
         detections / _DETECTION_MANIFEST,
+        detections / _INTRINSICS_FIT_RECORD,
         detections / _capture_intent_module().MANIFEST_FILENAME,
     ]
     for path in stale:
         with suppress(OSError):
             path.unlink()
+
+
+def _exportable_fisheye_cameras(report: Any) -> list[str]:
+    """Cameras whose fisheye model the exporter would take as it stands.
+
+    Mirrors ``export_production_calibration.export_intrinsics``: a K, exactly
+    four coefficients, and a model that neither folds inside the frame nor
+    leaves the corner without a ray.
+    """
+    entries = report.get("cameras") if isinstance(report, dict) else None
+    usable = []
+    for name, entry in (entries or {}).items():
+        block = ((entry or {}).get("models") or {}).get("fisheye") or {}
+        coefficients = block.get("D", [])
+        # Stored flat or nested ([[k1..k4]]); the exporter reshapes either way.
+        while isinstance(coefficients, list) and len(coefficients) == 1 and isinstance(coefficients[0], list):
+            coefficients = coefficients[0]
+        if "K" not in block or not isinstance(coefficients, list) or len(coefficients) != 4:
+            continue
+        try:
+            bearing = float(block.get("corner_bearing_deg", float("nan")))
+        except (TypeError, ValueError):
+            bearing = float("nan")
+        invertible = bool(block.get("corner_invertible", math.isfinite(bearing)))
+        if invertible and bool(block.get("monotonic_across_frame", False)):
+            usable.append(str(name))
+    return sorted(usable)
+
+
+def _record_intrinsics_fit(episodes: Path, detections: Path, report_path: Path) -> None:
+    """Which cameras a fit of these exact detections produced an exportable lens for.
+
+    Kept beside the detections and under the same fingerprint, so it answers for
+    this capture's videos only: re-recording a sweep changes the fingerprint and
+    the record stops counting, and re-detecting deletes it with the npz.
+    """
+    report = _read_json_file(report_path)
+    record = _detection_fingerprint(episodes)
+    fitted = (report or {}).get("cameras") if isinstance(report, dict) else None
+    record.update(
+        report=str(report_path),
+        fitted=sorted(str(name) for name in (fitted or {})),
+        exportable=_exportable_fisheye_cameras(report),
+        generatedUtc=_now_iso(),
+    )
+    with suppress(OSError):
+        (detections / _INTRINSICS_FIT_RECORD).write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def _proven_intrinsics_fit(state: GatewayState, capture: Path) -> tuple[list[str], list[str], str]:
+    """(exportable, refused, report) from an earlier fit of this capture, unchanged since.
+
+    ``refused`` is what the exporter would turn away -- fitted, but folding or
+    not inverting at the corner. Any one of them takes the whole export down.
+    """
+    record = _read_json_file(_detections_dir(state, capture) / _INTRINSICS_FIT_RECORD)
+    if not isinstance(record, dict):
+        return [], [], ""
+    current = _detection_fingerprint(capture / "episodes")
+    if record.get("stride") != current["stride"] or record.get("videos") != current["videos"]:
+        return [], [], ""
+    report = str(record.get("report") or "")
+    if not report or not Path(report).is_file():
+        return [], [], ""
+    exportable = sorted(str(name) for name in record.get("exportable") or [])
+    refused = sorted(str(name) for name in record.get("fitted") or [] if str(name) not in set(exportable))
+    return exportable, refused, report
 
 
 def _write_detection_manifest(episodes: Path, detections: Path) -> None:
@@ -7556,6 +7655,9 @@ def _run_extrinsics_calibration(
         ]
         if not _run("拟合内参…", fit_args, 3600):
             return
+        # What lets the next click export a camera production has no lens for:
+        # this fit is the evidence that it comes out of this capture usable.
+        _record_intrinsics_fit(intrinsics_dataset / "episodes", intrinsics_detections, fitted_intrinsics)
         # fisheye, not rational: the report holds both, and production declares
         # fisheye (cube_tracker.camera_model). Shipping the other one would be a
         # mismatch nothing downstream can detect.
@@ -7796,9 +7898,9 @@ def _start_extrinsics_calibration(
             return _refuse_solve(
                 state,
                 _preflight_message(preflight),
-                hint="改用「只解算，不导出」跑这一轮：BA 会把这些相机一起解出来并给出残差，"
-                "只是不写进生产。要把它们真正并进生产内参，得先让它们在自己那一段里拟合出可用模型——"
-                "承接机制救不了没有在产内参的相机。",
+                hint="先用「只解算，不导出」跑一轮：BA 会把这些相机一起解出来并给出残差，只是不写进生产。"
+                "这几台在那一轮里拟合出可用模型后，这里就会放行导出，再点一次即可——"
+                "角点检测会直接复用，不用再等一遍解码。",
             )
 
     run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"

@@ -529,6 +529,13 @@ export type IntrinsicsPreflight = {
   cameras: string[];
   production: string[];
   uncalibrated: string[];
+  /** Of those, the ones an earlier solve already fitted from this unchanged
+   * capture with a lens the exporter takes. They no longer block. */
+  proven?: string[];
+  provenReport?: string;
+  /** Fitted from this capture by an earlier solve, but a lens the exporter
+   * refuses (folds in the frame). Any one of them fails the whole export. */
+  refusedFit?: string[];
   /** Kept from the production run because this capture never swept them. */
   carriedForward?: string[];
   blocking: boolean;

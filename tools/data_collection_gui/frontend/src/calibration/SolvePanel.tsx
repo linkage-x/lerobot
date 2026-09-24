@@ -122,6 +122,8 @@ export function SolvePanel({
           <br />
           {preflight.hint}
         </p>
+      ) : preflight.message ? (
+        <p className="small cali-solve-detail">{preflight.message}</p>
       ) : null}
 
       <label className="cali-check">
