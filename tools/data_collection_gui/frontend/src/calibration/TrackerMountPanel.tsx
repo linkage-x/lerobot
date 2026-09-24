@@ -1050,6 +1050,28 @@ export function TrackerMountPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // What lands on disk is not what a button press returns: a take auto-saves
+  // seconds after "record" answered, and the tracker stream lands some time
+  // after Disconnect. Refreshing only on presses left the list a step behind
+  // for good (2026-09-24: 20 saved and landed dwells, none of them pickable).
+  // The snapshot poll does see those changes, so the list follows it.
+  const diskSignature = [
+    mountSession?.sessionName ?? "",
+    mountSession?.dwellsOnDisk ?? 0,
+    mountSession?.stage ?? "",
+    mountSession?.landedPath ?? "",
+    recorderState,
+  ].join("|");
+  useEffect(() => {
+    let stale = false;
+    void api.fetchTrackerMountCaptures().then((found) => {
+      if (!stale && found.ok) setCaptures(found.episodes ?? []);
+    });
+    return () => {
+      stale = true;
+    };
+  }, [api, diskSignature]);
+
   async function onStation() {
     setRunning("station");
     setResult(
