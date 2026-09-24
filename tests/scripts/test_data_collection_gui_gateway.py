@@ -5800,6 +5800,47 @@ def test_tracker_mount_carries_the_refusal_code_instead_of_collapsing_it(tmp_pat
     assert "rms 0.412" in result["summary"]
 
 
+def test_a_station_skips_a_wobbling_segment_and_names_it_even_when_refused(tmp_path, monkeypatch):
+    """One segment past the dwell gate used to refuse all 20 (2026-09-24)."""
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+    seen: dict[str, list[str]] = {}
+
+    def refused(_state, args, **_kw):
+        seen["args"] = args
+        return {
+            "returncode": 2,
+            "stdout": "",
+            "stderr": (
+                "skipped episode 11: only 0 dwell(s) passed in episode 11. Rejected: span 0.750 mm\n"
+                "cannot run: parked points are near-collinear or too small (extent 0.28 m)\n"
+            ),
+            "command": [],
+        }
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", refused)
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert "--skip-episodes-without-dwells" in seen["args"]
+    assert result["skipped"] == [
+        {"episode": 11, "why": "only 0 dwell(s) passed in episode 11. Rejected: span 0.750 mm"}
+    ]
+    # The refusal is still the cause shown, not the skip line above it.
+    assert "near-collinear" in result["error"] and "near-collinear" in result["summary"]
+
+
+def test_a_solved_station_lists_its_skipped_segments_from_the_artifact(tmp_path):
+    out = tmp_path / "station.json"
+    out.write_text(json.dumps({"capture": [{"episodes_without_dwells": [{"episode": 3, "why": "drift"}]}]}))
+    result = gateway._tracker_mount_result(
+        _tracker_mount_state(tmp_path),
+        {"returncode": 0, "stdout": "", "stderr": "skipped episode 3: drift\nstation over 1 session(s)\n"},
+        out,
+        kind="station",
+    )
+    assert result["skipped"] == [{"episode": 3, "why": "drift"}]
+    assert result["summary"] == "station over 1 session(s)"
+
+
 def test_tracker_mount_payload_lists_artifacts_newest_first_without_the_dwell_dump(tmp_path):
     """The per-dwell diagnostics stay on disk.
 

@@ -5483,6 +5483,32 @@ def _tracker_mount_capture_args(state: GatewayState, rows: list[dict[str, str]])
     return args
 
 
+_SKIPPED_EPISODE_LINE = re.compile(r"^skipped episode (\d+): (.*)$")
+
+
+def _tracker_mount_skipped(report: dict[str, Any] | None, stderr_lines: list[str]) -> list[dict[str, Any]]:
+    """Segments the fit left out, whether or not it went on to solve.
+
+    The artifact lists them (top level for pivot, per mount under ``capture``
+    for station). A refusal writes no artifact, and then the CLI's stderr is
+    the only record -- and "too few poses" is half an answer without it.
+    """
+    found: list[dict[str, Any]] = []
+    if isinstance(report, dict):
+        blocks = [report, *(c for c in report.get("capture") or [] if isinstance(c, dict))]
+        for block in blocks:
+            for key in ("episodes_skipped", "episodes_without_dwells"):
+                for item in block.get(key) or []:
+                    if isinstance(item, dict):
+                        found.append({"episode": int(item.get("episode", -1)), "why": str(item.get("why") or "")})
+    if not found:
+        for line in stderr_lines:
+            match = _SKIPPED_EPISODE_LINE.match(line)
+            if match:
+                found.append({"episode": int(match.group(1)), "why": match.group(2)})
+    return found
+
+
 def _tracker_mount_result(
     state: GatewayState, run: dict[str, Any], out_path: Path, *, kind: str
 ) -> dict[str, Any]:
@@ -5492,7 +5518,8 @@ def _tracker_mount_result(
             report = json.loads(out_path.read_text())
         except Exception:  # noqa: BLE001
             report = None
-    tail = (run["stderr"] or "").strip().splitlines()
+    lines = (run["stderr"] or "").strip().splitlines()
+    tail = [line for line in lines if not _SKIPPED_EPISODE_LINE.match(line)]
     error = "" if run["returncode"] == 0 else (tail[-1] if tail else "tracker mount 解算失败")
     return {
         "ok": run["returncode"] == 0,
@@ -5500,6 +5527,7 @@ def _tracker_mount_result(
         "kind": kind,
         "report": report,
         "reportPath": str(out_path) if out_path.is_file() else "",
+        "skipped": _tracker_mount_skipped(report, lines),
         "summary": tail[0] if tail else "",
         "stdout": run["stdout"],
         "stderr": run["stderr"],
@@ -5940,7 +5968,10 @@ def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> 
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = _tracker_mount_output_root(state) / f"station_{stamp}.json"
-    args = ["station", *args, "--out", str(out_path)]
+    # One segment that wobbled past the dwell gate used to refuse the whole
+    # batch (2026-09-24: 1 of 20). Skipped and listed instead, as pivot does;
+    # the pose-count and geometry gates still judge what is left.
+    args = ["station", *args, "--out", str(out_path), "--skip-episodes-without-dwells"]
     for flag, key in (("--world-frame-id", "worldFrameId"), ("--tracker-station-id", "trackerStationId")):
         value = str(payload.get(key) or "").strip()
         if value:

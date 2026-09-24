@@ -1358,6 +1358,8 @@ export type TrackerMountSolveResponse = {
   reportPath?: string;
   stationPath?: string;
   markerTcpPath?: string;
+  /** Segments left out (no dwell / no pivot data), listed whether or not the fit then solved. */
+  skipped?: { episode: number; why: string }[];
   summary?: string;
   stdout?: string;
   stderr?: string;

@@ -219,6 +219,8 @@ function CaptureRows({
 function Verdict({ result }: { result: TrackerMountSolveResponse | null }) {
   const verdict = trackerMountVerdict(result);
   if (!verdict) return null;
+  // A solved pivot's own card already lists them.
+  const skipped = result?.kind === "pivot" && result.report ? [] : (result?.skipped ?? []);
   return (
     <div className="cali-result-box">
       <div className="cali-result-box-head">
@@ -226,6 +228,21 @@ function Verdict({ result }: { result: TrackerMountSolveResponse | null }) {
         <b>{verdict.title}</b>
       </div>
       <p className="cali-muted">{verdict.detail}</p>
+      {skipped.length > 0 && (
+        <div className="cali-warn">
+          <p>
+            跳过了 {skipped.length} 段（没停够/晃动超门槛，不参与拟合）：
+            {skipped.map((item) => `ep${item.episode}`).join("、")}。这些姿态要的话请重录。
+          </p>
+          <ul>
+            {skipped.map((item) => (
+              <li key={item.episode}>
+                ep{item.episode}：{item.why}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {result?.reportPath && <p className="cali-muted">结果文件：<code>{result.reportPath}</code></p>}
     </div>
   );
