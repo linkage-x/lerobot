@@ -435,7 +435,7 @@ function ValidateResult({ result }: { result: TrackerValidateResponse | null }) 
       {summary && (
         <div className="cali-result-box">
           <div className="cali-result-box-head">
-            <b>残差</b>
+            <b>{report?.compared_point === "tcp" ? "TCP 平移误差（相机 TCP − 跟踪仪 TCP）" : "残差（SMR 球心）"}</b>
             <span className="cali-muted">ep{report?.episode} · {report?.target}</span>
           </div>
           <div className="cali-metric-row">
@@ -998,17 +998,20 @@ export function TrackerMountPanel({
   const [chainGt, setChainGt] = useState("");
   const [chainResult, setChainResult] = useState<TrackerMountChainResponse | null>(null);
   const [showManual, setShowManual] = useState(false);
-  const [artifacts, setArtifacts] = useState<{ stations: TrackerMountArtifact[]; mounts: TrackerMountArtifact[] }>({
-    stations: [],
-    mounts: [],
-  });
+  const [artifacts, setArtifacts] = useState<{
+    stations: TrackerMountArtifact[];
+    mounts: TrackerMountArtifact[];
+    pivots: TrackerMountArtifact[];
+  }>({ stations: [], mounts: [], pivots: [] });
+  const [diagnostic, setDiagnostic] = useState(false);
+  const [gtTcpFrom, setGtTcpFrom] = useState("");
 
   const disabled = busy || running !== "" || captureRunning !== "";
   const readiness = captureReadiness(captures, live);
 
   async function refresh() {
     const payload = await api.fetchTrackerMount();
-    setArtifacts({ stations: payload.stations ?? [], mounts: payload.mounts ?? [] });
+    setArtifacts({ stations: payload.stations ?? [], mounts: payload.mounts ?? [], pivots: payload.pivots ?? [] });
     // Opening on the newest station is the common case: a station is meant to be
     // reused, and retyping its path is how a stale one gets picked by accident.
     if (!stationPath && payload.stations?.length) setStationPath(payload.stations[0].path);
@@ -1047,12 +1050,14 @@ export function TrackerMountPanel({
         mountFit: chainMode === "pivot" ? pivotMountFit : undefined,
         worldFrameId: worldFrameId.trim(),
         trackerStationId: trackerStationId.trim(),
+        diagnostic,
         validate: gt
           ? {
               dataset: gt.dataset,
               episode: gt.episode,
               session: gt.sessionPath,
               mountFit: chainMode === "station" ? gtMountFit : "",
+              tcpFrom: gtTcpFrom,
               exposureFraction: gtFraction.trim() === "" ? "" : Number(gtFraction),
             }
           : undefined,
@@ -1123,6 +1128,7 @@ export function TrackerMountPanel({
         episode: gtEpisode,
         session: gtSession,
         mountFit: gtMountFit,
+        tcpFrom: gtTcpFrom,
         exposureFraction: gtFraction.trim() === "" ? "" : Number(gtFraction),
       }),
     );
@@ -1194,7 +1200,7 @@ export function TrackerMountPanel({
                 <input value={pivotBundle} disabled={disabled} onChange={(e) => setPivotBundle(e.target.value)} placeholder="留空" />
               </label>
               <label className="cali-field">
-                同一钢片的 lever-arm 结果（可选，做半径一致性检查）
+                同一钢片的 lever-arm 结果（做半径一致性检查；之后要比较 TCP 轨迹就必须选）
                 <select value={pivotMountFit} disabled={disabled} onChange={(e) => setPivotMountFit(e.target.value)}>
                   <option value="">不做</option>
                   {artifacts.mounts.map((item) => (
@@ -1227,6 +1233,26 @@ export function TrackerMountPanel({
               )}
             </>
           )}
+          <label className="cali-field">
+            <span>
+              <input type="checkbox" checked={diagnostic} disabled={disabled} onChange={(e) => setDiagnostic(e.target.checked)} />{" "}
+              诊断模式（不认证）
+            </span>
+            <span className="cali-muted">
+              点散得不够开也解 station；拟合不认证也继续做比较。用来先把整条链跑通，结果不能当定标。
+            </span>
+          </label>
+          <label className="cali-field">
+            比较哪个点
+            <select value={gtTcpFrom} disabled={disabled} onChange={(e) => setGtTcpFrom(e.target.value)}>
+              <option value="">SMR 球心（常量被杠杆臂吸收）</option>
+              {artifacts.pivots.map((item) => (
+                <option key={item.path} value={item.path}>
+                  TCP · {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="cali-field">
             顺便做 GT 比较（可不选；pivot 不做）
             <select value={chainGt} disabled={disabled || chainMode === "pivot"} onChange={(e) => setChainGt(e.target.value)}>
@@ -1397,6 +1423,9 @@ export function TrackerMountPanel({
         <b>GT 比较不碰 cube→TCP。</b>比的是球心：相机侧 <code>R·c + t</code>，跟踪仪侧{" "}
         <code>R_WG·p_G + t_WG</code>，TCP 一次都没出现。而杠杆臂拟合已经吸收了本体系的常量平移和常量旋转——
         那两项加起来<b>就是</b> marker→TCP 常量，所以残差再小也<b>不能</b>反过来证明 cube→TCP 是对的。
+          「比较哪个点」选了 TCP（一份带 SMR→TCP 向量的 pivot 结果，需要跑 pivot 时选过 lever-arm）就不一样了：
+          杠杆臂换成跟踪仪定的 TCP→SMR，残差就是<b>相机 TCP − 跟踪仪 TCP</b>，c_TCP 的常量误差<b>包含在内</b>；
+          只差球窝中心到真正 TCP 的偏距 d，两个仪器都看不见。
       </p>
 
       <Verdict result={result} />
@@ -1444,6 +1473,17 @@ export function TrackerMountPanel({
             </select>
           </label>
           <label className="cali-field">
+            比较哪个点
+            <select value={gtTcpFrom} disabled={disabled} onChange={(e) => setGtTcpFrom(e.target.value)}>
+              <option value="">SMR 球心（常量被杠杆臂吸收）</option>
+              {artifacts.pivots.map((item) => (
+                <option key={item.path} value={item.path}>
+                  TCP · {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="cali-field">
             曝光系数（留空 = 跟随录制器）
             <input
               value={gtFraction}
@@ -1460,6 +1500,9 @@ export function TrackerMountPanel({
           <b>这一步不碰 cube→TCP。</b>比的是球心：相机侧 <code>R·c + t</code>，跟踪仪侧 <code>R_WG·p_G + t_WG</code>，
           TCP 一次都没出现。而且杠杆臂拟合已经吸收了本体系的常量平移和常量旋转——那两项加起来<b>就是</b>
           marker→TCP 常量，所以残差再小也<b>不能</b>反过来证明 cube→TCP 是对的。能判的是随时间/姿态变化的那部分。
+          「比较哪个点」选了 TCP（一份带 SMR→TCP 向量的 pivot 结果，需要跑 pivot 时选过 lever-arm）就不一样了：
+          杠杆臂换成跟踪仪定的 TCP→SMR，残差就是<b>相机 TCP − 跟踪仪 TCP</b>，c_TCP 的常量误差<b>包含在内</b>；
+          只差球窝中心到真正 TCP 的偏距 d，两个仪器都看不见。
         </p>
         <p className="cali-muted">
           曝光系数留空会跟随录制器的 <code>EXPOSURE_CENTER_FRACTION</code>（现在是 0.0），
@@ -1473,6 +1516,9 @@ export function TrackerMountPanel({
         )}
       </div>
 
+      {chainResult?.uncertifiedFit && (
+        <p className="cali-warn">诊断模式：下面的比较用的是一个不认证的拟合，数字只说明链路通了，不能当定标结果。</p>
+      )}
       {chainResult?.fit && <Verdict result={chainResult.fit} />}
       {chainResult?.fit?.report && (
         <Observability report={chainResult.fit.report as TrackerStationReport | TrackerMountReport} />

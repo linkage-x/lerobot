@@ -1339,6 +1339,8 @@ export type TrackerMountListResponse = {
   root?: string;
   stations?: TrackerMountArtifact[];
   mounts?: TrackerMountArtifact[];
+  /** E1p artifacts that carry the SMR->TCP vector a TCP comparison needs. */
+  pivots?: TrackerMountArtifact[];
   error?: string;
 };
 
@@ -1402,6 +1404,9 @@ export type TrackerValidateReport = {
   min_coverage: number;
   lever_arm_m: number[];
   mount_fit: Record<string, unknown> | null;
+  /** "tcp": camera TCP - tracker TCP (c_TCP error included); "smr_centre": the lever arm absorbed the constants. */
+  compared_point?: "tcp" | "smr_centre";
+  tcp_from?: Record<string, unknown> | null;
   /** "argus_sidecar_sof_plus_exposure" or "dataset_nfps_grid_episode_local". */
   camera_time_base: string;
 };
@@ -1573,6 +1578,8 @@ export type TrackerMountRecordResponse = {
 
 export type TrackerMountChainResponse = {
   ok: boolean;
+  /** Diagnostic mode graded with a fit that ran but does not certify. */
+  uncertifiedFit?: boolean;
   fit?: TrackerMountSolveResponse | null;
   validate?: TrackerValidateResponse | null;
   error?: string;

@@ -57,6 +57,22 @@ def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) 
     pq.write_table(pa.table(rows), dataset_root / "data" / "chunk-000" / "file-000.parquet")
 
 
+def _real_sidecar_ensure(test):
+    test.real_sidecar_ensure = True
+    return test
+
+
+@pytest.fixture(autouse=True)
+def _tracker_sidecars_are_current(request, monkeypatch):
+    """Fits ensure production's sidecar first (a traj-gen job); unit tests of the
+    fit routes have none, so this stands in -- except where it is the subject."""
+    if getattr(request.function, "real_sidecar_ensure", False):
+        return
+    monkeypatch.setattr(
+        gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": target or "right"
+    )
+
+
 def test_dataset_scan_signature_tracks_v3_finalization_without_root_mtime_change(tmp_path):
     datasets_root = tmp_path / "outputs" / "datasets"
     dataset_root = datasets_root / "thor_gmsl2_7ch_v1_20260720_151325"
@@ -5877,6 +5893,7 @@ def test_tracker_mount_payload_is_empty_not_broken_before_any_fit(tmp_path):
         "root": str(tmp_path / "outputs" / "laser_tracker"),
         "stations": [],
         "mounts": [],
+        "pivots": [],
     }
 
 
@@ -6900,3 +6917,105 @@ def test_waiting_for_the_trajectory_reads_the_final_status_not_just_the_process(
 
     assert job["status"] == "complete"
     assert seen == ["tracking ep 3/5"]
+
+
+def _sidecar(dataset: Path, cube: str, rows: list[tuple[int, bool]]) -> Path:
+    path = gateway._marker_tcp_sidecar_path(dataset, cube)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["episode_index", "solve_ok"])
+        writer.writerows([(ep, "True" if ok else "False") for ep, ok in rows])
+    return path
+
+
+def _episode_meta(dataset: Path, episode: int, mtime: float) -> None:
+    meta = dataset / "episodes" / f"episode_{episode:06d}" / "meta.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text("{}")
+    os.utime(meta, (mtime, mtime))
+
+
+@_real_sidecar_ensure
+def test_the_fit_picks_the_cube_that_carries_the_smr(tmp_path, monkeypatch):
+    """The target used to default to april_cube; production writes left/right."""
+    dataset = tmp_path / "ds"
+    _episode_meta(dataset, 0, 1_700_000_000)
+    _sidecar(dataset, "left", [(0, False)] * 5)
+    _sidecar(dataset, "right", [(0, True)] * 5 + [(1, True)] * 50)
+    monkeypatch.setattr(gateway, "_queue_traj_gen", lambda *a, **k: pytest.fail("sidecar is current"))
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)], "left") == "left"
+
+
+@_real_sidecar_ensure
+def test_a_capture_nobody_tracked_is_tracked_before_the_fit(tmp_path, monkeypatch):
+    dataset = tmp_path / "ds"
+    _episode_meta(dataset, 0, time.time() + 60)  # newer than any sidecar
+    queued: list[Path] = []
+
+    def track(_state, root, **_kw):
+        queued.append(root)
+        _sidecar(root, "right", [(0, True)])
+        os.utime(gateway._marker_tcp_sidecar_path(root, "right"), (time.time() + 120,) * 2)
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", track)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *a, **k: {"status": "complete"})
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert queued == [dataset]
+
+
+def test_a_tracker_fit_route_does_not_hold_the_gateway(tmp_path, monkeypatch):
+    """A fit can wait minutes on a traj-gen job; snapshots must keep answering."""
+    import urllib.request
+
+    state = _tracker_mount_state(tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_fit(_state, _payload):
+        started.set()
+        release.wait(10)
+        return {"ok": True}
+
+    monkeypatch.setitem(gateway._TRACKER_MOUNT_FIT_ROUTES, "/api/calibration/tracker-mount/station", slow_fit)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/tracker-mount/station", data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        poster = threading.Thread(target=lambda: urllib.request.urlopen(request, timeout=15).read())
+        poster.start()
+        assert started.wait(5)
+        assert state.lock.acquire(timeout=2), "the fit route is holding the state lock"
+        state.lock.release()
+        release.set()
+        poster.join(10)
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_diagnostic_mode_grades_with_an_uncertified_fit_but_never_a_refused_one(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    seen: list[dict] = []
+    monkeypatch.setattr(gateway, "_run_tracker_validate", lambda _s, p: seen.append(p) or {"ok": True})
+    for returncode, diagnostic, graded in ((1, False, False), (1, True, True), (2, True, False)):
+        seen.clear()
+        monkeypatch.setattr(
+            gateway, "_run_tracker_mount_lever_arm",
+            lambda _s, _p, rc=returncode: {"ok": rc == 0, "returncode": rc, "reportPath": "/m.json"},
+        )
+        result = gateway._run_tracker_mount_chain(
+            state, {"mode": "lever-arm", "diagnostic": diagnostic, "validate": {"dataset": "d", "tcpFrom": "/p.json"}}
+        )
+        assert bool(seen) is graded, (returncode, diagnostic)
+        if graded:
+            assert result["uncertifiedFit"] is True and result["ok"] is False
+            assert seen[0]["tcpFrom"] == "/p.json" and seen[0]["mountFit"] == "/m.json"

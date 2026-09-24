@@ -5574,6 +5574,68 @@ def _note_tracker_mount_segment_end(state: GatewayState, action: str) -> None:
         state.log("warn", f"Tracker-mount segment saved after {elapsed:.1f}s, below the dwell floor")
 
 
+_TRACKER_FIT_CUBES = ("left", "right")
+
+
+def _sidecar_solved_frames(dataset: Path, cube: str, episodes: set[int]) -> int:
+    path = _marker_tcp_sidecar_path(dataset, cube)
+    if not path.is_file():
+        return 0
+    solved = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                episode = int(float(row.get("episode_index") or -1))
+            except ValueError:
+                continue
+            if episode in episodes and str(row.get("solve_ok") or "").strip().lower() in ("1", "1.0", "true"):
+                solved += 1
+    return solved
+
+
+def _ensure_tracker_sidecars(
+    state: GatewayState, pairs: list[tuple[Path, int]], target: str = ""
+) -> str:
+    """Make production's EE trajectory current for these episodes; return the cube.
+
+    Every fit here reads that sidecar, and neither of its two failure modes was
+    the operator's to fix by hand: a capture nobody had tracked yet ("derived
+    does not exist"), and the target defaulting to ``april_cube`` while
+    production writes one sidecar per cube -- both hit the first station of
+    2026-09-24. The job is the same one the replay page and the marker->TCP E1p
+    queue, so the fit grades the labels production actually writes.
+
+    With no ``target`` the cube is the one that solved the most frames of these
+    episodes: the SMR plate is on one BOX, and only that cube is in view.
+    """
+    by_dataset: dict[Path, set[int]] = {}
+    for dataset, episode in pairs:
+        by_dataset.setdefault(dataset, set()).add(int(episode))
+    cubes = (target,) if target else _TRACKER_FIT_CUBES
+    for dataset, episodes in by_dataset.items():
+        ep_dirs = [dataset / "episodes" / f"episode_{ep:06d}" for ep in sorted(episodes)]
+        if any(_marker_tcp_sidecar_is_current(dataset, cube, ep_dirs) for cube in cubes):
+            continue
+        _queue_traj_gen(state, dataset)
+        job = _await_traj_gen(state, dataset, on_progress=lambda _text: None)
+        if job.get("status") != "complete":
+            raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
+    if target:
+        return target
+    solved = {
+        cube: sum(_sidecar_solved_frames(dataset, cube, eps) for dataset, eps in by_dataset.items())
+        for cube in _TRACKER_FIT_CUBES
+    }
+    best = max(solved, key=lambda cube: solved[cube])
+    if solved[best] == 0:
+        raise RuntimeError("这些段里哪个 cube 都没解出一帧——相机看不到钢片所在的 BOX？")
+    return best
+
+
+def _tracker_row_pairs(state: GatewayState, rows: list[dict[str, str]]) -> list[tuple[Path, int]]:
+    return [(_resolve_user_path(state, row["dataset"]), int(row["episode"])) for row in rows]
+
+
 def _run_tracker_mount_pivot(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     """E1p: production's TCP against the pivot socket the tracker finds.
 
@@ -5598,6 +5660,7 @@ def _run_tracker_mount_pivot(state: GatewayState, payload: dict[str, Any]) -> di
         if bundle is None or not bundle.is_file():
             raise FileNotFoundError(f"marker→TCP bundle 不存在: {bundle}")
         args = _tracker_mount_capture_args(state, rows)
+        _ensure_tracker_sidecars(state, _tracker_row_pairs(state, rows), cube)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "returncode": 2}
 
@@ -5963,6 +6026,9 @@ def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> 
     try:
         rows = _tracker_mount_rows(payload)
         args = _tracker_mount_capture_args(state, rows)
+        target = _ensure_tracker_sidecars(
+            state, _tracker_row_pairs(state, rows), str(payload.get("target") or "").strip()
+        )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "returncode": 2}
 
@@ -5976,9 +6042,11 @@ def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> 
         value = str(payload.get(key) or "").strip()
         if value:
             args += [flag, value]
-    target = str(payload.get("target") or "").strip()
-    if target:
-        args += ["--target", target]
+    args += ["--target", target]
+    if payload.get("diagnostic"):
+        # Fits a point set too small to pin T_WG's rotation so the chain can
+        # run end to end; the artifact says it does not certify.
+        args.append("--allow-weak-geometry")
 
     try:
         run = _run_tracker_mount_command(state, args)
@@ -6009,17 +6077,17 @@ def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -
         holdout = int(str(payload.get("holdout") or "0").strip() or "0")
         if holdout < 0:
             raise ValueError("holdout 不能为负")
+        target = _ensure_tracker_sidecars(
+            state, _tracker_row_pairs(state, rows), str(payload.get("target") or "").strip()
+        )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "returncode": 2}
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = _tracker_mount_output_root(state) / f"mount_{stamp}.json"
-    args = ["lever-arm", *args, "--station", str(station), "--out", str(out_path)]
+    args = ["lever-arm", *args, "--station", str(station), "--out", str(out_path), "--target", target]
     if holdout:
         args += ["--holdout", str(holdout)]
-    target = str(payload.get("target") or "").strip()
-    if target:
-        args += ["--target", target]
 
     try:
         run = _run_tracker_mount_command(state, args)
@@ -6554,9 +6622,15 @@ def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> di
         return {"ok": False, "error": f"未知模式 {mode!r}", "returncode": 2}
 
     result: dict[str, Any] = {"ok": fit.get("ok", False), "fit": fit, "validate": None}
-    if not fit.get("ok") or not fit.get("reportPath"):
+    # Diagnostic mode goes on past "fitted, does not certify" (1) so the chain
+    # can be run end to end before the capture is good enough; never past a
+    # refusal (2), where there is no fit to grade with. The comparison then
+    # carries the fit's verdict with it rather than a certified-looking number.
+    proceed = fit.get("ok") or (payload.get("diagnostic") and fit.get("returncode") == 1)
+    if not proceed or not fit.get("reportPath"):
         result["error"] = fit.get("error") or "拟合没有通过，未继续做 GT 比较"
         return result
+    result["uncertifiedFit"] = not fit.get("ok")
 
     validate_request = payload.get("validate")
     if not isinstance(validate_request, dict) or not validate_request:
@@ -6650,6 +6724,17 @@ def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[
         )
         readout_offset_s = float(payload.get("readoutOffsetS") or 0.0)
         min_coverage = float(payload.get("minCoverage") or 0.8)
+        tcp_from_raw = str(payload.get("tcpFrom") or "").strip()
+        tcp_from = None
+        if tcp_from_raw:
+            if mount_fit is None:
+                raise ValueError("比较 TCP 需要同一块钢片的 lever-arm 结果（mount-fit）")
+            tcp_from = _resolve_user_path(state, tcp_from_raw)
+            if not tcp_from.is_file():
+                raise FileNotFoundError(f"pivot JSON 不存在: {tcp_from}")
+        target = _ensure_tracker_sidecars(
+            state, [(dataset, episode)], str(payload.get("target") or "").strip()
+        )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "returncode": 2}
 
@@ -6663,11 +6748,11 @@ def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[
         "--readout-offset-s", str(readout_offset_s),
         "--out", str(out_path),
     ]
-    target = str(payload.get("target") or "").strip()
-    if target:
-        args += ["--target", target]
+    args += ["--target", target]
     if mount_fit is not None:
         args += ["--mount-fit", str(mount_fit)]
+    if tcp_from is not None:
+        args += ["--tcp-from", str(tcp_from)]
     if episode_dir is not None:
         args += ["--episode-dir", str(episode_dir)]
 
@@ -6712,6 +6797,16 @@ def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[
     }
 
 
+# Routed outside the state lock (see the POST handler): each can wait minutes.
+_TRACKER_MOUNT_FIT_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/tracker-mount/station": _run_tracker_mount_station,
+    "/api/calibration/tracker-mount/pivot": _run_tracker_mount_pivot,
+    "/api/calibration/tracker-mount/lever-arm": _run_tracker_mount_lever_arm,
+    "/api/calibration/tracker-mount/chain": _run_tracker_mount_chain,
+    "/api/calibration/tracker-mount/validate": _run_tracker_validate,
+}
+
+
 def _tracker_mount_artifact_summary(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text())
@@ -6748,13 +6843,25 @@ def _tracker_mount_payload(state: GatewayState) -> dict[str, Any]:
             summary = _tracker_mount_artifact_summary(path)
             if summary:
                 mounts.append(summary)
+    pivots: list[dict[str, Any]] = []
+    if root.is_dir():
+        for path in sorted(root.glob("pivot_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                # The per-frame sampling is the bulk of a pivot artifact.
+                keep = (*_E1P_REPORT_KEYS, "mount_id", "pose_frame", "smr_to_tcp_pose_frame_mm")
+                summary["report"] = {k: summary["report"][k] for k in keep if k in summary["report"]}
+                pivots.append(summary)
     stations.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
     mounts.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    pivots.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
     return {
         "ok": True,
         "root": str(root),
         "stations": stations[:20],
         "mounts": mounts[:20],
+        # Only the ones that can turn a trajectory comparison into a TCP one.
+        "pivots": [p for p in pivots if "smr_to_tcp_pose_frame_mm" in p["report"]][:20],
     }
 
 
@@ -15696,6 +15803,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
+        tracker_fit = _TRACKER_MOUNT_FIT_ROUTES.get(path)
+        if tracker_fit is not None:
+            # Outside the state lock: a fit can first have to generate the
+            # capture's EE trajectory, which queues a job and waits on it -- both
+            # take the lock -- and the fit itself runs for minutes. Held here it
+            # froze every snapshot for the whole solve (82 s on 2026-09-24).
+            # A refusal is an answer about the capture, not a server fault: the
+            # panel renders which refusal it was, so it stays 200.
+            try:
+                result = tracker_fit(self.server.state, _read_json_body(self))
+            except Exception as exc:  # noqa: BLE001
+                with self.server.state.lock:
+                    self.server.state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.OK, result)
+            return
         if path == "/api/calibration/tracker-mount/captures/delete":
             # Outside the state lock, and it has to be: the function takes that
             # lock itself to read the recorder state, and Lock is not reentrant --
@@ -15933,21 +16057,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     # verdict, so this stays 200 and carries returncode.
                     _json_response(self, HTTPStatus.OK, result)
                     return
-                if path == "/api/calibration/tracker-mount/station":
-                    result = _run_tracker_mount_station(self.server.state, _read_json_body(self))
-                    # A refusal is an answer about the capture, not a server
-                    # fault: the panel renders which refusal it was, so the
-                    # returncode has to survive the transport.
-                    _json_response(self, HTTPStatus.OK, result)
-                    return
-                if path == "/api/calibration/tracker-mount/pivot":
-                    result = _run_tracker_mount_pivot(self.server.state, _read_json_body(self))
-                    _json_response(self, HTTPStatus.OK, result)
-                    return
-                if path == "/api/calibration/tracker-mount/lever-arm":
-                    result = _run_tracker_mount_lever_arm(self.server.state, _read_json_body(self))
-                    _json_response(self, HTTPStatus.OK, result)
-                    return
                 if path == "/api/calibration/tracker-mount/session":
                     result = _start_tracker_mount_session(
                         self.server.state, _read_json_body(self)
@@ -15964,14 +16073,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
-                    return
-                if path == "/api/calibration/tracker-mount/chain":
-                    result = _run_tracker_mount_chain(self.server.state, _read_json_body(self))
-                    _json_response(self, HTTPStatus.OK, result)
-                    return
-                if path == "/api/calibration/tracker-mount/validate":
-                    result = _run_tracker_validate(self.server.state, _read_json_body(self))
-                    _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/calibration/hand-eye/plan":
                     result = _run_hand_eye_plan(

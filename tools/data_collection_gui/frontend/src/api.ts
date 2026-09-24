@@ -1050,11 +1050,15 @@ export class DataCollectionGuiApi {
     tcpBudgetMm?: number;
     worldFrameId?: string;
     trackerStationId?: string;
+    /** Fit a too-small point set, and grade with a fit that does not certify. */
+    diagnostic?: boolean;
     validate?: {
       dataset: string;
       episode: string | number;
       session: string;
       mountFit?: string;
+      /** E1p artifact: compare TCP instead of the SMR centre. */
+      tcpFrom?: string;
       exposureFraction?: number | "";
     };
   }): Promise<TrackerMountChainResponse> {
@@ -1123,6 +1127,7 @@ export class DataCollectionGuiApi {
     episode: string | number;
     session: string;
     mountFit?: string;
+    tcpFrom?: string;
     episodeDir?: string;
     target?: string;
     exposureFraction?: number | "";
