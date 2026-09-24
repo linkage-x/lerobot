@@ -188,6 +188,11 @@ class PandaPyArmDriver:
         # timestamp them by when they were read *from the arm* rather than by when it happened
         # to pick them up -- those differ by up to one poll period.
         self._cached_joint_positions_at_s: float | None = None
+        # libfranka's estimate of the external wrench on the tool, base frame (O_F_ext_hat_K),
+        # taken from the same state read as the joints. Cached rather than read on demand because
+        # a second get_state() per control tick would double the round-trips for a value the
+        # reader already has in hand. None on a binding that does not report it.
+        self._cached_external_wrench: np.ndarray | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -335,10 +340,26 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
+        raw_wrench = getattr(state, "O_F_ext_hat_K", None)
+        wrench = None if raw_wrench is None else np.asarray(raw_wrench, dtype=np.float64).reshape(-1)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
+            if wrench is not None and wrench.size == 6:
+                self._cached_external_wrench = wrench
         return joint_positions
+
+    def get_external_wrench(self) -> np.ndarray | None:
+        """The last external wrench estimate (Fx, Fy, Fz, Tx, Ty, Tz; N, Nm; base frame).
+
+        libfranka's model-based estimate from the joint torque sensors: its absolute value carries
+        a bias of a few newtons that moves with posture and with the configured payload, so a
+        consumer should compare readings against a baseline taken at rest nearby rather than
+        against a fixed threshold. None until the state reader has seen a reading, and always on
+        a binding that does not report it.
+        """
+        with self._state_lock:
+            return None if self._cached_external_wrench is None else self._cached_external_wrench.copy()
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Cached joint positions together with when they were read from the arm.
@@ -393,6 +414,7 @@ class PandaPyArmDriver:
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None
+            self._cached_external_wrench = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:

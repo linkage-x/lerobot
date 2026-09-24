@@ -579,6 +579,22 @@ class FrankaResearch3(Robot):
 
         return self._reach_stall_error_m
 
+    @property
+    def external_wrench(self) -> tuple[float, ...] | None:
+        """libfranka's external wrench estimate on the tool (Fx, Fy, Fz, Tx, Ty, Tz), base frame.
+
+        None when the arm backend does not report one (the MuJoCo twin, the mock backend, a
+        binding without O_F_ext_hat_K) -- "no reading" is not "no force". Read-only: nothing in
+        control depends on it. See PandaPyArmDriver.get_external_wrench for why it should be
+        read as a change from a nearby baseline, not as an absolute.
+        """
+
+        get_wrench = getattr(self._arm, "get_external_wrench", None)
+        if not callable(get_wrench):
+            return None
+        wrench = get_wrench()
+        return None if wrench is None else tuple(float(v) for v in wrench)
+
     @check_if_not_connected
     def iter_reach_errors_m(
         self,

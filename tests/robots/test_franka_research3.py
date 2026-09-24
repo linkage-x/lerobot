@@ -3442,3 +3442,31 @@ def test_a_binding_that_cannot_send_a_load_refuses_rather_than_dropping_it(monke
     )
     with pytest.raises(RuntimeError, match="payload_mass_kg is set"):
         driver.connect()
+
+
+def test_the_external_wrench_rides_the_joint_state_read_and_is_none_when_not_reported(monkeypatch, robot):
+    """Read-only instrumentation for contact detection, 2026-09-24: O_F_ext_hat_K from the
+    same state read the joints come from, no second round-trip; None, not zeros, without it."""
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.state = types.SimpleNamespace(q=np.zeros(7), O_F_ext_hat_K=[0.5, -0.4, 6.2, 0.0, 0.1, 0.0])
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(Panda=DummyPanda, controllers=types.SimpleNamespace(JointPosition=object)),
+    )
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    assert driver.get_external_wrench() is None
+    driver._robot = DummyPanda("192.168.1.206")
+    driver._refresh_joint_positions_cache()
+    assert driver.get_external_wrench().tolist() == [0.5, -0.4, 6.2, 0.0, 0.1, 0.0]
+
+    robot._arm = driver
+    assert robot.external_wrench == (0.5, -0.4, 6.2, 0.0, 0.1, 0.0)
+    robot._arm = DummyArmDriver()
+    assert robot.external_wrench is None
