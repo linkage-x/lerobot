@@ -6707,7 +6707,9 @@ def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[
         session = _resolve_user_path(state, session_raw)
         if not session.is_dir():
             raise FileNotFoundError(f"tracker session 目录不存在: {session}")
-        episode = int(str(payload.get("episode") or "").strip())
+        # Not ``or ""``: episode 0 is the first of every dataset, and 0 is falsy.
+        raw_episode = payload.get("episode")
+        episode = int(str("" if raw_episode is None else raw_episode).strip())
         mount_fit_raw = str(payload.get("mountFit") or "").strip()
         mount_fit = None
         if mount_fit_raw:

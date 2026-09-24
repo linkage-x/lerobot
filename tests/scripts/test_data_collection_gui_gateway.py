@@ -7020,3 +7020,14 @@ def test_diagnostic_mode_grades_with_an_uncertified_fit_but_never_a_refused_one(
         if graded:
             assert result["uncertifiedFit"] is True and result["ok"] is False
             assert seen[0]["tcpFrom"] == "/p.json" and seen[0]["mountFit"] == "/m.json"
+
+
+def test_gt_comparison_takes_episode_zero(tmp_path, monkeypatch):
+    """0 is falsy: ``or ""`` turned the first episode of every dataset into ''."""
+    seen = _capture_validate_command(monkeypatch)
+    result = gateway._run_tracker_validate(
+        _tracker_mount_state(tmp_path), _validate_payload(tmp_path, episode=0)
+    )
+    assert result["returncode"] == 0, result.get("error")
+    command = seen[0]
+    assert command[command.index("--episode") + 1] == "0"
