@@ -51,6 +51,7 @@ UNATTENDED_ROOT = Path("outputs") / "unattended"
 # How many rows the status endpoint returns by default. A night is tens of thousands; the page
 # needs the recent ones and the counts, not the night.
 DEFAULT_TAIL = 200
+LOG_TAIL_LINES = 30
 
 
 @dataclass(frozen=True)
@@ -124,19 +125,21 @@ def _plan_terminal_trials(
         "text": describe_schedule(trials_request, schedule),
         "units": len(schedule),
     }
+    # Every value goes as --flag=value: an offsets list starting "-12,..." given as its own argv
+    # word is read by argparse as another flag, and the run dies before its first row.
     argv = [
         "tools/fr3/fr3_terminal_trials_runtime.py",
-        "--hole-pose", hole_pose,
-        "--offsets-mm", offsets,
-        "--repeats", str(trials_request.repeats),
-        "--control-every", str(trials_request.controlEvery),
-        "--seed", str(trials_request.seed),
-        "--search-ring", str(trials_request.searchRingM),
-        "--handoff-z", str(servo.handoffZ),
-        "--max-seconds", str(trials_request.maxSeconds),
-        "--pick-pose", pick,
-        "--out", str(run_dir / "rows.jsonl"),
-        "--stop-file", str(run_dir / "STOP"),
+        f"--hole-pose={hole_pose}",
+        f"--offsets-mm={offsets}",
+        f"--repeats={trials_request.repeats}",
+        f"--control-every={trials_request.controlEvery}",
+        f"--seed={trials_request.seed}",
+        f"--search-ring={trials_request.searchRingM}",
+        f"--handoff-z={servo.handoffZ}",
+        f"--max-seconds={trials_request.maxSeconds}",
+        f"--pick-pose={pick}",
+        f"--out={run_dir / 'rows.jsonl'}",
+        f"--stop-file={run_dir / 'STOP'}",
     ]
     return plan, argv
 
@@ -183,16 +186,109 @@ def _plan_auto_collect(
     }
     argv = [
         "tools/fr3/fr3_auto_collect_runtime.py",
-        "--mask", mask_path,
-        "--place-z", str(collect_request.placeZ),
-        "--carry-z", str(collect_request.carryZ),
-        "--cycles", str(collect_request.cycles),
-        "--seed", str(collect_request.seed),
-        "--recovery-fraction", str(collect_request.recoveryFraction),
-        "--max-seconds", str(collect_request.maxSeconds),
-        "--out", str(run_dir),
-        "--stop-file", str(run_dir / "STOP"),
+        f"--mask={mask_path}",
+        f"--place-z={collect_request.placeZ}",
+        f"--carry-z={collect_request.carryZ}",
+        f"--cycles={collect_request.cycles}",
+        f"--seed={collect_request.seed}",
+        f"--recovery-fraction={collect_request.recoveryFraction}",
+        f"--max-seconds={collect_request.maxSeconds}",
+        f"--out={run_dir}",
+        f"--stop-file={run_dir / 'STOP'}",
     ]
+    return plan, argv
+
+
+def _plan_grasp_envelope(
+    repo_root: Path, request: dict[str, Any], run_dir: Path
+) -> tuple[dict[str, Any], list[str]]:
+    from tools.fr3.grasp_envelope import (
+        GRASP_ENVELOPE_SPOT_XY,
+        GraspEnvelopeRequest,
+        build_envelope_schedule,
+        describe_schedule,
+        done_indices,
+        parse_offsets_mm,
+        parse_points_mm,
+        parse_xy,
+        read_rows,
+        validate_grasp_envelope,
+    )
+    from tools.fr3.terminal_servo import parse_terminal_servo_pose
+    from tools.fr3.workspace_fence import resolve_workspace_fence
+
+    spot = str(request.get("spot") or ",".join(str(v) for v in GRASP_ENVELOPE_SPOT_XY))
+    # Present-but-empty means "skip this block", so a fine scan can run its extra points alone;
+    # only a key that is absent altogether takes the coarse default.
+    xy_offsets = str(request.get("xyOffsetsMm", "-12,-8,-4,0,4,8,12") or "")
+    dz_offsets = str(request.get("dzOffsetsMm", "-12,-8,-4,0,4,8,14,20,28") or "")
+    extra = str(request.get("extraPointsMm") or "")
+    pick = str(request.get("pickPose") or "0.3640,-0.1370,0.0550").strip()
+    start = str(request.get("start") or "fixture")
+    envelope_request = GraspEnvelopeRequest(
+        spotXy=parse_xy(spot),
+        xyOffsetsMm=parse_offsets_mm(xy_offsets),
+        xyDzMm=float(request.get("xyDzMm") or -6.0),
+        dzOffsetsMm=parse_offsets_mm(dz_offsets),
+        centreRepeats=int(request.get("centreRepeats") if request.get("centreRepeats") not in (None, "") else 5),
+        extraPointsMm=parse_points_mm(extra),
+        repeats=int(request.get("repeats") or 1),
+        seed=int(request.get("seed") or 0),
+        start=start,
+        pickXyz=parse_terminal_servo_pose(pick),
+        maxSeconds=float(request.get("maxSeconds") or 0.0),
+        requestId=run_dir.name,
+    )
+    schedule = build_envelope_schedule(envelope_request)
+    workspace_min, workspace_max, fence_source = resolve_workspace_fence(
+        record_config_path=str(request.get("recordConfig") or "tools/fr3/fr3_record_config.yaml")
+    )
+    qc = validate_grasp_envelope(
+        envelope_request, schedule, workspace_min=workspace_min, workspace_max=workspace_max
+    )
+    text = describe_schedule(envelope_request, schedule)
+    resume_from = str(request.get("resumeFrom") or "").strip()
+    resume_rows = ""
+    if resume_from:
+        # A run that halted on a lost peg or a fault is finished by a second run with the same
+        # plan: same seed, same order, the finished indices skipped. The peg is wherever the
+        # first run left it, which is why `start` is still the operator's to set.
+        previous = runs_root(repo_root) / resume_from / "rows.jsonl"
+        if not previous.exists():
+            raise UnattendedError(f"resumeFrom: no rows at {previous}")
+        done = done_indices(read_rows(previous))
+        schedule = [point for point in schedule if point.index not in done]
+        resume_rows = str(previous)
+        text += f"\nresuming {resume_from}: {len(done)} done, {len(schedule)} remaining"
+    plan = {
+        "kind": "grasp_envelope",
+        "request": envelope_request.payload(),
+        "schedule": [vars(point) for point in schedule],
+        "qc": qc,
+        "fence": {"min": list(workspace_min), "max": list(workspace_max), "source": fence_source},
+        "text": text,
+        "units": len(schedule),
+    }
+    argv = [
+        "tools/fr3/fr3_grasp_envelope_runtime.py",
+        f"--spot={spot}",
+        f"--xy-offsets-mm={xy_offsets}",
+        f"--xy-dz-mm={envelope_request.xyDzMm}",
+        f"--dz-offsets-mm={dz_offsets}",
+        f"--centre-repeats={envelope_request.centreRepeats}",
+        f"--repeats={envelope_request.repeats}",
+        f"--extra-points-mm={extra}",
+        f"--seed={envelope_request.seed}",
+        f"--start={start}",
+        f"--pick-pose={pick}",
+        f"--max-seconds={envelope_request.maxSeconds}",
+        "--home-first",
+        f"--out={run_dir / 'rows.jsonl'}",
+        f"--stop-file={run_dir / 'STOP'}",
+        f"--continue-file={run_dir / 'CONTINUE'}",
+    ]
+    if resume_rows:
+        argv += [f"--resume-rows={resume_rows}"]
     return plan, argv
 
 
@@ -204,6 +300,13 @@ RUN_KINDS: dict[str, RunKind] = {
             label="E6-lite: terminal trials",
             script="tools/fr3/fr3_terminal_trials_runtime.py",
             plan=_plan_terminal_trials,
+            unit="trial",
+        ),
+        RunKind(
+            id="grasp_envelope",
+            label="P0: grasp envelope",
+            script="tools/fr3/fr3_grasp_envelope_runtime.py",
+            plan=_plan_grasp_envelope,
             unit="trial",
         ),
         RunKind(
@@ -226,6 +329,21 @@ def process_alive(pid: int | None) -> bool:
 
     if not pid or pid <= 0:
         return False
+    # A run this gateway launched and that has exited is a zombie until somebody waits on it, and
+    # signal 0 succeeds on a zombie. Without the reap a run that died on its first line reads as
+    # "running" for as long as the gateway lives.
+    try:
+        reaped, _ = os.waitpid(int(pid), os.WNOHANG)
+        if reaped:
+            return False
+    except ChildProcessError:
+        pass  # not our child: launched by an earlier gateway, which is the normal case after a restart
+    try:
+        state = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        if state == "Z":
+            return False
+    except (OSError, IndexError):
+        pass
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -297,17 +415,39 @@ def read_run(repo_root: Path, run_id: str, *, tail: int = DEFAULT_TAIL) -> dict[
         state = "running"
     elif summary is not None:
         state = "complete" if summary.get("ok") else "halted"
-    elif total > 0:
+    elif total > 0 or meta.get("pid"):
         # The process is gone and no summary was ever written. Never folded into "complete":
         # this is a night that stopped for a reason nobody has read, and on a row count alone it
         # is indistinguishable from one that finished.
         state = "crashed"
     else:
-        state = "starting" if meta.get("pid") else "planned"
+        state = "planned"
+
+    # Why a run died is in its log, and a crashed run whose page does not show it is one somebody
+    # has to ssh in to read.
+    log_tail: list[str] = []
+    if state == "crashed":
+        try:
+            log_tail = (run_dir / "run.log").read_text(errors="replace").splitlines()[-LOG_TAIL_LINES:]
+        except OSError:
+            pass
+
+    # A run waiting on a person says so. Only while it is alive: a needs_operator row followed by
+    # nothing is a run that gave up waiting, and asking somebody to put a peg back for a process
+    # that is gone would be a button that does nothing.
+    needs_operator = ""
+    for row in reversed(rows):
+        kind = row.get("kind")
+        if kind == "needs_operator":
+            needs_operator = str(row.get("message") or "the run needs a person") if alive else ""
+            break
+        if kind in ("operator", "trial", "summary", "staged"):
+            break
 
     return {
         "id": run_id,
         "kind": meta.get("kind", plan.get("kind", "")),
+        "needsOperator": needs_operator,
         "dir": str(run_dir),
         "state": state,
         "pid": meta.get("pid"),
@@ -315,6 +455,7 @@ def read_run(repo_root: Path, run_id: str, *, tail: int = DEFAULT_TAIL) -> dict[
         "startedAt": meta.get("startedAt"),
         "argv": meta.get("argv", []),
         "logPath": str(run_dir / "run.log"),
+        "logTail": log_tail,
         "stopRequested": (run_dir / "STOP").exists(),
         "stopReason": _stop_reason(run_dir),
         "plan": plan,
@@ -503,4 +644,17 @@ def release_brake(repo_root: Path, run_id: str) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise UnattendedError(f"no such run: {run_id}")
     (run_dir / "STOP").unlink(missing_ok=True)
+    return read_run(repo_root, run_id, tail=1)
+
+
+def request_continue(repo_root: Path, run_id: str) -> dict[str, Any]:
+    """Answer a run that is waiting for a person: the peg is back, carry on."""
+
+    run_dir = runs_root(repo_root) / run_id
+    if not run_dir.is_dir():
+        raise UnattendedError(f"no such run: {run_id}")
+    run = read_run(repo_root, run_id, tail=20)
+    if not run["needsOperator"]:
+        raise UnattendedError("the run is not waiting for anybody.")
+    (run_dir / "CONTINUE").write_text(f"continued at {time.strftime('%H:%M:%S')}", encoding="utf-8")
     return read_run(repo_root, run_id, tail=1)

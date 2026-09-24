@@ -616,6 +616,24 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
         clean_servo = _sanitize_terminal_servo(terminal_servo)
         if clean_servo:
             entry["terminalServo"] = clean_servo
+    # Where the reset that preceded this rollout put the peg. Kept out of `geometry` because
+    # that one is what the runtime measured about the *arm*; this is what the environment was
+    # set to before the policy ever saw it, and the two have different provenance.
+    #
+    # It is the only record of the peg's start pose. `geometry.graspXyz` is where the fingers
+    # closed, which on a rollout that closed on air or pushed the peg over is not where the peg
+    # was -- and those are exactly the rollouts whose start pose decides whether the offset is
+    # systematic (a direction) or noise (no direction).
+    #
+    # Absent rather than defaulted when no reset preceded the rollout, or when the reset did not
+    # finish: a stale target is worse than a missing one, because it names a start pose the peg
+    # never had and nothing downstream could tell.
+    reset_target = record.get("resetTarget")
+    if isinstance(reset_target, (list, tuple)) and len(reset_target) == 3:
+        try:
+            entry["resetTarget"] = [round(float(component), 5) for component in reset_target]
+        except (TypeError, ValueError):
+            pass
     path = rollout_log_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -712,7 +730,14 @@ def _align_takeovers(
     return rows, mismatch
 
 
-_ARM_INT_FIELDS = ("actionSamples", "selectionHorizon", "terminalServoSearchLandings")
+_ARM_INT_FIELDS = (
+    "actionSamples",
+    "selectionHorizon",
+    # Absent means the offset is derived per replan from the measured latency, which is the
+    # default. Present means it was pinned, and a pinned offset is a different arm.
+    "selectionOffsetSteps",
+    "terminalServoSearchLandings",
+)
 _ARM_SCALAR_FIELDS = (
     "terminalServoHandoffZ",
     "terminalServoMaxSpeedMs",

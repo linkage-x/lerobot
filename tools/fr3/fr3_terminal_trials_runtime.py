@@ -109,12 +109,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--step-tolerance-mm",
         type=float,
-        default=0.0,
+        default=4.0,
         help=(
             "What the positioning steps (align, search lift/transfer, retreat) must reach. "
-            "0 keeps the servo's own 2.0 mm. Raise it past this arm's dead-band -- measured at "
-            "about 2 mm along the direction of travel -- rather than raising the servo "
-            "tolerance, which the descent also reads for its seated test."
+            "0 falls back to the servo's own 2.0 mm, which is BELOW this arm's dead-band and "
+            "therefore cannot be reached: every positioning step then burns its whole timeout "
+            "and the run halts. Measured three times, 2026-09-11 and twice on 2026-09-22, the "
+            "residual is 4.6-5.7 mm on descend/lift and 1.9-3.6 mm on retreat, sign following "
+            "the direction of travel -- static friction, not a tuning error. 4 mm clears it. "
+            "Raise this rather than the servo tolerance, which the descent also reads for its "
+            "seated test (searchSeatedM is 3 mm, so 4 mm there would gift a seated verdict). "
+            "The cost is real and belongs in the reading: at 4 mm the align step settles at "
+            "3.4-3.7 mm of lateral error instead of 1.7 mm, which is 2 mm more handoff error "
+            "for anything sized against the landing accuracy, E7-C's ring coverage included."
         ),
     )
     parser.add_argument(

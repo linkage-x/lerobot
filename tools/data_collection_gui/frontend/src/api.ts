@@ -1055,7 +1055,9 @@ export class DataCollectionGuiApi {
    *  its own. The page sends it because a rollout the gateway launched has its stdin held as a
    *  pipe, which no keyboard backend can read: the `t` key a terminal operator would press does
    *  not exist here, and without this the browser session has no way to hold the arm still. */
-  async controlRollout(command: "start" | "stop" | "home" | "quit" | "takeover") {
+  async controlRollout(
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue"
+  ) {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
   }
 
@@ -1232,6 +1234,10 @@ export class DataCollectionGuiApi {
    *  stands. Two actions, never one button with a modifier. */
   async stopUnattendedRun(id: string, mode: "boundary" | "now") {
     return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/stop", { id, mode });
+  }
+
+  async continueUnattendedRun(id: string) {
+    return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/continue", { id });
   }
 
   async releaseUnattendedBrake(id: string) {

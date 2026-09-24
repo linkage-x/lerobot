@@ -1,3 +1,4 @@
+import { GraspLoopPanel } from "./GraspLoopPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
@@ -121,7 +122,7 @@ export function RolloutPage() {
   const [rtcMaxGuidanceWeight, setRtcMaxGuidanceWeight] = useState("10");
   const [rtcPrefixAttentionSchedule, setRtcPrefixAttentionSchedule] =
     useState<RolloutRtcSchedule>("EXP");
-  const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("25");
+  const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("34");
   const [rtcInferenceDelaySteps, setRtcInferenceDelaySteps] = useState("");
   const [commandEmaAlpha, setCommandEmaAlpha] = useState("");
   // E3 and E5. Both blank by default, which is the deployment that has been running all along:
@@ -131,6 +132,11 @@ export function RolloutPage() {
   const [terminalServoPose, setTerminalServoPose] = useState("");
   const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
   const [terminalServoSearchRing, setTerminalServoSearchRing] = useState("");
+  // Grasp loop (card 12). Attended by default: the page is open, so somebody is there to put a
+  // knocked-over peg back, and the alternative is a run that halts on its first knock.
+  const [graspLoopTrials, setGraspLoopTrials] = useState("40");
+  const [graspLoopAttended, setGraspLoopAttended] = useState(true);
+  const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -232,12 +238,17 @@ export function RolloutPage() {
       rtcExecutionHorizon: positiveNumberOr(rtcExecutionHorizon, 16),
       rtcMaxGuidanceWeight: positiveNumberOr(rtcMaxGuidanceWeight, 10),
       rtcPrefixAttentionSchedule,
-      rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 25),
+      rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 34),
       rtcInferenceDelaySteps: optionalNumberOrNull(rtcInferenceDelaySteps),
       commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha),
       actionSamples: positiveNumberOr(actionSamples, 1),
       actionAggregate,
-      terminalServoPose: terminalServoPose.trim() || undefined,
+      // The grasp loop ends every trial at the grasp, so a servo pose there is refused by the
+      // runtime; not sending it keeps a leftover field from blocking the start.
+      terminalServoPose: modeId === "grasp_loop" ? undefined : terminalServoPose.trim() || undefined,
+      graspLoopTrials: modeId === "grasp_loop" ? positiveNumberOr(graspLoopTrials, 40) : undefined,
+      graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
+      graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -266,7 +277,11 @@ export function RolloutPage() {
       daggerTakeover,
       daggerRecord,
       daggerDatasetRoot,
-      daggerReleaseAfterS
+      daggerReleaseAfterS,
+      modeId,
+      graspLoopTrials,
+      graspLoopAttended,
+      graspLoopArms
     ]
   );
 
@@ -472,10 +487,12 @@ export function RolloutPage() {
     }
     setTaskPrompt("");
     setRtcMode("auto");
-    setRtcExecutionHorizon("10");
+    // The same defaults as the initial state above. This reset once said 10 and 30, so choosing a
+    // checkpoint quietly ran it with 20 executed steps against a 10-step horizon (roadmap v14 D1).
+    setRtcExecutionHorizon("16");
     setRtcMaxGuidanceWeight("10");
     setRtcPrefixAttentionSchedule("EXP");
-    setRtcReplanQueueSize("30");
+    setRtcReplanQueueSize("34");
     setRtcInferenceDelaySteps("");
     setCommandEmaAlpha("");
     setShowRolloutAdvanced(false);
@@ -510,7 +527,9 @@ export function RolloutPage() {
     }
   };
 
-  const onControl = async (command: "start" | "stop" | "home" | "quit" | "takeover") => {
+  const onControl = async (
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue"
+  ) => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
   };
@@ -750,6 +769,10 @@ export function RolloutPage() {
           </div>
 
           <p className="hint">{run.message}</p>
+
+          {run.mode === "grasp_loop" && (
+            <GraspLoopPanel run={run} busy={busy} onControl={(command) => void onControl(command)} />
+          )}
 
           {/* First thing in the card while a grade is owed, ahead of the instruments below:
               the rollout it is asking about is over, the viewer and the camera strip are
@@ -1214,6 +1237,50 @@ export function RolloutPage() {
           ))}
         </div>
         {mode && <p className="hint">{mode.description}</p>}
+
+        {mode?.id === "grasp_loop" && (
+          <div className="subcard">
+            <h4>抓取循环设置</h4>
+            <p className="hint">
+              开始前把销插在孔里（scene reset 的 pick pose）。每条：复位放销 → 策略去抓 → 合手后脚本抬 3 cm
+              读宽度判定 → 抓住就直接搬去下一个点，没抓住就原地重夹。Replan queue 等 RTC 参数照常用下面的设置。
+            </p>
+            <label className="field">
+              <span>条数</span>
+              <input
+                value={graspLoopTrials}
+                onChange={(event) => setGraspLoopTrials(event.target.value)}
+                inputMode="numeric"
+                disabled={isLive}
+              />
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopAttended}
+                onChange={(event) => setGraspLoopAttended(event.target.checked)}
+                disabled={isLive}
+              />
+              <span>有人在场：销被碰倒时暂停等我放回（不勾则直接停机）</span>
+            </label>
+            <label className="field">
+              <span>对照臂</span>
+              <select
+                value={graspLoopArms}
+                onChange={(event) => setGraspLoopArms(event.target.value as "A" | "B" | "AB")}
+                disabled={isLive}
+              >
+                <option value="AB">A + B 交错（纯策略 / 策略 + 抓取漏斗）</option>
+                <option value="A">只跑 A：纯策略</option>
+                <option value="B">只跑 B：策略 + 抓取漏斗</option>
+              </select>
+            </label>
+            <p className="hint">
+              B 臂：策略把夹爪带到销上方 6 cm（或策略自己要合手）时，漏斗接管——先水平对准复位时记下的销位，
+              误差 ≤ 8 mm 且停稳后竖直降到合手高度（dz −6 mm），停稳再合手。A、B 按随机配对交错，判定方法完全相同。
+            </p>
+          </div>
+        )}
 
         {mode?.id === "real_once" && (
           <label className="field">

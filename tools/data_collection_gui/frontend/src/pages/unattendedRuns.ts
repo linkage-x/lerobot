@@ -112,7 +112,13 @@ const READING_KEYS: [string, string, (value: number) => string][] = [
   ["offsetMm", "offset", (v) => `${v.toFixed(1)} mm`],
   ["widthNormalized", "width", (v) => v.toFixed(3)],
   ["referenceStepMm", "hole moved", (v) => `${v.toFixed(2)} mm`],
-  ["lateralErrorMm", "lateral", (v) => `${v.toFixed(2)} mm`]
+  ["lateralErrorMm", "lateral", (v) => `${v.toFixed(2)} mm`],
+  ["dxMm", "dx", (v) => `${v.toFixed(1)}`],
+  ["dyMm", "dy", (v) => `${v.toFixed(1)}`],
+  ["dzMm", "dz", (v) => `${v.toFixed(1)} mm`],
+  ["widthLifted", "width lifted", (v) => v.toFixed(3)],
+  ["contactZ", "contact z", (v) => v.toFixed(4)],
+  ["verifyWidth", "verify", (v) => v.toFixed(3)]
 ];
 
 /** One row per unit of work, carrying the numbers the verdict came from.
@@ -131,10 +137,13 @@ export function projectRows(rows: UnattendedRow[]): UnitRow[] {
       const value = row[key];
       if (typeof value === "number" && Number.isFinite(value)) readings.push([label, format(value)]);
     }
+    // A grasp-envelope trial that left the peg unrecoverable is its own outcome on the map: the
+    // knock-over boundary is one of the four numbers the sweep exists to find.
+    const verdict = String(row.verdict ?? "");
     out.push({
       index: typeof row.index === "number" ? row.index : out.length,
       kind: String(row.trialKind ?? row.cycleKind ?? kind),
-      verdict: String(row.verdict ?? ""),
+      verdict: row.pegDisturbed === true ? `${verdict}+disturbed` : verdict,
       readings
     });
   }
@@ -191,5 +200,48 @@ export const VERDICT_COLORS: Record<string, string> = {
   changed: "#dd6b20",
   slip: "#e53e3e",
   ambiguous: "#805ad5",
-  halt: "#e53e3e"
+  halt: "#e53e3e",
+  contact: "#d69e2e",
+  "held+disturbed": "#805ad5",
+  "empty+disturbed": "#9b2c2c",
+  "contact+disturbed": "#9b2c2c"
 };
+
+/** The four envelope numbers from a grasp-envelope summary row, as label/value pairs.
+ *
+ *  An edge the grid ran out before reaching is shown as "≥", and misses inside the capture radius
+ *  are named: a radius that tolerated an outlier says which one.
+ */
+export function envelopeReadout(summary: Record<string, unknown> | null | undefined): [string, string][] {
+  if (!summary || !("xyCaptureRadiusMm" in summary)) return [];
+  const mm = (value: unknown) => (typeof value === "number" ? `${value.toFixed(1)} mm` : "—");
+  const interval = summary.graspDzIntervalMm;
+  const open = (Array.isArray(summary.graspDzOpen) ? summary.graspDzOpen : [false, false]) as boolean[];
+  const centre = summary.centre as { n?: number; held?: number } | undefined;
+  const verify = summary.verify as { n?: number; held?: number } | undefined;
+  const pooled = summary.xyCaptureHeld as { n?: number; held?: number } | undefined;
+  const misses = (Array.isArray(summary.xyMissesInsideCapture) ? summary.xyMissesInsideCapture : []) as number[][];
+  let capture = mm(summary.xyCaptureRadiusMm);
+  if (capture !== "—") {
+    if (summary.xyCaptureAtGridEdge === true) capture = `≥ ${capture} (grid edge)`;
+    if (pooled?.n) capture += ` · ${pooled.held}/${pooled.n} held`;
+    if (misses.length) capture += ` · missed at ${misses.map(([dx, dy]) => `(${dx},${dy})`).join(" ")}`;
+  }
+  const knock =
+    summary.knockOverRadiusMm === null && typeof summary.xyDisturbed === "number"
+      ? `none in grid (${summary.xyDisturbed} scattered)`
+      : mm(summary.knockOverRadiusMm);
+  return [
+    ["XY capture radius", capture],
+    [
+      "grasp dz interval",
+      Array.isArray(interval) && interval.length === 2
+        ? `${open[0] ? "≤ " : ""}${interval[0]} … ${open[1] ? "≥ " : ""}${interval[1]} mm`
+        : "—"
+    ],
+    ["contact at or below dz", mm(summary.contactBelowDzMm)],
+    ["knock-over from radius", knock],
+    ["centre held", centre?.n ? `${centre.held}/${centre.n}` : "—"],
+    ["verify grasps held", verify?.n ? `${verify.held}/${verify.n}` : "—"]
+  ];
+}

@@ -596,3 +596,42 @@ def test_a_step_tolerance_that_is_not_positive_is_refused_rather_than_treated_as
             FakeRobot(), request, "align_above_target", (0.36, -0.14, 0.13), (0.0, 0.0, 0.0), 1.0,
             tolerance_m=0.0 - 1e-9,
         )
+
+
+def test_a_hover_waits_for_the_arm_to_stop_sideways_not_for_it_to_arrive_in_3d():
+    """2026-09-24: parked 2.7 mm sideways and 1.8 mm low (the peg's sag) for 20 s -- 3.2 mm in
+    3-D, a timeout at 3 mm. What a hover needs is that nothing is sliding, so a still arm inside
+    the xy bound is done; one still moving is not, however close it is."""
+
+    class Parked(FakeRobot):
+        def send_action(self, action):
+            return super().send_action({
+                **action,
+                "ee.x": float(action["ee.x"]) - 0.0021,
+                "ee.y": float(action["ee.y"]) + 0.0017,
+                "ee.z": float(action["ee.z"]) - 0.0018,
+            })
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=0.5, toleranceM=0.006, controlPeriodS=0.001,
+    )
+    hover = (0.43, -0.27, 0.068)
+    with pytest.raises(TimeoutError):
+        scene_reset._run_step(Parked(), request, "settle_above_place", hover, (0.0, 0.0, 0.0), 0.0,
+                              max_speed_ms=50.0, tolerance_m=0.003)
+    started = time.perf_counter()
+    scene_reset._run_step(Parked(), request, "settle_above_place", hover, (0.0, 0.0, 0.0), 0.0,
+                          max_speed_ms=50.0, tolerance_m=0.005, still_window_s=0.05)
+    assert time.perf_counter() - started >= 0.05
+
+    class Creeping(Parked):
+        """Inside the bound but sliding 0.5 mm a tick: never still, so never done."""
+
+        def send_action(self, action):
+            self.creep = getattr(self, "creep", 0) + 1
+            return super().send_action({**action, "ee.x": float(action["ee.x"]) + 0.0005 * (self.creep % 4)})
+
+    with pytest.raises(TimeoutError):
+        scene_reset._run_step(Creeping(), request, "settle_above_place", hover, (0.0, 0.0, 0.0), 0.0,
+                              max_speed_ms=50.0, tolerance_m=0.005, still_window_s=0.05)

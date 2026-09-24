@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   HEARTBEAT_STALE_S,
+  envelopeReadout,
   mapPoints,
   outcomeLabel,
   projectRows,
@@ -152,5 +153,55 @@ describe("the map carries three layers, and the third is the one usually missing
 
   it("reads a terminal trial's aim when there is no placement", () => {
     expect(mapPoints([{ index: 0, aimXyz: [0.3599, -0.1333, 0.0523] }], [], null)[0].x).toBeCloseTo(0.3599);
+  });
+});
+
+describe("grasp envelope rows", () => {
+  it("marks a trial that lost the peg as its own outcome, so the knock-over edge shows on the map", () => {
+    const units = projectRows([
+      { kind: "trial", index: 0, verdict: "held", dxMm: 0, dyMm: 0, dzMm: -6, widthLifted: 0.31, pegDisturbed: false },
+      { kind: "trial", index: 1, verdict: "empty", dxMm: 12, dyMm: 0, dzMm: -6, pegDisturbed: true }
+    ]);
+    expect(units.map((unit) => unit.verdict)).toEqual(["held", "empty+disturbed"]);
+    expect(units[0].readings).toContainEqual(["width lifted", "0.310"]);
+  });
+
+  it("marks an edge the grid ran out before reaching, and names the outlier it tolerated", () => {
+    const readout = Object.fromEntries(
+      envelopeReadout({
+        xyCaptureRadiusMm: 16.97,
+        xyCaptureAtGridEdge: true,
+        xyCaptureHeld: { n: 55, held: 54 },
+        xyMissesInsideCapture: [[0, -4]],
+        graspDzIntervalMm: [-12, 14],
+        graspDzOpen: [true, false],
+        contactBelowDzMm: null,
+        knockOverRadiusMm: null,
+        xyDisturbed: 2,
+        centre: { n: 5, held: 5 },
+        verify: { n: 63, held: 60 }
+      })
+    );
+    expect(readout["XY capture radius"]).toBe("≥ 17.0 mm (grid edge) · 54/55 held · missed at (0,-4)");
+    expect(readout["grasp dz interval"]).toBe("≤ -12 … 14 mm");
+    expect(readout["knock-over from radius"]).toBe("none in grid (2 scattered)");
+  });
+
+  it("reads the four envelope numbers off the summary and nothing off other loops' summaries", () => {
+    const readout = envelopeReadout({
+      xyCaptureRadiusMm: 5.66,
+      graspDzIntervalMm: [-8, 4],
+      contactBelowDzMm: -12,
+      knockOverRadiusMm: null,
+      centre: { n: 5, held: 5 },
+      verify: { n: 63, held: 61 }
+    });
+    expect(Object.fromEntries(readout)).toMatchObject({
+      "XY capture radius": "5.7 mm",
+      "grasp dz interval": "-8 … 4 mm",
+      "knock-over from radius": "—",
+      "verify grasps held": "61/63"
+    });
+    expect(envelopeReadout({ ok: true, haltedOn: "schedule_complete", seated: 3 })).toEqual([]);
   });
 });

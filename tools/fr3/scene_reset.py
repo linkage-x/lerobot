@@ -47,6 +47,10 @@ SCENE_RESET_MAX_SPEED_MS = 0.15
 # and waiting cannot help. Without this, a reset spent its whole 20 s timeout leaning on a joint
 # limit with the peg gripped.
 SCENE_RESET_REACH_STALL_S = 0.5
+# A step waiting for the arm to *stop* sideways, rather than to arrive, calls it stopped when the
+# tool's xy has stayed inside this radius for the step's `still_window_s`. Measured at rest on
+# 2026-09-24: 20 s parked with the peg in the fingers moved 0.1 mm after the first 2 s.
+SCENE_RESET_STILL_XY_M = 0.0003
 # What fraction of the arm's rated joint speed a reset homes at.
 #
 # `move_to_start` is a joint-space move at the OTG's configured ceilings, which are the FR3's
@@ -562,6 +566,107 @@ def _reach_stall_error_m(robot: Any) -> float:
         return 0.0
 
 
+# ------------------------------------------------------------------------- force trace ---
+# Read-only instrumentation, 2026-09-24: before any step is allowed to stop on contact, the rig
+# has to show what contact looks like in libfranka's external-wrench estimate -- its noise at
+# rest, its bias drift with posture, and the size and shape of the step when a peg meets the
+# table. Nothing here changes a command. When a sink is set, every step (and every timed hold
+# between steps) appends one JSON line with its samples; when none is set, or the robot reports
+# no wrench, nothing is read and nothing is written.
+_force_trace_path: Any = None
+
+
+def set_force_trace_path(path: Any) -> None:
+    """Where step force traces are appended (JSONL), or None to stop tracing."""
+
+    global _force_trace_path
+    _force_trace_path = path
+
+
+def _read_external_wrench(robot: Any) -> tuple[float, ...] | None:
+    try:
+        wrench = getattr(robot, "external_wrench", None)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail a step
+        return None
+    if wrench is None or len(wrench) != 6:
+        return None
+    return tuple(float(v) for v in wrench)
+
+
+class _ForceTrace:
+    """Samples for one step: (t_s, commanded z, measured xyz, wrench) at the control rate."""
+
+    def __init__(self, robot: Any, request_id: str, name: str):
+        self.enabled = _force_trace_path is not None and _read_external_wrench(robot) is not None
+        self.robot = robot
+        self.request_id = request_id
+        self.name = name
+        self.started_at = time.time()
+        self.started_s = time.perf_counter()
+        self.samples: list[list[float]] = []
+
+    def sample(self, commanded_z: float, xyz: tuple[float, float, float]) -> None:
+        if not self.enabled:
+            return
+        wrench = _read_external_wrench(self.robot)
+        if wrench is None:
+            return
+        self.samples.append(
+            [round(time.perf_counter() - self.started_s, 4), round(commanded_z, 5)]
+            + [round(v, 5) for v in xyz]
+            + [round(v, 3) for v in wrench]
+        )
+
+    def summary(self) -> str:
+        """`fz_n=start/end dfz_max_n=` for the step's log line, or "" when nothing was sampled."""
+
+        if not self.samples:
+            return ""
+        fz = [row[7] for row in self.samples]
+        dfz = max(fz, key=lambda value: abs(value - fz[0])) - fz[0]
+        return f" fz_n={fz[0]:+.1f}/{fz[-1]:+.1f} dfz_max_n={dfz:+.1f}"
+
+    def flush(self, outcome: str) -> None:
+        if not self.enabled or not self.samples:
+            return
+        record = {
+            "at": round(self.started_at, 3),
+            "requestId": self.request_id,
+            "name": self.name,
+            "outcome": outcome,
+            "columns": ["t_s", "cmd_z", "x", "y", "z", "fx", "fy", "fz", "tx", "ty", "tz"],
+            "samples": self.samples,
+        }
+        try:
+            with open(_force_trace_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            print(f"[WARN] force_trace=write_failed path={_force_trace_path} details={exc}", flush=True)
+
+
+def traced_hold(robot: Any, request_id: str, name: str, seconds: float, period_s: float = 1.0 / 30.0) -> None:
+    """`precise_sleep(seconds)`, sampling the wrench meanwhile when a force trace is on.
+
+    Sends nothing: the arm holds its last setpoint exactly as it does through a plain sleep.
+    """
+
+    if seconds <= 0.0:
+        return
+    trace = _ForceTrace(robot, request_id, name)
+    if not trace.enabled:
+        precise_sleep(seconds)
+        return
+    deadline = time.perf_counter() + seconds
+    while True:
+        xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        trace.sample(xyz[2], xyz)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            break
+        precise_sleep(min(period_s, remaining))
+    trace.flush("done")
+
+
 def _scene_reset_waits_for_gripper_position(name: str) -> bool:
     # Once the peg is clamped, the measured opening is the peg thickness, not the closed command.
     # Waiting for `closedGripper` would block the lift and carry steps forever on a successful grasp.
@@ -569,6 +674,7 @@ def _scene_reset_waits_for_gripper_position(name: str) -> bool:
         "close_gripper",
         "lift_8cm_after_grasp",
         "move_to_place_above",
+        "settle_above_place",
         "descend_8cm_to_place",
         # Both of these hold the peg once the terminal loop re-grips in place: the first is the
         # close itself, the second carries what it just took. Waiting for either to report the
@@ -589,6 +695,7 @@ def _run_step(
     tap: Any = None,
     max_speed_ms: float | None = None,
     tolerance_m: float | None = None,
+    still_window_s: float | None = None,
 ) -> None:
     """Walk the setpoint to a waypoint, optionally publishing every step to a recorder.
 
@@ -613,6 +720,12 @@ def _run_step(
     99.9th percentile of the demonstrations. A reset is free to move at reset speed; a leg that
     is going into a dataset is not. `None` keeps the reset's own limit, so nothing that does not
     pass it changes.
+
+    `still_window_s` turns the step into a wait for the arm to stop *sideways*: `tolerance_m` is
+    then read against the xy error only, and the step is done once the tool's xy has also held
+    within SCENE_RESET_STILL_XY_M for that long. For a hover above the table, where what matters
+    is that nothing is sliding when the fingers reach it -- not the ~2 mm the arm sags with a
+    peg in the fingers, which on 2026-09-24 timed a 3 mm 3-D hover out at 3.2 mm, parked.
     """
 
     speed_ms = SCENE_RESET_MAX_SPEED_MS if max_speed_ms is None else float(max_speed_ms)
@@ -654,6 +767,10 @@ def _run_step(
     # this unset, and an unset reading is reported as `unknown` rather than as `no` -- "we could
     # not tell" and "the arm had stopped closing" send a person to different fixes.
     error_sampled_at = time.perf_counter()
+    trace = _ForceTrace(robot, request.requestId, name)
+    # (time, xy) since the tool last left SCENE_RESET_STILL_XY_M of where it was; only read by a
+    # step that waits to be still.
+    still_since: tuple[float, tuple[float, float]] | None = None
     while time.perf_counter() < deadline:
         now = time.perf_counter()
         commanded = _step_toward(commanded, xyz, max_step_m)
@@ -666,12 +783,14 @@ def _run_step(
             tap.publish(now, name, observation, action)
         robot.send_action(action)
         observation, current_xyz, _current_rotvec, current_gripper = _observation_snapshot(robot)
+        trace.sample(commanded[2], current_xyz)
         stall_m = _reach_stall_error_m(robot)
         if stall_m <= 0.0:
             stalled_since = None
         elif stalled_since is None:
             stalled_since = now
         elif now - stalled_since >= SCENE_RESET_REACH_STALL_S:
+            trace.flush("unreachable")
             raise SceneResetUnreachableError(
                 f"scene reset step {name} asks for a tool point the arm cannot reach: IK has "
                 f"been {stall_m * 1000.0:.1f} mm short of the commanded pose for "
@@ -700,7 +819,17 @@ def _run_step(
         # and the arm is left a few mm short of a coordinate that was asked for exactly -- which
         # for the pose probe, whose whole job is putting the tool at a known base coordinate for
         # the camera to be solved against, is calibration error rather than tracking error.
-        pos_ok = commanded == xyz and pos_error <= tolerance_m_value
+        if still_window_s is None:
+            pos_ok = commanded == xyz and pos_error <= tolerance_m_value
+        else:
+            xy = (current_xyz[0], current_xyz[1])
+            if still_since is None or math.dist(xy, still_since[1]) > SCENE_RESET_STILL_XY_M:
+                still_since = (now, xy)
+            pos_ok = (
+                commanded == xyz
+                and math.dist(xy, xyz[:2]) <= tolerance_m_value
+                and now - still_since[0] >= still_window_s
+            )
         gripper_ok = gripper_error <= request.gripperTolerance
         if pos_ok and position_reached_at is None:
             position_reached_at = now
@@ -722,11 +851,13 @@ def _run_step(
         if pos_ok and gripper_wait_done:
             print(
                 f"[INFO] scene_reset_step=done request_id={request.requestId} name={name} "
-                f"{last_error} gripper_wait={gripper_wait}",
+                f"{last_error} gripper_wait={gripper_wait}{trace.summary()}",
                 flush=True,
             )
+            trace.flush("done")
             return
         precise_sleep(request.controlPeriodS)
+    trace.flush("timeout")
     if not math.isfinite(error_a_second_ago):
         closing = "unknown"
     elif pos_error < error_a_second_ago - 1e-5:
@@ -809,8 +940,27 @@ def _abort_scene_reset(robot: Any, request: SceneResetRequest, *, gripper: float
     return {"returnedToStart": returned_to_start}
 
 
-def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any]:
-    """Execute the fixed-pick/random-place reset on an already connected FR3 robot."""
+def execute_scene_reset(
+    robot: Any,
+    request: SceneResetRequest,
+    *,
+    release_dwell_s: float = 0.0,
+    release_settle_s: float = 0.0,
+    hover_m: float = 0.0,
+    hover_tolerance_m: float | None = None,
+    hover_still_s: float | None = None,
+) -> dict[str, Any]:
+    """Execute the fixed-pick/random-place reset on an already connected FR3 robot.
+
+    `releasedXyz` in the result is where the tool measured when the fingers opened on the peg:
+    the step converges to within `toleranceM` (6 mm) of the target, so the commanded target can be
+    several mm from where the peg actually stands. `release_dwell_s` holds the arm at the place
+    height, still closed, before the open; `release_settle_s` holds it still after the open, so a
+    peg that rocks on release is not dragged by fingers leaving too early. `hover_m` stops both
+    descents that far above their point and waits there to within `hover_tolerance_m` (xy only,
+    and still for `hover_still_s`, when that is given), so the fingers do not meet the peg or the
+    table while the arm is still closing the last few mm sideways.
+    """
 
     current_xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
     workspace_min, workspace_max = _robot_workspace_bounds(robot)
@@ -839,10 +989,25 @@ def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any
     # What the gripper was last told, so an abort can hold the arm still without deciding on its
     # own whether the peg is dropped. Seeded open: nothing has been commanded yet at this point.
     commanded_gripper = request.openGripper
+    released_xyz: tuple[float, float, float] | None = None
     try:
         for waypoint in build_scene_reset_waypoints(request):
+            if hover_m > 0.0 and waypoint.name in ("descend_8cm_to_pick", "descend_8cm_to_place"):
+                hover_name = "settle_above_pick" if waypoint.name.endswith("pick") else "settle_above_place"
+                hover = (waypoint.xyz[0], waypoint.xyz[1], waypoint.xyz[2] + hover_m)
+                _run_step(
+                    robot, request, hover_name, hover, rotvec, waypoint.gripper,
+                    tolerance_m=hover_tolerance_m,
+                    still_window_s=hover_still_s,
+                )
+            if waypoint.name == "open_gripper" and release_dwell_s > 0.0:
+                traced_hold(robot, request.requestId, "dwell_before_open", release_dwell_s, request.controlPeriodS)
             commanded_gripper = waypoint.gripper
             _run_step(robot, request, waypoint.name, waypoint.xyz, rotvec, waypoint.gripper)
+            if waypoint.name == "open_gripper":
+                if release_settle_s > 0.0:
+                    traced_hold(robot, request.requestId, "settle_after_open", release_settle_s, request.controlPeriodS)
+                released_xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
         if request.returnToStart:
             print(f"[INFO] scene_reset_step=start request_id={request.requestId} name=return_to_start", flush=True)
             _move_to_start(robot)
@@ -853,6 +1018,7 @@ def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any
             "request": request.payload(),
             "trajectoryQc": qc,
             "returnedToStart": bool(request.returnToStart),
+            "releasedXyz": None if released_xyz is None else [round(v, 5) for v in released_xyz],
         }
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the gateway
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details={exc}", flush=True)

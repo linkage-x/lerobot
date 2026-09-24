@@ -12,6 +12,9 @@
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real                   # interactive rollouts (s/x/q)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_debug             # + MuJoCo target viewer
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_once              # one bounded rollout
+#   bash tools/fr3/run_pick_place_infer_workstation.sh grasp_loop             # graded grasp-only trials
+#     FR3_GRASP_LOOP_TRIALS (40), FR3_GRASP_LOOP_MASK, FR3_GRASP_LOOP_OUT, FR3_GRASP_LOOP_ATTENDED=1
+#     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
 #   place it elsewhere): expert spans and the handback gap in mm, the number to read before the
@@ -111,7 +114,7 @@ rtc_mode="${FR3_RTC_MODE-auto}"
 rtc_execution_horizon="${FR3_RTC_EXECUTION_HORIZON-16}"
 rtc_max_guidance_weight="${FR3_RTC_MAX_GUIDANCE_WEIGHT-10}"
 rtc_prefix_attention_schedule="${FR3_RTC_PREFIX_ATTENTION_SCHEDULE-EXP}"
-rtc_replan_queue_size="${FR3_RTC_REPLAN_QUEUE_SIZE-25}"
+rtc_replan_queue_size="${FR3_RTC_REPLAN_QUEUE_SIZE-34}"
 rtc_inference_delay_steps="${FR3_RTC_INFERENCE_DELAY_STEPS-}"
 command_ema_alpha="${FR3_COMMAND_EMA_ALPHA-}"
 # E3 and E5. Both default to unset, meaning the runtime's own defaults: one draw executed as it
@@ -308,7 +311,7 @@ announce() {
   echo "[INFO] workspace_fence=${record_config} (robot.workspace_min/max; the box the driver clips to)"
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
-  echo "[INFO] sampling: samples=${action_samples:-1} aggregate=${action_aggregate:-<runtime default>} horizon=${action_sample_horizon:-<execution horizon>}"
+  echo "[INFO] sampling: samples=${action_samples:-1} aggregate=${action_aggregate:-<runtime default>} horizon=${action_sample_horizon:-<steps the queue runs: chunk_size - replan_q>}"
   echo "[INFO] terminal_servo: pose=${terminal_servo_pose:-<off>} handoff_z=${terminal_servo_handoff_z:-<runtime default>} search_ring=${terminal_servo_search_ring:-<off>}"
   echo "[INFO] rtc: mode=${rtc_mode} horizon=${rtc_execution_horizon:-<runtime default>} guidance=${rtc_max_guidance_weight:-<runtime default>} schedule=${rtc_prefix_attention_schedule:-<runtime default>} replan_q=${rtc_replan_queue_size:-<runtime default>} delay=${rtc_inference_delay_steps:-auto}"
 }
@@ -329,7 +332,7 @@ case "$mode" in
     echo "FR3_COMMAND_EMA_ALPHA=${command_ema_alpha:-<disabled>}"
     echo "FR3_ACTION_SAMPLES=${action_samples:-1}"
     echo "FR3_ACTION_AGGREGATE=${action_aggregate:-<runtime default>}"
-    echo "FR3_ACTION_SAMPLE_HORIZON=${action_sample_horizon:-<execution horizon>}"
+    echo "FR3_ACTION_SAMPLE_HORIZON=${action_sample_horizon:-<steps the queue runs: chunk_size - replan_q>}"
     echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
     echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
     echo "FR3_TERMINAL_SERVO_SEARCH_RING=${terminal_servo_search_ring:-<off>}"
@@ -425,6 +428,27 @@ case "$mode" in
       --max-leash-rot-delta-deg "${max_leash_rot_delta_deg}" \
       --live-frame-interval 1
     ;;
+  grasp_loop)
+    # Card 12: grasp-only trials graded by measured width after a scripted lift. No keyboard and no
+    # takeover device -- the loop stages, runs and grades each trial itself. The mask defaults to
+    # the targets the 09-22 rollouts were reset to, so the loop is compared against those batches.
+    grasp_loop_stamp="$(date +%Y%m%d_%H%M%S)"
+    grasp_loop_out="${FR3_GRASP_LOOP_OUT-outputs/analysis/grasp_loop/grasp_${grasp_loop_stamp}.jsonl}"
+    grasp_loop_args=(
+      --grasp-loop-trials "${FR3_GRASP_LOOP_TRIALS-40}"
+      --grasp-loop-mask "${FR3_GRASP_LOOP_MASK-outputs/rollouts/rollout_log.jsonl}"
+      --grasp-loop-out "${grasp_loop_out}"
+      --grasp-loop-arms "${FR3_GRASP_LOOP_ARMS-A}"
+      --rollout-trace-dir "outputs/rollout_traces/grasp_loop_${grasp_loop_stamp}"
+    )
+    if [[ "${FR3_GRASP_LOOP_ATTENDED-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-attended); fi
+    announce
+    echo "[INFO] grasp_loop out=${grasp_loop_out} stop_at_trial_boundary=\`touch ${grasp_loop_out%.jsonl}.STOP\`"
+    if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi
+    exec "${FR3_HOST_PYTHON}" "${common_args[@]}" \
+      "${grasp_loop_args[@]}" \
+      "${extra_args[@]}"
+    ;;
   real_once)
     announce
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi
@@ -434,7 +458,7 @@ case "$mode" in
       "${extra_args[@]}"
     ;;
   *)
-    echo "Usage: $0 [env|home|smoke|preview|real|real_debug|real_once|dagger_sim]" >&2
+    echo "Usage: $0 [env|home|smoke|preview|real|real_debug|real_once|grasp_loop|dagger_sim]" >&2
     exit 2
     ;;
 esac

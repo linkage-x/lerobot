@@ -11,7 +11,15 @@ import pytest
 
 import numpy as np
 
-from tools.fr3 import fr3_compare_live_capture_to_dataset_runtime as compare_runtime
+# The module under test imports its sibling runtime by bare name -- `import
+# fr3_act_infer_real_runtime` -- which is the convention every `tools/fr3/*_runtime.py` follows,
+# and which works when the file is run as a script because then its own directory is sys.path[0].
+# Importing it as a package member has to set that up first, the same way
+# `tools/fr3/fr3_migrate_tool_frame.py` does for its own siblings. Without this the file cannot be
+# collected at all, which is how it silently stopped being run.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools" / "fr3"))
+
+from tools.fr3 import fr3_compare_live_capture_to_dataset_runtime as compare_runtime  # noqa: E402
 
 
 class _FakeTable:

@@ -52,6 +52,20 @@ blockers:
     # fell is one bit the operator can see for free, and it is the only thing that separates a
     # systematic offset (consistent direction) from noise (no direction).
     ask: 销朝哪个方向倒？
+  - id: grasp_height
+    label: 合手高度
+    instance: >-
+      横向对上了，但闭合发生在错误的高度 —— 太高则合在销上方的空处，太低则指尖把销压在台面上
+    # Measured, not guessed. On 2026-09-22 the single successful grasp closed at TCP z = 65.3 mm
+    # and the demonstrations' own median first closure is 51.4 mm, while 7 of 19 rollouts closed
+    # between 76.7 and 98.5 mm and not one of them grasped. z at closure comes out of the trace,
+    # so unlike the peg's fall direction this one does not depend on anybody having watched.
+    #
+    # The 51.4 mm was quoted as 53.5 mm until 2026-09-22 evening. 53.5 is the demonstrations'
+    # p75, not their median; the live human-takeover median is 53.8 mm, which is most likely
+    # what got transcribed. Six candidate definitions (state vs action channel, last-open vs
+    # first-closed frame) all land at 50.7-51.4 mm -- see outputs/analysis/p11/p11_variants.py.
+    ask: 合手时太高还是太低？
   - id: perception
     label: 感知
     instance: 没有找到销，或找错了位置

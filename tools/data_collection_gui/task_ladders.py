@@ -72,6 +72,12 @@ STAGES_BY_ID = {stage.id: stage for stage in STAGE_VOCABULARY}
 # one thing across tasks, or the tallies cannot be compared.
 BLOCKER_VOCABULARY: tuple[str, ...] = (
     "object_pose_offset",
+    # Separate from `object_pose_offset` because the two have different fixes and, on
+    # 2026-09-22, the same label: 7 of 19 rollouts closed the gripper 11-33 mm above the height
+    # the one successful grasp closed at, none of them grasped, and they were filed 4 as
+    # `object_pose_offset` and 3 as `perception`. A lateral miss and a closure 30 mm up in the
+    # air are not the same work item, and folding them together hid the larger of the two.
+    "grasp_height",
     "perception",
     "policy_action",
     "hardware",

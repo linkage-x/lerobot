@@ -1259,6 +1259,40 @@ export type RolloutRun = {
    *  Absent when no terminal servo pose was configured, which means the policy owns the
    *  descent. */
   terminalServoConfig?: RolloutArm;
+  /** Progress of a grasp-loop session, folded from the runtime's log lines. Empty otherwise. */
+  graspLoop?: GraspLoopProgress;
+};
+
+/** One graded grasp-loop trial, as the runtime printed it. The JSONL at `out` is the record. */
+export type GraspLoopTrial = {
+  trial: number;
+  /** A pure policy, B policy + GT grasp funnel. */
+  arm?: string;
+  /** held / empty come from the width after a 3 cm lift; no_close means the policy never shut. */
+  verdict: "held" | "empty" | "no_close" | "not_graded" | string;
+  widthLifted: number | null;
+  closeAboveTargetMm: number | null;
+  lateralMm: number | null;
+  trialS: number | null;
+};
+
+export type GraspLoopProgress = {
+  planned: number;
+  out: string;
+  attended: boolean;
+  arms?: string;
+  currentTrial: number | null;
+  trials: GraspLoopTrial[];
+  graded: number;
+  held: number;
+  byArm?: Record<string, { graded: number; held: number }>;
+  /** Non-empty while the loop is parked waiting for the peg to be put back in the fixture. */
+  needsOperator: string;
+  stopRequested: boolean;
+  done: boolean;
+  halted: string;
+  haltDetails: string;
+  summary: Record<string, unknown>;
 };
 
 /** What the runtime measured at one takeover.
@@ -1303,8 +1337,12 @@ export type Takeover = TakeoverDetail & {
 export type RolloutArm = {
   actionSamples?: number;
   actionAggregate?: RolloutActionAggregate;
-  /** Steps of the chunk the draws are compared over before one is executed. */
+  /** Steps of the chunk the draws are compared over before one is executed. This is the
+   *  executed-run length (chunk_size - replan queue size), not the RTC execution horizon. */
   selectionHorizon?: number;
+  /** Where that window starts, when it was pinned with --rtc-inference-delay-steps. Absent means
+   *  the default: the steps actually consumed during inference, re-derived at every replan. */
+  selectionOffsetSteps?: number;
   terminalServoXyz?: [number, number, number];
   terminalServoHandoffZ?: number;
   terminalServoMaxSpeedMs?: number;
@@ -1568,7 +1606,9 @@ export type RolloutRuntimeOptions = {
   actionSamples?: number;
   /** medoid executes the real draw nearest the draws' mean direction; mean averages them. */
   actionAggregate?: RolloutActionAggregate;
-  /** Steps of each draw compared when selecting. 0 or undefined uses the execution horizon. */
+  /** Steps of each draw compared when selecting. 0 or undefined uses the steps the queue will
+   *  actually run before the next replan, which is `chunk_size - rtcReplanQueueSize` -- not the
+   *  RTC execution horizon, which is the guidance schedule and a different number. */
   actionSampleHorizon?: number;
   /** E5. `x,y,z` in metres: below the handoff height, with the peg held, the arm comes off the
    *  policy and is driven here, then lets go. Empty or undefined leaves the policy in charge. */
@@ -1587,6 +1627,11 @@ export type RolloutRuntimeOptions = {
   daggerDatasetRoot?: string;
   /** null or undefined leaves the runtime's 1 s handback. 0 turns automatic handback off. */
   daggerReleaseAfterS?: number | null;
+  /** Grasp loop only: trials to run, and whether a person is there to put a lost peg back. */
+  graspLoopTrials?: number;
+  graspLoopAttended?: boolean;
+  /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
+  graspLoopArms?: "A" | "B" | "AB";
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.
@@ -1684,6 +1729,10 @@ export type UnattendedPlan = {
 export type UnattendedRow = Record<string, unknown> & { kind?: string };
 
 export type UnattendedRun = UnattendedListEntry & {
+  /** Set while a live run is waiting for a person (a lost peg to put back); empty otherwise. */
+  needsOperator?: string;
+  /** The end of run.log, filled only for a crashed run: why it died, without an ssh. */
+  logTail?: string[];
   dir: string;
   pid: number | null;
   argv: string[];

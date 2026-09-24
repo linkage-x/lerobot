@@ -379,6 +379,16 @@ class GatewayState:
         default_factory=lambda: deque(maxlen=ROLLOUT_LIVE_FRAME_CAPACITY)
     )
     rollout_live_frame_seq: int = 0
+    # The peg's start pose for the next rollout, in two stages. `pending` is what the reset
+    # sampled and sent; `confirmed` is what the runtime reported it finished putting the peg on.
+    # Two fields rather than one because a reset that was commanded is not a start pose: the
+    # place step can fail with the peg still in the gripper, and a single field would hand the
+    # next rollout a coordinate the peg never occupied.
+    #
+    # Kept here rather than on `rollout` because the page never needs it -- it is written into
+    # the rollout's own log row at grading time, which is the only place it is ever read back.
+    rollout_pending_scene_reset_target: tuple[float, float, float] | None = None
+    rollout_scene_reset_target: tuple[float, float, float] | None = None
     # The calibration probe the browser last asked the arm to visit. The still the runtime
     # writes at that point is only a measurement if it can be matched to the coordinate it was
     # taken at, and this is that end of the match.
@@ -5976,8 +5986,21 @@ def _apply_rollout_output(state: GatewayState, line: str) -> None:
     # its own index. Keyed by that index so a line lost to a truncated log leaves a hole instead
     # of renumbering every span after it.
     takeover = parsed.pop("takeoverDetail", None)
+    grasp_event = parsed.pop("graspLoopEvent", None)
+    if isinstance(grasp_event, dict):
+        status.graspLoop = rollout_backend.apply_grasp_loop_event(status.graspLoop, grasp_event)
     if isinstance(takeover, dict) and "index" in takeover:
         status.lastRolloutTakeovers[int(takeover["index"])] = takeover
+    # The reset's own verdict decides whether the target it sampled becomes the next rollout's
+    # start pose. Promoted on `done`, dropped on `failed` -- and the pending value is cleared
+    # either way, so a second rollout run off one reset inherits nothing.
+    scene_reset_verdict = parsed.pop("sceneResetVerdict", None)
+    if scene_reset_verdict is not None:
+        if scene_reset_verdict == "done":
+            state.rollout_scene_reset_target = state.rollout_pending_scene_reset_target
+        else:
+            state.rollout_scene_reset_target = None
+        state.rollout_pending_scene_reset_target = None
     for key, value in parsed.items():
         if key == "state":
             # A stop the operator already asked for is not undone by a line the runtime wrote
@@ -6357,6 +6380,14 @@ def _request_rollout_scene_reset(state: GatewayState, payload: dict[str, Any]) -
     state.rollout.state = "resetting"
     state.rollout.armAtStart = False
     target = request_payload["targetXyz"]
+    # Taken from the sanitized request, which is where the sampling happened -- the page sends a
+    # painted region, not a point, so this number cannot have come from the browser. Same
+    # provenance rule the geometry and the intervention are recorded under.
+    state.rollout_pending_scene_reset_target = (float(target[0]), float(target[1]), float(target[2]))
+    # The previous start pose stops being true the moment this reset lifts the peg, so it is
+    # dropped here rather than when the new one lands. A reset that then fails leaves the next
+    # rollout with no start pose, which is the truth.
+    state.rollout_scene_reset_target = None
     state.rollout.message = (
         "Scene reset sent: target "
         f"x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f}; lift is 8 cm before transfer."
@@ -6393,12 +6424,30 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
     so a word here is exactly a keypress there.
     """
-    allowed = {"start", "stop", "home", "quit", "takeover"}
+    allowed = {"start", "stop", "home", "quit", "takeover", "grasp_stop", "grasp_continue"}
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("No rollout is running.")
+    if command in ("grasp_stop", "grasp_continue"):
+        # The grasp loop is not interactive -- it runs its own trials -- but it does read two
+        # words on the same pipe: stop at the next trial boundary, and "the peg is back".
+        if state.rollout.mode != "grasp_loop":
+            raise ValueError("That control only applies to the grasp loop.")
+        if command == "grasp_continue" and not state.rollout.graspLoop.get("needsOperator"):
+            raise ValueError("The grasp loop is not waiting for anyone.")
+        word = b"stop\n" if command == "grasp_stop" else b"continue\n"
+        try:
+            process.stdin.write(word)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
+        if command == "grasp_stop":
+            state.rollout.graspLoop = rollout_backend.apply_grasp_loop_event(
+                state.rollout.graspLoop, {"type": "stop_requested"}
+            )
+        return {"ok": True, "rollout": asdict(state.rollout)}
     if not state.rollout.interactive:
         raise ValueError(
             f"{state.rollout.mode} is not an interactive mode; it runs to completion on its own."
@@ -6569,11 +6618,20 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
     for key in ("taskLadder", "stage", "stageId", "blocker", "blockers", "inDistribution"):
         if payload.get(key) is not None:
             record[key] = payload[key]
+    # Where the reset put the peg before this rollout started. Not forwarded from the page for
+    # the same reason `geometry` is not: the browser could otherwise file a grade against a
+    # start pose the arm never produced. Absent when no reset preceded this rollout or when the
+    # reset did not finish -- see `rollout_scene_reset_target`.
+    if state.rollout_scene_reset_target is not None:
+        record["resetTarget"] = list(state.rollout_scene_reset_target)
     try:
         entry = checkpoint_backend.append_rollout_outcome(state.repo_root, record)
     except checkpoint_backend.CheckpointError as error:
         state.log("warn", f"Rejected rollout grade: {error}")
         return {"ok": False, "error": str(error)}
+    # Consumed, not kept. One reset sets up one rollout; leaving it here would give the next
+    # rollout -- run without a reset, from wherever the peg ended up -- this rollout's start pose.
+    state.rollout_scene_reset_target = None
     # Clearing the prompt is what makes it fire once per rollout rather than on every poll.
     state.rollout.pendingOutcomeFor = 0
     graded = f" stage={entry['stage']}" if "stage" in entry else ""
@@ -6812,6 +6870,12 @@ def _unattended_stop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any
 def _unattended_release(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     return _unattended_guard(
         lambda: {"run": unattended_backend.release_brake(state.repo_root, str(body.get("id") or ""))}
+    )
+
+
+def _unattended_continue(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {"run": unattended_backend.request_continue(state.repo_root, str(body.get("id") or ""))}
     )
 
 
@@ -14321,7 +14385,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
             return
-        if path.startswith("/api/rollout/"):
+        # The mask and unattended routes live in this block but are not under /api/rollout/; with
+        # the prefix test alone they were unreachable and answered "Unknown endpoint" -- which is
+        # why the Unattended page could never plan a run and the drawn mask was never stored.
+        if path.startswith(("/api/rollout/", "/api/scene-reset/", "/api/unattended/")):
             state = self.server.state
             body = _read_json_body(self)
             try:
@@ -14352,6 +14419,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/unattended/release-brake":
                     _json_response(self, HTTPStatus.OK, _unattended_release(state, body))
+                    return
+                if path == "/api/unattended/continue":
+                    _json_response(self, HTTPStatus.OK, _unattended_continue(state, body))
                     return
                 if path == "/api/rollout/scene-reset":
                     with state.lock:

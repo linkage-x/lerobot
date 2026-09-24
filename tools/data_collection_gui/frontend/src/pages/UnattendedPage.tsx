@@ -4,6 +4,7 @@ import type { UnattendedKind, UnattendedListEntry, UnattendedPlan, UnattendedRun
 import { PageHeader, StatusDot } from "../shared/ui";
 import {
   VERDICT_COLORS,
+  envelopeReadout,
   mapPoints,
   outcomeLabel,
   projectRows,
@@ -56,6 +57,19 @@ const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
     searchRingM: "0",
     maxSeconds: "7200"
   },
+  grasp_envelope: {
+    start: "fixture",
+    spot: "0.4331,-0.1667",
+    xyOffsetsMm: "-12,-8,-4,0,4,8,12",
+    xyDzMm: "-6",
+    dzOffsetsMm: "-12,-8,-4,0,4,8,14,20,28",
+    centreRepeats: "5",
+    extraPointsMm: "",
+    repeats: "1",
+    seed: "0",
+    resumeFrom: "",
+    maxSeconds: "0"
+  },
   auto_collect: {
     cycles: "50",
     seed: "0",
@@ -71,7 +85,14 @@ const FIELD_HELP: Record<string, string> = {
   searchRingM: "0 measures the bare capture radius, which is the number the 7 mm ring was sized against. Turning the ring on measures the ring instead.",
   controlEvery: "A reference trial every N offset trials. Each one is a hole reading; you want at least 8 over the run.",
   recoveryFraction: "Fraction of cycles that start from a displaced pose. 0 is the acceptance run.",
-  maxSeconds: "0 runs the whole schedule. A budget is cheaper than discovering the rate at 3 a.m."
+  maxSeconds: "0 runs the whole schedule. A budget is cheaper than discovering the rate at 3 a.m.",
+  start: "fixture: the peg is in the pick fixture and the reset stages it at the spot. spot: it is already standing at the spot (every run leaves it there).",
+  spot: "x,y of the standing peg. Default is the median of the 38 reset targets of 09-22, where rollouts actually grasp.",
+  xyOffsetsMm: "XY grid, mm, swept at xyDzMm. 7 values = 49 trials.",
+  xyDzMm: "Relative grasp height of the XY grid. 0 = the reset's own grip (TCP 0.058); the demonstrations close at -6.6.",
+  dzOffsetsMm: "Height column at dx=dy=0, mm relative to the reset's grip. Floor is TCP 0.044.",
+  extraPointsMm: "Fine scan after the coarse pass: 'dx,dy,dz; dx,dy,dz' in mm.",
+  resumeFrom: "Run id of a halted envelope run with the same plan; its finished trials are skipped."
 };
 
 export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
@@ -254,6 +275,42 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
             <p style={{ margin: "0 0 10px" }}>
               <StatusDot state={run.state} /> <strong>{run.state}</strong> — {outcomeLabel(run)}
             </p>
+            {run.needsOperator ? (
+              <div
+                style={{
+                  display: "flex",
+                  gap: 12,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  background: "rgba(214, 158, 46, 0.18)",
+                  border: "1px solid #d69e2e",
+                  borderRadius: 6,
+                  padding: "8px 12px",
+                  marginBottom: 10
+                }}
+              >
+                <span>
+                  <strong>需要你：</strong>
+                  {run.needsOperator}。把销插回取销夹具，手离开工作区后点继续。
+                </span>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void guard("continue", () => api.continueUnattendedRun(run.id))}
+                >
+                  已放回，继续
+                </button>
+              </div>
+            ) : null}
+            {envelopeReadout(run.summary).length ? (
+              <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 10, fontSize: 13 }}>
+                {envelopeReadout(run.summary).map(([label, value]) => (
+                  <span key={label}>
+                    <span style={{ opacity: 0.7 }}>{label}</span> <strong>{value}</strong>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {health?.divergence ? (
               // The single most valuable line on the page, and the one a combined status light
               // cannot produce.
@@ -272,6 +329,22 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
             <p style={{ fontSize: 12, opacity: 0.75, margin: "0 0 12px" }}>
               rows land in <code>{run.dir}</code> · log <code>{run.logPath}</code>
             </p>
+            {run.logTail && run.logTail.length > 0 ? (
+              <pre
+                style={{
+                  fontSize: 11,
+                  maxHeight: 220,
+                  overflow: "auto",
+                  background: "rgba(229, 62, 62, 0.08)",
+                  border: "1px solid #e53e3e",
+                  padding: 8,
+                  margin: "0 0 12px",
+                  whiteSpace: "pre-wrap"
+                }}
+              >
+                {run.logTail.join("\n")}
+              </pre>
+            ) : null}
             <RunMap points={points} />
             <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "10px 0" }}>
               {counts.map(([verdict, count]) => (
@@ -354,7 +427,7 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
             </button>
           </div>
           <p style={{ fontSize: 12, opacity: 0.7, marginBottom: 0 }}>
-            The boundary stop finishes the {run.kind === "terminal_trials" ? "trial" : "cycle"} in
+            The boundary stop finishes the {run.kind === "auto_collect" ? "cycle" : "trial"} in
             flight and parks holding the peg, so the next run starts from a state the loop expects.
             Halting now does not.
           </p>

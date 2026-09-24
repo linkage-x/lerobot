@@ -113,6 +113,20 @@ from tools.fr3.scene_reset import (
     pose_probe_request_from_payload,
     scene_reset_request_from_payload,
 )
+from tools.fr3.grasp_loop import (
+    GRASP_LOOP_ARMS,
+    GRASP_LOOP_HELD_WIDTH,
+    GRASP_LOOP_MAX_POLICY_STEPS,
+    GRASP_LOOP_PICK_XYZ,
+    GRASP_LOOP_TARGET_Z,
+    GraspHandover,
+    GraspLoopControl,
+    GraspLoopRequest,
+    load_mask_strokes,
+    run_grasp_loop,
+    validate_grasp_loop_request,
+)
+from tools.fr3.collection_recorder import StopFile
 from tools.fr3.terminal_servo import (
     TERMINAL_SERVO_SEARCH_POINTS,
     TerminalServoError,
@@ -207,7 +221,10 @@ _RTC_POLICY_TYPES = {'pi0', 'pi05', 'pi0_fast', 'smolvla'}
 _DEFAULT_RTC_EXECUTION_HORIZON = 16
 _DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 10.0
 _DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE = RTCAttentionSchedule.EXP
-_DEFAULT_RTC_REPLAN_QUEUE_SIZE = 25
+# 50 - 34 = 16 executed steps, equal to the execution horizon, so RTC guides every step the
+# queue runs. 25 left steps 17-25 of each chunk executed blind (roadmap v12 (7)-(8)); 39 and
+# above are latency-locked at ~11 steps and the window stops being what was set.
+_DEFAULT_RTC_REPLAN_QUEUE_SIZE = 34
 _JOINT_NAMES = [
     'fr3_joint1',
     'fr3_joint2',
@@ -404,8 +421,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            'Steps of each draw compared when selecting among them. 0 (default) uses the RTC '
-            'execution horizon, i.e. the steps that will actually run before the next replan.'
+            'Steps of each draw compared when selecting among them. 0 (default) uses the steps '
+            'that will actually run before the next replan, which the queue sets at '
+            'chunk_size - --rtc-replan-queue-size (50 - 34 = 16 by default). This is NOT the '
+            'RTC execution horizon, which it used to default to; that is the guidance schedule '
+            'and on this rig it is 16.'
         ),
     )
     parser.add_argument(
@@ -417,6 +437,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             'release. Off by default. The demonstrations that let go at the seated depth mean '
             '0.3599,-0.1333,0.0523, and scatter a median 3.5 mm about it against a 2.5 mm '
             'radial clearance -- which is the prediction this is run to refute.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-trials',
+        type=int,
+        default=0,
+        help=(
+            'Card 12. Instead of rollouts, run this many grasp-only trials: the scene reset places '
+            'the peg, the policy runs until its gripper command has stayed closed for a third of a '
+            'second, then a scripted 3 cm lift grades the grasp by measured width. Held pegs are '
+            'carried straight to the next target, empty ones re-picked where they were placed. '
+            'Needs --grasp-loop-mask and --grasp-loop-out. 0 (default) is off.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-mask',
+        default='',
+        help=(
+            'Where pegs are placed: the gateway\'s scene_reset_mask.json, or a rollout_log.jsonl '
+            'whose recorded resetTargets are rebuilt into the mask they were drawn from.'
+        ),
+    )
+    parser.add_argument('--grasp-loop-out', default='', help='JSONL the trials are appended to; a rerun resumes it.')
+    parser.add_argument(
+        '--grasp-loop-pick-pose',
+        default=','.join(f'{v:.4f}' for v in GRASP_LOOP_PICK_XYZ),
+        help='Where the peg starts, and where a person puts it back: the scene reset\'s fixture pose.',
+    )
+    parser.add_argument('--grasp-loop-target-z', type=float, default=GRASP_LOOP_TARGET_Z)
+    parser.add_argument('--grasp-loop-held-width', type=float, default=GRASP_LOOP_HELD_WIDTH)
+    parser.add_argument('--grasp-loop-max-policy-steps', type=int, default=GRASP_LOOP_MAX_POLICY_STEPS)
+    parser.add_argument('--grasp-loop-seed', type=int, default=0)
+    parser.add_argument(
+        '--grasp-loop-arms',
+        choices=GRASP_LOOP_ARMS,
+        default='A',
+        help=(
+            'Roadmap v14 step 2. A: the pure policy grasps. B: the policy approaches and the GT '
+            'grasp funnel (tools/fr3/grasp_funnel.py) aligns over the placed peg, descends to '
+            'dz -6 mm and closes. AB: both, interleaved in randomised pairs.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-attended',
+        action='store_true',
+        help=(
+            'A person is at the rig: when the peg is lost, wait for Enter after it is put back in '
+            'the fixture. Without this the run halts there, which is what an empty room needs.'
         ),
     )
     parser.add_argument(
@@ -4189,6 +4257,27 @@ def build_dagger_action_encoder(
     return encode_delta, denormalize_gripper
 
 
+def resolve_policy_device(requested: str | None, cuda_available: bool) -> torch.device:
+    """The policy's device; refuse to start rather than fall back to CPU unless CPU was asked for.
+
+    On CPU a chunked policy cannot keep up with the control rate: the arm moves a few dozen
+    leash-limited steps and then halts on a starved queue (2026-09-24, after unattended-upgrades
+    left the NVIDIA libs newer than the loaded kernel module).
+    """
+    if requested:
+        device = torch.device(requested)
+        if device.type == 'cuda' and not cuda_available:
+            raise RuntimeError(f'--device {requested} requested but CUDA is not available; check nvidia-smi')
+        return device
+    if not cuda_available:
+        raise RuntimeError(
+            'CUDA is not available, refusing to run the policy on CPU. Check nvidia-smi: '
+            '"Driver/library version mismatch" means the NVIDIA libs were upgraded under the loaded '
+            'kernel module and the machine needs a reboot. Pass --device cpu to run on CPU anyway.'
+        )
+    return torch.device('cuda')
+
+
 def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_prompt: str | None) -> str | None:
     if explicit_task_prompt is not None and str(explicit_task_prompt).strip():
         return str(explicit_task_prompt).strip()
@@ -4207,20 +4296,57 @@ def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_p
         )
     return None
 
-def action_chunk_lateral_displacements(
-    chunks: torch.Tensor, *, lateral_indices: tuple[int, int], horizon: int
-) -> torch.Tensor:
-    """Each draw's net XY displacement over the steps that will actually be executed.
+def resolve_action_selection_horizon(
+    requested_horizon: int, *, chunk_size: int, replan_queue_size: int
+) -> int:
+    """How many steps of a drawn chunk the robot will actually run. Resolved before anything runs.
 
-    Measured over the execution horizon rather than the whole chunk because the tail of a chunk
-    is replanned before it is ever sent, so a draw that disagrees only after step ten disagrees
-    about nothing.
+    `--action-sample-horizon 0` used to fall back to `--rtc-execution-horizon`, on the stated
+    ground that the two are the same number. They are not, and nothing ever made them agree. The
+    execution horizon is RTC's guidance schedule; the steps that reach the robot are set by the
+    queue, which replans at `qsize <= replan_queue_size` and so consumes exactly
+    `chunk_size - replan_queue_size` steps of each chunk before the next one replaces it. On the
+    deployed configuration that is 50 - 25 = 25 against an execution horizon of 16 -- the old
+    default scored 16 of a 25-step run and let the robot finish the rest unscored.
+
+    A positive `requested_horizon` is honoured as given and only clamped to the chunk: it is an
+    experimental override, and an override that silently became something else would be worse
+    than the conflation this replaces.
     """
-    steps = max(1, min(int(horizon), int(chunks.shape[1])))
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive to size an action-selection window.")
+    requested = int(requested_horizon)
+    if requested > 0:
+        return min(requested, chunk_size)
+    return max(1, chunk_size - max(int(replan_queue_size), 0))
+
+
+def action_chunk_lateral_displacements(
+    chunks: torch.Tensor, *, lateral_indices: tuple[int, int], horizon: int, offset: int = 0
+) -> torch.Tensor:
+    """Each draw's net XY displacement over the steps of it that will actually reach the robot.
+
+    That slice is `[offset, offset + horizon)` and neither end is free. `ActionQueue` in RTC mode
+    *replaces* the queue with `processed_actions[real_delay:]`, so the first `real_delay` steps of
+    a chunk are discarded -- they cover the time inference took, which the previous chunk was
+    still driving. Replanning then fires at `qsize <= replan_queue_size`, leaving
+    `chunk_size - replan_queue_size` steps of this chunk executed before the next one replaces it.
+
+    Scoring from index 0 instead is not a near-miss. The discarded prefix is exactly the part RTC
+    pins to the previous chunk's leftover, so it is near-identical across draws: including it adds
+    the same common-mode vector to every draw, shrinking the angular differences the medoid exists
+    to rank, while the executed tail it displaces gets no vote at all.
+    """
+    length = int(chunks.shape[1])
+    # One step stays scorable even if the delay estimate swallowed the chunk -- the same rule
+    # `_clamp_rtc_delay_steps` applies to the merge whose slice this window is mirroring.
+    start = max(0, min(int(offset), length - 1))
+    stop = min(start + max(1, int(horizon)), length)
     return torch.stack(
         (
-            chunks[:, :steps, lateral_indices[0]].sum(dim=1),
-            chunks[:, :steps, lateral_indices[1]].sum(dim=1),
+            chunks[:, start:stop, lateral_indices[0]].sum(dim=1),
+            chunks[:, start:stop, lateral_indices[1]].sum(dim=1),
         ),
         dim=1,
     )
@@ -4231,6 +4357,7 @@ def select_action_chunk_medoid(
     *,
     lateral_indices: tuple[int, int],
     horizon: int,
+    offset: int = 0,
     min_lateral_m: float = 1e-5,
 ) -> int:
     """Which of N sampled chunks to execute: the real draw nearest the draws' mean direction.
@@ -4250,7 +4377,9 @@ def select_action_chunk_medoid(
     displacement worth calling a direction: at the top of a descent every draw is legitimately
     near-zero, and choosing by the angle of numerical noise would be worse than not choosing.
     """
-    vectors = action_chunk_lateral_displacements(chunks, lateral_indices=lateral_indices, horizon=horizon)
+    vectors = action_chunk_lateral_displacements(
+        chunks, lateral_indices=lateral_indices, horizon=horizon, offset=offset
+    )
     magnitudes = torch.linalg.vector_norm(vectors.to(torch.float32), dim=1)
     usable = torch.nonzero(magnitudes >= float(min_lateral_m), as_tuple=False).flatten()
     if int(usable.numel()) < 2:
@@ -4301,6 +4430,7 @@ def predict_action_chunk_for_rollout(
     lateral_action_indices: tuple[int, int] | None = None,
     gripper_action_index: int | None = None,
     action_sample_horizon: int = 0,
+    action_sample_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Predict one action chunk for a queue-driven rollout.
 
@@ -4311,11 +4441,23 @@ def predict_action_chunk_for_rollout(
     With ``action_samples > 1`` the observation is drawn N times in one batched forward and one
     chunk is chosen -- see `select_action_chunk_medoid`. Both tensors then describe the *same*
     choice, so RTC's prefix on the next inference is the chunk the arm actually executed.
+
+    ``action_sample_horizon`` and ``action_sample_offset`` are the caller's to resolve, and there
+    is no fallback here on purpose. They describe the slice of the chunk the *queue* will run, so
+    only the caller -- which knows the chunk size, the replan threshold and which merge path this
+    prediction is headed for -- can size them. This function used to fill a missing horizon in
+    from ``execution_horizon``, which is a different quantity and was wrong by 9 steps on the
+    deployed configuration; a loud refusal is the point of removing it.
     """
     observation = dict(observation)
     samples = max(1, int(action_samples))
     if samples > 1 and lateral_action_indices is None:
         raise ValueError('action_samples > 1 needs lateral_action_indices to choose among the draws.')
+    if samples > 1 and int(action_sample_horizon) <= 0:
+        raise ValueError(
+            'action_samples > 1 needs a resolved action_sample_horizon. Call '
+            'resolve_action_selection_horizon(); it is not the RTC execution horizon.'
+        )
     with (
         torch.no_grad(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
@@ -4344,9 +4486,11 @@ def predict_action_chunk_for_rollout(
             original_actions = actions.squeeze(0).detach().clone()
             processed_actions = processed.squeeze(0).detach().cpu().clone()
         else:
-            horizon = int(action_sample_horizon) or int(execution_horizon)
             chosen = select_action_chunk_medoid(
-                processed, lateral_indices=lateral_action_indices, horizon=horizon
+                processed,
+                lateral_indices=lateral_action_indices,
+                horizon=int(action_sample_horizon),
+                offset=int(action_sample_offset),
             )
             original_actions = actions[chosen].detach().clone()
             processed_actions = processed[chosen].detach().cpu().clone()
@@ -4645,7 +4789,7 @@ def run_inference(args: argparse.Namespace) -> int:
     )
     camera_configs = load_camera_configs(args.camera_config)
     camera_crop_specs, camera_crop_source_hw = load_camera_crop_specs(dataset_root)
-    device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+    device = resolve_policy_device(args.device, torch.cuda.is_available())
 
     policy, preprocessor, postprocessor = load_policy_stack(
         pretrained_dir,
@@ -4707,22 +4851,64 @@ def run_inference(args: argparse.Namespace) -> int:
             f'draws, and this action contract has none: {action_names}. Run with '
             '--action-samples 1, or point at a delta-EE view.'
         )
+    if action_samples > 1 and not rtc_enabled:
+        raise SystemExit(
+            f'--action-samples {action_samples} only has an effect on the RTC chunk path, and RTC '
+            'is disabled for this run. Without it the runtime predicts one action per step and '
+            'never selects among draws, so this would have recorded itself as a sampling arm '
+            'while behaving exactly like --action-samples 1.'
+        )
+    # Resolved here, once, and passed down. Both call sites used to re-derive it from
+    # `args.action_sample_horizon or args.rtc_execution_horizon`, and the line below printed a
+    # third copy -- three places that could disagree about the number the log then records as the
+    # arm's identity. Announced for every arm, including the N=1 control that selects nothing,
+    # because it is the executed-run length: the quantity that has to be equal across the three
+    # arms for their comparison to mean anything.
+    policy_chunk_size = int(getattr(policy.config, 'chunk_size', 0) or 0)
+    action_sample_horizon = (
+        resolve_action_selection_horizon(
+            int(args.action_sample_horizon),
+            chunk_size=policy_chunk_size,
+            replan_queue_size=rtc_replan_queue_size,
+        )
+        if rtc_enabled and policy_chunk_size > 0
+        else 0
+    )
     # Announced whether or not the sampling is on, which it was not until 2026-09-20. E3 is a
     # three-arm comparison and `--action-samples 1` is its control arm, so a run that prints
     # nothing is the arm whose rollouts cannot afterwards be told from any other run's. Silence
     # is not a record of the default; it is a record of a runtime too old to have the field.
     print(
-        '[INFO] action_samples=%d aggregate=%s selection_horizon=%s lateral=%s gripper=%s'
+        '[INFO] action_samples=%d aggregate=%s selection_horizon=%s selection_offset=%s '
+        'lateral=%s gripper=%s'
         % (
             action_samples,
             args.action_aggregate,
-            int(args.action_sample_horizon) or int(args.rtc_execution_horizon),
+            action_sample_horizon,
+            'auto'
+            if args.rtc_inference_delay_steps is None
+            else int(args.rtc_inference_delay_steps),
             None
             if lateral_action_indices is None
             else [action_names[i] for i in lateral_action_indices],
             None if gripper_action_index is None else action_names[gripper_action_index],
         )
     )
+    # Not changed here, only made visible. RTC's guidance schedule decays over
+    # `execution_horizon` steps, while the queue actually runs `chunk_size - replan_queue_size` of
+    # them; 16 against 25 as deployed. Correcting it would change how every chunk is guided, which
+    # is a different arm from the one being compared -- so it is the operator's call, taken with
+    # the number in front of them rather than after the fact.
+    if rtc_enabled and policy_chunk_size > 0:
+        executed_steps = max(1, policy_chunk_size - int(rtc_replan_queue_size))
+        if int(args.rtc_execution_horizon) != executed_steps:
+            print(
+                '[WARN] rtc_execution_horizon_vs_executed_steps '
+                f'execution_horizon={int(args.rtc_execution_horizon)} '
+                f'executed_steps={executed_steps} '
+                f'(chunk_size={policy_chunk_size} - replan_queue_size={int(rtc_replan_queue_size)}); '
+                'RTC guides over a different span than the queue runs. Unchanged by design.'
+            )
     # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
     # is a startup error, not something discovered with a peg in the gripper 12 cm above the
     # fixture. The reach check is not run yet -- it needs the arm -- so this is the deterministic
@@ -4747,6 +4933,41 @@ def run_inference(args: argparse.Namespace) -> int:
             % (*terminal_servo_request.xyz, terminal_servo_request.handoffZ,
                terminal_servo_request.maxSpeedMs, terminal_servo_request.searchRingM,
                len(terminal_servo_search_offsets(terminal_servo_request)))
+        )
+    # Built before the arm connects for the same reason as the servo request: a mask that does not
+    # load or lies outside the fence is a startup error, not a halt after the first reset.
+    grasp_loop_request: GraspLoopRequest | None = None
+    grasp_loop_out = Path(args.grasp_loop_out).expanduser() if args.grasp_loop_out else Path()
+    if int(args.grasp_loop_trials) > 0:
+        if args.interactive_rollouts or args.dagger_takeover or terminal_servo_request is not None:
+            raise SystemExit(
+                '--grasp-loop-trials runs on its own: drop --interactive-rollouts, '
+                '--dagger-takeover and --terminal-servo-pose.'
+            )
+        if not args.grasp_loop_mask or not args.grasp_loop_out:
+            raise SystemExit('--grasp-loop-trials needs --grasp-loop-mask and --grasp-loop-out.')
+        try:
+            grasp_loop_request = GraspLoopRequest(
+                pickXyz=parse_terminal_servo_pose(args.grasp_loop_pick_pose),
+                targetZ=float(args.grasp_loop_target_z),
+                strokes=load_mask_strokes(args.grasp_loop_mask),
+                trials=int(args.grasp_loop_trials),
+                heldWidth=float(args.grasp_loop_held_width),
+                maxPolicySteps=int(args.grasp_loop_max_policy_steps),
+                attended=bool(args.grasp_loop_attended),
+                seed=int(args.grasp_loop_seed),
+                arms=str(args.grasp_loop_arms),
+                controlPeriodS=1.0 / policy_fps,
+            )
+            validate_grasp_loop_request(grasp_loop_request)
+        except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
+            raise SystemExit(f'--grasp-loop-* is not usable: {exc}') from exc
+        print(
+            f'[INFO] grasp_loop=configured trials={grasp_loop_request.trials} '
+            f'strokes={len(grasp_loop_request.strokes)} held_width={grasp_loop_request.heldWidth:.3f} '
+            f'max_policy_steps={grasp_loop_request.maxPolicySteps} '
+            f'attended={grasp_loop_request.attended} '
+            f'arms={grasp_loop_request.arms} out={grasp_loop_out}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
@@ -4807,6 +5028,11 @@ def run_inference(args: argparse.Namespace) -> int:
         f'max=({workspace_max[0]:.3f}, {workspace_max[1]:.3f}, {workspace_max[2]:.3f}) '
         f'source={workspace_fence_source}'
     )
+    if grasp_loop_request is not None:
+        try:
+            validate_grasp_loop_request(grasp_loop_request, workspace_min=workspace_min, workspace_max=workspace_max)
+        except SceneResetError as exc:
+            raise SystemExit(f'--grasp-loop-mask does not fit the workspace fence: {exc}') from exc
 
     tactile_fallback_observation = build_tactile_fallback_observation(args.tactile_fallback)
     tactile_enabled = bool(required_tactile_keys) and tactile_fallback_observation is None
@@ -5114,6 +5340,7 @@ def run_inference(args: argparse.Namespace) -> int:
         trace: RolloutGeometryTrace | None = None,
         expert_takeover: ExpertTakeover | None = None,
         dagger_buffer: DaggerFrameBuffer | None = None,
+        grasp_handover: GraspHandover | None = None,
     ) -> str:
         reset_policy_runtime_state()
         T_B_Ws: np.ndarray | None = None
@@ -5183,6 +5410,21 @@ def run_inference(args: argparse.Namespace) -> int:
                     return finish_rollout(
                         'terminal_servo_ok' if servo_result.get('ok') else 'terminal_servo_failed'
                     )
+            if grasp_handover is not None:
+                # The grasp loop's segment ends at the grasp: the lift that grades it is scripted,
+                # so nothing the policy does after a settled close is part of the measurement.
+                if grasp_handover.observe(
+                    step_idx,
+                    tuple(float(robot_observation[key]) for key in ('ee.x', 'ee.y', 'ee.z')),
+                    float(previous_sent_command['gripper.pos']) if previous_sent_command is not None else 1.0,
+                ):
+                    print(
+                        f'[INFO] grasp_handover step={step_idx} close_step={grasp_handover.closeStep} '
+                        f'close_z={grasp_handover.closeXyz[2]:.4f}'
+                    )
+                    return finish_rollout('grasp_handover')
+                if grasp_handover.timed_out(step_idx):
+                    return finish_rollout('grasp_timeout')
             previous_tracking_position_delta: np.ndarray | None = None
             previous_tracking_rotation_delta: np.ndarray | None = None
             if previous_sent_command is not None:
@@ -5380,7 +5622,11 @@ def run_inference(args: argparse.Namespace) -> int:
                             action_aggregate=str(args.action_aggregate),
                             lateral_action_indices=lateral_action_indices,
                             gripper_action_index=gripper_action_index,
-                            action_sample_horizon=int(args.action_sample_horizon),
+                            action_sample_horizon=action_sample_horizon,
+                            # This path merges with `real_delay=0` -- nothing is consumed while
+                            # the main thread blocks here -- so the chunk runs from its own
+                            # first step and the window starts there.
+                            action_sample_offset=0,
                         )
                         chunk_latency_s = time.perf_counter() - chunk_start_t
                         latency_tracker.add(chunk_latency_s)
@@ -5437,7 +5683,12 @@ def run_inference(args: argparse.Namespace) -> int:
                                 'action_aggregate': str(args.action_aggregate),
                                 'lateral_action_indices': lateral_action_indices,
                                 'gripper_action_index': gripper_action_index,
-                                'action_sample_horizon': int(args.action_sample_horizon),
+                                'action_sample_horizon': action_sample_horizon,
+                                # `merge_completed_rtc_plan` will drop this many steps off the
+                                # front of the returned chunk: they cover the inference the
+                                # previous chunk drove through. They never reach the robot, so
+                                # they get no vote in which draw is executed.
+                                'action_sample_offset': guidance_delay_steps,
                             },
                             action_index_before_inference=action_queue.get_action_index(),
                             guidance_delay_steps=guidance_delay_steps,
@@ -5546,6 +5797,23 @@ def run_inference(args: argparse.Namespace) -> int:
                     # is an instruction, not a stall -- and an offset accumulated during a
                     # correction would be re-applied to a policy that has since been handed an
                     # arm somewhere else entirely.
+                    place_assist_state['stuck_count'] = 0
+                    place_assist_state['offset_xyz_m'] = np.zeros(3, dtype=np.float64)
+                    temporal_offset_state['stuck_count'] = 0
+
+            if grasp_handover is not None and grasp_handover.funnel is not None:
+                # Arm B. Every step goes through the funnel, so its record pairs what the policy
+                # asked for with what ran from the first step on; it only changes the command
+                # once the arm is near the peg, and it always withholds the policy's close.
+                robot_command = grasp_handover.funnel.step(
+                    step_idx,
+                    tuple(float(robot_observation[key]) for key in ('ee.x', 'ee.y', 'ee.z')),
+                    tuple(float(robot_observation[key]) for key in ('ee.wx', 'ee.wy', 'ee.wz')),
+                    robot_command,
+                    policy_gripper_raw=float(model_gripper_raw),
+                )
+                if grasp_handover.funnel.active:
+                    command_source = 'funnel'
                     place_assist_state['stuck_count'] = 0
                     place_assist_state['offset_xyz_m'] = np.zeros(3, dtype=np.float64)
                     temporal_offset_state['stuck_count'] = 0
@@ -5782,7 +6050,15 @@ def run_inference(args: argparse.Namespace) -> int:
                         f" prev_cmd_err_mm={np.linalg.norm(previous_tracking_position_delta) * 1000.0:.2f} "
                         f"prev_cmd_err_rot_deg={np.linalg.norm(np.rad2deg(previous_tracking_rotation_delta)):.2f}"
                     )
-                if command_source != 'policy':
+                if command_source == 'funnel' and grasp_handover is not None and grasp_handover.funnel is not None:
+                    # Arm B's steps: `takeover_debug` below exists only when a SpaceMouse does.
+                    funnel_step = grasp_handover.funnel.steps[-1]
+                    log_message += (
+                        f" source=funnel funnel_state={funnel_step['funnel_state']}"
+                        f" xy_error_mm={funnel_step['xy_error_mm']:.1f}"
+                        f" funnel_transition={funnel_step['transition_reason'] or '-'}"
+                    )
+                elif command_source != 'policy':
                     log_message += (
                         f" source={command_source} takeover={takeover_debug.get('status', '')}"
                         f" takeover_gripper={int(bool(takeover_debug.get('gripper_owned')))}"
@@ -5995,6 +6271,31 @@ def run_inference(args: argparse.Namespace) -> int:
                 if rollout_status == 'quit':
                     break
             print('[INFO] interactive_rollouts=stopped')
+        elif grasp_loop_request is not None:
+            stop_file = StopFile(grasp_loop_out.with_suffix('.STOP'))
+            stop_file.clear()
+            control = GraspLoopControl(sys.stdin)
+            control.start()
+            print(
+                f'[INFO] grasp_loop=brakes boundary_stop=`touch {stop_file.path}` or stdin `stop` '
+                'immediate_halt=SIGINT'
+            )
+
+            def run_grasp_trial(trial: int, handover: GraspHandover) -> str:
+                move_to_robot_init_state_if_requested(robot, robot_init_state)
+                trace = RolloutGeometryTrace(trial + 1, trace_dir=rollout_trace_dir)
+                status = run_policy_rollout(trace=trace, grasp_handover=handover)
+                trace.write()
+                return status
+
+            run_grasp_loop(
+                robot,
+                grasp_loop_request,
+                run_policy_trial=run_grasp_trial,
+                out_path=grasp_loop_out,
+                stop_requested=lambda: stop_file.requested() or control.stop_requested(),
+                wait_for_operator=control.wait_for_operator if args.grasp_loop_attended else None,
+            )
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)
             run_policy_rollout()

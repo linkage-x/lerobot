@@ -11,6 +11,7 @@ what follows checks that those cases are *refused*, not that the happy path work
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -3454,6 +3455,39 @@ def test_the_control_arm_announces_itself_too():
     }
 
 
+def test_the_default_offset_rule_files_no_number_because_it_has_none():
+    """`auto` means the offset is the steps actually consumed during inference, re-derived at
+    every replan. Filing that as 0 would name a real fixed offset -- a different arm."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] action_samples=8 aggregate=medoid selection_horizon=25 selection_offset=auto "
+        "lateral=None gripper=None"
+    )
+
+    assert parsed["policyArm"] == {
+        "actionSamples": 8,
+        "actionAggregate": "medoid",
+        "selectionHorizon": 25,
+    }
+
+
+def test_a_pinned_inference_delay_is_recorded_because_it_is_a_chosen_arm():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] action_samples=8 aggregate=medoid selection_horizon=25 selection_offset=10 "
+        "lateral=None gripper=None"
+    )
+
+    assert parsed["policyArm"]["selectionOffsetSteps"] == 10
+
+
+def test_the_announced_window_is_what_the_page_says_the_arm_scored_over():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] action_samples=8 aggregate=medoid selection_horizon=25 selection_offset=auto "
+        "lateral=None gripper=None"
+    )
+
+    assert "over 25 steps" in parsed["message"]
+
+
 def test_the_terminal_descent_reaches_the_page_as_fields_not_as_a_sentence():
     parsed = rollout_backend.parse_rollout_line(_DONE_LINE)
 
@@ -3531,6 +3565,53 @@ def test_the_arm_on_a_grade_comes_from_the_runtime_not_from_the_page(tmp_path: P
     # Both halves of the configuration, because no rollout can have run one without the other.
     assert entry["arm"]["terminalServoSearchLandings"] == 9
     assert entry["arm"]["terminalServoXyz"] == [0.3599, -0.1333, 0.0523]
+
+
+def test_the_selection_window_survives_the_arm_whitelist_because_the_audit_refuses_on_it(
+    tmp_path: Path,
+):
+    """`_sanitize_rollout_arm` keeps a fixed list of fields, and the E3 confound audit blocks a
+    verdict when the window moves mid-comparison. A field dropped here does not read as a warning
+    downstream -- it reads as `(absent)` for every rollout, which is the one value that looks like
+    the window never moved. The whitelist would turn the refusal into a silent yes.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        step=214,
+        pendingOutcomeFor=1,
+        policyArm={
+            "actionSamples": 8,
+            "actionAggregate": "medoid",
+            "selectionHorizon": 25,
+            "selectionOffsetSteps": 10,
+        },
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "success"})["entry"]
+
+    assert entry["arm"]["selectionHorizon"] == 25
+    assert entry["arm"]["selectionOffsetSteps"] == 10
+
+
+def test_an_unpinned_offset_files_no_field_rather_than_a_zero(tmp_path: Path):
+    """`auto` is the default rule, not the offset 0: the window starts at however many steps the
+    inference actually consumed, re-derived at every replan. Filing 0 would name a real pinned
+    arm, and the audit would pool it with runs that pinned nothing.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        step=214,
+        pendingOutcomeFor=1,
+        policyArm={"actionSamples": 8, "actionAggregate": "medoid", "selectionHorizon": 25},
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "success"})["entry"]
+
+    assert "selectionOffsetSteps" not in entry["arm"]
 
 
 def test_the_rigs_verdict_and_the_operators_grade_stay_two_columns(tmp_path: Path):
@@ -3754,3 +3835,251 @@ def test_an_assisted_rollout_that_reached_the_end_is_not_flagged(tmp_path: Path)
 
     assert "takeoverBlockerMismatch" not in entry
 
+
+
+def _reset_request() -> dict[str, object]:
+    """A reset whose painted region is one small disc, so the sampled point is known to ~3 cm."""
+    return {
+        "pickXyz": [0.3599, -0.1333, 0.0542],
+        "targetZ": 0.058,
+        "liftM": 0.08,
+        "approachClearanceM": 0.08,
+        "mask": {"strokes": [{"x": 0.44, "y": -0.12, "radiusM": 0.03}]},
+    }
+
+
+def _armed_rollout_state(tmp_path: Path) -> tuple[gateway.GatewayState, "_StdinProcess"]:
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        state="waiting",
+        interactive=True,
+        cameraKeys=["side"],
+        checkpointId="job_a/020000",
+        mode="real",
+        pendingOutcomeFor=1,
+    )
+    process = _StdinProcess()
+    state.rollout_process = process
+    return state, process
+
+
+def test_the_peg_start_pose_the_reset_sampled_is_filed_with_the_rollout_it_set_up(tmp_path: Path):
+    """The only record of where the peg started.
+
+    `geometry.graspXyz` is where the fingers closed, and on a rollout that closed on air or
+    pushed the peg over that is not where the peg was -- which is exactly the rollout whose
+    start pose decides whether the offset has a direction. The page cannot supply it (it sends a
+    painted region, not a point), so the gateway files the number it sampled itself.
+    """
+    state, _process = _armed_rollout_state(tmp_path)
+
+    sent = gateway._request_rollout_scene_reset(state, _reset_request())["sceneReset"]
+    gateway._apply_rollout_output(state, "[INFO] scene_reset=done request_id=abc")
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+
+    assert entry["resetTarget"] == [round(float(v), 5) for v in sent["targetXyz"]]
+    # Inside the painted disc, which is the only thing the caller asked for.
+    assert math.hypot(entry["resetTarget"][0] - 0.44, entry["resetTarget"][1] + 0.12) <= 0.03 + 1e-9
+
+
+def test_a_reset_that_failed_leaves_the_next_rollout_without_a_start_pose(tmp_path: Path):
+    """A commanded target is not a start pose. The place step can fail with the peg still in the
+    gripper, and filing the sample anyway would name a coordinate the peg never occupied --
+    silently, since nothing downstream could tell it from a real one.
+    """
+    state, _process = _armed_rollout_state(tmp_path)
+
+    gateway._request_rollout_scene_reset(state, _reset_request())
+    gateway._apply_rollout_output(
+        state, "[WARN] scene_reset=failed request_id=abc details=trajectory_qc_failed: unreachable"
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+
+    assert "resetTarget" not in entry
+
+
+def test_a_commanded_reset_is_not_filed_until_the_runtime_says_the_peg_got_there(tmp_path: Path):
+    """The gap between the two is a whole transfer. A rollout graded inside it has no start pose."""
+    state, _process = _armed_rollout_state(tmp_path)
+
+    gateway._request_rollout_scene_reset(state, _reset_request())
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "aborted"})["entry"]
+
+    assert "resetTarget" not in entry
+
+
+def test_one_reset_sets_up_one_rollout(tmp_path: Path):
+    """The second rollout of a pair run off a single reset starts from wherever the first one
+    left the peg, and nobody measured that. Inheriting the first one's target would file a
+    start pose that was true an hour and one rollout ago.
+    """
+    state, _process = _armed_rollout_state(tmp_path)
+
+    gateway._request_rollout_scene_reset(state, _reset_request())
+    gateway._apply_rollout_output(state, "[INFO] scene_reset=done request_id=abc")
+
+    first = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+    state.rollout.pendingOutcomeFor = 2
+    second = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+
+    assert "resetTarget" in first
+    assert "resetTarget" not in second
+
+
+def test_a_new_reset_drops_the_previous_start_pose_before_it_lands(tmp_path: Path):
+    """The old pose stops being true when the peg is lifted, not when the new one is placed. If
+    this reset then fails, the truth is "no start pose", not the one from two resets ago.
+    """
+    state, _process = _armed_rollout_state(tmp_path)
+
+    gateway._request_rollout_scene_reset(state, _reset_request())
+    gateway._apply_rollout_output(state, "[INFO] scene_reset=done request_id=abc")
+    assert state.rollout_scene_reset_target is not None
+
+    # Through the gate first: a reset finishing is not the runtime reading commands again, and
+    # the second request is refused until it says so.
+    gateway._apply_rollout_output(
+        state, "[INFO] interactive_waiting_for_start arm_at_start=0 press 's' to start."
+    )
+    gateway._request_rollout_scene_reset(state, _reset_request())
+    assert state.rollout_scene_reset_target is None
+
+    gateway._apply_rollout_output(state, "[WARN] scene_reset=failed request_id=def details=unreachable")
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+    assert "resetTarget" not in entry
+
+
+def test_the_start_pose_is_kept_out_of_geometry(tmp_path: Path):
+    """Two provenances, two columns. `geometry` is what the runtime measured about the arm; the
+    reset target is what the environment was set to before the policy saw it.
+    """
+    state, _process = _armed_rollout_state(tmp_path)
+    state.rollout.lastRolloutGeometry = {"graspXyz": [0.4516, -0.1017, 0.0602], "graspBy": "policy"}
+
+    gateway._request_rollout_scene_reset(state, _reset_request())
+    gateway._apply_rollout_output(state, "[INFO] scene_reset=done request_id=abc")
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "failure"})["entry"]
+
+    assert entry["geometry"]["graspXyz"] == [0.4516, -0.1017, 0.0602]
+    assert "resetTarget" not in entry["geometry"]
+    assert entry["resetTarget"] != entry["geometry"]["graspXyz"]
+
+
+def test_the_log_refuses_a_start_pose_that_is_not_a_point(tmp_path: Path):
+    """Same whitelist rule the geometry is written under: a caller cannot invent the shape."""
+    for bad in ([0.44, -0.12], "0.44,-0.12,0.058", [0.44, -0.12, "x"], None):
+        entry = checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {"checkpointId": "job_a/020000", "outcome": "failure", "resetTarget": bad},
+        )
+        assert "resetTarget" not in entry
+
+
+# ------------------------------------------------------------------------- grasp loop ---
+# The Rollout page drives the grasp loop through the same stdin pipe it drives interactive
+# rollouts with. The fake speaks the loop's real log lines (tools/fr3/grasp_loop.py) and answers
+# the two words the page can send.
+
+GRASP_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] grasp_loop=configured trials=3 strokes=38 held_width=0.025 max_policy_steps=450 repick=True attended=$([ "${FR3_GRASP_LOOP_ATTENDED:-0}" = 1 ] && echo True || echo False) out=outputs/analysis/grasp_loop/g.jsonl"
+echo "[INFO] grasp_loop=start trials=${FR3_GRASP_LOOP_TRIALS:-40} resumed_after=0 out=g.jsonl"
+echo "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500"
+echo "[INFO] grasp_loop_trial trial=0 verdict=empty width_lifted=0.006 close_above_target_mm=31.0 lateral_mm=9.5 trial_s=41.2"
+echo "[ATTENTION] grasp_loop_needs_operator peg not where it was left: put it back in the fixture at pick 0.3640,-0.1370,0.0550"
+read -r word
+echo "[INFO] grasp_loop_operator=continued"
+echo "[INFO] grasp_loop_trial_start trial=1 target=0.4100,-0.2000"
+read -r word
+[ "$word" = "stop" ] && echo "[INFO] grasp_loop_stop=requested"
+echo "[INFO] grasp_loop_trial trial=1 verdict=held width_lifted=0.310 close_above_target_mm=12.0 lateral_mm=2.0 trial_s=38.0"
+echo '[INFO] grasp_loop=done halted=stop_requested summary={"graded": 2, "held": 1}'
+"""
+
+
+def test_the_grasp_loop_is_a_mode_that_moves_the_arm_and_takes_its_options():
+    mode = rollout_backend.MODES_BY_ID["grasp_loop"]
+    assert mode.movesArm and not mode.interactive
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopTrials": 91, "graspLoopAttended": True})
+    assert options == {"FR3_GRASP_LOOP_TRIALS": "91", "FR3_GRASP_LOOP_ATTENDED": "1"}
+    # Absent means unattended, so no other mode is handed the variable.
+    assert "FR3_GRASP_LOOP_ATTENDED" not in rollout_backend.sanitize_rollout_runtime_options({"rtcMode": "auto"})
+
+
+def test_the_grasp_loop_arm_is_passed_through_and_nothing_else_is_accepted():
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopArms": "AB"})
+    assert options == {"FR3_GRASP_LOOP_ARMS": "AB"}
+    with pytest.raises(rollout_backend.RolloutError):
+        rollout_backend.sanitize_rollout_runtime_options({"graspLoopArms": "C"})
+    # Cleared from the inherited environment like the other loop variables.
+    assert "FR3_GRASP_LOOP_ARMS" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+
+
+def test_an_interleaved_run_is_counted_per_arm():
+    progress: dict = {}
+    for line in (
+        "[INFO] grasp_loop=configured trials=4 strokes=38 held_width=0.025 max_policy_steps=450 repick=True attended=True arms=AB out=g.jsonl",
+        "[INFO] grasp_loop_trial trial=0 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=40.0",
+        "[INFO] grasp_loop_trial trial=1 arm=A verdict=empty width_lifted=0.006 close_above_target_mm=25.0 lateral_mm=30.0 trial_s=40.0",
+        "[INFO] grasp_loop_trial trial=2 arm=A verdict=held width_lifted=0.200 close_above_target_mm=5.0 lateral_mm=12.0 trial_s=40.0",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["arms"] == "AB"
+    assert [t["arm"] for t in progress["trials"]] == ["B", "A", "A"]
+    assert progress["byArm"] == {"B": {"graded": 1, "held": 1}, "A": {"graded": 2, "held": 1}}
+
+
+def test_the_grasp_loop_lines_fold_into_progress():
+    progress: dict = {}
+    for line in GRASP_LAUNCHER.splitlines():
+        line = line.replace('$([ "${FR3_GRASP_LOOP_ATTENDED:-0}" = 1 ] && echo True || echo False)', "True").replace("${FR3_GRASP_LOOP_TRIALS:-40}", "3")
+        line = line.removeprefix("echo ").strip("\"'")
+        event = rollout_backend.parse_rollout_line(line).get("graspLoopEvent")
+        if event:
+            progress = rollout_backend.apply_grasp_loop_event(progress, event)
+    assert progress["planned"] == 3 and progress["attended"] is True
+    assert [t["verdict"] for t in progress["trials"]] == ["empty", "held"]
+    assert progress["trials"][0]["closeAboveTargetMm"] == 31.0
+    assert progress["graded"] == 2 and progress["held"] == 1
+    assert progress["needsOperator"] == "" and progress["stopRequested"] is True
+    assert progress["done"] is True and progress["halted"] == "stop_requested"
+    assert progress["summary"] == {"graded": 2, "held": 1}
+
+
+def test_the_page_can_answer_the_loop_and_stop_it_at_a_boundary(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, GRASP_LAUNCHER)
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 3, "graspLoopAttended": True},
+        },
+    )
+    assert _wait_for(lambda: bool(state.rollout.graspLoop.get("needsOperator"))), state.rollout.lastLines
+    assert state.rollout.graspLoop["attended"] is True
+    with state.lock:
+        gateway._send_rollout_control(state, "grasp_continue")
+    assert _wait_for(lambda: state.rollout.graspLoop.get("currentTrial") == 1), state.rollout.lastLines
+    with pytest.raises(ValueError, match="not waiting"):
+        gateway._send_rollout_control(state, "grasp_continue")
+    with state.lock:
+        gateway._send_rollout_control(state, "grasp_stop")
+    assert state.rollout.graspLoop["stopRequested"] is True
+    assert _wait_for(lambda: state.rollout.graspLoop.get("done") is True), state.rollout.lastLines
+    assert state.rollout.graspLoop["held"] == 1
+
+
+def test_grasp_controls_are_refused_outside_the_grasp_loop(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, SLOW_QUIT_LAUNCHER)
+    gateway._start_rollout(state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True})
+    with pytest.raises(ValueError, match="only applies to the grasp loop"):
+        gateway._send_rollout_control(state, "grasp_stop")
+    gateway._stop_rollout(state)

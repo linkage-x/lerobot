@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import math
 import os
 import signal
 import subprocess
@@ -109,6 +110,16 @@ def test_rollout_task_prompt_requires_explicit_value_for_multitask_view():
 
     with pytest.raises(ValueError, match='multiple task prompts'):
         fr3_act_infer_real_runtime.resolve_rollout_task_prompt(ds_meta, None)
+
+
+def test_policy_device_refuses_silent_cpu_fallback():
+    with pytest.raises(RuntimeError, match='refusing to run the policy on CPU'):
+        fr3_act_infer_real_runtime.resolve_policy_device(None, cuda_available=False)
+    with pytest.raises(RuntimeError, match='CUDA is not available'):
+        fr3_act_infer_real_runtime.resolve_policy_device('cuda:0', cuda_available=False)
+
+    assert fr3_act_infer_real_runtime.resolve_policy_device(None, cuda_available=True).type == 'cuda'
+    assert fr3_act_infer_real_runtime.resolve_policy_device('cpu', cuda_available=False).type == 'cpu'
 
 
 def test_rtc_auto_only_enables_supported_policy_types():
@@ -2263,6 +2274,133 @@ def test_only_the_steps_that_will_run_before_the_next_replan_are_compared():
     assert fr3_act_infer_real_runtime.select_action_chunk_medoid(
         chunks, lateral_indices=(0, 1), horizon=4
     ) in (0, 1)
+
+
+def test_the_selection_window_is_what_the_queue_runs_not_the_rtc_guidance_horizon():
+    """The two numbers the old default conflated, on the configuration that is deployed.
+
+    `--action-sample-horizon 0` resolved to `--rtc-execution-horizon`, on the stated ground that
+    it is "the steps that will actually run before the next replan". It is not: RTC's execution
+    horizon is the guidance schedule, and the steps that run are set by the queue, which replans
+    at `qsize <= 25` out of a chunk of 50. 16 against 25.
+    """
+    resolved = fr3_act_infer_real_runtime.resolve_action_selection_horizon(
+        0, chunk_size=50, replan_queue_size=25
+    )
+
+    assert resolved == 25
+    assert resolved != fr3_act_infer_real_runtime._DEFAULT_RTC_EXECUTION_HORIZON
+
+
+def test_a_replan_queue_that_only_fires_when_empty_scores_the_whole_chunk():
+    assert fr3_act_infer_real_runtime.resolve_action_selection_horizon(
+        0, chunk_size=50, replan_queue_size=0
+    ) == 50
+
+
+def test_an_explicit_selection_horizon_is_honoured_and_only_clamped_to_the_chunk():
+    """An override that silently became something else would be worse than the conflation."""
+    assert fr3_act_infer_real_runtime.resolve_action_selection_horizon(
+        12, chunk_size=50, replan_queue_size=25
+    ) == 12
+    assert fr3_act_infer_real_runtime.resolve_action_selection_horizon(
+        999, chunk_size=50, replan_queue_size=25
+    ) == 50
+
+
+def test_a_window_cannot_be_sized_against_a_policy_with_no_chunk():
+    with pytest.raises(ValueError, match='chunk_size must be positive'):
+        fr3_act_infer_real_runtime.resolve_action_selection_horizon(
+            0, chunk_size=0, replan_queue_size=25
+        )
+
+
+def test_the_steps_rtc_discards_get_no_vote_in_which_draw_is_executed():
+    """`ActionQueue._replace_actions_queue` keeps `processed_actions[real_delay:]`, so the head of
+    a chunk is thrown away -- it covers the inference the previous chunk drove through.
+
+    Here the first four steps are common to all three draws, as RTC's prefix guidance makes them,
+    and only the tail is executed. Scored from index 0 the common head dominates and the middle
+    draw wins; scored over what actually runs, the three tails are what they are and the first
+    draw is the one nearest their mean direction. The arm executed a draw chosen by motion it
+    never made.
+    """
+    discarded = [(1.0, 0.0)] * 4
+    chunks = torch.stack([
+        _chunk(discarded + [(-0.10, -0.50)] * 4),
+        _chunk(discarded + [(-0.45, -0.21)] * 4),
+        _chunk(discarded + [(0.42, 0.27)] * 4),
+    ])
+
+    scored_from_zero = fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=8, offset=0
+    )
+    scored_over_what_runs = fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4, offset=4
+    )
+
+    assert scored_from_zero == 1
+    assert scored_over_what_runs == 0
+
+
+def test_a_discarded_prefix_is_common_mode_and_shrinks_the_angles_it_is_scored_with():
+    """Not merely a wasted window: the prefix RTC pins to the previous chunk is near-identical
+    across draws, so including it adds the same vector to every one of them. Two draws that will
+    execute at right angles are scored as 45 degrees apart. The 52-55 deg conditional width the
+    medoid exists to narrow is the same size as the distortion.
+    """
+    discarded = [(1.0, 0.0)] * 4
+    chunks = torch.stack([
+        _chunk(discarded + [(1.0, 0.0)] * 4),
+        _chunk(discarded + [(0.0, 1.0)] * 4),
+    ])
+
+    def angle(vectors):
+        a, b = vectors[0], vectors[1]
+        cosine = a @ b / (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b))
+        return math.degrees(math.acos(float(cosine.clamp(-1.0, 1.0))))
+
+    executed = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=4, offset=4
+    )
+    with_the_prefix = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=8, offset=0
+    )
+
+    assert angle(executed) == pytest.approx(90.0)
+    assert angle(with_the_prefix) == pytest.approx(45.0)
+
+
+def test_an_offset_past_the_chunk_still_leaves_one_step_to_score():
+    """Same rule `_clamp_rtc_delay_steps` applies to the merge this window mirrors: a latency
+    estimate that swallowed the chunk must not leave the selection with nothing to compare."""
+    chunks = torch.stack([_chunk([(1.0, 0.0), (2.0, 0.0), (3.0, 0.0)])])
+
+    displacement = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=4, offset=99
+    )
+
+    assert displacement[0].tolist() == pytest.approx([3.0, 0.0])
+
+
+def test_selecting_among_draws_refuses_a_horizon_nobody_resolved():
+    """The fallback that made this bug possible is gone, and its absence is enforced here: a
+    caller that forgets the window gets a refusal rather than the RTC horizon."""
+    with pytest.raises(ValueError, match='resolve_action_selection_horizon'):
+        fr3_act_infer_real_runtime.predict_action_chunk_for_rollout(
+            {},
+            policy=None,
+            device=torch.device('cpu'),
+            preprocessor=None,
+            postprocessor=None,
+            use_amp=False,
+            inference_delay=0,
+            prev_chunk_left_over=None,
+            execution_horizon=16,
+            action_samples=8,
+            lateral_action_indices=(0, 1),
+            action_sample_horizon=0,
+        )
 
 
 def test_a_horizon_longer_than_the_chunk_uses_the_chunk():

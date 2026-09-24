@@ -199,10 +199,10 @@ def test_an_unknown_kind_is_refused(tmp_path):
         plan_run(tmp_path, "not_a_kind", {})
 
 
-def test_both_loops_are_tenants_of_the_same_contract():
+def test_all_loops_are_tenants_of_the_same_contract():
     """One page, two tenants. If this drifts, the page has to grow a special case."""
 
-    assert set(RUN_KINDS) == {"terminal_trials", "auto_collect"}
+    assert set(RUN_KINDS) == {"terminal_trials", "auto_collect", "grasp_envelope"}
     for kind in RUN_KINDS.values():
         assert kind.label and kind.unit and kind.script.endswith(".py")
 
@@ -210,3 +210,55 @@ def test_both_loops_are_tenants_of_the_same_contract():
 def test_reading_a_run_that_does_not_exist_says_so(tmp_path):
     with pytest.raises(UnattendedError, match="no such run"):
         read_run(tmp_path, "nope")
+
+
+# -- the first real launch of the envelope sweep died on its argv and read as "running" -----------
+
+
+def test_a_child_that_exited_reads_as_gone_even_before_anyone_waits_on_it():
+    """signal 0 succeeds on a zombie, so a run that died on line one used to read as running."""
+
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            state = open(f"/proc/{child.pid}/stat").read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            break
+        if state == "Z":
+            break
+        time.sleep(0.02)
+    assert process_alive(child.pid) is False
+
+
+def test_a_run_that_died_before_writing_a_row_is_crashed_and_shows_why(tmp_path):
+    run_dir = _make_run(tmp_path, "grasp_envelope_20260923_144600", pid=DEAD_PID, kind="grasp_envelope")
+    (run_dir / "run.log").write_text("usage: ...\nerror: argument --xy-offsets-mm: expected one argument\n")
+    run = read_run(tmp_path, run_dir.name)
+    assert run["state"] == "crashed", "never 'starting' forever"
+    assert run["logTail"][-1].endswith("expected one argument")
+
+
+@pytest.mark.parametrize(
+    ("kind", "module", "request_"),
+    [
+        ("grasp_envelope", "tools.fr3.fr3_grasp_envelope_runtime", {}),
+        ("grasp_envelope", "tools.fr3.fr3_grasp_envelope_runtime", {"xyOffsetsMm": "", "dzOffsetsMm": "", "centreRepeats": 0, "extraPointsMm": "-5,0,-6"}),
+        ("terminal_trials", "tools.fr3.fr3_terminal_trials_runtime", {"holePose": "0.3599,-0.1333,0.0523"}),
+    ],
+)
+def test_every_planned_argv_is_accepted_by_the_runtime_it_launches(tmp_path, kind, module, request_):
+    """Planning and launching are separate processes; the only contract between them is argv."""
+
+    import importlib
+
+    planned = plan_run(tmp_path, kind, request_)
+    runtime = importlib.import_module(module)
+    args = runtime.parse_args(planned["argv"][1:])
+    if kind == "grasp_envelope":
+        request = runtime.build_request(args)
+        assert request.xyOffsetsMm == tuple(planned["plan"]["request"]["xyOffsetsMm"])
+        assert request.dzOffsetsMm == tuple(planned["plan"]["request"]["dzOffsetsMm"])

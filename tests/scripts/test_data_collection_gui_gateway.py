@@ -5683,3 +5683,48 @@ def test_a_use_amp_alignment_failure_does_not_block_the_rollout():
     )
     assert 'state.log("warn"' in handler.split("else:")[0]
     assert "raise" not in handler.split("else:")[0]
+
+
+def test_post_routes_outside_the_rollout_prefix_are_reachable_over_http(tmp_path):
+    """Regression: the unattended and mask POSTs sat inside the `/api/rollout/` prefix test and
+    answered "Unknown endpoint" -- the Unattended page could never plan a run. Over a real socket,
+    because the bug was in the routing, which a call to the handler function skips."""
+
+    import threading
+    import urllib.error
+    import urllib.request
+
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path / "ds"), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def post(path, body):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}{path}",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as exc:  # a refusal is fine; only "not routed" is the bug
+                assert exc.code != 404, path
+                return json.loads(exc.read() or b"{}")
+
+        planned = post("/api/unattended/plan", {"kind": "grasp_envelope", "request": {}})
+        assert planned.get("ok") is True and planned["plan"]["units"] == 63
+        for path in ("/api/unattended/stop", "/api/unattended/release-brake", "/api/unattended/continue"):
+            answer = post(path, {"id": "nope"})
+            assert "Unknown endpoint" not in str(answer.get("error")), path
+        assert "Unknown endpoint" not in str(post("/api/scene-reset/mask", {}).get("error"))
+    finally:
+        server.shutdown()
+        server.server_close()

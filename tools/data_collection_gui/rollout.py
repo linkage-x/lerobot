@@ -14,6 +14,7 @@ the runtime prints for humans; the markers matched here are the ones it emits un
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -83,6 +84,11 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_DAGGER_TAKEOVER",
     "FR3_DAGGER_DATASET_ROOT",
     "FR3_DAGGER_RELEASE_AFTER_S",
+    # The grasp-only loop (card 12). Cleared like the rest: a shell that once exported a trial
+    # count must not turn the next launch into forty unasked-for grasps.
+    "FR3_GRASP_LOOP_TRIALS",
+    "FR3_GRASP_LOOP_ATTENDED",
+    "FR3_GRASP_LOOP_ARMS",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
@@ -183,6 +189,16 @@ ROLLOUT_MODES: tuple[RolloutMode, ...] = (
         movesArm=True,
         interactive=True,
         takeover=True,
+    ),
+    RolloutMode(
+        "grasp_loop",
+        "抓取循环 Grasp loop",
+        "Card 12. Grasp-only trials, graded by the rig itself: the scene reset places the peg, the "
+        "policy runs until it has closed on it, a scripted 3 cm lift reads the measured width "
+        "(held >= 0.025), and the peg is carried on or re-picked for the next trial. No insertion, "
+        "no grading by hand. Targets are the 09-22 rollouts' reset targets. The arm moves.",
+        movesArm=True,
+        interactive=False,
     ),
     RolloutMode(
         "dagger_sim",
@@ -379,6 +395,15 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options, raw, "terminalServoSearchRing", "FR3_TERMINAL_SERVO_SEARCH_RING", minimum=0.0
     )
 
+    _set_optional_int_env(options, raw, "graspLoopTrials", "FR3_GRASP_LOOP_TRIALS", minimum=1)
+    if _parse_bool_field(raw.get("graspLoopAttended", False), "graspLoopAttended"):
+        options["FR3_GRASP_LOOP_ATTENDED"] = "1"
+    grasp_arms = _optional_text(raw.get("graspLoopArms"))
+    if grasp_arms:
+        if grasp_arms not in ("A", "B", "AB"):
+            raise RolloutError("graspLoopArms must be A (pure policy), B (GT grasp funnel) or AB (interleaved).")
+        options["FR3_GRASP_LOOP_ARMS"] = grasp_arms
+
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
         if _parse_bool_field(raw.get("daggerRecord", True), "daggerRecord"):
@@ -500,6 +525,9 @@ class RolloutStatus:
     # of every rollout in the session can be filed against the configuration that produced it.
     policyArm: dict[str, Any] = field(default_factory=dict)
     terminalServoConfig: dict[str, Any] = field(default_factory=dict)
+    # The grasp loop's own progress, folded from its log lines by `apply_grasp_loop_event`.
+    # Empty for every other mode.
+    graspLoop: dict[str, Any] = field(default_factory=dict)
 
 
 def build_rollout_command(
@@ -652,6 +680,9 @@ _GEOMETRY_COUNT_RE = re.compile(r"\b(samples|held_steps|closed)=(\d+)")
 # geometry: a page that files its own numbers can file an arm the process never ran.
 _POLICY_ARM_RE = re.compile(
     r"\baction_samples=(\d+)\s+aggregate=(\S+)\s+selection_horizon=(\d+)"
+    # Optional because runtimes before 2026-09-21 announced no offset at all, and a log written by
+    # one of those must keep parsing as the arm it was rather than becoming unreadable.
+    r"(?:\s+selection_offset=(\S+))?"
 )
 # E5 / E7-C. Printed once, only when a terminal servo pose is configured, so absence means the
 # rollout ended wherever the policy left it.
@@ -948,12 +979,20 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # snapshot and re-enters the gate. Same rule as the rollout end marker: the reset being
         # over is not the runtime being ready for the next one.
         parsed["state"] = "finishing"
+        # The gateway sampled the place target and only it knows the number; what the log can
+        # say is whether the peg actually got there. Reported as a verdict rather than a pose
+        # for that reason -- and reported at all because a target that was commanded is not a
+        # start pose until the arm finished putting the peg on it.
+        parsed["sceneResetVerdict"] = "done"
         parsed["message"] = "Scene reset finished; the runtime is returning to its command gate."
         return parsed
 
     if "scene_reset=failed" in stripped:
         parsed["state"] = "finishing"
         parsed["armAtStart"] = False
+        # The peg is wherever the reset abandoned it, which is not the sampled target and is not
+        # measured anywhere. Saying so is what stops the next rollout inheriting that number.
+        parsed["sceneResetVerdict"] = "failed"
         parsed["message"] = stripped[:400]
         return parsed
 
@@ -1023,11 +1062,136 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         parsed["message"] = f"Rollout control channel ready ({backend_match.group(1)}); waiting for the runtime to reach its start gate."
         return parsed
 
+    if "grasp_loop" in stripped:
+        event = parse_grasp_loop_line(stripped)
+        if event:
+            parsed["graspLoopEvent"] = event
+            if event["type"] == "trial_start":
+                parsed["state"] = "rolling"
+                parsed["message"] = f"Grasp loop: trial {event['trial'] + 1} running."
+            elif event["type"] == "needs_operator":
+                parsed["message"] = "Grasp loop is waiting: put the peg back in the fixture, then press Continue."
+            elif event["type"] == "done":
+                parsed["message"] = f"Grasp loop finished (halted: {event.get('halted') or 'no'})."
+            return parsed
+
     if stripped.startswith("[ERROR]") or "Traceback (most recent call last)" in stripped:
         parsed["message"] = stripped[:400]
         return parsed
 
     return parsed
+
+
+_GRASP_FIELD_RE = re.compile(r"(\w+)=(\S+)")
+
+
+def _grasp_number(value: str | None) -> float | None:
+    try:
+        number = float(value) if value is not None else None
+    except ValueError:
+        return None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def parse_grasp_loop_line(line: str) -> dict[str, Any]:
+    """One grasp-loop marker as an event, or {} for a line that is not one.
+
+    The loop prints these from `tools/fr3/grasp_loop.py`; the row file it writes is the record,
+    and these are only what the page needs to draw progress while it runs.
+    """
+
+    if "[ATTENTION] grasp_loop_needs_operator " in line:
+        return {"type": "needs_operator", "message": line.split("grasp_loop_needs_operator ", 1)[1].strip()}
+    if "grasp_loop=done " in line:
+        halted_match = re.search(r"halted=(\S+)", line)
+        summary: dict[str, Any] = {}
+        if "summary=" in line:
+            try:
+                summary = json.loads(line.split("summary=", 1)[1])
+            except json.JSONDecodeError:
+                summary = {}
+        halted = halted_match.group(1) if halted_match else ""
+        return {"type": "done", "halted": "" if halted == "no" else halted, "summary": summary}
+    fields = dict(_GRASP_FIELD_RE.findall(line))
+    if "grasp_loop=configured" in line:
+        return {
+            "type": "configured",
+            "planned": int(fields.get("trials", "0") or 0),
+            "attended": fields.get("attended") == "True",
+            "arms": fields.get("arms", "A"),
+            "out": fields.get("out", ""),
+        }
+    if "grasp_loop=halted" in line:
+        return {"type": "halted", "reason": fields.get("reason", ""), "details": line.split("details=", 1)[-1][:400]}
+    if "grasp_loop_stop=requested" in line:
+        return {"type": "stop_requested"}
+    if "grasp_loop_operator=" in line:
+        return {"type": "operator", "answer": fields.get("grasp_loop_operator", "")}
+    if "grasp_loop_trial_start " in line:
+        target = [_grasp_number(part) for part in fields.get("target", "").split(",")]
+        return {"type": "trial_start", "trial": int(fields.get("trial", "0")), "target": target}
+    if "grasp_loop_trial " in line:
+        return {
+            "type": "trial",
+            "trial": int(fields.get("trial", "0")),
+            "arm": fields.get("arm", "A"),
+            "verdict": fields.get("verdict", ""),
+            "widthLifted": _grasp_number(fields.get("width_lifted")),
+            "closeAboveTargetMm": _grasp_number(fields.get("close_above_target_mm")),
+            "lateralMm": _grasp_number(fields.get("lateral_mm")),
+            "trialS": _grasp_number(fields.get("trial_s")),
+        }
+    return {}
+
+
+def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Fold one event into the page's progress record. Returns a new dict."""
+
+    state = {
+        "planned": 0,
+        "out": "",
+        "attended": False,
+        "arms": "A",
+        "currentTrial": None,
+        "trials": [],
+        "needsOperator": "",
+        "stopRequested": False,
+        "done": False,
+        "halted": "",
+        "haltDetails": "",
+        "summary": {},
+        **progress,
+    }
+    kind = event.get("type")
+    if kind == "configured":
+        state.update(planned=event["planned"], attended=event["attended"], out=event["out"], arms=event.get("arms", "A"))
+    elif kind == "trial_start":
+        state["currentTrial"] = event["trial"]
+    elif kind == "trial":
+        row = {key: value for key, value in event.items() if key != "type"}
+        state["trials"] = [t for t in state["trials"] if t.get("trial") != row["trial"]] + [row]
+        state["currentTrial"] = None
+    elif kind == "needs_operator":
+        state["needsOperator"] = event["message"]
+    elif kind == "operator":
+        state["needsOperator"] = ""
+    elif kind == "stop_requested":
+        state["stopRequested"] = True
+    elif kind == "halted":
+        state.update(halted=event["reason"], haltDetails=event["details"])
+    elif kind == "done":
+        state.update(done=True, halted=event["halted"] or state["halted"], summary=event["summary"], currentTrial=None, needsOperator="")
+    graded = [t for t in state["trials"] if t.get("verdict") in ("held", "empty", "no_close")]
+    state["graded"] = len(graded)
+    state["held"] = sum(1 for t in graded if t.get("verdict") == "held")
+    # Per arm, because the pooled rate of an interleaved run is a rate of neither arm.
+    by_arm: dict[str, dict[str, int]] = {}
+    for t in graded:
+        entry = by_arm.setdefault(str(t.get("arm", "A")), {"graded": 0, "held": 0})
+        entry["graded"] += 1
+        entry["held"] += t.get("verdict") == "held"
+    state["byArm"] = by_arm
+    return state
 
 
 def parse_policy_arm(text: str) -> dict[str, Any]:
@@ -1037,17 +1201,31 @@ def parse_policy_arm(text: str) -> dict[str, Any]:
     same mechanism. The three numbers that name the arm were settable from the page and reachable
     by the runtime, and then present in neither the status nor the outcome log -- so two arms of
     the same comparison were distinguishable only by which log file a reader happened to open.
+
+    `selectionHorizon` is the window the draws are scored over, which is the executed-run length
+    and must be equal across the arms for their comparison to mean anything; `selectionOffsetSteps`
+    is where that window starts. Both are filed because both can change what "the same arm" means
+    without changing the aggregate or the draw count.
     Parsed from the runtime's announce rather than echoed back from the launch request, the same
     provenance rule the landing points follow.
     """
     match = _POLICY_ARM_RE.search(text)
     if not match:
         return {}
-    return {
+    arm: dict[str, Any] = {
         "actionSamples": int(match.group(1)),
         "actionAggregate": match.group(2),
         "selectionHorizon": int(match.group(3)),
     }
+    offset = match.group(4)
+    # `auto` is the default rule and has no number to file: the offset is the steps actually
+    # consumed during inference, re-derived at every replan. Only a fixed
+    # `--rtc-inference-delay-steps` pins it, and that is a chosen arm. Absent therefore means
+    # auto, the same convention the servo fields follow -- not zero, which is a real fixed offset
+    # and a different arm from letting the latency decide.
+    if offset is not None and offset.isdigit():
+        arm["selectionOffsetSteps"] = int(offset)
+    return arm
 
 
 def parse_terminal_servo_config(text: str) -> dict[str, Any]:
