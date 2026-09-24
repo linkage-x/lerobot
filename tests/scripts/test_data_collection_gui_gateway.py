@@ -6097,6 +6097,39 @@ def test_deleting_every_dwell_removes_the_capture_and_its_orphaned_stream(tmp_pa
     assert (tmp_path / "outputs" / "datasets" / "rec_tm_b" / "laser_tracker" / "lt_b").is_dir()
 
 
+def test_the_delete_route_answers_instead_of_deadlocking_the_gateway(tmp_path):
+    """2026-09-24: routed inside do_POST's ``with state.lock`` block, the delete
+    took that non-reentrant lock a second time and wedged every POST and every
+    snapshot until the gateway was restarted. Only the HTTP path shows it -- the
+    tests above call the function directly, outside any lock."""
+    import threading
+    import urllib.request
+
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1], "lt_a")
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/calibration/tracker-mount/captures/delete",
+            data=json.dumps({"episodeDirs": [_ep(dataset, 1)]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body["ok"] is True
+    assert not (dataset / "episodes" / "episode_000001").exists()
+    # And the lock is free afterwards, not merely released by a lucky timeout.
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
 def test_delete_refuses_paths_the_list_does_not_show(tmp_path):
     state = _tracker_mount_state(tmp_path)
     victim = tmp_path / "outputs" / "important"

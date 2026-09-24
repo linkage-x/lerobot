@@ -6488,10 +6488,11 @@ def _delete_tracker_mount_captures(state: GatewayState, payload: dict[str, Any])
         if stream.is_dir() and stream.parent.name == "laser_tracker" and stream.name == row["sessionId"]:
             shutil.rmtree(stream)
             removed_streams.append(str(stream))
-    state.log(
-        "warn",
-        f"Deleted {len(wanted)} tracker capture(s): {len(removed)} dir(s), {len(removed_streams)} tracker stream(s)",
-    )
+    with state.lock:
+        state.log(
+            "warn",
+            f"Deleted {len(wanted)} tracker capture(s): {len(removed)} dir(s), {len(removed_streams)} tracker stream(s)",
+        )
     return {"ok": True, "deleted": len(wanted), "removedDirs": removed, "removedStreams": removed_streams}
 
 
@@ -15664,6 +15665,22 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
+        if path == "/api/calibration/tracker-mount/captures/delete":
+            # Outside the state lock, and it has to be: the function takes that
+            # lock itself to read the recorder state, and Lock is not reentrant --
+            # routed inside the block below it deadlocked the whole gateway on
+            # its first real use (2026-09-24). rmtree of a capture's video is
+            # also far too slow to hold every snapshot poll behind.
+            try:
+                result = _delete_tracker_mount_captures(self.server.state, _read_json_body(self))
+            except Exception as exc:  # noqa: BLE001
+                with self.server.state.lock:
+                    self.server.state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+            _json_response(self, status, result)
+            return
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/start":
@@ -15914,11 +15931,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/calibration/tracker-mount/record":
                     result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))
-                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
-                    _json_response(self, status, result)
-                    return
-                if path == "/api/calibration/tracker-mount/captures/delete":
-                    result = _delete_tracker_mount_captures(self.server.state, _read_json_body(self))
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
