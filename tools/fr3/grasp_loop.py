@@ -33,15 +33,21 @@ The loop keeps track of where the peg is, because that decides how the next tria
     held      in the fingers after a held verdict       -> set down where it was lifted, re-gripped
                                                            the script's way, carried to the next
                                                            target ("regrip")
-    lost      after an empty grasp, or a re-grip that   -> a person puts it back in the fixture,
-              came up empty                                or the run halts if nobody is there
+    untouched after a miss whose tool path never came  -> the script picks it up where it stands
+              low near the peg                             and carries it to the next target
+                                                           ("repick"); an empty pick makes it lost
+    lost      after any other miss, or a re-grip or     -> a person puts it back in the fixture,
+              re-pick that came up empty                   or the run halts if nobody is there
 
 Every staged peg is released from the script's own grip, never the policy's. On 2026-09-23 the
 B arm held 8/8 pegs staged from a scripted grip and 2/6 carried on in the policy's: a policy's
 grip is high, low or by the edge, the peg slides in it on the carry, and the drop on release
-varies with all of that -- it bounced, tipped or walked off the target. Nor is an empty grasp
-re-picked any more: the peg a policy closed on air beside has usually been knocked over, and
-re-picks came up empty 9 times in 13, each one costing a reset before the person was asked anyway.
+varies with all of that -- it bounced, tipped or walked off the target. Nor is every empty grasp
+re-picked: the peg a policy closed on air beside has usually been knocked over, and re-picks came
+up empty 9 times in 13, each one costing a reset before the person was asked anyway. Only a miss
+whose whole tool path stayed clear of the peg is (GraspHandover.peg_untouched): the pure policy
+misses mostly in mid-air, several cm off, and 8 of its 13 misses in the 09-23/09-24 runs were
+that kind.
 
 Where the peg stands is the tool position *measured* when the fingers opened, not the commanded
 target: a place step converges to within 6 mm, and the funnel aims at the peg.
@@ -132,6 +138,14 @@ GRASP_LOOP_PLACE_DWELL_S = 1.0
 GRASP_LOOP_HOVER_M = 0.010
 GRASP_LOOP_HOVER_TOLERANCE_M = 0.005
 GRASP_LOOP_HOVER_STILL_S = 0.3
+# A miss leaves the peg standing when the tool never came low near it. "Near" is a horizontal
+# radius the open fingers could reach the peg from: fully open they stand about 48 mm apart (a
+# 15 mm peg reads 0.31), so a finger's outside is ~30 mm off the tool point, plus the peg's
+# 7.5 mm radius. "Low" is below the peg's grasp height plus this clearance -- the peg top.
+# Sized on the 09-23/09-24 trajectories: it passes the A misses closed 2-4 cm above and 4-7 cm
+# off, and none that went below the grasp height within 3 cm.
+GRASP_LOOP_UNTOUCHED_XY_M = 0.040
+GRASP_LOOP_UNTOUCHED_Z_M = 0.020
 # Held still after the fingers open, so a peg that rocks on release is not dragged by the retreat.
 GRASP_LOOP_RELEASE_SETTLE_S = 0.5
 GRASP_LOOP_WIDTH_SAMPLES = 10
@@ -336,6 +350,17 @@ class GraspHandover:
     # command; the close it makes is then the close this object sees.
     funnel: GraspFunnel | None = None
     funnelMaxSteps: int = GRASP_LOOP_FUNNEL_MAX_STEPS
+    # Where the peg stands, when known: the tool's lowest height over it, within the reach of the
+    # open fingers, is what says whether a miss can have disturbed it.
+    pegXyz: tuple[float, float, float] | None = None
+    lowestNearPegM: float | None = None
+
+    def peg_untouched(self) -> bool:
+        """True when no step brought the tool below the peg top within reach of the fingers."""
+
+        return self.pegXyz is not None and (
+            self.lowestNearPegM is None or self.lowestNearPegM >= GRASP_LOOP_UNTOUCHED_Z_M
+        )
 
     def timed_out(self, step: int) -> bool:
         """Out of steps: the policy's budget until the funnel has the arm, the funnel's after."""
@@ -347,6 +372,10 @@ class GraspHandover:
     def observe(self, step: int, xyz: tuple[float, float, float], commanded_gripper: float) -> bool:
         """Feed one policy step; True when the arm should be taken off the policy now."""
 
+        if self.pegXyz is not None and math.dist(xyz[:2], self.pegXyz[:2]) < GRASP_LOOP_UNTOUCHED_XY_M:
+            above = float(xyz[2]) - self.pegXyz[2]
+            if self.lowestNearPegM is None or above < self.lowestNearPegM:
+                self.lowestNearPegM = above
         streak, fire = grasp_handover_due(
             self.closedStreak,
             commanded_gripper=commanded_gripper,
@@ -728,8 +757,19 @@ def run_grasp_loop(
             log(f"[INFO] grasp_loop_trial_start trial={trial} target={target[0]:.4f},{target[1]:.4f}")
 
             # ---- stage the peg at `target`, arm homed ------------------------------------------
+            repicked = False
+            if peg == "untouched":
+                assert peg_xyz is not None
+                width = verified_pick(robot, request, (peg_xyz[0], peg_xyz[1], request.regripZ), request_id=request_id)
+                repicked = grasp_is_held(width, request.closedGripper, held_width=request.heldWidth, blocked_margin=request.blockedMargin)
+                log(f"[INFO] grasp_loop_repick trial={trial} width={width:.3f} held={repicked}")
+                if repicked:
+                    peg, held_place_z, held_gripper = "held", request.regripZ - request.placePressM, request.closedGripper
+                else:
+                    release_and_clear(robot, request, request_id=request_id)
+                    peg = "lost"
             if peg == "at_target":
-                # Nobody re-picks a peg the policy missed: it is usually lying down by now.
+                # A miss that came low near the peg: it is usually lying down by now.
                 peg = "lost"
             if peg == "lost":
                 if wait_for_operator is None or not wait_for_operator(
@@ -740,7 +780,7 @@ def run_grasp_loop(
                     break
                 peg = "at_pick"
             if peg == "held":
-                staging = "regrip"
+                staging = "repick" if repicked else "regrip"
                 assert held_place_z is not None
                 released = place_held_peg(robot, request, target, place_z=held_place_z, gripper=held_gripper, request_id=request_id)
             else:
@@ -776,6 +816,7 @@ def run_grasp_loop(
                 closedBelow=request.closedBelow,
                 maxPolicySteps=request.maxPolicySteps,
                 funnelMaxSteps=request.funnelMaxSteps,
+                pegXyz=peg_xyz,
             )
             if arm == "B":
                 handover.funnel = GraspFunnel(
@@ -808,6 +849,9 @@ def run_grasp_loop(
                 row["closeAboveTargetMm"] = round((handover.closeXyz[2] - target[2]) * 1000.0, 1)
                 # From the peg as placed, not the target it was aimed at.
                 row["lateralMm"] = round(math.dist(handover.closeXyz[:2], peg_xyz[:2]) * 1000.0, 1)
+            row["lowestNearPegMm"] = (
+                None if handover.lowestNearPegM is None else round(handover.lowestNearPegM * 1000.0, 1)
+            )
             if handover.funnel is not None:
                 row.update(handover.funnel.trial_record())
                 row["funnelSteps"] = str(_write_funnel_steps(out_path, trial, handover.funnel))
@@ -841,9 +885,15 @@ def run_grasp_loop(
                     release_and_clear(robot, request, request_id=request_id)
             else:
                 # Ran out of steps without a settled close, or was stopped. Either way nothing is
-                # graded as held, and the peg is assumed to be where it was put.
+                # graded as held.
                 row["verdict"] = "no_close" if status == "grasp_timeout" else "not_graded"
                 release_and_clear(robot, request, request_id=request_id)
+            if peg == "at_target":
+                # Missed. Standing where it was put if the tool never came low near it; otherwise
+                # it may be anywhere, and the next staging hands it to a person.
+                row["pegUntouched"] = handover.peg_untouched()
+                if row["pegUntouched"]:
+                    peg = "untouched"
             row["trialS"] = round(time.perf_counter() - started, 1)
             write(row)
             done.append(row)

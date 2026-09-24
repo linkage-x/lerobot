@@ -97,7 +97,8 @@ def _policy(robot, plan):
     """A stand-in policy: per trial, either reach the peg (with an XY miss) and close, or wander.
 
     `plan` items: ("grasp", miss_m), ("knock", None) -- closes on air after shoving the peg away --
-    or ("wander", None) -- never closes.
+    ("air", (sideways_m, above_m)) -- closes on air clear of the peg -- or ("wander", None) --
+    never closes.
     """
 
     plan = list(plan)
@@ -115,7 +116,11 @@ def _policy(robot, plan):
                 handover.observe(step, robot.xyz, 1.0)
             return "grasp_timeout"
         px, py, pz = robot.peg_xyz
-        at = (px + miss, py, pz)
+        if kind == "air":
+            # Closes in mid-air: `miss` is (sideways, above) the peg.
+            at = (px + miss[0], py, pz + miss[1])
+        else:
+            at = (px + miss, py, pz)
         for step in range(100):
             gripper = 1.0 if step < 5 else 0.2
             robot.send_action({
@@ -583,3 +588,62 @@ def test_held_needs_the_fingers_stopped_wider_than_their_command():
     # The 2026-09-23 pilot, as (width lifted, command).
     assert held(0.3102, 0.0) and held(0.3088, 0.0012)
     assert not any(held(w, c) for w, c in [(0.0573, 0.0562), (0.075, 0.0744), (0.0622, 0.0666), (0.4913, 0.4964), (0.006, 0.0)])
+
+
+def test_a_miss_that_never_came_low_near_the_peg_is_picked_up_by_the_script(tmp_path):
+    """09-24 trial 8: the pure policy closed 35 mm above the peg and 49 mm off. The peg was still
+    standing; asking a person to put it back cost a trial's worth of their time for nothing."""
+
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=3),
+        run_policy_trial=_policy(robot, [("air", (0.05, 0.035)), ("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["empty", "held", "held"]
+    assert rows[0]["pegUntouched"] is True and rows[0]["lowestNearPegMm"] is None
+    assert [r["staging"] for r in rows] == ["fixture", "repick", "regrip"]
+    assert asked == []
+
+
+def test_a_miss_that_came_low_near_the_peg_still_goes_to_the_operator(tmp_path):
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=2),
+        # 30 mm off at the grasp height: inside the fingers' reach, below the peg top.
+        run_policy_trial=_policy(robot, [("air", (0.03, 0.0)), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert rows[0]["pegUntouched"] is False and rows[0]["lowestNearPegMm"] == pytest.approx(0.0, abs=0.5)
+    assert [r["staging"] for r in rows] == ["fixture", "fixture"]
+    assert len(asked) == 1
+
+
+def test_a_repick_that_comes_up_empty_hands_the_peg_to_the_operator(tmp_path):
+    """The path said clear, but the peg is not there (the fake's knock moves it without the tool
+    going near): the re-pick closes on air, and a person is asked rather than trusting it."""
+
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("knock", None), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert rows[0]["pegUntouched"] is True
+    assert rows[1]["staging"] == "fixture" and len(asked) == 1
+    assert not robot.held
