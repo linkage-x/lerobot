@@ -6085,7 +6085,12 @@ def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = _tracker_mount_output_root(state) / f"mount_{stamp}.json"
-    args = ["lever-arm", *args, "--station", str(station), "--out", str(out_path), "--target", target]
+    # Skipped and listed like station and pivot, so one wobbling segment does
+    # not refuse the rest; the holdout is then the first N of what is left.
+    args = [
+        "lever-arm", *args, "--station", str(station), "--out", str(out_path), "--target", target,
+        "--skip-episodes-without-dwells",
+    ]
     if holdout:
         args += ["--holdout", str(holdout)]
 

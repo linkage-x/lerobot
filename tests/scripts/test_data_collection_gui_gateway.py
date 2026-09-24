@@ -6635,6 +6635,7 @@ def test_lever_arm_takes_every_segment_of_one_mount(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert calls[0].count("--episode") == 3
+    assert "--skip-episodes-without-dwells" in calls[0]
 
 
 def test_lever_arm_refuses_segments_from_two_mounts(tmp_path, monkeypatch):
