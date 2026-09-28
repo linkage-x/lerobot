@@ -31,6 +31,7 @@ import { CalibrationHistory } from "./CalibrationHistory";
 import { RigCheckPanel } from "./RigCheckPanel";
 import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
+import { CrossCameraPanel } from "./CrossCameraPanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
 import { HandEyePanel } from "./HandEyePanel";
@@ -191,6 +192,11 @@ export function CalibrationPage({
           frame survived it is a different question, and the one that decides
           if today's absolute poses can be compared with last week's. */}
       <WorldFramePanel api={api} busy={busy} />
+
+      {/* Both checks above compare with the past, so an extrinsic that was
+          wrong from the day it was solved passes them. This one compares the
+          cameras with each other, in the workspace, now. */}
+      <CrossCameraPanel api={api} busy={busy} />
 
       <CalibrationWizard
         snapshot={snapshot}

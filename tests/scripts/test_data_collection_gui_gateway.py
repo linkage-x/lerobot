@@ -7109,3 +7109,138 @@ def test_camera_identity_without_an_expected_table_enforces_nothing(tmp_path, mo
     gateway._start_episode(state)
     assert written
     assert gateway._snapshot(state)["recording"]["cameraIdentity"]["cam_06"]["serial"] == "SN-Z"
+
+
+# --- cross-camera consistency ---------------------------------------------------
+
+
+def _cross_camera_dataset(root: Path, name: str, *, offset_mm: dict[str, float] | None = None) -> Path:
+    """A dataset with a generated trajectory: four cameras watching one cube."""
+    dataset = root / "outputs" / "datasets" / name
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    sidecar = dataset / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    centers = {
+        "cam_03": np.array([1.4, 0.0, 1.2]),
+        "cam_06": np.array([-1.4, 0.2, 1.1]),
+        "cam_08": np.array([0.1, 1.5, 1.3]),
+        "cam_12": np.array([0.0, -1.5, 1.0]),
+    }
+    rng = np.random.default_rng(0)
+    t = np.linspace(0.0, 2 * np.pi, 120)
+    cube = np.stack([0.15 * np.sin(t), 0.1 * np.cos(2 * t), 0.05 * np.sin(3 * t)], axis=1)
+    for cam, center in centers.items():
+        ray = -center / np.linalg.norm(center)
+        side = np.cross(ray, [0.0, 0.0, 1.0])
+        side /= np.linalg.norm(side)
+        # camera looks along +z of its own frame: build R_base_cam
+        x_axis = np.cross([0.0, 0.0, 1.0], ray)
+        x_axis /= np.linalg.norm(x_axis)
+        rot_base_cam = np.stack([x_axis, np.cross(ray, x_axis), ray], axis=1)
+        w = float(np.sqrt(max(1.0 + np.trace(rot_base_cam.T), 1e-12))) / 2.0
+        m = rot_base_cam.T
+        q_cam = [(m[2, 1] - m[1, 2]) / (4 * w), (m[0, 2] - m[2, 0]) / (4 * w), (m[1, 0] - m[0, 1]) / (4 * w), w]
+        rows = []
+        for i, p_true in enumerate(cube):
+            p = p_true + (offset_mm or {}).get(cam, 0.0) * 1e-3 * side + rng.normal(scale=2e-4, size=3)
+            p_cam = rot_base_cam.T @ (p - center)
+            row = {"episode_index": 0, "frame_index": i, "camera_serial": f"S{cam}", "cube_detected": 1, "used_for_fusion": 1}
+            for axis, value in zip("xyz", p, strict=True):
+                row[f"cube_base_{axis}_m"] = value
+            for axis, value in zip("xyz", p_cam, strict=True):
+                row[f"cube_cam_{axis}_m"] = value
+            for key, value in zip(("qx", "qy", "qz", "qw"), (0.0, 0.0, 0.0, 1.0), strict=True):
+                row[f"cube_base_{key}"] = value
+            for key, value in zip(("qx", "qy", "qz", "qw"), q_cam, strict=True):
+                row[f"cube_cam_{key}"] = value
+            rows.append(row)
+        with (sidecar / f"cube_pose.right.{cam}.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    return dataset
+
+
+def _cross_camera_state(tmp_path: Path, monkeypatch) -> gateway.GatewayState:
+    # the real CLI, from the real submodule, on the fixture dataset
+    real_root = Path(gateway.__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(real_root / "third_party" / "opencv_kalibr"))
+    monkeypatch.setattr(gateway, "_marker_tcp_tool_env", lambda _state: env)
+    monkeypatch.setattr(gateway, "_hand_eye_python", lambda _state: Path(sys.executable))
+    state = _tracker_mount_state(tmp_path)
+    state.calibration.extrinsicsRun = "calib_test_extrinsics"
+    return state
+
+
+def test_cross_camera_lists_only_datasets_with_a_trajectory(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    _cross_camera_dataset(tmp_path, "with_traj")
+    bare = tmp_path / "outputs" / "datasets" / "no_traj"
+    (bare / "meta").mkdir(parents=True)
+    (bare / "meta" / "info.json").write_text("{}")
+
+    payload = gateway._last_cross_camera_check(state)
+
+    assert payload["report"] is None
+    assert [c["name"] for c in payload["candidates"]] == ["with_traj"]
+    assert payload["candidates"][0]["cameras"] == ["cam_03", "cam_06", "cam_08", "cam_12"]
+
+
+def test_cross_camera_run_keeps_the_report_and_the_calibration_it_judged(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    dataset = _cross_camera_dataset(tmp_path, "bench", offset_mm={"cam_08": 8.0})
+
+    result = gateway._run_cross_camera_check(state, {"dataset": str(dataset)})
+
+    assert result["ok"] is True, result
+    report = result["report"]
+    assert report["overall"] == "fail"
+    assert report["cubes"]["right"]["cameras"]["cam_08"]["verdict"] == "fail"
+    assert report["extrinsics_run"] == "calib_test_extrinsics"
+    assert gateway._last_cross_camera_check(state)["report"]["overall"] == "fail"
+
+
+def test_cross_camera_run_refuses_a_dataset_without_a_trajectory(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    bare = tmp_path / "outputs" / "datasets" / "no_traj"
+    bare.mkdir(parents=True)
+
+    result = gateway._run_cross_camera_check(state, {"dataset": str(bare)})
+
+    assert result["ok"] is False
+    assert "EE 轨迹" in result["error"]
+    assert gateway._last_cross_camera_check(state)["report"] is None
+
+
+def test_the_cross_camera_route_answers_over_http_without_holding_the_lock(tmp_path, monkeypatch):
+    import urllib.request
+
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    dataset = _cross_camera_dataset(tmp_path, "bench")
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/cross-camera/run",
+            data=json.dumps({"dataset": str(dataset)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/calibration/cross-camera", timeout=5) as response:
+            last = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body["ok"] is True, body
+    # every camera agrees; "partial" because the fixture has no fused trajectory
+    # to measure set-change steps on
+    assert body["report"]["overall"] == "partial"
+    assert last["report"]["generated_utc"] == body["report"]["generated_utc"]
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()

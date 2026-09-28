@@ -24,6 +24,7 @@ import type {
   HandEyePlanResponse,
   HandEyeSolveResponse,
   RigCheckResponse,
+  CrossCameraResponse,
   WorldFrameResponse,
   MujocoCubeMode,
   RealCubeMode,
@@ -947,6 +948,34 @@ export class DataCollectionGuiApi {
       });
       const payload = (await response.json()) as RigCheckResponse;
       return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  async fetchCrossCameraCheck(): Promise<CrossCameraResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/cross-camera`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as CrossCameraResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async runCrossCameraCheck(dataset: string): Promise<CrossCameraResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/cross-camera/run`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ dataset })
+      });
+      const payload = (await response.json()) as CrossCameraResponse;
+      return { ...payload, report: payload.report ?? null, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
     }

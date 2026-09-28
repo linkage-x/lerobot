@@ -978,6 +978,68 @@ export type RigCheckResponse = {
   baseline?: RigCheckBaseline;
 };
 
+// --- cross-camera consistency ------------------------------------------------
+//
+// metrology.cli.cross_camera_check, verbatim. Offsets are across each camera's
+// line of sight; depth (along_p50_mm) is reported and never judged.
+
+export type CrossCameraVerdict = "ok" | "warn" | "fail" | "unknown";
+export type CrossCameraOverall = CrossCameraVerdict | "partial";
+
+export type CrossCameraCamera = {
+  frames: number;
+  verdict: CrossCameraVerdict;
+  reason?: string;
+  lateral_offset_mm?: number;
+  lateral_offset_vector_mm?: number[];
+  lateral_offset_least_squares_mm?: number;
+  scatter_p50_mm?: number;
+  scatter_p95_mm?: number;
+  along_p50_mm?: number;
+  rotation_p50_deg?: number;
+  lateral_offset_per_episode_mm?: Record<string, number>;
+};
+
+export type CrossCameraSetChanges = {
+  verdict: CrossCameraVerdict;
+  reason?: string;
+  changes?: number;
+  flicker_changes?: number;
+  step_p50_mm?: number | null;
+  step_p95_mm?: number | null;
+  steady_p50_mm?: number | null;
+  steady_p95_mm?: number | null;
+  budget_mm?: number;
+  per_camera_toggle?: Record<string, { toggles: number; step_p50_mm: number | null; step_max_mm: number }>;
+};
+
+export type CrossCameraReport = {
+  generated_utc: string;
+  dataset: string;
+  sidecar_generated_utc?: string | null;
+  thresholds: { warn_mm: number; fail_mm: number; step_budget_mm: number };
+  camera_serials?: Record<string, string>;
+  cubes: Record<string, { frames_with_cube: number; cameras: Record<string, CrossCameraCamera>; set_changes: CrossCameraSetChanges }>;
+  overall: CrossCameraOverall;
+  guidance: string;
+  extrinsics_run?: string;
+};
+
+export type CrossCameraCandidate = {
+  dataset: string;
+  name: string;
+  trajectoryModifiedUnixS: number;
+  cameras: string[];
+};
+
+export type CrossCameraResponse = {
+  ok: boolean;
+  error?: string;
+  report: CrossCameraReport | null;
+  extrinsicsRun?: string;
+  candidates?: CrossCameraCandidate[];
+};
+
 // --- canonical world frame (roadmap 2.4) ------------------------------------
 //
 // The world is not re-derived from each calibration; it is frozen once, and

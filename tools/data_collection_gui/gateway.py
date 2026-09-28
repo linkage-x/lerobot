@@ -2883,6 +2883,117 @@ def _last_rig_check(state: GatewayState) -> dict[str, Any]:
     return {"ok": True, "report": report, "baseline": _rig_check_baseline_meta(state)}
 
 
+# --- Cross-camera consistency ------------------------------------------------
+#
+# The third check, and the only one that asks whether the cameras agree *now*
+# rather than whether something changed: the self-check and world continuity
+# both carry an extrinsic that was wrong from the start inside their reference.
+# It runs on a recording of the cube moving through the workspace whose EE
+# trajectory has been generated; the analysis is metrology.cli.cross_camera_check
+# (numpy-only, so the hand-eye interpreter can run it).
+
+_CROSS_CAMERA_SUBDIR = Path("outputs") / "metrology" / "cross_camera_check"
+_CROSS_CAMERA_SIDECAR = Path("derived") / DEFAULT_TRAJ_SIDECAR_NAME
+_CROSS_CAMERA_CANDIDATES = 15
+
+
+def _cross_camera_result_path(state: GatewayState) -> Path:
+    return state.repo_root / _CROSS_CAMERA_SUBDIR / "last_result.json"
+
+
+def _cross_camera_candidates(state: GatewayState) -> list[dict[str, Any]]:
+    """Datasets with a generated trajectory, newest trajectory first."""
+    found: list[dict[str, Any]] = []
+    for dataset in _tracker_mount_capture_candidates(state, limit=None):
+        sidecar = dataset / _CROSS_CAMERA_SIDECAR
+        try:
+            poses = list(sidecar.glob("cube_pose.*.csv"))
+        except OSError:
+            continue
+        if not poses:
+            continue
+        found.append(
+            {
+                "dataset": str(dataset),
+                "name": dataset.name,
+                "trajectoryModifiedUnixS": max(_path_modified_s(p) for p in poses),
+                "cameras": sorted({p.name.split(".")[2] for p in poses if p.name.count(".") >= 3}),
+            }
+        )
+    found.sort(key=lambda entry: entry["trajectoryModifiedUnixS"], reverse=True)
+    return found[:_CROSS_CAMERA_CANDIDATES]
+
+
+def _last_cross_camera_check(state: GatewayState) -> dict[str, Any]:
+    report = _read_json_file(_cross_camera_result_path(state))
+    return {
+        "ok": True,
+        "report": report if isinstance(report, dict) else None,
+        "extrinsicsRun": state.calibration.extrinsicsRun,
+        "candidates": _cross_camera_candidates(state),
+    }
+
+
+def _run_cross_camera_check(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the check on one dataset; the report is kept as the last result.
+
+    Runs outside the state lock like the tracker fits: it reads every
+    per-camera sidecar of the dataset and takes seconds to tens of seconds on
+    Thor.
+    """
+    dataset_raw = str(payload.get("dataset") or "").strip()
+    if not dataset_raw:
+        return {"ok": False, "error": "需要选择一个已生成 EE 轨迹的数据集"}
+    dataset = _resolve_user_path(state, dataset_raw)
+    if not (dataset / _CROSS_CAMERA_SIDECAR).is_dir():
+        return {"ok": False, "error": f"{dataset.name} 还没有生成 EE 轨迹（缺 {_CROSS_CAMERA_SIDECAR}），先在回放页生成"}
+
+    out_path = _cross_camera_result_path(state)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = out_path.with_name("running.json")
+    command = [
+        str(_hand_eye_python(state)),
+        "-m",
+        "metrology.cli.cross_camera_check",
+        "--dataset",
+        str(dataset),
+        "--out",
+        str(scratch),
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)}
+
+    report = _read_json_file(scratch) if scratch.is_file() else None
+    if not isinstance(report, dict):
+        # exit 1/2 are verdicts and still write a report; no report is a crash
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"ok": False, "error": tail[-1] if tail else f"exit {proc.returncode}"}
+    # Which calibration it judged. A result about extrinsics that have since
+    # been replaced says nothing about the ones in production.
+    report["extrinsics_run"] = state.calibration.extrinsicsRun
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    scratch.unlink(missing_ok=True)
+    with state.lock:
+        level = "info" if report.get("overall") == "ok" else "warn"
+        state.log(level, f"Cross-camera check on {dataset.name}: {report.get('overall')} — {report.get('guidance', '')}")
+    return {"ok": True, "report": report}
+
+
+_CROSS_CAMERA_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/cross-camera/run": _run_cross_camera_check,
+}
+
+
 # --- Canonical world frame (roadmap Phase 2.4) -------------------------------
 #
 # A bundle adjustment fixes its gauge on whichever camera it likes, so exporting
@@ -15517,6 +15628,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
+        if path == "/api/calibration/cross-camera":
+            _json_response(self, HTTPStatus.OK, _last_cross_camera_check(self.server.state))
+            return
         if path == "/api/calibration/world-frame":
             _json_response(self, HTTPStatus.OK, _world_frame_payload(self.server.state))
             return
@@ -15934,7 +16048,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
-        tracker_fit = _TRACKER_MOUNT_FIT_ROUTES.get(path)
+        tracker_fit = _TRACKER_MOUNT_FIT_ROUTES.get(path) or _CROSS_CAMERA_ROUTES.get(path)
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the
             # capture's EE trajectory, which queues a job and waits on it -- both
