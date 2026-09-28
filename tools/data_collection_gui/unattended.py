@@ -660,7 +660,16 @@ def request_stop(repo_root: Path, run_id: str, *, mode: str = "boundary") -> dic
         # SIGINT, not SIGTERM: the loops catch KeyboardInterrupt, park the arm holding whatever
         # they hold, and write their summary. SIGTERM would kill them between two motions with
         # the peg in the air and nothing written down.
-        os.kill(int(pid), signal.SIGINT)
+        #
+        # A second press on a run that is still there is SIGKILL. 09-28 16:40: after a reflex a
+        # run hung inside the robot driver's teardown, where SIGINT is never seen, and the page
+        # had no way left to end it.
+        marker = run_dir / "HALT"
+        if marker.exists():
+            os.kill(int(pid), signal.SIGKILL)
+        else:
+            marker.write_text(f"SIGINT at {time.strftime('%H:%M:%S')}", encoding="utf-8")
+            os.kill(int(pid), signal.SIGINT)
     else:
         raise UnattendedError(f"unknown stop mode: {mode}")
     return read_run(repo_root, run_id, tail=1)

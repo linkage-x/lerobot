@@ -474,7 +474,8 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
           <p style={{ fontSize: 12, opacity: 0.7, marginBottom: 0 }}>
             The boundary stop finishes the {run.kind === "auto_collect" ? "cycle" : "trial"} in
             flight and parks holding the peg, so the next run starts from a state the loop expects.
-            Halting now does not.
+            Halting now does not. If a halted run is still here a few seconds later (stuck in the
+            robot driver), press Halt now again: the second press kills the process outright.
           </p>
         </section>
       ) : null}

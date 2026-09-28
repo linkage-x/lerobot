@@ -311,3 +311,17 @@ def test_an_answered_or_dead_question_asks_for_nothing(tmp_path):
         request_grade(tmp_path, "terminal_trials_H", "in")
     _make_run(tmp_path, "terminal_trials_I", pid=DEAD_PID, rows=[question])
     assert read_run(tmp_path, "terminal_trials_I")["needsGrade"] is False
+
+
+def test_a_second_halt_kills_a_run_that_did_not_answer_the_first(tmp_path, monkeypatch):
+    import signal
+    import tools.data_collection_gui.unattended as unattended
+
+    sent = []
+    # Signal 0 is the liveness probe; only the real ones are the brake.
+    monkeypatch.setattr(unattended.os, "kill", lambda pid, sig: sig and sent.append(sig))
+    run_dir = _make_run(tmp_path, "terminal_trials_K", pid=os.getpid(), rows=[_trial(0)])
+    request_stop(tmp_path, "terminal_trials_K", mode="now")
+    request_stop(tmp_path, "terminal_trials_K", mode="now")
+    assert sent == [signal.SIGINT, signal.SIGKILL]
+    assert (run_dir / "HALT").exists()

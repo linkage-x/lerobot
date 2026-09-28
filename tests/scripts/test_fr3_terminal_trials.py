@@ -789,14 +789,18 @@ def test_a_reflex_ends_the_run_where_it_stands_with_nobody_asked(monkeypatch):
     assert summary["parked"] is False and moves == [] and asked == []
 
 
-def test_a_run_that_starts_holding_the_peg_does_not_fetch_it_again(capsys):
+def test_a_peg_left_in_the_fingers_is_set_down_at_the_pick_and_taken_anew(capsys):
+    """09-28 16:39: a grip left over from a crashed run met the fixture 20 mm high and the peg
+    was pressed out of the fingers. The run makes its own grip before the first trial."""
+
     robot = FakeTrialRig(hole_xy=SEATED[:2], held=True)
     robot.gripper = FakeTrialRig.PEG_WIDTH
     summary = run_terminal_trials(robot, _request(offsetsMm=(0.0,), repeats=1, controlEvery=100))
     start = next(row for row in summary["rows"] if row.get("stage") == "start")
     assert start["graspVerdict"] == "held"
     names = _step_names(capsys.readouterr().out)
-    assert names.count("descend_8cm_to_pick") == 0 or names.index("descend_8cm_to_pick") > names.index("align_above_target")
+    assert names[:3] == ["descend_8cm_to_place", "descend_8cm_to_pick", "close_gripper"]
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
 
 
 def test_two_capped_presses_in_a_row_stop_the_run_before_a_third(monkeypatch):

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import os
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -61,7 +62,7 @@ from tools.fr3.terminal_servo import (
     TerminalServoRequest,
     parse_terminal_servo_pose,
 )
-from tools.fr3.scene_reset import set_force_trace_path
+from tools.fr3.scene_reset import control_loop_alive, set_force_trace_path
 from tools.fr3.terminal_trials import (
     TERMINAL_TRIAL_MAX_TILT_DEG,
     FileGradeGate,
@@ -464,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             _park(robot, request)
             print("[INFO] terminal_trials=homing", flush=True)
             robot.move_to_start()
+        loop_died = False
         ask_grade = None
         if request.operatorGrade:
             ask_grade = FileGradeGate(
@@ -481,7 +483,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         finally:
             set_force_trace_path(None)
-            robot.disconnect()
+            # After a reflex the controller is gone, and stopping it blocks for good: 09-28 16:40
+            # a run wrote its summary and then hung here, deaf to both brakes on the page.
+            if control_loop_alive(robot):
+                robot.disconnect()
+            else:
+                loop_died = True
+                print("[WARN] terminal_trials=control_loop_dead skipping_disconnect=1 -- clear the "
+                      "reflex on the robot before the next run", flush=True)
 
     print(f"[INFO] terminal_trials=done halted_on={summary['haltedOn']} "
           f"trials={summary['trials']} seated={summary['seated']} out={out_path}", flush=True)
@@ -519,6 +528,11 @@ def main(argv: list[str] | None = None) -> int:
             f"p_seat={'n/a' if fraction is None else f'{fraction:.2f}'}",
             flush=True,
         )
+    if loop_died:
+        # Interpreter shutdown would run the same controller teardown and hang the same way.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     return 0 if summary["ok"] else 1
 
 
