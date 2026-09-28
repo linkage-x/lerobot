@@ -204,8 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--match-px", type=float, default=8.0,
                     help="a fingerprint farther than this matches nothing")
     ap.add_argument("--write-expected", type=Path, default=None,
-                    help="write port -> serial for every port whose factory intrinsics match "
-                         "--intrinsics' camera on that same port (camera_identity_expected.json)")
+                    help="write calibrated camera -> serial, each found by its factory "
+                         "intrinsics on whatever port it is on now (camera_identity_expected.json)")
     args = ap.parse_args(argv)
     if args.write_expected and not args.intrinsics:
         ap.error("--write-expected needs --intrinsics: a port is only vouched for once its "
@@ -246,29 +246,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         args.json.write_text(json.dumps({"modules": rows}, indent=2))
     if args.write_expected:
-        ports = {
-            r["camera_name"]: r["serial"] for r in rows
-            if r["serial"] and r["calibrated_match"] and r["calibrated_match"]["same_port"]
-        }
-        refused = sorted(
-            r["camera_name"] for r in rows
-            if r["answered"] and r["camera_name"] in calibrated and r["camera_name"] not in ports
-        )
-        unread = sorted(
-            name for name in calibrated if name not in {r["camera_name"] for r in rows if r["answered"]}
+        # The table is "which serial each calibrated camera was", found by
+        # fingerprint wherever that camera is plugged in now -- so the gateway
+        # can say where a camera went, not only that a port changed.
+        ports: dict[str, str] = {}
+        claims: dict[str, list[str]] = {}
+        for r in rows:
+            hit = r["calibrated_match"]
+            if r["serial"] and hit and hit["camera"]:
+                claims.setdefault(hit["camera"], []).append(r["serial"])
+        for cam, serials in claims.items():
+            if len(serials) == 1:
+                ports[cam] = serials[0]
+        ambiguous = sorted(c for c, v in claims.items() if len(v) > 1)
+        unread = sorted(name for name in calibrated if name not in claims)
+        moved = sorted(
+            f"{cam}->{r['camera_name']}" for r in rows
+            for cam in [(r["calibrated_match"] or {}).get("camera")]
+            if cam and cam in ports and cam != r["camera_name"]
         )
         args.write_expected.write_text(json.dumps({
             "calibration": args.intrinsics.name,
             "generated_utc": datetime.now(UTC).isoformat(timespec="seconds"),
             "match_px": args.match_px,
-            "ports": ports,
-            # Calibrated ports this could not vouch for: another camera is on
-            # them, or they did not answer. Not enforced, listed so it is seen.
-            "not_vouched": {"other_camera": refused, "unread": unread},
+            "ports": dict(sorted(ports.items())),
+            # Calibrated cameras this could not tie to a serial: not plugged in,
+            # silent, or two modules claimed them. Not enforced; listed so it is seen.
+            "not_identified": {"unread": unread, "ambiguous": ambiguous},
         }, indent=2) + "\n")
-        print(f"wrote {args.write_expected}: {len(ports)} ports"
-              + (f"; other camera on {', '.join(refused)}" if refused else "")
-              + (f"; unread {', '.join(unread)}" if unread else ""))
+        print(f"wrote {args.write_expected}: {len(ports)} calibrated cameras identified"
+              + (f"; now on another port: {', '.join(moved)}" if moved else "")
+              + (f"; not found: {', '.join(unread)}" if unread else "")
+              + (f"; ambiguous: {', '.join(ambiguous)}" if ambiguous else ""))
     return 0
 
 
