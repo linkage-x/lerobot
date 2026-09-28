@@ -40,6 +40,7 @@ run can command against the fence and the arm's own reach, and touches nothing.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -352,6 +353,10 @@ def _default_out_path(request: TerminalTrialsRequest) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 09-28 16:31:50: a run died between two trials with no traceback and no summary, the
+    # signature of a crash inside a native extension (panda_py, the Pika SDK, the IK). This
+    # prints every thread's Python stack to run.log when that happens again.
+    faulthandler.enable(all_threads=True)
     args = parse_args(argv)
     request = build_request(args)
     schedule = build_trial_schedule(request)
