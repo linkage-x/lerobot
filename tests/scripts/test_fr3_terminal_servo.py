@@ -378,6 +378,18 @@ def test_the_wrist_angle_is_reported_rather_than_commanded():
     assert {(a["ee.wx"], a["ee.wy"], a["ee.wz"]) for a in robot.actions} == {(0.98, 0.05, -0.02)}
 
 
+def test_a_caller_that_holds_an_orientation_gets_it_sent_and_the_reading_reported():
+    """A loop re-sending each handoff's reading re-sends the wrist's sag and adds another."""
+
+    robot = _descending(0.118)
+    robot.rotvec = (0.98, 0.05, -0.02)
+    result = execute_terminal_servo(robot, _request(), commanded_rotvec=(1.0, 0.0, 0.0))
+    assert result["handoffRotvec"] == pytest.approx([0.98, 0.05, -0.02])
+    assert result["commandedRotvec"] == pytest.approx([1.0, 0.0, 0.0])
+    assert {(a["ee.wx"], a["ee.wy"], a["ee.wz"]) for a in robot.actions} == {(1.0, 0.0, 0.0)}
+    assert result["stoppedAtRotvec"] == pytest.approx([1.0, 0.0, 0.0])
+
+
 # --- what is refused before the arm moves ------------------------------------------------------
 
 

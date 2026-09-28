@@ -316,19 +316,60 @@ def tool_axis_tilt_deg(rotvec: tuple[float, float, float]) -> float:
     `e3 cos t + (k x e3) sin t + k (k . e3)(1 - cos t)`.
     """
 
+    axis_z = _tool_axis(rotvec)
+    # Sign-free: a tool pointing down is as level as one pointing up, and this loop's tool points
+    # down. What is being asked is how far the axis leans, not which way along it the peg sits.
+    return math.degrees(math.acos(min(1.0, abs(axis_z[2]))))
+
+
+def _tool_axis(rotvec: tuple[float, float, float]) -> tuple[float, float, float]:
     angle = math.sqrt(sum(value * value for value in rotvec))
     if angle <= 0.0:
-        return 0.0
+        return (0.0, 0.0, 1.0)
     kx, ky, kz = (value / angle for value in rotvec)
     sin_t, cos_t = math.sin(angle), math.cos(angle)
-    axis_z = (
+    return (
         ky * sin_t + kx * kz * (1.0 - cos_t),
         -kx * sin_t + ky * kz * (1.0 - cos_t),
         cos_t + kz * kz * (1.0 - cos_t),
     )
-    # Sign-free: a tool pointing down is as level as one pointing up, and this loop's tool points
-    # down. What is being asked is how far the axis leans, not which way along it the peg sits.
-    return math.degrees(math.acos(min(1.0, abs(axis_z[2]))))
+
+
+def _quaternion(rotvec: tuple[float, float, float]) -> tuple[float, float, float, float]:
+    """(w, x, y, z) of a rotation vector."""
+
+    angle = math.sqrt(sum(value * value for value in rotvec))
+    if angle <= 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    scale = math.sin(0.5 * angle) / angle
+    return (math.cos(0.5 * angle), rotvec[0] * scale, rotvec[1] * scale, rotvec[2] * scale)
+
+
+def orientation_from_anchor(
+    anchor: tuple[float, float, float], rotvec: tuple[float, float, float]
+) -> dict[str, float]:
+    """How far `rotvec` has turned from `anchor`, split into lean and twist, in degrees.
+
+    `tiltDeg` is the angle between the two tool axes: what moves a held peg's tip sideways and
+    what wedges it. `yawDeg` is the signed turn about the anchor's own tool axis, the swing-twist
+    split of anchor^-1 * rotvec; a round peg does not care about it, but the wrist's last joint
+    is the softest in the arm and this is where its sag shows first.
+    """
+
+    a = _tool_axis(anchor)
+    b = _tool_axis(rotvec)
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, sum(p * q for p, q in zip(a, b))))))
+    aw, ax, ay, az = _quaternion(anchor)
+    bw, bx, by, bz = _quaternion(rotvec)
+    # conj(a) * b
+    rw = aw * bw + ax * bx + ay * by + az * bz
+    rz = aw * bz - az * bw - ax * by + ay * bx
+    yaw = math.degrees(2.0 * math.atan2(rz, rw))
+    if yaw > 180.0:
+        yaw -= 360.0
+    elif yaw <= -180.0:
+        yaw += 360.0
+    return {"tiltDeg": tilt, "yawDeg": yaw}
 
 
 def assert_tool_is_level(rotvec: tuple[float, float, float], request: TerminalTrialsRequest) -> float:
@@ -425,7 +466,9 @@ def _holds_something(width: float, request: TerminalTrialsRequest) -> bool:
     return request.graspFloor <= float(width) < TERMINAL_TRIAL_OPEN_ABOVE
 
 
-def _stow(robot: Any, request: TerminalTrialsRequest) -> None:
+def _stow(
+    robot: Any, request: TerminalTrialsRequest, rotvec: tuple[float, float, float] | None = None
+) -> None:
     """Put a held peg back where runs fetch it from, and let go, before the process exits.
 
     The gripper driver's disconnect disables the motor, so whatever the fingers hold when the run
@@ -436,7 +479,8 @@ def _stow(robot: Any, request: TerminalTrialsRequest) -> None:
 
     if request.pickXyz is None:
         return
-    xyz, rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    xyz, measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    rotvec = measured_rotvec if rotvec is None else rotvec
     if not _holds_something(gripper, request):
         return
     pick = tuple(request.pickXyz)
@@ -452,14 +496,17 @@ def _stow(robot: Any, request: TerminalTrialsRequest) -> None:
     print("[INFO] terminal_trials=stowed peg_left_at_pick=1", flush=True)
 
 
-def _park(robot: Any, request: TerminalTrialsRequest) -> None:
+def _park(
+    robot: Any, request: TerminalTrialsRequest, rotvec: tuple[float, float, float] | None = None
+) -> None:
     """Leave the arm at carrying height wherever it is, still holding whatever it holds.
 
     Deliberately not "open the fingers and go home". A run that stopped because it could not
     read its own state is the worst moment to drop a peg on a fixture nobody is watching.
     """
 
-    xyz, rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    xyz, measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    rotvec = measured_rotvec if rotvec is None else rotvec
     hold_z = _hold_z(request)
     if xyz[2] >= hold_z:
         return
@@ -615,6 +662,14 @@ def run_terminal_trials(
     # property of the poses it will visit: a leaning run passes every reach and fence test and
     # still measures the wrong thing.
     preflight_tilt_deg = assert_tool_is_level(preflight_rotvec, request)
+    # Every pose this run sends carries this one orientation, never one read back from the arm.
+    # The controller is a joint PD with no integral term, so under the wrist's unmodelled load
+    # the measured pose sits a few tenths of a degree off the command; re-sending the reading
+    # re-sends the sag and the next reading sags again. 09-28, four runs: the side force at the
+    # bottom of each landing grew every trial (fx 0 -> +3 N) at an unchanged landing point, and
+    # at trial 11-13 the tool kicked 2-3 mm sideways and the press capped; only a new run, which
+    # homes, reset it. Taken here, after the runtime's homing and the level check it just passed.
+    anchor_rotvec = tuple(float(value) for value in preflight_rotvec)
     workspace_min, workspace_max = _robot_workspace_bounds(robot)
     # Run-level QC lives here rather than in the caller so that no entry point can skip it. It
     # raises, and an unattended run that cannot reach its widest offset should never have been
@@ -645,7 +700,7 @@ def run_terminal_trials(
             on_row(row)
 
     try:
-        _, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
+        rotvec = anchor_rotvec
         start_attempts = 1
         if request.pickXyz is not None:
             width, verdict, start_attempts = _grasp_until_held(
@@ -690,7 +745,6 @@ def run_terminal_trials(
                 halted = "stop_requested"
                 break
 
-            _, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
             servo = _servo_for(request, spec, state.referenceXyz)
             grade: dict[str, Any] = {}
 
@@ -718,9 +772,10 @@ def run_terminal_trials(
                 return grade["answer"] == "in"
 
             if request.operatorGrade:
-                result = execute_terminal_servo(robot, servo, release_gate=release_gate)
+                result = execute_terminal_servo(robot, servo, release_gate=release_gate,
+                                                commanded_rotvec=anchor_rotvec)
             else:
-                result = execute_terminal_servo(robot, servo)
+                result = execute_terminal_servo(robot, servo, commanded_rotvec=anchor_rotvec)
             if result.get("controlLoopDied"):
                 emit({"kind": "trial", "index": spec.index, "trialKind": spec.kind, "ok": False,
                       "error": result.get("error"), "controlLoopDied": True,
@@ -794,6 +849,28 @@ def run_terminal_trials(
                 "pressCapped": bool(result.get("pressCapped", False)),
                 "elapsedS": time.perf_counter() - started,
             }
+            # How far the wrist is from the anchor it is being sent: at the handoff, in free air
+            # with the peg's weight on it, and at the stop, under the press. With the anchor held
+            # both should stay flat across a run; a climb means something else is turning it.
+            for where, key in (("handoff", "handoffRotvec"), ("stop", "stoppedAtRotvec")):
+                measured = result.get(key)
+                if measured is None:
+                    continue
+                row[f"{where}Rotvec"] = [float(value) for value in measured]
+                turned = orientation_from_anchor(anchor_rotvec, tuple(float(v) for v in measured))
+                row[f"{where}TiltFromAnchorDeg"] = turned["tiltDeg"]
+                row[f"{where}YawFromAnchorDeg"] = turned["yawDeg"]
+                row[f"{where}ToolTiltDeg"] = tool_axis_tilt_deg(tuple(float(v) for v in measured))
+            if "stopTiltFromAnchorDeg" in row:
+                print(
+                    f"[INFO] terminal_trials_orientation trial={spec.index:03d} "
+                    f"handoff_tilt_deg={row.get('handoffTiltFromAnchorDeg', float('nan')):.3f} "
+                    f"handoff_yaw_deg={row.get('handoffYawFromAnchorDeg', float('nan')):+.3f} "
+                    f"stop_tilt_deg={row['stopTiltFromAnchorDeg']:.3f} "
+                    f"stop_yaw_deg={row['stopYawFromAnchorDeg']:+.3f} "
+                    f"stop_tool_tilt_deg={row['stopToolTiltDeg']:.3f}",
+                    flush=True,
+                )
             if request.operatorGrade:
                 row["operatorGrade"] = grade.get("answer")
 
@@ -908,7 +985,8 @@ def run_terminal_trials(
                 break
             # 09-28, twice at the same trial count: seats pressed -8 to -15 N for eleven trials,
             # then the tool kicked 3 mm sideways at -21 and -25 N and the third one tripped the
-            # reflex. Cause not known yet; two capped presses in a row is that pattern starting,
+            # reflex. Suspected cause: the orientation ratchet `anchor_rotvec` now prevents, not
+            # yet confirmed on the arm; two capped presses in a row is that pattern starting,
             # and the peg should be looked at before it is pressed a third time.
             if state.cappedRun >= 2:
                 halted = "press_capped_twice"
@@ -965,9 +1043,9 @@ def run_terminal_trials(
             # Every command from here would go to a controller that is not there. The arm stays
             # where the reflex stopped it until a person clears it and starts the next run.
             raise RuntimeError("control loop died; not parking")
-        _park(robot, request)
+        _park(robot, request, anchor_rotvec)
         parked = True
-        _stow(robot, request)
+        _stow(robot, request, anchor_rotvec)
     except Exception as exc:  # noqa: BLE001 - the summary has to survive a failed park
         parked = False
         print(f"[WARN] terminal_trials=park_failed details={exc}", flush=True)
@@ -986,6 +1064,7 @@ def run_terminal_trials(
         # Recorded, not merely checked. Two runs that disagree are worth being able to ask this
         # of afterwards, and it is not recoverable from anything else in the file.
         "toolTiltDeg": preflight_tilt_deg,
+        "anchorRotvec": list(anchor_rotvec),
         "referenceXyz": list(state.referenceXyz),
         "referenceUpdates": state.referenceUpdates,
         "graspReference": state.graspReference,

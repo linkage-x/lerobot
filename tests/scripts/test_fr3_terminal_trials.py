@@ -27,6 +27,7 @@ from tools.fr3.terminal_trials import (
     TerminalTrialsRequest,
     build_trial_schedule,
     classify_stop,
+    orientation_from_anchor,
     run_terminal_trials,
     summarize_by_offset,
     validate_terminal_trials,
@@ -352,11 +353,11 @@ def test_a_servo_that_refuses_its_own_qc_ends_the_run_with_the_reason_on_the_row
     calls = {"n": 0}
     real = terminal_trials.execute_terminal_servo
 
-    def fail_on_the_second(robot_arg, servo_request):
+    def fail_on_the_second(robot_arg, servo_request, **kw):
         calls["n"] += 1
         if calls["n"] == 2:
             return {"ok": False, "error": "trajectory_qc_failed: contrived"}
-        return real(robot_arg, servo_request)
+        return real(robot_arg, servo_request, **kw)
 
     terminal_trials.execute_terminal_servo = fail_on_the_second
     try:
@@ -946,3 +947,55 @@ def test_the_runtime_wires_the_descent_speed_and_keeps_the_modules_own_default()
     )
     slowed = build_request(parse_args(base + ["--descent-speed-ms", "0.01"])).servo
     assert slowed.maxSpeedMs == pytest.approx(0.01)
+
+
+# --- the wrist orientation ---------------------------------------------------------------------
+
+
+def test_a_lean_and_a_twist_are_told_apart_against_the_anchor():
+    down = _rotvec_leaning(0.0)
+    leaned = orientation_from_anchor(down, _rotvec_leaning(2.0))
+    assert leaned["tiltDeg"] == pytest.approx(2.0, abs=1e-6)
+    assert leaned["yawDeg"] == pytest.approx(0.0, abs=1e-6)
+    # The same tool turned 5 degrees about its own axis: anchor * Rz(5 deg), worked by hand.
+    half = math.radians(5.0) / 2.0
+    twisted = tuple(math.pi * value for value in (math.cos(half), -math.sin(half), 0.0))
+    turned = orientation_from_anchor(down, twisted)
+    assert turned["tiltDeg"] == pytest.approx(0.0, abs=1e-6)
+    assert turned["yawDeg"] == pytest.approx(5.0, abs=1e-6)
+    assert orientation_from_anchor(down, down) == pytest.approx({"tiltDeg": 0.0, "yawDeg": 0.0}, abs=1e-6)
+
+
+class SaggingWrist(FakeTrialRig):
+    """A joint PD with no integral term: the wrist settles a fixed angle short of every command.
+
+    A loop that sends back what it reads adds that angle again on every re-send, which is the
+    ratchet this rig exists to catch.
+    """
+
+    SAG_RAD = math.radians(0.2)
+
+    def send_action(self, action):
+        result = super().send_action(action)
+        self.rotvec = (self.rotvec[0] - self.SAG_RAD, self.rotvec[1], self.rotvec[2])
+        return result
+
+
+def test_every_pose_of_a_run_carries_the_orientation_it_started_level_at(capsys):
+    """09-28: four runs whose landing side force grew every trial until trial 11-13 jammed."""
+
+    robot = SaggingWrist(hole_xy=SEATED[:2])
+    robot.rotvec = _rotvec_leaning(0.0)
+    summary = run_terminal_trials(robot, _request(offsetsMm=(0.0,), repeats=6, controlEvery=100,
+                                                  regripInPlace=True))
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    assert summary["anchorRotvec"] == pytest.approx(list(_rotvec_leaning(0.0)))
+    assert {(a["ee.wx"], a["ee.wy"], a["ee.wz"]) for a in robot.actions} == {_rotvec_leaning(0.0)}
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert len(trials) == 7  # the reference, then the six
+    # One sag and never two: flat across the run, which is what the log is there to show.
+    for row in trials:
+        assert row["stopTiltFromAnchorDeg"] == pytest.approx(0.2, abs=1e-6)
+        assert row["handoffTiltFromAnchorDeg"] == pytest.approx(0.2, abs=1e-6)
+        assert row["stopYawFromAnchorDeg"] == pytest.approx(0.0, abs=1e-6)
+    assert capsys.readouterr().out.count("terminal_trials_orientation trial=") == 7

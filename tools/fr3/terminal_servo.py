@@ -518,7 +518,7 @@ def descend_until_refused(
     delay itself so it stays visible in the log rather than being inferred from a stop.
     """
 
-    commanded, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    commanded, current_rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
     start_z = float(commanded[2])
     max_step_m = request.maxSpeedMs * request.controlPeriodS
     started = time.perf_counter()
@@ -560,6 +560,9 @@ def descend_until_refused(
             "pressCapped": unload_z is not None,
             "stoppedOn": reason,
             "stoppedAtXyz": list(current_xyz),
+            # Measured, under whatever the press is doing to the wrist: what a peg that will not
+            # go home is leaning at, as opposed to what it was told to lean at.
+            "stoppedAtRotvec": [float(value) for value in current_rotvec],
             "heldUpMm": 1000.0 * held_up_m,
             "heldUpGrowthMm": 1000.0 * growth_m,
             "peakGrowthMm": 1000.0 * peak_growth_m,
@@ -583,7 +586,7 @@ def descend_until_refused(
         commanded = _step_toward(commanded, target_xyz, max_step_m)
         sent = commanded if unload_z is None else (commanded[0], commanded[1], max(commanded[2], unload_z))
         _send_absolute(robot, sent, rotvec, gripper)
-        current_xyz, _current_rotvec, _current_gripper = _observation_xyz_rotvec_gripper(robot)
+        current_xyz, current_rotvec, _current_gripper = _observation_xyz_rotvec_gripper(robot)
         if not control_loop_alive(robot):
             trace.flush("control_loop_died")
             raise ControlLoopDiedError(
@@ -761,6 +764,7 @@ def execute_terminal_servo(
     request: TerminalServoRequest,
     *,
     release_gate: Callable[[dict[str, Any]], bool] | None = None,
+    commanded_rotvec: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Take the arm off the policy and drive the last centimetres to the fixed pose.
 
@@ -780,9 +784,16 @@ def execute_terminal_servo(
     offset at the same time as the position and make the answer unreadable. The angle to the
     demonstrations is logged so a run can be checked afterwards for having handed over at an
     orientation the demonstrations never used.
+
+    `commanded_rotvec` replaces that reading as the orientation sent, for a caller that holds
+    one fixed across many calls. The reading is the *measured* pose, and the joint PD sags
+    under the wrist's unmodelled load, so a loop that hands each call back the last one's
+    reading re-commands the sag and adds another on top (09-28: four runs whose landing side
+    force grew every trial until trial 11-13 jammed). `handoffRotvec` stays the reading.
     """
 
-    current_xyz, rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    current_xyz, measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    rotvec = measured_rotvec if commanded_rotvec is None else tuple(float(v) for v in commanded_rotvec)
     if request.holdGripper is not None:
         gripper = float(request.holdGripper)
     workspace_min, workspace_max = _robot_workspace_bounds(robot)
@@ -823,7 +834,9 @@ def execute_terminal_servo(
         # commanding the landing jumped the open fingers 1.2 mm sideways and the re-grip closed
         # off-centre on a peg whose foot the hole holds -- a little crooked each time. 09-28,
         # three runs: the seated press grew -8 to -15 N over eleven re-grips and the twelfth could
-        # not be pushed home (the operator saw the peg crooked in the fingers).
+        # not be pushed home (the operator saw the peg crooked in the fingers). This alone did not
+        # cure that: the 17:17 run released here and jammed at trial 13 all the same, its side
+        # force climbing from the first trial -- see `anchor_rotvec` in terminal_trials.
         release_xyz = (stopped_at[0], stopped_at[1], stopped_at[2])
         seated = descent["searchStoppedOn"] == "seated"
         if release_gate is not None:
@@ -868,7 +881,8 @@ def execute_terminal_servo(
             "request": request.payload(),
             "trajectoryQc": qc,
             "handoffXyz": list(current_xyz),
-            "handoffRotvec": list(rotvec),
+            "handoffRotvec": list(measured_rotvec),
+            "commandedRotvec": list(rotvec),
             "lateralErrorMm": 1000.0
             * math.hypot(stopped_at[0] - request.xyz[0], stopped_at[1] - request.xyz[1]),
             "seatedDepthErrorMm": 1000.0 * (stopped_at[2] - request.xyz[2]),
