@@ -717,6 +717,51 @@ def test_an_automatic_seat_the_person_calls_out_is_never_let_go_of_nor_trusted_a
     assert summary["gradeAgreement"] == {"seated_out": 1, "seated_in": 3}
 
 
+def test_a_crooked_peg_is_let_go_of_at_the_hole_set_right_by_hand_and_taken_anew(capsys):
+    robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
+    answers = iter(["in", "reset", "in", "in", "in"])
+
+    class Gate:
+        waited = []
+
+        def __call__(self, trial):
+            return next(answers)
+
+        def wait_for_replacement(self, index):
+            self.waited.append(index)
+            # The person stands the peg back where the run picks from.
+            robot.peg_xyz = PICK
+            return True
+
+    gate = Gate()
+    summary = run_terminal_trials(robot, _graded(), ask_grade=gate)
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    assert gate.waited == [1]
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert [row["operatorGrade"] for row in trials] == ["in", "reset", "in", "in"]
+    assert trials[1]["released"] is True
+    repick = [row for row in summary["rows"] if row.get("stage") == "repick"]
+    assert len(repick) == 1 and repick[0]["graspVerdict"] == "held"
+    out = capsys.readouterr().out
+    # Let go of at the hole without the in-place re-grip, then fetched from the pick point.
+    assert "regrip_after_release" not in out.split("terminal_servo=start request_id=terminal_trials#001")[1].split("terminal_servo=done")[0]
+
+
+def test_the_file_gate_waits_for_the_continue_button_after_a_reset(tmp_path):
+    rows = []
+    grade = tmp_path / "GRADE"
+
+    def sleep(seconds):
+        (tmp_path / "CONTINUE").write_text("continued", encoding="utf-8")
+
+    gate = terminal_trials.FileGradeGate(grade, on_row=rows.append, stop_requested=lambda: False,
+                                         timeout_s=10.0, sleep=sleep)
+    assert gate.wait_for_replacement(4) is True
+    assert rows[0]["kind"] == "needs_operator" and rows[0]["grade"] is False
+    assert rows[-1]["kind"] == "operator" and rows[-1]["continued"] is True
+    assert not (tmp_path / "CONTINUE").exists()
+
+
 def test_nobody_answering_ends_the_run_holding_the_peg():
     robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
     summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: None)

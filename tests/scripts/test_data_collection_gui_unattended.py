@@ -296,7 +296,7 @@ def test_a_grade_question_is_answered_with_in_or_out_and_not_with_continue(tmp_p
     assert run["needsGrade"] is True and run["needsOperator"].startswith("trial 003")
     with pytest.raises(UnattendedError):
         request_continue(tmp_path, "terminal_trials_G")
-    with pytest.raises(UnattendedError, match="'in' or 'out'"):
+    with pytest.raises(UnattendedError, match="'in', 'out' or 'reset'"):
         request_grade(tmp_path, "terminal_trials_G", "maybe")
     request_grade(tmp_path, "terminal_trials_G", "OUT")
     assert (run_dir / "GRADE").read_text() == "out"

@@ -319,6 +319,13 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
                 >
                   不在孔里
                 </button>
+                <button
+                  disabled={busy}
+                  title="夹爪在孔上松开，抬起等你把销摆正插回孔里，点继续后重新取销"
+                  onClick={() => void guard("grade", () => api.gradeUnattendedRun(run.id, "reset"))}
+                >
+                  销歪了，重新摆放
+                </button>
               </div>
             ) : run.needsOperator ? (
               <div
@@ -336,7 +343,7 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
               >
                 <span>
                   <strong>需要你：</strong>
-                  {run.needsOperator}。把销插回取销夹具，手离开工作区后点继续。
+                  {run.needsOperator}。手离开工作区后点继续。
                 </span>
                 <button
                   className="primary"

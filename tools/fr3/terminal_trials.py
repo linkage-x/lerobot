@@ -699,6 +699,8 @@ def run_terminal_trials(
                         "dfzPeakN": descent.get("dfzPeakN"),
                     }
                 )
+                if grade["answer"] == "reset":
+                    return "open"
                 return grade["answer"] == "in"
 
             if request.operatorGrade:
@@ -859,6 +861,31 @@ def run_terminal_trials(
                 # Nobody answered, and the peg was not let go of: stop holding it.
                 halted = "operator_gone"
                 break
+            if request.operatorGrade and row["operatorGrade"] == "reset":
+                # The peg sits crooked in the fingers and no descent will seat it. It has been let
+                # go of at the hole; a person sets it back upright, then it is taken anew.
+                waiter = getattr(ask_grade, "wait_for_replacement", None)
+                if waiter is None or not waiter(spec.index) or request.pickXyz is None:
+                    halted = "operator_gone"
+                    break
+                width, grasp, attempts = _grasp_until_held(
+                    robot, request, tuple(request.pickXyz), rotvec, state.graspReference
+                )
+                state.heldWidth = width
+                emit({"kind": "grasp", "stage": "repick", "index": spec.index,
+                      "widthNormalized": width, "referenceWidth": state.graspReference,
+                      "graspVerdict": grasp, "attempts": attempts,
+                      "pickXyz": list(request.pickXyz)})
+                if grasp != "held":
+                    halted = f"grasp_{grasp}"
+                    break
+                # Run again with the new grip: a crooked peg is not a good-grasp insertion, which
+                # is what step 3 measures, so it does not use up the trial. Nor is it a failure to
+                # find the hole, so the count taken above for an unconfirmed reference is undone.
+                if spec.kind == "reference":
+                    state.referenceFailures = max(0, state.referenceFailures - 1)
+                pending.insert(cursor, spec)
+                continue
 
             if spec.kind == "reference" and not confirmed:
                 if state.referenceFailures >= request.referenceAttempts:
@@ -987,7 +1014,7 @@ class FileGradeGate:
     buttons on, and answered with an `operator` row, which is what takes them away again.
     """
 
-    ANSWERS = ("in", "out")
+    ANSWERS = ("in", "out", "reset")
 
     def __init__(
         self,
@@ -1037,6 +1064,34 @@ class FileGradeGate:
         self.on_row({"kind": "operator", "trial": trial["index"], "grade": answer, "at": time.time()})
         print(f"[INFO] terminal_trials_grade trial={trial['index']:03d} answer={answer or 'none'}", flush=True)
         return answer
+
+    def wait_for_replacement(self, index: int) -> bool:
+        """After "reset": the peg is let go of at the hole; wait for a person to set it upright.
+
+        Answered by the page's continue button (the CONTINUE file beside the grade file), as a
+        lost peg is in the grasp-envelope runs.
+        """
+
+        continue_path = self.grade_path.with_name("CONTINUE")
+        continue_path.unlink(missing_ok=True)
+        message = f"trial {index:03d}: 销已松开。请把销摆正插回孔里"
+        self.on_row({"kind": "needs_operator", "grade": False, "trial": index, "at": time.time(),
+                     "message": message})
+        print(f"[ATTENTION] terminal_trials_needs_operator {message}", flush=True)
+        waited = 0.0
+        answered = False
+        while waited < self.timeout_s:
+            if continue_path.exists():
+                answered = True
+                break
+            if self.stop_requested():
+                break
+            self.sleep(self.poll_s)
+            waited += self.poll_s
+        continue_path.unlink(missing_ok=True)
+        self.on_row({"kind": "operator", "trial": index, "continued": answered, "at": time.time()})
+        print(f"[INFO] terminal_trials_replaced trial={index:03d} continued={int(answered)}", flush=True)
+        return answered
 
 
 class _Halt(Exception):

@@ -766,7 +766,8 @@ def execute_terminal_servo(
 
     `release_gate`, when given, decides whether the fingers open, in place of
     `releaseOnlyWhenSeated`: it is handed the descent (with `seatedDepthErrorMm`) while the peg
-    is still held, so a person can look before anything is let go of.
+    is still held, so a person can look before anything is let go of. True releases (and
+    re-grips in place if asked to), False keeps hold, and "open" releases without re-gripping.
 
     Only the descent is slowed to this module's speed. The lateral leg runs at the reset's
     0.15 m/s because it happens at the handoff height with nothing under it, and so does the
@@ -823,11 +824,15 @@ def execute_terminal_servo(
         release_xyz = (landing[0], landing[1], stopped_at[2])
         seated = descent["searchStoppedOn"] == "seated"
         if release_gate is not None:
-            released = bool(release_gate(
+            decision = release_gate(
                 {**descent, "seatedDepthErrorMm": 1000.0 * (stopped_at[2] - request.xyz[2])}
-            ))
+            )
+            # "open": let go and leave the peg for a person to set right -- no re-grip in place.
+            released = decision is True or decision == "open"
+            regrip = decision is True
         else:
             released = seated or not request.releaseOnlyWhenSeated
+            regrip = released
         retreat_gripper = request.openGripper
         if released:
             _send_absolute(robot, release_xyz, rotvec, request.openGripper)
@@ -836,7 +841,7 @@ def execute_terminal_servo(
             # Still holding it. The trial is over either way -- what the peg does next is not a
             # measurement, it is the next trial's starting condition.
             retreat_gripper = gripper
-        if released and request.regripGripper is not None:
+        if regrip and request.regripGripper is not None:
             regrip_xyz = (
                 release_xyz[0],
                 release_xyz[1],
@@ -863,7 +868,7 @@ def execute_terminal_servo(
             "lateralErrorMm": 1000.0
             * math.hypot(stopped_at[0] - request.xyz[0], stopped_at[1] - request.xyz[1]),
             "seatedDepthErrorMm": 1000.0 * (stopped_at[2] - request.xyz[2]),
-            "regripped": released and request.regripGripper is not None,
+            "regripped": regrip and request.regripGripper is not None,
             "released": released,
             **descent,
         }

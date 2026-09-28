@@ -692,8 +692,8 @@ def request_grade(repo_root: Path, run_id: str, grade: str) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise UnattendedError(f"no such run: {run_id}")
     answer = str(grade or "").strip().lower()
-    if answer not in ("in", "out"):
-        raise UnattendedError("grade must be 'in' or 'out'.")
+    if answer not in ("in", "out", "reset"):
+        raise UnattendedError("grade must be 'in', 'out' or 'reset'.")
     run = read_run(repo_root, run_id, tail=20)
     if not run["needsGrade"]:
         raise UnattendedError("the run is not asking for a grade.")

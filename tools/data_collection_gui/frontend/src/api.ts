@@ -1236,7 +1236,7 @@ export class DataCollectionGuiApi {
     return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/stop", { id, mode });
   }
 
-  async gradeUnattendedRun(id: string, grade: "in" | "out") {
+  async gradeUnattendedRun(id: string, grade: "in" | "out" | "reset") {
     return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/grade", { id, grade });
   }
 
