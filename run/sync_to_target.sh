@@ -116,16 +116,41 @@ normalise_pointers() {
   sed -E 's/#.*$//; s/[[:blank:]]//g; s/["'"'"']//g' | grep -v '^$' | sort
 }
 
+# --- World reference drift -------------------------------------------------
+#
+# world_reference.json / world_graph.json are tracked here but written on the
+# target: the GUI commits a new world there after a recalibration. Mirroring an
+# older copy over it would not just revert a setting -- the recorder stamps every
+# episode with the id in that file, so from then on new episodes would claim a
+# world the cameras are no longer in, with nothing on either side failing.
+#
+# So, unlike the pointers, this is not left to a warning: when the target's
+# reference is newer than this tree's, the two files are left out of this sync
+# (and so kept), and the operator is told to bring them into the checkout.
+# Nothing is refused -- the rest of the tree still deploys.
+world_dir="tools/thor/gmsl2/world"
+extract_world="grep -hoE '\"(world_frame_id|created_utc)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' '$remote_dir/$world_dir/world_reference.json' 2>/dev/null | head -n 2"
+world_field() {
+  # $1 = field name; stdin = the grep output above
+  grep -E "\"$1\"" | head -n 1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
+
 echo "==> Preparing ${remote}:${remote_dir}"
 # The trailing `true` is load-bearing: the probe ends in a bare grep, and on a
 # target that has neither file yet that grep exits 1 -- which would make ssh
 # fail, and `set -e` abort the deploy before it had done anything.
-remote_probe="$(ssh -o ConnectTimeout=5 "$remote" "mkdir -p '$remote_dir'; $extract_schema_version; echo '---POINTERS---'; $extract_pointers; true")"
+remote_probe="$(ssh -o ConnectTimeout=5 "$remote" "mkdir -p '$remote_dir'; $extract_schema_version; echo '---POINTERS---'; $extract_pointers; echo '---WORLD---'; $extract_world; true")"
 # `|| true` on both: with `set -o pipefail`, a grep that matches nothing (a
 # target with neither file yet -- a first deploy) is a failed assignment, and
 # `set -e` would turn that into an aborted deploy.
 remote_schema_version="$(printf '%s\n' "$remote_probe" | sed -n '1,/^---POINTERS---$/p' | grep -v '^---POINTERS---$' | tr -d '[:space:]' || true)"
-remote_pointers="$(printf '%s\n' "$remote_probe" | sed -n '/^---POINTERS---$/,$p' | grep -v '^---POINTERS---$' | normalise_pointers || true)"
+remote_pointers="$(printf '%s\n' "$remote_probe" | sed -n '/^---POINTERS---$/,/^---WORLD---$/p' | grep -vE '^---(POINTERS|WORLD)---$' | normalise_pointers || true)"
+remote_world="$(printf '%s\n' "$remote_probe" | sed -n '/^---WORLD---$/,$p' | grep -v '^---WORLD---$' || true)"
+remote_world_id="$(printf '%s\n' "$remote_world" | world_field world_frame_id || true)"
+remote_world_created="$(printf '%s\n' "$remote_world" | world_field created_utc || true)"
+local_world="$(grep -hoE '"(world_frame_id|created_utc)"[[:space:]]*:[[:space:]]*"[^"]*"' "$local_dir$world_dir/world_reference.json" 2>/dev/null | head -n 2 || true)"
+local_world_id="$(printf '%s\n' "$local_world" | world_field world_frame_id || true)"
+local_world_created="$(printf '%s\n' "$local_world" | world_field created_utc || true)"
 local_pointers="$(grep -hE "$pointer_keys" "$local_dir$tracking_config" 2>/dev/null | normalise_pointers || true)"
 
 if [[ -z "$local_schema_version" ]]; then
@@ -171,6 +196,22 @@ else
   echo "    calibration pointers: match"
 fi
 
+# Both stamps are "%Y-%m-%dT%H:%M:%SZ", so lexicographic order is time order.
+world_excludes=()
+if [[ -n "$remote_world_id" && "$remote_world_id" != "$local_world_id" && "$remote_world_created" > "$local_world_created" ]]; then
+  world_excludes=(--exclude="/$world_dir/world_reference.json" --exclude="/$world_dir/world_graph.json")
+  echo "WARNING: ${target} has a newer world reference than this tree, and it is being KEPT:" >&2
+  echo "           ${target} has: ${remote_world_id} (${remote_world_created})" >&2
+  echo "           this tree: ${local_world_id:-none} (${local_world_created:-none})" >&2
+  echo "         Episodes are stamped from that file; overwriting it would label new data" >&2
+  echo "         with a world the cameras are no longer in. Bring it into this checkout:" >&2
+  echo "           scp ${remote}:${remote_dir}/${world_dir}/{world_reference,world_graph}.json ${world_dir}/" >&2
+elif [[ -n "$remote_world_id" && "$remote_world_id" != "$local_world_id" ]]; then
+  echo "    world reference: this tree's ${local_world_id} replaces ${target}'s older ${remote_world_id}"
+else
+  echo "    world reference: ${local_world_id:-none}, match"
+fi
+
 echo "==> Incrementally replacing files on ${target}..."
 rsync -avz --itemize-changes --delete-delay \
   --exclude='.git/' \
@@ -196,5 +237,6 @@ rsync -avz --itemize-changes --delete-delay \
   --exclude='run/run_vite.sh' \
   --exclude='run/restart_gateway.sh' \
   --exclude='run/logs/' \
+  ${world_excludes[@]+"${world_excludes[@]}"} \
   ${rsync_args[@]+"${rsync_args[@]}"} \
   "$local_dir" "${remote}:${remote_dir}/"

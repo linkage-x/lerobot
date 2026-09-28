@@ -201,7 +201,9 @@ export type PromotionView = {
   visible: boolean;
   headline: string;
   /** Per-camera gauge-free movement, largest first. */
-  rows: { camera: string; baselineMm: string; rotationDeg: string }[];
+  rows: { camera: string; module: string; baselineMm: string; rotationDeg: string }[];
+  /** How the two runs' cameras were matched, said because a port is not a camera. */
+  pairing: string;
   summary: string;
   world: string;
   rmseNote: string;
@@ -214,6 +216,7 @@ export function promotionView(review: CalibrationPromotionReview | undefined): P
     visible: false,
     headline: "",
     rows: [],
+    pairing: "",
     summary: "",
     world: "",
     rmseNote: "",
@@ -232,10 +235,19 @@ export function promotionView(review: CalibrationPromotionReview | undefined): P
     extrinsics?.ok && extrinsics.cameras
       ? extrinsics.cameras.map((row) => ({
           camera: row.camera,
+          module: row.serial
+            ? `…${row.serial.slice(-3)}` + (row.livePort ? `（原在 ${row.livePort}）` : "")
+            : "",
           baselineMm: row.medianBaselineShiftMm.toFixed(2),
           rotationDeg: row.medianRotationDeg.toFixed(3),
         }))
       : [];
+
+  const pairing = !extrinsics?.ok
+    ? ""
+    : extrinsics.pairedBy === "serial"
+      ? "按模组序列号配对：换过端口的相机仍和它自己比，数字就是这台相机真实的移动。"
+      : "按端口配对（至少一份标定没有记录模组序列号）：如果重新接过线，这里比的可能是两台不同的相机。";
 
   let summary = "";
   if (extrinsics?.ok) {
@@ -271,6 +283,7 @@ export function promotionView(review: CalibrationPromotionReview | undefined): P
     visible: true,
     headline: `有一份解算尚未生效：${parts.join("，")}`,
     rows,
+    pairing,
     summary,
     world,
     rmseNote,

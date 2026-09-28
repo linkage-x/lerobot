@@ -576,6 +576,10 @@ export type CalibrationStatus = {
 /** Per-camera difference between two extrinsics runs, in gauge-free terms. */
 export type PromotionCameraRow = {
   camera: string;
+  /** Module serial; empty when the run cannot name its modules. */
+  serial?: string;
+  /** The port this module was on in the live run, when it has changed. */
+  livePort?: string;
   medianBaselineShiftMm: number;
   maxBaselineShiftMm: number;
   medianRotationDeg: number;
@@ -598,6 +602,8 @@ export type ExtrinsicsComparison = {
   live: string;
   candidate: string;
   cameras?: PromotionCameraRow[];
+  /** "serial" when cameras were paired by module; "port" when only cables could be. */
+  pairedBy?: "serial" | "port";
   addedCameras?: string[];
   removedCameras?: string[];
   pairCount?: number;

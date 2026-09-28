@@ -3414,6 +3414,50 @@ def test_freezing_twice_is_refused_because_it_would_be_a_different_world(tmp_pat
     assert "already defines world" in again["error"]
 
 
+def test_committing_an_exported_island_keeps_the_id_the_export_stamped(tmp_path, monkeypatch):
+    """09-28: export, commit and re-freeze each minted an id for one solve, and
+    the episodes (stamped from the reference) would not have matched the
+    calibration they are tracked with."""
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    first = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(first.parent)
+    assert gateway._freeze_world_reference(state)["ok"] is True
+
+    # Every camera moved differently: no stable cluster, so a new island.
+    second = tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json"
+    payload = json.loads(first.read_text(encoding="utf-8"))
+    for index, matrix in enumerate(payload["T_ref_cam"].values()):
+        matrix[index % 3][3] += 0.1 * (index + 1)
+    second.parent.mkdir(parents=True)
+    second.write_text(json.dumps(payload), encoding="utf-8")
+    exported = tmp_path / "outputs" / "calibration" / "calib_b_extrinsics"
+    exported.mkdir(parents=True)
+    (exported / "summary.json").write_text(
+        json.dumps({
+            "source_report": str(second),
+            "world": {
+                "world_frame_id": "world_exported",
+                "parent_world_frame_id": "world_parent",
+                "world_continuity_state": "BROKEN",
+            },
+        }),
+        encoding="utf-8",
+    )
+    state.calibration.outputPath = str(second.parent)
+
+    committed = gateway._register_world(state, apply_result=True, use_rig_check=False)
+    assert committed["ok"] is True, committed.get("error")
+    assert committed["reference"]["world_frame_id"] == "world_exported"
+
+    # And re-freezing the same solve names it the same, parent kept.
+    refrozen = gateway._freeze_world_reference(state, replace=True)
+    assert refrozen["ok"] is True, refrozen.get("error")
+    reference = json.loads((gateway._world_root(state) / "world_reference.json").read_text(encoding="utf-8"))
+    assert reference["world_frame_id"] == "world_exported"
+    assert reference["parent_world_frame_id"] == "world_parent"
+
+
 def _write_rig_check_result(
     state: gateway.GatewayState,
     *,
@@ -5343,6 +5387,19 @@ def test_promotion_writes_the_pointer_and_keeps_the_comments(tmp_path):
     assert "intrinsics_run_name: live_intrinsics" in text
     # And the panel now agrees with the file, without waiting for a restart.
     assert state.calibration.extrinsicsRun == "calib_20260902_103833_extrinsics"
+
+
+def test_promotion_moves_the_carrier_tracker_with_the_april_one(tmp_path):
+    """09-28 left the carrier config on 09-23 while the april one moved on."""
+    state, _ = _promotion_state(tmp_path)
+    carrier = tmp_path / gateway.HYBRID_CARRIER_EE_TRAJECTORY_CONFIG
+    carrier.parent.mkdir(parents=True, exist_ok=True)
+    carrier.write_text(_TRACKING_CONFIG_TEXT, encoding="utf-8")
+
+    assert gateway._promote_calibration(state, ["extrinsics"])["ok"] is True
+    text = carrier.read_text(encoding="utf-8")
+    assert "fixed_camera_run_name: calib_20260902_103833_extrinsics" in text
+    assert "intrinsics_run_name: live_intrinsics" in text
 
 
 def test_promotion_leaves_an_audit_line_carrying_the_evidence(tmp_path):

@@ -3329,6 +3329,34 @@ def _run_world_cli(state: GatewayState, args: list[str], *, timeout: int = 300) 
     return proc.returncode, output.strip()
 
 
+def _exported_island(state: GatewayState, bundle: Path | None) -> dict[str, str]:
+    """The new-island id the exporter already stamped for this bundle, if any.
+
+    The exporter registers a solve before writing it and, on a break, names the
+    island then. Committing or freezing that solve afterwards must reuse the
+    name: on 2026-09-28 export, commit and re-freeze each minted their own id for
+    one solve, and the episodes (stamped from the reference) would have carried a
+    different world than the calibration they are tracked with.
+    """
+    if bundle is None:
+        return {}
+    wanted = str(Path(bundle).resolve())
+    for summary_path in (state.repo_root / "outputs" / "calibration").glob("*_extrinsics/summary.json"):
+        summary = _read_json_file(summary_path) or {}
+        world = summary.get("world") or {}
+        try:
+            same = str(Path(str(summary.get("source_report") or "")).resolve()) == wanted
+        except OSError:
+            same = False
+        if same and world.get("world_continuity_state") == "BROKEN" and world.get("world_frame_id"):
+            return {
+                "world_frame_id": str(world["world_frame_id"]),
+                "parent_world_frame_id": str(world.get("parent_world_frame_id") or ""),
+                "run": summary_path.parent.name,
+            }
+    return {}
+
+
 def _freeze_world_reference(state: GatewayState, *, replace: bool = False) -> dict[str, Any]:
     """Declare the current calibration to be the canonical world.
 
@@ -3354,6 +3382,11 @@ def _freeze_world_reference(state: GatewayState, *, replace: bool = False) -> di
         "--definition",
         "canonical camera-rig world (roadmap 2.4), frozen from " + str(source),
     ]
+    island = _exported_island(state, source if source.name == "extrinsics_report.json" else None)
+    if island:
+        args += ["--world-frame-id", island["world_frame_id"]]
+        if island["parent_world_frame_id"]:
+            args += ["--parent-world-frame-id", island["parent_world_frame_id"]]
     if replace:
         args.append("--replace")
     code, output = _run_world_cli(state, args)
@@ -3409,6 +3442,9 @@ def _register_world(
     if assume_stable:
         args += ["--assume-stable", *assume_stable]
     if apply_result:
+        island = _exported_island(state, bundle)
+        if island:
+            args += ["--island-world-frame-id", island["world_frame_id"]]
         args.append("--apply")
     code, output = _run_world_cli(state, args)
     # Exit code 2 is "continuity broken", which is a verdict rather than a
@@ -3470,6 +3506,9 @@ _TRACKING_CONFIG = (
     Path("third_party") / "opencv_kalibr" / "hikon_cube_tracking_offline"
     / "config_thor" / "april_cube_tracking_in_robot_base_thor.yaml"
 )
+# Trackers that read the same camera rig. Promotion keeps them on the run
+# _TRACKING_CONFIG points at; they are never the authority on what is live.
+_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,)
 
 
 def _load_active_calibration_runs(state: GatewayState) -> None:
@@ -3683,8 +3722,12 @@ def _promotion_review(state: GatewayState, production: dict[str, str]) -> dict[s
     if "extrinsics" in candidates:
         live_run = production.get("extrinsicsRun", "")
         comparison = promotion.compare_runs(
-            promotion.load_run(root / live_run, live_run) if live_run else promotion.RunPoses(),
-            promotion.load_run(root / candidates["extrinsics"], candidates["extrinsics"]),
+            promotion.load_run(root / live_run, live_run, registry=intrinsics_by_serial.REGISTRY)
+            if live_run
+            else promotion.RunPoses(),
+            promotion.load_run(
+                root / candidates["extrinsics"], candidates["extrinsics"], registry=intrinsics_by_serial.REGISTRY
+            ),
         )
         review["extrinsics"] = comparison
         review["extrinsicsBlockers"] = promotion.promotion_blockers(comparison)
@@ -3758,18 +3801,34 @@ def _promote_calibration(
         }
 
     path = state.repo_root / _TRACKING_CONFIG
+    pointers = {kind: candidates[kind] for kind in wanted}
     try:
         original = path.read_text(encoding="utf-8")
-        updated, changes = promotion.rewrite_pointers(
-            original, {kind: candidates[kind] for kind in wanted}
-        )
+        updated, changes = promotion.rewrite_pointers(original, pointers)
     except (OSError, promotion.PointerWriteError) as exc:
         return {"ok": False, "error": f"改写生产配置失败：{exc}"}
     if updated == original:
         return {"ok": False, "error": "生产配置没有变化——指针已经指向这些 run 了"}
 
+    # Every other tracking config reads the same rig. Rewritten first and all
+    # together, so a failure leaves production untouched rather than split
+    # between two calibrations (on 2026-09-28 the carrier config was left on
+    # 09-23 while the april one moved on).
+    followers: list[tuple[Path, str]] = []
+    for extra in _FOLLOWER_TRACKING_CONFIGS:
+        extra_path = state.repo_root / extra
+        if not extra_path.is_file():
+            continue
+        try:
+            text = extra_path.read_text(encoding="utf-8")
+            followers.append((extra_path, promotion.rewrite_pointers(text, pointers)[0]))
+        except (OSError, promotion.PointerWriteError) as exc:
+            return {"ok": False, "error": f"改写 {extra.name} 失败：{exc}"}
+
     try:
         promotion.write_config_atomically(path, updated)
+        for extra_path, text in followers:
+            promotion.write_config_atomically(extra_path, text)
     except OSError as exc:
         return {"ok": False, "error": f"写生产配置失败：{exc}"}
 

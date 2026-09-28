@@ -67,6 +67,7 @@ export function PromotionPanel({
             <thead>
               <tr>
                 <th>相机</th>
+                <th>模组</th>
                 <th>与其余相机的间距变化（中位）</th>
                 <th>相对朝向变化（中位）</th>
               </tr>
@@ -75,6 +76,7 @@ export function PromotionPanel({
               {view.rows.map((row) => (
                 <tr key={row.camera}>
                   <td className="mono">{row.camera}</td>
+                  <td className="mono">{row.module || "—"}</td>
                   <td>{row.baselineMm} mm</td>
                   <td>{row.rotationDeg}°</td>
                 </tr>
@@ -83,6 +85,7 @@ export function PromotionPanel({
           </table>
         </div>
       ) : null}
+      {view.pairing ? <p className={view.pairing.startsWith("按端口") ? "small cali-warn" : "small"}>{view.pairing}</p> : null}
       <p className="small">
         以上都是<b>规范无关</b>的量：相机间距与相对朝向不随整体坐标系变化，所以不需要先对齐两份标定，
         也没有「哪台没动」这个前提。取中位而不是最大值，是因为一台相机独自移动时，
