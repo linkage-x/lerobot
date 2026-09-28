@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
@@ -411,6 +412,11 @@ class TrackerMountSession:
     lastSegmentStartedMono: float = 0.0
     lastSegmentSeconds: float = 0.0
     shortSegments: int = 0
+    # Capture-time geometry per episode index, from the recorder's LT_SEGMENT
+    # lines: the parked point of a dwell, the gain of a pivot. Keyed by index
+    # so a discarded take that is re-recorded replaces its own entry; the
+    # payload keeps only the ones on disk.
+    liveSegments: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -6236,6 +6242,29 @@ def _tracker_mount_session_payload(state: GatewayState) -> dict[str, Any]:
         # what happened on 2026-09-21.
         "recorderState": state.recording.state,
         "episodeInFlight": state.recording.state in _EPISODE_OPEN_STATES,
+        "live": _tracker_mount_live_geometry(session),
+    }
+
+
+def _tracker_mount_live_geometry(session: TrackerMountSession) -> dict[str, Any]:
+    """What the solves will think of the capture so far, while the rig still stands.
+
+    Only segments whose episode is on disk count, so a discarded take drops out.
+    """
+    root = Path(session.captureRoot) / "episodes" if session.captureRoot else None
+    segments = [
+        seg for idx, seg in sorted(session.liveSegments.items())
+        if root is not None and (root / f"episode_{idx:06d}" / "meta.json").is_file()
+    ]
+    points = [tuple(seg["point_mm"]) for seg in segments if seg.get("kind") == "dwell" and seg.get("point_mm")]
+    return {
+        "segments": segments,
+        "station": tracker_geometry.station_geometry(points) if points else None,
+        "thresholds": {
+            "stationMinExtentM": tracker_geometry.STATION_MIN_EXTENT_M,
+            "stationMinPlanarity": tracker_geometry.STATION_MIN_PLANARITY,
+            "pivotMinGain": tracker_geometry.PIVOT_MIN_GAIN,
+        },
     }
 
 
@@ -14167,6 +14196,15 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         return
     if output.startswith("LT_HOMED "):
         state.recording.laserTrackerHomed = output.removeprefix("LT_HOMED ").strip() == "1"
+        return
+    if output.startswith("LT_SEGMENT "):
+        try:
+            seg = json.loads(output.removeprefix("LT_SEGMENT "))
+            idx = int(seg["episode"])
+        except (ValueError, KeyError, TypeError):
+            return
+        if state.tracker_mount_session.active and isinstance(seg, dict):
+            state.tracker_mount_session.liveSegments[idx] = seg
         return
     if output.startswith("LT_BEAM "):
         raw = output.removeprefix("LT_BEAM ").strip()

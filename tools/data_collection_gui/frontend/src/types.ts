@@ -1457,6 +1457,31 @@ export type TrackerMountSession = {
   lastSegmentSeconds?: number;
   segmentMinSeconds?: number;
   segmentSuggestedSeconds?: number;
+  /** Capture-time geometry from each saved segment's tracker samples. */
+  live?: TrackerMountLiveGeometry;
+};
+
+/** One saved segment as the recorder saw it at Stop (LT_SEGMENT). */
+export type TrackerMountLiveSegment = {
+  episode: number;
+  kind: "dwell" | "pivot";
+  n: number;
+  /** dwell: median parked SMR point, tracker frame. */
+  point_mm?: number[];
+  spread_mm?: number;
+  /** pivot: the same weak-direction gain the E1p solve gates on. */
+  gain_min?: number | null;
+  gain_max?: number | null;
+  radius_mm?: number | null;
+  rms_mm?: number | null;
+  span_deg?: number | null;
+  ok?: boolean;
+};
+
+export type TrackerMountLiveGeometry = {
+  segments: TrackerMountLiveSegment[];
+  station: null | { n: number; extent_m: number | null; planarity: number | null; ok: boolean };
+  thresholds: { stationMinExtentM: number; stationMinPlanarity: number; pivotMinGain: number };
 };
 
 /** E1p: production's TCP against the pivot socket the tracker finds. */
@@ -1484,6 +1509,11 @@ export type TrackerPivotReport = {
     gain_min: number;
     center_sigma_norm_mm: number | null;
     center_sigma_weak_mm: number;
+    /** Continuous pivots: delete-one-time-block jackknife (sees the hand-held wander). */
+    center_sigma_jackknife_norm_mm?: number | null;
+    center_sigma_jackknife_weak_mm?: number | null;
+    /** The larger of bootstrap and jackknife -- what certification gates on. */
+    center_sigma_quoted_mm?: number | null;
     /** Continuous pivots only: what the sphere was fitted from. */
     continuous?: {
       n_points: number;

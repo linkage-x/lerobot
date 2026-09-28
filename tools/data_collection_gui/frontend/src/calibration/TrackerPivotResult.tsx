@@ -30,7 +30,10 @@ export function TrackerPivotResult({ report }: { report: TrackerPivotReport }) {
         />
         <Metric label="max" value={fmtMm(report.static_tcp_error_mm.max, 2)} />
         <Metric label="c_TCP 常量误差" value={fmtMm(report.c_tcp_error_norm_mm, 2)} />
-        <Metric label="球窝中心 σ" value={fmtMm(sphere?.center_sigma_norm_mm, 3)} />
+        <Metric
+          label="球窝中心 σ"
+          value={fmtMm(sphere?.center_sigma_quoted_mm ?? sphere?.center_sigma_norm_mm, 3)}
+        />
       </div>
       <p className="cali-muted">
         c_TCP（cube 系）：生产 {mm(report.c_tcp_production_mm)} mm，跟踪仪实测 {mm(report.c_tcp_measured_mm)} mm，
@@ -53,7 +56,14 @@ export function TrackerPivotResult({ report }: { report: TrackerPivotReport }) {
       {sphere && (
         <p className="cali-muted">
           球面半径 {fmtMm(sphere.radius_mm, 1)}，弱方向增益 {sphere.gain_min.toFixed(3)}
-          （绕光束方向侧倾越大越高），弱方向 σ {fmtMm(sphere.center_sigma_weak_mm, 3)}。
+          （绕光束方向侧倾越大越高），弱方向 σ{" "}
+          {fmtMm(sphere.center_sigma_jackknife_weak_mm ?? sphere.center_sigma_weak_mm, 3)}。
+          {sphere.center_sigma_jackknife_norm_mm != null && (
+            <>
+              {" "}球窝 σ 取按时间分块 jackknife（{fmtMm(sphere.center_sigma_jackknife_norm_mm, 3)}）与 bootstrap
+              （{fmtMm(sphere.center_sigma_norm_mm, 3)}）中较大者：手持扫动时支点会游动几秒，bootstrap 看不见。
+            </>
+          )}
           {continuous && (
             <>
               {" "}球面用了 {continuous.n_points_seated} / {continuous.n_points} 个跟踪仪点

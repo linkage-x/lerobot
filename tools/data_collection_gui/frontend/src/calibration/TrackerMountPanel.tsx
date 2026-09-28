@@ -29,6 +29,7 @@ import type {
   TrackerPivotReport,
   TrackerStationReport,
   TrackerValidateResponse,
+  TrackerMountLiveGeometry,
 } from "../types";
 import { Metric, StatusDot } from "../shared/ui";
 import { Modal } from "./ConfirmModal";
@@ -530,9 +531,52 @@ function SessionLine({ session }: { session: TrackerMountSession }) {
           解算时会被丢掉，对应的姿态要重录。
         </p>
       )}
+      {session.live && <LiveGeometryLine session={session} live={session.live} />}
       {session.message && <p className="cali-muted">{session.message}</p>}
       {session.landedPath && <p className="cali-muted">落地于 {session.landedPath}</p>}
     </div>
+  );
+}
+
+/**
+ * The numbers the solve will refuse on, while the rig is still standing.
+ *
+ * 2026-09-24 found out after Disconnect: station extent 0.28 m (< 0.3), pivot
+ * weak-direction gain 0.024 (< 0.05). Both are tracker-only quantities, so the
+ * recorder computes them from each segment's samples at Stop.
+ */
+function LiveGeometryLine({
+  session,
+  live,
+}: {
+  session: TrackerMountSession;
+  live: TrackerMountLiveGeometry;
+}) {
+  const t = live.thresholds;
+  if (session.kind === "pivot") {
+    const last = [...live.segments].reverse().find((s) => s.kind === "pivot");
+    if (!last) return null;
+    const gain = last.gain_min;
+    return (
+      <p className={last.ok ? "cali-muted" : "cali-warn"}>
+        <StatusDot state={last.ok ? "running" : "warning"} /> 上一段 pivot（episode {last.episode}）：弱方向增益{" "}
+        <b>{gain == null ? "—" : gain.toFixed(3)}</b>（认证要 ≥ {t.pivotMinGain}），球冠张角{" "}
+        {last.span_deg == null ? "—" : `${last.span_deg.toFixed(0)}°`}，球面半径 {fmtMm(last.radius_mm, 1)}。
+        {!last.ok && " 不够：绕「跟踪仪→球窝」光束线多滚转（±45° 以上），再录一段。"}
+        <span className="cali-muted"> 预览用的是全部有效点，解算会先剔掉插件抬起的点。</span>
+      </p>
+    );
+  }
+  const st = live.station;
+  if (!st) return null;
+  return (
+    <p className={st.ok ? "cali-muted" : "cali-warn"}>
+      <StatusDot state={st.ok ? "running" : "warning"} /> 已存 {st.n} 个驻点：跨度{" "}
+      <b>{st.extent_m == null ? "—" : `${st.extent_m.toFixed(2)} m`}</b>（要 ≥ {t.stationMinExtentM} m），
+      planarity <b>{st.planarity == null ? "—" : st.planarity.toFixed(3)}</b>（要 ≥ {t.stationMinPlanarity}）。
+      {!st.ok && " 下一个姿态往离已有点最远的地方放，并改变高度。"}
+      <span className="cali-muted"> 预览按每段中位点算，解算会丢掉没停稳的段。</span>
+    </p>
   );
 }
 

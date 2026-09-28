@@ -87,6 +87,7 @@ from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
+from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -130,6 +131,45 @@ BOX_SENSOR_NOMINAL_HZ = {
     "box_six_d_force": 480.0,
 }
 _MIN_HEALTHY_STREAM_HZ = 30.0
+
+
+# Capture intents whose tracker samples the calibration page previews live.
+_TRACKER_GEOMETRY_PROTOCOLS = {
+    "smr_parked_pose_dwell": "dwell",
+    "tcp_pivot_sweep": "pivot",
+}
+
+
+def _emit_tracker_segment_geometry(
+    tracker: Any, tracker_record: dict[str, Any], capture_intent: Any, ep_idx: int
+) -> None:
+    """``LT_SEGMENT <json>``: the segment's parked point, or its pivot gain.
+
+    The solves refuse a thin capture only after Disconnect, when the rig is
+    gone (2026-09-24: station extent 0.28 m, pivot gain 0.024). One more read of
+    the capture PC after the episode has ended, so it costs the cameras nothing;
+    a failure here only loses the preview.
+    """
+    if not isinstance(capture_intent, dict):
+        return
+    kind = _TRACKER_GEOMETRY_PROTOCOLS.get(str(capture_intent.get("protocol") or ""))
+    if kind is None:
+        return
+    try:
+        window = int(round(max(0.0, float(tracker_record.get("t_end_wall_s") or 0.0)
+                               - float(tracker_record.get("t_start_wall_s") or 0.0)) * 1000.0))
+        pts = tracker.segment_points(last_rows=window)
+        out: dict[str, Any] = {"episode": int(ep_idx), "kind": kind, "n": len(pts)}
+        if kind == "dwell" and pts:
+            med = tlg.median_point(pts)
+            out["point_mm"] = [round(v, 3) for v in med]
+            out["spread_mm"] = round(max(math.dist(p, med) for p in pts), 3)
+        elif kind == "pivot":
+            out.update(tlg.pivot_geometry(pts))
+        _emit("LT_SEGMENT " + json.dumps(out, separators=(",", ":")))
+    except Exception as exc:  # noqa: BLE001 -- a preview must never cost the take
+        logger.warning("tracker segment geometry failed: %s", exc)
+
 
 
 def _box_expected_rate_summary() -> str:
@@ -2096,6 +2136,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"Laser tracker streaming ({tracker_record['rt_rows_total_at_stop']} "
                         f"samples so far this session)"
                     )
+                    _emit_tracker_segment_geometry(tracker, tracker_record, capture_intent, ep_idx)
 
             pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -7031,3 +7032,36 @@ def test_gt_comparison_takes_episode_zero(tmp_path, monkeypatch):
     assert result["returncode"] == 0, result.get("error")
     command = seen[0]
     assert command[command.index("--episode") + 1] == "0"
+
+
+def test_tracker_mount_previews_the_station_geometry_as_segments_land(tmp_path):
+    """09-24: the station was refused after Disconnect for an extent of 0.28 m.
+    Each saved dwell's parked point reaches the snapshot, discarded ones do not."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    root = tmp_path / "tm_live" / "tracker_mount"
+    state.tracker_mount_session = gateway.TrackerMountSession(
+        active=True, stage="capture", sessionName="tm_live", captureRoot=str(root)
+    )
+    points = {0: [0.0, 0.0, 0.0], 1: [200.0, 0.0, 0.0], 2: [0.0, 150.0, 60.0], 3: [900.0, 900.0, 900.0]}
+    for idx, pt in points.items():
+        if idx != 3:  # 3 was discarded: no meta.json
+            (root / "episodes" / f"episode_{idx:06d}").mkdir(parents=True)
+            (root / "episodes" / f"episode_{idx:06d}" / "meta.json").write_text("{}")
+        gateway._apply_recorder_output(
+            state, "LT_SEGMENT " + json.dumps({"episode": idx, "kind": "dwell", "n": 400, "point_mm": pt})
+        )
+    gateway._apply_recorder_output(state, "LT_SEGMENT not json")
+
+    live = gateway._tracker_mount_session_payload(state)["live"]
+    assert [s["episode"] for s in live["segments"]] == [0, 1, 2]
+    station = live["station"]
+    assert station["n"] == 3
+    assert station["extent_m"] == pytest.approx(math.dist([200, 0, 0], [0, 150, 60]) * 1e-3)
+    assert station["ok"] is False  # 0.26 m < 0.3 m
+    assert live["thresholds"]["stationMinExtentM"] == 0.3
+
+
+def test_tracker_segment_lines_outside_a_mount_capture_are_ignored(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+    gateway._apply_recorder_output(state, 'LT_SEGMENT {"episode":0,"kind":"pivot","gain_min":0.1}')
+    assert state.tracker_mount_session.liveSegments == {}

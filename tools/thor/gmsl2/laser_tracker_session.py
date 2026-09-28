@@ -676,6 +676,43 @@ class LaserTrackerSession:
             "dist_max_mm": dmax,
         }
 
+    def segment_points(self, *, last_rows: int, max_points: int = 3000) -> list[tuple[float, float, float]]:
+        """x/y/z (mm) of the valid samples among the last ``last_rows``, thinned
+        on the capture PC to at most ``max_points`` so the reply stays small.
+
+        Only for the capture-time geometry preview (``tracker_live_geometry``);
+        the solves read the landed stream. A v2 row whose lock is not yet ranged
+        (``ranged`` column 0) is left out, as the solves leave it out.
+        """
+        if last_rows <= 0:
+            return []
+        budget = (last_rows + 2) * self._BYTES_PER_ROW
+        code = (
+            "import sys;"
+            "f=open(sys.argv[1],'rb');"
+            "f.seek(0,2);n=f.tell();f.seek(max(0,n-int(sys.argv[2])));"
+            "ls=f.read().decode('ascii','replace').splitlines()[1:];"
+            "rs=[l.split(',') for l in ls if l.count(',')>=16][-int(sys.argv[3]):];"
+            "vr=[r for r in rs if r[9].strip() in ('1','true')"
+            " and (len(r)<19 or r[18].strip() in ('1','true'))];"
+            "k=max(1,len(vr)//int(sys.argv[4]));"
+            "print(';'.join(r[6]+' '+r[7]+' '+r[8] for r in vr[::k]))"
+        )
+        res = self._run(
+            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{code}" '
+            f'{self.session_id}.rt.csv {budget} {last_rows} {max(1, int(max_points))}',
+            timeout_s=45,
+        )
+        out: list[tuple[float, float, float]] = []
+        lines = (res.stdout or "").strip().splitlines()
+        for item in (lines[-1].split(";") if lines else []):
+            try:
+                x, y, z = (float(v) for v in item.split())
+            except ValueError:
+                continue
+            out.append((x, y, z))
+        return out
+
     def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:  # noqa: D401
         """Fraction of recent samples that are ``valid`` and ``tracking``."""
         st = self.beam_stats(sample_bytes=sample_bytes)
