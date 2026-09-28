@@ -579,6 +579,48 @@ class FrankaResearch3(Robot):
 
         return self._reach_stall_error_m
 
+    # A running libfranka loop ticks its clock every millisecond and the state reader polls at
+    # 200 Hz, so a clock standing still this long is a loop that has ended, not a slow poll.
+    CONTROL_LOOP_STALL_S = 0.1
+
+    @property
+    def control_loop_alive(self) -> bool:
+        """False once libfranka's control loop has ended (a reflex), whatever the state says.
+
+        After a reflex every reading freezes at its last value, so a caller that only watches the
+        observation sees an arm that is holding still and carries on commanding it. True on a
+        backend that cannot tell -- the MuJoCo twin, the mocks.
+        """
+
+        stalled_s = getattr(self._arm, "control_loop_stalled_s", None)
+        if not callable(stalled_s):
+            return True
+        stalled = stalled_s()
+        return stalled is None or stalled < self.CONTROL_LOOP_STALL_S
+
+    def recover_control_loop(self) -> None:
+        """After a reflex: clear it and hold the arm where it stopped.
+
+        The OTG is re-seeded at the measured joints, not left at its last target: that target is
+        where the arm was being driven when the reflex fired -- into whatever stopped it -- and a
+        restarted controller would push straight back there.
+        """
+
+        recover = getattr(self._arm, "recover", None)
+        if not callable(recover):
+            raise RuntimeError("FR3 arm backend cannot recover its control loop.")
+        otg_enabled = self._otg is not None
+        if otg_enabled:
+            self._stop_otg_loop()
+        self._clear_observation_state_snapshot()
+        recover()
+        joints = np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
+        self._reset_teleop_state()
+        if otg_enabled:
+            self._otg_error = None
+            self._otg.reset(joints)
+            self._start_otg_loop(joints)
+
     @property
     def external_wrench(self) -> tuple[float, ...] | None:
         """libfranka's external wrench estimate on the tool (Fx, Fy, Fz, Tx, Ty, Tz), base frame.

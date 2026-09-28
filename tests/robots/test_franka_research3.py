@@ -3470,3 +3470,89 @@ def test_the_external_wrench_rides_the_joint_state_read_and_is_none_when_not_rep
     assert robot.external_wrench == (0.5, -0.4, 6.2, 0.0, 0.1, 0.0)
     robot._arm = DummyArmDriver()
     assert robot.external_wrench is None
+
+
+def test_a_control_loop_whose_clock_stops_is_reported_dead_and_recovery_restarts_it(monkeypatch):
+    """09-28: a cartesian reflex ended libfranka's loop and get_state() kept handing back the last
+    state -- an arm that looked parked. The controller's clock is what stops."""
+
+    events = []
+
+    class Clocked:
+        def __init__(self):
+            self.t = 0.0
+            events.append("controller")
+
+        def set_control(self, joint_positions):
+            pass
+
+        def get_time(self):
+            return self.t
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.state = types.SimpleNamespace(q=np.zeros(7), robot_mode=types.SimpleNamespace(name="kIdle"))
+
+        def get_state(self):
+            return self.state
+
+        def start_controller(self, controller):
+            events.append("start")
+
+        def stop_controller(self):
+            events.append("stop")
+
+        def recover(self):
+            events.append("recover")
+
+    monkeypatch.setitem(
+        sys.modules, "panda_py", types.SimpleNamespace(Panda=DummyPanda, controllers=types.SimpleNamespace(JointPosition=Clocked))
+    )
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    assert driver.control_loop_stalled_s() is None
+    driver.connect()
+    assert driver.control_loop_stalled_s() < 0.05
+    driver._controller.t = 1.0
+    driver._refresh_joint_positions_cache()
+    time.sleep(0.12)
+    # Nothing has ticked for 120 ms: the loop is gone.
+    assert driver.control_loop_stalled_s() >= 0.1
+
+    driver.recover()
+    assert events == ["controller", "start", "stop", "recover", "controller", "start"]
+    assert driver.control_loop_stalled_s() < 0.05
+
+
+def test_recovery_holds_the_arm_where_it_stopped_rather_than_where_it_was_being_driven(robot):
+    """The OTG's last target is the pose the arm was pushing toward when the reflex fired. A
+    restarted controller left with it would push straight back into whatever stopped it."""
+
+    events = []
+
+    class Recoverable(DummyArmDriver):
+        stalled = 0.0
+
+        def control_loop_stalled_s(self):
+            return self.stalled
+
+        def recover(self):
+            events.append("recover")
+
+    robot.connect()
+    arm = Recoverable()
+    robot._arm = arm
+    assert robot.control_loop_alive
+    arm.stalled = 0.5
+    assert not robot.control_loop_alive
+
+    with robot._otg_target_lock:
+        robot._otg_target_joints = arm.joint_positions + 0.3
+    arm.joint_positions = np.array([0.0, -0.4, 0.0, -2.3, 0.0, 1.9, 0.8])
+    robot.recover_control_loop()
+    assert events == ["recover"]
+    assert np.allclose(robot._otg.reset_calls[-1], arm.joint_positions)
+    with robot._otg_target_lock:
+        assert np.allclose(robot._otg_target_joints, arm.joint_positions)
+    robot._arm = DummyArmDriver()
+    assert robot.control_loop_alive
+    robot.disconnect()

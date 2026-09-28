@@ -193,6 +193,12 @@ class PandaPyArmDriver:
         # a second get_state() per control tick would double the round-trips for a value the
         # reader already has in hand. None on a binding that does not report it.
         self._cached_external_wrench: np.ndarray | None = None
+        # The controller's own clock, and when it was last seen to move. libfranka ends the
+        # control loop on a reflex without anything reaching this process but a log line, and
+        # from then on `get_state()` hands back the last state it had: joints, pose and wrench all
+        # frozen, looking exactly like an arm holding still. The clock is what tells them apart.
+        self._controller_time: float | None = None
+        self._controller_time_advanced_at_s: float | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -340,6 +346,7 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
+        self._note_controller_time(sampled_at_s)
         raw_wrench = getattr(state, "O_F_ext_hat_K", None)
         wrench = None if raw_wrench is None else np.asarray(raw_wrench, dtype=np.float64).reshape(-1)
         with self._state_lock:
@@ -348,6 +355,52 @@ class PandaPyArmDriver:
             if wrench is not None and wrench.size == 6:
                 self._cached_external_wrench = wrench
         return joint_positions
+
+    def _note_controller_time(self, now_s: float) -> None:
+        get_time = getattr(self._controller, "get_time", None)
+        if not callable(get_time):
+            return
+        try:
+            controller_time = float(get_time())
+        except Exception:  # noqa: BLE001 - a clock that cannot be read is not evidence of anything
+            return
+        if self._controller_time is None or controller_time != self._controller_time:
+            self._controller_time = controller_time
+            self._controller_time_advanced_at_s = now_s
+
+    def control_loop_stalled_s(self) -> float | None:
+        """Seconds since the controller's clock last moved; None when it cannot be told.
+
+        A running loop ticks it every millisecond, so anything past a few poll periods means the
+        loop has ended -- on this rig, a `cartesian_reflex` when a finger pressed on the peg top.
+        Read from the state reader's cache; nothing is sent to the arm.
+        """
+        if self._controller_time_advanced_at_s is None:
+            return None
+        self._note_controller_time(time.perf_counter())
+        return max(0.0, time.perf_counter() - self._controller_time_advanced_at_s)
+
+    def recover(self) -> None:
+        """Clear a reflex and start a fresh controller holding the joints where they are.
+
+        libfranka's automatic error recovery, then the same controller start `connect()` makes,
+        seeded from a fresh state read so its first setpoint is the arm's own position. Moves
+        nothing on its own; the caller decides what comes next.
+        """
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        try:
+            self._robot.stop_controller()
+        except Exception as exc:  # noqa: BLE001 - a loop that already ended may refuse to be stopped
+            logger.info("FR3 stop_controller before recovery: %s", exc)
+        self._controller = None
+        self._robot.recover()
+        state = self._robot.get_state()
+        self._assert_arm_accepts_control(state)
+        self._controller_time = None
+        self._controller_time_advanced_at_s = None
+        self._start_controller(state)
+        logger.info("FR3 at %s recovered from a reflex; controller restarted", self.robot_ip)
 
     def get_external_wrench(self) -> np.ndarray | None:
         """The last external wrench estimate (Fx, Fy, Fz, Tx, Ty, Tz; N, Nm; base frame).
