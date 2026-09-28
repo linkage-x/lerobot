@@ -89,6 +89,8 @@ from tools.fr3.terminal_servo import (
 TERMINAL_TRIAL_MAX_TILT_DEG = 2.0
 
 TERMINAL_TRIAL_GRASP_FLOOR = 0.10
+# Above this the fingers are open, not holding: the peg reads ~0.31, open fingers ~1.0.
+TERMINAL_TRIAL_OPEN_ABOVE = 0.6
 # How far a later grasp may sit from the first one of the same run before the loop stops. The
 # first grasp is the reference because the absolute number belongs to the gripper's calibration
 # and the run should not have to be told it. 0.08 normalized is about 7 mm of jaw opening on a
@@ -413,6 +415,12 @@ def _close_and_lift(
     return float(width)
 
 
+def _holds_something(width: float, request: TerminalTrialsRequest) -> bool:
+    """Fingers stopped by something between them: not shut on air, not open."""
+
+    return request.graspFloor <= float(width) < TERMINAL_TRIAL_OPEN_ABOVE
+
+
 def _park(robot: Any, request: TerminalTrialsRequest) -> None:
     """Leave the arm at carrying height wherever it is, still holding whatever it holds.
 
@@ -426,7 +434,7 @@ def _park(robot: Any, request: TerminalTrialsRequest) -> None:
         return
     # Holding something: keep squeezing it. Re-commanding the measured width (0.332 on 09-28,
     # wider than the peg's 0.31) is an open command, and that park let the peg go.
-    if gripper >= request.graspFloor:
+    if _holds_something(gripper, request):
         gripper = request.closedGripper
     _run_step(robot, request, "lift_8cm_after_grasp", (xyz[0], xyz[1], hold_z), rotvec, gripper)
 
@@ -532,6 +540,7 @@ class TrialLoopState:
     graspReference: float | None = None
     heldWidth: float = 0.0
     slipRun: int = 0
+    cappedRun: int = 0
     referenceFailures: int = 0
     seated: int = 0
     completed: int = 0
@@ -607,7 +616,10 @@ def run_terminal_trials(
     try:
         _, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
         start_attempts = 1
-        if request.pickXyz is not None:
+        _, _, start_width = _observation_xyz_rotvec_gripper(robot)
+        # Already holding the peg (a run that stopped holding it): fetching would open the
+        # fingers over the pick point and drop it there.
+        if request.pickXyz is not None and not _holds_something(start_width, request):
             width, verdict, start_attempts = _grasp_until_held(
                 robot, request, tuple(request.pickXyz), rotvec, None
             )
@@ -679,6 +691,12 @@ def run_terminal_trials(
                 result = execute_terminal_servo(robot, servo, release_gate=release_gate)
             else:
                 result = execute_terminal_servo(robot, servo)
+            if result.get("controlLoopDied"):
+                emit({"kind": "trial", "index": spec.index, "trialKind": spec.kind, "ok": False,
+                      "error": result.get("error"), "controlLoopDied": True,
+                      "offsetMm": spec.offsetMm, "aimXyz": list(servo.xyz)})
+                halted = "control_loop_died"
+                break
             if not result.get("ok"):
                 emit(
                     {
@@ -746,6 +764,7 @@ def run_terminal_trials(
                 "fzTareN": result.get("fzTareN"),
                 "dfzPeakN": result.get("dfzPeakN"),
                 "dfzEndN": result.get("dfzEndN"),
+                "pressCapped": bool(result.get("pressCapped", False)),
                 "elapsedS": time.perf_counter() - started,
             }
             if request.operatorGrade:
@@ -755,6 +774,7 @@ def run_terminal_trials(
             if verdict == "seated":
                 state.seated += 1
             state.slipRun = state.slipRun + 1 if verdict == "slip" else 0
+            state.cappedRun = state.cappedRun + 1 if row["pressCapped"] else 0
 
             # A reference trial exists to re-read the hole, so its seating event is where the
             # estimate comes from. The tool is held laterally by the seated peg, so where it
@@ -834,6 +854,13 @@ def run_terminal_trials(
             if state.slipRun >= request.slipStreak:
                 halted = "slip_streak"
                 break
+            # 09-28, twice at the same trial count: seats pressed -8 to -15 N for eleven trials,
+            # then the tool kicked 3 mm sideways at -21 and -25 N and the third one tripped the
+            # reflex. Cause not known yet; two capped presses in a row is that pattern starting,
+            # and the peg should be looked at before it is pressed a third time.
+            if state.cappedRun >= 2:
+                halted = "press_capped_twice"
+                break
 
             if not result.get("released", True):
                 # The servo never let go, so the peg is where it always was: in the fingers.
@@ -882,6 +909,10 @@ def run_terminal_trials(
         halted = f"step_failed: {exc}"
 
     try:
+        if halted == "control_loop_died":
+            # Every command from here would go to a controller that is not there. The arm stays
+            # where the reflex stopped it until a person clears it and starts the next run.
+            raise RuntimeError("control loop died; not parking")
         _park(robot, request)
         parked = True
     except Exception as exc:  # noqa: BLE001 - the summary has to survive a failed park

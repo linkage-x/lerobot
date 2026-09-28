@@ -45,6 +45,7 @@ import time
 from typing import Any, Callable, Iterable
 
 from tools.fr3.scene_reset import (
+    ControlLoopDiedError,
     SceneResetError,
     _ForceTrace,
     _check_reach_along_path,
@@ -58,6 +59,7 @@ from tools.fr3.scene_reset import (
     _send_absolute,
     _step_toward,
     _workspace_bounds,
+    control_loop_alive,
     precise_sleep,
     read_fz,
 )
@@ -272,6 +274,10 @@ class TerminalServoRequest:
     # verdict said "seated" (the operator: out). The next trial wedged, and the park -- still
     # re-commanding a measured 0.332 -- let the peg go. The scripted grasps close to 0.0.
     holdGripper: float | None = None
+    # How hard, in N below the descent's first reading, the descent may press before its setpoint
+    # is moved up to the tool and held there. See `descend_until_refused`. None never caps; a
+    # stretch of all-zero wrench readings leaves it uncapped too, as before.
+    pressCapN: float | None = 16.0
     gripperTolerance: float = 0.08
     controlPeriodS: float = 1.0 / 30.0
     requestId: str = ""
@@ -551,6 +557,7 @@ def descend_until_refused(
             "fzTareN": fz_tare,
             "dfzEndN": None if fz_tare is None or fz_end is None else fz_end - fz_tare,
             "dfzPeakN": None if fz_tare is None else fz_peak_drop,
+            "pressCapped": unload_z is not None,
             "stoppedOn": reason,
             "stoppedAtXyz": list(current_xyz),
             "heldUpMm": 1000.0 * held_up_m,
@@ -563,18 +570,44 @@ def descend_until_refused(
             "settleMm": settle_mm,
         }
 
+    # Where the setpoint is held once the press passes `pressCapN`: at the tool, not below it.
+    # 09-28 (fixed hole): the peg bottomed 1.8-2.7 mm above the target and the descent kept
+    # commanding the target through its 0.5 s settle -- seats read -8 to -14 N, but trials 12-14
+    # reached -19 to -25 N, the tool kicked 3 mm sideways, and trial 14 tripped cartesian_reflex.
+    # A cap rather than always letting off at arrival, because the settle reads a peg sliding in
+    # the jaws by pressing on it (09-10), and below the cap that reading is kept.
+    unload_z: float | None = None
+
     while time.perf_counter() < deadline:
         now = time.perf_counter()
         commanded = _step_toward(commanded, target_xyz, max_step_m)
-        _send_absolute(robot, commanded, rotvec, gripper)
+        sent = commanded if unload_z is None else (commanded[0], commanded[1], max(commanded[2], unload_z))
+        _send_absolute(robot, sent, rotvec, gripper)
         current_xyz, _current_rotvec, _current_gripper = _observation_xyz_rotvec_gripper(robot)
-        trace.sample(float(commanded[2]), current_xyz)
+        if not control_loop_alive(robot):
+            trace.flush("control_loop_died")
+            raise ControlLoopDiedError(
+                f"terminal descent: the FR3 control loop has ended (a reflex); the arm stopped at "
+                f"({current_xyz[0]:+.4f}, {current_xyz[1]:+.4f}, {current_xyz[2]:+.4f})."
+            )
+        trace.sample(float(sent[2]), current_xyz)
         if fz_tare is None:
             fz_tare = read_fz(robot)
         else:
             fz_now = read_fz(robot)
             if fz_now is not None:
                 fz_peak_drop = min(fz_peak_drop, fz_now - fz_tare)
+                if (
+                    unload_z is None
+                    and request.pressCapN is not None
+                    and fz_now - fz_tare <= -request.pressCapN
+                ):
+                    unload_z = float(current_xyz[2])
+                    print(
+                        f"[INFO] terminal_servo_press_capped request_id={request.requestId} "
+                        f"z={unload_z:.4f} dfz_n={fz_now - fz_tare:+.1f}",
+                        flush=True,
+                    )
         # Positive means the tool is sitting above where it was told to be. The sign matters: an
         # arm that overshoots downward is not in contact, and reading |error| here would stop the
         # descent on its own tracking.
@@ -851,6 +884,10 @@ def execute_terminal_servo(
             flush=True,
         )
         return result
+    except ControlLoopDiedError as exc:
+        # Nothing more can be sent, and the caller must not try: no grade, no release, no park.
+        print(f"[WARN] terminal_servo=control_loop_died request_id={request.requestId} details={exc}", flush=True)
+        return {"ok": False, "error": str(exc), "controlLoopDied": True, "request": request.payload()}
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the session
         print(f"[WARN] terminal_servo=failed request_id={request.requestId} details={exc}", flush=True)
         return {"ok": False, "error": str(exc), "request": request.payload()}

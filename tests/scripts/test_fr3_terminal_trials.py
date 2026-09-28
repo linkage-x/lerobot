@@ -777,6 +777,45 @@ def test_a_park_while_holding_keeps_the_fingers_closed():
     assert robot.gripper_commands and set(robot.gripper_commands) == {0.0}
 
 
+def test_a_reflex_ends_the_run_where_it_stands_with_nobody_asked(monkeypatch):
+    moves = []
+    monkeypatch.setattr(terminal_trials, "execute_terminal_servo",
+                        lambda robot, servo, **kw: {"ok": False, "error": "reflex", "controlLoopDied": True})
+    monkeypatch.setattr(terminal_trials, "_park", lambda robot, request: moves.append("park"))
+    robot = FakeTrialRig(hole_xy=SEATED[:2])
+    asked = []
+    summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: asked.append(trial) or "in")
+    assert summary["haltedOn"] == "control_loop_died"
+    assert summary["parked"] is False and moves == [] and asked == []
+
+
+def test_a_run_that_starts_holding_the_peg_does_not_fetch_it_again(capsys):
+    robot = FakeTrialRig(hole_xy=SEATED[:2], held=True)
+    robot.gripper = FakeTrialRig.PEG_WIDTH
+    summary = run_terminal_trials(robot, _request(offsetsMm=(0.0,), repeats=1, controlEvery=100))
+    start = next(row for row in summary["rows"] if row.get("stage") == "start")
+    assert start["graspVerdict"] == "held"
+    names = _step_names(capsys.readouterr().out)
+    assert names.count("descend_8cm_to_pick") == 0 or names.index("descend_8cm_to_pick") > names.index("align_above_target")
+
+
+def test_two_capped_presses_in_a_row_stop_the_run_before_a_third(monkeypatch):
+    real = terminal_trials.execute_terminal_servo
+    calls = []
+
+    def capped_from_the_second(robot, servo, **kw):
+        result = real(robot, servo, **kw)
+        calls.append(servo.requestId)
+        return {**result, "pressCapped": len(calls) >= 2}
+
+    monkeypatch.setattr(terminal_trials, "execute_terminal_servo", capped_from_the_second)
+    robot = FakeTrialRig(hole_xy=SEATED[:2])
+    summary = run_terminal_trials(robot, _request(offsetsMm=(0.0,), repeats=6, controlEvery=100,
+                                                  regripInPlace=True))
+    assert summary["haltedOn"] == "press_capped_twice"
+    assert len(calls) == 3
+
+
 def test_the_file_gate_posts_the_question_and_takes_the_pages_answer(tmp_path):
     rows = []
     grade = tmp_path / "GRADE"

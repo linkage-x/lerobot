@@ -64,6 +64,7 @@ from tools.fr3.scene_reset import set_force_trace_path
 from tools.fr3.terminal_trials import (
     TERMINAL_TRIAL_MAX_TILT_DEG,
     FileGradeGate,
+    _park,
     TerminalTrialsRequest,
     build_trial_schedule,
     describe_schedule,
@@ -452,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.home_first:
             # Before anything reads the orientation: the run inherits whatever pose the arm is
             # in, and home is the one pose known to be level.
+            # Straight up first: the last run may have stopped with the peg down in the hole, and
+            # the home move is a joint-space one that would drag it sideways out of the fixture.
+            print("[INFO] terminal_trials=lifting_before_home", flush=True)
+            _park(robot, request)
             print("[INFO] terminal_trials=homing", flush=True)
             robot.move_to_start()
         ask_grade = None

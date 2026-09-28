@@ -759,3 +759,75 @@ def test_every_landing_carries_its_own_verdict():
     assert len(result["searchAttempts"]) == 9
     assert {attempt["verdict"] for attempt in result["searchAttempts"]} == {"standing"}
 
+
+
+# --- no pressing once down, and a reflex stops everything -------------------------------------
+
+
+class PressedFixtureRobot(FakeFixtureRobot):
+    """A peg bottoming at `floor_z`, read as a force of 10 N per mm the setpoint is below it."""
+
+    def __init__(self, floor_z):
+        super().__init__(floor_z)
+        self.commanded_z = []
+
+    def send_action(self, action):
+        self.commanded_z.append(float(action["ee.z"]))
+        return super().send_action(action)
+
+    @property
+    def external_wrench(self):
+        pressed_mm = 1000.0 * max(0.0, self.floor_z - (self.commanded_z[-1] if self.commanded_z else 1.0))
+        return (0.0, 0.0, 6.0 - 10.0 * pressed_mm, 0.0, 0.0, 0.0)
+
+
+def test_a_press_past_the_cap_moves_the_setpoint_up_to_the_tool():
+    """09-28: bottomed 1.8-2.7 mm above the target and pressed there for 0.5 s -- up to -25 N,
+    the tool kicked sideways, and the fourteenth trial tripped the reflex."""
+
+    floor = SEATED[2] + 0.0025
+    robot = PressedFixtureRobot(floor)
+    robot.xyz = (SEATED[0], SEATED[1], 0.10)
+    result = terminal_servo.descend_until_refused(robot, _request(settleS=0.02), SEATED, (0.0, 0.0, 0.0), 0.0)
+    assert result["stoppedOn"] == "timeout"
+    # 16 N at 10 N/mm is 1.6 mm below the floor; once capped, nothing deeper is sent.
+    assert min(robot.commanded_z) >= floor - 0.0016 - 0.0008
+    assert robot.commanded_z[-1] == pytest.approx(floor)
+    assert result["dfzPeakN"] <= -16.0
+    assert abs(result["stoppedAtXyz"][2] - floor) < 1e-9
+
+
+def test_below_the_cap_or_with_it_off_the_settle_still_presses():
+    """The settle reads a peg sliding in the jaws by pressing on it; a light press is kept."""
+
+    light = PressedFixtureRobot(SEATED[2] + 0.001)  # 10 N at the target, under the 16 N cap
+    light.xyz = (SEATED[0], SEATED[1], 0.10)
+    terminal_servo.descend_until_refused(light, _request(settleS=0.02), SEATED, (0.0, 0.0, 0.0), 0.0)
+    assert light.commanded_z[-1] == SEATED[2]
+    uncapped = PressedFixtureRobot(SEATED[2] + 0.0025)
+    uncapped.xyz = (SEATED[0], SEATED[1], 0.10)
+    terminal_servo.descend_until_refused(
+        uncapped, _request(settleS=0.02, pressCapN=None), SEATED, (0.0, 0.0, 0.0), 0.0
+    )
+    assert uncapped.commanded_z[-1] == SEATED[2]
+
+
+def test_a_reflex_mid_descent_ends_the_servo_without_another_command():
+    class Reflexing(FakeRobot):
+        sends = 0
+
+        @property
+        def control_loop_alive(self):
+            return self.sends < 30
+
+        def send_action(self, action):
+            self.sends += 1
+            return super().send_action(action)
+
+    robot = Reflexing()
+    robot.xyz = (SEATED[0], SEATED[1], 0.08)
+    gate_calls = []
+    result = execute_terminal_servo(robot, _request(), release_gate=lambda d: gate_calls.append(d) or True)
+    assert result["ok"] is False and result["controlLoopDied"] is True
+    assert gate_calls == [], "nobody is asked to grade a descent read off frozen state"
+    assert robot.sends == 30
