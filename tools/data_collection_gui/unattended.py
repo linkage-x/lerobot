@@ -111,6 +111,7 @@ def _plan_terminal_trials(
         regripInPlace=_flag(request, "regripInPlace"),
         releaseOnlyWhenSeated=_flag(request, "releaseOnlyWhenSeated"),
         operatorGrade=_flag(request, "operatorGrade"),
+        updateReference=not _flag(request, "fixedHole"),
         requestId=run_dir.name,
     )
     schedule = build_trial_schedule(trials_request)
@@ -152,6 +153,8 @@ def _plan_terminal_trials(
         argv.append("--release-only-when-seated")
     if trials_request.operatorGrade:
         argv += ["--operator-grade", f"--grade-file={run_dir / 'GRADE'}"]
+    if not trials_request.updateReference:
+        argv.append("--fixed-hole")
     return plan, argv
 
 

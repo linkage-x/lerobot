@@ -749,6 +749,9 @@ def traced_hold(
 def _scene_reset_waits_for_gripper_position(name: str) -> bool:
     # Once the peg is clamped, the measured opening is the peg thickness, not the closed command.
     # Waiting for `closedGripper` would block the lift and carry steps forever on a successful grasp.
+    # The terminal servo's own carry legs, since it holds the peg on the closed command (09-28).
+    if name == "align_above_target" or name.startswith(("search_lift[", "search_transfer[")):
+        return False
     return name not in {
         "close_gripper",
         "lift_8cm_after_grasp",

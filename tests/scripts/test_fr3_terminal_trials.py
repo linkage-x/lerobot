@@ -730,6 +730,53 @@ def test_a_graded_run_without_anybody_to_ask_is_refused():
         run_terminal_trials(robot, _graded())
 
 
+class RecordingGripper(FakeTrialRig):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gripper_commands = []
+
+    def send_action(self, action):
+        self.gripper_commands.append(float(action["gripper.pos"]))
+        return super().send_action(action)
+
+
+def test_the_peg_is_carried_and_pressed_with_the_fingers_told_to_close(capsys):
+    """09-28 trial 021: carried on its measured width, the peg slid ~20 mm up the fingers under
+    -18 N on the face, and the tool reached the seated depth with the peg out of the hole."""
+
+    robot = RecordingGripper(hole_xy=SEATED[:2], capture_m=0.0042)
+    summary = run_terminal_trials(robot, _request(offsetsMm=(0.0,), repeats=1, controlEvery=100,
+                                                  releaseOnlyWhenSeated=True, regripInPlace=True))
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    # Between the start grasp and the end, every command is closed or fully open (the release):
+    # never the 0.31 the fingers read, which a position-controlled gripper takes as "hold still".
+    assert not [value for value in robot.gripper_commands if 0.05 < value < 0.9]
+
+
+def test_a_fixed_hole_is_aimed_at_all_run_while_the_references_still_say_what_they_read():
+    robot = FakeTrialRig(hole_xy=(SEATED[0] + 0.003, SEATED[1]), capture_m=0.0042)
+    summary = run_terminal_trials(
+        robot, _request(offsetsMm=(0.0,), repeats=4, controlEvery=2, searchRingM=0.007,
+                        updateReference=False)
+    )
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    assert summary["referenceXyz"] == list(SEATED)
+    assert summary["referenceUpdates"] == []
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert {tuple(row["aimXyz"]) for row in trials} == {SEATED}
+    references = [row for row in trials if row["trialKind"] == "reference"]
+    assert references and all(row["referenceAccepted"] is False and "referenceReadXyz" in row
+                              for row in references)
+
+
+def test_a_park_while_holding_keeps_the_fingers_closed():
+    robot = RecordingGripper(hole_xy=SEATED[:2], held=True)
+    robot.gripper = 0.332
+    robot.xyz = (SEATED[0], SEATED[1], 0.09)
+    terminal_trials._park(robot, _request())
+    assert robot.gripper_commands and set(robot.gripper_commands) == {0.0}
+
+
 def test_the_file_gate_posts_the_question_and_takes_the_pages_answer(tmp_path):
     rows = []
     grade = tmp_path / "GRADE"

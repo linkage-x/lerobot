@@ -212,6 +212,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="How long to wait for an answer before ending the run holding the peg.",
     )
     parser.add_argument(
+        "--fixed-hole",
+        action="store_true",
+        help=(
+            "Keep aiming at --hole-pose: reference trials record what they read but do not move "
+            "the estimate. On 09-28 five updates walked it 4.6 mm sideways and 7.2 mm up, the "
+            "arm's own offset added once per reference, until an aim missed the hole."
+        ),
+    )
+    parser.add_argument(
         "--home-first",
         action="store_true",
         help="Move to the home keyframe before the first trial. Home is level to 0.05 deg, "
@@ -332,6 +341,7 @@ def build_request(args: argparse.Namespace) -> TerminalTrialsRequest:
         releaseOnlyWhenSeated=bool(args.release_only_when_seated),
         regripDropM=float(args.regrip_drop_mm) / 1000.0,
         operatorGrade=bool(args.operator_grade),
+        updateReference=not bool(args.fixed_hole),
         requestId=f"terminal_trials_{time.strftime('%Y%m%d_%H%M%S')}",
     )
 

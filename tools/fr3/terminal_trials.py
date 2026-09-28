@@ -191,6 +191,12 @@ class TerminalTrialsRequest:
     # answer, not the automatic verdict, also decides whether a reference trial re-reads the
     # hole, since one misread reference moves every trial after it.
     operatorGrade: bool = False
+    # Let a confirmed reference trial move the hole estimate. 09-28: five references walked it
+    # 4.6 mm in x and 7.2 mm up, about -1 mm and +1.5 mm each -- the arm stops that far short of
+    # its command whatever the command is, so each reading is the last aim plus the arm's own
+    # offset, not the hole. The sixth aim missed the hole. False keeps the typed pose and still
+    # records what each reference read (`referenceReadXyz`).
+    updateReference: bool = True
     graspToleranceM: float = TERMINAL_TRIAL_GRASP_TOLERANCE
     standingMm: float = TERMINAL_TRIAL_STANDING_MM
     maxReferenceStepM: float = TERMINAL_TRIAL_MAX_REFERENCE_STEP_M
@@ -418,6 +424,10 @@ def _park(robot: Any, request: TerminalTrialsRequest) -> None:
     hold_z = _hold_z(request)
     if xyz[2] >= hold_z:
         return
+    # Holding something: keep squeezing it. Re-commanding the measured width (0.332 on 09-28,
+    # wider than the peg's 0.31) is an open command, and that park let the peg go.
+    if gripper >= request.graspFloor:
+        gripper = request.closedGripper
     _run_step(robot, request, "lift_8cm_after_grasp", (xyz[0], xyz[1], hold_z), rotvec, gripper)
 
 
@@ -510,6 +520,7 @@ def _servo_for(
         regripGripper=request.closedGripper if request.regripInPlace else None,
         releaseOnlyWhenSeated=request.releaseOnlyWhenSeated,
         regripDropM=request.regripDropM,
+        holdGripper=request.closedGripper,
         graspSettleS=request.graspSettleS,
         requestId=f"{request.requestId or 'terminal_trials'}#{spec.index:03d}",
     )
@@ -788,6 +799,11 @@ def run_terminal_trials(
                         emit(row)
                         halted = "reference_step_too_large"
                         break
+                    if not request.updateReference:
+                        row["referenceAccepted"] = False
+                        row["referenceReadXyz"] = list(proposed)
+                        emit(row)
+                        continue
                     row["referenceAccepted"] = True
                     state.referenceUpdates.append(
                         {
@@ -1058,6 +1074,12 @@ def describe_schedule(request: TerminalTrialsRequest, schedule: Iterable[TrialSp
         f"reference_search_ring_m={request.referenceRingM:.4f}",
         f"control_every={request.controlEvery} slip_streak={request.slipStreak} "
         f"max_reference_step_mm={1000.0 * request.maxReferenceStepM:.1f}",
+        "pick="
+        + ("none (already held)" if request.pickXyz is None
+           else ",".join(f"{value:+.4f}" for value in request.pickXyz))
+        + f" grasp_attempts={request.graspAttempts} regrip_in_place={int(request.regripInPlace)} "
+        f"release_only_when_seated={int(request.releaseOnlyWhenSeated)} "
+        f"operator_grade={int(request.operatorGrade)} fixed_hole={int(not request.updateReference)}",
     ]
     for spec in specs:
         lines.append(

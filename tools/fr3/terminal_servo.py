@@ -265,6 +265,13 @@ class TerminalServoRequest:
     # is what "sometimes it fell further than the fingers are deep" looks like. 0 keeps the old
     # behaviour. Clamped at `minZ` so this can never drive the fingers into the fixture.
     regripDropM: float = 0.0
+    # What the fingers are told while the peg is carried and pressed. None keeps the measured
+    # width, which is what this did first -- and a position-controlled gripper told to stay where
+    # it is squeezes nothing. 09-28 trial 021: a landing on the face pressed to -18 N and the peg
+    # slid ~20 mm up through the fingers in 0.2 s, the tool reached the seated depth, and the
+    # verdict said "seated" (the operator: out). The next trial wedged, and the park -- still
+    # re-commanding a measured 0.332 -- let the peg go. The scripted grasps close to 0.0.
+    holdGripper: float | None = None
     gripperTolerance: float = 0.08
     controlPeriodS: float = 1.0 / 30.0
     requestId: str = ""
@@ -742,6 +749,8 @@ def execute_terminal_servo(
     """
 
     current_xyz, rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    if request.holdGripper is not None:
+        gripper = float(request.holdGripper)
     workspace_min, workspace_max = _robot_workspace_bounds(robot)
     try:
         qc = validate_terminal_servo_trajectory(
