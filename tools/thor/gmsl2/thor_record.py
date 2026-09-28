@@ -679,8 +679,9 @@ def _box_camera_alignment_summary(
     currently zero. ``camera_frame_times_rel`` can add
     ``exposure_fraction * exposure + readout_offset_s`` per frame, and ships
     with ``exposure_fraction = 0.0`` -- the exposure is recorded, the shift is
-    not applied, because which edge the Tegra VI stamps has not been measured
-    and the wrong sign doubles the error the right one removes.
+    not applied.  The sign is measured (-0.5, 2026-09-28), but the uncorrected
+    BOX transport delay was half-cancelled by the late SOF, so the camera half on
+    its own moves the BOX lookup further off; see ``EXPOSURE_CENTER_FRACTION``.
 
     "Not corrected" is exactly as much a claim about the data as "corrected by
     half an exposure", so both get written down. The terms in force are named

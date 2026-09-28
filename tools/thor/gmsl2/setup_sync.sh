@@ -79,7 +79,20 @@ run() {
 
 echo "==> Unloading any previous camera modules"
 for mod in sg8-imx715c-g3a sg12-imx577c-g3a sg17-imx735c-g3a sgx-yuv-gmsl2 sg2-ar0234c-g2f max96726; do
-  run rmmod "$mod" 2>/dev/null || true
+  # sysfs uses underscores even when the .ko filename uses hyphens.
+  module_path="/sys/module/${mod//-/_}"
+  if [[ $DRY_RUN -eq 0 && ! -d "$module_path" ]]; then
+    continue
+  fi
+  if ! run rmmod "$mod"; then
+    echo "ERROR: could not unload $mod; aborting before loading replacement modules." >&2
+    if [[ -r "$module_path/refcnt" ]]; then
+      echo "Module reference count: $(cat "$module_path/refcnt")" >&2
+    fi
+    ls -l "$module_path/holders" >&2 || true
+    echo "Stop camera clients and nvargus-daemon, then retry. If threads remain in D state after stopping, reboot Thor; do not force module removal." >&2
+    exit 1
+  fi
 done
 
 echo "==> Loading SG16A modules (max96726 + AR0234 driver)"

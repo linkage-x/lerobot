@@ -134,8 +134,10 @@ function UsageModal({ onClose }: { onClose: () => void }) {
           静止段的 p95 就是纯几何误差，涨出来的那部分是时间基准的账。
         </li>
         <li>
-          <b>顺带能定曝光符号</b>：同一个 episode 用 −0.5 / 0 / +0.5 各跑一遍，哪个把速度相关的增长压平，
-          哪个就是对的符号。默认留空 = 跟随录制器现行值（0.0），因为拿 CLI 默认的 0.5 打分等于给一条
+          <b>曝光符号</b>：同一个 episode 用 −0.5 / 0 / +0.5 各跑一遍，哪个把速度相关的增长压平，
+          哪个就是对的符号。09-28 已这样定为 −0.5（跟踪仪最优偏移 −5.0 ms = −曝光/2）；
+          录制器仍用 0.0，因为 BOX 自身的传输延迟还没扣，单改相机这一半会让 BOX 配帧更偏。
+          默认留空 = 该 episode 录制时实际用的值（读它的 meta.json），因为拿别的值打分等于给一条
           从来没被生产出来过的轨迹打分。
         </li>
       </ul>
@@ -1309,7 +1311,7 @@ export function TrackerMountPanel({
             </select>
           </label>
           <label className="cali-field">
-            曝光系数（留空 = 跟随录制器）
+            曝光系数（留空 = 该 episode 录制时用的值）
             <input
               value={gtFraction}
               disabled={disabled}
@@ -1528,7 +1530,7 @@ export function TrackerMountPanel({
             </select>
           </label>
           <label className="cali-field">
-            曝光系数（留空 = 跟随录制器）
+            曝光系数（留空 = 该 episode 录制时用的值）
             <input
               value={gtFraction}
               disabled={disabled}
@@ -1549,9 +1551,10 @@ export function TrackerMountPanel({
           只差球窝中心到真正 TCP 的偏距 d，两个仪器都看不见。
         </p>
         <p className="cali-muted">
-          曝光系数留空会跟随录制器的 <code>EXPOSURE_CENTER_FRACTION</code>（现在是 0.0），
-          而不是 CLI 自己的默认 0.5——用 0.5 打分等于给一条<b>从来没被生产出来过</b>的轨迹打分。
-          想定曝光符号就填 −0.5 / 0 / +0.5 各跑一遍，看哪个把下面「按速度分层」那一项压平。
+          曝光系数留空时，用该 episode 录制时实际施加的值（读它 <code>meta.json</code> 里的
+          <code>box_camera_alignment.exposure_fraction</code>，目前都是 0.0；实测符号是 −0.5，
+          想看补上曝光中点后的误差就填 −0.5）；
+          用别的值打分等于给一条<b>从来没被生产出来过</b>的轨迹打分。
         </p>
         {gtResult?.episodeDir && (
           <p className="cali-muted">

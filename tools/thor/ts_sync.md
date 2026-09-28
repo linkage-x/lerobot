@@ -8,6 +8,7 @@
 > 2026-07-29 实施 IMU 姿态去冗余（§9.1.1 / 原 §10 P2）：删 `rpy`、quat 改 xyzw，`observation.state` 31 → 28 维；四元数半球用 213 条真机 IMU 流实测后决定**不强制**。同日核对后关闭原 §10 P0（replay 修复的 Thor 部署）。
 > 2026-08-25 新增 §5.5（BOX↔相机残余偏移首次实测 +4.4 ms，gyro↔vision 互相关；同时更正当前固件的传感器实际速率为 520/244/120/60 Hz）；§5.2 的 MCU→host 回归改为去均值形式（原写法在真实量级上有 0.107 ms RMS 的数值误差）
 > 2026-09-21 `camera_frame_times_rel` 的曝光项改为**逐帧跨相机中位数**（原先取 glob 排序第一台相机的曝光,等于让文件名顺序决定共享时间线;本 rig 排最前的 cam_01/02/03 恰好有流但未标定）。残差地板由新的 `camera_exposure_spread` 写进 `meta.json.box_camera_alignment.cross_camera_exposure`。见 §5.4 时间线框图。
+> 2026-09-28 曝光中点符号实测为 **−0.5**（SOF = 积分终点；采样时刻 = SOF − E/2；EOF−SOF 对曝光斜率 ≈0 + 跟踪仪最优偏移 −5.0 ms @ E=10 ms）。metrology 默认改 −0.5；**录制器仍 0.0**，理由见 §5.4 框图与 §5.5 末段（BOX 传输延迟未扣，单施加相机半边使 BOX 配帧更差）。
 > 2026-09-21 订正 §3「注意事项」的曝光-周期约束：约束项是 `exposure_us` 单项，不含读出时间（AR0234C 全局快门 + 存储节点，读出与下一帧积分重叠；实测 readout 14.68 ms 与 AE 曝光 8.7 ms 之和已超周期而帧率不掉）。同步订正 `gmsl2/README.md`、`gmsl2_record.py`。
 
 ## 1. 系统总览
@@ -368,6 +369,13 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 
 **这个数目前没有被任何代码消费**——录制器不减它，已录数据都带着它。
 
+**2026-09-28 重新解读（曝光符号定为 −0.5 之后）。** 这两个 session 的 sidecar 还没有曝光列，
+所以上表的 Δt 是对**原始 SOF** 量的：`Δt = d_box − E/2`，其中 d_box 是 BOX 自身（传输 + 滤波）
+的真延迟、E/2 是 SOF 比画面真实时刻晚的那半个曝光。按 E ≈ 8.7 ms，d_box ≈ **8.7 ms（left）/
+3.2 ms（right）**。生产配帧目标现在是 SOF（fraction 0.0），误差 = E/2 − d_box = −Δt；改成 −0.5
+后误差 = −d_box，**两个 BOX 都更偏**。所以曝光修正只能和「逐 BOX 扣 d_box」一起上，
+且 d_box 要在带曝光列的新录制上重测（工具默认已是 −0.5，输出即 d_box；right 这里 σ 2.5 ms 太大）。
+
 > **不要把它读成「标完就到亚毫秒了」。** 标定去掉的是**偏置**，去不掉的是逐帧
 > **最近邻量化**，而后者按传感器不同、且更大：`间隔/√12` = six_d_force 0.6 ms、
 > imu 1.2 ms、gripper/trigger 2.4 ms、**touch 4.8 ms**。也就是说端到端的主导项是
@@ -419,9 +427,11 @@ Stop / auto-duration
        │    = (sensor_timestamp_ns/1e9 + exposure_fraction×E_median[N]
        │       + readout_offset_s) − t0_mono_s
        │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4;
-       │      SOF 不是曝光中点,但符号未测定 → exposure_fraction **默认 0.0:只记录曝光列,不施加**。
-       │      符号错会把姿态相关残差从 0.5·δE 放大到 1.0·δE,和"不修"同期望、双倍最坏;
-       │      用 resolve_frame_time_semantics.py 对一段普通 AE 录制回归出符号后再改成 ±0.5）
+       │      SOF 不是曝光中点;2026-09-28 实测 SOF = 积分终点 → 物理上应为 −0.5,
+       │      但 exposure_fraction **仍默认 0.0:只记录曝光列,不施加**——BOX 最近邻的正确目标是
+       │      T + d_box,BOX 传输延迟 d_box 没人扣(§5.5),偏晚的 SOF 恰好抵掉一半;
+       │      单改 −0.5 会让 left/right 误差从 ≈−4.4/+1.2 ms 变成 ≈−8.7/−3.2 ms。
+       │      须与逐 BOX 的 d_box 同一次提交一起施加）
        │    E_median[N] = 该帧**跨相机曝光中位数**（2026-09-21;原先取 glob 排序第一台相机的曝光）。
        │      一条融合位姿只带一个时间,所以逐帧只能有一个曝光项代表全部相机,各相机必留
        │      fraction×(E_median − E_k) 残差 —— 但用哪台代表是个选择,不该由文件名顺序决定

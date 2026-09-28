@@ -673,9 +673,51 @@ def _nearest_sample_data(
 #: Fraction of the integration window that separates ``sensor_timestamp_ns``
 #: from the instant the scene was actually sampled.
 #:
-#: **0.0 means the correction is recorded but not applied**, which is where this
-#: sits until the convention has been measured.  It is not a third model; it is
-#: the refusal to pick between the only two:
+#: **The sign is measured (2026-09-28): -0.5.  The production value stays 0.0**,
+#: because on its own the camera half makes BOX alignment worse, not better.
+#:
+#: The sign.  Three independent lines on ``thor_gmsl2_9ch_v1_20260928_154725``
+#: episode 0 agree:
+#:
+#: 1. Camera-only (``resolve_frame_time_semantics``, cam_12, whose AE moved
+#:    1.46 ms): ``EOF - SOF`` vs exposure slope -0.001 (a fixed 14.679 ms
+#:    readout window), ``SOF - sensor_ts`` slope +0.037.  SOF is the start of
+#:    readout, i.e. the end of integration -> ``-0.5``.
+#: 2. Image blur (2026-09-11): the SOF label sits after mid-exposure by >= 4.4 ms.
+#: 3. Laser tracker, no camera assumptions: scanning a pure time offset against
+#:    the tracker minimises TCP error at -5.0 ms and zeroes the motion
+#:    cross-correlation at -5.1 ms, with every camera at E = 10 ms.  The model
+#:    predicts -E/2 = -5.0 ms with no free parameter, which also bounds any
+#:    remaining camera clock-chain offset (``READOUT_OFFSET_S``) to ~0 +/- 0.5 ms.
+#:
+#: So the scene in frame N was sampled at ``T = SOF - E/2``; metrology
+#: (``camera_times``, ``validate_against_tracker``, the camera<->IMU fit)
+#: defaults to -0.5 for that reason.
+#:
+#: Why production does not follow.  The only production consumer of this term is
+#: the BOX nearest-neighbour target, and the right target is not ``T`` but
+#: ``T + d_box``: BOX stamps come out of an MCU->host regression whose intercept
+#: absorbs the device->host transport delay, and nothing subtracts it
+#: (ts_sync.md s5.5).  s5.5 measured the BOX-vs-SOF offset on sidecars with no
+#: exposure column, i.e. against raw SOF: ``Dt = d_box - E/2`` = +4.4 ms (left,
+#: box1672693301) / -1.2 ms (right, box1819152274), so ``d_box`` ~ 8.7 / 3.2 ms
+#: at E ~ 8.7 ms.  The lookup error is then
+#:
+#:     fraction  0.0 (SOF)   ->  E/2 - d_box  =  -Dt   ~ -4.4 / +1.2 ms
+#:     fraction -0.5 (T)     ->     -d_box            ~ -8.7 / -3.2 ms
+#:
+#: Late SOF was cancelling part of the late BOX; correcting the camera alone
+#: removes the cancellation and doubles the left box's error.  (What -0.5 would
+#: win is only the AE wander, ``0.5 * dE``; with AE pinned near its 10 ms
+#: ceiling that is ~0.5-1 ms, against a ~5 ms constant loss.)  The fix is both
+#: halves together: -0.5 here *and* a per-box ``d_box`` subtracted from BOX
+#: stamps, re-measured with ``estimate_camera_imu_time_offset`` (whose default is
+#: now -0.5, so it reports ``d_box`` directly) on a recording that has the
+#: exposure column -- the s5.5 numbers are from August and the right box's
+#: sigma was 2.5 ms.  Until then 0.0 is the smaller error, and every episode's
+#: ``meta.json`` ``box_camera_alignment`` names the fraction it was built with.
+#:
+#: The two models:
 #:
 #: * ``+0.5`` -- the stamp is the *start* of integration, mid-exposure is half
 #:   an exposure later.
@@ -869,9 +911,9 @@ def camera_frame_times_rel(
     fused pose carries one time; ``check_exposure_timing.py`` prices that.
 
     ``exposure_fraction`` defaults to :data:`EXPOSURE_CENTER_FRACTION`, which is
-    ``0.0``: the exposure is recorded, the shift is not applied, and the caller
-    has to ask for it.  See that constant for why applying an unmeasured sign is
-    worse than applying nothing.
+    ``0.0``: the sign is measured (-0.5, 2026-09-28) but the BOX transport delay
+    it used to half-cancel is not yet subtracted, so applying the camera half
+    alone would move the BOX lookup further from the truth.  See that constant.
 
     With ``camera=None`` the exposure term is the per-frame *median* across every
     sidecar in the episode, not the one camera that happens to sort first.  There
@@ -892,8 +934,7 @@ def camera_frame_times_rel(
     Naming a ``camera`` keeps that camera's own exposure: an explicit request is
     a question about that camera, not about the shared timeline.  Reading every
     sidecar is skipped entirely when ``exposure_fraction`` is 0, where the term
-    is zero however it is computed -- which is today's shipped default, so this
-    changes no production read until the sign is measured.
+    is zero however it is computed -- which is today's shipped default.
 
     Frames whose sidecar carries no exposure column read 0 and are therefore
     left exactly where they were, so pre-column episodes load unchanged.

@@ -6861,16 +6861,31 @@ def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> di
     return result
 
 
-def _production_exposure_fraction() -> float:
-    """What the recorder actually applied -- not what the CLI defaults to.
+def _production_exposure_fraction(episode_dir: Path | None = None) -> float:
+    """What the recorder actually applied to *this* episode -- not what the CLI defaults to.
 
-    ``validate_against_tracker`` defaults ``--exposure-fraction`` to 0.5, while
-    the recorder ships ``EXPOSURE_CENTER_FRACTION = 0.0`` because the sign has
-    never been measured. Grading at 0.5 would score a trajectory that was never
-    produced: the whole point of this comparison is the labels production wrote,
-    so the default here follows the recorder and is read from the recorder's own
-    module rather than copied, which is how the two would drift apart silently.
+    Grading at a value the recorder did not use would score a trajectory that
+    was never produced: the whole point of this comparison is the labels
+    production wrote.  The recorder's value is expected to change (the sign is
+    measured as -0.5; it waits on the BOX transport delay being subtracted
+    alongside it), and one global default would then be wrong for half the
+    archive, so each episode's ``meta.json`` names the one it was recorded under:
+
+    * ``box_camera_alignment.exposure_fraction`` present -> that value;
+    * the block present without it -> 0.0 (a recorder that predates the
+      exposure column, which could not have applied any);
+    * no readable meta -> the recorder's current constant, read from the
+      recorder's own module rather than copied, which is how the two would
+      drift apart silently.
     """
+    if episode_dir is not None:
+        try:
+            meta = json.loads((episode_dir / "meta.json").read_text(encoding="utf-8"))
+            alignment = meta.get("box_camera_alignment")
+            if isinstance(alignment, dict):
+                return float(alignment.get("exposure_fraction", 0.0))
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
 
@@ -6934,7 +6949,7 @@ def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[
             episode_dir = _tracker_validate_episode_dir(dataset, episode)
         exposure_fraction = payload.get("exposureFraction")
         fraction = (
-            _production_exposure_fraction()
+            _production_exposure_fraction(episode_dir)
             if exposure_fraction in (None, "")
             else float(exposure_fraction)
         )

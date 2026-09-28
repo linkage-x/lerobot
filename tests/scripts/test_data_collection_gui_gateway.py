@@ -5981,21 +5981,41 @@ def _capture_validate_command(monkeypatch) -> list[list[str]]:
 
 
 def test_gt_comparison_grades_the_exposure_fraction_production_actually_used(tmp_path, monkeypatch):
-    """The CLI defaults --exposure-fraction to 0.5; the recorder ships 0.0.
-
-    Grading at 0.5 would score a trajectory that was never produced. The whole
-    point of the comparison is the labels production wrote, so the default has
-    to follow the recorder -- and be read from it, not copied.
-    """
+    """Grading at a fraction the recorder did not apply scores a trajectory
+    that was never produced. The recorder's value is expected to change once the
+    BOX transport delay is subtracted alongside the measured -0.5, so
+    "production" means *this episode's* production: its meta.json names the
+    fraction, and that wins over the current constant."""
     state = _tracker_mount_state(tmp_path)
     seen = _capture_validate_command(monkeypatch)
-    monkeypatch.setattr(gateway, "_production_exposure_fraction", lambda: 0.0)
+    payload = _validate_payload(tmp_path)
+    meta = Path(payload["dataset"]) / "episodes" / "episode_000012" / "meta.json"
+    meta.write_text(json.dumps({"box_camera_alignment": {"exposure_fraction": 0.0}}))
 
-    result = gateway._run_tracker_validate(state, _validate_payload(tmp_path))
+    result = gateway._run_tracker_validate(state, payload)
     assert result["ok"] is True
     command = seen[0]
     assert command[command.index("--exposure-fraction") + 1] == "0.0"
     assert result["exposureFraction"] == 0.0
+
+
+def test_gt_comparison_fraction_for_older_and_unreadable_episodes(tmp_path):
+    """A pre-exposure-column recorder applied none; without meta, fall back to
+    the recorder's constant, read from its module rather than copied."""
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "meta.json").write_text(json.dumps({"box_camera_alignment": {"mode": "sensor_timestamp_sof"}}))
+    assert gateway._production_exposure_fraction(legacy) == 0.0
+
+    current = tmp_path / "current"
+    current.mkdir()
+    (current / "meta.json").write_text(json.dumps({"box_camera_alignment": {"exposure_fraction": -0.5}}))
+    assert gateway._production_exposure_fraction(current) == -0.5
+
+    assert gateway._production_exposure_fraction(tmp_path / "missing") == lr3.EXPOSURE_CENTER_FRACTION
+    assert gateway._production_exposure_fraction(None) == lr3.EXPOSURE_CENTER_FRACTION
 
 
 def test_gt_comparison_still_lets_the_operator_override_the_fraction(tmp_path, monkeypatch):

@@ -648,15 +648,17 @@ def test_readout_offset_default_is_uncalibrated_zero(tmp_path):
 
 
 def test_exposure_centre_is_recorded_but_not_applied_by_default(tmp_path):
-    """The shipped default must leave the labels on the stamp the hardware gave.
+    """The shipped default leaves the BOX lookup on the stamp the hardware gave.
 
-    Both candidate signs are one whole exposure apart, so applying the wrong one
-    doubles the pose-correlated error that applying the right one removes --
-    same expected cost as doing nothing, twice the worst case. Until
-    resolve_frame_time_semantics has been run on a recording that carries the
-    exposure column, the honest default is to carry the column and apply none of
-    it. If this assertion is ever changed to +/-0.5, the commit that changes it
-    should cite that script's output.
+    Not because the sign is unknown -- it was measured on 2026-09-28 as -0.5
+    (EOF-SOF flat vs exposure, the 09-11 blur note, and the laser tracker's best
+    offset -5.0 ms at E = 10 ms) -- but because this term's only production
+    consumer is the BOX nearest-neighbour target, whose right value is
+    ``T + d_box``.  The BOX transport delay d_box is not subtracted anywhere, and
+    the late SOF was half-cancelling it (ts_sync.md s5.5: raw-SOF offset +4.4 /
+    -1.2 ms -> d_box ~ 8.7 / 3.2 ms).  -0.5 alone moves both boxes further off.
+    If this assertion changes, the same commit must subtract a re-measured
+    per-box d_box from BOX stamps.
     """
     t0_mono = 100.0
     _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [4000, 12000])
@@ -665,11 +667,12 @@ def test_exposure_centre_is_recorded_but_not_applied_by_default(tmp_path):
     default = lr3.camera_frame_times_rel(tmp_path, t0_mono)
     raw = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.0)
     assert default == raw
-    # And the exposure really was there to be applied, so this is a decision
-    # about the default rather than a test that passes because the fixture is
-    # missing the column.
-    applied = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
-    assert applied[1] - raw[1] == pytest.approx(0.006, abs=1e-9)
+    # And the exposure really was there to be applied, per frame from that
+    # frame's own exposure, so this is a decision about the default rather than
+    # a test that passes because the fixture is missing the column.
+    applied = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=-0.5)
+    assert applied[0] - raw[0] == pytest.approx(-0.002, abs=1e-9)
+    assert applied[1] - raw[1] == pytest.approx(-0.006, abs=1e-9)
 
 
 # --------------------------------------------------------------------------
@@ -749,11 +752,12 @@ def test_frames_no_camera_reported_stay_exactly_where_they_were(tmp_path):
 
 
 def test_exposure_fraction_zero_reads_only_one_sidecar(tmp_path, monkeypatch):
-    """The shipped default must not pay for a correction it does not apply.
+    """A read that asks for no correction must not pay for one.
 
     Guards the short-circuit rather than the arithmetic: at fraction 0 the term
     is zero however it is computed, so reading every sidecar per episode would
-    be pure cost on the production path.
+    be pure cost -- the recorder makes exactly this read once per episode (the
+    ``raw`` timeline that meta.json's ``exposure_correction_ms`` is taken from).
     """
     t0_mono = 100.0
     _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [8000])
@@ -765,8 +769,7 @@ def test_exposure_fraction_zero_reads_only_one_sidecar(tmp_path, monkeypatch):
         lr3, "_exposures_by_frame_s",
         lambda ep: (calls.append(ep), real(ep))[1],
     )
-    assert lr3.EXPOSURE_CENTER_FRACTION == 0.0
-    lr3.camera_frame_times_rel(tmp_path, t0_mono)
+    lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.0)
     assert calls == []
     lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.5)
     assert len(calls) == 1
