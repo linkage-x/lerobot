@@ -64,6 +64,7 @@ from tools.fr3.scene_reset import (
     _robot_workspace_bounds,
     _run_step,
     _workspace_bounds,
+    read_fz,
 )
 from tools.fr3.terminal_servo import (
     TERMINAL_SERVO_SEARCH_RING_M,
@@ -89,6 +90,9 @@ from tools.fr3.terminal_servo import (
 TERMINAL_TRIAL_MAX_TILT_DEG = 2.0
 
 TERMINAL_TRIAL_GRASP_FLOOR = 0.10
+# How hard the end of a run may set the peg down on the pick point, N below the reading before
+# the descent: the grasp loop's set-down cap.
+TERMINAL_TRIAL_STOW_CAP_N = 7.0
 # Above this the fingers are open, not holding: the peg reads ~0.31, open fingers ~1.0.
 TERMINAL_TRIAL_OPEN_ABOVE = 0.6
 # How far a later grasp may sit from the first one of the same run before the loop stops. The
@@ -419,6 +423,33 @@ def _holds_something(width: float, request: TerminalTrialsRequest) -> bool:
     """Fingers stopped by something between them: not shut on air, not open."""
 
     return request.graspFloor <= float(width) < TERMINAL_TRIAL_OPEN_ABOVE
+
+
+def _stow(robot: Any, request: TerminalTrialsRequest) -> None:
+    """Put a held peg back where runs fetch it from, and let go, before the process exits.
+
+    The gripper driver's disconnect disables the motor, so whatever the fingers hold when the run
+    ends falls from wherever it is: 09-28 17:17 a run halted holding the peg 8 cm over the hole
+    and dropped it on exit. Set down on the pick point with the set-down cap, since a halt can
+    mean a crooked peg that will not go all the way in; it is let go of wherever the cap stops it.
+    """
+
+    if request.pickXyz is None:
+        return
+    xyz, rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
+    if not _holds_something(gripper, request):
+        return
+    pick = tuple(request.pickXyz)
+    hold_z = max(float(xyz[2]), _hold_z(request))
+    _run_step(robot, request, "move_to_place_above", (pick[0], pick[1], hold_z), rotvec,
+              request.closedGripper)
+    tare = read_fz(robot)
+    _run_step(robot, request, "descend_8cm_to_place", pick, rotvec, request.closedGripper,
+              force_cap=None if tare is None else (tare, TERMINAL_TRIAL_STOW_CAP_N))
+    here, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    _run_step(robot, request, "open_gripper", here, rotvec, request.openGripper)
+    _run_step(robot, request, "retreat_8cm", (here[0], here[1], hold_z), rotvec, request.openGripper)
+    print("[INFO] terminal_trials=stowed peg_left_at_pick=1", flush=True)
 
 
 def _park(robot: Any, request: TerminalTrialsRequest) -> None:
@@ -936,6 +967,7 @@ def run_terminal_trials(
             raise RuntimeError("control loop died; not parking")
         _park(robot, request)
         parked = True
+        _stow(robot, request)
     except Exception as exc:  # noqa: BLE001 - the summary has to survive a failed park
         parked = False
         print(f"[WARN] terminal_trials=park_failed details={exc}", flush=True)

@@ -119,6 +119,13 @@ def _request(**overrides):
     return TerminalTrialsRequest(**fields)
 
 
+def _stowed(robot):
+    """The run's last act: the peg set down on the pick point and let go of (see `_stow`)."""
+
+    return (not robot.held
+            and math.hypot(robot.peg_xyz[0] - PICK[0], robot.peg_xyz[1] - PICK[1]) < 1e-6)
+
+
 # --- the schedule -----------------------------------------------------------------------------
 
 
@@ -214,7 +221,7 @@ def test_the_loop_closes_on_itself_and_needs_nobody_between_trials():
     assert summary["haltedOn"] == "schedule_complete"
     assert summary["trials"] == 4  # one reference plus three offsets
     assert summary["seated"] == 4
-    assert robot.held is True
+    assert _stowed(robot)
 
 
 def test_the_run_answers_p_seat_against_offset_rather_than_one_more_success_rate():
@@ -325,13 +332,17 @@ def test_the_run_stops_when_it_is_out_of_time_rather_than_mid_descent():
     assert summary["trials"] == 0
 
 
-def test_the_arm_is_left_holding_the_peg_at_carrying_height_when_a_run_stops():
+def test_a_run_ends_with_the_peg_set_down_on_the_pick_and_the_arm_clear_of_it(capsys):
+    """The gripper driver disables the motor on disconnect, so a peg still held when the process
+    exits falls from wherever it is -- 09-28 17:17, from 8 cm over the hole."""
+
     robot = FakeTrialRig(hole_xy=SEATED[:2])
     request = _request(offsetsMm=(0.0,), repeats=1, controlEvery=100)
     summary = run_terminal_trials(robot, request)
     assert summary["parked"] is True
-    assert robot.held is True
+    assert _stowed(robot)
     assert robot.xyz[2] >= SEATED[2] + request.servo.retreatM - 1e-6
+    assert "terminal_trials=stowed" in capsys.readouterr().out
 
 
 def test_a_servo_that_refuses_its_own_qc_ends_the_run_with_the_reason_on_the_row():
@@ -381,9 +392,9 @@ def test_the_brake_stops_between_trials_so_the_loop_ends_holding_the_peg():
     summary = run_terminal_trials(robot, request, should_stop=should_stop)
     assert summary["haltedOn"] == "stop_requested"
     assert summary["trials"] == 2
-    # A deliberate stop is not a fault, and the peg is still held.
+    # A deliberate stop is not a fault, and the peg is put back rather than dropped.
     assert summary["ok"] is True
-    assert robot.held is True
+    assert _stowed(robot)
 
 
 def test_a_trial_that_failed_before_a_verdict_is_not_arithmetic_but_is_not_lost_either():
@@ -639,7 +650,8 @@ def test_a_peg_that_did_not_seat_is_not_stood_on_the_face_at_all():
                         releaseOnlyWhenSeated=True, regripInPlace=True)
     )
     assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
-    assert robot.held, "the last trial did not seat, so the fingers never opened"
+    # The last trial did not seat, so the fingers stayed shut until the run put the peg away.
+    assert _stowed(robot)
     offset_rows = [row for row in summary["rows"]
                    if row.get("kind") == "trial" and row.get("trialKind") == "offset"]
     assert offset_rows and all(row["verdict"] != "seated" for row in offset_rows), (
@@ -690,8 +702,9 @@ def test_a_graded_run_asks_before_the_fingers_open_and_lets_go_only_on_in():
     assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
     assert [trial["index"] for trial in asked] == [0, 1, 2]
     assert all(trial["autoVerdict"] == "seated" for trial in asked)
-    # Asked while the peg was held: each answer is followed by exactly one release.
-    assert robot.releases == 3
+    # Asked while the peg was held: each answer is followed by exactly one release, and the run
+    # ends with one more, setting the peg down on the pick.
+    assert robot.releases == 3 + 1
     assert summary["gradeAgreement"] == {"seated_in": 3}
     trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
     assert [row["operatorGrade"] for row in trials] == ["in", "in", "in"]
@@ -713,7 +726,7 @@ def test_an_automatic_seat_the_person_calls_out_is_never_let_go_of_nor_trusted_a
     # The reference is retried, and only the confirmed one moves the estimate.
     assert trials[1]["trialKind"] == "reference" and trials[1]["referenceAccepted"] is True
     assert len(summary["referenceUpdates"]) == 1
-    assert robot.releases == 3
+    assert robot.releases == 3 + 1  # the last one is the stow
     assert summary["gradeAgreement"] == {"seated_out": 1, "seated_in": 3}
 
 
@@ -766,7 +779,8 @@ def test_nobody_answering_ends_the_run_holding_the_peg():
     robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
     summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: None)
     assert summary["haltedOn"] == "operator_gone"
-    assert robot.releases == 0 and robot.held
+    # Never let go of at the hole; only put away on the pick when the run ends.
+    assert robot.releases == 1 and _stowed(robot)
 
 
 def test_a_graded_run_without_anybody_to_ask_is_refused():
