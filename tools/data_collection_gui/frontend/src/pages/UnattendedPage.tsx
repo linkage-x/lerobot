@@ -6,6 +6,7 @@ import {
   VERDICT_COLORS,
   envelopeReadout,
   mapPoints,
+  mergeRememberedRequest,
   outcomeLabel,
   projectRows,
   runHealth,
@@ -48,20 +49,23 @@ const POLL_MS = 2000;
 type Draft = { kind: string; request: Record<string, string> };
 
 const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
+  // The 09-28 step-3 calibration run (terminal_trials_20260928_171702): peg taken from the
+  // hole, fixed aim, re-gripped in place, graded by hand. Kept identical run to run so the
+  // only difference between two of them is the code.
   terminal_trials: {
-    holePose: "0.3599,-0.1333,0.0523",
-    pickPose: "0.3640,-0.1370,0.0550",
-    offsetsMm: "0,2,3,4,5,6,8,10",
-    repeats: "6",
+    holePose: "0.3597,-0.1328,0.0580",
+    pickPose: "0.3597,-0.1328,0.0550",
+    offsetsMm: "0",
+    repeats: "20",
     controlEvery: "4",
     seed: "0",
-    searchRingM: "0",
+    searchRingM: "0.007",
     maxSeconds: "7200",
-    graspAttempts: "1",
-    regripInPlace: "0",
+    graspAttempts: "2",
+    regripInPlace: "1",
     releaseOnlyWhenSeated: "0",
-    operatorGrade: "0",
-    fixedHole: "0",
+    operatorGrade: "1",
+    fixedHole: "1",
     homeFirst: "1"
   },
   grasp_envelope: {
@@ -108,13 +112,39 @@ const FIELD_HELP: Record<string, string> = {
   operatorGrade: "1: after every descent, with the peg still held, ask you whether it is in the hole; it lets go only on your \"in\". Calibrates the automatic verdict."
 };
 
+// The parameters of the last run started from this browser, one set per kind. Saved on a start
+// rather than on every keystroke, so what comes back is a set that was planned, fence-checked
+// and run -- not half an edit. Per browser only; the rig's own record of a run is its run.json.
+const REMEMBERED_KEY = (kind: string) => `lerobot.unattended.lastRequest.v1.${kind}`;
+
+function rememberedRequest(kind: string): Record<string, string> {
+  const defaults = DEFAULT_REQUESTS[kind] ?? {};
+  try {
+    const raw = window.localStorage.getItem(REMEMBERED_KEY(kind));
+    return mergeRememberedRequest(defaults, raw ? JSON.parse(raw) : null);
+  } catch {
+    return { ...defaults };
+  }
+}
+
+function rememberRequest(kind: string, request: Record<string, string>): void {
+  try {
+    window.localStorage.setItem(REMEMBERED_KEY(kind), JSON.stringify(request));
+  } catch {
+    /* storage denied: the run still started, only the form will not come back */
+  }
+}
+
 export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
   const [kinds, setKinds] = useState<UnattendedKind[]>([]);
   const [runs, setRuns] = useState<UnattendedListEntry[]>([]);
   const [active, setActive] = useState<UnattendedListEntry | null>(null);
   const [selectedId, setSelectedId] = useState<string>("");
   const [run, setRun] = useState<UnattendedRun | null>(null);
-  const [draft, setDraft] = useState<Draft>({ kind: "terminal_trials", request: DEFAULT_REQUESTS.terminal_trials });
+  const [draft, setDraft] = useState<Draft>(() => ({
+    kind: "terminal_trials",
+    request: rememberedRequest("terminal_trials")
+  }));
   const [plan, setPlan] = useState<UnattendedPlan | null>(null);
   const [error, setError] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -166,6 +196,7 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
   const onStart = async () => {
     const result = await guard("start", () => api.startUnattendedRun(draft.kind, draft.request));
     if (result.ok && "run" in result) {
+      rememberRequest(draft.kind, draft.request);
       const started = (result as { run: UnattendedRun }).run;
       setSelectedId(started.id);
       setPlan(null);
@@ -204,7 +235,7 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
               className={draft.kind === kind.id ? "primary" : ""}
               disabled={busy || Boolean(active)}
               onClick={() => {
-                setDraft({ kind: kind.id, request: DEFAULT_REQUESTS[kind.id] ?? {} });
+                setDraft({ kind: kind.id, request: rememberedRequest(kind.id) });
                 setPlan(null);
               }}
             >
@@ -243,6 +274,19 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
           <button className="primary" onClick={() => void onStart()} disabled={busy || !plan || Boolean(active)}>
             Start this plan
           </button>
+          <button
+            onClick={() => {
+              setDraft((current) => ({ ...current, request: { ...(DEFAULT_REQUESTS[current.kind] ?? {}) } }));
+              setPlan(null);
+            }}
+            disabled={busy || Boolean(active)}
+            title="只改表单；记住的参数在下一次启动时才会被覆盖"
+          >
+            恢复默认值
+          </button>
+          <span style={{ fontSize: 11, opacity: 0.6, alignSelf: "center" }}>
+            启动时记住本次参数（仅本浏览器），下次打开页面自动填入
+          </span>
         </div>
         {plan ? (
           <div style={{ marginTop: 12 }}>

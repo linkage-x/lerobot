@@ -3,6 +3,7 @@ import {
   HEARTBEAT_STALE_S,
   envelopeReadout,
   mapPoints,
+  mergeRememberedRequest,
   outcomeLabel,
   projectRows,
   runHealth,
@@ -203,5 +204,35 @@ describe("grasp envelope rows", () => {
       "verify grasps held": "61/63"
     });
     expect(envelopeReadout({ ok: true, haltedOn: "schedule_complete", seated: 3 })).toEqual([]);
+  });
+});
+
+describe("mergeRememberedRequest", () => {
+  const defaults = { holePose: "0.3597,-0.1328,0.0580", repeats: "20", fixedHole: "1" };
+
+  it("starts from the defaults when nothing was remembered", () => {
+    expect(mergeRememberedRequest(defaults, null)).toEqual(defaults);
+    expect(mergeRememberedRequest(defaults, "garbage")).toEqual(defaults);
+    expect(mergeRememberedRequest(defaults, ["repeats", "5"])).toEqual(defaults);
+  });
+
+  it("brings back what was last started, field by field", () => {
+    expect(mergeRememberedRequest(defaults, { repeats: "40" })).toEqual({ ...defaults, repeats: "40" });
+  });
+
+  it("drops fields the form no longer has and values that are not text", () => {
+    const merged = mergeRememberedRequest(defaults, { repeats: 40, retiredFlag: "1", fixedHole: "0" });
+    expect(merged).toEqual({ ...defaults, fixedHole: "0" });
+    expect(merged).not.toHaveProperty("retiredFlag");
+  });
+
+  it("does not write into the defaults it was given", () => {
+    const before = { ...defaults };
+    mergeRememberedRequest(defaults, { repeats: "1" });
+    expect(defaults).toEqual(before);
+  });
+
+  it("takes the remembered fields as they are for a kind with no defaults", () => {
+    expect(mergeRememberedRequest({}, { spot: "0.4,-0.1" })).toEqual({ spot: "0.4,-0.1" });
   });
 });

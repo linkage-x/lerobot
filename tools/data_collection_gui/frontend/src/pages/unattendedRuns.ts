@@ -245,3 +245,23 @@ export function envelopeReadout(summary: Record<string, unknown> | null | undefi
     ["verify grasps held", verify?.n ? `${verify.held}/${verify.n}` : "—"]
   ];
 }
+
+/** What the form starts from: the kind's defaults, overlaid with what was last started.
+ *
+ *  Only fields the defaults still have are taken back, so a field that was renamed or dropped
+ *  does not come back from the dead as an argument the runtime no longer reads; a kind with no
+ *  defaults takes the remembered fields as they are. Anything that is not a string map is
+ *  treated as nothing remembered. */
+export function mergeRememberedRequest(
+  defaults: Record<string, string>,
+  remembered: unknown
+): Record<string, string> {
+  const merged = { ...defaults };
+  if (!remembered || typeof remembered !== "object" || Array.isArray(remembered)) return merged;
+  const open = Object.keys(defaults).length === 0;
+  for (const [key, value] of Object.entries(remembered as Record<string, unknown>)) {
+    if (typeof value !== "string") continue;
+    if (open || key in defaults) merged[key] = value;
+  }
+  return merged;
+}
