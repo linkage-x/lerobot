@@ -164,9 +164,10 @@ GRASP_LOOP_HOVER_STILL_S = 0.3
 # their closing axis; across the pad nothing does. The release point is recorded from the tool,
 # which does not see where on the pad the peg is, so the next close aims at the tool point and
 # keeps the offset -- it never shows in any reading. Turned, each close squeezes out what the
-# other one left. -90 deg takes joint 7 from 0.785 to about -0.785 rad, well inside its range;
-# +90 would take it to 2.36.
-GRASP_LOOP_REGRIP_TURN_RAD = -math.pi / 2
+# other one left. +90 deg, at the operator's call after watching -90 run (09-28): the other way
+# is kinder to the gripper cable. It takes joint 7 from 0.785 to about 2.36 rad, 0.66 rad inside
+# its 3.016 limit; the regrip always starts from home, so it does not stack on a policy's turn.
+GRASP_LOOP_REGRIP_TURN_RAD = math.pi / 2
 GRASP_LOOP_TURN_S = 1.5
 GRASP_LOOP_UNTOUCHED_XY_M = 0.040
 GRASP_LOOP_UNTOUCHED_Z_M = 0.025
