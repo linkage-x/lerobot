@@ -16,7 +16,7 @@ import pytest
 
 import tools.fr3.grasp_loop as grasp_loop
 import tools.fr3.scene_reset as scene_reset
-from tools.fr3.grasp_funnel import ALIGN, CLOSE, DESCEND, SEARCH, FunnelConfig, GraspFunnel
+from tools.fr3.grasp_funnel import ALIGN, CLOSE, DESCEND, FUNNEL_ALIGN_Z_SLACK_M, SEARCH, FunnelConfig, GraspFunnel
 from tools.fr3.grasp_loop import GraspHandover, arm_for_trial, completed_trials, run_grasp_loop, summarize_grasp_loop
 
 from tests.scripts.test_fr3_grasp_loop import GraspRig, _put_back, _request
@@ -97,12 +97,33 @@ def test_nothing_moves_sideways_below_the_align_height_while_outside_the_capture
     _simulate(funnel, target, start=(PEG[0], PEG[1] + 0.020, 0.20))
     align_z = funnel.config.alignZ
     for record in funnel.steps:
-        if record["funnel_state"] in (ALIGN,) and record["xy_error_mm"] > 8.0 and record["ee_xyz"][2] < align_z - 0.002:
+        if record["funnel_state"] in (ALIGN,) and record["xy_error_mm"] > 8.0 and record["ee_xyz"][2] < align_z - FUNNEL_ALIGN_Z_SLACK_M:
             # Below the align height and outside the radius: the setpoint may only go up.
             assert record["executed_action"][:2] == pytest.approx(record["ee_xyz"][:2], abs=0.004)
     assert funnel.state == CLOSE
     assert funnel.trial_record()["prematureDescend"] is True
     assert funnel.blockedSteps > 0
+
+
+def test_an_arm_that_parks_short_of_the_align_height_still_moves_across():
+    """09-23 trial 9, 09-28 trials 9 and 19: ALIGN entered just under alignZ and 50 mm off; the
+    setpoint went up to alignZ, the arm stopped 2.4 mm short of it -- this arm's dead band -- and
+    "up first" judged on the measurement waited out the whole budget without moving across."""
+
+    funnel = GraspFunnel(FunnelConfig(pegXyz=PEG))
+    align_z = funnel.config.alignZ
+    ee = [PEG[0] + 0.05, PEG[1], align_z - 0.0004]
+    for step in range(400):
+        command = funnel.step(step, tuple(ee), ROT, _command((ee[0], ee[1], ee[2] - 0.004)), policy_gripper_raw=1.0)
+        target = (command["ee.x"], command["ee.y"], command["ee.z"])
+        ee[0] += 0.4 * (target[0] - ee[0])
+        ee[1] += 0.4 * (target[1] - ee[1])
+        # Rising, the arm never gets closer than 2.4 mm to where it was sent.
+        ee[2] = min(ee[2] + 0.4 * (target[2] - ee[2]), target[2] - 0.0024) if target[2] > ee[2] else target[2]
+        if funnel.state == CLOSE:
+            break
+    assert funnel.state == CLOSE
+    assert funnel.xyErrorAtCloseMm is not None and funnel.xyErrorAtCloseMm <= 8.0
 
 
 def test_the_close_waits_for_the_arm_to_stop():

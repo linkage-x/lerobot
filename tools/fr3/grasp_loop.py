@@ -73,6 +73,9 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
+import numpy as np
+
+from lerobot.utils.rotation import Rotation
 from tools.fr3.grasp_funnel import FUNNEL_CLOSE_DZ_MM, FunnelConfig, GraspFunnel
 from tools.fr3.scene_reset import (
     SCENE_RESET_LIFT_M,
@@ -82,6 +85,7 @@ from tools.fr3.scene_reset import (
     _check_xyz_in_workspace,
     _hold_where_it_is,
     _move_to_start,
+    _absolute_action,
     _observation_xyz_rotvec_gripper,
     _robot_workspace_bounds,
     _run_step,
@@ -153,6 +157,17 @@ GRASP_LOOP_HOVER_STILL_S = 0.3
 # off, and none that went below the grasp height within 3 cm. Measured 09-28, when an open finger
 # came down on the peg top from 31 mm off and the arm stopped: the top is 18 mm above the grasp
 # height, so 25 mm keeps a fingertip that passed as "clear" 7 mm over it.
+# The script's re-grip closes with the wrist turned this far about the tool axis from the pose the
+# funnel closes at, so the two closes of every cycle squeeze the peg along perpendicular axes.
+# Seen 2026-09-28 (B-only run, photo 11:25): once one close took the peg off-centre across the pad,
+# it stayed there, cycle after cycle, at the pad's edge. The fingers centre the peg only along
+# their closing axis; across the pad nothing does. The release point is recorded from the tool,
+# which does not see where on the pad the peg is, so the next close aims at the tool point and
+# keeps the offset -- it never shows in any reading. Turned, each close squeezes out what the
+# other one left. -90 deg takes joint 7 from 0.785 to about -0.785 rad, well inside its range;
+# +90 would take it to 2.36.
+GRASP_LOOP_REGRIP_TURN_RAD = -math.pi / 2
+GRASP_LOOP_TURN_S = 1.5
 GRASP_LOOP_UNTOUCHED_XY_M = 0.040
 GRASP_LOOP_UNTOUCHED_Z_M = 0.025
 # Held still after the fingers open, so a peg that rocks on release is not dragged by the retreat.
@@ -548,7 +563,10 @@ def set_down_and_regrip(
     released = _open_and_settle(robot, request, step_request, (xyz[0], xyz[1], place_z), rotvec)
     _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
     _move_to_start(robot)
-    width = verified_pick(robot, request, (released[0], released[1], request.regripZ), request_id=request_id)
+    width = verified_pick(
+        robot, request, (released[0], released[1], request.regripZ),
+        request_id=request_id, turn_rad=GRASP_LOOP_REGRIP_TURN_RAD,
+    )
     return width, released
 
 
@@ -591,14 +609,51 @@ def release_and_clear(robot: Any, request: GraspLoopRequest, *, request_id: str)
     _move_to_start(robot)
 
 
+def turned_about_tool_z(rotvec: tuple[float, float, float], angle_rad: float) -> tuple[float, float, float]:
+    """`rotvec` turned by `angle_rad` about its own z axis -- the fingers' axis of symmetry."""
+
+    turned = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64)) * Rotation.from_rotvec(
+        np.array([0.0, 0.0, angle_rad])
+    )
+    return tuple(float(v) for v in turned.as_rotvec())  # type: ignore[return-value]
+
+
+def _turn_wrist(
+    robot: Any,
+    step_request: SceneResetRequest,
+    rotvec: tuple[float, float, float],
+    angle_rad: float,
+    gripper: float,
+) -> tuple[float, float, float]:
+    """Turn the tool about its own axis where it stands, in small steps, and answer the new rotvec.
+
+    Stepped rather than sent whole: the absolute branch of `send_action` has no rotation clamp,
+    and one 90 deg jump is an IK problem the solver is seeded far from.
+    """
+
+    xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    ticks = max(1, round(GRASP_LOOP_TURN_S / step_request.controlPeriodS))
+    for tick in range(1, ticks + 1):
+        robot.send_action(_absolute_action(xyz, turned_about_tool_z(rotvec, angle_rad * tick / ticks), gripper))
+        precise_sleep(step_request.controlPeriodS)
+    turned = turned_about_tool_z(rotvec, angle_rad)
+    _run_step(robot, step_request, "turn_wrist", xyz, turned, gripper)
+    return turned
+
+
 def verified_pick(
     robot: Any,
     request: GraspLoopRequest,
     at_xyz: tuple[float, float, float],
     *,
     request_id: str,
+    turn_rad: float = 0.0,
 ) -> float:
-    """The reset's own pick, at `at_xyz`, answering the width it holds at carry height."""
+    """The reset's own pick, at `at_xyz`, answering the width it holds at carry height.
+
+    `turn_rad` turns the wrist about the tool axis before the approach; see
+    GRASP_LOOP_REGRIP_TURN_RAD. The peg is then carried at that turn until it is let go.
+    """
 
     step_request = request.step_request(request_id)
     low, high = _robot_workspace_bounds(robot)
@@ -606,6 +661,8 @@ def verified_pick(
     _check_xyz_in_workspace(above, "regrip_above", low, high)
     _check_xyz_in_workspace(at_xyz, "regrip", low, high)
     rotvec = _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
+    if turn_rad:
+        rotvec = _turn_wrist(robot, step_request, rotvec, turn_rad, request.openGripper)
     _run_step(robot, step_request, "go_to_pick_above", above, rotvec, request.openGripper)
     _settled_descent(robot, step_request, "descend_8cm_to_pick", at_xyz, rotvec, request.openGripper)
     _run_step(robot, step_request, "close_gripper", at_xyz, rotvec, request.closedGripper)

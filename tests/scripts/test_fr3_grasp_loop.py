@@ -12,6 +12,8 @@ reach of the peg take it, and it moves with them until they open.
 import json
 import math
 
+import numpy as np
+
 import pytest
 
 import tools.fr3.grasp_loop as grasp_loop
@@ -737,3 +739,94 @@ def test_a_reflex_in_a_scripted_step_is_recovered_and_is_not_charged_to_the_poli
     assert [line["kind"] for line in lines if line["kind"] in ("reflex", "trial")] == ["reflex", "trial"]
     assert robot.recoveries == 1 and asked[0].startswith(grasp_loop.GRASP_LOOP_REFLEX_PROMPT)
     assert result["halted"] == ""
+
+
+class PadRig(FakeRobot):
+    """Fingers that centre the peg only along their closing axis (tool y), on a pad 20 mm wide
+    (tool x). `knock_once_m` is one bad close: the first grasp the fingers make lands that far off
+    across the pad, as 09-28's did. Homing puts the wrist back, as the real keyframe move does."""
+
+    PAD_HALF_M = 0.010
+
+    def __init__(self, knock_once_m=0.0):
+        super().__init__()
+        self.peg_xyz = PICK
+        self.held = self.closed = False
+        self.offset = (0.0, 0.0)
+        self.knock_once_m = knock_once_m
+        self.offsets_at_close = []
+
+    def move_to_start(self):
+        super().move_to_start()
+        self.rotvec = (0.0, 0.0, 0.0)
+
+    def send_action(self, action):
+        result = super().send_action(action)
+        if float(action["gripper.pos"]) >= 0.5:
+            if self.held:
+                self.peg_xyz = (self.xyz[0] + self.offset[0], self.xyz[1] + self.offset[1], self.xyz[2])
+            self.held = self.closed = False
+            return result
+        if not self.closed:
+            self.closed = True
+            turn = _rotation(self.rotvec)
+            width_axis, closing_axis = turn.apply(np.array([1.0, 0.0, 0.0]))[:2], turn.apply(np.array([0.0, 1.0, 0.0]))[:2]
+            d = np.array(self.peg_xyz[:2]) - np.array(self.xyz[:2])
+            across = float(d @ width_axis) + self.knock_once_m
+            self.knock_once_m = 0.0
+            self.held = (
+                abs(across) <= self.PAD_HALF_M
+                and abs(float(d @ closing_axis)) <= 0.02
+                and abs(self.xyz[2] - self.peg_xyz[2]) <= 0.012
+            )
+            if self.held:
+                # Squeezed onto the tool along the closing axis; left where it was across the pad.
+                self.offset = tuple(float(v) for v in across * width_axis)
+                self.offsets_at_close.append(abs(across))
+        if self.held:
+            self.peg_xyz = (self.xyz[0] + self.offset[0], self.xyz[1] + self.offset[1], self.xyz[2])
+        self.gripper = GraspRig.HELD_WIDTH if self.held else GraspRig.EMPTY_WIDTH
+        return result
+
+
+def _rotation(rotvec):
+    from lerobot.utils.rotation import Rotation
+
+    return Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64))
+
+
+def _aim_at_the_record(robot):
+    """A funnel-like arm B: closes exactly where the loop says the peg is."""
+
+    def run(trial, handover):
+        at = handover.pegXyz
+        for step in range(100):
+            gripper = 1.0 if step < 5 else 0.0
+            robot.send_action({
+                "ee.x": at[0], "ee.y": at[1], "ee.z": at[2] - 0.006,
+                "ee.wx": robot.rotvec[0], "ee.wy": robot.rotvec[1], "ee.wz": robot.rotvec[2],
+                "gripper.pos": gripper,
+            })
+            if handover.observe(step, robot.xyz, gripper):
+                return "grasp_handover"
+        return "grasp_timeout"
+
+    return run
+
+
+@pytest.mark.parametrize(("turn", "stays_off"), [(grasp_loop.GRASP_LOOP_REGRIP_TURN_RAD, False), (0.0, True)])
+def test_one_off_centre_close_is_squeezed_out_by_the_turned_regrip(tmp_path, monkeypatch, turn, stays_off):
+    """09-28 (photo 11:25): one close put the peg 6 mm off across the pad, and every close after it
+    kept it there -- each aimed at the recorded tool point, which never sees the offset. With the
+    re-grip closing across the funnel's close, the next close squeezes it out."""
+
+    monkeypatch.setattr(grasp_loop, "GRASP_LOOP_REGRIP_TURN_RAD", turn)
+    robot = PadRig(knock_once_m=0.006)
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(robot, _request(trials=6), run_policy_trial=_aim_at_the_record(robot), out_path=out)
+    assert [r["verdict"] for r in _trials(out)] == ["held"] * 6
+    later = robot.offsets_at_close[3:]
+    if stays_off:
+        assert all(v == pytest.approx(0.006, abs=1e-4) for v in later)
+    else:
+        assert all(v <= 1e-4 for v in later)

@@ -69,6 +69,12 @@ FUNNEL_ALIGN_DZ_MM = 60.0
 # above a standing peg; the descent is the terminal servo's 0.02 m/s, the speed this rig already
 # descends onto things at.
 FUNNEL_ALIGN_SPEED_M_S = 0.05
+# How far below `alignZ` the *measured* tool may sit and still move across. The arm parks up to
+# ~2.4 mm short along its direction of travel and does not close that with time (scene_reset,
+# 09-11), so "up first" judged against the measurement alone can wait forever: 09-23 trial 9 and
+# 09-28 trials 9 and 19 entered ALIGN just under alignZ, the setpoint reached it, the arm stopped
+# at alignZ - 2.4 mm, and the funnel held that pose for its whole 360-step budget.
+FUNNEL_ALIGN_Z_SLACK_M = 0.006
 FUNNEL_DESCEND_SPEED_M_S = 0.02
 # Steps the settle test must hold, so one quiet frame between two moves is not a stop.
 FUNNEL_SETTLE_STEPS = 5
@@ -209,7 +215,9 @@ class GraspFunnel:
         else:
             assert self.setpoint is not None and self.rotvec is not None
             if self.state == ALIGN:
-                below = ee_xyz[2] < cfg.alignZ - 0.002
+                # Below until the *setpoint* is up, then across once the arm is within the slack
+                # of it: the peg top is ~40 mm under alignZ, so a few mm of dead band is no risk.
+                below = self.setpoint[2] < cfg.alignZ - 1e-9 or ee_xyz[2] < cfg.alignZ - FUNNEL_ALIGN_Z_SLACK_M
                 if xy_err > cfg.captureXyMm and below:
                     # Up first, never sideways at peg height.
                     goal = (self.setpoint[0], self.setpoint[1], cfg.alignZ)
