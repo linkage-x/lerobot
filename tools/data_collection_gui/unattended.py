@@ -129,6 +129,7 @@ def _plan_terminal_trials(
         "fence": {"min": list(workspace_min), "max": list(workspace_max), "source": fence_source},
         "text": describe_schedule(trials_request, schedule),
         "units": len(schedule),
+        "homeFirst": _flag(request, "homeFirst"),
     }
     # Every value goes as --flag=value: an offsets list starting "-12,..." given as its own argv
     # word is read by argparse as another flag, and the run dies before its first row.
@@ -155,6 +156,10 @@ def _plan_terminal_trials(
         argv += ["--operator-grade", f"--grade-file={run_dir / 'GRADE'}"]
     if not trials_request.updateReference:
         argv.append("--fixed-hole")
+    # The run inherits the wrist from wherever the arm was left, and refuses to start leaning;
+    # home is level. 09-28: the run after a wedged peg found the tool 16.2 deg off.
+    if _flag(request, "homeFirst"):
+        argv.append("--home-first")
     return plan, argv
 
 

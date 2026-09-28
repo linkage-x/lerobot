@@ -282,6 +282,11 @@ def test_a_graded_terminal_plan_reaches_the_runtime_with_its_switches(tmp_path):
     assert any(arg.startswith("--grade-file=") and arg.endswith("GRADE") for arg in planned["argv"])
     ungraded = plan_run(tmp_path, "terminal_trials", {"holePose": "0.3599,-0.1333,0.0523"})
     assert "--operator-grade" not in ungraded["argv"]
+    assert "--home-first" not in ungraded["argv"]
+    homed = plan_run(tmp_path, "terminal_trials", {"holePose": "0.3599,-0.1333,0.0523",
+                                                   "homeFirst": "1", "fixedHole": "1"})
+    assert runtime.parse_args(homed["argv"][1:]).home_first
+    assert not runtime.build_request(runtime.parse_args(homed["argv"][1:])).updateReference
 
 
 def test_a_grade_question_is_answered_with_in_or_out_and_not_with_continue(tmp_path):

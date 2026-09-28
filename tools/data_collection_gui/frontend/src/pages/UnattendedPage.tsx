@@ -61,7 +61,8 @@ const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
     regripInPlace: "0",
     releaseOnlyWhenSeated: "0",
     operatorGrade: "0",
-    fixedHole: "0"
+    fixedHole: "0",
+    homeFirst: "1"
   },
   grasp_envelope: {
     start: "fixture",
@@ -100,6 +101,7 @@ const FIELD_HELP: Record<string, string> = {
   extraPointsMm: "Fine scan after the coarse pass: 'dx,dy,dz; dx,dy,dz' in mm.",
   resumeFrom: "Run id of a halted envelope run with the same plan; its finished trials are skipped.",
   pickPose: "Where the peg is fetched from before the first trial: the pick fixture the grasp loop takes it from.",
+  homeFirst: "1: move to the home keyframe (level) before the first trial. The run refuses to start with the tool leaning over 2 deg.",
   fixedHole: "1: keep aiming at holePose; reference trials record what they read but do not move the aim (09-28: updates walked it 4.6 mm off and it missed).",
   regripInPlace: "1: close on the peg where it was let go of, before retreating (no new descent to fetch it).",
   releaseOnlyWhenSeated: "1: keep hold of a peg the automatic verdict did not call seated.",
