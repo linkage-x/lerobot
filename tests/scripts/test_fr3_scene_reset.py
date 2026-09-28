@@ -658,3 +658,58 @@ def test_a_dead_control_loop_stops_the_step_at_once_and_the_reset_does_not_try_t
     result = scene_reset.execute_scene_reset(Dead(), request)
     assert result["ok"] is False and result["controlLoopDied"] is True
     assert "returnedToStart" not in result
+
+
+def test_a_force_capped_step_stops_pushing_where_something_holds_it_up():
+    """09-28: a peg met the table 4 mm above the step's target and was pressed into it until the
+    reflex fired at -21 N. Capped, the step ends at the cap and the setpoint moves to the arm."""
+
+    class Table(FakeRobot):
+        # A spring 5 N/mm under z = 0.056, pushing up: the estimate reads it as downward force.
+        @property
+        def external_wrench(self):
+            return (0.1, 0.1, 2.0 - 5000.0 * max(0.0, 0.056 - self.xyz[2]), 0.0, 0.0, 0.0)
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.0, 0.0, 0.0), targetXyz=(0.0, 0.0, 0.0),
+        timeoutS=0.5, toleranceM=0.006, controlPeriodS=0.001,
+    )
+    robot = Table()
+    robot.xyz = (0.40, -0.14, 0.062)
+    hit = scene_reset._run_step(
+        robot, request, "descend_8cm_to_place", (0.40, -0.14, 0.052), (0.0, 0.0, 0.0), 0.0,
+        max_speed_ms=1.0, force_cap=(2.0, 7.0),
+    )
+    assert hit is True
+    last = robot.actions[-1]
+    # Held where it was stopped -- within one walk step of where the cap was crossed -- with the
+    # fingers still told to hold.
+    assert last["ee.z"] >= 0.056 - 0.0014 - 0.001
+    assert last["gripper.pos"] == 0.0
+    assert min(a["ee.z"] for a in robot.actions) >= 0.056 - 0.0014 - 0.001
+
+    free = FakeRobot()
+    free.xyz = (0.40, -0.14, 0.062)
+    assert scene_reset._run_step(
+        free, request, "descend_8cm_to_place", (0.40, -0.14, 0.052), (0.0, 0.0, 0.0), 0.0,
+        max_speed_ms=1.0, force_cap=(2.0, 7.0),
+    ) is False
+
+
+def test_a_capped_hold_moves_the_setpoint_to_the_arm_once_and_keeps_the_fingers_closed():
+    class Pressed(FakeRobot):
+        external_wrench = (0.0, 0.0, -9.0, 0.0, 0.0, 0.0)
+
+    robot = Pressed()
+    robot.xyz = (0.40, -0.14, 0.055)
+    scene_reset.traced_hold(robot, "r", "dwell_before_open", 0.05, 0.001, force_cap=(0.0, 7.0, 0.0))
+    assert len(robot.actions) == 1
+    assert robot.actions[0]["ee.z"] == 0.055 and robot.actions[0]["gripper.pos"] == 0.0
+
+    class Dropout(FakeRobot):
+        external_wrench = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    quiet = Dropout()
+    scene_reset.traced_hold(quiet, "r", "dwell_before_open", 0.05, 0.001, force_cap=(5.0, 7.0, 0.0))
+    # All zeros is no reading, not -5 N below the tare.
+    assert quiet.actions == []

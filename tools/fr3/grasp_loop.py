@@ -96,6 +96,7 @@ from tools.fr3.scene_reset import (
     execute_scene_reset,
     parse_mask_strokes,
     precise_sleep,
+    read_fz,
     set_force_trace_path,
     traced_hold,
 )
@@ -149,6 +150,19 @@ GRASP_LOOP_PLACE_DWELL_S = 1.0
 GRASP_LOOP_HOVER_M = 0.010
 GRASP_LOOP_HOVER_TOLERANCE_M = 0.005
 GRASP_LOOP_HOVER_STILL_S = 0.3
+# A set-down stops pushing once the tool reads this much more downward force than it did parked
+# at the hover. 2026-09-28: ordinary set-downs read -3 to -9 N by the end of the dwell; the one
+# that tripped libfranka's reflex reached -21.4 N. 7 N sits under the reflex with room and above
+# the ~3 N the fast walk's own deceleration shows. Blind while the estimate reads all zeros (a
+# fifth of samples that day); the reflex recovery is what covers those.
+GRASP_LOOP_SET_DOWN_CAP_N = 7.0
+# Before the script closes on a standing peg, the tool has to have stopped: within this radius for
+# this long. The descent is called done up to 6 mm short while still moving, so a close started
+# then grips the peg at whatever height the arm has reached, and the next set-down meets the table
+# that much early -- 09-28 trial 35 met it 4 mm above its target.
+GRASP_LOOP_CLOSE_STILL_M = 0.0003
+GRASP_LOOP_CLOSE_STILL_S = 0.3
+GRASP_LOOP_CLOSE_STILL_TIMEOUT_S = 2.0
 # A miss leaves the peg standing when the tool never came low near it. "Near" is a horizontal
 # radius the open fingers could reach the peg from: fully open they stand about 48 mm apart (a
 # 15 mm peg reads 0.31), so a finger's outside is ~30 mm off the tool point, plus the peg's
@@ -482,8 +496,13 @@ def _settled_descent(
     xyz: tuple[float, float, float],
     rotvec: tuple[float, float, float],
     gripper: float,
-) -> None:
-    """Down to `xyz` by way of a hover `GRASP_LOOP_HOVER_M` above it, where the arm has to stop."""
+) -> tuple[float, float] | None:
+    """Down to `xyz` by way of a hover `GRASP_LOOP_HOVER_M` above it, where the arm has to stop.
+
+    A set-down (a "place" step, carrying the peg) is capped at GRASP_LOOP_SET_DOWN_CAP_N against
+    the force read parked at the hover, and answers that cap for the dwell to keep; None when
+    the estimate could not be read there, or for a pick.
+    """
 
     hover_name = "settle_above_place" if "place" in name else "settle_above_pick"
     hover = (xyz[0], xyz[1], xyz[2] + GRASP_LOOP_HOVER_M)
@@ -492,7 +511,30 @@ def _settled_descent(
         tolerance_m=GRASP_LOOP_HOVER_TOLERANCE_M,
         still_window_s=GRASP_LOOP_HOVER_STILL_S,
     )
-    _run_step(robot, step_request, name, xyz, rotvec, gripper)
+    tare = read_fz(robot) if "place" in name else None
+    cap = None if tare is None else (tare, GRASP_LOOP_SET_DOWN_CAP_N)
+    _run_step(robot, step_request, name, xyz, rotvec, gripper, force_cap=cap)
+    return cap
+
+
+def _await_still(robot: Any, period_s: float) -> None:
+    """Until the tool has held within GRASP_LOOP_CLOSE_STILL_M for GRASP_LOOP_CLOSE_STILL_S.
+
+    Gives up quietly after GRASP_LOOP_CLOSE_STILL_TIMEOUT_S: an arm still creeping then is closing
+    no worse than it did before this existed.
+    """
+
+    started = time.perf_counter()
+    anchor, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    anchored_at = started
+    while time.perf_counter() - started < GRASP_LOOP_CLOSE_STILL_TIMEOUT_S:
+        xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        now = time.perf_counter()
+        if math.dist(xyz, anchor) > GRASP_LOOP_CLOSE_STILL_M:
+            anchor, anchored_at = xyz, now
+        elif now - anchored_at >= GRASP_LOOP_CLOSE_STILL_S:
+            return
+        precise_sleep(period_s)
 
 
 def place_held_peg(
@@ -519,8 +561,8 @@ def place_held_peg(
         _check_xyz_in_workspace(point, name, low, high)
     rotvec = _clear_upward(robot, request, step_request, gripper, "lift_8cm_after_grasp")
     _run_step(robot, step_request, "move_to_place_above", (target_xyz[0], target_xyz[1], carry_z), rotvec, gripper)
-    _settled_descent(robot, step_request, "descend_8cm_to_place", (target_xyz[0], target_xyz[1], place_z), rotvec, gripper)
-    released = _open_and_settle(robot, request, step_request, (target_xyz[0], target_xyz[1], place_z), rotvec)
+    cap = _settled_descent(robot, step_request, "descend_8cm_to_place", (target_xyz[0], target_xyz[1], place_z), rotvec, gripper)
+    released = _open_and_settle(robot, request, step_request, (target_xyz[0], target_xyz[1], place_z), rotvec, cap=cap, gripper=gripper)
     _run_step(robot, step_request, "retreat_8cm", (target_xyz[0], target_xyz[1], carry_z), rotvec, request.openGripper)
     _move_to_start(robot)
     return released
@@ -532,8 +574,17 @@ def _open_and_settle(
     step_request: SceneResetRequest,
     xyz: tuple[float, float, float],
     rotvec: tuple[float, float, float],
+    *,
+    cap: tuple[float, float] | None = None,
+    gripper: float | None = None,
 ) -> tuple[float, float, float]:
-    traced_hold(robot, step_request.requestId, "dwell_before_open", request.placeDwellS, request.controlPeriodS)
+    traced_hold(
+        robot, step_request.requestId, "dwell_before_open", request.placeDwellS, request.controlPeriodS,
+        force_cap=None if cap is None or gripper is None else (cap[0], cap[1], gripper),
+    )
+    # Opened where the arm is, not at the target: after a capped set-down the arm is holding
+    # above it, and walking back down to the target would press the peg all over again.
+    xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
     _run_step(robot, step_request, "open_gripper", xyz, rotvec, request.openGripper)
     traced_hold(robot, step_request.requestId, "settle_after_open", request.releaseSettleS, request.controlPeriodS)
     released, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
@@ -560,8 +611,8 @@ def set_down_and_regrip(
     xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
     low, high = _robot_workspace_bounds(robot)
     _check_xyz_in_workspace((xyz[0], xyz[1], place_z), "descend_8cm_to_place", low, high)
-    _settled_descent(robot, step_request, "descend_8cm_to_place", (xyz[0], xyz[1], place_z), rotvec, gripper)
-    released = _open_and_settle(robot, request, step_request, (xyz[0], xyz[1], place_z), rotvec)
+    cap = _settled_descent(robot, step_request, "descend_8cm_to_place", (xyz[0], xyz[1], place_z), rotvec, gripper)
+    released = _open_and_settle(robot, request, step_request, (xyz[0], xyz[1], place_z), rotvec, cap=cap, gripper=gripper)
     _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
     _move_to_start(robot)
     width = verified_pick(
@@ -666,6 +717,7 @@ def verified_pick(
         rotvec = _turn_wrist(robot, step_request, rotvec, turn_rad, request.openGripper)
     _run_step(robot, step_request, "go_to_pick_above", above, rotvec, request.openGripper)
     _settled_descent(robot, step_request, "descend_8cm_to_pick", at_xyz, rotvec, request.openGripper)
+    _await_still(robot, request.controlPeriodS)
     _run_step(robot, step_request, "close_gripper", at_xyz, rotvec, request.closedGripper)
     _run_step(robot, step_request, "lift_8cm_after_grasp", above, rotvec, request.closedGripper)
     precise_sleep(GRASP_LOOP_WIDTH_SETTLE_S)

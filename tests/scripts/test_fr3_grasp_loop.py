@@ -830,3 +830,50 @@ def test_one_off_centre_close_is_squeezed_out_by_the_turned_regrip(tmp_path, mon
         assert all(v == pytest.approx(0.006, abs=1e-4) for v in later)
     else:
         assert all(v <= 1e-4 for v in later)
+
+
+class HighTableRig(GraspRig):
+    """The rig with a force estimate, and a table the carried peg meets 4 mm above the place
+    height -- 09-28 trial 35. The arm goes where it is told; the estimate reads the overlap as a
+    5 N/mm push."""
+
+    CONTACT_Z = None
+
+    def send_action(self, action):
+        was_closed = self.closed
+        result = super().send_action(action)
+        if self.closed and not was_closed:
+            self.grip_z = self.xyz[2]
+        return result
+
+    @property
+    def external_wrench(self):
+        # Only a carried peg meets the table early; at the height it was taken it stands on it.
+        if not self.held or self.CONTACT_Z is None or abs(self.xyz[2] - getattr(self, "grip_z", -1.0)) < 1e-6:
+            return (0.1, 0.1, 1.0, 0.0, 0.0, 0.0)
+        return (0.1, 0.1, 1.0 - 5000.0 * max(0.0, self.CONTACT_Z - self.xyz[2]), 0.0, 0.0, 0.0)
+
+
+def test_a_set_down_that_meets_the_table_early_stops_pushing_and_lets_go_there(tmp_path, capsys, monkeypatch):
+    # 1 mm a tick, so the cap is crossed a millimetre or two into the table rather than a jump.
+    monkeypatch.setattr(scene_reset, "SCENE_RESET_MAX_SPEED_MS", 0.03)
+    request = _request(trials=2)
+    robot = HighTableRig()
+    HighTableRig.CONTACT_Z = request.regripZ + 0.004
+    try:
+        run_grasp_loop(robot, request, run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=tmp_path / "g.jsonl")
+    finally:
+        HighTableRig.CONTACT_Z = None
+    out = capsys.readouterr().out
+    assert "stopped_on=contact" in out
+    contact = request.regripZ + 0.004
+    stops = [float(line.rsplit("z=", 1)[1]) for line in out.splitlines() if "stopped_on=contact" in line]
+    # Every set-down stopped within the cap's worth (7 N at 5 N/mm) plus one tick of the table.
+    assert stops and all(z >= contact - 0.0014 - 0.0011 for z in stops)
+    # And let go where it stopped, not back down at the target.
+    opens = [
+        a for prev, a in zip(robot.actions, robot.actions[1:])
+        if prev["gripper.pos"] == request.closedGripper and a["gripper.pos"] >= 0.5 and a["ee.z"] < 0.07
+    ]
+    assert opens and all(a["ee.z"] >= contact - 0.0025 for a in opens)
+    assert [r["verdict"] for r in _trials(tmp_path / "g.jsonl")] == ["held", "held"]

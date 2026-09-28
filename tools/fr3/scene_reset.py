@@ -611,6 +611,19 @@ def _read_external_wrench(robot: Any) -> tuple[float, ...] | None:
     return tuple(float(v) for v in wrench)
 
 
+def read_fz(robot: Any) -> float | None:
+    """The z force estimate, or None when there is none to read.
+
+    All six components at exactly 0.0 is a dropout, not a reading: on 2026-09-28 about a fifth
+    of samples came back that way, in stretches of ~3 s, including whole placements.
+    """
+
+    wrench = _read_external_wrench(robot)
+    if wrench is None or not any(wrench):
+        return None
+    return wrench[2]
+
+
 class _ForceTrace:
     """Samples for one step: (t_s, commanded z, measured xyz, wrench) at the control rate."""
 
@@ -662,27 +675,50 @@ class _ForceTrace:
             print(f"[WARN] force_trace=write_failed path={_force_trace_path} details={exc}", flush=True)
 
 
-def traced_hold(robot: Any, request_id: str, name: str, seconds: float, period_s: float = 1.0 / 30.0) -> None:
+def traced_hold(
+    robot: Any,
+    request_id: str,
+    name: str,
+    seconds: float,
+    period_s: float = 1.0 / 30.0,
+    *,
+    force_cap: tuple[float, float, float] | None = None,
+) -> None:
     """`precise_sleep(seconds)`, sampling the wrench meanwhile when a force trace is on.
 
-    Sends nothing: the arm holds its last setpoint exactly as it does through a plain sleep.
+    Sends nothing -- the arm holds its last setpoint exactly as it does through a plain sleep --
+    unless `force_cap` = (tare_fz, cap_n, gripper) is given and the tool is pressed down harder
+    than `cap_n` below the tare: then the setpoint is moved to where the arm is, so it stops
+    pushing. `gripper` is the command the fingers are holding, re-sent as it is: the observed
+    opening of a clamped peg is the peg's width, and sending that back would let go of it.
     """
 
     if seconds <= 0.0:
         return
     trace = _ForceTrace(robot, request_id, name)
-    if not trace.enabled:
+    if not trace.enabled and force_cap is None:
         precise_sleep(seconds)
         return
     deadline = time.perf_counter() + seconds
+    unloaded = False
     while True:
-        xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        if force_cap is not None and not unloaded:
+            fz = read_fz(robot)
+            if fz is not None and fz - force_cap[0] < -force_cap[1]:
+                _send_absolute(robot, xyz, rotvec, force_cap[2])
+                unloaded = True
+                print(
+                    f"[INFO] scene_reset_step=unloaded request_id={request_id} name={name} "
+                    f"dfz_n={fz - force_cap[0]:+.1f} z={xyz[2]:+.4f}",
+                    flush=True,
+                )
         trace.sample(xyz[2], xyz)
         remaining = deadline - time.perf_counter()
         if remaining <= 0.0:
             break
         precise_sleep(min(period_s, remaining))
-    trace.flush("done")
+    trace.flush("unloaded" if unloaded else "done")
 
 
 def _scene_reset_waits_for_gripper_position(name: str) -> bool:
@@ -714,7 +750,8 @@ def _run_step(
     max_speed_ms: float | None = None,
     tolerance_m: float | None = None,
     still_window_s: float | None = None,
-) -> None:
+    force_cap: tuple[float, float] | None = None,
+) -> bool:
     """Walk the setpoint to a waypoint, optionally publishing every step to a recorder.
 
     `tap` is the only thing a recorded step does that an unrecorded one does not, and it is
@@ -744,6 +781,12 @@ def _run_step(
     within SCENE_RESET_STILL_XY_M for that long. For a hover above the table, where what matters
     is that nothing is sliding when the fingers reach it -- not the ~2 mm the arm sags with a
     peg in the fingers, which on 2026-09-24 timed a 3 mm 3-D hover out at 3.2 mm, parked.
+
+    `force_cap` = (tare_fz, cap_n) ends the step early when the tool is pressed down more than
+    `cap_n` below the tare -- something under it has been reached -- and moves the setpoint to
+    where the arm is, so it stops pushing. Answers True when that happened. 2026-09-28: a peg set
+    down 4 mm higher than the step's target was pressed into the table until libfranka's reflex
+    fired at -21 N; ordinary set-downs read -3 to -9 N.
     """
 
     speed_ms = SCENE_RESET_MAX_SPEED_MS if max_speed_ms is None else float(max_speed_ms)
@@ -808,6 +851,17 @@ def _run_step(
                 f"stopped at ({current_xyz[0]:+.4f}, {current_xyz[1]:+.4f}, {current_xyz[2]:+.4f})."
             )
         trace.sample(commanded[2], current_xyz)
+        if force_cap is not None:
+            fz = read_fz(robot)
+            if fz is not None and fz - force_cap[0] < -force_cap[1]:
+                _send_absolute(robot, current_xyz, rotvec, gripper)
+                print(
+                    f"[INFO] scene_reset_step=done request_id={request.requestId} name={name} "
+                    f"stopped_on=contact dfz_n={fz - force_cap[0]:+.1f} z={current_xyz[2]:+.4f}",
+                    flush=True,
+                )
+                trace.flush("contact")
+                return True
         stall_m = _reach_stall_error_m(robot)
         if stall_m <= 0.0:
             stalled_since = None
@@ -879,7 +933,7 @@ def _run_step(
                 flush=True,
             )
             trace.flush("done")
-            return
+            return False
         precise_sleep(request.controlPeriodS)
     trace.flush("timeout")
     if not math.isfinite(error_a_second_ago):
