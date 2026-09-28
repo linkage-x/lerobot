@@ -5,6 +5,7 @@ const VERDICT_COLORS: Record<string, string> = {
   held: "#38a169",
   empty: "#e53e3e",
   no_close: "#dd6b20",
+  collision: "#9b2c2c",
   not_graded: "#718096"
 };
 
@@ -17,6 +18,7 @@ const VERDICT_LABELS: Record<string, string> = {
   held: "抓住",
   empty: "空抓",
   no_close: "没合手",
+  collision: "碰撞保护",
   not_graded: "未评"
 };
 
@@ -62,12 +64,19 @@ export function GraspLoopPanel({
 
       {progress.needsOperator && (
         <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span>
-            <strong>需要你：</strong>销不在它原来的位置了（被碰倒或推走）。把销插回孔里（fixture pick pose），
-            手离开工作区后点「已放回，继续」。
-          </span>
+          {progress.needsOperator.startsWith("reflex") ? (
+            <span>
+              <strong>需要你：</strong>机械臂触发了碰撞保护，已停住。确认手指下没有压着东西、周围安全后点「安全，恢复」——
+              机械臂会松爪、竖直抬起、回原位，然后再请你放回销子。
+            </span>
+          ) : (
+            <span>
+              <strong>需要你：</strong>销不在它原来的位置了（被碰倒或推走）。把销插回孔里（fixture pick pose），
+              手离开工作区后点「已放回，继续」。
+            </span>
+          )}
           <button type="button" className="primary" disabled={busy} onClick={() => onControl("grasp_continue")}>
-            已放回，继续
+            {progress.needsOperator.startsWith("reflex") ? "安全，恢复" : "已放回，继续"}
           </button>
         </div>
       )}

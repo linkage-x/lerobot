@@ -18,6 +18,9 @@ function median(values: number[]): number | null {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/** What `summarize_grasp_loop` grades: a miss, no close, or a collision counts against the arm. */
+export const GRADED_VERDICTS = ["held", "empty", "no_close", "collision"];
+
 /** Median of one covariate, split by verdict: held against everything graded that was not. */
 export function medianByVerdict(
   trials: GraspLoopTrial[],
@@ -27,18 +30,18 @@ export function medianByVerdict(
     median(trials.filter(keep).map((t) => t[key]).filter((v): v is number => typeof v === "number"));
   return {
     held: pick((t) => t.verdict === "held"),
-    notHeld: pick((t) => t.verdict === "empty" || t.verdict === "no_close")
+    notHeld: pick((t) => t.verdict !== "held" && GRADED_VERDICTS.includes(t.verdict))
   };
 }
 
 export type ArmRate = { arm: string; graded: number; held: number; low: number; high: number };
 
 /** Held rate per arm. An interleaved run's pooled rate is a rate of neither arm, so the panel
- *  leads with these. Same grading as `summarize_grasp_loop`: held, empty and no_close count. */
+ *  leads with these. Same grading as `summarize_grasp_loop` (GRADED_VERDICTS). */
 export function armRates(trials: GraspLoopTrial[]): ArmRate[] {
   const byArm = new Map<string, { graded: number; held: number }>();
   for (const trial of trials) {
-    if (!["held", "empty", "no_close"].includes(trial.verdict)) continue;
+    if (!GRADED_VERDICTS.includes(trial.verdict)) continue;
     const arm = trial.arm ?? "A";
     const entry = byArm.get(arm) ?? { graded: 0, held: 0 };
     entry.graded += 1;

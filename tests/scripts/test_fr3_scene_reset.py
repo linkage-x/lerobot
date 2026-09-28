@@ -635,3 +635,26 @@ def test_a_hover_waits_for_the_arm_to_stop_sideways_not_for_it_to_arrive_in_3d()
     with pytest.raises(TimeoutError):
         scene_reset._run_step(Creeping(), request, "settle_above_place", hover, (0.0, 0.0, 0.0), 0.0,
                               max_speed_ms=50.0, tolerance_m=0.005, still_window_s=0.05)
+
+
+def test_a_dead_control_loop_stops_the_step_at_once_and_the_reset_does_not_try_to_home():
+    """After a reflex every reading freezes, so the step used to wait out its 20 s timeout and the
+    abort then tried to home an arm that was not listening. Now the tick that sees it stops."""
+
+    class Dead(FakeRobot):
+        control_loop_alive = False
+
+    request = scene_reset.SceneResetRequest(
+        pickXyz=(0.36, -0.14, 0.055), targetXyz=(0.43, -0.2, 0.058),
+        timeoutS=5.0, toleranceM=0.006, controlPeriodS=0.001,
+    )
+    robot = Dead()
+    started = time.perf_counter()
+    with pytest.raises(scene_reset.ControlLoopDiedError):
+        scene_reset._run_step(robot, request, "go_to_pick_above", (0.36, -0.14, 0.135), (0.0, 0.0, 0.0), 1.0)
+    assert time.perf_counter() - started < 0.5
+    assert len(robot.actions) == 1
+
+    result = scene_reset.execute_scene_reset(Dead(), request)
+    assert result["ok"] is False and result["controlLoopDied"] is True
+    assert "returnedToStart" not in result

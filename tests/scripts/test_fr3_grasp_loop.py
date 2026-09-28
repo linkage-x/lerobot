@@ -647,3 +647,93 @@ def test_a_repick_that_comes_up_empty_hands_the_peg_to_the_operator(tmp_path):
     assert rows[0]["pegUntouched"] is True
     assert rows[1]["staging"] == "fixture" and len(asked) == 1
     assert not robot.held
+
+
+class ReflexRig(GraspRig):
+    """The rig with libfranka's loop: it can die, and `recover_control_loop` brings it back."""
+
+    def __init__(self):
+        super().__init__()
+        self.control_loop_alive = True
+        self.recoveries = 0
+
+    def recover_control_loop(self):
+        self.recoveries += 1
+        self.control_loop_alive = True
+
+
+def _reflex_policy(robot, plan):
+    """Like `_policy`, plus ("reflex", None): the arm is driven into the peg top and the loop dies."""
+
+    inner = _policy(robot, [p if p[0] != "reflex" else ("wander", None) for p in plan])
+
+    def run(trial, handover):
+        if plan[trial][0] == "reflex":
+            robot.control_loop_alive = False
+            return "control_loop_died"
+        return inner(trial, handover)
+
+    return run
+
+
+def test_a_reflex_in_the_policys_segment_is_a_collision_and_recovers_only_on_the_operators_word(tmp_path):
+    robot = ReflexRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_reflex_policy(robot, [("reflex", None), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["collision", "held"]
+    # First the reflex -- recover, open, up, home -- then the peg, which it may have knocked.
+    assert asked[0].startswith(grasp_loop.GRASP_LOOP_REFLEX_PROMPT) and "fixture" in asked[1]
+    assert robot.recoveries == 1 and robot.gripper >= 0.5
+    assert result["halted"] == ""
+    # Counted against the arm, like a miss.
+    summary = result["summary"]
+    assert summary["graded"] == 2 and summary["held"] == 1 and summary["collision"] == 1
+
+
+def test_an_unattended_reflex_halts_without_moving_the_arm(tmp_path):
+    robot = ReflexRig()
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_reflex_policy(robot, [("reflex", None), ("grasp", 0.0)]),
+        out_path=out,
+    )
+    moved = len(robot.actions)
+    assert result["halted"] == "control_loop_died"
+    assert robot.recoveries == 0 and not robot.control_loop_alive
+    assert [r["verdict"] for r in _trials(out)] == ["collision"]
+    assert len(robot.actions) == moved
+
+
+def test_a_reflex_in_a_scripted_step_is_recovered_and_is_not_charged_to_the_policy(tmp_path):
+    class DiesOnSetDown(ReflexRig):
+        def send_action(self, action):
+            if self.held and action["ee.z"] < 0.07 and not getattr(self, "died", False):
+                self.died = True
+                self.control_loop_alive = False
+                return dict(action)
+            return super().send_action(action)
+
+    robot = DiesOnSetDown()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    lines = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [line["kind"] for line in lines if line["kind"] in ("reflex", "trial")] == ["reflex", "trial"]
+    assert robot.recoveries == 1 and asked[0].startswith(grasp_loop.GRASP_LOOP_REFLEX_PROMPT)
+    assert result["halted"] == ""

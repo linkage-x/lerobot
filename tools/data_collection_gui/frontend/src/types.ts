@@ -1269,7 +1269,7 @@ export type GraspLoopTrial = {
   /** A pure policy, B policy + GT grasp funnel. */
   arm?: string;
   /** held / empty come from the width after a 3 cm lift; no_close means the policy never shut. */
-  verdict: "held" | "empty" | "no_close" | "not_graded" | string;
+  verdict: "held" | "empty" | "no_close" | "collision" | "not_graded" | string;
   widthLifted: number | null;
   closeAboveTargetMm: number | null;
   lateralMm: number | null;

@@ -68,6 +68,24 @@ class SceneResetError(ValueError):
     """A reset request that is invalid before a robot should move."""
 
 
+class ControlLoopDiedError(RuntimeError):
+    """libfranka ended the control loop (a reflex): nothing sent reaches the arm until recovery.
+
+    Its own type because every reading freezes at its last value once the loop is gone, so the
+    step that notices is not the step at fault, and the only safe answer is to stop commanding
+    -- an abort that homes the arm would only time out against a controller that is not there.
+    """
+
+
+def control_loop_alive(robot: Any) -> bool:
+    """False once the robot says its control loop has ended; True for one that cannot say."""
+
+    try:
+        return bool(getattr(robot, "control_loop_alive", True))
+    except Exception:  # noqa: BLE001 - a liveness probe that fails is not a dead loop
+        return True
+
+
 class SceneResetUnreachableError(RuntimeError):
     """A waypoint IK cannot realise, found with the arm already part-way through the reset.
 
@@ -783,6 +801,12 @@ def _run_step(
             tap.publish(now, name, observation, action)
         robot.send_action(action)
         observation, current_xyz, _current_rotvec, current_gripper = _observation_snapshot(robot)
+        if not control_loop_alive(robot):
+            trace.flush("control_loop_died")
+            raise ControlLoopDiedError(
+                f"scene reset step {name}: the FR3 control loop has ended (a reflex); the arm "
+                f"stopped at ({current_xyz[0]:+.4f}, {current_xyz[1]:+.4f}, {current_xyz[2]:+.4f})."
+            )
         trace.sample(commanded[2], current_xyz)
         stall_m = _reach_stall_error_m(robot)
         if stall_m <= 0.0:
@@ -1022,6 +1046,9 @@ def execute_scene_reset(
         }
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the gateway
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details={exc}", flush=True)
+        if isinstance(exc, ControlLoopDiedError):
+            # Nothing to abort into: the arm is not listening.
+            return {"ok": False, "error": str(exc), "request": request.payload(), "trajectoryQc": qc, "controlLoopDied": True}
         recovery = _abort_scene_reset(robot, request, gripper=commanded_gripper)
         return {
             "ok": False,

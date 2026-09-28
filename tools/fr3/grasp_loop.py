@@ -37,7 +37,12 @@ The loop keeps track of where the peg is, because that decides how the next tria
               low near the peg                             and carries it to the next target
                                                            ("repick"); an empty pick makes it lost
     lost      after any other miss, or a re-grip or     -> a person puts it back in the fixture,
-              re-pick that came up empty                   or the run halts if nobody is there
+              re-pick that came up empty, or a reflex      or the run halts if nobody is there
+
+A reflex -- libfranka's collision stop, which ends its control loop -- is caught the tick it
+happens (`scene_reset.control_loop_alive`). A person confirms the arm is clear before the loop
+recovers it, opens, backs straight up and homes; a reflex in the policy's segment is graded
+"collision", a failure of that arm.
 
 Every staged peg is released from the script's own grip, never the policy's. On 2026-09-23 the
 B arm held 8/8 pegs staged from a scripted grip and 2/6 carried on in the policy's: a policy's
@@ -82,6 +87,8 @@ from tools.fr3.scene_reset import (
     _run_step,
     _sample_xy_from_strokes,
     _workspace_bounds,
+    ControlLoopDiedError,
+    control_loop_alive,
     execute_scene_reset,
     parse_mask_strokes,
     precise_sleep,
@@ -143,9 +150,11 @@ GRASP_LOOP_HOVER_STILL_S = 0.3
 # 15 mm peg reads 0.31), so a finger's outside is ~30 mm off the tool point, plus the peg's
 # 7.5 mm radius. "Low" is below the peg's grasp height plus this clearance -- the peg top.
 # Sized on the 09-23/09-24 trajectories: it passes the A misses closed 2-4 cm above and 4-7 cm
-# off, and none that went below the grasp height within 3 cm.
+# off, and none that went below the grasp height within 3 cm. Measured 09-28, when an open finger
+# came down on the peg top from 31 mm off and the arm stopped: the top is 18 mm above the grasp
+# height, so 25 mm keeps a fingertip that passed as "clear" 7 mm over it.
 GRASP_LOOP_UNTOUCHED_XY_M = 0.040
-GRASP_LOOP_UNTOUCHED_Z_M = 0.020
+GRASP_LOOP_UNTOUCHED_Z_M = 0.025
 # Held still after the fingers open, so a peg that rocks on release is not dragged by the retreat.
 GRASP_LOOP_RELEASE_SETTLE_S = 0.5
 GRASP_LOOP_WIDTH_SAMPLES = 10
@@ -543,6 +552,35 @@ def set_down_and_regrip(
     return width, released
 
 
+GRASP_LOOP_REFLEX_PROMPT = "reflex: the arm tripped its collision reflex and stopped"
+
+
+def recover_from_reflex(
+    robot: Any,
+    request: GraspLoopRequest,
+    wait_for_operator: OperatorWait | None,
+    *,
+    request_id: str,
+) -> bool:
+    """After a reflex: a person says the arm is clear, then recover, open, straight up, home.
+
+    False -- nothing moved -- when nobody is there to ask, they did not answer, or the robot
+    cannot recover its loop. The peg is whatever the reflex left, so the caller treats it as lost.
+    """
+
+    recover = getattr(robot, "recover_control_loop", None)
+    if wait_for_operator is None or not callable(recover):
+        return False
+    if not wait_for_operator(
+        f"{GRASP_LOOP_REFLEX_PROMPT}: check nothing is trapped under the fingers, then continue "
+        "-- the arm will open, back straight up and home"
+    ):
+        return False
+    recover()
+    release_and_clear(robot, request, request_id=request_id)
+    return True
+
+
 def release_and_clear(robot: Any, request: GraspLoopRequest, *, request_id: str) -> None:
     """After an empty or abandoned grasp: open, straight up, home. Nothing is known to be held."""
 
@@ -586,6 +624,11 @@ def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, flo
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+# A failure of the policy's segment counts against it: missed, never closed, or drove the arm
+# into something hard enough to trip the reflex.
+GRADED_VERDICTS = ("held", "empty", "no_close", "collision")
+
+
 def summarize_grasp_loop(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Held rate over graded trials, and the two covariates card 12 says to look at next.
 
@@ -603,7 +646,7 @@ def summarize_grasp_loop(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    graded = [r for r in rows if r.get("verdict") in ("held", "empty", "no_close")]
+    graded = [r for r in rows if r.get("verdict") in GRADED_VERDICTS]
     held = [r for r in graded if r["verdict"] == "held"]
     low, high = wilson_interval(len(held), len(graded))
 
@@ -619,6 +662,7 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "heldRate": round(len(held) / len(graded), 3) if graded else None,
         "wilson95": [round(low, 3), round(high, 3)],
         "noClose": sum(1 for r in graded if r["verdict"] == "no_close"),
+        "collision": sum(1 for r in graded if r["verdict"] == "collision"),
         "closeAboveTargetMm": {"held": by(("held",), "closeAboveTargetMm"), "empty": by(("empty",), "closeAboveTargetMm")},
         "lateralMm": {"held": by(("held",), "lateralMm"), "empty": by(("empty",), "lateralMm")},
     }
@@ -798,6 +842,8 @@ def run_grasp_loop(
                     hover_tolerance_m=GRASP_LOOP_HOVER_TOLERANCE_M,
                     hover_still_s=GRASP_LOOP_HOVER_STILL_S,
                 )
+                if reset.get("controlLoopDied"):
+                    raise ControlLoopDiedError(str(reset.get("error")))
                 if not reset.get("ok"):
                     write({"kind": "halt", "trial": trial, "reason": "scene_reset_failed", "error": reset.get("error")})
                     halted = "scene_reset_failed"
@@ -856,6 +902,19 @@ def run_grasp_loop(
                 row.update(handover.funnel.trial_record())
                 row["funnelSteps"] = str(_write_funnel_steps(out_path, trial, handover.funnel))
 
+            if status == "control_loop_died":
+                # The policy's segment drove the arm into something (09-28: an open finger onto
+                # the peg top). Graded against the arm, then recovered with a person's say-so.
+                row["verdict"] = "collision"
+                row["trialS"] = round(time.perf_counter() - started, 1)
+                write(row)
+                done.append(row)
+                log(f"[WARN] grasp_loop_trial trial={trial} arm={arm} verdict=collision trial_s={row['trialS']}")
+                peg = "lost"
+                if not recover_from_reflex(robot, request, wait_for_operator, request_id=request_id):
+                    halted, peg = "control_loop_died", "unknown"
+                    break
+                continue
             if handover.fired:
                 check = check_grasp(robot, request, gripper=float(handover.commandedGripper), request_id=request_id)
                 row.update({k: v for k, v in check.items() if k != "rotvec"})
@@ -903,6 +962,16 @@ def run_grasp_loop(
                 f"lateral_mm={row.get('lateralMm')} trial_s={row['trialS']}"
             )
         except Exception as exc:  # noqa: BLE001 - a motion fault ends the run, it must not end it silently
+            if isinstance(exc, ControlLoopDiedError) or not control_loop_alive(robot):
+                # A reflex in a scripted step: not the policy's, so no trial row. Recovered with a
+                # person's say-so like any other, and the peg handed to them.
+                write({"kind": "reflex", "trial": trial, "where": "script", "error": f"{type(exc).__name__}: {exc}"})
+                log(f"[WARN] grasp_loop=reflex trial={trial} details={exc}")
+                if recover_from_reflex(robot, request, wait_for_operator, request_id=request_id):
+                    peg = "lost"
+                    continue
+                halted, peg = "control_loop_died", "unknown"
+                break
             # Held still rather than homed: the fingers may have the peg, and a fault is the
             # worst moment to decide that on the loop's behalf.
             try:

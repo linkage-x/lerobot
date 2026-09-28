@@ -47,6 +47,11 @@ describe("armRates", () => {
       ["B", 1, 1]
     ]);
   });
+
+  it("counts a collision against the arm, as the backend does", () => {
+    const rates = armRates([row(0, "A", "collision"), row(1, "A", "held")]);
+    expect(rates.map(({ arm, graded, held }) => [arm, graded, held])).toEqual([["A", 2, 1]]);
+  });
 });
 
 describe("gateReading", () => {

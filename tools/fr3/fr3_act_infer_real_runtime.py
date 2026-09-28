@@ -108,6 +108,7 @@ from tools.fr3.interactive_control import InteractiveRolloutKeyboard
 from tools.fr3.scene_reset import (
     PoseProbeRequest,
     SceneResetError,
+    control_loop_alive,
     execute_pose_probe,
     execute_scene_reset,
     pose_probe_request_from_payload,
@@ -5386,6 +5387,15 @@ def run_inference(args: argparse.Namespace) -> int:
                 return finish_rollout('quit' if interactive_keyboard.quit_requested.is_set() else 'stopped')
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
+            if not control_loop_alive(robot):
+                # A reflex ended libfranka's loop: every reading from here on is the last one it
+                # had, and the policy would keep commanding an arm that is not listening. 09-28:
+                # it ran 2 s on frozen state and "closed", and the lift timed out 20 s later.
+                print(
+                    f'[WARN] control_loop_died step={step_idx} '
+                    f'xyz={robot_observation["ee.x"]:.4f},{robot_observation["ee.y"]:.4f},{robot_observation["ee.z"]:.4f}'
+                )
+                return finish_rollout('control_loop_died')
             if terminal_servo_request is not None and not terminal_servo_state['fired']:
                 observed_z = float(robot_observation['ee.z'])
                 commanded_gripper = (
@@ -6268,7 +6278,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     # drive the arm again. The loop has stopped by now, so a slow write costs
                     # nothing but the operator's patience.
                     dagger_writer.write(dagger_buffer, rollout_index=rollout_index)
-                if rollout_status == 'quit':
+                if rollout_status in ('quit', 'control_loop_died'):
                     break
             print('[INFO] interactive_rollouts=stopped')
         elif grasp_loop_request is not None:

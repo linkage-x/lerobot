@@ -1070,7 +1070,11 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
                 parsed["state"] = "rolling"
                 parsed["message"] = f"Grasp loop: trial {event['trial'] + 1} running."
             elif event["type"] == "needs_operator":
-                parsed["message"] = "Grasp loop is waiting: put the peg back in the fixture, then press Continue."
+                parsed["message"] = (
+                    "Grasp loop is waiting: the arm tripped its collision reflex. Check nothing is trapped, then press Continue."
+                    if event["message"].startswith("reflex")
+                    else "Grasp loop is waiting: put the peg back in the fixture, then press Continue."
+                )
             elif event["type"] == "done":
                 parsed["message"] = f"Grasp loop finished (halted: {event.get('halted') or 'no'})."
             return parsed
@@ -1181,7 +1185,7 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         state.update(halted=event["reason"], haltDetails=event["details"])
     elif kind == "done":
         state.update(done=True, halted=event["halted"] or state["halted"], summary=event["summary"], currentTrial=None, needsOperator="")
-    graded = [t for t in state["trials"] if t.get("verdict") in ("held", "empty", "no_close")]
+    graded = [t for t in state["trials"] if t.get("verdict") in ("held", "empty", "no_close", "collision")]
     state["graded"] = len(graded)
     state["held"] = sum(1 for t in graded if t.get("verdict") == "held")
     # Per arm, because the pooled rate of an interleaved run is a rate of neither arm.
