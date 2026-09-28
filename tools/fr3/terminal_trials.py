@@ -727,11 +727,8 @@ def run_terminal_trials(
                 slip_mm=servo.searchSlipM * 1000.0,
                 standing_mm=request.standingMm,
             )
-            release_xyz = (
-                float(result["searchLandingXyz"][0]),
-                float(result["searchLandingXyz"][1]),
-                float(result["stoppedAtXyz"][2]),
-            )
+            # Where the servo let go: the tool's pose at the stop (see `execute_terminal_servo`).
+            release_xyz = tuple(float(value) for value in result["stoppedAtXyz"])
             row: dict[str, Any] = {
                 "kind": "trial",
                 "index": spec.index,

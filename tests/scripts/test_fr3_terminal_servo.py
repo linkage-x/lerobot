@@ -831,3 +831,19 @@ def test_a_reflex_mid_descent_ends_the_servo_without_another_command():
     assert result["ok"] is False and result["controlLoopDied"] is True
     assert gate_calls == [], "nobody is asked to grade a descent read off frozen state"
     assert robot.sends == 30
+
+
+def test_a_seated_peg_is_let_go_of_and_retaken_where_the_tool_is_not_where_it_was_aimed(capsys):
+    """09-28: the seated peg held the tool ~1.2 mm off the landing; letting go at the landing
+    jumped the open fingers sideways and each re-grip closed off-centre, tilting the peg."""
+
+    robot = FakeSeatedRobot(from_z=SEATED[2] + 0.02, offset_xyz=(-0.0012, 0.0003, 0.0015))
+    robot.xyz = (SEATED[0], SEATED[1], 0.10)
+    result = execute_terminal_servo(robot, _request(regripGripper=0.0, settleS=0.02))
+    assert result["ok"], result
+    stopped = result["stoppedAtXyz"]
+    lines = [line for line in capsys.readouterr().out.splitlines() if "scene_reset_step=start" in line]
+    regrip = next(line for line in lines if "name=regrip_after_release" in line)
+    retreat = next(line for line in lines if "name=retreat_after_release" in line)
+    assert f"xyz={stopped[0]:+.4f},{stopped[1]:+.4f}" in regrip
+    assert f"xyz={stopped[0]:+.4f},{stopped[1]:+.4f}" in retreat

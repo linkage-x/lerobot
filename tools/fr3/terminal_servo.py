@@ -819,9 +819,12 @@ def execute_terminal_servo(
         # Let go where the descent stopped, not at the target: on a contact stop the target is a
         # height the arm could not reach, and re-commanding it while opening the fingers would
         # lean on the fixture through the one moment the peg is no longer clamped. The XY is the
-        # landing's, which is the nominal pose whenever the search is off or found the hole on
-        # its first try, and never a lateral move made at fixture height.
-        release_xyz = (landing[0], landing[1], stopped_at[2])
+        # tool's too, not the landing's. A seated peg holds the tool ~1.2 mm off the landing, so
+        # commanding the landing jumped the open fingers 1.2 mm sideways and the re-grip closed
+        # off-centre on a peg whose foot the hole holds -- a little crooked each time. 09-28,
+        # three runs: the seated press grew -8 to -15 N over eleven re-grips and the twelfth could
+        # not be pushed home (the operator saw the peg crooked in the fingers).
+        release_xyz = (stopped_at[0], stopped_at[1], stopped_at[2])
         seated = descent["searchStoppedOn"] == "seated"
         if release_gate is not None:
             decision = release_gate(
@@ -854,7 +857,8 @@ def execute_terminal_servo(
             robot,
             request,
             "retreat_after_release",
-            (landing[0], landing[1], waypoints["retreat_after_release"][2]),
+            # Straight up from where it let go: the peg may still be in the hole.
+            (release_xyz[0], release_xyz[1], waypoints["retreat_after_release"][2]),
             rotvec,
             retreat_gripper,
             tolerance_m=request.stepToleranceM,
