@@ -195,6 +195,68 @@ def match_calibrated(
             "same_port": best == ident.camera_name}
 
 
+def _producer_paths(run_dir: Path) -> dict[str, str]:
+    """``{camera_name: path relative to the run}`` of each producer file."""
+    out: dict[str, str] = {}
+    for path in sorted(run_dir.glob("converted/*/intrinsics_producer.json")):
+        name = re.match(r"(cam_\d+)", path.parent.name)
+        if name:
+            out[name.group(1)] = str(path.relative_to(run_dir))
+    return out
+
+
+def register_intrinsics(
+    runs: Sequence[Path],
+    factory: dict[str, dict[str, float]],
+    match_px: float,
+    previous: dict[str, object] | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    """Tie every camera of each run to a module serial by its factory fingerprint.
+
+    Runs are given oldest first; a later run's lens replaces an earlier one for
+    the same serial. A camera whose nearest module is farther than ``match_px``,
+    or that shares its nearest module with another camera of the same run, is
+    left out and reported -- guessing is how the serial map went wrong.
+    """
+    serials: dict[str, dict[str, object]] = dict((previous or {}).get("serials") or {})
+    notes: list[str] = []
+    for run in runs:
+        calibrated = load_calibrated(run)
+        producers = _producer_paths(run)
+        claims: dict[str, list[tuple[str, float, float]]] = {}
+        for camera, (fx, cx, cy) in calibrated.items():
+            dists = sorted(
+                (math.hypot(f["cx"] - cx, f["cy"] - cy, 0.5 * (f["fx"] - fx)), serial)
+                for serial, f in factory.items()
+            )
+            if not dists or dists[0][0] > match_px:
+                near = f"{dists[0][1]} at {dists[0][0]:.1f} px" if dists else "no factory data"
+                notes.append(f"{run.name}/{camera}: no module within {match_px:g} px ({near})")
+                continue
+            runner = dists[1][0] if len(dists) > 1 else float("inf")
+            claims.setdefault(dists[0][1], []).append((camera, dists[0][0], runner))
+        for serial, hits in claims.items():
+            if len(hits) > 1:
+                notes.append(f"{run.name}: {', '.join(h[0] for h in hits)} all match {serial}; none registered")
+                continue
+            camera, dist, runner = hits[0]
+            serials[serial] = {
+                "run": run.name,
+                "camera": camera,
+                "producer": producers[camera],
+                "distance_px": round(dist, 2),
+                "runner_up_px": round(runner, 2),
+            }
+    return {
+        "generated_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "match_px": match_px,
+        # immutable per module, kept so a later run can be fingerprinted
+        # without the camera plugged in
+        "factory": dict(sorted(factory.items())),
+        "serials": dict(sorted(serials.items())),
+    }, notes
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--sids", default="0-15", help="e.g. 0-15 or 4,6,8")
@@ -206,6 +268,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--write-expected", type=Path, default=None,
                     help="write calibrated camera -> serial, each found by its factory "
                          "intrinsics on whatever port it is on now (camera_identity_expected.json)")
+    ap.add_argument("--register-intrinsics", type=Path, nargs="+", default=None, metavar="RUN",
+                    help="intrinsics runs, oldest first: tie each camera to a module serial by "
+                         "fingerprint and write --registry")
+    ap.add_argument("--registry", type=Path, default=Path(__file__).with_name("camera_intrinsics_registry.json"))
     args = ap.parse_args(argv)
     if args.write_expected and not args.intrinsics:
         ap.error("--write-expected needs --intrinsics: a port is only vouched for once its "
@@ -245,6 +311,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no answer: {', '.join(silent)}")
     if args.json:
         args.json.write_text(json.dumps({"modules": rows}, indent=2))
+    if args.register_intrinsics:
+        previous = json.loads(args.registry.read_text()) if args.registry.is_file() else {}
+        factory = dict(previous.get("factory") or {})
+        for m in modules:
+            if m.serial and m.cx is not None:
+                factory[m.serial] = {"fx": m.fx, "fy": m.fy, "cx": m.cx, "cy": m.cy}
+        registry, notes = register_intrinsics(args.register_intrinsics, factory, args.match_px, previous)
+        args.registry.write_text(json.dumps(registry, indent=2) + "\n")
+        for serial, entry in registry["serials"].items():
+            print(f"  {serial}: {entry['run']}/{entry['camera']} "
+                  f"({entry['distance_px']} px, next {entry['runner_up_px']})")
+        for note in notes:
+            print(f"  !! {note}")
+        print(f"wrote {args.registry}: {len(registry['serials'])} lenses by serial")
     if args.write_expected:
         # The table is "which serial each calibrated camera was", found by
         # fingerprint wherever that camera is plugged in now -- so the gateway

@@ -7244,3 +7244,115 @@ def test_the_cross_camera_route_answers_over_http_without_holding_the_lock(tmp_p
     assert last["report"]["generated_utc"] == body["report"]["generated_utc"]
     assert state.lock.acquire(timeout=1)
     state.lock.release()
+
+
+# --- intrinsics by module serial --------------------------------------------------
+
+
+def _eeprom_intrinsics_run(tmp_path: Path, name: str, cameras: dict[str, str]) -> None:
+    run = tmp_path / "outputs" / "calibration" / name
+    rows = []
+    for camera, serial in cameras.items():
+        path = run / "converted" / f"{camera}_{serial}" / "intrinsics_producer.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"camera_name": camera, "camera_serial": serial, "model": "opencv_fisheye",
+                                    "camera_matrix": [[1000, 0, 960], [0, 1000, 540], [0, 0, 1]]}))
+        rows.append({"camera_name": camera, "camera_serial": serial, "status": "ok", "intrinsics_json": str(path)})
+    (run / "summary.json").write_text(json.dumps(
+        {"timestamp_utc": "2026-09-01T00:00:00Z", "serial_source": "eeprom", "cameras": rows}))
+
+
+def _stamp_identity(capture: Path, ports: dict[str, str]) -> None:
+    for episode in sorted((capture / "episodes").glob("episode_*")):
+        (episode / "meta.json").write_text(json.dumps({"camera_identity": {
+            cam: {"serial": serial, "answered": True} for cam, serial in ports.items()}}))
+
+
+def _solve_by_serial(tmp_path, monkeypatch, run_name: str) -> tuple[gateway.GatewayState, dict[str, list[str]]]:
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    capture = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    # cam_00 and cam_01 swapped modules since the lenses were calibrated
+    _stamp_identity(capture, {"cam_00": "SN-B", "cam_01": "SN-A"})
+    seen: dict[str, list[str]] = {}
+    work = tmp_path / "outputs" / "metrology" / run_name
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        seen[module.split(".")[-1]] = list(args)
+        if module.endswith("calibrate_extrinsics"):
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "extrinsics_report.json").write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}))
+        if module.endswith("export_production_calibration"):
+            (tmp_path / "outputs" / "calibration" / f"{run_name}_extrinsics").mkdir(parents=True)
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(state, capture, run_name, Path(sys.executable))
+    return state, seen
+
+
+def test_the_solve_takes_each_lens_by_the_serial_on_the_port_now(tmp_path, monkeypatch):
+    _eeprom_intrinsics_run(tmp_path, "lenses_intrinsics", {"cam_00": "SN-A", "cam_01": "SN-B"})
+
+    state, seen = _solve_by_serial(tmp_path, monkeypatch, "run_s")
+
+    assert state.calibration.state == "complete", state.calibration.message
+    bundle = seen["calibrate_extrinsics"]
+    staged = Path(bundle[bundle.index("--intrinsics-run") + 1])
+    moved = json.loads((staged / "converted" / "cam_00_SN-B" / "intrinsics_producer.json").read_text())
+    assert moved["intrinsics_origin"]["camera"] == "cam_01"
+
+    export = seen["export_production_calibration"]
+    assert export[export.index("--serial-source") + 1] == "eeprom"
+    serial_map = Path(export[export.index("--serial-map") + 1]).read_text()
+    assert "cam_00: SN-B" in serial_map
+    assert "--intrinsics-report" not in export
+
+    # the new port -> lens assignment is what production is pointed at, and the
+    # Connect gate learns the new port -> module table from the run itself
+    produced = tmp_path / "outputs" / "calibration" / "run_s_intrinsics"
+    assert state.calibration.intrinsicsRun == "run_s_intrinsics"
+    summary = json.loads((produced / "summary.json").read_text())
+    assert all(str(produced) in row["intrinsics_json"] for row in summary["cameras"])
+    identity = json.loads((tmp_path / "outputs" / "calibration" / "run_s_extrinsics" / "camera_identity.json").read_text())
+    assert identity["ports"] == {"cam_00": "SN-B", "cam_01": "SN-A"}
+
+
+def test_the_solve_refuses_a_module_with_no_calibrated_lens(tmp_path, monkeypatch):
+    _eeprom_intrinsics_run(tmp_path, "lenses_intrinsics", {"cam_00": "SN-B"})
+
+    state, seen = _solve_by_serial(tmp_path, monkeypatch, "run_m")
+
+    assert state.calibration.state == "failed"
+    assert "cam_01（SN-A）" in state.calibration.message
+    assert seen == {}
+
+
+def test_a_calibration_sweep_is_not_blocked_by_the_port_check(tmp_path, monkeypatch):
+    """Re-calibrating the ports as they are now is a way out of a mismatch."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    written = _capture_recorder_stdin(monkeypatch)
+    _write_identity_expected(tmp_path, {"cam_07": "SN-B"})
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_07":{"serial":"SN-C","answered":true}}')
+
+    with pytest.raises(RuntimeError, match="cam_07"):
+        gateway._start_episode(state, capture_intent={"purpose": "calibration_marker_tcp"})
+    gateway._start_episode(state, capture_intent={"purpose": "calibration_extrinsics"})
+    assert written
+
+
+def test_the_expected_ports_come_from_the_production_extrinsics_run(tmp_path, monkeypatch):
+    _write_identity_expected(tmp_path, {"cam_07": "SN-OLD"})
+    run = tmp_path / "outputs" / "calibration" / "run_p_extrinsics"
+    run.mkdir(parents=True)
+    (run / "camera_identity.json").write_text(json.dumps({"calibration": "run_p", "ports": {"cam_07": "SN-NEW"}}))
+    state = _solve_state(tmp_path)
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "run_p_extrinsics"})
+
+    assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_07": "SN-NEW"}
+
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "legacy_extrinsics"})
+    assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_07": "SN-OLD"}

@@ -1,0 +1,125 @@
+{
+  "generated_utc": "2026-09-28T04:59:16+00:00",
+  "match_px": 8.0,
+  "factory": {
+    "H120K-I05130020": {
+      "fx": 1005.7461753794,
+      "fy": 1005.7037191495,
+      "cx": 972.6600994628,
+      "cy": 564.7698241817
+    },
+    "H120K-I05130024": {
+      "fx": 998.8504370182,
+      "fy": 998.8281085225,
+      "cx": 964.7284944739,
+      "cy": 557.4101392894
+    },
+    "H120K-I05130029": {
+      "fx": 1006.0237898352,
+      "fy": 1006.0618773819,
+      "cx": 929.7460360499,
+      "cy": 519.4127447978
+    },
+    "H120K-I05130031": {
+      "fx": 1002.4589569337,
+      "fy": 1002.3741178636,
+      "cx": 961.4974608009,
+      "cy": 534.4259870521
+    },
+    "H120K-I05130057": {
+      "fx": 1004.6204027911,
+      "fy": 1004.641979718,
+      "cx": 925.4162704836,
+      "cy": 530.796274325
+    },
+    "H120K-I05130058": {
+      "fx": 1002.6833400032,
+      "fy": 1002.6303923158,
+      "cx": 971.563485717,
+      "cy": 529.9628201257
+    },
+    "H120K-I05130060": {
+      "fx": 1001.3473341801,
+      "fy": 1001.3193165922,
+      "cx": 1001.3722914789,
+      "cy": 555.3079123146
+    },
+    "H120K-I05130066": {
+      "fx": 1001.0739762997,
+      "fy": 1001.0374446823,
+      "cx": 982.6430719369,
+      "cy": 589.3972097004
+    },
+    "H120K-I05130067": {
+      "fx": 1008.5463660235,
+      "fy": 1008.5305609405,
+      "cx": 983.7940211359,
+      "cy": 551.7603677976
+    }
+  },
+  "serials": {
+    "H120K-I05130020": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_03",
+      "producer": "converted/cam_03_CAM_03/intrinsics_producer.json",
+      "distance_px": 1.52,
+      "runner_up_px": 11.31
+    },
+    "H120K-I05130024": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_06",
+      "producer": "converted/cam_06_H120K-I05130029/intrinsics_producer.json",
+      "distance_px": 5.18,
+      "runner_up_px": 9.66
+    },
+    "H120K-I05130029": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_13",
+      "producer": "converted/cam_13_H120K-I05130031/intrinsics_producer.json",
+      "distance_px": 1.42,
+      "runner_up_px": 11.41
+    },
+    "H120K-I05130031": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_14",
+      "producer": "converted/cam_14_H120K-I05130057/intrinsics_producer.json",
+      "distance_px": 2.09,
+      "runner_up_px": 10.61
+    },
+    "H120K-I05130057": {
+      "run": "thor_gmsl2_fisheye_cam09_20260911_intrinsics",
+      "camera": "cam_13",
+      "producer": "converted/cam_13_H120K-I05130031/intrinsics_producer.json",
+      "distance_px": 2.21,
+      "runner_up_px": 12.37
+    },
+    "H120K-I05130058": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_07",
+      "producer": "converted/cam_07_H120K-I05130066/intrinsics_producer.json",
+      "distance_px": 2.43,
+      "runner_up_px": 13.0
+    },
+    "H120K-I05130060": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_09",
+      "producer": "converted/cam_09_H120K-I05130058/intrinsics_producer.json",
+      "distance_px": 1.39,
+      "runner_up_px": 19.21
+    },
+    "H120K-I05130066": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_08",
+      "producer": "converted/cam_08_H120K-I05130024/intrinsics_producer.json",
+      "distance_px": 2.88,
+      "runner_up_px": 29.24
+    },
+    "H120K-I05130067": {
+      "run": "calib_20260923_cam13refit_intrinsics",
+      "camera": "cam_12",
+      "producer": "converted/cam_12_H120K-I05130067/intrinsics_producer.json",
+      "distance_px": 0.46,
+      "runner_up_px": 17.12
+    }
+  }
+}

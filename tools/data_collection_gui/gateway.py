@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -7831,6 +7832,50 @@ def _annotate_intrinsics_coverage(cameras: list[dict[str, Any]], report_path: Pa
             )
 
 
+def _intrinsics_capture_targets(capture: Path) -> set[str]:
+    """Cameras an intrinsics capture swept, from each episode's capture_intent."""
+    targets: set[str] = set()
+    for meta_path in sorted((capture / "episodes").glob("episode_*/meta.json")):
+        meta = _read_json_file(meta_path) or {}
+        intent = meta.get("capture_intent") if isinstance(meta.get("capture_intent"), dict) else {}
+        if intent.get("target_camera"):
+            targets.add(str(intent["target_camera"]))
+    return targets
+
+
+def _repoint_intrinsics_json(run_dir: Path) -> None:
+    """A copied run's summary must name its own producer files, not the staging copy's."""
+    summary_path = run_dir / "summary.json"
+    summary = _read_json_file(summary_path)
+    if not isinstance(summary, dict):
+        return
+    for row in summary.get("cameras") or []:
+        old = Path(str(row.get("intrinsics_json") or ""))
+        row["intrinsics_json"] = str(run_dir / "converted" / old.parent.name / old.name)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+CALIBRATION_IDENTITY_FILE = "camera_identity.json"
+
+
+def _write_calibration_identity(extrinsics_run: Path, run_name: str, port_serials: dict[str, str]) -> None:
+    """Which module each port had when this calibration was captured.
+
+    Kept inside the run, under outputs/, rather than in the tracked expected
+    table: written on the rig, a tracked file would be overwritten by the next
+    deploy from a workstation that never saw this solve.
+    """
+    if not extrinsics_run.is_dir():
+        return
+    (extrinsics_run / CALIBRATION_IDENTITY_FILE).write_text(
+        json.dumps(
+            {"calibration": run_name, "generated_utc": _now_iso(), "source": "capture_eeprom", "ports": port_serials},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _run_extrinsics_calibration(
     state: GatewayState,
     dataset: Path,
@@ -7853,7 +7898,44 @@ def _run_extrinsics_calibration(
     calib_root = state.repo_root / "outputs" / "calibration"
     intrinsics_run = calib_root / (state.calibration.intrinsicsRun or "")
     intrinsics_source: list[str] = []
-    if intrinsics_dataset is None:
+    work = state.repo_root / "outputs" / "metrology" / run_name
+
+    # Lenses by module serial, not by port. The capture recorded which module
+    # each port had at Connect; each lens is looked up by that serial, wherever
+    # it was calibrated, and relabelled with the port it is on now. A capture
+    # from before identity recording (09-28) falls back to the old by-port path.
+    try:
+        port_serials = intrinsics_by_serial.capture_port_serials(dataset / "episodes")
+    except ValueError as exc:
+        _fail_calibration(state, str(exc))
+        return
+    staged_intrinsics: Path | None = None
+    if port_serials:
+        refit = _intrinsics_capture_targets(intrinsics_dataset) if intrinsics_dataset is not None else set()
+        sources, missing = intrinsics_by_serial.resolve_sources(sorted(set(port_serials.values())), calib_root)
+        uncovered = [cam for cam, serial in sorted(port_serials.items()) if serial in missing and cam not in refit]
+        if uncovered:
+            _fail_calibration(state, (
+                "这些相机没有已标定的内参："
+                + "、".join(f"{cam}（{port_serials[cam]}）" for cam in uncovered)
+                + "。先在标定向导里给它们录内参，再一起解算。"
+            ))
+            return
+        staged_intrinsics = work / "intrinsics_by_serial"
+        shutil.rmtree(staged_intrinsics, ignore_errors=True)
+        try:
+            intrinsics_by_serial.stage_run(port_serials, sources, staged_intrinsics)
+        except (OSError, ValueError) as exc:
+            _fail_calibration(state, f"按序列号装配内参失败：{exc}")
+            return
+        for line in intrinsics_by_serial.describe(port_serials, sources):
+            state.log("info", f"Intrinsics by serial: {line}")
+        if intrinsics_dataset is None:
+            intrinsics_source = ["--intrinsics-run", str(staged_intrinsics)]
+    else:
+        state.log("warn", "这段采集没有记录相机 EEPROM 序列号（09-28 之前录的），内参仍按端口取")
+
+    if intrinsics_dataset is None and staged_intrinsics is None:
         # Solve against the intrinsics production is actually using, not the
         # metrology report: that report lives under outputs/, which is excluded
         # from the deploy sync and so is simply absent on the rig. Using the
@@ -7871,7 +7953,6 @@ def _run_extrinsics_calibration(
             ))
             return
 
-    work = state.repo_root / "outputs" / "metrology" / run_name
     base_run = calib_root / (state.calibration.extrinsicsRun or "")
     # Two captures, two detection passes. Weighted by video count because that
     # is what the time goes into: an intrinsics capture is one sweep per camera.
@@ -7988,8 +8069,11 @@ def _run_extrinsics_calibration(
         ]
         # Only emit intrinsics when they were just re-fitted, or when there is no
         # production run to keep. Re-solving extrinsics alone does not touch lenses.
+        # By serial, the port -> lens assignment is new whenever a module moved,
+        # so the run production loads is always re-emitted, never kept.
         keep_intrinsics_run = (
             fitted_intrinsics is None
+            and staged_intrinsics is None
             and bool(state.calibration.intrinsicsRun)
             and intrinsics_run.is_dir()
         )
@@ -8000,8 +8084,12 @@ def _run_extrinsics_calibration(
             # run holding three lenses -- the other eight not stale, just gone.
             # Carrying them across is what makes a partial re-sweep a thing the
             # operator can actually do.
-            if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+            if staged_intrinsics is not None:
+                export_args += ["--carry-forward-intrinsics", str(staged_intrinsics)]
+            elif state.calibration.intrinsicsRun and intrinsics_run.is_dir():
                 export_args += ["--carry-forward-intrinsics", str(intrinsics_run)]
+        elif staged_intrinsics is not None:
+            pass  # copied into place after the export succeeds, below
         elif not keep_intrinsics_run:
             export_args += [
                 "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
@@ -8033,12 +8121,27 @@ def _run_extrinsics_calibration(
                 export_args += ["--align-cameras", *unmoved]
                 state.log("info", f"Base-frame alignment restricted to unmoved cameras: {', '.join(unmoved)}")
         serial_map = state.repo_root / "tools" / "thor" / "gmsl2" / "camera_serial_map.yaml"
-        if serial_map.is_file():
+        if port_serials:
+            # the capture's own EEPROM reads, not the hand-written map that
+            # never matched the hardware
+            work.mkdir(parents=True, exist_ok=True)
+            export_args += [
+                "--serial-map", str(intrinsics_by_serial.write_serial_map(port_serials, work / "camera_serial_map.yaml")),
+                "--serial-source", "eeprom",
+            ]
+        elif serial_map.is_file():
             export_args += ["--serial-map", str(serial_map)]
 
         _begin_solve_step(state, step_count, step_count, "导出生产标定…")
         if not _run("导出生产标定…", export_args, 600):
             return
+        if staged_intrinsics is not None and fitted_intrinsics is None:
+            target = calib_root / f"{run_name}_intrinsics"
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(staged_intrinsics, target)
+            _repoint_intrinsics_json(target)
+        if port_serials:
+            _write_calibration_identity(calib_root / f"{run_name}_extrinsics", run_name, port_serials)
 
     report_path = work / "extrinsics_report.json"
     try:
@@ -13568,7 +13671,13 @@ def _start_episode(
     # Every per-camera constant is keyed on the port, and the port is the cable.
     # A camera on another camera's port gets that camera's intrinsics and
     # extrinsics, and nothing downstream can tell (09-23 remount, found 09-28).
-    if state.recording.cameraIdentityMismatches:
+    # A camera calibration sweep is exempt: re-calibrating the ports as they are
+    # now is one of the two ways out of a mismatch, and it must be recordable.
+    recalibrating = str((capture_intent or {}).get("purpose") or "") in {
+        "calibration_intrinsics",
+        "calibration_extrinsics",
+    }
+    if state.recording.cameraIdentityMismatches and not recalibrating:
         lines = "；".join(
             f"{m['camera']} 上是 {m['actual']}，标定时是 {m['expected']}"
             + (f"（{m['expected']} 现在在 {m['expectedNowOn']}）" if m.get("expectedNowOn") else "")
@@ -13576,8 +13685,8 @@ def _start_episode(
         )
         raise RuntimeError(
             f"相机和端口的对应关系与标定时不一致：{lines}。"
-            "把线缆插回原端口后重新 Connect；或者按现在的接法重新标定，"
-            "再用 camera_eeprom.py --write-expected 更新期望表。"
+            "把线缆插回原端口后重新 Connect；或者按现在的接法重新标定"
+            "（标定页的采集不受这条限制，内参会按序列号自动取，期望表随新外参更新）。"
         )
 
     # An episode recorded while the tracker is blind is structurally complete and
@@ -14333,12 +14442,26 @@ intrinsics against that calibration. Absent means nothing is enforced."""
 
 
 def _load_camera_identity_expected(state: GatewayState) -> dict[str, Any]:
-    path = state.repo_root / CAMERA_IDENTITY_EXPECTED
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) and isinstance(data.get("ports"), dict) else {}
+    """Port -> serial the calibration in production was captured with.
+
+    The production extrinsics run carries its own table when it was solved by
+    serial; older runs fall back to the tracked table, fingerprinted by hand.
+    Production is what the tracker config names, not the in-memory pointer a
+    solve moves before anyone has promoted it.
+    """
+    run = _production_calibration_runs(state).get("extrinsicsRun") or ""
+    candidates = []
+    if run:
+        candidates.append(state.repo_root / "outputs" / "calibration" / run / CALIBRATION_IDENTITY_FILE)
+    candidates.append(state.repo_root / CAMERA_IDENTITY_EXPECTED)
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("ports"), dict):
+            return data
+    return {}
 
 
 def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> None:
