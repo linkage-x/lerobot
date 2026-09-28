@@ -1731,6 +1731,8 @@ export type UnattendedRow = Record<string, unknown> & { kind?: string };
 export type UnattendedRun = UnattendedListEntry & {
   /** Set while a live run is waiting for a person (a lost peg to put back); empty otherwise. */
   needsOperator?: string;
+  /** The waiting question is "is the peg in the hole?" (a graded terminal run), not "put it back". */
+  needsGrade?: boolean;
   /** The end of run.log, filled only for a crashed run: why it died, without an ssh. */
   logTail?: string[];
   dir: string;

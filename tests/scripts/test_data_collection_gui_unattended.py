@@ -23,6 +23,8 @@ from tools.data_collection_gui.unattended import (
     process_alive,
     read_run,
     release_brake,
+    request_continue,
+    request_grade,
     request_stop,
     runs_root,
 )
@@ -248,6 +250,9 @@ def test_a_run_that_died_before_writing_a_row_is_crashed_and_shows_why(tmp_path)
         ("grasp_envelope", "tools.fr3.fr3_grasp_envelope_runtime", {}),
         ("grasp_envelope", "tools.fr3.fr3_grasp_envelope_runtime", {"xyOffsetsMm": "", "dzOffsetsMm": "", "centreRepeats": 0, "extraPointsMm": "-5,0,-6"}),
         ("terminal_trials", "tools.fr3.fr3_terminal_trials_runtime", {"holePose": "0.3599,-0.1333,0.0523"}),
+        ("terminal_trials", "tools.fr3.fr3_terminal_trials_runtime",
+         {"holePose": "0.3599,-0.1333,0.0523", "offsetsMm": "0", "searchRingM": "0.007",
+          "operatorGrade": "1", "regripInPlace": "1", "graspAttempts": "2"}),
     ],
 )
 def test_every_planned_argv_is_accepted_by_the_runtime_it_launches(tmp_path, kind, module, request_):
@@ -262,3 +267,42 @@ def test_every_planned_argv_is_accepted_by_the_runtime_it_launches(tmp_path, kin
         request = runtime.build_request(args)
         assert request.xyOffsetsMm == tuple(planned["plan"]["request"]["xyOffsetsMm"])
         assert request.dzOffsetsMm == tuple(planned["plan"]["request"]["dzOffsetsMm"])
+
+
+def test_a_graded_terminal_plan_reaches_the_runtime_with_its_switches(tmp_path):
+    import tools.fr3.fr3_terminal_trials_runtime as runtime
+
+    planned = plan_run(tmp_path, "terminal_trials", {
+        "holePose": "0.3599,-0.1333,0.0523", "offsetsMm": "0", "searchRingM": "0.007",
+        "operatorGrade": "1", "regripInPlace": "yes", "graspAttempts": "2",
+    })
+    request = runtime.build_request(runtime.parse_args(planned["argv"][1:]))
+    assert request.operatorGrade and request.regripInPlace and not request.releaseOnlyWhenSeated
+    assert request.graspAttempts == 2
+    assert any(arg.startswith("--grade-file=") and arg.endswith("GRADE") for arg in planned["argv"])
+    ungraded = plan_run(tmp_path, "terminal_trials", {"holePose": "0.3599,-0.1333,0.0523"})
+    assert "--operator-grade" not in ungraded["argv"]
+
+
+def test_a_grade_question_is_answered_with_in_or_out_and_not_with_continue(tmp_path):
+    question = {"kind": "needs_operator", "grade": True, "message": "trial 003: 销在孔里吗？"}
+    run_dir = _make_run(tmp_path, "terminal_trials_G", pid=os.getpid(), rows=[_trial(0), question])
+    run = read_run(tmp_path, "terminal_trials_G")
+    assert run["needsGrade"] is True and run["needsOperator"].startswith("trial 003")
+    with pytest.raises(UnattendedError):
+        request_continue(tmp_path, "terminal_trials_G")
+    with pytest.raises(UnattendedError, match="'in' or 'out'"):
+        request_grade(tmp_path, "terminal_trials_G", "maybe")
+    request_grade(tmp_path, "terminal_trials_G", "OUT")
+    assert (run_dir / "GRADE").read_text() == "out"
+
+
+def test_an_answered_or_dead_question_asks_for_nothing(tmp_path):
+    question = {"kind": "needs_operator", "grade": True, "message": "q"}
+    _make_run(tmp_path, "terminal_trials_H", pid=os.getpid(),
+              rows=[question, {"kind": "operator", "trial": 0, "grade": "in"}])
+    assert read_run(tmp_path, "terminal_trials_H")["needsGrade"] is False
+    with pytest.raises(UnattendedError, match="not asking"):
+        request_grade(tmp_path, "terminal_trials_H", "in")
+    _make_run(tmp_path, "terminal_trials_I", pid=DEAD_PID, rows=[question])
+    assert read_run(tmp_path, "terminal_trials_I")["needsGrade"] is False

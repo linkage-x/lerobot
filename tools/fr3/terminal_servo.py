@@ -42,10 +42,11 @@ from collections import deque
 from dataclasses import asdict, dataclass
 import math
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from tools.fr3.scene_reset import (
     SceneResetError,
+    _ForceTrace,
     _check_reach_along_path,
     _check_xyz_in_workspace,
     _distance,
@@ -58,6 +59,7 @@ from tools.fr3.scene_reset import (
     _step_toward,
     _workspace_bounds,
     precise_sleep,
+    read_fz,
 )
 
 # How fast the commanded tool point may travel, in m/s. A third of the reset's, because the
@@ -518,6 +520,13 @@ def descend_until_refused(
     lags: list[float] = []
     # (commanded travel so far, the lag then), oldest first, trimmed to just span the window.
     trail: deque[tuple[float, float]] = deque()
+    # Read-only, and nothing below decides on it. Recorded because the position verdict has
+    # called a peg standing on the rim "seated" (09-11: four re-grips came up empty after one,
+    # the peg having fallen), and the force is the other candidate for telling the two apart.
+    # The tare is the first reading of the descent, taken while the peg is still in free air.
+    trace = _ForceTrace(robot, request.requestId, "terminal_descent")
+    fz_tare = read_fz(robot)
+    fz_peak_drop = 0.0
 
     def stopped(reason: str) -> dict[str, Any]:
         ranked = sorted(lags)
@@ -528,7 +537,13 @@ def descend_until_refused(
         # one are the same kinematics, because it is the peg that gives way and not the arm.
         settle_s = 0.0 if arrived_at is None else time.perf_counter() - arrived_at
         settle_mm = 0.0 if arrived_z is None else 1000.0 * (arrived_z - float(current_xyz[2]))
+        trace.flush(reason)
+        fz_end = read_fz(robot)
         return {
+            # Change from the tare, N; negative is the tool pushed on. None without a reading.
+            "fzTareN": fz_tare,
+            "dfzEndN": None if fz_tare is None or fz_end is None else fz_end - fz_tare,
+            "dfzPeakN": None if fz_tare is None else fz_peak_drop,
             "stoppedOn": reason,
             "stoppedAtXyz": list(current_xyz),
             "heldUpMm": 1000.0 * held_up_m,
@@ -546,6 +561,13 @@ def descend_until_refused(
         commanded = _step_toward(commanded, target_xyz, max_step_m)
         _send_absolute(robot, commanded, rotvec, gripper)
         current_xyz, _current_rotvec, _current_gripper = _observation_xyz_rotvec_gripper(robot)
+        trace.sample(float(commanded[2]), current_xyz)
+        if fz_tare is None:
+            fz_tare = read_fz(robot)
+        else:
+            fz_now = read_fz(robot)
+            if fz_now is not None:
+                fz_peak_drop = min(fz_peak_drop, fz_now - fz_tare)
         # Positive means the tool is sitting above where it was told to be. The sign matters: an
         # arm that overshoots downward is not in contact, and reading |error| here would stop the
         # descent on its own tracking.
@@ -653,6 +675,8 @@ def search_for_seat(
                 "aboveTargetMm": 1000.0 * above_target_m,
                 "settleSeconds": descent["settleSeconds"],
                 "settleMm": descent["settleMm"],
+                "dfzPeakN": descent["dfzPeakN"],
+                "dfzEndN": descent["dfzEndN"],
                 "verdict": reading,
             }
         )
@@ -692,8 +716,17 @@ def search_for_seat(
     }
 
 
-def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[str, Any]:
+def execute_terminal_servo(
+    robot: Any,
+    request: TerminalServoRequest,
+    *,
+    release_gate: Callable[[dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
     """Take the arm off the policy and drive the last centimetres to the fixed pose.
+
+    `release_gate`, when given, decides whether the fingers open, in place of
+    `releaseOnlyWhenSeated`: it is handed the descent (with `seatedDepthErrorMm`) while the peg
+    is still held, so a person can look before anything is let go of.
 
     Only the descent is slowed to this module's speed. The lateral leg runs at the reset's
     0.15 m/s because it happens at the handoff height with nothing under it, and so does the
@@ -747,7 +780,12 @@ def execute_terminal_servo(robot: Any, request: TerminalServoRequest) -> dict[st
         # its first try, and never a lateral move made at fixture height.
         release_xyz = (landing[0], landing[1], stopped_at[2])
         seated = descent["searchStoppedOn"] == "seated"
-        released = seated or not request.releaseOnlyWhenSeated
+        if release_gate is not None:
+            released = bool(release_gate(
+                {**descent, "seatedDepthErrorMm": 1000.0 * (stopped_at[2] - request.xyz[2])}
+            ))
+        else:
+            released = seated or not request.releaseOnlyWhenSeated
         retreat_gripper = request.openGripper
         if released:
             _send_absolute(robot, release_xyz, rotvec, request.openGripper)

@@ -107,6 +107,10 @@ def _plan_terminal_trials(
         searchRingM=float(request.get("searchRingM") or 0.0),
         maxSeconds=float(request.get("maxSeconds") or 0.0),
         pickXyz=parse_terminal_servo_pose(pick) if pick else None,
+        graspAttempts=int(request.get("graspAttempts") or 1),
+        regripInPlace=_flag(request, "regripInPlace"),
+        releaseOnlyWhenSeated=_flag(request, "releaseOnlyWhenSeated"),
+        operatorGrade=_flag(request, "operatorGrade"),
         requestId=run_dir.name,
     )
     schedule = build_trial_schedule(trials_request)
@@ -138,10 +142,23 @@ def _plan_terminal_trials(
         f"--handoff-z={servo.handoffZ}",
         f"--max-seconds={trials_request.maxSeconds}",
         f"--pick-pose={pick}",
+        f"--grasp-attempts={trials_request.graspAttempts}",
         f"--out={run_dir / 'rows.jsonl'}",
         f"--stop-file={run_dir / 'STOP'}",
     ]
+    if trials_request.regripInPlace:
+        argv.append("--regrip-in-place")
+    if trials_request.releaseOnlyWhenSeated:
+        argv.append("--release-only-when-seated")
+    if trials_request.operatorGrade:
+        argv += ["--operator-grade", f"--grade-file={run_dir / 'GRADE'}"]
     return plan, argv
+
+
+def _flag(request: dict[str, Any], key: str) -> bool:
+    """A yes/no field typed into a text box: 1/true/yes/on, anything else is no."""
+
+    return str(request.get(key) or "").strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def _plan_auto_collect(
@@ -436,10 +453,13 @@ def read_run(repo_root: Path, run_id: str, *, tail: int = DEFAULT_TAIL) -> dict[
     # nothing is a run that gave up waiting, and asking somebody to put a peg back for a process
     # that is gone would be a button that does nothing.
     needs_operator = ""
+    needs_grade = False
     for row in reversed(rows):
         kind = row.get("kind")
         if kind == "needs_operator":
             needs_operator = str(row.get("message") or "the run needs a person") if alive else ""
+            # Not "put the peg back" but "is it in the hole?": two different buttons.
+            needs_grade = bool(row.get("grade")) and alive
             break
         if kind in ("operator", "trial", "summary", "staged"):
             break
@@ -448,6 +468,7 @@ def read_run(repo_root: Path, run_id: str, *, tail: int = DEFAULT_TAIL) -> dict[
         "id": run_id,
         "kind": meta.get("kind", plan.get("kind", "")),
         "needsOperator": needs_operator,
+        "needsGrade": needs_grade,
         "dir": str(run_dir),
         "state": state,
         "pid": meta.get("pid"),
@@ -647,6 +668,22 @@ def release_brake(repo_root: Path, run_id: str) -> dict[str, Any]:
     return read_run(repo_root, run_id, tail=1)
 
 
+def request_grade(repo_root: Path, run_id: str, grade: str) -> dict[str, Any]:
+    """Answer a graded run's question: the peg is "in" the hole or "out" of it."""
+
+    run_dir = runs_root(repo_root) / run_id
+    if not run_dir.is_dir():
+        raise UnattendedError(f"no such run: {run_id}")
+    answer = str(grade or "").strip().lower()
+    if answer not in ("in", "out"):
+        raise UnattendedError("grade must be 'in' or 'out'.")
+    run = read_run(repo_root, run_id, tail=20)
+    if not run["needsGrade"]:
+        raise UnattendedError("the run is not asking for a grade.")
+    (run_dir / "GRADE").write_text(answer, encoding="utf-8")
+    return read_run(repo_root, run_id, tail=1)
+
+
 def request_continue(repo_root: Path, run_id: str) -> dict[str, Any]:
     """Answer a run that is waiting for a person: the peg is back, carry on."""
 
@@ -654,7 +691,7 @@ def request_continue(repo_root: Path, run_id: str) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise UnattendedError(f"no such run: {run_id}")
     run = read_run(repo_root, run_id, tail=20)
-    if not run["needsOperator"]:
+    if not run["needsOperator"] or run["needsGrade"]:
         raise UnattendedError("the run is not waiting for anybody.")
     (run_dir / "CONTINUE").write_text(f"continued at {time.strftime('%H:%M:%S')}", encoding="utf-8")
     return read_run(repo_root, run_id, tail=1)

@@ -6873,6 +6873,16 @@ def _unattended_release(state: GatewayState, body: dict[str, Any]) -> dict[str, 
     )
 
 
+def _unattended_grade(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {
+            "run": unattended_backend.request_grade(
+                state.repo_root, str(body.get("id") or ""), str(body.get("grade") or "")
+            )
+        }
+    )
+
+
 def _unattended_continue(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     return _unattended_guard(
         lambda: {"run": unattended_backend.request_continue(state.repo_root, str(body.get("id") or ""))}
@@ -14422,6 +14432,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/unattended/continue":
                     _json_response(self, HTTPStatus.OK, _unattended_continue(state, body))
+                    return
+                if path == "/api/unattended/grade":
+                    _json_response(self, HTTPStatus.OK, _unattended_grade(state, body))
                     return
                 if path == "/api/rollout/scene-reset":
                     with state.lock:

@@ -657,6 +657,114 @@ def test_a_peg_that_seated_is_still_let_go_of():
     assert summary["seated"] >= 1
 
 
+# --- the person's grade -----------------------------------------------------------------------
+
+
+class CountingReleases(FakeTrialRig):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.releases = 0
+
+    def send_action(self, action):
+        was_held = self.held
+        result = super().send_action(action)
+        if was_held and not self.held:
+            self.releases += 1
+        return result
+
+
+def _graded(**overrides):
+    return _request(offsetsMm=(0.0,), repeats=2, controlEvery=100, regripInPlace=True,
+                    operatorGrade=True, **overrides)
+
+
+def test_a_graded_run_asks_before_the_fingers_open_and_lets_go_only_on_in():
+    robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
+    asked = []
+
+    def ask(trial):
+        asked.append(trial)
+        return "in"
+
+    summary = run_terminal_trials(robot, _graded(), ask_grade=ask)
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    assert [trial["index"] for trial in asked] == [0, 1, 2]
+    assert all(trial["autoVerdict"] == "seated" for trial in asked)
+    # Asked while the peg was held: each answer is followed by exactly one release.
+    assert robot.releases == 3
+    assert summary["gradeAgreement"] == {"seated_in": 3}
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert [row["operatorGrade"] for row in trials] == ["in", "in", "in"]
+    assert all(row["released"] for row in trials)
+
+
+def test_an_automatic_seat_the_person_calls_out_is_never_let_go_of_nor_trusted_as_the_hole():
+    """The 09-11 failure: a peg on the rim read as seated and was let go of, and fell."""
+
+    robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
+    answers = iter(["out", "in", "in", "in"])
+    summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: next(answers))
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    first = trials[0]
+    assert first["trialKind"] == "reference" and first["verdict"] == "seated"
+    assert first["operatorGrade"] == "out" and first["released"] is False
+    assert first["referenceAccepted"] is False
+    # The reference is retried, and only the confirmed one moves the estimate.
+    assert trials[1]["trialKind"] == "reference" and trials[1]["referenceAccepted"] is True
+    assert len(summary["referenceUpdates"]) == 1
+    assert robot.releases == 3
+    assert summary["gradeAgreement"] == {"seated_out": 1, "seated_in": 3}
+
+
+def test_nobody_answering_ends_the_run_holding_the_peg():
+    robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
+    summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: None)
+    assert summary["haltedOn"] == "operator_gone"
+    assert robot.releases == 0 and robot.held
+
+
+def test_a_graded_run_without_anybody_to_ask_is_refused():
+    robot = FakeTrialRig(hole_xy=SEATED[:2])
+    with pytest.raises(TerminalTrialError, match="ask_grade"):
+        run_terminal_trials(robot, _graded())
+
+
+def test_the_file_gate_posts_the_question_and_takes_the_pages_answer(tmp_path):
+    rows = []
+    grade = tmp_path / "GRADE"
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        if len(polls) == 2:
+            grade.write_text("OUT\n", encoding="utf-8")
+
+    gate = terminal_trials.FileGradeGate(
+        grade, on_row=rows.append, stop_requested=lambda: False, timeout_s=10.0, sleep=sleep
+    )
+    trial = {"index": 3, "trialKind": "offset", "autoVerdict": "seated",
+             "aboveTargetMm": 1.9, "settleMm": 2.2, "dfzPeakN": -6.5}
+    assert gate(trial) == "out"
+    assert not grade.exists()
+    assert rows[0]["kind"] == "needs_operator" and rows[0]["grade"] is True and rows[0]["index"] == 3
+    assert "seated" in rows[0]["message"] and "-6.5 N" in rows[0]["message"]
+    assert rows[1] == {"kind": "operator", "trial": 3, "grade": "out", "at": rows[1]["at"]}
+
+
+def test_the_file_gate_ignores_a_stale_answer_and_gives_up_on_stop(tmp_path):
+    grade = tmp_path / "GRADE"
+    grade.write_text("in", encoding="utf-8")  # left over from an earlier question
+    stops = iter([False, True])
+    gate = terminal_trials.FileGradeGate(
+        grade, on_row=lambda row: None, stop_requested=lambda: next(stops), timeout_s=10.0,
+        sleep=lambda seconds: None,
+    )
+    trial = {"index": 0, "trialKind": "reference", "autoVerdict": "seated",
+             "aboveTargetMm": 1.9, "settleMm": 0.1, "dfzPeakN": None}
+    assert gate(trial) is None
+
+
 def test_the_runtime_wires_the_contact_thresholds_into_the_descent():
     """They set the axial force a jammed peg sees, so a flag that does not arrive is invisible.
 

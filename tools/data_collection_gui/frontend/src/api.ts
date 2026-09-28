@@ -1236,6 +1236,10 @@ export class DataCollectionGuiApi {
     return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/stop", { id, mode });
   }
 
+  async gradeUnattendedRun(id: string, grade: "in" | "out") {
+    return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/grade", { id, grade });
+  }
+
   async continueUnattendedRun(id: string) {
     return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/continue", { id });
   }

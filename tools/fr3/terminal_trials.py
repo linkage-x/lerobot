@@ -184,6 +184,13 @@ class TerminalTrialsRequest:
     # Close this far below the pose the peg was released at. See
     # `TerminalServoRequest.regripDropM`: a released peg falls, and the fingers have to follow it.
     regripDropM: float = 0.0
+    # Ask a person, after every descent and before the fingers open, whether the peg is in the
+    # hole ("in") or not ("out"), and let go only on "in". The calibration batch for the seated
+    # verdict: on 2026-09-11 four re-grips came up empty right after an automatic "seated", and
+    # the operator remembers the peg mostly lying down -- it had been let go of on the rim. The
+    # answer, not the automatic verdict, also decides whether a reference trial re-reads the
+    # hole, since one misread reference moves every trial after it.
+    operatorGrade: bool = False
     graspToleranceM: float = TERMINAL_TRIAL_GRASP_TOLERANCE
     standingMm: float = TERMINAL_TRIAL_STANDING_MM
     maxReferenceStepM: float = TERMINAL_TRIAL_MAX_REFERENCE_STEP_M
@@ -528,8 +535,13 @@ def run_terminal_trials(
     should_stop: Callable[[], bool] | None = None,
     on_row: Callable[[dict[str, Any]], None] | None = None,
     reference_xyz: tuple[float, float, float] | None = None,
+    ask_grade: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> dict[str, Any]:
     """Run the whole sweep and answer with what happened and why it stopped.
+
+    With `request.operatorGrade`, `ask_grade` is called once per trial with the descent's
+    numbers while the peg is still held, and answers "in", "out", or None for nobody there
+    (which ends the run holding the peg).
 
     The cycle is: aim at the current hole estimate plus this trial's offset, descend, read the
     verdict off the descent, pick the peg back up from the pose the servo let go at, repeat. That
@@ -545,6 +557,8 @@ def run_terminal_trials(
     """
 
     specs = tuple(schedule) if schedule is not None else build_trial_schedule(request)
+    if request.operatorGrade and ask_grade is None:
+        raise TerminalTrialError("operatorGrade needs somebody to ask: pass ask_grade.")
     _, preflight_rotvec, _ = _observation_xyz_rotvec_gripper(robot)
     # Before the fence check, because a level tool is a precondition of the experiment and not a
     # property of the poses it will visit: a leaning run passes every reach and fence test and
@@ -627,7 +641,33 @@ def run_terminal_trials(
 
             _, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
             servo = _servo_for(request, spec, state.referenceXyz)
-            result = execute_terminal_servo(robot, servo)
+            grade: dict[str, Any] = {}
+
+            def release_gate(descent: dict[str, Any], spec: TrialSpec = spec,
+                             servo: TerminalServoRequest = servo) -> bool:
+                auto = classify_stop(
+                    float(descent["seatedDepthErrorMm"]),
+                    float(descent["settleMm"]),
+                    seated_mm=servo.searchSeatedM * 1000.0,
+                    slip_mm=servo.searchSlipM * 1000.0,
+                    standing_mm=request.standingMm,
+                )
+                grade["answer"] = ask_grade(
+                    {
+                        "index": spec.index,
+                        "trialKind": spec.kind,
+                        "autoVerdict": auto,
+                        "aboveTargetMm": float(descent["seatedDepthErrorMm"]),
+                        "settleMm": float(descent["settleMm"]),
+                        "dfzPeakN": descent.get("dfzPeakN"),
+                    }
+                )
+                return grade["answer"] == "in"
+
+            if request.operatorGrade:
+                result = execute_terminal_servo(robot, servo, release_gate=release_gate)
+            else:
+                result = execute_terminal_servo(robot, servo)
             if not result.get("ok"):
                 emit(
                     {
@@ -691,8 +731,14 @@ def run_terminal_trials(
                 "searchAttempts": result.get("searchAttempts", []),
                 "releaseXyz": list(release_xyz),
                 "handoffXyz": [float(value) for value in result["handoffXyz"]],
+                "released": bool(result.get("released", True)),
+                "fzTareN": result.get("fzTareN"),
+                "dfzPeakN": result.get("dfzPeakN"),
+                "dfzEndN": result.get("dfzEndN"),
                 "elapsedS": time.perf_counter() - started,
             }
+            if request.operatorGrade:
+                row["operatorGrade"] = grade.get("answer")
 
             state.completed += 1
             if verdict == "seated":
@@ -704,8 +750,9 @@ def run_terminal_trials(
             # actually stopped is a measurement of the hole plus whatever bias the peg carries
             # in the fingers -- and since the peg is about to be re-gripped at exactly that
             # pose, that sum is precisely the pose the next trial should aim at.
+            confirmed = row["operatorGrade"] == "in" if request.operatorGrade else verdict == "seated"
             if spec.kind == "reference":
-                if verdict == "seated":
+                if confirmed:
                     state.referenceFailures = 0
                     # z as well as xy, for the same reason the comment above gives for xy:
                     # a seated reference stopped where the hole is, and carrying the typed-in z
@@ -758,8 +805,12 @@ def run_terminal_trials(
                     row["referenceFailures"] = state.referenceFailures
 
             emit(row)
+            if request.operatorGrade and row["operatorGrade"] is None:
+                # Nobody answered, and the peg was not let go of: stop holding it.
+                halted = "operator_gone"
+                break
 
-            if spec.kind == "reference" and verdict != "seated":
+            if spec.kind == "reference" and not confirmed:
                 if state.referenceFailures >= request.referenceAttempts:
                     halted = "reference_lost"
                     break
@@ -842,10 +893,89 @@ def run_terminal_trials(
         "elapsedS": time.perf_counter() - started,
         "byOffsetMm": summarize_by_offset(trials),
     }
+    if request.operatorGrade:
+        summary["gradeAgreement"] = summarize_grades(trials)
     if on_row is not None:
         on_row(summary)
     summary["rows"] = rows
     return summary
+
+
+def summarize_grades(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Automatic verdict against the person's, as `<auto>_<in|out>` counts.
+
+    `seated_out` is the one that costs a peg: the loop would have let go of it on the rim.
+    """
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        answer = row.get("operatorGrade")
+        if answer not in ("in", "out"):
+            continue
+        key = f"{row.get('verdict')}_{answer}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+class FileGradeGate:
+    """Ask the person on the Unattended Runs page, through a file, whether the peg is in the hole.
+
+    The page writes "in" or "out" into `grade_path`; the boundary STOP answers "nobody is
+    coming". Polled for the same reason `grasp_envelope.FileOperatorGate` is. The question is
+    posted as a `needs_operator` row with `grade: true`, which is what the page keys its two
+    buttons on, and answered with an `operator` row, which is what takes them away again.
+    """
+
+    ANSWERS = ("in", "out")
+
+    def __init__(
+        self,
+        grade_path: Any,
+        *,
+        on_row: Callable[[dict[str, Any]], None],
+        stop_requested: Callable[[], bool],
+        timeout_s: float,
+        poll_s: float = 0.3,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        from pathlib import Path
+
+        self.grade_path = Path(grade_path)
+        self.on_row = on_row
+        self.stop_requested = stop_requested
+        self.timeout_s = float(timeout_s)
+        self.poll_s = float(poll_s)
+        self.sleep = sleep
+
+    def _read(self) -> str | None:
+        try:
+            answer = self.grade_path.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            return None
+        return answer if answer in self.ANSWERS else None
+
+    def __call__(self, trial: dict[str, Any]) -> str | None:
+        self.grade_path.unlink(missing_ok=True)
+        dfz = trial.get("dfzPeakN")
+        message = (
+            f"trial {trial['index']:03d}: 销在孔里吗？自动判定 {trial['autoVerdict']}，"
+            f"above {trial['aboveTargetMm']:+.1f} mm，settle {trial['settleMm']:+.1f} mm"
+            + ("" if dfz is None else f"，dFz {dfz:+.1f} N")
+        )
+        self.on_row({"kind": "needs_operator", "grade": True, "at": time.time(), "message": message, **trial})
+        print(f"[ATTENTION] terminal_trials_needs_grade {message}", flush=True)
+        waited = 0.0
+        answer: str | None = None
+        while waited < self.timeout_s:
+            answer = self._read()
+            if answer is not None or self.stop_requested():
+                break
+            self.sleep(self.poll_s)
+            waited += self.poll_s
+        self.grade_path.unlink(missing_ok=True)
+        self.on_row({"kind": "operator", "trial": trial["index"], "grade": answer, "at": time.time()})
+        print(f"[INFO] terminal_trials_grade trial={trial['index']:03d} answer={answer or 'none'}", flush=True)
+        return answer
 
 
 class _Halt(Exception):

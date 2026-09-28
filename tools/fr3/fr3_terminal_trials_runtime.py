@@ -60,8 +60,10 @@ from tools.fr3.terminal_servo import (
     TerminalServoRequest,
     parse_terminal_servo_pose,
 )
+from tools.fr3.scene_reset import set_force_trace_path
 from tools.fr3.terminal_trials import (
     TERMINAL_TRIAL_MAX_TILT_DEG,
+    FileGradeGate,
     TerminalTrialsRequest,
     build_trial_schedule,
     describe_schedule,
@@ -191,6 +193,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--operator-grade",
+        action="store_true",
+        help=(
+            "After every descent, with the peg still held, wait for a person to answer whether "
+            "it is in the hole, and let go only on 'in'. Calibrates the automatic seated verdict."
+        ),
+    )
+    parser.add_argument(
+        "--grade-file",
+        default="",
+        help="Where the page writes 'in' or 'out'. Defaults to GRADE beside --out.",
+    )
+    parser.add_argument(
+        "--grade-timeout-s",
+        type=float,
+        default=900.0,
+        help="How long to wait for an answer before ending the run holding the peg.",
+    )
+    parser.add_argument(
         "--home-first",
         action="store_true",
         help="Move to the home keyframe before the first trial. Home is level to 0.05 deg, "
@@ -310,6 +331,7 @@ def build_request(args: argparse.Namespace) -> TerminalTrialsRequest:
         regripInPlace=bool(args.regrip_in_place),
         releaseOnlyWhenSeated=bool(args.release_only_when_seated),
         regripDropM=float(args.regrip_drop_mm) / 1000.0,
+        operatorGrade=bool(args.operator_grade),
         requestId=f"terminal_trials_{time.strftime('%Y%m%d_%H%M%S')}",
     )
 
@@ -422,12 +444,23 @@ def main(argv: list[str] | None = None) -> int:
             # in, and home is the one pose known to be level.
             print("[INFO] terminal_trials=homing", flush=True)
             robot.move_to_start()
+        ask_grade = None
+        if request.operatorGrade:
+            ask_grade = FileGradeGate(
+                Path(args.grade_file) if args.grade_file else out_path.with_name("GRADE"),
+                on_row=write,
+                stop_requested=stop_file,
+                timeout_s=float(args.grade_timeout_s),
+            )
+        # Every scripted step and every descent, with the state fields read beside the wrench.
+        set_force_trace_path(out_path.with_name(f"{out_path.stem}_force.jsonl"))
         try:
             summary = run_terminal_trials(
                 robot, request, schedule, should_stop=stop_file, on_row=write,
-                reference_xyz=resume_reference
+                reference_xyz=resume_reference, ask_grade=ask_grade,
             )
         finally:
+            set_force_trace_path(None)
             robot.disconnect()
 
     print(f"[INFO] terminal_trials=done halted_on={summary['haltedOn']} "

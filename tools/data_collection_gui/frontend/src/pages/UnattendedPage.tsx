@@ -55,7 +55,11 @@ const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
     controlEvery: "4",
     seed: "0",
     searchRingM: "0",
-    maxSeconds: "7200"
+    maxSeconds: "7200",
+    graspAttempts: "1",
+    regripInPlace: "0",
+    releaseOnlyWhenSeated: "0",
+    operatorGrade: "0"
   },
   grasp_envelope: {
     start: "fixture",
@@ -92,7 +96,10 @@ const FIELD_HELP: Record<string, string> = {
   xyDzMm: "Relative grasp height of the XY grid. 0 = the reset's own grip (TCP 0.058); the demonstrations close at -6.6.",
   dzOffsetsMm: "Height column at dx=dy=0, mm relative to the reset's grip. Floor is TCP 0.044.",
   extraPointsMm: "Fine scan after the coarse pass: 'dx,dy,dz; dx,dy,dz' in mm.",
-  resumeFrom: "Run id of a halted envelope run with the same plan; its finished trials are skipped."
+  resumeFrom: "Run id of a halted envelope run with the same plan; its finished trials are skipped.",
+  regripInPlace: "1: close on the peg where it was let go of, before retreating (no new descent to fetch it).",
+  releaseOnlyWhenSeated: "1: keep hold of a peg the automatic verdict did not call seated.",
+  operatorGrade: "1: after every descent, with the peg still held, ask you whether it is in the hole; it lets go only on your \"in\". Calibrates the automatic verdict."
 };
 
 export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
@@ -275,7 +282,39 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
             <p style={{ margin: "0 0 10px" }}>
               <StatusDot state={run.state} /> <strong>{run.state}</strong> — {outcomeLabel(run)}
             </p>
-            {run.needsOperator ? (
+            {run.needsOperator && run.needsGrade ? (
+              <div
+                style={{
+                  display: "flex",
+                  gap: 12,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  background: "rgba(214, 158, 46, 0.18)",
+                  border: "1px solid #d69e2e",
+                  borderRadius: 6,
+                  padding: "8px 12px",
+                  marginBottom: 10
+                }}
+              >
+                <span>
+                  <strong>需要你判定：</strong>
+                  {run.needsOperator}（销还夹在爪里；只有选“在孔里”才会松手）
+                </span>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void guard("grade", () => api.gradeUnattendedRun(run.id, "in"))}
+                >
+                  在孔里
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => void guard("grade", () => api.gradeUnattendedRun(run.id, "out"))}
+                >
+                  不在孔里
+                </button>
+              </div>
+            ) : run.needsOperator ? (
               <div
                 style={{
                   display: "flex",
