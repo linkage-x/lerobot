@@ -64,7 +64,6 @@ from tools.fr3.scene_reset import (
     _robot_workspace_bounds,
     _run_step,
     _workspace_bounds,
-    read_fz,
 )
 from tools.fr3.terminal_servo import (
     TERMINAL_SERVO_SEARCH_RING_M,
@@ -90,9 +89,6 @@ from tools.fr3.terminal_servo import (
 TERMINAL_TRIAL_MAX_TILT_DEG = 2.0
 
 TERMINAL_TRIAL_GRASP_FLOOR = 0.10
-# How hard a peg carried over from a previous run may be set down in the pick fixture, N below
-# the reading before the descent: the grasp loop's set-down cap.
-TERMINAL_TRIAL_SET_DOWN_CAP_N = 7.0
 # Above this the fingers are open, not holding: the peg reads ~0.31, open fingers ~1.0.
 TERMINAL_TRIAL_OPEN_ABOVE = 0.6
 # How far a later grasp may sit from the first one of the same run before the loop stops. The
@@ -620,20 +616,7 @@ def run_terminal_trials(
     try:
         _, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
         start_attempts = 1
-        _, _, start_width = _observation_xyz_rotvec_gripper(robot)
         if request.pickXyz is not None:
-            if _holds_something(start_width, request):
-                # Holding a peg a previous run left in the fingers. Its grip is not one this run
-                # made -- 09-28 16:39: a peg held over a crashed run met the fixture 20 mm high
-                # and was pressed out of the fingers -- and fetching as usual would open the
-                # fingers above the pick point and drop it. So carry it down, closed, to where
-                # it would be picked from; the fetch below then lets go there and takes it anew.
-                # Capped as the grasp loop's set-down is: this grip's offset is unknown, so the
-                # peg may meet the fixture before the tool reaches the pick height.
-                tare = read_fz(robot)
-                _run_step(robot, request, "descend_8cm_to_place", tuple(request.pickXyz), rotvec,
-                          request.closedGripper,
-                          force_cap=None if tare is None else (tare, TERMINAL_TRIAL_SET_DOWN_CAP_N))
             width, verdict, start_attempts = _grasp_until_held(
                 robot, request, tuple(request.pickXyz), rotvec, None
             )

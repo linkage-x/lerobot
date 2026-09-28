@@ -62,7 +62,12 @@ from tools.fr3.terminal_servo import (
     TerminalServoRequest,
     parse_terminal_servo_pose,
 )
-from tools.fr3.scene_reset import control_loop_alive, set_force_trace_path
+from tools.fr3.scene_reset import (
+    _observation_xyz_rotvec_gripper,
+    _run_step,
+    control_loop_alive,
+    set_force_trace_path,
+)
 from tools.fr3.terminal_trials import (
     TERMINAL_TRIAL_MAX_TILT_DEG,
     FileGradeGate,
@@ -456,6 +461,13 @@ def main(argv: list[str] | None = None) -> int:
 
         write({"kind": "header", "request": request.payload(), "schedule": [vars(spec) for spec in schedule]})
         robot.connect()
+        if request.pickXyz is not None:
+            # The run fetches its own peg, so it starts with open fingers, opened where the arm
+            # stands. Not decided from the width: fingers a stopped run left behind stay where
+            # they were blocked, and on 09-28 an empty pair reading 0.31 was taken for a held peg
+            # and carried closed onto the one standing in the hole (-21.9 N, reflex).
+            xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
+            _run_step(robot, request, "open_gripper", xyz, rotvec, request.openGripper)
         if args.home_first:
             # Before anything reads the orientation: the run inherits whatever pose the arm is
             # in, and home is the one pose known to be level.
