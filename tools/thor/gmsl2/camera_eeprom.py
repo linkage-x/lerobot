@@ -37,12 +37,17 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 FIRST_BUS = 17  # i2c-12 mux channels 0..3, one per MAX96726
 LINKS_PER_DESERIALIZER = 4
 EEPROM_BASE_ADDR = 0x60
 READ_BYTES = 0x140  # through the serial number
+# The two stretches that carry anything (calibration block: 5 + 12 * 8 bytes):
+# 5 transfers per camera instead of 10,
+# so reading every port at Connect costs well under a second.
+READ_RANGES = ((0x60, 0x68), (0x120, 0x20))
 
 CALIB_OFFSET = 0x60
 SERIAL_OFFSET = 0x120
@@ -119,11 +124,35 @@ def parse_eeprom(sid: int, raw: bytes | None) -> ModuleIdentity:
     return ident
 
 
+def read_raw(sid: int, reader: Reader = i2ctransfer_reader) -> bytes | None:
+    """The EEPROM image up to the serial, 0xff where it was not read."""
+    bus, addr = eeprom_location(sid)
+    image = bytearray(b"\xff" * READ_BYTES)
+    for offset, length in READ_RANGES:
+        chunk = reader(bus, addr, offset, length)
+        if chunk is None:
+            return None
+        image[offset:offset + len(chunk)] = chunk
+    return bytes(image)
+
+
 def read_modules(sids: Sequence[int], reader: Reader = i2ctransfer_reader) -> list[ModuleIdentity]:
-    out = []
-    for sid in sids:
-        bus, addr = eeprom_location(sid)
-        out.append(parse_eeprom(sid, reader(bus, addr, 0, READ_BYTES)))
+    return [parse_eeprom(sid, read_raw(sid, reader)) for sid in sids]
+
+
+def identity_summary(modules: Sequence[ModuleIdentity]) -> dict[str, dict[str, object]]:
+    """``{cam_NN: {...}}`` for meta.json and the recorder's CAMERA_IDENTITY line."""
+    out: dict[str, dict[str, object]] = {}
+    for m in modules:
+        entry: dict[str, object] = {"sensor_id": m.sid, "serial": m.serial, "answered": m.answered}
+        if m.cx is not None:
+            entry["factory_intrinsics"] = {
+                "fx": m.fx, "fy": m.fy, "cx": m.cx, "cy": m.cy, "model": "opencv_rational",
+                "dist": m.dist,
+            }
+        if m.problem:
+            entry["problem"] = m.problem
+        out[m.camera_name] = entry
     return out
 
 
@@ -174,7 +203,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", type=Path, default=None, help="write the result here")
     ap.add_argument("--match-px", type=float, default=8.0,
                     help="a fingerprint farther than this matches nothing")
+    ap.add_argument("--write-expected", type=Path, default=None,
+                    help="write port -> serial for every port whose factory intrinsics match "
+                         "--intrinsics' camera on that same port (camera_identity_expected.json)")
     args = ap.parse_args(argv)
+    if args.write_expected and not args.intrinsics:
+        ap.error("--write-expected needs --intrinsics: a port is only vouched for once its "
+                 "camera is shown to be the one that calibration measured")
 
     sids: list[int] = []
     for part in args.sids.split(","):
@@ -210,6 +245,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no answer: {', '.join(silent)}")
     if args.json:
         args.json.write_text(json.dumps({"modules": rows}, indent=2))
+    if args.write_expected:
+        ports = {
+            r["camera_name"]: r["serial"] for r in rows
+            if r["serial"] and r["calibrated_match"] and r["calibrated_match"]["same_port"]
+        }
+        refused = sorted(
+            r["camera_name"] for r in rows
+            if r["answered"] and r["camera_name"] in calibrated and r["camera_name"] not in ports
+        )
+        unread = sorted(
+            name for name in calibrated if name not in {r["camera_name"] for r in rows if r["answered"]}
+        )
+        args.write_expected.write_text(json.dumps({
+            "calibration": args.intrinsics.name,
+            "generated_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            "match_px": args.match_px,
+            "ports": ports,
+            # Calibrated ports this could not vouch for: another camera is on
+            # them, or they did not answer. Not enforced, listed so it is seen.
+            "not_vouched": {"other_camera": refused, "unread": unread},
+        }, indent=2) + "\n")
+        print(f"wrote {args.write_expected}: {len(ports)} ports"
+              + (f"; other camera on {', '.join(refused)}" if refused else "")
+              + (f"; unread {', '.join(unread)}" if unread else ""))
     return 0
 
 

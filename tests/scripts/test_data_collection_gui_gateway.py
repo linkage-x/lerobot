@@ -7065,3 +7065,47 @@ def test_tracker_segment_lines_outside_a_mount_capture_are_ignored(tmp_path):
     state = _marker_tcp_gateway_state(tmp_path)
     gateway._apply_recorder_output(state, 'LT_SEGMENT {"episode":0,"kind":"pivot","gain_min":0.1}')
     assert state.tracker_mount_session.liveSegments == {}
+
+
+def _write_identity_expected(repo_root: Path, ports: dict[str, str]) -> None:
+    path = repo_root / gateway.CAMERA_IDENTITY_EXPECTED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"calibration": "calib_x_intrinsics", "ports": ports}))
+
+
+def test_start_episode_refuses_a_camera_on_another_cameras_port(tmp_path, monkeypatch):
+    """09-23: modules moved between ports and every constant followed the port."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    _write_identity_expected(tmp_path, {"cam_06": "SN-A", "cam_07": "SN-B", "cam_09": "SN-C"})
+
+    gateway._apply_recorder_output(state, "CAMERA_IDENTITY " + json.dumps({
+        "cam_06": {"serial": "SN-A", "answered": True},
+        "cam_07": {"serial": "SN-C", "answered": True},   # cam_09's camera
+        "cam_09": {"serial": None, "answered": False},    # silent: unknown, not wrong
+    }))
+    assert state.recording.cameraIdentityExpectedFrom == "calib_x_intrinsics"
+    assert state.recording.cameraIdentityMismatches == [{
+        "camera": "cam_07", "expected": "SN-B", "actual": "SN-C",
+        "expectedNowOn": "", "actualCalibratedAs": "cam_09",
+    }]
+    with pytest.raises(RuntimeError, match="cam_07 上是 SN-C，标定时是 SN-B"):
+        gateway._start_episode(state)
+    assert written == []
+
+    # Cable put back and reconnected: the next identity line clears it.
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_07":{"serial":"SN-B","answered":true}}')
+    assert state.recording.cameraIdentityMismatches == []
+    gateway._start_episode(state)
+    assert written
+
+
+def test_camera_identity_without_an_expected_table_enforces_nothing(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_06":{"serial":"SN-Z","answered":true}}')
+    assert state.recording.cameraIdentity["cam_06"]["serial"] == "SN-Z"
+    assert state.recording.cameraIdentityMismatches == []
+    gateway._start_episode(state)
+    assert written
+    assert gateway._snapshot(state)["recording"]["cameraIdentity"]["cam_06"]["serial"] == "SN-Z"

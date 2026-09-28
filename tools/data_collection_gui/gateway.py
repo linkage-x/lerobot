@@ -196,6 +196,15 @@ class RecordingStatus:
     laserTrackerHomed: bool = False
     # Homed, but the beam broke since: the current lock's range is not absolute.
     laserTrackerBeamBroken: bool = False
+    # Which physical camera is on each port, read by the recorder off each
+    # module's EEPROM at Connect ({cam_NN: {serial, answered}}). cam_NN is the
+    # cable's port, not the camera: a swapped cable silently hands one camera
+    # another's intrinsics and extrinsics.
+    cameraIdentity: dict[str, Any] = field(default_factory=dict)
+    # Ports whose camera is not the one the production calibration was made
+    # with -- StartEpisode refuses while any are listed.
+    cameraIdentityMismatches: list[dict[str, str]] = field(default_factory=list)
+    cameraIdentityExpectedFrom: str = ""
 
 
 @dataclass
@@ -13331,6 +13340,9 @@ def _connect_recorder(
     state.recording.laserTrackerReady = False
     state.recording.laserTrackerHomed = False
     state.recording.laserTrackerBeamBroken = False
+    state.recording.cameraIdentity = {}
+    state.recording.cameraIdentityMismatches = []
+    state.recording.cameraIdentityExpectedFrom = ""
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -13440,6 +13452,21 @@ def _start_episode(
             f"跟踪仪站位采集 {mount_session.sessionName} 正在占用录制器。"
             "要录任务数据，先到「标定」页结束这次站位采集"
             "（已经录下的停驻段不会被删）。"
+        )
+
+    # Every per-camera constant is keyed on the port, and the port is the cable.
+    # A camera on another camera's port gets that camera's intrinsics and
+    # extrinsics, and nothing downstream can tell (09-23 remount, found 09-28).
+    if state.recording.cameraIdentityMismatches:
+        lines = "；".join(
+            f"{m['camera']} 上是 {m['actual']}，标定时是 {m['expected']}"
+            + (f"（{m['expected']} 现在在 {m['expectedNowOn']}）" if m.get("expectedNowOn") else "")
+            for m in state.recording.cameraIdentityMismatches
+        )
+        raise RuntimeError(
+            f"相机和端口的对应关系与标定时不一致：{lines}。"
+            "把线缆插回原端口后重新 Connect；或者按现在的接法重新标定，"
+            "再用 camera_eeprom.py --write-expected 更新期望表。"
         )
 
     # An episode recorded while the tracker is blind is structurally complete and
@@ -14188,6 +14215,57 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
     return ""
 
 
+CAMERA_IDENTITY_EXPECTED = Path("tools") / "thor" / "gmsl2" / "camera_identity_expected.json"
+"""Port -> EEPROM serial the production calibration was made with, written by
+``camera_eeprom.py --write-expected`` after checking each port's factory
+intrinsics against that calibration. Absent means nothing is enforced."""
+
+
+def _load_camera_identity_expected(state: GatewayState) -> dict[str, Any]:
+    path = state.repo_root / CAMERA_IDENTITY_EXPECTED
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) and isinstance(data.get("ports"), dict) else {}
+
+
+def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> None:
+    """Compare the cameras on the ports now with those the calibration expects.
+
+    Only a serial read that differs is a mismatch. A port that did not answer
+    is unknown, not wrong -- it is shown, and does not block.
+    """
+    state.recording.cameraIdentity = identity
+    expected = _load_camera_identity_expected(state)
+    ports: dict[str, str] = {str(k): str(v) for k, v in (expected.get("ports") or {}).items()}
+    state.recording.cameraIdentityExpectedFrom = str(expected.get("calibration") or "")
+    now_at = {
+        str((v or {}).get("serial")): cam for cam, v in identity.items()
+        if isinstance(v, dict) and v.get("serial")
+    }
+    mismatches: list[dict[str, str]] = []
+    for cam, want in sorted(ports.items()):
+        live = identity.get(cam)
+        have = str(live.get("serial") or "") if isinstance(live, dict) else ""
+        if not have or have == want:
+            continue
+        mismatches.append({
+            "camera": cam,
+            "expected": want,
+            "actual": have,
+            # Where the expected camera went, if it is plugged in elsewhere.
+            "expectedNowOn": now_at.get(want, ""),
+            "actualCalibratedAs": next((c for c, s in ports.items() if s == have), ""),
+        })
+    state.recording.cameraIdentityMismatches = mismatches
+    for m in mismatches:
+        where = f"，它现在在 {m['expectedNowOn']}" if m["expectedNowOn"] else ""
+        detail = f"端口上是 {m['actual']}，标定时是 {m['expected']}{where}"
+        state.log("error", f"Camera identity: {m['camera']} {detail}")
+        _set_device_state(state, m["camera"], "error", detail)
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
@@ -14196,6 +14274,14 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         return
     if output.startswith("LT_HOMED "):
         state.recording.laserTrackerHomed = output.removeprefix("LT_HOMED ").strip() == "1"
+        return
+    if output.startswith("CAMERA_IDENTITY "):
+        try:
+            identity = json.loads(output.removeprefix("CAMERA_IDENTITY "))
+        except ValueError:
+            return
+        if isinstance(identity, dict):
+            _apply_camera_identity(state, identity)
         return
     if output.startswith("LT_SEGMENT "):
         try:

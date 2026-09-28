@@ -87,6 +87,7 @@ from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
+from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
 from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
@@ -169,6 +170,28 @@ def _emit_tracker_segment_geometry(
         _emit("LT_SEGMENT " + json.dumps(out, separators=(",", ":")))
     except Exception as exc:  # noqa: BLE001 -- a preview must never cost the take
         logger.warning("tracker segment geometry failed: %s", exc)
+
+
+def _read_camera_identity(sids: list[int]) -> dict[str, Any]:
+    """``CAMERA_IDENTITY <json>``: serial and factory intrinsics per locked port.
+
+    Read before Argus opens anything, so the i2c reads never race the driver's
+    own sensor writes. The port a camera is on is the cable, not the camera
+    (2026-09-28: the 09-23 remount had swapped modules between ports, and the
+    hand-kept serial map had never matched); the gateway compares this against
+    the identity the production calibration was made with. Never fatal: without
+    sudo or with a silent EEPROM the recording goes on, unidentified, and says so.
+    """
+    try:
+        identity = ce.identity_summary(ce.read_modules(sids))
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"WARNING: camera identity not read: {type(exc).__name__}: {exc}")
+        return {}
+    _emit("CAMERA_IDENTITY " + json.dumps(
+        {name: {"serial": v.get("serial"), "answered": v.get("answered")} for name, v in identity.items()},
+        separators=(",", ":"),
+    ))
+    return identity
 
 
 
@@ -752,6 +775,7 @@ def _write_episode_meta(
     wallclock_end_utc: str,
     world_frame: dict[str, Any],
     capture_intent: dict[str, Any] | None = None,
+    camera_identity: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -900,6 +924,10 @@ def _write_episode_meta(
         # ABSENT on ordinary captures on purpose: consumers must be able to tell
         # "nothing was declared" from "declared, and it was this".
         meta["capture_intent"] = capture_intent
+    if camera_identity:
+        # Which physical camera each cam_NN was, read off its EEPROM at Connect.
+        # cam_NN is the cable's port; a swapped cable is invisible without this.
+        meta["camera_identity"] = camera_identity
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
@@ -1419,6 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
     if not locked:
         _emit("ERROR: no locked GMSL2 cameras detected")
         return 1
+    camera_identity = _read_camera_identity(locked)
     _emit(f"Connecting: {len(locked)} cameras locked, probing Argus ISP...")
 
     if args.skip_argus_probe:
@@ -2195,7 +2224,7 @@ def main(argv: list[str] | None = None) -> int:
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
-                    world_frame, capture_intent,
+                    world_frame, capture_intent, camera_identity,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for

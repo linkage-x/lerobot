@@ -85,3 +85,21 @@ def test_cli_writes_json(tmp_path, monkeypatch, capsys):
     rows = {r["sid"]: r for r in json.loads(out.read_text())["modules"]}
     assert rows[4]["serial"] == "H120K-I05130057" and rows[7]["answered"] is False
     assert "no answer: cam_07" in capsys.readouterr().out
+
+
+def test_write_expected_vouches_only_for_ports_whose_camera_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(ce.read_modules, "__defaults__", (_reader,))
+    conv = tmp_path / "calib" / "converted"
+    for cam, (fx, cx, cy) in {"cam_06": (992.94, 966.27, 561.38), "cam_12": (1007.62, 983.78, 551.79),
+                              "cam_04": (1001.0, 1002.0, 556.5), "cam_09": (1001.0, 1002.0, 556.5)}.items():
+        (conv / f"{cam}_X").mkdir(parents=True)
+        (conv / f"{cam}_X" / "intrinsics_producer.json").write_text(
+            json.dumps({"camera_matrix": [[fx, 0, cx], [0, fx, cy], [0, 0, 1]]}))
+    out = tmp_path / "expected.json"
+    assert ce.main(["--sids", "4,6,12", "--intrinsics", str(tmp_path / "calib"),
+                    "--write-expected", str(out)]) == 0
+    data = json.loads(out.read_text())
+    assert data["ports"] == {"cam_06": "H120K-I05130024", "cam_12": "H120K-I05130067"}
+    assert data["not_vouched"] == {"other_camera": ["cam_04"], "unread": ["cam_09"]}
+    with pytest.raises(SystemExit):
+        ce.main(["--write-expected", str(out)])
