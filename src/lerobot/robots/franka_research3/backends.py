@@ -193,6 +193,10 @@ class PandaPyArmDriver:
         # a second get_state() per control tick would double the round-trips for a value the
         # reader already has in hand. None on a binding that does not report it.
         self._cached_external_wrench: np.ndarray | None = None
+        # Read beside the wrench to find out why it comes back all zeros on ~15% of reads (09-28,
+        # in 0.1-4 s stretches, while the joints stay live): the joint-space estimate it is built
+        # from, the robot mode, the command success rate and the arm's own clock. None until read.
+        self._cached_state_diagnostics: dict[str, Any] | None = None
         # The controller's own clock, and when it was last seen to move. libfranka ends the
         # control loop on a reflex without anything reaching this process but a log line, and
         # from then on `get_state()` hands back the last state it had: joints, pose and wrench all
@@ -349,11 +353,13 @@ class PandaPyArmDriver:
         self._note_controller_time(sampled_at_s)
         raw_wrench = getattr(state, "O_F_ext_hat_K", None)
         wrench = None if raw_wrench is None else np.asarray(raw_wrench, dtype=np.float64).reshape(-1)
+        diagnostics = _state_diagnostics(state)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
             if wrench is not None and wrench.size == 6:
                 self._cached_external_wrench = wrench
+            self._cached_state_diagnostics = diagnostics
         return joint_positions
 
     def _note_controller_time(self, now_s: float) -> None:
@@ -413,6 +419,11 @@ class PandaPyArmDriver:
         """
         with self._state_lock:
             return None if self._cached_external_wrench is None else self._cached_external_wrench.copy()
+
+    def get_state_diagnostics(self) -> dict[str, Any] | None:
+        """The fields read beside the wrench (see `_cached_state_diagnostics`); read-only."""
+        with self._state_lock:
+            return None if self._cached_state_diagnostics is None else dict(self._cached_state_diagnostics)
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Cached joint positions together with when they were read from the arm.
@@ -507,6 +518,23 @@ class PandaPyArmDriver:
         finally:
             if controller_was_running:
                 self._start_controller()
+
+
+def _state_diagnostics(state: Any) -> dict[str, Any] | None:
+    """tau_ext_hat_filtered (Nm), robot_mode, control_command_success_rate, time (s); None if absent."""
+    try:
+        tau_ext = getattr(state, "tau_ext_hat_filtered", None)
+        mode = getattr(state, "robot_mode", None)
+        success_rate = getattr(state, "control_command_success_rate", None)
+        clock = getattr(state, "time", None)
+        return {
+            "tau_ext": None if tau_ext is None else [float(v) for v in tau_ext],
+            "mode": None if mode is None else int(mode),
+            "success_rate": None if success_rate is None else float(success_rate),
+            "time_s": None if clock is None else float(getattr(clock, "to_sec", lambda: clock)()),
+        }
+    except Exception:  # noqa: BLE001 - diagnostics must never break the state reader
+        return None
 
 
 @dataclass

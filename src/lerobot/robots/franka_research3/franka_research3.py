@@ -22,6 +22,7 @@ from functools import cached_property
 import logging
 import threading
 import time
+from typing import Any
 
 import numpy as np
 
@@ -636,6 +637,13 @@ class FrankaResearch3(Robot):
             return None
         wrench = get_wrench()
         return None if wrench is None else tuple(float(v) for v in wrench)
+
+    @property
+    def state_diagnostics(self) -> dict[str, Any] | None:
+        """Fields read beside the wrench to explain its all-zero stretches; None when unsupported."""
+
+        get_diagnostics = getattr(self._arm, "get_state_diagnostics", None)
+        return get_diagnostics() if callable(get_diagnostics) else None
 
     @check_if_not_connected
     def iter_reach_errors_m(

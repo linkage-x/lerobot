@@ -624,6 +624,30 @@ def read_fz(robot: Any) -> float | None:
     return wrench[2]
 
 
+# Beside each wrench sample, to explain its all-zero stretches: is the joint-space estimate
+# (tau_ext_hat_filtered, 7 joints) zero too, or only the Cartesian one? Did the robot mode or the
+# command success rate change, and is the arm's clock still moving? Null where not reported.
+_DIAGNOSTIC_COLUMNS = ("tau1", "tau2", "tau3", "tau4", "tau5", "tau6", "tau7", "mode", "success_rate", "state_t_s")
+
+
+def _diagnostic_columns(robot: Any) -> list[Any]:
+    try:
+        diagnostics = getattr(robot, "state_diagnostics", None)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail a step
+        diagnostics = None
+    if not isinstance(diagnostics, dict):
+        return [None] * len(_DIAGNOSTIC_COLUMNS)
+    tau = diagnostics.get("tau_ext")
+    tau = [round(float(v), 3) for v in tau] if tau is not None and len(tau) == 7 else [None] * 7
+    success_rate = diagnostics.get("success_rate")
+    state_t = diagnostics.get("time_s")
+    return tau + [
+        diagnostics.get("mode"),
+        None if success_rate is None else round(float(success_rate), 3),
+        None if state_t is None else round(float(state_t), 4),
+    ]
+
+
 class _ForceTrace:
     """Samples for one step: (t_s, commanded z, measured xyz, wrench) at the control rate."""
 
@@ -646,6 +670,7 @@ class _ForceTrace:
             [round(time.perf_counter() - self.started_s, 4), round(commanded_z, 5)]
             + [round(v, 5) for v in xyz]
             + [round(v, 3) for v in wrench]
+            + _diagnostic_columns(self.robot)
         )
 
     def summary(self) -> str:
@@ -665,7 +690,7 @@ class _ForceTrace:
             "requestId": self.request_id,
             "name": self.name,
             "outcome": outcome,
-            "columns": ["t_s", "cmd_z", "x", "y", "z", "fx", "fy", "fz", "tx", "ty", "tz"],
+            "columns": ["t_s", "cmd_z", "x", "y", "z", "fx", "fy", "fz", "tx", "ty", "tz", *_DIAGNOSTIC_COLUMNS],
             "samples": self.samples,
         }
         try:

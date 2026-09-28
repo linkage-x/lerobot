@@ -1,3 +1,4 @@
+import json
 import math
 import random
 import time
@@ -658,6 +659,31 @@ def test_a_dead_control_loop_stops_the_step_at_once_and_the_reset_does_not_try_t
     result = scene_reset.execute_scene_reset(Dead(), request)
     assert result["ok"] is False and result["controlLoopDied"] is True
     assert "returnedToStart" not in result
+
+
+def test_the_force_trace_carries_the_state_diagnostics_and_nulls_without_them(tmp_path):
+    class Diagnosed(FakeRobot):
+        external_wrench = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        state_diagnostics = {"tau_ext": [0.5] * 7, "mode": 2, "success_rate": 1.0, "time_s": 3.25}
+
+    class Plain(FakeRobot):
+        external_wrench = (0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
+
+    path = tmp_path / "force.jsonl"
+    scene_reset.set_force_trace_path(path)
+    try:
+        for robot in (Diagnosed(), Plain()):
+            trace = scene_reset._ForceTrace(robot, "r", "step")
+            trace.sample(0.1, (0.0, 0.0, 0.1))
+            trace.flush("done")
+    finally:
+        scene_reset.set_force_trace_path(None)
+    diagnosed, plain = [json.loads(line) for line in path.read_text().splitlines()]
+    assert diagnosed["columns"][11:] == ["tau1", "tau2", "tau3", "tau4", "tau5", "tau6", "tau7",
+                                        "mode", "success_rate", "state_t_s"]
+    assert diagnosed["samples"][0][11:] == [0.5] * 7 + [2, 1.0, 3.25]
+    assert plain["samples"][0][7] == -1.0
+    assert plain["samples"][0][11:] == [None] * 10
 
 
 def test_a_force_capped_step_stops_pushing_where_something_holds_it_up():

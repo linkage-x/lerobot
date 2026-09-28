@@ -3472,6 +3472,42 @@ def test_the_external_wrench_rides_the_joint_state_read_and_is_none_when_not_rep
     assert robot.external_wrench is None
 
 
+def test_state_diagnostics_ride_the_same_read_as_the_wrench(monkeypatch, robot):
+    """09-28: to tell whether the all-zero wrench stretches are the whole estimate or only its
+    Cartesian form, the joint-space estimate, mode, success rate and clock come along."""
+
+    class Clock:
+        def to_sec(self):
+            return 12.5
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7), O_F_ext_hat_K=[0.0] * 6, tau_ext_hat_filtered=[0.1] * 7,
+                robot_mode=2, control_command_success_rate=0.98, time=Clock(),
+            )
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(Panda=DummyPanda, controllers=types.SimpleNamespace(JointPosition=object)),
+    )
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    assert driver.get_state_diagnostics() is None
+    driver._robot = DummyPanda("192.168.1.206")
+    driver._refresh_joint_positions_cache()
+    assert driver.get_state_diagnostics() == {
+        "tau_ext": [0.1] * 7, "mode": 2, "success_rate": 0.98, "time_s": 12.5,
+    }
+    robot._arm = driver
+    assert robot.state_diagnostics["mode"] == 2
+    robot._arm = DummyArmDriver()
+    assert robot.state_diagnostics is None
+
+
 def test_a_control_loop_whose_clock_stops_is_reported_dead_and_recovery_restarts_it(monkeypatch):
     """09-28: a cartesian reflex ended libfranka's loop and get_state() kept handing back the last
     state -- an arm that looked parked. The controller's clock is what stops."""
