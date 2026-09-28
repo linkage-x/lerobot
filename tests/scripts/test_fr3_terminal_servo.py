@@ -187,6 +187,27 @@ def test_dropping_the_peg_disarms_until_it_has_been_lifted_again():
     assert not fired
 
 
+def test_fingers_closed_on_air_do_not_hand_over():
+    """D3: the same carry with a closed command but nothing between the fingers."""
+
+    armed = False
+    fired = False
+    for gripper, z in ((1.0, 0.046), (0.0, 0.046), (0.0, 0.10), (0.0, 0.25), (0.0, 0.14), (0.0, 0.11)):
+        armed, fired = terminal_servo_arming(
+            armed, commanded_gripper=gripper, observed_z=z, handoff_z=0.12, held=False
+        )
+        assert (armed, fired) == (False, False)
+
+
+def test_losing_the_peg_on_the_carry_disarms():
+    armed, _ = terminal_servo_arming(False, commanded_gripper=0.0, observed_z=0.25, handoff_z=0.12)
+    assert armed
+    armed, fired = terminal_servo_arming(
+        armed, commanded_gripper=0.0, observed_z=0.11, handoff_z=0.12, held=False
+    )
+    assert (armed, fired) == (False, False)
+
+
 # --- what the descent reports ----------------------------------------------------------------
 
 

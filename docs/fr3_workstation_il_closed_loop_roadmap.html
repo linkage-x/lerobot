@@ -1362,7 +1362,7 @@ padding 占动作监督的比例
         <tr><th>编号</th><th>缺陷</th><th>状态</th></tr>
         <tr><td><b>D1</b></td><td>Replan queue 25 与 Horizon 16 不相等：每个 chunk 的第 17–25 步在没有 RTC 引导的情况下执行（第十二版 (7)(8)）。第十二版说「直接采纳 34」，但<b>默认值从来没改</b></td><td><span class="badge done">已改</span> 默认值改为 34：<code>fr3_act_infer_real_runtime.py</code> 的 <code>_DEFAULT_RTC_REPLAN_QUEUE_SIZE</code>、<code>run_pick_place_infer_workstation.sh</code>、Rollout 页。<b>注意</b>：Rollout 页会从 <code>last_params.json</code> 恢复上次用过的值（目前是 25），要在页面上手动改成 34 跑一次，之后才会保持 34。<b>同日补修第二处</b>：Rollout 页每次切换 checkpoint 都会把参数重置为 Horizon 10、Replan queue 30，也就是执行 20 步、Horizon 10。现在重置为 16 / 34，和页面初始值一致</td></tr>
         <tr><td>D2</td><td>多采样选择按 <code>chunk[0:16]</code> 打分，实际执行的却是 <code>chunk[d:d+25]</code></td><td><span class="badge done">已修</span>，见 <code>resolve_action_selection_horizon</code></td></tr>
-        <tr><td><b>D3</b></td><td>终段伺服的交接只看夹爪<b>指令</b>，不看实测宽度，所以会把一个空爪交给伺服（第十二版 (10) 顺序 3，idx 9）</td><td>未修。漏斗和第 3 步都依赖「手里确实有销」这个判断，所以<b>这一条要在第 3 步之前修</b>。实测宽度有丢帧，需要带窗口的判据</td></tr>
+        <tr><td><b>D3</b></td><td>终段伺服的交接只看夹爪<b>指令</b>，不看实测宽度，所以会把一个空爪交给伺服（第十二版 (10) 顺序 3，idx 9）</td><td><b>已修（2026-09-28）</b>：交接除了夹爪指令闭合，还要求最近 5 帧实测宽度的中位数像夹着销（≥ 0.025，且比指令宽 ≥ 0.05，与抓取循环的判据相同）；空爪会解除待命，并打印 <code>terminal_servo_disarmed_empty</code>。尚未在真机上验证</td></tr>
         <tr><td>D4</td><td>trace 的 <code>graspXyz</code> 取的是最长的一段闭合，不是第一次闭合。对取销来说，第一次闭合才是指尖第一次碰到销的时刻，例如 0712 批 idx 5 第一次合在 dz +29，最长那段却在 100 mm 以外</td><td>未修。只影响分析，成本很低：加一个 <code>firstGraspXyz</code> 字段</td></tr>
         <tr><td>D5</td><td>trace 不记末端姿态，无法把偏移投影到合爪方向上</td><td>未修。漏斗本身用不上它；只有第 2 步没过线、要查各向异性时才需要</td></tr>
       </table>

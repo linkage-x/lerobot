@@ -26,6 +26,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -116,6 +117,7 @@ from tools.fr3.scene_reset import (
 )
 from tools.fr3.grasp_loop import (
     GRASP_LOOP_ARMS,
+    GRASP_LOOP_BLOCKED_MARGIN,
     GRASP_LOOP_HELD_WIDTH,
     GRASP_LOOP_MAX_POLICY_STEPS,
     GRASP_LOOP_PICK_XYZ,
@@ -125,6 +127,7 @@ from tools.fr3.grasp_loop import (
     GraspLoopRequest,
     load_mask_strokes,
     run_grasp_loop,
+    grasp_is_held,
     validate_grasp_loop_request,
 )
 from tools.fr3.collection_recorder import StopFile
@@ -2520,6 +2523,9 @@ class PolicyCameraPreviewSink:
 # `observation.state.gripper.pos` reads 0 on 47% of frames while the command held a clean 1.0,
 # so any "did it close?" test keyed on the observation fires on dropouts instead of on grasps.
 _TRACE_GRIPPER_CLOSED_BELOW = 0.5
+# Frames of measured width behind the terminal-servo handoff's "is a peg held" test (D3): a sixth
+# of a second at 30 Hz, the same median-of-a-burst idea as the grasp loop's `read_width`.
+_TERMINAL_SERVO_WIDTH_WINDOW = 5
 # An open stretch shorter than this does not end a hold. Observed on rollout 9 of
 # L4_full48_holdout22_40/030000: the command touched 0.4997 for two steps, went back up, and
 # only shut for real 22 steps later, so "the first hold" was a two-sample blip and the rollout
@@ -5372,8 +5378,11 @@ def run_inference(args: argparse.Namespace) -> int:
         # arm has to have been above the handoff height while holding it, or the approach to
         # the pick, which descends through the same height on its way to z = 0.046, hands over
         # before the peg has even been grasped. Only then does crossing the height downward
-        # take the arm off the policy.
+        # take the arm off the policy. D3: the command alone also arms on fingers closed on air,
+        # so the measured width must read a peg too -- the median of the last few frames, so one
+        # bad frame neither arms nor disarms it, against the grasp loop's lifted-width test.
         terminal_servo_state: dict[str, bool] = {'armed': False, 'fired': False}
+        terminal_servo_widths: deque[float] = deque(maxlen=_TERMINAL_SERVO_WIDTH_WINDOW)
         rtc_planner = AsyncActionChunkPlanner() if rtc_enabled else None
 
         def finish_rollout(status: str) -> str:
@@ -5403,13 +5412,28 @@ def run_inference(args: argparse.Namespace) -> int:
                     if previous_sent_command is not None
                     else 1.0
                 )
+                terminal_servo_widths.append(float(robot_observation['gripper.pos']))
+                held = grasp_is_held(
+                    float(np.median(terminal_servo_widths)),
+                    commanded_gripper,
+                    held_width=GRASP_LOOP_HELD_WIDTH,
+                    blocked_margin=GRASP_LOOP_BLOCKED_MARGIN,
+                )
+                was_armed = terminal_servo_state['armed']
                 terminal_servo_state['armed'], hand_over_now = terminal_servo_arming(
-                    terminal_servo_state['armed'],
+                    was_armed,
                     commanded_gripper=commanded_gripper,
                     observed_z=observed_z,
                     handoff_z=terminal_servo_request.handoffZ,
                     closed_below=_TRACE_GRIPPER_CLOSED_BELOW,
+                    held=held,
                 )
+                if was_armed and not held and commanded_gripper < _TRACE_GRIPPER_CLOSED_BELOW:
+                    print(
+                        f'[WARN] terminal_servo_disarmed_empty step={step_idx} z={observed_z:.4f} '
+                        f'width_median={float(np.median(terminal_servo_widths)):.4f} '
+                        f'gripper_cmd={commanded_gripper:.3f}'
+                    )
                 if hand_over_now:
                     terminal_servo_state['fired'] = True
                     print(

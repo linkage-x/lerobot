@@ -296,6 +296,7 @@ def terminal_servo_arming(
     observed_z: float,
     handoff_z: float,
     closed_below: float = 0.5,
+    held: bool = True,
 ) -> tuple[bool, bool]:
     """Whether the handoff is armed after this observation, and whether it fires on it.
 
@@ -307,11 +308,15 @@ def terminal_servo_arming(
     re-grasps has to climb back over the height before it can hand over again.
 
     `commanded_gripper` is the command rather than the measured width, matching
-    `RolloutGeometryTrace`: the observed width reads 0 on 47% of frames in this dataset, so a
-    test keyed on it fires on signal dropouts instead of on grasps.
+    `RolloutGeometryTrace`: the observed width read 0 on 47% of frames in that dataset, so a
+    test keyed on it alone fires on signal dropouts instead of on grasps. But a closed command
+    is not a peg: fingers that closed on air hold the same command (D3), and the servo would
+    then carry an empty gripper into the fixture. So `held` -- the caller's reading of the
+    measured width over a short window, possible since the 09-07 dropout repair -- must agree,
+    and an empty gripper disarms like an open one.
     """
 
-    if commanded_gripper >= closed_below:
+    if commanded_gripper >= closed_below or not held:
         return False, False
     if observed_z > handoff_z:
         return True, False
