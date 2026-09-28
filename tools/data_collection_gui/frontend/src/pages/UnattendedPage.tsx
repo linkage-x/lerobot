@@ -112,9 +112,10 @@ const FIELD_HELP: Record<string, string> = {
   operatorGrade: "1: after every descent, with the peg still held, ask you whether it is in the hole; it lets go only on your \"in\". Calibrates the automatic verdict."
 };
 
-// The parameters of the last run started from this browser, one set per kind. Saved on a start
-// rather than on every keystroke, so what comes back is a set that was planned, fence-checked
-// and run -- not half an edit. Per browser only; the rig's own record of a run is its run.json.
+// The form as it was last left in this browser, one set per kind, saved on every edit so a
+// reload never loses what was typed. That can be a set nobody planned yet -- the plan and its
+// fence check still stand between it and the arm. Per browser only; the rig's own record of a
+// run is its run.json.
 const REMEMBERED_KEY = (kind: string) => `lerobot.unattended.lastRequest.v1.${kind}`;
 
 function rememberedRequest(kind: string): Record<string, string> {
@@ -196,7 +197,6 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
   const onStart = async () => {
     const result = await guard("start", () => api.startUnattendedRun(draft.kind, draft.request));
     if (result.ok && "run" in result) {
-      rememberRequest(draft.kind, draft.request);
       const started = (result as { run: UnattendedRun }).run;
       setSelectedId(started.id);
       setPlan(null);
@@ -251,10 +251,9 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
                 value={value}
                 disabled={busy || Boolean(active)}
                 onChange={(event) => {
-                  setDraft((current) => ({
-                    ...current,
-                    request: { ...current.request, [key]: event.target.value }
-                  }));
+                  const request = { ...draft.request, [key]: event.target.value };
+                  setDraft({ ...draft, request });
+                  rememberRequest(draft.kind, request);
                   setPlan(null);
                 }}
               />
@@ -276,16 +275,18 @@ export function UnattendedPage({ api }: { api: DataCollectionGuiApi }) {
           </button>
           <button
             onClick={() => {
-              setDraft((current) => ({ ...current, request: { ...(DEFAULT_REQUESTS[current.kind] ?? {}) } }));
+              const request = { ...(DEFAULT_REQUESTS[draft.kind] ?? {}) };
+              setDraft({ ...draft, request });
+              rememberRequest(draft.kind, request);
               setPlan(null);
             }}
             disabled={busy || Boolean(active)}
-            title="只改表单；记住的参数在下一次启动时才会被覆盖"
+            title="表单和记住的参数一起改回默认值"
           >
             恢复默认值
           </button>
           <span style={{ fontSize: 11, opacity: 0.6, alignSelf: "center" }}>
-            启动时记住本次参数（仅本浏览器），下次打开页面自动填入
+            修改即记住（仅本浏览器），下次打开页面自动填入
           </span>
         </div>
         {plan ? (
