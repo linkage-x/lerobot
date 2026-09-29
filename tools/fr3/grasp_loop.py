@@ -54,8 +54,9 @@ whose whole tool path stayed clear of the peg is (GraspHandover.peg_untouched): 
 misses mostly in mid-air, several cm off, and 8 of its 13 misses in the 09-23/09-24 runs were
 that kind.
 
-Where the peg stands is the tool position *measured* when the fingers opened, not the commanded
-target: a place step converges to within 6 mm, and the funnel aims at the peg.
+Where the peg stands is the tool position *measured* as the fingers open (read just before, since
+the tool can spring sideways once they have), not the commanded target: a place step converges to
+within 6 mm, and the funnel aims at the peg.
 
 Only the policy segment is the policy's. Everything else is the reset's own step loop, so the
 fence, the reach check and the stall detection are the ones every other motion on this rig has.
@@ -605,7 +606,7 @@ def place_held_peg(
 ) -> tuple[float, float, float]:
     """Carry the peg the fingers already hold to `target_xyz`, set it down, home.
 
-    Answers where the tool measured when the fingers opened, which is where the peg stands.
+    Answers where the tool measured just before the fingers opened, which is where the peg stands.
     """
 
     step_request = request.step_request(request_id)
@@ -644,8 +645,13 @@ def _open_and_settle(
     xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
     _run_step(robot, step_request, "open_gripper", xyz, rotvec, request.openGripper)
     traced_hold(robot, step_request.requestId, "settle_after_open", request.releaseSettleS, request.controlPeriodS)
-    released, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
-    return released
+    # Where the peg stands is where the tool was while it still held it, read before the fingers
+    # let go. After a set-down in the script's turned re-grip the tool springs 1.6-2.6 mm sideways
+    # as they open (09-29 run 152430; under 0.4 mm after the fixture's pick), and the peg does not
+    # go with it. Read after the settle, that spring was the peg's place: the policy's funnel
+    # closed on it exactly, so the peg sat ~2.4 mm off in every grasp that followed, every one
+    # missed the hole, and every miss was set down and re-gripped the same way again.
+    return xyz
 
 
 def set_down_and_regrip(
@@ -1274,7 +1280,7 @@ def run_grasp_loop(
                     halted = "scene_reset_failed"
                     break
                 released = tuple(reset.get("releasedXyz") or target)
-            # The peg stands where the fingers opened, at the table height the target names.
+            # The peg stands where the fingers let go of it, at the table height the target names.
             peg, peg_xyz = "at_target", (float(released[0]), float(released[1]), target[2])
             place_offset_mm = math.dist(peg_xyz[:2], target[:2]) * 1000.0
             log(f"[INFO] grasp_loop_staged trial={trial} staging={staging} place_offset_mm={place_offset_mm:.1f}")

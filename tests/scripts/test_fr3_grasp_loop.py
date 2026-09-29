@@ -832,6 +832,57 @@ def test_one_off_centre_close_is_squeezed_out_by_the_turned_regrip(tmp_path, mon
         assert all(v <= 1e-4 for v in later)
 
 
+class SpringRig(GraspRig):
+    """The tool springs sideways the moment the fingers let go of a peg, and stays sprung until it
+    next goes home -- 09-29 run 152430's re-grip set-downs, 1.6-2.6 mm each. The peg stays where
+    it stood."""
+
+    SPRING = (-0.0015, 0.0010, 0.0)
+
+    def __init__(self):
+        super().__init__()
+        self.sprung = (0.0, 0.0, 0.0)
+
+    def get_observation(self, *, include_cameras=False):
+        observation = super().get_observation(include_cameras=include_cameras)
+        for axis, bias in zip(("ee.x", "ee.y", "ee.z"), self.sprung):
+            observation[axis] += bias
+        return observation
+
+    def send_action(self, action):
+        letting_go = self.held and float(action["gripper.pos"]) >= 0.5
+        result = super().send_action(action)
+        if letting_go:
+            self.sprung = self.SPRING
+        return result
+
+    def move_to_start(self):
+        super().move_to_start()
+        self.sprung = (0.0, 0.0, 0.0)
+
+
+def test_the_peg_is_recorded_where_it_was_let_go_not_where_the_tool_sprang_to(tmp_path):
+    """09-29: a re-grip set-down's tool sprang ~2.4 mm as the fingers opened, the peg's place was
+    read after the spring, the funnel closed on that point exactly, and the peg sat that far off
+    in every grasp after it -- five misses of the hole in a row."""
+
+    robot = SpringRig()
+    out = tmp_path / "g.jsonl"
+    staged_at = []
+    policy = _aim_at_the_record(robot)
+
+    def run(trial, handover):
+        staged_at.append((tuple(robot.peg_xyz), tuple(handover.pegXyz)))
+        return policy(trial, handover)
+
+    run_grasp_loop(robot, _request(trials=3), run_policy_trial=run, out_path=out)
+    rows = _trials(out)
+    assert [r["staging"] for r in rows] == ["fixture", "regrip", "regrip"]
+    for (peg, recorded), row in zip(staged_at, rows):
+        if row["staging"] == "regrip":
+            assert math.dist(peg[:2], recorded[:2]) < 1e-6
+
+
 class HighTableRig(GraspRig):
     """The rig with a force estimate, and a table the carried peg meets 4 mm above the place
     height -- 09-28 trial 35. The arm goes where it is told; the estimate reads the overlap as a

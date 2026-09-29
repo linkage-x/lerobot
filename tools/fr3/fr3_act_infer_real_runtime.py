@@ -506,6 +506,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument('--grasp-loop-insert-ring', type=float, default=0.007)
+    parser.add_argument('--grasp-loop-insert-inner-ring', type=float, default=0.0035)
     parser.add_argument(
         '--terminal-servo-handoff-z',
         type=float,
@@ -4985,6 +4986,7 @@ def run_inference(args: argparse.Namespace) -> int:
                         xyz=parse_terminal_servo_pose(args.grasp_loop_insert_pose),
                         handoffZ=float(args.terminal_servo_handoff_z),
                         searchRingM=float(args.grasp_loop_insert_ring),
+                        searchInnerRingM=float(args.grasp_loop_insert_inner_ring),
                         stepToleranceM=GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
                         pressCapN=GRASP_LOOP_INSERT_PRESS_CAP_N,
                         controlPeriodS=1.0 / policy_fps,
@@ -5004,8 +5006,12 @@ def run_inference(args: argparse.Namespace) -> int:
             f'attended={grasp_loop_request.attended} '
             f'arms={grasp_loop_request.arms} '
             + (
-                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f '
-                % (*grasp_loop_request.insertServo.xyz, grasp_loop_request.insertServo.searchRingM)
+                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f '
+                % (
+                    *grasp_loop_request.insertServo.xyz,
+                    grasp_loop_request.insertServo.searchRingM,
+                    grasp_loop_request.insertServo.searchInnerRingM,
+                )
                 if grasp_loop_request.insertServo is not None
                 else 'insert=off '
             )

@@ -588,6 +588,42 @@ def test_a_ring_of_two_landings_is_refused():
         validate_terminal_servo_trajectory(_searching(searchPoints=2))
 
 
+def test_the_inner_ring_lands_between_the_centre_and_the_outer_ring_and_before_it():
+    offsets = terminal_servo_search_offsets(_searching(searchInnerRingM=0.0035))
+    assert len(offsets) == 17 and offsets[0] == (0.0, 0.0)
+    assert all(math.hypot(*o) == pytest.approx(0.0035) for o in offsets[1:9])
+    assert all(math.hypot(*o) == pytest.approx(0.007) for o in offsets[9:])
+    # Turned half a step, so each inner landing sits between two outer ones.
+    assert math.degrees(math.atan2(offsets[1][1], offsets[1][0])) == pytest.approx(22.5)
+    # And the single ring every earlier run used is untouched when it is off.
+    assert terminal_servo_search_offsets(_searching()) == terminal_servo_search_offsets(_searching(searchInnerRingM=0.0))
+
+
+def test_a_hole_in_the_band_the_outer_ring_misses_seats_on_the_inner_one():
+    """09-29 run 152430: pegs ~2.5 mm off, with a capture far under E7's 4.2 mm, stood on the face
+    at the centre and at all eight 7 mm landings. The inner ring is what reaches them."""
+
+    hole = (SEATED[0] + 0.0030, SEATED[1] + 0.0012)
+    for inner, seats in ((0.0, False), (0.0035, True)):
+        robot = FakeHoleRobot(hole_xy=hole, capture_m=0.0015)
+        robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+        robot.gripper = 0.25
+        result = execute_terminal_servo(robot, _searching(searchInnerRingM=inner))
+        assert (result["searchStoppedOn"] == "seated") is seats
+        if seats:
+            assert 1 <= result["searchIndex"] <= 8
+            assert result["searchOffsetMm"] == pytest.approx(3.5, abs=0.1)
+
+
+def test_an_inner_ring_not_inside_the_outer_one_is_refused():
+    with pytest.raises(TerminalServoError, match="must be inside searchRingM"):
+        validate_terminal_servo_trajectory(_searching(searchInnerRingM=0.007))
+    with pytest.raises(TerminalServoError, match="must be inside searchRingM"):
+        validate_terminal_servo_trajectory(_request(searchInnerRingM=0.0035))
+    with pytest.raises(TerminalServoError, match="non-negative"):
+        validate_terminal_servo_trajectory(_searching(searchInnerRingM=-0.001))
+
+
 def test_a_landing_outside_the_workspace_never_reaches_the_arm():
     request = _searching(searchRingM=0.007)
     with pytest.raises(SceneResetError, match="search_"):

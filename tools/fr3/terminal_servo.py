@@ -225,6 +225,11 @@ class TerminalServoRequest:
     # arrives switched on turns every later run into a different experiment than that one.
     searchRingM: float = 0.0
     searchPoints: int = TERMINAL_SERVO_SEARCH_POINTS
+    # A second ring inside the first, landed before it, turned half a step so its points fall
+    # between the outer ring's. Zero keeps the single ring every run before 09-29 used. It exists
+    # because the 7 mm ring left the 2-5 mm band unreached: grasp-loop run 152430 put five pegs in
+    # a row there, and every one of the nine landings stood on the face.
+    searchInnerRingM: float = 0.0
     searchLiftM: float = TERMINAL_SERVO_SEARCH_LIFT_M
     searchSeatedM: float = TERMINAL_SERVO_SEARCH_SEATED_M
     searchSlipM: float = TERMINAL_SERVO_SEARCH_SLIP_M
@@ -371,16 +376,24 @@ def terminal_servo_search_offsets(
     six plus the centre covers one to about 11 mm with no landing wasted on the middle of an
     already-covered patch. A spiral's extra landings buy resolution the capture radius does not
     need -- anything within 4.2 mm of a landing goes in on its own.
+
+    That capture radius did not hold for a peg in the policy's grasp: on 09-29 five pegs in a row
+    stood on the face at the centre and at all eight points of a 7 mm ring, so the optional inner
+    ring (`searchInnerRingM`) lands between the two, after the centre and before the outer ring.
     """
 
     if request.searchRingM <= 0.0 or request.searchPoints <= 0:
         return ((0.0, 0.0),)
     step = 2.0 * math.pi / float(request.searchPoints)
-    ring = tuple(
-        (request.searchRingM * math.cos(index * step), request.searchRingM * math.sin(index * step))
-        for index in range(int(request.searchPoints))
-    )
-    return ((0.0, 0.0),) + ring
+
+    def ring(radius: float, turn: float) -> tuple[tuple[float, float], ...]:
+        return tuple(
+            (radius * math.cos(index * step + turn), radius * math.sin(index * step + turn))
+            for index in range(int(request.searchPoints))
+        )
+
+    inner = ring(request.searchInnerRingM, 0.5 * step) if request.searchInnerRingM > 0.0 else ()
+    return ((0.0, 0.0),) + inner + ring(request.searchRingM, 0.0)
 
 
 def terminal_servo_search_path(
@@ -443,6 +456,13 @@ def validate_terminal_servo_trajectory(
         )
     if request.searchRingM < 0.0:
         raise TerminalServoError("searchRingM must be non-negative; zero disables the search.")
+    if request.searchInnerRingM < 0.0:
+        raise TerminalServoError("searchInnerRingM must be non-negative; zero disables the inner ring.")
+    if request.searchInnerRingM > 0.0 and request.searchInnerRingM >= request.searchRingM:
+        raise TerminalServoError(
+            f"searchInnerRingM {request.searchInnerRingM:.4f} must be inside searchRingM "
+            f"{request.searchRingM:.4f}: it is the ring landed first, nearer the nominal pose."
+        )
     if request.searchRingM > 0.0:
         if request.searchPoints < 3:
             raise TerminalServoError(
