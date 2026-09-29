@@ -6424,16 +6424,20 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
     so a word here is exactly a keypress there.
     """
-    allowed = {"start", "stop", "home", "quit", "takeover", "grasp_stop", "grasp_continue", "grasp_in", "grasp_out"}
+    allowed = {
+        "start", "stop", "home", "quit", "takeover",
+        "grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void",
+    }
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("No rollout is running.")
-    if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out"):
+    if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void"):
         # The grasp loop is not interactive -- it runs its own trials -- but it does read a few
-        # words on the same pipe: stop at the next trial boundary, "the peg is back", and, in an
-        # end-to-end run, whether the peg it is still holding at the hole went in.
+        # words on the same pipe: stop at the next trial boundary, "the peg is back", in an
+        # end-to-end run whether the peg it is still holding at the hole went in, and "the peg
+        # it staged fell over", which voids the trial in flight.
         if state.rollout.mode != "grasp_loop":
             raise ValueError("That control only applies to the grasp loop.")
         waiting_for = str(state.rollout.graspLoop.get("needsOperator") or "")
@@ -6441,11 +6445,14 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
             raise ValueError("The grasp loop is not waiting for anyone to continue it.")
         if command in ("grasp_in", "grasp_out") and not waiting_for.startswith("grade"):
             raise ValueError("The grasp loop is not asking for a grade.")
+        if command == "grasp_void" and (state.rollout.graspLoop.get("currentTrial") is None or waiting_for):
+            raise ValueError("No trial is being staged or grasped, so there is nothing to void.")
         word = {
             "grasp_stop": b"stop\n",
             "grasp_continue": b"continue\n",
             "grasp_in": b"in\n",
             "grasp_out": b"out\n",
+            "grasp_void": b"void\n",
         }[command]
         try:
             process.stdin.write(word)

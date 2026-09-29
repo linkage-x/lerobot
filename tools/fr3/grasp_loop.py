@@ -66,11 +66,17 @@ level, into the fixture's hole by step 3's servo, and graded in or out before th
 (`insert_held_peg`). In, it is let go of there -- the fixture, where the next staging fetches it
 from; out, it goes back to where it was picked and is re-gripped there as above. The rate that
 counts is then pegs in the hole over graded grasps, a miss of either layer being a miss.
+
+A staged peg that falls over is the staging's failure, not the policy's, and nothing on the rig
+sees it. The operator voids the trial (`void`): the policy's segment ends on its next step, or
+on its first if the void came during the staging, and the trial is recorded "voided" -- out of
+every rate, and not one of `request.trials` -- with the peg handed to the person to put back.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import itertools
 import json
 import math
 from pathlib import Path
@@ -279,6 +285,12 @@ class GraspLoopRequest:
     # descent and the ring search), instead of setting it down to be re-gripped. None ends each
     # trial at the grasp, which is what steps 1-2 measured. See `insert_held_peg`.
     insertServo: TerminalServoRequest | None = None
+    # Aim each insertion where the last peg went in (8cc0b2c0) instead of at `insertServo.xyz`.
+    # Off by default since 09-29 run 163333: the tool xy a peg needs scattered -3..+7 mm in x with
+    # no memory between trials (lag-1 r = 0.03), so the last seat is no better a guess than the
+    # hole, and an aim off the hole is off the fixture's pick too, which is what hands the next
+    # peg over in the pose the last one went in with.
+    insertFollowSeat: bool = False
 
     @property
     def regripZ(self) -> float:
@@ -451,6 +463,11 @@ class GraspHandover:
     # open fingers, is what says whether a miss can have disturbed it.
     pegXyz: tuple[float, float, float] | None = None
     lowestNearPegM: float | None = None
+    # The operator's void (the staged peg fell over), polled by the rollout loop every step.
+    voidRequested: Callable[[], bool] | None = None
+
+    def void_due(self) -> bool:
+        return self.voidRequested is not None and bool(self.voidRequested())
 
     def peg_untouched(self) -> bool:
         """True when no step brought the tool below the peg top within reach of the fingers."""
@@ -694,8 +711,13 @@ def insert_held_peg(
     request_id: str,
     ask_grade: OperatorGrade | None = None,
     aim_xy: tuple[float, float] | None = None,
+    snapshot_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
+
+    With `snapshot_dir`, every camera's frame is saved there with the peg hanging over the hole
+    before the descent, and again after it if the peg is still held: how the peg sits in the
+    fingers is what decides where the tool has to be, and nothing else on the rig sees it.
 
     `aim_xy` replaces the configured xy: where the last peg went in (see
     GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M). None aims at `insertServo.xyz`.
@@ -742,6 +764,7 @@ def insert_held_peg(
     # Across at the handoff height first, at the reset's speed: the servo's own lateral leg keeps
     # the height it starts from, and from home that would make its slow descent 20 cm long.
     _run_step(robot, step_request, "align_above_target", (x, y, servo.handoffZ), rotvec, held)
+    snapshots = [] if snapshot_dir is None else save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_before")
     grade: dict[str, Any] = {}
 
     def release_gate(descent: dict[str, Any]) -> bool | str:
@@ -769,6 +792,8 @@ def insert_held_peg(
     if not result.get("ok"):
         raise SceneResetError(f"insertion failed: {result.get('error')}")
     released = bool(result.get("released"))
+    if snapshot_dir is not None and not released:
+        snapshots += save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_after")
     inserted: bool | None
     if ask_grade is None:
         inserted = released
@@ -793,6 +818,7 @@ def insert_held_peg(
         "searchStoppedOn": result.get("searchStoppedOn"),
         "dfzPeakN": None if not peaks else round(min(peaks), 1),
         "pressCapped": bool(result.get("pressCapped", False)),
+        "snapshots": snapshots,
         "rotvec": rotvec,
     }
     print(
@@ -812,11 +838,13 @@ def next_insert_aim(
 ) -> tuple[float, float] | None:
     """Where the next insertion aims: the landing of the last peg in `rows` that went in.
 
+    Only with `request.insertFollowSeat`; otherwise None, the configured hole.
+
     Within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of the configured hole, or it is not adopted. Read
     from the row file too, so a resumed run aims where it left off.
     """
 
-    if request.insertServo is None:
+    if request.insertServo is None or not request.insertFollowSeat:
         return None
     hole = request.insertServo.xyz[:2]
     aim = current
@@ -829,6 +857,31 @@ def next_insert_aim(
         if math.dist(xy, hole) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M:
             aim = xy
     return aim
+
+
+def save_camera_frames(robot: Any, directory: Path, stem: str) -> list[str]:
+    """Every camera's latest frame as `<directory>/<stem>_<camera>.png`; the paths written.
+
+    Instrumentation only: a camera that has no frame, or a write that fails, costs the picture
+    and never the trial.
+    """
+
+    try:
+        from PIL import Image
+
+        observation = robot.get_observation()
+        directory.mkdir(parents=True, exist_ok=True)
+        written = []
+        for key, value in observation.items():
+            if not isinstance(value, np.ndarray) or value.ndim != 3:
+                continue
+            path = directory / f"{stem}_{str(key).replace('/', '_').replace('.', '_')}.png"
+            Image.fromarray(np.ascontiguousarray(value).astype(np.uint8)).save(path)
+            written.append(str(path))
+        return written
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(f"[WARN] grasp_loop_snapshot=failed stem={stem} details={type(exc).__name__}: {exc}", flush=True)
+        return []
 
 
 def _flag(value: bool | None) -> str:
@@ -1011,7 +1064,8 @@ def summarize_grasp_loop(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Held rate over graded trials, and the two covariates card 12 says to look at next.
 
     A trial the policy never closed on is a failure of the grasp and counts against it; a trial
-    stopped by the operator or aborted by a staging fault is not a policy outcome and does not.
+    stopped by the operator, voided (its staged peg fell over), or aborted by a staging fault is
+    not a policy outcome and does not.
     A run of more than one arm is also summarised per arm, which is the only reading of it that
     means anything: the pooled rate of an interleaved run is a rate of neither arm.
     """
@@ -1041,6 +1095,8 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "wilson95": [round(low, 3), round(high, 3)],
         "noClose": sum(1 for r in graded if r["verdict"] == "no_close"),
         "collision": sum(1 for r in graded if r["verdict"] == "collision"),
+        # Staged pegs that fell over: counted, so a staging that tips pegs shows, but never graded.
+        "voided": sum(1 for r in rows if r.get("verdict") == "voided"),
         "closeAboveTargetMm": {"held": by(("held",), "closeAboveTargetMm"), "empty": by(("empty",), "closeAboveTargetMm")},
         "lateralMm": {"held": by(("held",), "lateralMm"), "empty": by(("empty",), "lateralMm")},
     }
@@ -1097,6 +1153,9 @@ class GraspLoopControl:
                       escalates to a signal after its grace, which is the immediate brake)
         continue / "" the peg is back in the fixture; the loop may go on
         in / out      the answer to an insertion grade (`ask_grade`); nothing else answers one
+        void          the staged peg fell over: end this trial's policy segment and record it
+                      "voided". Cleared at each trial's start, so it applies to the trial in
+                      flight only, and ignored once the segment is over.
 
     A stream that closes (stdin from /dev/null under setsid) answers any wait with "nobody is
     there", which is what an unattended run needs.
@@ -1106,6 +1165,7 @@ class GraspLoopControl:
         self._stream = stream
         self._log = log
         self._stop = threading.Event()
+        self._void = threading.Event()
         self._continue = threading.Event()
         self._closed = threading.Event()
         self._answer: str | None = None
@@ -1127,6 +1187,10 @@ class GraspLoopControl:
                 elif word in ("in", "out"):
                     self._answer = word
                     self._continue.set()
+                elif word == "void":
+                    if not self._void.is_set():
+                        self._log("[INFO] grasp_loop_void=requested")
+                    self._void.set()
         except (OSError, ValueError):
             pass
         self._closed.set()
@@ -1134,6 +1198,12 @@ class GraspLoopControl:
 
     def stop_requested(self) -> bool:
         return self._stop.is_set()
+
+    def void_requested(self) -> bool:
+        return self._void.is_set()
+
+    def clear_void(self) -> None:
+        self._void.clear()
 
     def wait_for_operator(self, message: str) -> bool:
         self._continue.clear()
@@ -1187,6 +1257,8 @@ def run_grasp_loop(
     stop_requested: Callable[[], bool] = lambda: False,
     wait_for_operator: OperatorWait | None = None,
     ask_grade: OperatorGrade | None = None,
+    void_requested: Callable[[], bool] | None = None,
+    clear_void: Callable[[], None] = lambda: None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
@@ -1197,6 +1269,9 @@ def run_grasp_loop(
     With `request.insertServo`, a held grasp is carried on into the hole (`insert_held_peg`), and
     `ask_grade`, when given, is asked "in" or "out" before the fingers open; without it the
     servo's own seated verdict decides. A peg that went in is where the next staging fetches from.
+
+    `void_requested` is the operator's void (see the module docstring); `clear_void` resets it at
+    each trial's start. A voided trial does not use up one of `request.trials`.
     """
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1221,10 +1296,14 @@ def run_grasp_loop(
         f"[INFO] grasp_loop=start trials={request.trials} resumed_after={len(done)} out={out_path} "
         f"force_trace={force_trace}"
     )
-    for trial in range(len(done), request.trials):
+    voided = sum(1 for r in done if r.get("verdict") == "voided")
+    for trial in itertools.count(len(done)):
+        if trial - voided >= request.trials:
+            break
         if stop_requested():
             halted = "stop_requested"
             break
+        clear_void()
         request_id = f"grasp_loop_{trial:03d}_{time.time_ns()}"
         try:
             target = sample_target_xyz(request, rng, workspace_min=workspace_min, workspace_max=workspace_max)
@@ -1294,6 +1373,7 @@ def run_grasp_loop(
                 maxPolicySteps=request.maxPolicySteps,
                 funnelMaxSteps=request.funnelMaxSteps,
                 pegXyz=peg_xyz,
+                voidRequested=void_requested,
             )
             if arm == "B":
                 handover.funnel = GraspFunnel(
@@ -1359,6 +1439,7 @@ def run_grasp_loop(
                     insert = insert_held_peg(
                         robot, request, trial=trial, close_z=handover.closeXyz[2],
                         request_id=request_id, ask_grade=ask_grade, aim_xy=insert_aim,
+                        snapshot_dir=out_path.with_name(f"{out_path.stem}_peg"),
                     )
                     insert_rotvec = insert.pop("rotvec")
                     row["insert"] = insert
@@ -1396,6 +1477,13 @@ def run_grasp_loop(
                         peg = "lost"
                 elif not check["held"]:
                     release_and_clear(robot, request, request_id=request_id)
+            elif status == "voided":
+                # The staged peg fell over. Not the policy's trial: off every rate, and the peg,
+                # lying wherever it fell, is the person's to put back in the fixture.
+                row["verdict"] = "voided"
+                release_and_clear(robot, request, request_id=request_id)
+                voided += 1
+                peg = "lost"
             else:
                 # Ran out of steps without a settled close, or was stopped. Either way nothing is
                 # graded as held.

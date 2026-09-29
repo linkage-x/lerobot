@@ -1251,7 +1251,7 @@ def test_the_next_insertion_aims_where_the_last_peg_went_in(tmp_path, _fast_serv
     out = tmp_path / "e2e.jsonl"
     run_grasp_loop(
         robot,
-        _request(trials=3, insertServo=_insert_servo()),
+        _request(trials=3, insertServo=_insert_servo(), insertFollowSeat=True),
         run_policy_trial=_policy(robot, [("grasp", 0.0)] * 3),
         out_path=out,
         ask_grade=_grades(robot, ["in", "in", "in"], []),
@@ -1265,7 +1265,7 @@ def test_the_next_insertion_aims_where_the_last_peg_went_in(tmp_path, _fast_serv
 
 
 def test_the_aim_follows_only_pegs_that_went_in_and_only_so_far_from_the_hole():
-    request = _request(insertServo=_insert_servo())
+    request = _request(insertServo=_insert_servo(), insertFollowSeat=True)
     hole = request.insertServo.xyz
     near = {"inserted": True, "insert": {"landingXyz": [hole[0] - 0.007, hole[1], hole[2]]}}
     out = {"inserted": False, "insert": {"landingXyz": [hole[0] + 0.007, hole[1], hole[2]]}}
@@ -1273,14 +1273,176 @@ def test_the_aim_follows_only_pegs_that_went_in_and_only_so_far_from_the_hole():
     assert grasp_loop.next_insert_aim(request, []) is None
     assert grasp_loop.next_insert_aim(request, [near, out, far]) == pytest.approx((hole[0] - 0.007, hole[1]))
     assert grasp_loop.next_insert_aim(_request(), [near]) is None
+    # Off unless asked for (09-29 run 163333): the configured hole every time.
+    assert grasp_loop.next_insert_aim(_request(insertServo=_insert_servo()), [near]) is None
 
 
 def test_a_resumed_run_aims_where_it_left_off(tmp_path, _fast_servo):
     robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
     out = tmp_path / "e2e.jsonl"
     common = dict(ask_grade=_grades(robot, ["in", "in"], []), out_path=out)
-    run_grasp_loop(robot, _request(trials=1, insertServo=_insert_servo()),
+    run_grasp_loop(robot, _request(trials=1, insertServo=_insert_servo(), insertFollowSeat=True),
                    run_policy_trial=_policy(robot, [("grasp", 0.0)]), **common)
-    run_grasp_loop(robot, _request(trials=2, insertServo=_insert_servo()),
+    run_grasp_loop(robot, _request(trials=2, insertServo=_insert_servo(), insertFollowSeat=True),
                    run_policy_trial=_policy(robot, [None, ("grasp", 0.0)]), **common)
     assert [r["insert"]["searchIndex"] for r in _trials(out)][1] == 0
+
+
+def test_by_default_every_insertion_aims_at_the_configured_hole(tmp_path, _fast_servo):
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    request = _request(trials=2, insertServo=_insert_servo())
+    run_grasp_loop(
+        robot, request, run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+        ask_grade=_grades(robot, ["in", "in"], []),
+    )
+    aims = [r["insert"]["aimXyz"][:2] for r in _trials(out)]
+    assert aims == [pytest.approx(request.insertServo.xyz[:2])] * 2
+
+
+class CameraRig(InsertRig):
+    def get_observation(self, *, include_cameras=True):
+        observation = super().get_observation()
+        if include_cameras:
+            observation["wrist"] = np.full((4, 6, 3), 200, dtype=np.uint8)
+        return observation
+
+
+def test_the_peg_is_photographed_over_the_hole_and_again_if_it_is_still_held(tmp_path, _fast_servo):
+    robot = CameraRig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot, _request(trials=2, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+        ask_grade=_grades(robot, ["in", "out"], []),
+    )
+    first, second = (r["insert"]["snapshots"] for r in _trials(out))
+    assert [p.split("/")[-1] for p in first] == ["trial_000_before_wrist.png"]
+    assert [p.split("/")[-1] for p in second] == ["trial_001_before_wrist.png", "trial_001_after_wrist.png"]
+    assert all((tmp_path / "e2e_peg" / p.split("/")[-1]).is_file() for p in first + second)
+
+
+def test_a_camera_that_fails_costs_the_picture_not_the_trial(tmp_path):
+    class Broken:
+        def get_observation(self):
+            raise RuntimeError("no frame")
+
+    assert grasp_loop.save_camera_frames(Broken(), tmp_path, "x") == []
+
+
+# ---------------------------------------------------------------------------- void ---
+
+
+def _voidable(robot, plan, void_on):
+    """The runtime's side of a void: a pending one ends the policy's segment on its first step.
+
+    `void_on` holds the trials whose staged peg the operator sees fall over, during the staging.
+    """
+
+    policy = _policy(robot, plan)
+    switch = {"on": False, "cleared": 0}
+
+    def run(trial, handover: GraspHandover) -> str:
+        if trial in void_on:
+            robot.peg_xyz = (robot.peg_xyz[0] + 0.03, robot.peg_xyz[1], TARGET_Z - 0.02)  # lying down
+            switch["on"] = True
+        if handover.void_due():
+            return "voided"
+        return policy(trial, handover)
+
+    def clear():
+        switch["on"] = False
+        switch["cleared"] += 1
+
+    return run, (lambda: switch["on"]), clear, switch
+
+
+def test_a_voided_trial_is_off_every_rate_is_replaced_and_hands_the_peg_back(tmp_path):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+    asked = []
+    run, void_requested, clear_void, switch = _voidable(robot, [("grasp", 0.0)] * 4, void_on={1})
+    result = run_grasp_loop(
+        robot,
+        _request(trials=3),
+        run_policy_trial=run,
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+        void_requested=void_requested,
+        clear_void=clear_void,
+    )
+    rows = _trials(out)
+    # Three graded trials were asked for, so the voided one is replaced by a fourth.
+    assert [r["verdict"] for r in rows] == ["held", "voided", "held", "held"]
+    # Its peg is lying wherever it fell: the next staging hands it to the person.
+    assert rows[2]["staging"] == "fixture" and len(asked) == 1 and "fixture" in asked[0]
+    assert result["summary"]["graded"] == 3 and result["summary"]["held"] == 3
+    assert result["summary"]["voided"] == 1
+    # Cleared at every trial's start, so a void never outlives the trial it was pressed in.
+    assert switch["cleared"] == 4
+    assert not robot.held and robot.gripper >= 0.5
+
+
+def test_a_void_pressed_after_the_grasp_changes_nothing(tmp_path):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+    switch = {"on": False}
+    policy = _policy(robot, [("grasp", 0.0)] * 2)
+
+    def run(trial, handover):
+        status = policy(trial, handover)
+        switch["on"] = True  # too late: the segment is over
+        return status
+
+    run_grasp_loop(
+        robot, _request(trials=2), run_policy_trial=run, out_path=out,
+        void_requested=lambda: switch["on"], clear_void=lambda: switch.update(on=False),
+    )
+    assert [r["verdict"] for r in _trials(out)] == ["held", "held"]
+
+
+def test_a_resumed_run_does_not_count_a_voided_trial_towards_the_plan(tmp_path):
+    out = tmp_path / "g.jsonl"
+    robot = GraspRig()
+    run, void_requested, clear_void, _switch = _voidable(robot, [("grasp", 0.0)] * 2, void_on={0})
+    run_grasp_loop(
+        robot, _request(trials=1), run_policy_trial=run, out_path=out,
+        wait_for_operator=_put_back(robot, []), void_requested=void_requested, clear_void=clear_void,
+    )
+    assert [r["verdict"] for r in _trials(out)] == ["voided", "held"]
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=2), run_policy_trial=_policy(robot, [None, None, ("grasp", 0.0)]), out_path=out)
+    assert [r["trial"] for r in _trials(out)] == [0, 1, 2]
+
+
+def test_the_control_channel_voids_the_trial_in_flight_until_cleared():
+    import queue
+
+    from tools.fr3.grasp_loop import GraspLoopControl
+
+    lines: list[str] = []
+    words: "queue.Queue[str | None]" = queue.Queue()
+
+    def stream():
+        while (word := words.get()) is not None:
+            yield word
+
+    control = GraspLoopControl(stream(), log=lines.append)
+    control.start()
+    assert not control.void_requested()
+    words.put("void\n")
+    words.put(None)
+    for _ in range(200):
+        if control.void_requested():
+            break
+        threading_wait(0.01)
+    assert control.void_requested() and not control.stop_requested()
+    assert "[INFO] grasp_loop_void=requested" in lines
+    control.clear_void()
+    assert not control.void_requested()
+
+
+def threading_wait(seconds):
+    import threading
+
+    threading.Event().wait(seconds)

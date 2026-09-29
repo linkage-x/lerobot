@@ -4150,3 +4150,53 @@ def test_the_page_answers_an_insertion_grade_and_only_with_in_or_out(tmp_path: P
     assert state.rollout.graspLoop["inserted"] == 1 and state.rollout.graspLoop["e2eGraded"] == 1
     with pytest.raises(ValueError):
         gateway._send_rollout_control(state, "grasp_out")
+
+
+def test_a_void_folds_into_progress_and_lasts_only_until_the_next_trial():
+    progress: dict = {}
+    for line in (
+        "[INFO] grasp_loop=configured trials=2 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=off out=g.jsonl",
+        "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500",
+        "[INFO] grasp_loop_void=requested",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["voidRequested"] is True and progress["stopRequested"] is False
+    for line in (
+        "[INFO] grasp_loop_trial trial=0 arm=B verdict=voided width_lifted=None close_above_target_mm=None lateral_mm=None trial_s=20.0",
+        "[INFO] grasp_loop_trial_start trial=1 target=0.4300,-0.1500",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["voidRequested"] is False
+    # Never graded: not a held grasp, not a miss.
+    assert progress["graded"] == 0 and progress["trials"][0]["verdict"] == "voided"
+
+
+VOID_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] grasp_loop=configured trials=1 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=off out=g.jsonl"
+echo "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500"
+read -r word
+[ "$word" = void ] && echo "[INFO] grasp_loop_void=requested"
+echo "[INFO] grasp_loop_trial trial=0 arm=B verdict=voided width_lifted=None close_above_target_mm=None lateral_mm=None trial_s=20.0"
+echo '[INFO] grasp_loop=done halted=no summary={"graded": 0, "held": 0, "voided": 1}'
+"""
+
+
+def test_the_page_voids_only_a_trial_in_flight(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, VOID_LAUNCHER)
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 1, "graspLoopAttended": True},
+        },
+    )
+    assert _wait_for(lambda: state.rollout.graspLoop.get("currentTrial") == 0), state.rollout.lastLines
+    with state.lock:
+        gateway._send_rollout_control(state, "grasp_void")
+    assert _wait_for(lambda: state.rollout.graspLoop.get("done") is True), state.rollout.lastLines
+    assert state.rollout.graspLoop["trials"][0]["verdict"] == "voided"
+    with pytest.raises(ValueError):
+        gateway._send_rollout_control(state, "grasp_void")

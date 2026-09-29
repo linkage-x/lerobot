@@ -532,7 +532,7 @@ export function RolloutPage() {
   };
 
   const onControl = async (
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out"
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void"
   ) => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);

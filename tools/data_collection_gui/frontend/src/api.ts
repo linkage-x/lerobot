@@ -1056,7 +1056,7 @@ export class DataCollectionGuiApi {
    *  pipe, which no keyboard backend can read: the `t` key a terminal operator would press does
    *  not exist here, and without this the browser session has no way to hold the arm still. */
   async controlRollout(
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out"
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void"
   ) {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
   }

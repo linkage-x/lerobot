@@ -1269,7 +1269,8 @@ export type GraspLoopTrial = {
   /** A pure policy, B policy + GT grasp funnel. */
   arm?: string;
   /** held / empty come from the width after a 3 cm lift; no_close means the policy never shut. */
-  verdict: "held" | "empty" | "no_close" | "collision" | "not_graded" | string;
+  /** voided: the operator voided it because the staged peg fell over; never graded. */
+  verdict: "held" | "empty" | "no_close" | "collision" | "not_graded" | "voided" | string;
   widthLifted: number | null;
   closeAboveTargetMm: number | null;
   lateralMm: number | null;
@@ -1297,6 +1298,8 @@ export type GraspLoopProgress = {
    *  "reflex..." a collision recovery, anything else the peg to be put back in the fixture. */
   needsOperator: string;
   stopRequested: boolean;
+  /** The trial in flight has been voided; reset when the next one starts. */
+  voidRequested?: boolean;
   done: boolean;
   halted: string;
   haltDetails: string;

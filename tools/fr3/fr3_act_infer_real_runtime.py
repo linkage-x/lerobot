@@ -508,6 +508,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--grasp-loop-insert-ring', type=float, default=0.007)
     parser.add_argument('--grasp-loop-insert-inner-ring', type=float, default=0.0035)
     parser.add_argument(
+        '--grasp-loop-insert-follow-seat',
+        action='store_true',
+        help='Aim each insertion where the last peg went in, not at --grasp-loop-insert-pose.',
+    )
+    parser.add_argument(
         '--terminal-servo-handoff-z',
         type=float,
         default=0.12,
@@ -4995,6 +5000,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     if str(args.grasp_loop_insert_pose).strip()
                     else None
                 ),
+                insertFollowSeat=bool(args.grasp_loop_insert_follow_seat),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -5006,11 +5012,12 @@ def run_inference(args: argparse.Namespace) -> int:
             f'attended={grasp_loop_request.attended} '
             f'arms={grasp_loop_request.arms} '
             + (
-                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f '
+                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_follow_seat=%d '
                 % (
                     *grasp_loop_request.insertServo.xyz,
                     grasp_loop_request.insertServo.searchRingM,
                     grasp_loop_request.insertServo.searchInnerRingM,
+                    int(grasp_loop_request.insertFollowSeat),
                 )
                 if grasp_loop_request.insertServo is not None
                 else 'insert=off '
@@ -5486,6 +5493,11 @@ def run_inference(args: argparse.Namespace) -> int:
                         'terminal_servo_ok' if servo_result.get('ok') else 'terminal_servo_failed'
                     )
             if grasp_handover is not None:
+                if grasp_handover.void_due():
+                    # The operator saw the staged peg fall over: nothing this segment does from
+                    # here is a trial of the policy, so it ends where it stands.
+                    print(f'[INFO] grasp_handover_voided step={step_idx}')
+                    return finish_rollout('voided')
                 # The grasp loop's segment ends at the grasp: the lift that grades it is scripted,
                 # so nothing the policy does after a settled close is part of the measurement.
                 if grasp_handover.observe(
@@ -6353,7 +6365,7 @@ def run_inference(args: argparse.Namespace) -> int:
             control.start()
             print(
                 f'[INFO] grasp_loop=brakes boundary_stop=`touch {stop_file.path}` or stdin `stop` '
-                'immediate_halt=SIGINT'
+                'void_trial=stdin `void` immediate_halt=SIGINT'
             )
 
             def run_grasp_trial(trial: int, handover: GraspHandover) -> str:
@@ -6371,6 +6383,8 @@ def run_inference(args: argparse.Namespace) -> int:
                 stop_requested=lambda: stop_file.requested() or control.stop_requested(),
                 wait_for_operator=control.wait_for_operator if args.grasp_loop_attended else None,
                 ask_grade=control.ask_grade if args.grasp_loop_attended else None,
+                void_requested=control.void_requested,
+                clear_void=control.clear_void,
             )
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)

@@ -1143,6 +1143,8 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
         return {"type": "halted", "reason": fields.get("reason", ""), "details": line.split("details=", 1)[-1][:400]}
     if "grasp_loop_stop=requested" in line:
         return {"type": "stop_requested"}
+    if "grasp_loop_void=requested" in line:
+        return {"type": "void_requested"}
     if "grasp_loop_operator=" in line:
         return {"type": "operator", "answer": fields.get("grasp_loop_operator", "")}
     if "grasp_loop_trial_start " in line:
@@ -1177,6 +1179,8 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         "trials": [],
         "needsOperator": "",
         "stopRequested": False,
+        # The trial in flight has been voided; cleared when the next one starts.
+        "voidRequested": False,
         "done": False,
         "halted": "",
         "haltDetails": "",
@@ -1190,7 +1194,7 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
             arms=event.get("arms", "A"), insert=bool(event.get("insert", False)),
         )
     elif kind == "trial_start":
-        state["currentTrial"] = event["trial"]
+        state.update(currentTrial=event["trial"], voidRequested=False)
     elif kind == "trial":
         row = {key: value for key, value in event.items() if key != "type"}
         state["trials"] = [t for t in state["trials"] if t.get("trial") != row["trial"]] + [row]
@@ -1201,6 +1205,8 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         state["needsOperator"] = ""
     elif kind == "stop_requested":
         state["stopRequested"] = True
+    elif kind == "void_requested":
+        state["voidRequested"] = True
     elif kind == "halted":
         state.update(halted=event["reason"], haltDetails=event["details"])
     elif kind == "done":

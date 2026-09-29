@@ -6,7 +6,8 @@ const VERDICT_COLORS: Record<string, string> = {
   empty: "#e53e3e",
   no_close: "#dd6b20",
   collision: "#9b2c2c",
-  not_graded: "#718096"
+  not_graded: "#718096",
+  voided: "#a0aec0"
 };
 
 const ARM_LABELS: Record<string, string> = {
@@ -19,7 +20,8 @@ const VERDICT_LABELS: Record<string, string> = {
   empty: "空抓",
   no_close: "没合手",
   collision: "碰撞保护",
-  not_graded: "未评"
+  not_graded: "未评",
+  voided: "作废（销倒了）"
 };
 
 function fmt(value: number | null | undefined, digits = 1): string {
@@ -30,7 +32,8 @@ function fmt(value: number | null | undefined, digits = 1): string {
  *
  *  The loop grades its grasps itself. What the operator does is start it, put the peg back when
  *  the loop asks, answer in / out for each insertion of an end-to-end run (the fingers open only
- *  on "in"), and stop it -- at a trial boundary, which leaves the peg on the table or in the hole
+ *  on "in"), void a trial whose staged peg fell over (never graded, and not one of the planned
+ *  trials), and stop it -- at a trial boundary, which leaves the peg on the table or in the hole
  *  and the arm homed, or with End session, which stops it where it stands. */
 export function GraspLoopPanel({
   run,
@@ -39,7 +42,7 @@ export function GraspLoopPanel({
 }: {
   run: RolloutRun;
   busy: boolean;
-  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out") => void;
+  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void") => void;
 }) {
   const progress: GraspLoopProgress | undefined = run.graspLoop;
   const live = run.state !== "complete" && run.state !== "error" && run.state !== "stopped";
@@ -55,7 +58,8 @@ export function GraspLoopPanel({
   const [e2eLow, e2eHigh] = wilsonInterval(progress.inserted ?? 0, progress.e2eGraded ?? 0);
   const closeHeight = medianByVerdict(progress.trials, "closeAboveTargetMm");
   const lateral = medianByVerdict(progress.trials, "lateralMm");
-  const done = progress.trials.length;
+  // Voided trials are replaced, so they are not progress towards the planned count.
+  const done = progress.trials.filter((trial) => trial.verdict !== "voided").length;
   const rates = armRates(progress.trials);
   const multiArm = rates.length > 1 || (progress.arms ?? "A") !== "A";
   const current = progress.currentTrial;
@@ -179,6 +183,22 @@ export function GraspLoopPanel({
           </strong>
         </div>
       </div>
+
+      {live && !progress.done && current !== null && !progress.needsOperator && (
+        <div className="row-actions" style={{ marginBottom: 8 }}>
+          <button
+            type="button"
+            disabled={busy || progress.voidRequested}
+            onClick={() => onControl("grasp_void")}
+            title="The staged peg fell over. The policy stops at once (or never starts), the fingers open and the arm lifts and homes; the trial is recorded as voided and not graded, and you are asked to put the peg back in the hole."
+          >
+            {progress.voidRequested ? "已请求作废本条" : "作废本条（销倒了）"}
+          </button>
+          <span className="hint">
+            摆好的销倒了就点：策略立刻停（还没开始就不开始），本条不计入成功率，也不占计划次数。已经抓起来之后点不起作用。
+          </span>
+        </div>
+      )}
 
       {live && !progress.done && (
         <div className="row-actions" style={{ marginBottom: 8 }}>
