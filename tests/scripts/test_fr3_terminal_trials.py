@@ -652,6 +652,26 @@ def test_every_nth_trial_takes_the_peg_anew_from_the_pick_point_instead_of_in_pl
     assert names.count("regrip_after_release") == 3
 
 
+def test_a_fixed_hole_reference_trial_is_counted_checked_and_refetched_like_any_other(capsys):
+    """09-29 10:03: with fixedHole a confirmed reference skipped everything after its row."""
+
+    at_hole = SEATED
+    robot = FakeTrialRig(hole_xy=SEATED[:2], capture_m=0.0042, peg_xyz=at_hole)
+    # A reference every 2 offsets and a refetch every 4 trials: the fourth trial is a reference.
+    request = _request(offsetsMm=(0.0,), repeats=4, controlEvery=2, regripInPlace=True,
+                       refetchEvery=4, pickXyz=at_hole, updateReference=False)
+    summary = run_terminal_trials(robot, request)
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert trials[3]["trialKind"] == "reference" and trials[3]["refetch"]
+    assert summary["seated"] == len(trials)
+    grasps = [row for row in summary["rows"] if row.get("kind") == "grasp" and row["stage"] != "start"]
+    # One grasp row per trial, references included, every one of them held.
+    assert [row["index"] for row in grasps] == [row["index"] for row in trials]
+    assert all(row["graspVerdict"] == "held" for row in grasps)
+    assert [row["refetch"] for row in trials] == [(i + 1) % 4 == 0 for i in range(len(trials))]
+
+
 def test_refetching_needs_somewhere_to_take_the_peg_from():
     request = _request(regripInPlace=True, refetchEvery=4, pickXyz=None)
     with pytest.raises(TerminalTrialError, match="pickXyz"):

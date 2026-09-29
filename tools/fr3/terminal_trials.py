@@ -993,21 +993,25 @@ def run_terminal_trials(
                         halted = "reference_step_too_large"
                         break
                     if not request.updateReference:
+                        # Recorded, not aimed at. Falls through to the checks and the re-grip
+                        # every trial gets: this used to `continue` past them, so with a fixed
+                        # hole a reference trial skipped the slip and press halts, the grasp
+                        # check, and the refetch count -- and a refetch landing on one would
+                        # have left the peg in the hole and sent the next trial down empty.
                         row["referenceAccepted"] = False
                         row["referenceReadXyz"] = list(proposed)
-                        emit(row)
-                        continue
-                    row["referenceAccepted"] = True
-                    state.referenceUpdates.append(
-                        {
-                            "index": spec.index,
-                            "fromXyz": list(state.referenceXyz),
-                            "toXyz": list(proposed),
-                            "stepMm": 1000.0 * step_m,
-                            "elapsedS": row["elapsedS"],
-                        }
-                    )
-                    state.referenceXyz = proposed
+                    else:
+                        row["referenceAccepted"] = True
+                        state.referenceUpdates.append(
+                            {
+                                "index": spec.index,
+                                "fromXyz": list(state.referenceXyz),
+                                "toXyz": list(proposed),
+                                "stepMm": 1000.0 * step_m,
+                                "elapsedS": row["elapsedS"],
+                            }
+                        )
+                        state.referenceXyz = proposed
                 else:
                     state.referenceFailures += 1
                     row["referenceAccepted"] = False
