@@ -127,6 +127,39 @@ def test_the_median_singles_out_the_camera_that_moved(tmp_path):
     assert rows["cam_d"]["maxBaselineShiftMm"] > 5.0
 
 
+def test_recabling_is_not_reported_as_cameras_moving(tmp_path):
+    """09-28: three modules rotated through cam_07/09/14. Keyed on the port, the
+    table showed three cameras moving 60-200 mm; keyed on the module, nothing."""
+    serial = {"cam_a": "S1", "cam_b": "S2", "cam_c": "S3", "cam_d": "S4"}
+    live = _write_run(tmp_path, "calib_live_extrinsics", _RING)
+    # Same modules, same places; S2 and S3 swapped cables.
+    recabled = {"cam_a": _RING["cam_a"], "cam_b": _RING["cam_c"], "cam_c": _RING["cam_b"], "cam_d": _RING["cam_d"]}
+    candidate = _write_run(tmp_path, "calib_new_extrinsics", recabled)
+    (candidate / "camera_identity.json").write_text(
+        json.dumps({"ports": {"cam_a": "S1", "cam_b": "S3", "cam_c": "S2", "cam_d": "S4"}}), encoding="utf-8"
+    )
+    # The live run predates identity files; it is tied to modules by the registry.
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps({"serials": {s: {"run": "calib_live_intrinsics", "camera": c} for c, s in serial.items()}}),
+        encoding="utf-8",
+    )
+
+    by_port = promotion.compare_runs(promotion.load_run(live), promotion.load_run(candidate))
+    assert by_port["pairedBy"] == "port"
+    assert by_port["medianBaselineShiftMm"] > 100.0
+
+    by_module = promotion.compare_runs(
+        promotion.load_run(live, registry=registry), promotion.load_run(candidate, registry=registry)
+    )
+    assert by_module["pairedBy"] == "serial"
+    assert by_module["medianBaselineShiftMm"] == pytest.approx(0.0, abs=1e-6)
+    rows = {row["camera"]: row for row in by_module["cameras"]}
+    assert rows["cam_b"]["serial"] == "S3"
+    assert rows["cam_b"]["livePort"] == "cam_c"
+    assert rows["cam_a"]["livePort"] == ""
+
+
 def test_a_translation_perpendicular_to_a_collinear_rig_is_under_reported(tmp_path):
     """A known blind spot of baseline lengths, recorded rather than hidden.
 

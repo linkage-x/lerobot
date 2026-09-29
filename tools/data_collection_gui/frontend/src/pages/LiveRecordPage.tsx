@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
@@ -186,7 +186,8 @@ export function RecordingPanel({
   onStop,
   logLines,
   backendPicker,
-  laserTrackerToggle
+  laserTrackerToggle,
+  mountSession
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -197,13 +198,32 @@ export function RecordingPanel({
   logLines?: string[];
   backendPicker?: React.ReactNode;
   laserTrackerToggle?: React.ReactNode;
+  /** A calibration capture holding the recorder; see TrackerMountSession. */
+  mountSession?: TrackerMountSession;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   // Only while the tracker is actually switched on for this session: an episode
   // recorded with a blind tracker looks complete and measures nothing, and the
   // tracker re-homes on a timer, so this clears itself once the SMR is in place.
+  // Ready also means homed: a locked beam without a Home measures every distance
+  // against a stale reference, so "not homed" is named on its own.
   const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
-  const trackerBlockReason = status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+  const trackerNotHomed = Boolean(status.laserTracker) && !status.laserTrackerHomed;
+  const trackerBeamBroken = Boolean(status.laserTracker) && Boolean(status.laserTrackerBeamBroken);
+  const trackerBlockReason = trackerNotHomed
+    ? `激光跟踪仪还没 Home 成功，不能开录：把 SMR 放进 home 窝等待自动 Home（${status.laserTrackerDetail || "等待中"}）`
+    : trackerBeamBroken
+      ? "激光跟踪仪断过光，当前距离不是绝对的，不能开录：请把 SMR 放回 home 窝，会自动重新 Home"
+      : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+  // The gateway refuses StartEpisode while a mount capture owns the recorder,
+  // because a task episode there does two invisible kinds of damage: it clears
+  // the calibration redirect and lands a stationary rig in the training set, and
+  // it puts motion into the middle of the tracker stream the mount fit will cut
+  // parked poses out of. Shown here so the refusal is not a surprise.
+  const mountHeld = Boolean(mountSession?.active) && mountSession?.stage === "capture";
+  const mountBlockReason = mountHeld
+    ? `跟踪仪站位采集 ${mountSession?.sessionName ?? ""} 正在占用录制器`
+    : "";
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
@@ -230,9 +250,28 @@ export function RecordingPanel({
       </div>
       {isGmsl && <CameraEncodingInfo config={config} />}
       {laserTrackerToggle}
+      {status.laserTracker && isConnected && (
+        <p
+          className="tracker-home-state"
+          data-homed={status.laserTrackerHomed && !status.laserTrackerBeamBroken ? "yes" : "no"}
+        >
+          跟踪仪 Home：
+          {!status.laserTrackerHomed
+            ? "❌ 未 Home"
+            : status.laserTrackerBeamBroken
+              ? "⚠️ 断过光，请把 SMR 放回窝里重新 Home（放回后自动 Home）"
+              : "✅ 已 Home（有绝对距离）"}
+        </p>
+      )}
       {trackerBlocking && (
         <p className="tracker-wait-banner">
           ⏳ {trackerBlockReason}
+        </p>
+      )}
+      {mountHeld && (
+        <p className="tracker-wait-banner">
+          🔒 {mountBlockReason}（已落盘 {mountSession?.dwellsOnDisk ?? 0} 段）。
+          要录任务数据，先到「标定」页结束这次站位采集——已经录下的停驻段不会被删。
         </p>
       )}
       <div className="progress">
@@ -241,9 +280,9 @@ export function RecordingPanel({
       <div className="control-row">
         <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
         <button
-          disabled={busy || !canStartEpisode || trackerBlocking}
+          disabled={busy || !canStartEpisode || trackerBlocking || mountHeld}
           onClick={onStart}
-          title={trackerBlocking ? trackerBlockReason : "Shortcut: E"}
+          title={mountHeld ? mountBlockReason : trackerBlocking ? trackerBlockReason : "Shortcut: E"}
         >
           StartEpisode <kbd>E</kbd>
         </button>
@@ -451,6 +490,7 @@ export function LiveRecordPage({
           onStop={onStop}
           logLines={logLines}
           backendPicker={backendPicker}
+          mountSession={snapshot.trackerMountSession}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>

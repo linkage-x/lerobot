@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -55,6 +56,22 @@ def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) 
             rows["observation.state"].append(pose)
             rows["action"].append(pose)
     pq.write_table(pa.table(rows), dataset_root / "data" / "chunk-000" / "file-000.parquet")
+
+
+def _real_sidecar_ensure(test):
+    test.real_sidecar_ensure = True
+    return test
+
+
+@pytest.fixture(autouse=True)
+def _tracker_sidecars_are_current(request, monkeypatch):
+    """Fits ensure production's sidecar first (a traj-gen job); unit tests of the
+    fit routes have none, so this stands in -- except where it is the subject."""
+    if getattr(request.function, "real_sidecar_ensure", False):
+        return
+    monkeypatch.setattr(
+        gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": target or "right"
+    )
 
 
 def test_dataset_scan_signature_tracks_v3_finalization_without_root_mtime_change(tmp_path):
@@ -223,6 +240,59 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     return written
 
 
+def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
+    """Homed, then the beam broke: the lock's range is not absolute any more."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM_BROKEN 1")
+    gateway._apply_recorder_output(state, "LT_BEAM waiting|the beam broke since Home")
+    assert state.recording.laserTrackerBeamBroken is True
+    with pytest.raises(RuntimeError, match="断过光"):
+        gateway._start_episode(state)
+    assert written == []
+
+    gateway._apply_recorder_output(state, "LT_BEAM_BROKEN 0")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+    gateway._start_episode(state)
+    assert written
+
+
+def test_start_episode_refuses_a_tracker_session_that_never_homed(tmp_path, monkeypatch):
+    """Locked-on and green is not enough: W2 (2026-09-21) never homed.
+
+    The recorder only sends LT_BEAM ready once the session has homed as well,
+    and LT_HOMED lets the refusal say which of the two is missing.
+    """
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+
+    gateway._apply_recorder_output(state, "LT_HOMED 0")
+    gateway._apply_recorder_output(
+        state, "LT_BEAM waiting|locked on the SMR but NOT homed yet — put the SMR in the home nest"
+    )
+    assert state.recording.laserTrackerHomed is False
+    with pytest.raises(RuntimeError, match="还没 Home 成功"):
+        gateway._start_episode(state)
+    assert written == []
+
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+    assert state.recording.laserTrackerHomed is True
+    assert state.recording.laserTrackerReady is True
+    gateway._start_episode(state)
+    assert written  # the start went through
+
+    # Homed but the beam wandered off: still refused, and it says the beam.
+    gateway._apply_recorder_output(state, "LT_BEAM waiting|beam lost — reacquiring")
+    state.recording.state = "armed"
+    with pytest.raises(RuntimeError, match="尚未锁定 SMR"):
+        gateway._start_episode(state)
+
+
 def test_start_episode_sends_a_calibration_sweep_somewhere_else(tmp_path, monkeypatch):
     state = _calibration_gateway_state(tmp_path)
     written = _capture_recorder_stdin(monkeypatch)
@@ -259,6 +329,78 @@ def test_start_episode_refuses_a_redirect_the_recorder_never_confirmed(tmp_path,
     # It asked, then stopped: no episode was started anywhere.
     assert written == [f"capture_root:{capture_root}\n"]
     assert state.recording.state == "armed"
+
+
+def test_a_recorder_that_is_merely_slow_is_not_told_to_redeploy(tmp_path, monkeypatch):
+    # The two silences have opposite fixes. On 2026-09-21 a tracker-mount dwell
+    # was refused because the echo landed 5.28 s after the recorder wrote it --
+    # the redirect had taken effect, the gateway had just stopped waiting -- and
+    # the operator was told to deploy and reconnect, which would have thrown away
+    # a live tracker session. A recorder still reporting the *previous* root is a
+    # real mismatch and gets the reset instruction instead.
+    state = _calibration_gateway_state(tmp_path)
+    _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_CAPTURE_ROOT_ACK_TIMEOUT_S", 0.05)
+    stale = tmp_path / "outputs" / "calibration_captures" / "calib_0" / "intrinsics"
+    state.recording.captureRoot = str(stale)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state, 30, capture_root=capture_root, require_capture_root_ack=True)
+
+    message = str(excinfo.value)
+    assert "deploy" not in message
+    assert str(stale) in message
+    # The take was never started, so retrying costs nothing -- say so, because
+    # the operator's alternative is to Disconnect, which seals an empty session.
+    assert "重试" in message
+    assert state.recording.state == "armed"
+
+
+def test_waiting_for_the_ack_does_not_deadlock_the_thread_that_delivers_it(
+    tmp_path, monkeypatch
+):
+    # The POST routes run inside one coarse `with state.lock`, and the recorder
+    # output consumer needs that same lock to apply the acknowledgement. Polling
+    # for it therefore could never succeed: on 2026-09-21 the ack was applied
+    # 5.28 s after the recorder wrote it against a 5 s budget, then 19.6 s
+    # against a 20 s budget -- the lag was the budget, because the consumer got
+    # in only once the wait gave up. Raising the number made it fail slower.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+
+    def _consumer():
+        # Exactly what _consume_recorder_output does: take the lock, apply the
+        # line, notify. It cannot run at all while the waiter holds the lock.
+        for _ in range(200):
+            with state.lock:
+                if written:
+                    state.recording.captureRoot = str(capture_root)
+                    state.recorder_output_applied.notify_all()
+                    return
+            time.sleep(0.005)
+
+    thread = threading.Thread(target=_consumer, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    with state.lock:  # the route handler's lock, held across the whole call
+        gateway._start_episode(
+            state, 30, capture_root=capture_root, require_capture_root_ack=True
+        )
+    thread.join(timeout=5)
+
+    assert state.recording.state == "recording"
+    # Delivered promptly, not at the timeout. The old code returned only when
+    # the budget ran out, so this is the assertion that separates them.
+    assert time.monotonic() - started < gateway._CAPTURE_ROOT_ACK_TIMEOUT_S / 2
+    assert written[-1] == "\n"
+
+
+def test_the_ack_budget_is_about_a_silent_recorder_not_about_latency():
+    # With the wait event-driven the round trip is sub-second, so a long budget
+    # buys nothing and costs a page frozen with every button greyed.
+    assert gateway._CAPTURE_ROOT_ACK_TIMEOUT_S <= 10.0
 
 
 def test_start_episode_puts_an_abandoned_calibration_redirect_back(tmp_path, monkeypatch):
@@ -2880,6 +3022,19 @@ class _FakeStdin:
         pass
 
 
+class _ExitedRecorderProcess:
+    """A recorder that has already exited, for the cleanup _snapshot does."""
+
+    pid = 4321
+    stdin = None
+
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
 class _FakeRecorderProcess:
     pid = 4321
 
@@ -3257,6 +3412,50 @@ def test_freezing_twice_is_refused_because_it_would_be_a_different_world(tmp_pat
 
     assert again["ok"] is False
     assert "already defines world" in again["error"]
+
+
+def test_committing_an_exported_island_keeps_the_id_the_export_stamped(tmp_path, monkeypatch):
+    """09-28: export, commit and re-freeze each minted an id for one solve, and
+    the episodes (stamped from the reference) would not have matched the
+    calibration they are tracked with."""
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    first = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(first.parent)
+    assert gateway._freeze_world_reference(state)["ok"] is True
+
+    # Every camera moved differently: no stable cluster, so a new island.
+    second = tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json"
+    payload = json.loads(first.read_text(encoding="utf-8"))
+    for index, matrix in enumerate(payload["T_ref_cam"].values()):
+        matrix[index % 3][3] += 0.1 * (index + 1)
+    second.parent.mkdir(parents=True)
+    second.write_text(json.dumps(payload), encoding="utf-8")
+    exported = tmp_path / "outputs" / "calibration" / "calib_b_extrinsics"
+    exported.mkdir(parents=True)
+    (exported / "summary.json").write_text(
+        json.dumps({
+            "source_report": str(second),
+            "world": {
+                "world_frame_id": "world_exported",
+                "parent_world_frame_id": "world_parent",
+                "world_continuity_state": "BROKEN",
+            },
+        }),
+        encoding="utf-8",
+    )
+    state.calibration.outputPath = str(second.parent)
+
+    committed = gateway._register_world(state, apply_result=True, use_rig_check=False)
+    assert committed["ok"] is True, committed.get("error")
+    assert committed["reference"]["world_frame_id"] == "world_exported"
+
+    # And re-freezing the same solve names it the same, parent kept.
+    refrozen = gateway._freeze_world_reference(state, replace=True)
+    assert refrozen["ok"] is True, refrozen.get("error")
+    reference = json.loads((gateway._world_root(state) / "world_reference.json").read_text(encoding="utf-8"))
+    assert reference["world_frame_id"] == "world_exported"
+    assert reference["parent_world_frame_id"] == "world_parent"
 
 
 def _write_rig_check_result(
@@ -4971,6 +5170,97 @@ def test_carrying_forward_cannot_rescue_a_camera_production_never_had(tmp_path):
     assert "cam_09" in gateway._preflight_message(preflight)
 
 
+def _fit_report(path: Path, lenses: dict[str, dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"cameras": {name: {"models": {"fisheye": block}} for name, block in lenses.items()}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+_GOOD_FISHEYE = {
+    "K": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    "D": [0.1, 0.0, 0.0, 0.0],
+    "monotonic_across_frame": True,
+    "corner_invertible": True,
+}
+
+
+def test_an_experiment_that_fitted_the_new_camera_unblocks_the_export(tmp_path):
+    """The refusal used to be permanent: a camera with no production lens could
+    never be exported, however well it fitted. An experiment solve on the same,
+    unchanged capture that produced an exportable lens for it rules out the
+    failure the refusal guards against."""
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_09": _GOOD_FISHEYE},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == ["cam_09"]
+    assert preflight["proven"] == ["cam_09"]
+    assert preflight["blocking"] is False
+
+    # Re-recording the sweep makes it a different capture: the record stops counting.
+    video = capture / "episodes" / "episode_000001" / "cam_09.mkv"
+    video.write_bytes(b"y" * 4096)
+    os.utime(video, ns=(1, 1))
+    assert gateway._intrinsics_preflight(state, capture)["blocking"] is True
+
+
+def test_a_folded_fit_does_not_count_as_proof(tmp_path):
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_09": {**_GOOD_FISHEYE, "monotonic_across_frame": False}},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["proven"] == []
+    assert preflight["blocking"] is True
+    assert "cam_09" in gateway._preflight_message(preflight)
+
+
+def test_a_production_camera_whose_refit_folds_blocks_the_export(tmp_path):
+    """cam_08, 2026-09-23: in production, re-swept without reaching the corners,
+    and fitted a model that folds at 78 deg. The exporter refuses the whole run
+    rather than falling back to the production lens, so this has to block too."""
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_08"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_08"])
+    detections = gateway._detections_dir(state, capture)
+    detections.mkdir(parents=True)
+    report = _fit_report(
+        tmp_path / "outputs" / "metrology" / "calib_x" / "intrinsics_report.json",
+        {"cam_05": _GOOD_FISHEYE, "cam_08": {**_GOOD_FISHEYE, "monotonic_across_frame": False}},
+    )
+
+    gateway._record_intrinsics_fit(capture / "episodes", detections, report)
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == []
+    assert preflight["refusedFit"] == ["cam_08"]
+    assert preflight["blocking"] is True
+    assert "cam_08" in gateway._preflight_message(preflight)
+
+
 def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):
     """Blocking is about extending a set that exists. With no production
     intrinsics there is nothing to lose and nothing to carry forward."""
@@ -5097,6 +5387,19 @@ def test_promotion_writes_the_pointer_and_keeps_the_comments(tmp_path):
     assert "intrinsics_run_name: live_intrinsics" in text
     # And the panel now agrees with the file, without waiting for a restart.
     assert state.calibration.extrinsicsRun == "calib_20260902_103833_extrinsics"
+
+
+def test_promotion_moves_the_carrier_tracker_with_the_april_one(tmp_path):
+    """09-28 left the carrier config on 09-23 while the april one moved on."""
+    state, _ = _promotion_state(tmp_path)
+    carrier = tmp_path / gateway.HYBRID_CARRIER_EE_TRAJECTORY_CONFIG
+    carrier.parent.mkdir(parents=True, exist_ok=True)
+    carrier.write_text(_TRACKING_CONFIG_TEXT, encoding="utf-8")
+
+    assert gateway._promote_calibration(state, ["extrinsics"])["ok"] is True
+    text = carrier.read_text(encoding="utf-8")
+    assert "fixed_camera_run_name: calib_20260902_103833_extrinsics" in text
+    assert "intrinsics_run_name: live_intrinsics" in text
 
 
 def test_promotion_leaves_an_audit_line_carrying_the_evidence(tmp_path):
@@ -5441,3 +5744,1692 @@ def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(
     assert anchor["points"] == observed[0]["points"]
     assert facet["color"] == "#ef4444"
     assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])
+
+
+# --------------------------------------------------------------------------- #
+# tracker mount: T_WG + the SMR lever arm c, surfaced in the calibration centre
+# --------------------------------------------------------------------------- #
+
+
+def _tracker_mount_state(tmp_path: Path) -> gateway.GatewayState:
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+
+
+def _tracker_mount_row(tmp_path: Path, *, mount_id: str = "plate_v1", episode: int = 3) -> dict:
+    session = tmp_path / "outputs" / "laser_tracker" / f"sess_{mount_id}"
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    session.mkdir(parents=True, exist_ok=True)
+    dataset.mkdir(parents=True, exist_ok=True)
+    return {
+        "session": str(session),
+        "dataset": str(dataset),
+        "episode": episode,
+        "mountId": mount_id,
+    }
+
+
+def test_tracker_mount_rows_refuse_a_row_that_cannot_name_its_mount(tmp_path):
+    """The mount id is load-bearing, not a label.
+
+    ``fit_station`` pairs poses within a mount because two poses taken across a
+    re-bolting have different lever arms, so differencing them constrains
+    nothing. A blank id does not fail loudly later -- it silently inflates the
+    apparent conditioning with pairs that carry no information.
+    """
+    row = _tracker_mount_row(tmp_path)
+    row["mountId"] = ""
+    with pytest.raises(ValueError, match="mountId"):
+        gateway._tracker_mount_rows({"rows": [row]})
+
+
+def test_tracker_mount_rows_refuse_an_empty_capture(tmp_path):
+    with pytest.raises(ValueError, match="至少一行"):
+        gateway._tracker_mount_rows({"rows": []})
+
+
+def test_tracker_mount_rows_refuse_a_non_integer_episode(tmp_path):
+    row = _tracker_mount_row(tmp_path)
+    row["episode"] = "latest"
+    with pytest.raises(ValueError, match="episode"):
+        gateway._tracker_mount_rows({"rows": [row]})
+
+
+def test_tracker_mount_args_repeat_every_flag_once_per_row(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    rows = gateway._tracker_mount_rows(
+        {"rows": [_tracker_mount_row(tmp_path, mount_id="a"), _tracker_mount_row(tmp_path, mount_id="b")]}
+    )
+    args = gateway._tracker_mount_capture_args(state, rows)
+    assert args.count("--session") == 2
+    assert args.count("--dataset") == 2
+    assert args.count("--episode") == 2
+    assert args.count("--mount-id") == 2
+    assert "a" in args and "b" in args
+
+
+def test_tracker_mount_session_ids_are_all_or_nothing(tmp_path):
+    """The CLI refuses a partial ``--session-id`` list, so a half-filled form
+    must not produce one. Filling the blank from the directory name keeps the
+    repeat count right without inventing an identity."""
+    state = _tracker_mount_state(tmp_path)
+    first = _tracker_mount_row(tmp_path, mount_id="a")
+    first["sessionId"] = "20260921_a"
+    second = _tracker_mount_row(tmp_path, mount_id="b")
+    rows = gateway._tracker_mount_rows({"rows": [first, second]})
+    args = gateway._tracker_mount_capture_args(state, rows)
+    assert args.count("--session-id") == 2
+    assert "20260921_a" in args
+    assert "sess_b" in args  # filled from the directory name, not left blank
+
+    plain = gateway._tracker_mount_rows({"rows": [_tracker_mount_row(tmp_path, mount_id="c")]})
+    assert "--session-id" not in gateway._tracker_mount_capture_args(state, plain)
+
+
+def test_tracker_mount_station_refuses_a_missing_session_without_running(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+    row["session"] = str(tmp_path / "outputs" / "laser_tracker" / "no_such_session")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the CLI must not be started for an input error")
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", _boom)
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert result["ok"] is False
+    # 2 is "a finding about the setup", which is what a missing directory is.
+    assert result["returncode"] == 2
+    assert "不存在" in result["error"]
+
+
+def test_tracker_mount_carries_the_refusal_code_instead_of_collapsing_it(tmp_path, monkeypatch):
+    """1 and 2 mean different things and the panel has to be able to say which.
+
+    2 is "this capture cannot determine c" -- go rotate about a second axis. 1 is
+    "it fitted and does not certify" -- the numbers are there to read. Collapsing
+    both into ok=false would send an operator to re-record data that is fine.
+    """
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_command",
+        lambda *a, **k: {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "station over 1 session(s), 18 poses; rms 0.412 mm\n",
+            "command": [],
+        },
+    )
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert result["ok"] is False
+    assert result["returncode"] == 1
+    assert "rms 0.412" in result["summary"]
+
+
+def test_a_station_skips_a_wobbling_segment_and_names_it_even_when_refused(tmp_path, monkeypatch):
+    """One segment past the dwell gate used to refuse all 20 (2026-09-24)."""
+    state = _tracker_mount_state(tmp_path)
+    row = _tracker_mount_row(tmp_path)
+    seen: dict[str, list[str]] = {}
+
+    def refused(_state, args, **_kw):
+        seen["args"] = args
+        return {
+            "returncode": 2,
+            "stdout": "",
+            "stderr": (
+                "skipped episode 11: only 0 dwell(s) passed in episode 11. Rejected: span 0.750 mm\n"
+                "cannot run: parked points are near-collinear or too small (extent 0.28 m)\n"
+            ),
+            "command": [],
+        }
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", refused)
+    result = gateway._run_tracker_mount_station(state, {"rows": [row]})
+    assert "--skip-episodes-without-dwells" in seen["args"]
+    assert result["skipped"] == [
+        {"episode": 11, "why": "only 0 dwell(s) passed in episode 11. Rejected: span 0.750 mm"}
+    ]
+    # The refusal is still the cause shown, not the skip line above it.
+    assert "near-collinear" in result["error"] and "near-collinear" in result["summary"]
+
+
+def test_a_solved_station_lists_its_skipped_segments_from_the_artifact(tmp_path):
+    out = tmp_path / "station.json"
+    out.write_text(json.dumps({"capture": [{"episodes_without_dwells": [{"episode": 3, "why": "drift"}]}]}))
+    result = gateway._tracker_mount_result(
+        _tracker_mount_state(tmp_path),
+        {"returncode": 0, "stdout": "", "stderr": "skipped episode 3: drift\nstation over 1 session(s)\n"},
+        out,
+        kind="station",
+    )
+    assert result["skipped"] == [{"episode": 3, "why": "drift"}]
+    assert result["summary"] == "station over 1 session(s)"
+
+
+def test_tracker_mount_payload_lists_artifacts_newest_first_without_the_dwell_dump(tmp_path):
+    """The per-dwell diagnostics stay on disk.
+
+    They are the biggest part of the artifact and none of it is what a panel
+    shows; shipping them would make every poll of the calibration page carry a
+    capture log.
+    """
+    state = _tracker_mount_state(tmp_path)
+    root = tmp_path / "outputs" / "laser_tracker"
+    root.mkdir(parents=True)
+    (root / "station_20260920_120000.json").write_text(
+        json.dumps({"rms_mm": 0.08, "capture": [{"windows_found": 40}]})
+    )
+    (root / "station_20260921_090000.json").write_text(json.dumps({"rms_mm": 0.05}))
+    (root / "mount_20260921_093000.json").write_text(json.dumps({"lever_arm_mm": 161.0}))
+    os.utime(root / "station_20260920_120000.json", (1_700_000_000, 1_700_000_000))
+    os.utime(root / "station_20260921_090000.json", (1_700_100_000, 1_700_100_000))
+
+    payload = gateway._tracker_mount_payload(state)
+    assert payload["ok"] is True
+    assert [item["name"] for item in payload["stations"]] == [
+        "station_20260921_090000.json",
+        "station_20260920_120000.json",
+    ]
+    assert "capture" not in payload["stations"][1]["report"]
+    assert payload["stations"][1]["report"]["rms_mm"] == 0.08
+    assert [item["name"] for item in payload["mounts"]] == ["mount_20260921_093000.json"]
+
+
+def test_tracker_mount_payload_is_empty_not_broken_before_any_fit(tmp_path):
+    payload = gateway._tracker_mount_payload(_tracker_mount_state(tmp_path))
+    assert payload == {
+        "ok": True,
+        "root": str(tmp_path / "outputs" / "laser_tracker"),
+        "stations": [],
+        "mounts": [],
+        "pivots": [],
+    }
+
+
+def _validate_payload(tmp_path: Path, **over) -> dict:
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    (dataset / "episodes" / "episode_000012").mkdir(parents=True, exist_ok=True)
+    session = tmp_path / "outputs" / "laser_tracker" / "20260921_a"
+    session.mkdir(parents=True, exist_ok=True)
+    return {"dataset": str(dataset), "session": str(session), "episode": 12, **over}
+
+
+def _capture_validate_command(monkeypatch) -> list[list[str]]:
+    seen: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "wrote x\n"
+        stderr = "paired 900/1000 (90.0% coverage)  residual p95 0.812 mm\n"
+
+    def _run(command, **kwargs):
+        seen.append(list(command))
+        return _Proc()
+
+    monkeypatch.setattr(gateway.subprocess, "run", _run)
+    monkeypatch.setattr(gateway, "_hand_eye_python", lambda state: Path(sys.executable))
+    return seen
+
+
+def test_gt_comparison_grades_the_exposure_fraction_production_actually_used(tmp_path, monkeypatch):
+    """Grading at a fraction the recorder did not apply scores a trajectory
+    that was never produced. The recorder's value is expected to change once the
+    BOX transport delay is subtracted alongside the measured -0.5, so
+    "production" means *this episode's* production: its meta.json names the
+    fraction, and that wins over the current constant."""
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path)
+    meta = Path(payload["dataset"]) / "episodes" / "episode_000012" / "meta.json"
+    meta.write_text(json.dumps({"box_camera_alignment": {"exposure_fraction": 0.0}}))
+
+    result = gateway._run_tracker_validate(state, payload)
+    assert result["ok"] is True
+    command = seen[0]
+    assert command[command.index("--exposure-fraction") + 1] == "0.0"
+    assert result["exposureFraction"] == 0.0
+
+
+def test_gt_comparison_fraction_for_older_and_unreadable_episodes(tmp_path):
+    """A pre-exposure-column recorder applied none; without meta, fall back to
+    the recorder's constant, read from its module rather than copied."""
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "meta.json").write_text(json.dumps({"box_camera_alignment": {"mode": "sensor_timestamp_sof"}}))
+    assert gateway._production_exposure_fraction(legacy) == 0.0
+
+    current = tmp_path / "current"
+    current.mkdir()
+    (current / "meta.json").write_text(json.dumps({"box_camera_alignment": {"exposure_fraction": -0.5}}))
+    assert gateway._production_exposure_fraction(current) == -0.5
+
+    assert gateway._production_exposure_fraction(tmp_path / "missing") == lr3.EXPOSURE_CENTER_FRACTION
+    assert gateway._production_exposure_fraction(None) == lr3.EXPOSURE_CENTER_FRACTION
+
+
+def test_gt_comparison_still_lets_the_operator_override_the_fraction(tmp_path, monkeypatch):
+    """Running the same episode at -0.5 / 0 / +0.5 is how the sign gets measured:
+    a wrong time base shows up as a speed-proportional residual, which the
+    artifact's speed strata already separate."""
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    gateway._run_tracker_validate(state, _validate_payload(tmp_path, exposureFraction=-0.5))
+    command = seen[0]
+    assert command[command.index("--exposure-fraction") + 1] == "-0.5"
+
+
+def test_gt_comparison_auto_fills_the_episode_dir_so_the_time_base_is_the_hardware_one(
+    tmp_path, monkeypatch
+):
+    """Without --episode-dir the camera times fall back to the nominal N/fps
+    grid, which is episode-local and up to 55 ms from the hardware SOF. That is a
+    different time base, not a slightly worse one, so a residual computed on it
+    is not comparable with one that used the sidecars."""
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    result = gateway._run_tracker_validate(state, _validate_payload(tmp_path))
+    command = seen[0]
+    assert "--episode-dir" in command
+    assert command[command.index("--episode-dir") + 1].endswith("episode_000012")
+    assert result["episodeDir"].endswith("episode_000012")
+
+
+def test_gt_comparison_says_so_when_there_is_no_episode_dir_to_use(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path, episode=77)  # no episodes/episode_000077
+    result = gateway._run_tracker_validate(state, payload)
+    assert "--episode-dir" not in seen[0]
+    assert result["episodeDir"] == ""
+
+
+def test_gt_comparison_writes_where_the_replay_page_already_looks(tmp_path, monkeypatch):
+    """Otherwise the comparison exists and cannot be found.
+
+    ``_tracker_alignment_payload`` globs ``<root>/*/alignment_ep<N>.json``, so
+    the artifact has to land inside the session directory under
+    ``outputs/laser_tracker`` -- that is the whole of "running this from the
+    calibration page makes it show up on the replay page".
+    """
+    state = _tracker_mount_state(tmp_path)
+    seen = _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path)
+    gateway._run_tracker_validate(state, payload)
+    out = Path(seen[0][seen[0].index("--out") + 1])
+    assert out.name == "alignment_ep12.json"
+    assert out.parent == Path(payload["session"])
+    root = Path(state.repo_root) / gateway.TRACKER_ALIGNMENT_ROOT
+    assert out.parent.parent == root
+
+
+def test_gt_comparison_drops_the_plot_series_from_the_response(tmp_path, monkeypatch):
+    """Up to 4000 points of two trajectories, none of which this panel draws --
+    and the replay page reads the file directly."""
+    state = _tracker_mount_state(tmp_path)
+    _capture_validate_command(monkeypatch)
+    payload = _validate_payload(tmp_path)
+    out = Path(payload["session"]) / "alignment_ep12.json"
+    out.write_text(
+        json.dumps(
+            {
+                "summary": {"coverage": 0.9, "certifies_space": True},
+                "series": {"residual_mm": list(range(4000))},
+            }
+        )
+    )
+    result = gateway._run_tracker_validate(state, payload)
+    assert "series" not in (result["report"] or {})
+    assert result["report"]["summary"]["coverage"] == 0.9
+
+
+def test_gt_comparison_refuses_a_missing_mount_fit_instead_of_silently_dropping_it(
+    tmp_path, monkeypatch
+):
+    """Without the mount fit the run is shape-only and certifies nothing. A typo
+    in the path must not quietly become that run."""
+    state = _tracker_mount_state(tmp_path)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not start the CLI on an input error")
+
+    monkeypatch.setattr(gateway.subprocess, "run", _boom)
+    result = gateway._run_tracker_validate(
+        state, _validate_payload(tmp_path, mountFit=str(tmp_path / "nope.json"))
+    )
+    assert result["ok"] is False
+    assert result["returncode"] == 2
+    assert "mount-fit" in result["error"]
+
+
+# --------------------------------------------------------------------------- #
+# tracker mount: record -> discover -> solve, without typing a path
+# --------------------------------------------------------------------------- #
+
+
+def _write_tracker_episode(
+    dataset: Path,
+    episode: int,
+    *,
+    session_id: str = "20260921_a",
+    enabled: bool = True,
+    land: bool = True,
+    pose_label: str = "p0",
+) -> Path:
+    ep_dir = dataset / "episodes" / f"episode_{episode:06d}"
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    tracker = (
+        {"enabled": True, "session_id": session_id, "beam_valid_fraction": 0.91, "stream_advanced": True}
+        if enabled
+        else {"enabled": False, "error": "tracker offline"}
+    )
+    (ep_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "episode_index": episode,
+                "laser_tracker": tracker,
+                "capture_intent": {"purpose": "calibration_tracker_mount", "pose_label": pose_label},
+            }
+        )
+    )
+    if land:
+        (dataset / "laser_tracker" / session_id).mkdir(parents=True, exist_ok=True)
+    return ep_dir
+
+
+def test_discovery_resolves_the_session_path_so_nobody_types_it(tmp_path):
+    """The recorder lands at <dataset>/laser_tracker/<session_id>; deriving that
+    is the whole reason the panel has no path box."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 3)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+    assert len(rows) == 1
+    assert rows[0]["episode"] == 3
+    assert rows[0]["sessionPath"] == str(dataset / "laser_tracker" / "20260921_a")
+    assert rows[0]["landed"] is True
+    assert rows[0]["poseLabel"] == "p0"
+
+
+def test_discovery_marks_a_session_that_has_not_landed_yet(tmp_path):
+    """The session seals and lands at Disconnect, not at the end of an episode.
+
+    Between the last dwell and Disconnect every row is correct and none is
+    usable -- which is exactly the state an operator needs told, rather than
+    discovering it as a solver failure two clicks later.
+    """
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0, land=False)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+    assert rows[0]["landed"] is False
+    assert rows[0]["sessionPath"].endswith("20260921_a")
+
+
+def test_discovery_skips_episodes_the_tracker_was_not_running_for(tmp_path):
+    """An episode that says the tracker was off is not a candidate, and is not
+    the same thing as one that is silent about it."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0, enabled=False)
+    (dataset / "episodes" / "episode_000001").mkdir(parents=True)
+    (dataset / "episodes" / "episode_000001" / "meta.json").write_text(json.dumps({"episode_index": 1}))
+
+    assert gateway._tracker_mount_discover(state)["episodes"] == []
+
+
+def _mount_capture(tmp_path: Path, name: str, episodes: list[int], session_id: str) -> Path:
+    """A mount capture as the recorder leaves it: episodes under the calibration
+    tree, the stream landed under the recorder's own dataset."""
+    dataset = tmp_path / "outputs" / "calibration_captures" / name / "tracker_mount"
+    for ep in episodes:
+        _write_tracker_episode(dataset, ep, session_id=session_id, land=False)
+    (tmp_path / "outputs" / "datasets" / f"rec_{name}" / "laser_tracker" / session_id).mkdir(parents=True)
+    return dataset
+
+
+def _ep(dataset: Path, ep: int) -> str:
+    return str(dataset / "episodes" / f"episode_{ep:06d}")
+
+
+def test_deleting_some_dwells_keeps_the_survivors_indices_and_the_shared_stream(tmp_path):
+    """Fits and pose sidecars name episodes by index; renumbering would repoint them."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1, 2], "lt_a")
+
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 1)]})
+
+    assert result["ok"] is True
+    assert sorted(p.name for p in (dataset / "episodes").iterdir()) == ["episode_000000", "episode_000002"]
+    assert result["removedStreams"] == []
+    assert (tmp_path / "outputs" / "datasets" / "rec_tm_a" / "laser_tracker" / "lt_a").is_dir()
+
+
+def test_deleting_every_dwell_removes_the_capture_and_its_orphaned_stream(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1], "lt_a")
+    other = _mount_capture(tmp_path, "tm_b", [0], "lt_b")
+
+    result = gateway._delete_tracker_mount_captures(
+        state, {"episodeDirs": [_ep(dataset, 0), _ep(dataset, 1)]}
+    )
+
+    assert result["ok"] is True
+    assert not dataset.parent.exists()
+    assert not (tmp_path / "outputs" / "datasets" / "rec_tm_a" / "laser_tracker" / "lt_a").exists()
+    assert other.is_dir()
+    assert (tmp_path / "outputs" / "datasets" / "rec_tm_b" / "laser_tracker" / "lt_b").is_dir()
+
+
+def test_the_delete_route_answers_instead_of_deadlocking_the_gateway(tmp_path):
+    """2026-09-24: routed inside do_POST's ``with state.lock`` block, the delete
+    took that non-reentrant lock a second time and wedged every POST and every
+    snapshot until the gateway was restarted. Only the HTTP path shows it -- the
+    tests above call the function directly, outside any lock."""
+    import threading
+    import urllib.request
+
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0, 1], "lt_a")
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/calibration/tracker-mount/captures/delete",
+            data=json.dumps({"episodeDirs": [_ep(dataset, 1)]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body["ok"] is True
+    assert not (dataset / "episodes" / "episode_000001").exists()
+    # And the lock is free afterwards, not merely released by a lucky timeout.
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
+def test_delete_refuses_paths_the_list_does_not_show(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    victim = tmp_path / "outputs" / "important"
+    victim.mkdir(parents=True)
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [str(victim)]})
+    assert result["ok"] is False
+    assert victim.is_dir()
+
+
+def test_delete_refuses_the_capture_in_progress_and_deletes_nothing_else(tmp_path):
+    """One refused row refuses the batch, so nothing is left half-deleted."""
+    state = _tracker_mount_state(tmp_path)
+    live = _mount_capture(tmp_path, "tm_live", [0], "lt_live")
+    old = _mount_capture(tmp_path, "tm_old", [0], "lt_old")
+    state.tracker_mount_session = gateway.TrackerMountSession(
+        active=True, sessionName="tm_live", captureRoot=str(live)
+    )
+
+    result = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(old, 0), _ep(live, 0)]})
+
+    assert result["ok"] is False
+    assert "结束采集" in result["error"]
+    assert (old / "episodes" / "episode_000000").is_dir()
+
+
+def test_delete_refuses_part_of_a_recorder_dataset_but_takes_all_of_it(tmp_path):
+    """A recorder dataset's parquet is indexed by episode; only whole is safe here."""
+    state = _tracker_mount_state(tmp_path)
+    dataset = tmp_path / "outputs" / "datasets" / "rig"
+    _write_tracker_episode(dataset, 0)
+    _write_tracker_episode(dataset, 1)
+
+    partial = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0)]})
+    assert partial["ok"] is False
+    assert (dataset / "episodes" / "episode_000000").is_dir()
+
+    whole = gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0), _ep(dataset, 1)]})
+    assert whole["ok"] is True
+    assert not dataset.exists()
+
+
+def test_delete_refuses_while_a_take_is_in_flight(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    dataset = _mount_capture(tmp_path, "tm_a", [0], "lt_a")
+    state.recording.state = "recording"
+    assert gateway._delete_tracker_mount_captures(state, {"episodeDirs": [_ep(dataset, 0)]})["ok"] is False
+    assert (dataset / "episodes" / "episode_000000").is_dir()
+
+
+def test_recording_a_dwell_refuses_before_connect_with_the_next_action(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "idle"
+    result = gateway._start_tracker_mount_episode(state, {"sessionName": "s", "seconds": 6})
+    assert result["ok"] is False
+    assert "Connect" in result["error"]
+
+
+def test_a_dwell_goes_to_its_own_capture_tree_not_the_session_dataset(tmp_path, monkeypatch):
+    """Parked poses are useless as training data: a minute of a stationary rig
+    landing in whatever is being collected that day is a silent contamination."""
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict[str, object] = {}
+
+    def _fake_start(_state, seconds, *, capture_root, capture_intent, require_capture_root_ack):
+        seen["root"] = capture_root
+        seen["intent"] = capture_intent
+        seen["ack"] = require_capture_root_ack
+
+    monkeypatch.setattr(gateway, "_start_episode", _fake_start)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_20260921"})
+    result = gateway._start_tracker_mount_episode(state, {"poseLabel": "p3", "seconds": 8})
+    assert result["ok"] is True
+    assert Path(str(seen["root"])).name == "tracker_mount"
+    assert seen["intent"]["purpose"] == "calibration_tracker_mount"
+    assert seen["intent"]["pose_label"] == "p3"
+    # The wizard's own rule: refuse rather than let a segment go somewhere the
+    # recorder did not confirm.
+    assert seen["ack"] is True
+
+
+def test_a_redirected_capture_finds_its_stream_in_the_recorder_dataset(tmp_path):
+    # The episodes go to calibration_captures/<session>/tracker_mount while the
+    # tracker stream lands under datasets/<recorder session>/laser_tracker. On
+    # 2026-09-21 a capture of 15 clean poses read "待 Disconnect" forever
+    # because discovery only looked beside the episodes -- the one field that
+    # decides whether the solve can run at all.
+    state = _tracker_mount_state(tmp_path)
+    capture = tmp_path / "outputs" / "calibration_captures" / "tm_1" / "tracker_mount"
+    ep = capture / "episodes" / "episode_000000"
+    ep.mkdir(parents=True)
+    (ep / "meta.json").write_text(
+        json.dumps({
+            "episode_index": 0,
+            "laser_tracker": {"enabled": True, "session_id": "lt_1", "beam_valid_fraction": 1.0},
+            "capture_intent": {"purpose": "calibration_tracker_mount"},
+        }),
+        encoding="utf-8",
+    )
+    landed = tmp_path / "outputs" / "datasets" / "rig_20260921" / "laser_tracker" / "lt_1"
+    landed.mkdir(parents=True)
+
+    rows = gateway._tracker_mount_discover(state)["episodes"]
+
+    assert len(rows) == 1
+    assert rows[0]["landed"] is True
+    assert rows[0]["sessionPath"] == str(landed)
+
+
+def test_the_session_name_is_minted_by_the_gateway_not_the_browser(tmp_path):
+    # It used to live in the calibration page's React state, so a reload renamed
+    # the session mid-capture and orphaned every dwell already on disk under the
+    # old name. Nothing that both pages have to agree on can live in one of them.
+    state = _tracker_mount_state(tmp_path)
+
+    result = gateway._start_tracker_mount_session(state, {})
+
+    assert result["ok"] is True
+    name = result["session"]["sessionName"]
+    assert name.startswith("tm_")
+    assert result["session"]["captureRoot"].endswith(f"{name}/tracker_mount")
+    assert result["session"]["stage"] == "capture"
+    # A second claim is refused rather than silently renaming the run in flight.
+    again = gateway._start_tracker_mount_session(state, {})
+    assert again["ok"] is False
+    assert name in again["error"]
+
+
+def test_live_record_cannot_queue_a_task_episode_into_a_mount_capture(tmp_path, monkeypatch):
+    # Two kinds of damage at once, neither of which announces itself: the task
+    # episode clears the calibration redirect and lands a stationary rig in the
+    # training dataset, and it puts a stretch of motion into the middle of the
+    # tracker stream the mount fit will cut parked poses out of.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state)
+
+    assert "tm_1" in str(excinfo.value)
+    # Nothing was said to the recorder, so the capture in progress is untouched.
+    assert written == []
+    assert state.recording.state == "armed"
+
+
+def test_a_mount_capture_does_not_block_its_own_dwells(tmp_path, monkeypatch):
+    # The guard keys on "no capture root given", which is what Live Record sends
+    # and what the dwell path never sends. Pinned because the obvious sloppier
+    # guard -- refuse whenever a session is active -- would block the session
+    # from recording anything at all.
+    state = _calibration_gateway_state(tmp_path)
+    _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_await_capture_root", lambda *a, **k: True)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 8})
+
+    assert result["ok"] is True
+    assert result["session"]["dwellsStarted"] == 1
+
+
+def test_a_dwell_needs_a_session_before_it_needs_a_name(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 6})
+
+    assert result["ok"] is False
+    assert "站位采集" in result["error"]
+
+
+def test_dwells_are_counted_off_disk_not_off_the_button(tmp_path):
+    # A dwell the operator discarded, and one the recorder auto-saved when its
+    # timer ran out while the page was closed, both have to end up on the same
+    # number the solve will read.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.dwellsStarted = 7
+    episodes = Path(session.captureRoot) / "episodes"
+    for index in range(3):
+        ep = episodes / f"episode_{index:06d}"
+        ep.mkdir(parents=True)
+        (ep / "meta.json").write_text("{}", encoding="utf-8")
+    (episodes / "episode_000009").mkdir()  # started, never written
+
+    payload = gateway._tracker_mount_session_payload(state)
+
+    assert payload["dwellsStarted"] == 7
+    assert payload["dwellsOnDisk"] == 3
+
+
+def test_the_session_is_solvable_only_once_the_tracker_stream_lands(tmp_path):
+    # Between the last dwell and Disconnect every dwell on disk is correct and
+    # none of them can be read, because the stream they index into is still open.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    assert state.tracker_mount_session.stage == "capture"
+
+    gateway._apply_recorder_output(
+        state,
+        "Laser tracker session landed: /data/rig/laser_tracker/lt_20260921_053335",
+    )
+
+    session = state.tracker_mount_session
+    assert session.stage == "landed"
+    assert session.trackerSessionId == "lt_20260921_053335"
+    assert session.landedPath.endswith("lt_20260921_053335")
+
+
+def test_a_recorder_that_exits_without_landing_fails_the_session(tmp_path):
+    # The failure this must not render as "capture in progress": on 2026-09-21 a
+    # Disconnect sealed a session with zero episode boundaries, and the dwells --
+    # had there been any -- would have had no stream to be cut out of.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    state.process = _ExitedRecorderProcess(0)
+    state.recording.state = "armed"
+
+    gateway._snapshot(state)
+
+    assert state.tracker_mount_session.stage == "failed"
+    assert "没有落地" in state.tracker_mount_session.message
+
+
+def test_cancelling_a_session_keeps_what_was_recorded(tmp_path):
+    # The session object is a claim on the recorder, not the data.
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    episodes = Path(state.tracker_mount_session.captureRoot) / "episodes" / "episode_000000"
+    episodes.mkdir(parents=True)
+    (episodes / "meta.json").write_text("{}", encoding="utf-8")
+
+    result = gateway._cancel_tracker_mount_session(state)
+
+    assert result["ok"] is True
+    assert state.tracker_mount_session.active is False
+    assert (episodes / "meta.json").is_file()
+
+
+def test_the_chain_does_not_grade_a_trajectory_against_a_refused_fit(tmp_path, monkeypatch):
+    """A refusal that gets followed by a comparison turns back into a number."""
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_lever_arm",
+        lambda *a, **k: {"ok": False, "returncode": 2, "error": "no dwell survived", "reportPath": ""},
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not grade against a fit that was declined")
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _boom)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "lever-arm", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is False
+    assert result["validate"] is None
+    assert "no dwell survived" in result["error"]
+
+
+def test_the_chain_hands_the_lever_arm_artifact_to_the_comparison(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_lever_arm",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/mount_x.json"},
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_validate(_state, payload):
+        seen.update(payload)
+        return {"ok": True, "returncode": 0}
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _fake_validate)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "lever-arm", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is True
+    assert seen["mountFit"] == "/out/mount_x.json"
+
+
+def test_a_station_fit_is_not_passed_off_as_a_lever_arm(tmp_path, monkeypatch):
+    """A station artifact is a transform, not a lever arm. Handing it to
+    --mount-fit would be a different file than the flag means."""
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_station",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/station_x.json"},
+    )
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        gateway, "_run_tracker_validate", lambda _s, payload: (seen.update(payload), {"ok": True})[1]
+    )
+    gateway._run_tracker_mount_chain(
+        state,
+        {"mode": "station", "validate": {"dataset": "d", "session": "s", "episode": 1, "mountFit": ""}},
+    )
+    assert seen["mountFit"] == ""
+
+
+def test_the_chain_stops_at_the_fit_when_no_comparison_was_asked_for(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_run_tracker_mount_station",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "/out/station_x.json"},
+    )
+    monkeypatch.setattr(gateway, "_run_tracker_validate", lambda *a, **k: pytest.fail("not asked for"))
+    result = gateway._run_tracker_mount_chain(state, {"mode": "station"})
+    assert result["ok"] is True
+    assert result["validate"] is None
+
+
+# --- one pose per segment, pivot capture (2026-09-22) -------------------------
+
+
+def test_a_segment_too_short_to_hold_a_dwell_is_refused_before_recording(tmp_path, monkeypatch):
+    """2.0 s still plus 0.3 s trimmed at each end: under 2.6 s there is no dwell.
+
+    Refused at the button, where it costs nothing, instead of at solve time,
+    where the 2026-09-21 capture found 4 of its 15 poses too short.
+    """
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    monkeypatch.setattr(gateway, "_start_episode", lambda *a, **k: None)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {"seconds": 2.0})
+
+    assert result["ok"] is False
+    assert "2.6" in result["error"]
+    assert state.tracker_mount_session.dwellsStarted == 0
+
+
+def test_the_default_segment_is_one_pose_long_not_a_whole_session(tmp_path, monkeypatch):
+    # The panel used to default to ~100 s -- a long take holding every pose --
+    # which is what made operators save early at each pose once the protocol
+    # became one pose per segment.
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(
+        gateway, "_start_episode",
+        lambda _s, seconds, **k: seen.update(seconds=seconds, intent=k["capture_intent"]),
+    )
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+
+    result = gateway._start_tracker_mount_episode(state, {})
+
+    assert result["ok"] is True
+    assert seen["seconds"] == 4.0
+    assert seen["intent"]["segment_seconds"] == 4.0
+
+
+def test_a_segment_saved_before_it_can_hold_a_dwell_is_flagged_at_once(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.5
+
+    gateway._note_tracker_mount_segment_end(state, "save")
+
+    assert session.shortSegments == 1
+    assert "重录" in session.message
+    payload = gateway._tracker_mount_session_payload(state)
+    assert payload["shortSegments"] == 1
+    assert 1.4 <= payload["lastSegmentSeconds"] <= 2.0
+
+
+def test_a_pivot_sweep_stopped_early_is_not_a_short_segment(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(gateway, "_start_episode", lambda _s, seconds, **_k: seen.update(seconds=seconds))
+    gateway._start_tracker_mount_session(state, {"sessionName": "tp_1", "kind": "pivot"})
+    gateway._start_tracker_mount_episode(state, {})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.5
+
+    gateway._note_tracker_mount_segment_end(state, "save")
+
+    # A sweep is read frame by frame: cutting it short costs attitudes, not the take.
+    assert seen["seconds"] == 30.0
+    assert session.shortSegments == 0
+
+
+def test_a_full_length_or_discarded_segment_is_not_flagged(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    gateway._start_tracker_mount_session(state, {"sessionName": "tm_1"})
+    session = state.tracker_mount_session
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 5.0
+    gateway._note_tracker_mount_segment_end(state, "save")
+    session.lastSegmentStartedMono = gateway.time.monotonic() - 1.0
+    gateway._note_tracker_mount_segment_end(state, "discard")
+
+    assert session.shortSegments == 0
+    assert session.lastSegmentStartedMono == 0.0
+
+
+def test_a_pivot_session_says_what_it_is_in_every_episode(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    state.recording.state = "armed"
+    seen: dict = {}
+    monkeypatch.setattr(gateway, "_start_episode", lambda _s, _sec, **k: seen.update(k["capture_intent"]))
+
+    started = gateway._start_tracker_mount_session(state, {"sessionName": "tp_1", "kind": "pivot"})
+    gateway._start_tracker_mount_episode(state, {})
+
+    assert started["session"]["kind"] == "pivot"
+    assert "侧倾" in started["session"]["message"]
+    # Continuous, the same protocol the marker->TCP panel records.
+    assert seen["protocol"] == "tcp_pivot_sweep"
+
+
+def test_an_unknown_capture_kind_is_refused(tmp_path):
+    state = _tracker_mount_state(tmp_path)
+    result = gateway._start_tracker_mount_session(state, {"kind": "sweep"})
+    assert result["ok"] is False
+    assert state.tracker_mount_session.active is False
+
+
+def _captured_cli(monkeypatch) -> list:
+    calls: list = []
+
+    def _fake(_state, args, **_k):
+        calls.append(list(args))
+        return {"returncode": 0, "stdout": "", "stderr": "ok\n", "command": args}
+
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", _fake)
+    return calls
+
+
+def test_lever_arm_takes_every_segment_of_one_mount(tmp_path, monkeypatch):
+    """One segment is one pose now, so "one session" meant "one pose"."""
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    rows = [_tracker_mount_row(tmp_path, mount_id="plate_v1", episode=i) for i in range(3)]
+
+    result = gateway._run_tracker_mount_lever_arm(state, {"rows": rows, "station": str(station)})
+
+    assert result["ok"] is True
+    assert calls[0].count("--episode") == 3
+    assert "--skip-episodes-without-dwells" in calls[0]
+
+
+def test_lever_arm_refuses_segments_from_two_mounts(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    rows = [_tracker_mount_row(tmp_path, mount_id="a"), _tracker_mount_row(tmp_path, mount_id="b")]
+
+    result = gateway._run_tracker_mount_lever_arm(state, {"rows": rows, "station": str(station)})
+
+    assert result["ok"] is False
+    assert "一个 mount" in result["error"]
+
+
+def test_the_pivot_solve_calls_the_cli_with_the_production_bundle(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+    bundle = tmp_path / "marker_to_tcp.json"
+    bundle.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gateway, "_default_marker_tcp_bundle_path", lambda _s: bundle)
+    rows = [_tracker_mount_row(tmp_path, episode=i) for i in range(2)]
+
+    result = gateway._run_tracker_mount_pivot(
+        state, {"rows": rows, "station": str(station), "cube": "right"}
+    )
+
+    assert result["ok"] is True
+    assert result["kind"] == "pivot"
+    args = calls[0]
+    assert args[0] == "pivot"
+    assert args[args.index("--marker-tcp") + 1] == str(bundle)
+    assert args[args.index("--cube") + 1] == "right"
+    assert Path(args[args.index("--out") + 1]).name.startswith("pivot_right_")
+    # Continuous sweeps: one segment with the beam off is listed, not fatal.
+    assert "--skip-episodes-without-dwells" in args
+
+
+def test_the_pivot_solve_needs_to_be_told_which_cube(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    calls = _captured_cli(monkeypatch)
+    station = tmp_path / "station.json"
+    station.write_text("{}", encoding="utf-8")
+
+    result = gateway._run_tracker_mount_pivot(
+        state, {"rows": [_tracker_mount_row(tmp_path)], "station": str(station)}
+    )
+
+    assert result["ok"] is False
+    assert "cube" in result["error"]
+    assert calls == []
+
+
+def test_the_chain_never_grades_a_trajectory_against_a_pivot(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    monkeypatch.setattr(
+        gateway, "_run_tracker_mount_pivot",
+        lambda *a, **k: {"ok": True, "returncode": 0, "reportPath": "p.json", "kind": "pivot"},
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("a static pivot has no trajectory to grade")
+
+    monkeypatch.setattr(gateway, "_run_tracker_validate", _boom)
+    result = gateway._run_tracker_mount_chain(
+        state, {"mode": "pivot", "validate": {"dataset": "d", "session": "s", "episode": 1}}
+    )
+    assert result["ok"] is True
+    assert result["validate"] is None
+
+
+def test_episode_zero_is_a_segment_not_a_missing_field(tmp_path):
+    rows = gateway._tracker_mount_rows({"rows": [_tracker_mount_row(tmp_path, episode=0)]})
+    assert rows[0]["episode"] == "0"
+
+
+# --- E1p from the marker->TCP panel ------------------------------------------
+
+E1P_SID = "lt_20260923_101500"
+
+
+def test_a_pivot_sample_recorded_with_the_tracker_says_so(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.config["recorder"] = {"script": "tools/thor/gmsl2/thor_record.py"}
+    state.recording.laserTracker = True
+    state.recording.laserTrackerDetail = f"session {E1P_SID} · beam on SMR"
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+    seen: dict = {}
+
+    def fake_start_episode(fake_state, episode_time_s=None, **kwargs):
+        seen.update(kwargs)
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    result = gateway._marker_tcp_record_sample(state, "start", box_id="box1672693301", condition="e1p_01")
+
+    assert result["ok"] is True
+    assert seen["capture_intent"]["protocol"] == "tcp_pivot_sweep"
+    assert seen["capture_intent"]["condition"] == "e1p_01"
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.laserTracker is True
+    assert sample.trackerSessionId == E1P_SID
+    assert "连续扫动" in state.marker_tcp_session.message
+
+
+def _e1p_repo(tmp_path: Path, *, landed: bool = True, tracker: bool = True):
+    """The marker->TCP solve repo, with both samples as one clamping recorded with the tracker."""
+    state, dataset_root, bundle_path = _marker_tcp_solve_repo(tmp_path)
+    for sample in state.marker_tcp_session.samples:
+        sample.condition = "e1p_01"
+        sample.laserTracker = tracker
+        episode_dir = dataset_root / "episodes" / f"episode_{sample.episodeIndex:06d}"
+        (episode_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "episode_index": sample.episodeIndex,
+                    "laser_tracker": {"enabled": tracker, "session_id": E1P_SID if tracker else ""},
+                }
+            ),
+            encoding="utf-8",
+        )
+    if landed:
+        (dataset_root / "laser_tracker" / E1P_SID).mkdir(parents=True)
+    station = state.repo_root / "outputs" / "laser_tracker" / "station_1.json"
+    station.parent.mkdir(parents=True, exist_ok=True)
+    station.write_text("{}", encoding="utf-8")
+    return state, dataset_root, bundle_path, station
+
+
+def _stub_e1p(monkeypatch, dataset_root: Path, *, returncode: int = 0):
+    """Record traj-gen and fit calls; the fit writes an artifact like the CLI's."""
+    calls: dict = {"traj_gen": [], "fit": []}
+
+    def fake_queue(_state, dataset, **_k):
+        calls["traj_gen"].append(Path(dataset))
+        sidecar = gateway._marker_tcp_sidecar_path(Path(dataset), "left")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text("x", encoding="utf-8")
+
+    def fake_fit(_state, args, **_k):
+        calls["fit"].append(list(args))
+        out = Path(args[args.index("--out") + 1])
+        out.write_text(
+            json.dumps(
+                {
+                    "n_poses": 16,
+                    "cube": "left",
+                    "static_tcp_error_mm": {"p95": 1.4, "rms": 0.9, "max": 1.6, "per_pose": [0.9] * 16},
+                    "c_tcp_error_norm_mm": 1.1,
+                    "certifies": returncode == 0,
+                    "certify_reasons": [] if returncode == 0 else ["socket centre sigma 0.2 mm"],
+                    "sampling": {"mode": "continuous", "n_frames_seated": 900, "n_attitudes": 40},
+                    "capture": [{"dwells": ["a very long diagnostic"] * 50}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"returncode": returncode, "stdout": "", "stderr": "static TCP error p95 1.40 mm\n", "command": args}
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", fake_queue)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *_a, **_k: {"status": "complete"})
+    monkeypatch.setattr(gateway, "_run_tracker_mount_command", fake_fit)
+    return calls
+
+
+def test_e1p_grades_production_labels_on_the_pivot_samples(tmp_path, monkeypatch):
+    state, dataset_root, bundle_path, station = _e1p_repo(tmp_path)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True, result
+    # No sidecar yet: production's trajectory job runs first, on the samples' dataset.
+    assert calls["traj_gen"] == [dataset_root]
+    args = calls["fit"][0]
+    assert args[0] == "pivot"
+    assert args.count("--episode") == 2
+    assert {args[i + 1] for i, a in enumerate(args) if a == "--mount-id"} == {"box1672693301_e1p_01"}
+    assert args[args.index("--cube") + 1] == "left"
+    # Graded with the bundle the trajectory was composed with, not a new one.
+    assert args[args.index("--marker-tcp") + 1] == str(bundle_path)
+    assert "--skip-episodes-without-dwells" in args
+    assert args[args.index("--session") + 1] == str(dataset_root / "laser_tracker" / E1P_SID)
+    check = state.marker_tcp_session.trackerCheck
+    assert check["ok"] is True and check["returncode"] == 0
+    assert check["report"]["static_tcp_error_mm"]["p95"] == 1.4
+    # The snapshot carries the numbers, not the per-dwell diagnostics.
+    assert "capture" not in check["report"]
+    assert check["report"]["sampling"]["n_attitudes"] == 40
+    assert state.marker_tcp_session.stage == "capture"
+    assert state.marker_tcp_session.solvePath == ""
+
+
+def test_e1p_that_does_not_certify_is_a_finding_not_a_failure(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path)
+    _stub_e1p(monkeypatch, dataset_root, returncode=1)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True
+    check = state.marker_tcp_session.trackerCheck
+    assert check["returncode"] == 1
+    assert check["report"]["certify_reasons"] == ["socket centre sigma 0.2 mm"]
+
+
+def test_e1p_reuses_a_trajectory_newer_than_the_samples(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+    sidecar = gateway._marker_tcp_sidecar_path(dataset_root, "left")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text("x", encoding="utf-8")
+    later = max(p.stat().st_mtime for p in dataset_root.glob("episodes/*/meta.json")) + 10
+    os.utime(sidecar, (later, later))
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is True
+    assert calls["traj_gen"] == []
+
+
+def test_e1p_waits_for_disconnect_before_anything_runs(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path, landed=False)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+
+    result = gateway._run_marker_tcp_tracker_check(
+        state,
+        {"boxId": "box1672693301", "condition": "e1p_01", "station": str(station)},
+        background=False,
+    )
+
+    assert result["ok"] is False
+    assert "Disconnect" in result["error"]
+    assert calls == {"traj_gen": [], "fit": []}
+    assert state.marker_tcp_session.stage == "capture"
+
+
+def test_e1p_refuses_samples_recorded_without_the_tracker_or_a_station(tmp_path, monkeypatch):
+    state, dataset_root, _bundle, station = _e1p_repo(tmp_path, tracker=False)
+    calls = _stub_e1p(monkeypatch, dataset_root)
+    request = {"boxId": "box1672693301", "condition": "e1p_01"}
+
+    no_station = gateway._run_marker_tcp_tracker_check(state, request, background=False)
+    no_tracker = gateway._run_marker_tcp_tracker_check(
+        state, {**request, "station": str(station)}, background=False
+    )
+
+    assert no_station["ok"] is False and "station" in no_station["error"]
+    assert no_tracker["ok"] is False and "跟踪仪" in no_tracker["error"]
+    assert calls == {"traj_gen": [], "fit": []}
+
+
+def test_waiting_for_the_trajectory_reads_the_final_status_not_just_the_process(tmp_path):
+    # The output reader releases the process a moment before it writes
+    # "complete"; returning on the release alone would read "running".
+    state = _marker_tcp_gateway_state(tmp_path)
+    dataset = tmp_path / "ds"
+    dataset.mkdir()
+    gateway._update_traj_gen_meta(dataset, job_id="j", status="running", message="tracking ep 3/5")
+    seen: list[str] = []
+
+    def progress(text: str) -> None:
+        seen.append(text)
+        gateway._update_traj_gen_meta(dataset, job_id="j", status="complete", message="done")
+
+    job = gateway._await_traj_gen(state, dataset, on_progress=progress, poll_s=0.0)
+
+    assert job["status"] == "complete"
+    assert seen == ["tracking ep 3/5"]
+
+
+def _sidecar(dataset: Path, cube: str, rows: list[tuple[int, bool]]) -> Path:
+    path = gateway._marker_tcp_sidecar_path(dataset, cube)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["episode_index", "solve_ok"])
+        writer.writerows([(ep, "True" if ok else "False") for ep, ok in rows])
+    return path
+
+
+def _episode_meta(dataset: Path, episode: int, mtime: float) -> None:
+    meta = dataset / "episodes" / f"episode_{episode:06d}" / "meta.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text("{}")
+    os.utime(meta, (mtime, mtime))
+
+
+@_real_sidecar_ensure
+def test_the_fit_picks_the_cube_that_carries_the_smr(tmp_path, monkeypatch):
+    """The target used to default to april_cube; production writes left/right."""
+    dataset = tmp_path / "ds"
+    _episode_meta(dataset, 0, 1_700_000_000)
+    _sidecar(dataset, "left", [(0, False)] * 5)
+    _sidecar(dataset, "right", [(0, True)] * 5 + [(1, True)] * 50)
+    monkeypatch.setattr(gateway, "_queue_traj_gen", lambda *a, **k: pytest.fail("sidecar is current"))
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)], "left") == "left"
+
+
+@_real_sidecar_ensure
+def test_a_capture_nobody_tracked_is_tracked_before_the_fit(tmp_path, monkeypatch):
+    dataset = tmp_path / "ds"
+    _episode_meta(dataset, 0, time.time() + 60)  # newer than any sidecar
+    queued: list[Path] = []
+
+    def track(_state, root, **_kw):
+        queued.append(root)
+        _sidecar(root, "right", [(0, True)])
+        os.utime(gateway._marker_tcp_sidecar_path(root, "right"), (time.time() + 120,) * 2)
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", track)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *a, **k: {"status": "complete"})
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert queued == [dataset]
+
+
+def test_a_tracker_fit_route_does_not_hold_the_gateway(tmp_path, monkeypatch):
+    """A fit can wait minutes on a traj-gen job; snapshots must keep answering."""
+    import urllib.request
+
+    state = _tracker_mount_state(tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_fit(_state, _payload):
+        started.set()
+        release.wait(10)
+        return {"ok": True}
+
+    monkeypatch.setitem(gateway._TRACKER_MOUNT_FIT_ROUTES, "/api/calibration/tracker-mount/station", slow_fit)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/tracker-mount/station", data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        poster = threading.Thread(target=lambda: urllib.request.urlopen(request, timeout=15).read())
+        poster.start()
+        assert started.wait(5)
+        assert state.lock.acquire(timeout=2), "the fit route is holding the state lock"
+        state.lock.release()
+        release.set()
+        poster.join(10)
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_diagnostic_mode_grades_with_an_uncertified_fit_but_never_a_refused_one(tmp_path, monkeypatch):
+    state = _tracker_mount_state(tmp_path)
+    seen: list[dict] = []
+    monkeypatch.setattr(gateway, "_run_tracker_validate", lambda _s, p: seen.append(p) or {"ok": True})
+    for returncode, diagnostic, graded in ((1, False, False), (1, True, True), (2, True, False)):
+        seen.clear()
+        monkeypatch.setattr(
+            gateway, "_run_tracker_mount_lever_arm",
+            lambda _s, _p, rc=returncode: {"ok": rc == 0, "returncode": rc, "reportPath": "/m.json"},
+        )
+        result = gateway._run_tracker_mount_chain(
+            state, {"mode": "lever-arm", "diagnostic": diagnostic, "validate": {"dataset": "d", "tcpFrom": "/p.json"}}
+        )
+        assert bool(seen) is graded, (returncode, diagnostic)
+        if graded:
+            assert result["uncertifiedFit"] is True and result["ok"] is False
+            assert seen[0]["tcpFrom"] == "/p.json" and seen[0]["mountFit"] == "/m.json"
+
+
+def test_gt_comparison_takes_episode_zero(tmp_path, monkeypatch):
+    """0 is falsy: ``or ""`` turned the first episode of every dataset into ''."""
+    seen = _capture_validate_command(monkeypatch)
+    result = gateway._run_tracker_validate(
+        _tracker_mount_state(tmp_path), _validate_payload(tmp_path, episode=0)
+    )
+    assert result["returncode"] == 0, result.get("error")
+    command = seen[0]
+    assert command[command.index("--episode") + 1] == "0"
+
+
+def test_tracker_mount_previews_the_station_geometry_as_segments_land(tmp_path):
+    """09-24: the station was refused after Disconnect for an extent of 0.28 m.
+    Each saved dwell's parked point reaches the snapshot, discarded ones do not."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    root = tmp_path / "tm_live" / "tracker_mount"
+    state.tracker_mount_session = gateway.TrackerMountSession(
+        active=True, stage="capture", sessionName="tm_live", captureRoot=str(root)
+    )
+    points = {0: [0.0, 0.0, 0.0], 1: [200.0, 0.0, 0.0], 2: [0.0, 150.0, 60.0], 3: [900.0, 900.0, 900.0]}
+    for idx, pt in points.items():
+        if idx != 3:  # 3 was discarded: no meta.json
+            (root / "episodes" / f"episode_{idx:06d}").mkdir(parents=True)
+            (root / "episodes" / f"episode_{idx:06d}" / "meta.json").write_text("{}")
+        gateway._apply_recorder_output(
+            state, "LT_SEGMENT " + json.dumps({"episode": idx, "kind": "dwell", "n": 400, "point_mm": pt})
+        )
+    gateway._apply_recorder_output(state, "LT_SEGMENT not json")
+
+    live = gateway._tracker_mount_session_payload(state)["live"]
+    assert [s["episode"] for s in live["segments"]] == [0, 1, 2]
+    station = live["station"]
+    assert station["n"] == 3
+    assert station["extent_m"] == pytest.approx(math.dist([200, 0, 0], [0, 150, 60]) * 1e-3)
+    assert station["ok"] is False  # 0.26 m < 0.3 m
+    assert live["thresholds"]["stationMinExtentM"] == 0.3
+
+
+def test_tracker_segment_lines_outside_a_mount_capture_are_ignored(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+    gateway._apply_recorder_output(state, 'LT_SEGMENT {"episode":0,"kind":"pivot","gain_min":0.1}')
+    assert state.tracker_mount_session.liveSegments == {}
+
+
+def _write_identity_expected(repo_root: Path, ports: dict[str, str]) -> None:
+    path = repo_root / gateway.CAMERA_IDENTITY_EXPECTED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"calibration": "calib_x_intrinsics", "ports": ports}))
+
+
+def test_start_episode_refuses_a_camera_on_another_cameras_port(tmp_path, monkeypatch):
+    """09-23: modules moved between ports and every constant followed the port."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    _write_identity_expected(tmp_path, {"cam_06": "SN-A", "cam_07": "SN-B", "cam_09": "SN-C"})
+
+    gateway._apply_recorder_output(state, "CAMERA_IDENTITY " + json.dumps({
+        "cam_06": {"serial": "SN-A", "answered": True},
+        "cam_07": {"serial": "SN-C", "answered": True},   # cam_09's camera
+        "cam_09": {"serial": None, "answered": False},    # silent: unknown, not wrong
+    }))
+    assert state.recording.cameraIdentityExpectedFrom == "calib_x_intrinsics"
+    assert state.recording.cameraIdentityMismatches == [{
+        "camera": "cam_07", "expected": "SN-B", "actual": "SN-C",
+        "expectedNowOn": "", "actualCalibratedAs": "cam_09",
+    }]
+    with pytest.raises(RuntimeError, match="cam_07 上是 SN-C，标定时是 SN-B"):
+        gateway._start_episode(state)
+    assert written == []
+
+    # Cable put back and reconnected: the next identity line clears it.
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_07":{"serial":"SN-B","answered":true}}')
+    assert state.recording.cameraIdentityMismatches == []
+    gateway._start_episode(state)
+    assert written
+
+
+def test_camera_identity_without_an_expected_table_enforces_nothing(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_06":{"serial":"SN-Z","answered":true}}')
+    assert state.recording.cameraIdentity["cam_06"]["serial"] == "SN-Z"
+    assert state.recording.cameraIdentityMismatches == []
+    gateway._start_episode(state)
+    assert written
+    assert gateway._snapshot(state)["recording"]["cameraIdentity"]["cam_06"]["serial"] == "SN-Z"
+
+
+# --- cross-camera consistency ---------------------------------------------------
+
+
+def _cross_camera_dataset(root: Path, name: str, *, offset_mm: dict[str, float] | None = None) -> Path:
+    """A dataset with a generated trajectory: four cameras watching one cube."""
+    dataset = root / "outputs" / "datasets" / name
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    sidecar = dataset / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    centers = {
+        "cam_03": np.array([1.4, 0.0, 1.2]),
+        "cam_06": np.array([-1.4, 0.2, 1.1]),
+        "cam_08": np.array([0.1, 1.5, 1.3]),
+        "cam_12": np.array([0.0, -1.5, 1.0]),
+    }
+    rng = np.random.default_rng(0)
+    t = np.linspace(0.0, 2 * np.pi, 120)
+    cube = np.stack([0.15 * np.sin(t), 0.1 * np.cos(2 * t), 0.05 * np.sin(3 * t)], axis=1)
+    for cam, center in centers.items():
+        ray = -center / np.linalg.norm(center)
+        side = np.cross(ray, [0.0, 0.0, 1.0])
+        side /= np.linalg.norm(side)
+        # camera looks along +z of its own frame: build R_base_cam
+        x_axis = np.cross([0.0, 0.0, 1.0], ray)
+        x_axis /= np.linalg.norm(x_axis)
+        rot_base_cam = np.stack([x_axis, np.cross(ray, x_axis), ray], axis=1)
+        w = float(np.sqrt(max(1.0 + np.trace(rot_base_cam.T), 1e-12))) / 2.0
+        m = rot_base_cam.T
+        q_cam = [(m[2, 1] - m[1, 2]) / (4 * w), (m[0, 2] - m[2, 0]) / (4 * w), (m[1, 0] - m[0, 1]) / (4 * w), w]
+        rows = []
+        for i, p_true in enumerate(cube):
+            p = p_true + (offset_mm or {}).get(cam, 0.0) * 1e-3 * side + rng.normal(scale=2e-4, size=3)
+            p_cam = rot_base_cam.T @ (p - center)
+            row = {"episode_index": 0, "frame_index": i, "camera_serial": f"S{cam}", "cube_detected": 1, "used_for_fusion": 1}
+            for axis, value in zip("xyz", p, strict=True):
+                row[f"cube_base_{axis}_m"] = value
+            for axis, value in zip("xyz", p_cam, strict=True):
+                row[f"cube_cam_{axis}_m"] = value
+            for key, value in zip(("qx", "qy", "qz", "qw"), (0.0, 0.0, 0.0, 1.0), strict=True):
+                row[f"cube_base_{key}"] = value
+            for key, value in zip(("qx", "qy", "qz", "qw"), q_cam, strict=True):
+                row[f"cube_cam_{key}"] = value
+            rows.append(row)
+        with (sidecar / f"cube_pose.right.{cam}.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    return dataset
+
+
+def _cross_camera_state(tmp_path: Path, monkeypatch) -> gateway.GatewayState:
+    # the real CLI, from the real submodule, on the fixture dataset
+    real_root = Path(gateway.__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(real_root / "third_party" / "opencv_kalibr"))
+    monkeypatch.setattr(gateway, "_marker_tcp_tool_env", lambda _state: env)
+    monkeypatch.setattr(gateway, "_hand_eye_python", lambda _state: Path(sys.executable))
+    state = _tracker_mount_state(tmp_path)
+    state.calibration.extrinsicsRun = "calib_test_extrinsics"
+    return state
+
+
+def test_cross_camera_lists_only_datasets_with_a_trajectory(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    _cross_camera_dataset(tmp_path, "with_traj")
+    bare = tmp_path / "outputs" / "datasets" / "no_traj"
+    (bare / "meta").mkdir(parents=True)
+    (bare / "meta" / "info.json").write_text("{}")
+
+    payload = gateway._last_cross_camera_check(state)
+
+    assert payload["report"] is None
+    assert [c["name"] for c in payload["candidates"]] == ["with_traj"]
+    assert payload["candidates"][0]["cameras"] == ["cam_03", "cam_06", "cam_08", "cam_12"]
+
+
+def test_cross_camera_run_keeps_the_report_and_the_calibration_it_judged(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    dataset = _cross_camera_dataset(tmp_path, "bench", offset_mm={"cam_08": 8.0})
+
+    result = gateway._run_cross_camera_check(state, {"dataset": str(dataset)})
+
+    assert result["ok"] is True, result
+    report = result["report"]
+    assert report["overall"] == "fail"
+    assert report["cubes"]["right"]["cameras"]["cam_08"]["verdict"] == "fail"
+    assert report["extrinsics_run"] == "calib_test_extrinsics"
+    assert gateway._last_cross_camera_check(state)["report"]["overall"] == "fail"
+
+
+def test_cross_camera_run_refuses_a_dataset_without_a_trajectory(tmp_path, monkeypatch):
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    bare = tmp_path / "outputs" / "datasets" / "no_traj"
+    bare.mkdir(parents=True)
+
+    result = gateway._run_cross_camera_check(state, {"dataset": str(bare)})
+
+    assert result["ok"] is False
+    assert "EE 轨迹" in result["error"]
+    assert gateway._last_cross_camera_check(state)["report"] is None
+
+
+def test_the_cross_camera_route_answers_over_http_without_holding_the_lock(tmp_path, monkeypatch):
+    import urllib.request
+
+    state = _cross_camera_state(tmp_path, monkeypatch)
+    dataset = _cross_camera_dataset(tmp_path, "bench")
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/cross-camera/run",
+            data=json.dumps({"dataset": str(dataset)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/calibration/cross-camera", timeout=5) as response:
+            last = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body["ok"] is True, body
+    # every camera agrees; "partial" because the fixture has no fused trajectory
+    # to measure set-change steps on
+    assert body["report"]["overall"] == "partial"
+    assert last["report"]["generated_utc"] == body["report"]["generated_utc"]
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
+# --- intrinsics by module serial --------------------------------------------------
+
+
+def _eeprom_intrinsics_run(tmp_path: Path, name: str, cameras: dict[str, str]) -> None:
+    run = tmp_path / "outputs" / "calibration" / name
+    rows = []
+    for camera, serial in cameras.items():
+        path = run / "converted" / f"{camera}_{serial}" / "intrinsics_producer.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"camera_name": camera, "camera_serial": serial, "model": "opencv_fisheye",
+                                    "camera_matrix": [[1000, 0, 960], [0, 1000, 540], [0, 0, 1]]}))
+        rows.append({"camera_name": camera, "camera_serial": serial, "status": "ok", "intrinsics_json": str(path)})
+    (run / "summary.json").write_text(json.dumps(
+        {"timestamp_utc": "2026-09-01T00:00:00Z", "serial_source": "eeprom", "cameras": rows}))
+
+
+def _stamp_identity(capture: Path, ports: dict[str, str]) -> None:
+    for episode in sorted((capture / "episodes").glob("episode_*")):
+        (episode / "meta.json").write_text(json.dumps({"camera_identity": {
+            cam: {"serial": serial, "answered": True} for cam, serial in ports.items()}}))
+
+
+def _solve_by_serial(tmp_path, monkeypatch, run_name: str) -> tuple[gateway.GatewayState, dict[str, list[str]]]:
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    capture = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    # cam_00 and cam_01 swapped modules since the lenses were calibrated
+    _stamp_identity(capture, {"cam_00": "SN-B", "cam_01": "SN-A"})
+    seen: dict[str, list[str]] = {}
+    work = tmp_path / "outputs" / "metrology" / run_name
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        seen[module.split(".")[-1]] = list(args)
+        if module.endswith("calibrate_extrinsics"):
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "extrinsics_report.json").write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}))
+        if module.endswith("export_production_calibration"):
+            (tmp_path / "outputs" / "calibration" / f"{run_name}_extrinsics").mkdir(parents=True)
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(state, capture, run_name, Path(sys.executable))
+    return state, seen
+
+
+def test_the_solve_takes_each_lens_by_the_serial_on_the_port_now(tmp_path, monkeypatch):
+    _eeprom_intrinsics_run(tmp_path, "lenses_intrinsics", {"cam_00": "SN-A", "cam_01": "SN-B"})
+
+    state, seen = _solve_by_serial(tmp_path, monkeypatch, "run_s")
+
+    assert state.calibration.state == "complete", state.calibration.message
+    bundle = seen["calibrate_extrinsics"]
+    staged = Path(bundle[bundle.index("--intrinsics-run") + 1])
+    moved = json.loads((staged / "converted" / "cam_00_SN-B" / "intrinsics_producer.json").read_text())
+    assert moved["intrinsics_origin"]["camera"] == "cam_01"
+
+    export = seen["export_production_calibration"]
+    assert export[export.index("--serial-source") + 1] == "eeprom"
+    serial_map = Path(export[export.index("--serial-map") + 1]).read_text()
+    assert "cam_00: SN-B" in serial_map
+    assert "--intrinsics-report" not in export
+
+    # the new port -> lens assignment is what production is pointed at, and the
+    # Connect gate learns the new port -> module table from the run itself
+    produced = tmp_path / "outputs" / "calibration" / "run_s_intrinsics"
+    assert state.calibration.intrinsicsRun == "run_s_intrinsics"
+    summary = json.loads((produced / "summary.json").read_text())
+    assert all(str(produced) in row["intrinsics_json"] for row in summary["cameras"])
+    identity = json.loads((tmp_path / "outputs" / "calibration" / "run_s_extrinsics" / "camera_identity.json").read_text())
+    assert identity["ports"] == {"cam_00": "SN-B", "cam_01": "SN-A"}
+
+
+def test_the_solve_refuses_a_module_with_no_calibrated_lens(tmp_path, monkeypatch):
+    _eeprom_intrinsics_run(tmp_path, "lenses_intrinsics", {"cam_00": "SN-B"})
+
+    state, seen = _solve_by_serial(tmp_path, monkeypatch, "run_m")
+
+    assert state.calibration.state == "failed"
+    assert "cam_01（SN-A）" in state.calibration.message
+    assert seen == {}
+
+
+def test_a_calibration_sweep_is_not_blocked_by_the_port_check(tmp_path, monkeypatch):
+    """Re-calibrating the ports as they are now is a way out of a mismatch."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    written = _capture_recorder_stdin(monkeypatch)
+    _write_identity_expected(tmp_path, {"cam_07": "SN-B"})
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_07":{"serial":"SN-C","answered":true}}')
+
+    with pytest.raises(RuntimeError, match="cam_07"):
+        gateway._start_episode(state, capture_intent={"purpose": "calibration_marker_tcp"})
+    gateway._start_episode(state, capture_intent={"purpose": "calibration_extrinsics"})
+    assert written
+
+
+def test_the_expected_ports_come_from_the_production_extrinsics_run(tmp_path, monkeypatch):
+    _write_identity_expected(tmp_path, {"cam_07": "SN-OLD"})
+    run = tmp_path / "outputs" / "calibration" / "run_p_extrinsics"
+    run.mkdir(parents=True)
+    (run / "camera_identity.json").write_text(json.dumps({"calibration": "run_p", "ports": {"cam_07": "SN-NEW"}}))
+    state = _solve_state(tmp_path)
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "run_p_extrinsics"})
+
+    assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_07": "SN-NEW"}
+
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "legacy_extrinsics"})
+    assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_07": "SN-OLD"}

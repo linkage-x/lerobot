@@ -3471,6 +3471,13 @@ button.danger {
   outline: 2px solid rgba(15, 118, 110, 0.16);
 }
 .marker-tcp-solve { grid-template-columns: minmax(260px, 1fr) 150px; }
+.marker-tcp-e1p {
+  border-top: 1px solid #e2e8f0;
+  margin-top: 16px;
+  padding-top: 12px;
+}
+.marker-tcp-e1p .marker-tcp-controls { grid-template-columns: repeat(2, minmax(200px, 1fr)); }
+.marker-tcp-e1p .cali-result-box { margin-top: 10px; }
 .marker-tcp-solve-notes { margin-top: 8px; }
 .marker-tcp-solve-notes .panel-note { margin: 4px 0; }
 .marker-tcp-label-row {
@@ -4362,4 +4369,30 @@ button.danger {
   color: #6b4e00;
   margin: 8px 0 0;
   padding: 8px 10px;
+}
+
+/* Homed is its own line: "not homed" and "beam off the SMR" need different
+   actions, and W2 looked green while never having homed. */
+.tracker-home-state {
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+
+.tracker-home-state[data-homed="no"] {
+  color: #b42318;
+  font-weight: 600;
+}
+
+.tracker-capture-actions {
+  align-items: center;
+  margin-top: 8px;
+}
+
+.tracker-capture-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.tracker-capture-scroll tbody tr {
+  cursor: pointer;
 }

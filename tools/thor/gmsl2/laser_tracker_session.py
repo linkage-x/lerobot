@@ -71,6 +71,31 @@ _SSH_BASE = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHost
 _PROGRESS_RE = re.compile(r"^\s*rows \d+\s+dropped \d+\s*$")
 _OP_MODES = ("Idle", "Tracking", "Position", "TrackIdle", "Searching", "Internal")
 
+# What a failure means right after the controller has been power-cycled, which
+# is exactly when these codes stop meaning what they usually mean.  2026-09-21,
+# after an unplanned power cut, four Connects in a row walked through the whole
+# cold start -- CommunicationFailed (controller still booting), IndexSearchFailed
+# (encoder index search on the first connect after power-on), then two Connects
+# that *succeeded* but reported TrackerNotWarmedUp -- and the operator, told to
+# close SA and to put the SMR in the nest, gave up on a tracker that only needed
+# fifteen minutes.
+_CONNECT_HINTS = {
+    "CommunicationFailed": (
+        " -- either another client holds it (the tracker admits one client at a time: "
+        "close SA / RadianCAL / Tracker Studio), or the controller is still booting "
+        "after a power cycle (wait until it answers, then reconnect)"
+    ),
+    "DeviceAlreadyConnected": (
+        " -- the tracker admits one client at a time; close SA / RadianCAL / "
+        "Tracker Studio and reconnect"
+    ),
+    "IndexSearchFailed": (
+        " -- the first connect after power-on runs an encoder index search, which "
+        "rotates the head about both axes: check the Servo switch is on (Power "
+        "first, then Servo) and nothing blocks the head, then reconnect"
+    ),
+}
+
 
 def _decode(raw: bytes) -> str:
     """Decode whatever the Windows console said, without ever raising.
@@ -226,6 +251,17 @@ class LaserTrackerStatus:
     gimbal_mode: str = ""
     beam_ready: bool = False
     beam_status: str = "unknown"
+    # The logger ranges every beam lock absolutely before its samples count
+    # (2026-09-22). This is the last one it reported, step and all: the number
+    # an operator needs while judging whether a catch can be trusted.
+    range_status: str = ""
+    locks_ranged: int = 0
+    locks_not_ranged: int = 0
+    # Homing is what gives the session an absolute range, and "beam: acquired"
+    # does not imply it: W2 (2026-09-21) ran locked-on and green from start to
+    # finish without ever homing, and every lock carried a range hundreds of mm
+    # off. A session that has not homed is not ground truth.
+    homed: bool = False
     episodes: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -256,6 +292,14 @@ class LaserTrackerSession:
         # the operator is actively changing, not a verdict on the session.
         self.beam_ready = False
         self.beam_status = "unknown"
+        self.range_status = ""
+        self.locks_ranged = 0
+        self.locks_not_ranged = 0
+        self.homed = False
+        # Whether the current lock's range traces back to a Home without a beam
+        # break. None: the logger does not report it (an exe older than
+        # 2026-09-23), and then only `homed` is gated on.
+        self.range_absolute: bool | None = None
         self._logger_tail: collections.deque[str] = collections.deque(maxlen=40)
         self._logger_proc: subprocess.Popen[str] | None = None
 
@@ -326,6 +370,13 @@ class LaserTrackerSession:
             if not self._await_probe():
                 return False
             if not self._await_logger():
+                # A logger that is still alive here is almost always stuck in the
+                # SDK handshake, and one that finishes it later would hold the
+                # tracker's only client slot until session_cap_s -- so the next
+                # Connect would fail as "CommunicationFailed" with no logger in
+                # sight. The stop-file is what releases it: the logger checks it
+                # the moment it is connected.
+                self._teardown_logger(wait_s=5.0)
                 self._teardown_probe()
                 return False
             self._connected = True
@@ -334,6 +385,7 @@ class LaserTrackerSession:
         except Exception as exc:  # never break Connect for the other devices
             self.last_error = f"connect failed: {type(exc).__name__}: {exc}"
             logger.warning("laser tracker connect failed: %s", exc)
+            self._teardown_logger(wait_s=5.0)
             self._teardown_probe()
             return False
 
@@ -434,6 +486,34 @@ class LaserTrackerSession:
                     self.beam_ready = False
                     self.beam_status = what  # carries the SDK's reason in brackets
                 logger.info("tracker beam: %s", self.beam_status)
+            # Recovery and search attempts go to the recorder log: on 2026-09-23 a
+            # session sat tracking with no distance for minutes and the only
+            # account of why -- what each re-range answered -- was in this tail,
+            # in memory, gone with the process.
+            for tag in ("recover:", "search:", "home: nest"):
+                at = line.find(tag)
+                if at >= 0:
+                    logger.info("tracker %s", line[at:])
+                    break
+            range_at = line.find("range:")
+            if range_at >= 0:
+                what = line[range_at + len("range:"):].strip()
+                if "not absolute" in what:
+                    self.range_absolute = False
+                elif "absolute" in what:
+                    self.range_absolute = True
+                logger.info("tracker range: %s", what)
+            if line.find("home: ok") >= 0:
+                self.homed = True
+                logger.info("tracker homed: the session has an absolute range")
+            lock_at = line.find("lock:")
+            if lock_at >= 0:
+                self.range_status = line[lock_at + len("lock:"):].strip()
+                if "NOT ranged" in self.range_status:
+                    self.locks_not_ranged += 1
+                else:
+                    self.locks_ranged += 1
+                logger.info("tracker lock: %s", self.range_status)
             dev_at = line.find("device:")
             if dev_at >= 0:
                 fields = {}
@@ -494,12 +574,7 @@ class LaserTrackerSession:
                 # or RadianCAL being open is enough to refuse us -- and the SDK
                 # reports that as a generic communication failure, which reads
                 # like a network fault and sends people to check cables.
-                hint = ""
-                if "CommunicationFailed" in tail or "DeviceAlreadyConnected" in tail:
-                    hint = (
-                        " -- the tracker admits one client at a time; close SA / "
-                        "RadianCAL / Tracker Studio and reconnect"
-                    )
+                hint = next((h for code, h in _CONNECT_HINTS.items() if code in tail), "")
                 self.last_error = f"tracker logger exited: {tail[:300]}{hint}"
                 self._logger_proc = None
                 return False
@@ -509,7 +584,8 @@ class LaserTrackerSession:
         if rows <= 0:
             self.last_error = (
                 f"tracker produced no samples in {self.cfg.logger_ready_timeout_s:g} s -- "
-                "is it warmed up, locked on an SMR, and not held by SA?"
+                "is the controller up (it takes a while after a power cycle), and is the "
+                "tracker not held by SA?"
             )
             return False
         self._rows_mark = rows
@@ -599,6 +675,43 @@ class LaserTrackerSession:
             "dist_min_mm": dmin,
             "dist_max_mm": dmax,
         }
+
+    def segment_points(self, *, last_rows: int, max_points: int = 3000) -> list[tuple[float, float, float]]:
+        """x/y/z (mm) of the valid samples among the last ``last_rows``, thinned
+        on the capture PC to at most ``max_points`` so the reply stays small.
+
+        Only for the capture-time geometry preview (``tracker_live_geometry``);
+        the solves read the landed stream. A v2 row whose lock is not yet ranged
+        (``ranged`` column 0) is left out, as the solves leave it out.
+        """
+        if last_rows <= 0:
+            return []
+        budget = (last_rows + 2) * self._BYTES_PER_ROW
+        code = (
+            "import sys;"
+            "f=open(sys.argv[1],'rb');"
+            "f.seek(0,2);n=f.tell();f.seek(max(0,n-int(sys.argv[2])));"
+            "ls=f.read().decode('ascii','replace').splitlines()[1:];"
+            "rs=[l.split(',') for l in ls if l.count(',')>=16][-int(sys.argv[3]):];"
+            "vr=[r for r in rs if r[9].strip() in ('1','true')"
+            " and (len(r)<19 or r[18].strip() in ('1','true'))];"
+            "k=max(1,len(vr)//int(sys.argv[4]));"
+            "print(';'.join(r[6]+' '+r[7]+' '+r[8] for r in vr[::k]))"
+        )
+        res = self._run(
+            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{code}" '
+            f'{self.session_id}.rt.csv {budget} {last_rows} {max(1, int(max_points))}',
+            timeout_s=45,
+        )
+        out: list[tuple[float, float, float]] = []
+        lines = (res.stdout or "").strip().splitlines()
+        for item in (lines[-1].split(";") if lines else []):
+            try:
+                x, y, z = (float(v) for v in item.split())
+            except ValueError:
+                continue
+            out.append((x, y, z))
+        return out
 
     def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:  # noqa: D401
         """Fraction of recent samples that are ``valid`` and ``tracking``."""
@@ -770,16 +883,26 @@ class LaserTrackerSession:
                        capture_output=True, timeout=120)
         local.unlink(missing_ok=True)
 
-    def _teardown_logger(self) -> None:
+    def _teardown_logger(self, *, wait_s: float = 60.0) -> None:
+        """Ask the logger to stop, then drop the ssh channel if it will not.
+
+        The stop-file is the part that actually works on the Windows side:
+        ``lt_realtime_logger`` polls it in its writer loop, i.e. from the moment
+        it is connected. Closing the local ssh channel is only a backstop --
+        whether that ends the remote process is up to the Windows OpenSSH
+        server, and nothing here relies on it. So on a failed Connect the
+        stop-file is left in place for a logger that has not connected yet.
+        """
         if self._logger_proc is None:
             return
         try:
             self._run(f'type nul > "{self.logger_stop_file}"')
             try:
-                self._logger_proc.wait(timeout=60)
+                self._logger_proc.wait(timeout=wait_s)
             except subprocess.TimeoutExpired:
                 self._logger_proc.terminate()
-                self.last_error = "tracker logger did not stop within 60 s; terminated"
+                if not self.last_error:
+                    self.last_error = f"tracker logger did not stop within {wait_s:g} s; terminated"
         except Exception as exc:
             self.last_error = f"logger teardown failed: {type(exc).__name__}: {exc}"
         finally:
@@ -849,10 +972,46 @@ class LaserTrackerSession:
         parts.append(f"1 kHz @ {self.cfg.tracker_ip}")
         return ", ".join(parts)
 
+    @property
+    def ready(self) -> bool:
+        """Whether an episode recorded now would carry ground truth.
+
+        A locked beam is not enough: without a successful Home the session has
+        no absolute range, and every lock inherits whatever reference was left
+        behind -- W2 (2026-09-21) was locked and green throughout and every
+        range was 337-440 mm off.  This is what gates Start Episode.
+        """
+        return self.beam_ready and self.homed and self.range_absolute is not False
+
+    @property
+    def beam_broken(self) -> bool:
+        """Homed, but the beam broke since: this lock's range is not absolute.
+
+        A catch after a break takes whatever range the ADM hands back, and a
+        single-point measurement only reports that back -- pivot
+        lt_20260923_062953 was caught 14 mm out of the nest and carried +4.3 mm.
+        """
+        return self.homed and self.range_absolute is False
+
     def beam_summary(self) -> str:
         """What the beam is doing, in the words an operator needs."""
+        if self.beam_ready and self.beam_broken:
+            return (
+                "the beam broke since Home, so this lock has no absolute range — put the "
+                "SMR back in the home nest; it re-homes automatically"
+            )
+        if self.beam_ready and self.homed:
+            return "homed, locked on the SMR"
         if self.beam_ready:
-            return "locked on the SMR"
+            if not self.cfg.home_on_connect:
+                return (
+                    "locked on the SMR but NOT homed: this Connect does not home "
+                    "(home_on_connect is off), so the session has no absolute range"
+                )
+            return (
+                "locked on the SMR but NOT homed yet — put the SMR in the home nest "
+                "and wait for Home to succeed; homing retries automatically"
+            )
         if self.beam_status.startswith("waiting"):
             # Exactly one layer of brackets: the SDK's reason carries its own
             # numeric code in brackets, so strip(" ()") would eat that one too
@@ -862,7 +1021,15 @@ class LaserTrackerSession:
                 reason = reason[1:-1]
             if reason.startswith("NoSmrAtHomePosition"):
                 return "waiting for the SMR — put it in the home nest, homing retries automatically"
-            return f"waiting for the SMR ({reason}) — homing retries automatically"
+            if reason.startswith("TrackerNotWarmedUp"):
+                # Nothing the operator does with the SMR changes this, and saying
+                # "waiting for the SMR" here is what made a healthy tracker look
+                # broken after the 2026-09-21 power cut.
+                return (
+                    "tracker still warming up — homing is refused until the laser is ready "
+                    "(at least 15 min after power-on, front LED steady); retries automatically"
+                )
+            return f"waiting ({reason}) — homing retries automatically"
         if self.beam_status == "lost":
             return "beam lost — reacquiring"
         return "waiting for the SMR — homing retries automatically"
@@ -883,5 +1050,9 @@ class LaserTrackerSession:
             gimbal_mode=self.gimbal_mode,
             beam_ready=self.beam_ready,
             beam_status=self.beam_status,
+            range_status=self.range_status,
+            homed=self.homed,
+            locks_ranged=self.locks_ranged,
+            locks_not_ranged=self.locks_not_ranged,
             episodes=[asdict(r) for r in self._episodes],
         )

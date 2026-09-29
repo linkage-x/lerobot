@@ -125,16 +125,25 @@ if [[ ${SKIP_KILL} -eq 0 ]]; then
   # a failed connect. Ignore misses so the script is idempotent.
   pkill -TERM -f 'python.*tools\.thor\.gmsl2\.thor_record' 2>/dev/null || true
   pkill -TERM -f 'python.*tools\.data_collection_gui\.gateway' 2>/dev/null || true
+  # Native recorder children can outlive their Python parent. Match argv[0]
+  # because Linux truncates their comm names (so pkill -x cannot match them).
+  pkill -TERM -f '^([^[:space:]]*/)?lerobot_argus_(online_sync|metadata)_video_recorder([[:space:]]|$)' 2>/dev/null || true
   pkill -TERM -x gst-launch-1.0 2>/dev/null || true
   sleep 1
   pkill -KILL -f 'python.*tools\.thor\.gmsl2\.thor_record' 2>/dev/null || true
+  pkill -KILL -f '^([^[:space:]]*/)?lerobot_argus_(online_sync|metadata)_video_recorder([[:space:]]|$)' 2>/dev/null || true
   pkill -KILL -x gst-launch-1.0 2>/dev/null || true
 else
   print_step "Skipping stale process cleanup"
 fi
 
 print_step "Stopping nvargus-daemon"
-run_sudo service nvargus-daemon stop || true
+if ! run_sudo service nvargus-daemon stop; then
+  echo "ERROR: nvargus-daemon did not stop; aborting camera module recovery." >&2
+  echo "Check: ps -eLo pid,tid,stat,wchan:32,comm | grep -E 'argus|SCF|gst-launch'" >&2
+  echo "If threads remain in D state after SIGKILL, reboot Thor before retrying." >&2
+  exit 1
+fi
 sleep 1
 
 if [[ ${SKIP_SETUP} -eq 0 ]]; then

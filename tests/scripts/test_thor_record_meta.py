@@ -500,18 +500,51 @@ def test_the_alignment_block_states_the_formula_that_was_actually_applied() -> N
     An episode whose meta says "sensor_timestamp_ns - t0_mono_s" while its
     numbers carry +exposure_fraction*exposure is worse than one that says
     nothing: it is a claim of not-corrected on data that was corrected.
+
+    Which camera's exposure stood for the shared timeline is part of that
+    formula and not an implementation detail -- one fused pose carries one time,
+    so the term is the per-frame cross-camera median -- so the stamp names it.
     """
     thor_record = _load_thor_record_module()
     summary = _alignment_summary(
         thor_record, corrected=[0.0, 1 / 60, 2 / 60], raw=[0.0, 1 / 60, 2 / 60]
     )
 
-    assert "exposure_fraction*sensor_exposure_time_ns" in summary["reference"]
+    assert "exposure_fraction*median_k(sensor_exposure_time_ns[k])" in summary["reference"]
+    assert "median across cameras" in summary["reference"]
     # 0.0 is the shipped default -- the exposure column is recorded, the shift
     # is not applied -- and the block has to say so, because "not corrected" is
     # exactly as much a claim about the data as "corrected by half an exposure".
     assert summary["exposure_fraction"] == 0.0
     assert summary["readout_offset_s"] == 0.0
+
+
+def test_the_alignment_block_carries_the_residual_the_median_cannot_remove() -> None:
+    """The floor gets written down next to the correction, not left to be assumed.
+
+    ``exposure_correction_ms`` says how far the exposure term moved this episode
+    and is reversible from meta alone.  The cross-camera spread is the part that
+    is not reversible: one fused pose carries one time, so camera k keeps
+    fraction*(E_median - E_k) whatever the sign turns out to be.  An episode that
+    records the reversible half and drops the irreversible half reads as more
+    corrected than it is.
+    """
+    thor_record = _load_thor_record_module()
+    spread = {"frames": 3600, "abs_dev_from_median_ms": {"p50": 0.4, "p95": 2.1, "max": 3.3}}
+
+    summary = thor_record._box_camera_alignment_summary(
+        [0.0, 1 / 60], 60, raw_frame_times_s=[0.0, 1 / 60], exposure_spread=spread,
+    )
+    assert summary["cross_camera_exposure"] == spread
+
+
+def test_a_pre_column_episode_carries_no_spread_block_rather_than_an_empty_one() -> None:
+    """No exposure column is a legacy fact, not a measurement of zero spread."""
+    thor_record = _load_thor_record_module()
+    summary = _alignment_summary(
+        thor_record, corrected=[0.0, 1 / 60], raw=[0.0, 1 / 60]
+    )
+    assert "cross_camera_exposure" not in summary
 
 
 def test_the_alignment_block_says_how_far_the_correction_moved_this_episode() -> None:

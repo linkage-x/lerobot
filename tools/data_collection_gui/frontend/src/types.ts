@@ -125,8 +125,13 @@ export type RecordingStatus = {
   laserTrackerDetail?: string;
   // Model / serial / firmware as the instrument reported them.
   laserTrackerDevice?: string;
-  // Whether the beam is on the SMR. Start Episode is gated on it.
+  // Whether the beam is on the SMR *and* the session homed. Start Episode is gated on it.
   laserTrackerReady?: boolean;
+  // Whether this tracker session homed. Without it every range inherits a stale
+  // reference (W2, 2026-09-21: locked and green throughout, 337-440 mm off).
+  laserTrackerHomed?: boolean;
+  /** Homed, but the beam broke since: the current lock has no absolute range. */
+  laserTrackerBeamBroken?: boolean;
 };
 
 export type MarkerTcpSample = {
@@ -141,6 +146,29 @@ export type MarkerTcpSample = {
   staticTransformPath: string;
   note: string;
   createdAt: string;
+  /** This Connect had the laser tracker on: the sample doubles as an E1p capture. */
+  laserTracker?: boolean;
+  trackerSessionId?: string;
+};
+
+/** The last E1p run from the marker->TCP panel, as the gateway holds it. */
+export type MarkerTcpTrackerCheck = {
+  ok?: boolean;
+  returncode?: number;
+  error?: string;
+  summary?: string;
+  boxId?: string;
+  cube?: string;
+  condition?: string;
+  mountId?: string;
+  samples?: number;
+  notes?: string[];
+  stationPath?: string;
+  mountFitPath?: string;
+  markerTcpPath?: string;
+  reportPath?: string;
+  createdAt?: string;
+  report?: TrackerPivotReport | null;
 };
 
 export type MarkerTcpSession = {
@@ -156,6 +184,7 @@ export type MarkerTcpSession = {
   solveSummaryPath?: string;
   pivotReportPath?: string;
   trackingRunPath?: string;
+  trackerCheck?: MarkerTcpTrackerCheck;
 };
 
 export type RecordingBackend = "real" | "sim";
@@ -500,6 +529,13 @@ export type IntrinsicsPreflight = {
   cameras: string[];
   production: string[];
   uncalibrated: string[];
+  /** Of those, the ones an earlier solve already fitted from this unchanged
+   * capture with a lens the exporter takes. They no longer block. */
+  proven?: string[];
+  provenReport?: string;
+  /** Fitted from this capture by an earlier solve, but a lens the exporter
+   * refuses (folds in the frame). Any one of them fails the whole export. */
+  refusedFit?: string[];
   /** Kept from the production run because this capture never swept them. */
   carriedForward?: string[];
   blocking: boolean;
@@ -540,6 +576,10 @@ export type CalibrationStatus = {
 /** Per-camera difference between two extrinsics runs, in gauge-free terms. */
 export type PromotionCameraRow = {
   camera: string;
+  /** Module serial; empty when the run cannot name its modules. */
+  serial?: string;
+  /** The port this module was on in the live run, when it has changed. */
+  livePort?: string;
   medianBaselineShiftMm: number;
   maxBaselineShiftMm: number;
   medianRotationDeg: number;
@@ -562,6 +602,8 @@ export type ExtrinsicsComparison = {
   live: string;
   candidate: string;
   cameras?: PromotionCameraRow[];
+  /** "serial" when cameras were paired by module; "port" when only cables could be. */
+  pairedBy?: "serial" | "port";
   addedCameras?: string[];
   removedCameras?: string[];
   pairCount?: number;
@@ -942,6 +984,68 @@ export type RigCheckResponse = {
   baseline?: RigCheckBaseline;
 };
 
+// --- cross-camera consistency ------------------------------------------------
+//
+// metrology.cli.cross_camera_check, verbatim. Offsets are across each camera's
+// line of sight; depth (along_p50_mm) is reported and never judged.
+
+export type CrossCameraVerdict = "ok" | "warn" | "fail" | "unknown";
+export type CrossCameraOverall = CrossCameraVerdict | "partial";
+
+export type CrossCameraCamera = {
+  frames: number;
+  verdict: CrossCameraVerdict;
+  reason?: string;
+  lateral_offset_mm?: number;
+  lateral_offset_vector_mm?: number[];
+  lateral_offset_least_squares_mm?: number;
+  scatter_p50_mm?: number;
+  scatter_p95_mm?: number;
+  along_p50_mm?: number;
+  rotation_p50_deg?: number;
+  lateral_offset_per_episode_mm?: Record<string, number>;
+};
+
+export type CrossCameraSetChanges = {
+  verdict: CrossCameraVerdict;
+  reason?: string;
+  changes?: number;
+  flicker_changes?: number;
+  step_p50_mm?: number | null;
+  step_p95_mm?: number | null;
+  steady_p50_mm?: number | null;
+  steady_p95_mm?: number | null;
+  budget_mm?: number;
+  per_camera_toggle?: Record<string, { toggles: number; step_p50_mm: number | null; step_max_mm: number }>;
+};
+
+export type CrossCameraReport = {
+  generated_utc: string;
+  dataset: string;
+  sidecar_generated_utc?: string | null;
+  thresholds: { warn_mm: number; fail_mm: number; step_budget_mm: number };
+  camera_serials?: Record<string, string>;
+  cubes: Record<string, { frames_with_cube: number; cameras: Record<string, CrossCameraCamera>; set_changes: CrossCameraSetChanges }>;
+  overall: CrossCameraOverall;
+  guidance: string;
+  extrinsics_run?: string;
+};
+
+export type CrossCameraCandidate = {
+  dataset: string;
+  name: string;
+  trajectoryModifiedUnixS: number;
+  cameras: string[];
+};
+
+export type CrossCameraResponse = {
+  ok: boolean;
+  error?: string;
+  report: CrossCameraReport | null;
+  extrinsicsRun?: string;
+  candidates?: CrossCameraCandidate[];
+};
+
 // --- canonical world frame (roadmap 2.4) ------------------------------------
 //
 // The world is not re-derived from each calibration; it is frozen once, and
@@ -1202,3 +1306,379 @@ export type TrackerAlignment =
         observability?: { fixed_attitude?: boolean; rotation_span_deg?: number } | null;
       } | null;
     };
+
+// --- Laser tracker station + SMR lever arm (metrology.tracker_mount_fit) ---
+//
+// The shapes mirror the solver's artifacts rather than flattening them, because
+// what the panel has to render is *which* claim a fit is entitled to make, and
+// that lives in the nested observability / sigma / attitude blocks.
+
+export type TrackerMountObservability = {
+  n_poses: number;
+  station_frozen: boolean;
+  ok: boolean;
+  rotation_span_deg: number;
+  fixed_attitude: boolean;
+  c_gain_min: number;
+  c_gain_max: number;
+  c_gain_min_equiv_deg: number;
+  c_sigma_amplification: number;
+  planarity: number | null;
+  extent_m: number | null;
+  reasons: string[];
+};
+
+export type TrackerMountSigma = {
+  num_resamples: number;
+  c_sigma_mm: number[] | null;
+  c_sigma_norm_mm: number | null;
+  rotation_sigma_deg: number | null;
+  translation_sigma_mm: number | null;
+  note: string;
+};
+
+/** Structure of the per-pose lever arms in attitude -- the mount-rigidity check. */
+export type TrackerAttitudeDependence = {
+  n_poses: number;
+  explained_frac: number;
+  null_explained_frac: number;
+  slope_mm_per_deg: number;
+  rotation_span_deg: number;
+  structured: boolean;
+};
+
+export type TrackerStationSession = {
+  session_id: string;
+  mount_id: string;
+  c_m: number[];
+  lever_arm_mm: number;
+  attitude: TrackerAttitudeDependence | null;
+};
+
+export type TrackerStationReport = {
+  T_world_tracker: number[][];
+  world_frame_id: string;
+  tracker_station_id: string;
+  sessions: TrackerStationSession[];
+  n_poses_total: number;
+  iterations: number;
+  rms_mm: number;
+  registration_rms_mm: number;
+  leave_one_out_max_mm: number;
+  attitude_structured: boolean | null;
+  scale_diagnostic: number;
+  scale_error_ppm: number;
+  scale_applied: boolean;
+  observability: TrackerMountObservability;
+  sigma: TrackerMountSigma;
+  certifies_marker_to_tcp: boolean;
+};
+
+export type TrackerMountReport = {
+  mount_id: string;
+  session_id: string;
+  c_m: number[];
+  lever_arm_mm: number;
+  rotation_sensitivity_mm_per_deg: number;
+  T_world_tracker: number[][];
+  station_fitted: boolean;
+  n_poses: number;
+  rms_mm: number;
+  max_mm: number;
+  holdout_rms_mm: number | null;
+  per_pose_c_spread_mm: number;
+  attitude: TrackerAttitudeDependence | null;
+  observability: TrackerMountObservability;
+  sigma: TrackerMountSigma;
+  absorbed_modes: string[];
+  certifies: boolean;
+  certifies_marker_to_tcp: boolean;
+};
+
+export type TrackerMountArtifact = {
+  path: string;
+  name: string;
+  modifiedUnixS: number;
+  report: TrackerStationReport | TrackerMountReport;
+};
+
+export type TrackerMountListResponse = {
+  ok: boolean;
+  root?: string;
+  stations?: TrackerMountArtifact[];
+  mounts?: TrackerMountArtifact[];
+  /** E1p artifacts that carry the SMR->TCP vector a TCP comparison needs. */
+  pivots?: TrackerMountArtifact[];
+  error?: string;
+};
+
+export type TrackerMountCaptureRow = {
+  session: string;
+  dataset: string;
+  episode: string;
+  mountId: string;
+  sessionId?: string;
+};
+
+export type TrackerMountSolveResponse = {
+  ok: boolean;
+  returncode?: number;
+  kind?: "station" | "lever_arm" | "pivot";
+  report?: TrackerStationReport | TrackerMountReport | TrackerPivotReport | null;
+  reportPath?: string;
+  stationPath?: string;
+  markerTcpPath?: string;
+  /** Segments left out (no dwell / no pivot data), listed whether or not the fit then solved. */
+  skipped?: { episode: number; why: string }[];
+  summary?: string;
+  stdout?: string;
+  stderr?: string;
+  error?: string;
+};
+
+// --- GT comparison: camera trajectory vs tracker (validate_against_tracker) ---
+
+export type TrackerErrorStats = {
+  count: number;
+  mean_mm?: number;
+  rms_mm?: number;
+  p50_mm?: number;
+  p95_mm?: number;
+  max_mm?: number;
+};
+
+export type TrackerValidateSummary = {
+  n_paired: number;
+  n_camera_frames: number;
+  coverage: number;
+  residual_mm: TrackerErrorStats;
+  /** Split by speed, because that is the axis a timing error lives on. */
+  strata: Record<string, TrackerErrorStats>;
+  clock: Record<string, unknown>;
+  registration: { source?: string; absorbed_modes?: string[]; certifies_space?: boolean };
+  lever_arm_mm: number[];
+  rotation_sensitivity_mm_per_deg: number;
+  interp_error_mm_bound: number;
+  time_crosscheck_s: number | null;
+  certifies_space: boolean;
+};
+
+export type TrackerValidateReport = {
+  dataset: string;
+  episode: number;
+  target: string;
+  sidecar: string;
+  summary: TrackerValidateSummary;
+  min_coverage: number;
+  lever_arm_m: number[];
+  mount_fit: Record<string, unknown> | null;
+  /** "tcp": camera TCP - tracker TCP (c_TCP error included); "smr_centre": the lever arm absorbed the constants. */
+  compared_point?: "tcp" | "smr_centre";
+  tcp_from?: Record<string, unknown> | null;
+  /** "argus_sidecar_sof_plus_exposure" or "dataset_nfps_grid_episode_local". */
+  camera_time_base: string;
+};
+
+export type TrackerValidateResponse = {
+  ok: boolean;
+  returncode?: number;
+  kind?: "validate";
+  report?: TrackerValidateReport | null;
+  reportPath?: string;
+  summary?: string;
+  episodeDir?: string;
+  exposureFraction?: number;
+  stderr?: string;
+  error?: string;
+};
+
+// --- One-click tracker-mount capture: record -> discover -> solve -----------
+
+/**
+ * Who owns the recorder while parked poses are collected.
+ *
+ * Minted and kept by the gateway, not by this page: the session name used to
+ * live in React state, so a reload renamed the run in flight and orphaned every
+ * dwell already on disk, and Live Record had no way to know a mount capture was
+ * under way. Both pages read this one object instead.
+ */
+export type TrackerMountSession = {
+  active: boolean;
+  /** idle | capture | landed | failed. `landed` is the only solvable one. */
+  stage: string;
+  sessionName: string;
+  captureRoot: string;
+  trackerSessionId: string;
+  landedPath: string;
+  /** Presses. Diverges from `dwellsOnDisk` when a take was discarded. */
+  dwellsStarted: number;
+  /** Episode directories actually written -- what the solve will read. */
+  dwellsOnDisk: number;
+  message: string;
+  startedAt: string;
+  recorderState: string;
+  episodeInFlight: boolean;
+  /** "dwell" (station + lever arm) or "pivot" (E1p, TCP pinned in the socket). */
+  kind?: "dwell" | "pivot";
+  /** Segments saved before they could hold a dwell; each needs re-recording. */
+  shortSegments?: number;
+  lastSegmentSeconds?: number;
+  segmentMinSeconds?: number;
+  segmentSuggestedSeconds?: number;
+  /** Capture-time geometry from each saved segment's tracker samples. */
+  live?: TrackerMountLiveGeometry;
+};
+
+/** One saved segment as the recorder saw it at Stop (LT_SEGMENT). */
+export type TrackerMountLiveSegment = {
+  episode: number;
+  kind: "dwell" | "pivot";
+  n: number;
+  /** dwell: median parked SMR point, tracker frame. */
+  point_mm?: number[];
+  spread_mm?: number;
+  /** pivot: the same weak-direction gain the E1p solve gates on. */
+  gain_min?: number | null;
+  gain_max?: number | null;
+  radius_mm?: number | null;
+  rms_mm?: number | null;
+  span_deg?: number | null;
+  ok?: boolean;
+};
+
+export type TrackerMountLiveGeometry = {
+  segments: TrackerMountLiveSegment[];
+  station: null | { n: number; extent_m: number | null; planarity: number | null; ok: boolean };
+  thresholds: { stationMinExtentM: number; stationMinPlanarity: number; pivotMinGain: number };
+};
+
+/** E1p: production's TCP against the pivot socket the tracker finds. */
+export type TrackerPivotReport = {
+  n_poses: number;
+  cube?: string;
+  mount_id?: string;
+  static_tcp_error_mm: { p95: number; rms: number; max: number; per_pose: number[] };
+  tcp_budget_mm: number;
+  static_p95_within_budget: boolean;
+  c_tcp_production_mm: number[];
+  c_tcp_measured_mm: number[];
+  c_tcp_error_mm: number[];
+  c_tcp_error_norm_mm: number;
+  d_cube_mm: number[];
+  split: null | {
+    cube_frame_constant_mm: number[];
+    world_frame_constant_mm: number[];
+    pose_dependent_rms_mm: number;
+    gain_min: number;
+  };
+  sphere: null | {
+    radius_mm: number;
+    rms_mm: number;
+    gain_min: number;
+    center_sigma_norm_mm: number | null;
+    center_sigma_weak_mm: number;
+    /** Continuous pivots: delete-one-time-block jackknife (sees the hand-held wander). */
+    center_sigma_jackknife_norm_mm?: number | null;
+    center_sigma_jackknife_weak_mm?: number | null;
+    /** The larger of bootstrap and jackknife -- what certification gates on. */
+    center_sigma_quoted_mm?: number | null;
+    /** Continuous pivots only: what the sphere was fitted from. */
+    continuous?: {
+      n_points: number;
+      n_points_seated: number;
+      lifted_fraction: number | null;
+      n_direction_cells: number;
+      max_radial_mm: number;
+      radial_sigma_mm: number | null;
+    };
+  };
+  radius_check_mm: null | {
+    sphere_radius_mm: number;
+    socket_to_smr_from_camera_mm: number;
+    difference_mm: number;
+  };
+  certifies: boolean;
+  certify_reasons: string[];
+  cannot_see: string[];
+  /** SMR -> TCP in the cube frame, TCP end from the tracker; only with a lever-arm fit. */
+  smr_to_tcp_cube_mm?: number[];
+  smr_to_tcp_norm_mm?: number;
+  /** "tcp" when graded on production's own TCP labels, "cube" on cube poses. */
+  pose_frame?: string;
+  bundle_calibration_id?: string | null;
+  /** Legacy dwell-based pivots: samples without a pause; listed, not fatal. */
+  episodes_without_dwells?: { dataset: string; episode: number; why: string }[];
+  /** Continuous pivots: samples with no solved frame or no beam; listed, not fatal. */
+  episodes_skipped?: { dataset: string; episode: number; why: string }[];
+  /** Continuous pivots: every seated frame compared, pooled into attitude cells. */
+  sampling?: TrackerPivotSampling;
+};
+
+export type TrackerPivotSampling = {
+  mode: "continuous";
+  n_frames: number;
+  n_frames_seated: number;
+  n_attitudes: number;
+  attitude_cell_deg: number;
+  per_frame_error_mm: null | { n: number; p95: number; rms: number; max: number };
+  by_smr_speed: { smr_speed_mm_s: [number, number | null]; n: number; p95?: number; rms?: number; max?: number }[];
+  lift_sensitivity: null | { median: number; p10: number };
+};
+
+export type TrackerMountSessionResponse = {
+  ok: boolean;
+  error?: string;
+  session?: TrackerMountSession;
+};
+
+export type TrackerMountCapture = {
+  dataset: string;
+  datasetName: string;
+  episode: number;
+  episodeDir: string;
+  sessionId: string;
+  sessionPath: string;
+  /** The session seals and lands at Disconnect, not at the end of an episode. */
+  landed: boolean;
+  poseLabel: string;
+  purpose: string;
+  /** smr_parked_pose_dwell | tcp_pivot_sweep (tcp_pivot_dwell before 2026-09-22); empty on older captures. */
+  protocol?: string;
+  segmentSeconds?: number;
+  beamValidFraction: number;
+  streamAdvanced: boolean;
+  trackerError: string;
+  modifiedUnixS: number;
+};
+
+export type TrackerMountCaptureListResponse = {
+  ok: boolean;
+  episodes?: TrackerMountCapture[];
+  error?: string;
+};
+
+export type TrackerMountCaptureDeleteResponse = {
+  ok: boolean;
+  deleted?: number;
+  removedDirs?: string[];
+  /** Tracker streams no surviving episode referred to any more. */
+  removedStreams?: string[];
+  error?: string;
+};
+
+export type TrackerMountRecordResponse = {
+  ok: boolean;
+  captureRoot?: string;
+  episodeIndex?: number;
+  seconds?: number;
+  error?: string;
+};
+
+export type TrackerMountChainResponse = {
+  ok: boolean;
+  /** Diagnostic mode graded with a fit that ran but does not certify. */
+  uncertifiedFit?: boolean;
+  fit?: TrackerMountSolveResponse | null;
+  validate?: TrackerValidateResponse | null;
+  error?: string;
+};

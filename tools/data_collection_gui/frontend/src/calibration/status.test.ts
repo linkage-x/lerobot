@@ -244,6 +244,21 @@ describe("promotionView", () => {
     expect(rows[0].baselineMm).toBe("0.64");
   });
 
+  it("says how cameras were paired, and names a module that changed port", () => {
+    expect(promotionView(review).pairing).toContain("按端口配对");
+    const bySerial = {
+      ...review,
+      extrinsics: {
+        ...review.extrinsics!,
+        pairedBy: "serial" as const,
+        cameras: [{ ...review.extrinsics!.cameras![0], serial: "H120K-I05130060", livePort: "cam_09" }],
+      },
+    };
+    const view = promotionView(bySerial);
+    expect(view.pairing).toContain("按模组序列号配对");
+    expect(view.rows[0].module).toBe("…060（原在 cam_09）");
+  });
+
   it("shows the reprojection numbers but refuses to let them read as a verdict", () => {
     const view = promotionView(review);
     expect(view.rmseNote).toContain("0.2728");

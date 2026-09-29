@@ -7,6 +7,21 @@
       "calibration_id": "thor_gmsl2_selfcal_0804_fisheye_extrinsics",
       "parent_world_frame_id": null,
       "reason": "frozen_reference"
+    },
+    {
+      "world_frame_id": "world_20260928_063531",
+      "created_utc": "2026-09-28T07:04:05Z",
+      "calibration_id": "calib_20260928_143107_extrinsics",
+      "parent_world_frame_id": "world_20260819_031843",
+      "reason": "no_stable_cluster"
+    },
+    {
+      "world_frame_id": "world_20260923_143048",
+      "created_utc": "2026-09-28T07:04:22Z",
+      "calibration_id": "calib_20260923_cam13refit_extrinsics",
+      "parent_world_frame_id": "world_20260819_031843",
+      "reason": "no_stable_cluster",
+      "note": "exported 09-23 but never committed to world_reference.json, so episodes recorded 09-24..09-28 with this calibration were stamped world_20260819_031843"
     }
   ],
   "edges": []
