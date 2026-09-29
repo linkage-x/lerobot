@@ -169,7 +169,7 @@
     <span class="pill">目标：TCP 位置 3 mm（2026-09-22 定，不含姿态）</span>
     <span class="pill">首个 TCP 轨迹误差（诊断）· 2026-09-24</span>
     <span class="pill">站位首次认证 · 2026-09-28</span>
-    <span class="pill">本页 v1.10 · 2026-09-28</span>
+    <span class="pill">本页 v1.11 · 2026-09-29</span>
   </div>
   <div class="readouts">
     <div class="readout"><div class="label">GT 链自身预算 · <b>球心口径</b></div><div class="value">≤ 1.0 mm</div><div class="note">低于它才有资格裁决 3 mm。TCP 位置的常量项<b>改由跟踪仪 pivot（E1p）直接测</b></div></div>
@@ -184,8 +184,9 @@
 <main class="stack">
 
 <section class="card" id="verdict">
-  <div class="section-title"><h2>结论先行</h2><span class="badge todo">12 条</span><span class="badge ok">第 1 条 2026-09-28 新增</span></div>
+  <div class="section-title"><h2>结论先行</h2><span class="badge todo">13 条</span><span class="badge ok">第 1 条 2026-09-29 新增</span></div>
   <ul class="verdict">
+    <li class="lead"><b>2026-09-29：换上形封闭 pivot 插件 v2（顶住指尖端面定位），TCP 定义为它的球窝中心，d = 0 按定义成立；right 常量换成新插件的实测值并上线。</b>ep2 球窝（cube 系）= (0.51, −217.00, 121.96) mm，弱方向增益 0.064，<b>第一次过 0.05 门槛</b>；只剩球窝 σ 0.31 mm（jackknife）高于 0.10，仍不认证。与 09-28 常量差 4.49 mm，几乎全在<b>指宽方向</b>（4.35 mm）——旧插件在这个方向只靠摩擦，这是换了一个物理点，不是测得更准。录制中球窝抖了一下（开头 8 s 未落座、28 s 一次尖峰），0.2 mm 落座门限已自动剔除，手动再裁时间窗只动 ≤ 0.04 mm。同一次夹持的 ep1 与 ep2 差 0.83 mm。还没有用新插件录自由运动，所以 TCP 轨迹误差仍是 09-28 旧插件的数。见 <a href="#w3d">W3d</a>。</li>
     <li class="lead"><b>2026-09-28：全相机重标外参 + cube 重装后第二轮。站位第一次认证通过（rms 0.74 mm）；TCP 轨迹误差用 pivot 实测 c<sub>TCP</sub> 时 p50 1.20 / p95 3.12 mm（诊断，d 按 0、界 &lt; 3 mm）。</b>生产常量因 cube 重装差了 22.6 mm，right cube 常量已换成 pivot 实测值并上线。静止 p95 约 1 mm、随速度升到 3 mm；时间偏置扫出 Δt = −5 ms（曝光中点在 SOF 前约 5 ms），补上后 p95 2.02 mm。符号已定为 −0.5（相机时刻 = SOF − E/2），metrology 默认值已改；<b>但生产录制器仍用 0.0</b>：它只决定 BOX 配帧，而 BOX 自身约 8.7 / 3.2 ms 的传输延迟没人扣，SOF 偏晚正好抵掉一半，单改相机这一半会让两个 BOX 都更偏。09-24–09-28 盖错的 world id 已改正。常量已换并上线（顺带修了 pivot 工具漏乘 R<sub>x</sub>(π) 的坐标系 bug）。见 <a href="#w3c">W3c</a>。</li>
     <li class="lead"><b>2026-09-24：TCP 轨迹误差的整条链第一次跑通，数是 p50 4.70 / p95 6.90 mm（诊断，不认证）。</b>链路是站位 → 杠杆臂 → 跟踪仪 pivot → 自由运动比较；比较的是<b>相机 TCP − 跟踪仪 TCP</b>，生产 c<sub>TCP</sub> 的常量误差包含在内，只剩偏距 d 看不见。误差<b>不随速度变</b>（静止 5.15 / 慢 4.70 / 中 4.65 mm），所以是几何或常量项，不是时间项。最大的一块是生产 c<sub>TCP</sub> 常量误差 <b>4.9 mm</b>（(3.05, −3.82, −0.6) mm），随姿态变化的部分约 2.1 mm。不认证的原因都在采集侧：只录了 6 路相机（缺 07/09/14，每帧中位 3 台）、站位散布 0.28 m、pivot 绕光束滚转不够、d 未量。详见 <a href="#w3b">W3b</a>。</li>
     <li class="lead"><b>2026-09-22：目标收窄为「认证 TCP 位置 3 mm」，姿态不再是必测量。</b>TCP 位置 = R<sub>i</sub>·c<sub>TCP</sub> + t<sub>i</sub>，TCP 的姿态不进式子，所以 bundle 的旋转只通过 c<sub>TCP</sub>（3 个数）起作用——<a href="#budget">表外 ①</a> 那 3.5–9.1 mm 在位置口径下<b>只是 c<sub>TCP</sub> 的一个误差来源</b>，可以不测旋转、直接在 TCP 处测。办法是<b>跟踪仪 pivot（新增 <a href="#experiments">E1p</a>）</b>：SMR 留在钢片上不动，TCP 卡进相机 pivot 标定用的同一个球窝里转，钢片球心落在以球窝中心为心的球面上，跟踪仪单独定出球窝中心，再用冻结站位与生产标签<b>逐位姿相减</b>。c<sub>TCP</sub> 原样代入、不拟合，所以常量误差与静态姿态相关误差都直接可见。顺带：left 的 pivot 平移第一次有独立核对、right 的拷贝平移（最坏 13 mm）直接实测、6.15 mm URDF 矛盾同场裁决。<b>T4b 三窝 / STS 从 3 mm 位置路径上移出</b>，只在要认证 TCP 姿态时再做。新增一个必须单独收紧的量：<b>球窝中心 → TCP 的定义偏距 d</b>——两边都加它、在比较里抵消，跟踪仪看不见；要 CAD / 卡尺量到约 0.3 mm，而生产 pivot 工具给它的默认 σ 是 5 mm。推导见 <a href="box_umi_smr_lever_arm_theory.html">TCP 位置认证原理</a>，待办见 <a href="#next">下一步</a>。</li>
@@ -229,7 +230,7 @@
   <div class="table-scroll">
   <table class="metric-table">
     <tr><th>#</th><th>需要你做（不需要 Thor）</th><th>卡住什么</th></tr>
-    <tr class="lead"><td class="key">U1 <span class="badge warn">09-28：条件不具备</span></td><td><b>用户答复：只能目测保证 d ≈ 0</b>（球窝中心即 TCP），所以结论里 d 是一项<b>未量化</b>的定义误差，必须在结论里写明。原文：<b>量准 d。</b>pivot 插件球心 → TCP 的偏距与方向，CAD / 卡尺 / 三坐标，目标约 ±0.3 mm；并确认生产用的 TCP 就是这个点。</td><td>3 mm 结论本身（跟踪仪看不见 d）</td></tr>
+    <tr class="lead"><td class="key">U1 <span class="badge ok">09-29：改为按定义</span></td><td><b>09-29：用形封闭插件 v2 把 TCP 定义成它的球窝中心，d = 0 按定义成立</b>（插件相对指尖由硬基准定位，设计者给出 &lt; 0.2 mm）。剩下的是另一件事：这个点到 URDF 闭合指尖中心 <code>link_lt_gripper_tcp</code> 的偏距（插件 CAD + 夹持宽度下的指尖后退量 z(w)），只在与 FR3 FK 比较时需要，尚未记入 bundle。以下为 09-28 原状态：<b>用户答复：只能目测保证 d ≈ 0</b>（球窝中心即 TCP），所以结论里 d 是一项<b>未量化</b>的定义误差，必须在结论里写明。原文：<b>量准 d。</b>pivot 插件球心 → TCP 的偏距与方向，CAD / 卡尺 / 三坐标，目标约 ±0.3 mm；并确认生产用的 TCP 就是这个点。</td><td>3 mm 结论本身（跟踪仪看不见 d）</td></tr>
     <tr><td class="key">U2</td><td><b>确认 pivot 工装能用于 E1p。</b>球窝能固定在跟踪仪视野内的桌面上；夹住插件后，钢片 SMR 在侧倾 ±45–60°、前后倾 ±25° 内不断光；磁吸窝有防脱。</td><td>E1p</td></tr>
     <tr><td class="key">U3</td><td><b>回答 <a href="#inputs">⑦ ⑧</a>。</b>套筒是否占掉某台相机的位置；球心到安装面的悬伸。</td><td>|c|、球心 → TCP 距离、转移项</td></tr>
     <tr><td class="key">U4</td><td><b>跟踪仪与工控机空闲时做 E0。</b>静载刚度 mm/N（弹簧秤 + 跟踪仪读位移）、接受角扫掠（绕两轴转到失锁记角度）。在工控机上直接跑 logger 或 RadianCAL 即可，不经过 GUI、不需要 Thor。</td><td>T6 钢片刚度行；E1p 可用的倾角</td></tr>
@@ -285,6 +286,17 @@
       <b>生产常量（已上线）：</b>新 bundle <code>marker_to_tcp_calibration_20260928.json</code>（opencv_kalibr <code>cf5b99a</code>，已部署 Thor），right 平移换成 pivot 实测 (1.04, −216.46, 126.39) mm，旋转保留；σ 2.05 mm/轴（球窝 0.47 与夹持重复性 2 mm 合成）；d 记 0、界 &lt; 3 mm。left 沿用 0825、文件里标过期风险；hybrid carrier 用自己的 CAD bundle，不受影响。<br/>
       <b>坐标系 bug（已修）：</b>第一次直接用产物的 cube 系数换常量，TCP 误差只从 22.4 降到 14.7 mm。对比 sidecar 发现 TCP 系下的移动 y、z 反号：生产 sidecar 的位姿是 <code>T_cube_tcp · R<sub>x</sub>(π)</code>（april yaml 的 <code>target_child_link</code> 经 URDF 跳到 <code>corenetic_gripper_ee</code>），而 pivot 工具换回 cube 系时漏了这一跳。已改为从跟踪配置读 URDF 的固定链（<code>metrology/pose_frame_hop.py</code>，<code>--tracking-config</code>），加回归测试。<br/>
       <b>world id 碎片：</b>这次解算一度被 GUI 的 commit 和 freeze 各发了一个新 world id（065203 / 065221 作废，只保留 063531），已修成复用导出时的 id；09-24–09-28 录的 episode 实际属于 09-23 的孤岛、却被盖成 <code>world_20260819</code>——<b>09-28 已改正</b>（新工具 <code>tools/thor/gmsl2/restamp_world.py</code>：原 block 原样存在 <code>restamp.original</code> 里、只替换指定 id、目标必须是 world graph 的节点、默认 dry run）。Thor 上共改 33 个 episode meta + 6 个数据集 info.json → <code>world_20260923_143048</code>（09-23 pivot 之后、18:55 起，含 <code>_no_cam12</code> 派生树的软链）；09-28 重装后到提交前录的外参采集 1 个 episode + 1 个 info.json → <code>world_20260928_063531</code>。09-23 14:31 那次 pivot 及更早的 tm_20260923_* 属于重装前，保持 0819。现在 Thor 上重装后录的文件没有一个还声称 0819。</td><td><b>站位第一次认证</b>；TCP 误差诊断值 p95 3.12 mm（实测常量、d=0）</td></tr>
+    <tr class="lead" id="w3d"><td class="key">W3d <span class="badge ok">09-29 新插件</span></td><td><b>形封闭 pivot 插件 v2 第一次 E1p；right 常量换成它的球窝中心并上线（TCP := 球窝中心，d = 0）。</b>站位沿用 09-28 认证的 <code>station_20260928_160434</code>：用相机 + 站位推出的 |SMR − 球窝| = 93.45 mm，与跟踪仪球面半径 93.43 mm 只差 0.02 mm，站位仍有效；SMR 在 cube 系里只动约 1 mm，钢片与 cube 都没动。
+      <div class="table-scroll"><table class="metric-table">
+        <tr><th>段</th><th>球窝（cube 系, mm）</th><th>半径</th><th>增益</th><th>σ（jackknife）</th><th>说明</th></tr>
+        <tr><td><b>ep2</b>（采用）</td><td><b>(0.51, −217.00, 121.96)</b></td><td>93.43</td><td><b>0.064</b></td><td>0.31</td><td>1259 落座帧 / 133 姿态格，转角跨度 89°；产物 <code>pivot_right_20260929_ep2.json</code></td></tr>
+        <tr><td>ep1</td><td>(0.43, −216.38, 122.51)</td><td>93.42</td><td>0.028</td><td>0.28</td><td>与 ep2 同一次夹持，差 0.83 mm</td></tr>
+        <tr><td>ep0</td><td>(0.94, −217.71, 123.91)</td><td>95.48</td><td>0.020</td><td>3.4</td><td>一半时间断光，几何太弱，不用</td></tr>
+        <tr><td>09-28 常量</td><td>(1.04, −216.46, 126.39)</td><td>96.04</td><td>0.047</td><td>0.47</td><td>旧插件（摩擦定位）</td></tr>
+      </table></div>
+      <b>读法：</b>① 与 09-28 差 4.49 mm，换到夹爪系是 (4.35, −0.54, 0.50) mm：指宽 / 夹持 / 手指方向。主项在指宽方向，旧 <code>centered_compact</code> 插件在这个方向没有任何定位结构，所以这是换了一个点，不是误差。② 抖动：跟踪仪残差开头 0–8 s 从 +1.1 降到 +0.2 mm（未落座），28.25 s 一次 +0.49 mm 尖峰、之后约 1.5 s 在 −0.2 mm；0.2 mm 落座门限已把两段剔掉，手动再裁掉 t &lt; 9 s 和 t ≥ 28 s，球窝只动 0.03 mm（跟踪仪）/ 0.04 mm（相机），相机侧没有超过 3 MAD 的帧，所以没有额外剔除。③ 按 cube 系 / world 系拆分误差，cube z 比直接平均多 1.15 mm（world 系部分 1.7 mm），是站位与相机 world 的共模，这次分不开，写进 open_items。④ 工具报的「半径检查差 −10.6 mm」是假警报：mount-fit 的 c 表示在生成它的 sidecar 所用 bundle（0825）的 TCP 位姿系里，拿 0928 bundle 的 sidecar 比就错了系。<br/>
+      <b>生产常量（已上线）：</b><code>marker_to_tcp_calibration_20260929.json</code>，right 平移 = ep2 球窝，旋转保留；σ 0.91 mm/轴 = √(0.31² + 0.2²（插件定位）+ 0.83²（ep1/ep2 差）)；<code>socket_centre_beyond_tcp_closed_mm</code> = 0 按定义。<code>tcp_link</code> 首词仍是 <code>link_lt_gripper_tcp</code>（代码按它取姿态跳转），说明里写明原点是插件 v2 的球窝中心。left 仍是 0825。<br/>
+      <b>还欠：</b>新插件的重夹重复性（松开再夹 3 次各 pivot 一次，或千分表）；用新插件录一段自由运动，重算 TCP 轨迹误差；球窝 → 闭合指尖中心的 CAD 偏距。</td><td>right 常量的第一个「形封闭 + 按定义 d = 0」版本</td></tr>
     <tr class="lead"><td class="key">W3</td><td>同一站位下：驻点集重采 20 段（每段 3.5–4 s）+ left / right 各一场 E1p。<b>09-24：right 一侧已按这个协议采完一轮（W3b），但只录了 6 路相机、站位跨度不够，结果只能当诊断。</b>left 一侧未采。</td><td><b>第一次 TCP 位置常量实测</b>（含 right 的 13 mm 风险与 6.15 mm 矛盾）</td></tr>
     <tr><td class="key">W4</td><td>E3a 固定姿态动态，按速度档。</td><td>动态增量第一组数</td></tr>
   </table>

@@ -7433,3 +7433,45 @@ def test_the_expected_ports_come_from_the_production_extrinsics_run(tmp_path, mo
 
     monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "legacy_extrinsics"})
     assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_07": "SN-OLD"}
+
+
+def test_a_port_the_run_solved_no_pose_for_is_not_enforced(tmp_path, monkeypatch):
+    """2026-09-29: cam_04 answered during the 09-28 capture but never saw the board,
+    so it has no extrinsics; swapping its module while adding cameras blocked every
+    StartEpisode although no label can read that port."""
+    run = tmp_path / "outputs" / "calibration" / "run_p_extrinsics"
+    run.mkdir(parents=True)
+    (run / "camera_identity.json").write_text(json.dumps(
+        {"calibration": "run_p", "ports": {"cam_04": "SN-57", "cam_07": "SN-B"}}))
+    (run / "summary.json").write_text(json.dumps({"joint_solution": {"cameras": {"cam_07": {"status": "ok"}}}}))
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "run_p_extrinsics"})
+
+    expected = gateway._load_camera_identity_expected(state)
+    assert expected["ports"] == {"cam_07": "SN-B"}
+    assert expected["portsWithoutExtrinsics"] == ["cam_04"]
+
+    gateway._apply_recorder_output(state, "CAMERA_IDENTITY " + json.dumps({
+        "cam_04": {"serial": "SN-50", "answered": True},
+        "cam_07": {"serial": "SN-B", "answered": True},
+    }))
+    assert state.recording.cameraIdentityMismatches == []
+    gateway._start_episode(state)
+    assert written
+
+    # A solved port is still enforced.
+    state.recording.state = "armed"
+    gateway._apply_recorder_output(state, 'CAMERA_IDENTITY {"cam_07":{"serial":"SN-X","answered":true}}')
+    with pytest.raises(RuntimeError, match="cam_07 上是 SN-X"):
+        gateway._start_episode(state)
+
+
+def test_an_unreadable_run_summary_enforces_the_whole_table(tmp_path, monkeypatch):
+    run = tmp_path / "outputs" / "calibration" / "run_p_extrinsics"
+    run.mkdir(parents=True)
+    (run / "camera_identity.json").write_text(json.dumps(
+        {"calibration": "run_p", "ports": {"cam_04": "SN-57", "cam_07": "SN-B"}}))
+    state = _solve_state(tmp_path)
+    monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "run_p_extrinsics"})
+    assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_04": "SN-57", "cam_07": "SN-B"}
