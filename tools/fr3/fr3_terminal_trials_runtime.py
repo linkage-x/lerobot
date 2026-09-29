@@ -191,6 +191,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--refetch-on-trouble",
+        action="store_true",
+        help=(
+            "With --regrip-in-place: after a trial that needed the search, pressed past the "
+            "trouble force or seated high, let go in the hole and take the peg anew from "
+            "--pick-pose instead of closing on it in place."
+        ),
+    )
+    parser.add_argument(
         "--regrip-drop-mm",
         type=float,
         default=0.0,
@@ -356,6 +365,7 @@ def build_request(args: argparse.Namespace) -> TerminalTrialsRequest:
         graspAttempts=int(args.grasp_attempts),
         regripInPlace=bool(args.regrip_in_place),
         refetchEvery=int(args.refetch_every),
+        refetchOnTrouble=bool(args.refetch_on_trouble),
         releaseOnlyWhenSeated=bool(args.release_only_when_seated),
         regripDropM=float(args.regrip_drop_mm) / 1000.0,
         operatorGrade=bool(args.operator_grade),

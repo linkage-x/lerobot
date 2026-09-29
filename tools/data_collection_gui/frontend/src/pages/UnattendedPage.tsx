@@ -51,7 +51,7 @@ type Draft = { kind: string; request: Record<string, string> };
 const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
   // The 09-28 step-3 calibration run (terminal_trials_20260928_171702): peg taken from the
   // hole, fixed aim, re-gripped in place, graded by hand. Kept identical run to run so the
-  // only difference between two of them is the code. refetchEvery added 09-29, after 18:25.
+  // only difference between two of them is the code. refetchEvery added 09-29, after 18:25; refetchOnTrouble after 10:17.
   terminal_trials: {
     holePose: "0.3597,-0.1328,0.0580",
     pickPose: "0.3597,-0.1328,0.0550",
@@ -64,6 +64,7 @@ const DEFAULT_REQUESTS: Record<string, Record<string, string>> = {
     graspAttempts: "2",
     regripInPlace: "1",
     refetchEvery: "8",
+    refetchOnTrouble: "1",
     releaseOnlyWhenSeated: "0",
     operatorGrade: "1",
     fixedHole: "1",
@@ -110,6 +111,7 @@ const FIELD_HELP: Record<string, string> = {
   fixedHole: "1: keep aiming at holePose; reference trials record what they read but do not move the aim (09-28: updates walked it 4.6 mm off and it missed).",
   regripInPlace: "1: close on the peg where it was let go of, before retreating (no new descent to fetch it).",
   refetchEvery: "With regripInPlace: every N trials, let go in the hole and take the peg anew from pickPose (09-28: after 12 in-place re-grips the peg sat ~6 mm off in the fingers). 0 = never.",
+  refetchOnTrouble: "1: with regripInPlace, after a trial that needed the search, pressed past 16 N or seated 3 mm high, take the peg anew from pickPose instead of re-gripping it crooked (09-29 10:17).",
   releaseOnlyWhenSeated: "1: keep hold of a peg the automatic verdict did not call seated.",
   operatorGrade: "1: after every descent, with the peg still held, ask you whether it is in the hole; it lets go only on your \"in\". Calibrates the automatic verdict."
 };

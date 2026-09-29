@@ -110,6 +110,7 @@ def _plan_terminal_trials(
         graspAttempts=int(request.get("graspAttempts") or 1),
         regripInPlace=_flag(request, "regripInPlace"),
         refetchEvery=int(request.get("refetchEvery") or 0),
+        refetchOnTrouble=_flag(request, "refetchOnTrouble"),
         releaseOnlyWhenSeated=_flag(request, "releaseOnlyWhenSeated"),
         operatorGrade=_flag(request, "operatorGrade"),
         updateReference=not _flag(request, "fixedHole"),
@@ -153,6 +154,8 @@ def _plan_terminal_trials(
         argv.append("--regrip-in-place")
     if trials_request.refetchEvery:
         argv.append(f"--refetch-every={trials_request.refetchEvery}")
+    if trials_request.refetchOnTrouble:
+        argv.append("--refetch-on-trouble")
     if trials_request.releaseOnlyWhenSeated:
         argv.append("--release-only-when-seated")
     if trials_request.operatorGrade:

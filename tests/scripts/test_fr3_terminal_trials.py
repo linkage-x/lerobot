@@ -30,6 +30,7 @@ from tools.fr3.terminal_trials import (
     orientation_from_anchor,
     run_terminal_trials,
     summarize_by_offset,
+    trial_trouble,
     validate_terminal_trials,
 )
 
@@ -672,8 +673,62 @@ def test_a_fixed_hole_reference_trial_is_counted_checked_and_refetched_like_any_
     assert [row["refetch"] for row in trials] == [(i + 1) % 4 == 0 for i in range(len(trials))]
 
 
+def test_trouble_is_a_missed_first_landing_a_hard_press_or_a_high_seat():
+    request = _request(troubleAboveMm=3.0, troubleDfzN=16.0)
+    clean = {"searchIndex": 0, "pressCapped": False, "dfzPeakN": -9.5, "seatedDepthErrorMm": 1.7,
+             "searchAttempts": [{"dfzPeakN": -9.5}]}
+    assert trial_trouble(clean, request) == []
+    # The peg's second resting pose: -14 to -16 N on a first-landing seat is not trouble.
+    assert trial_trouble({**clean, "dfzPeakN": -15.0}, request) == []
+    assert trial_trouble({**clean, "searchIndex": 1}, request) == ["search"]
+    assert trial_trouble({**clean, "searchAttempts": [{"dfzPeakN": -17.0}, {"dfzPeakN": -9.0}]},
+                         request) == ["press"]
+    assert trial_trouble({**clean, "pressCapped": True}, request) == ["press"]
+    assert trial_trouble({**clean, "seatedDepthErrorMm": 3.2}, request) == ["high"]
+
+
+@pytest.mark.parametrize("graded", [False, True])
+def test_a_trial_that_went_badly_takes_the_peg_anew_instead_of_regripping_it_in_place(capsys, graded):
+    """09-29 10:17: in-place re-grips kept a crooked, slid peg until the run halted."""
+
+    # The hole sits 6 mm off the aim, so every first landing misses and the search finds it.
+    hole = (SEATED[0] + 0.006, SEATED[1], SEATED[2])
+    robot = FakeTrialRig(hole_xy=hole[:2], capture_m=0.0042, peg_xyz=hole)
+    request = _request(offsetsMm=(0.0,), repeats=2, controlEvery=100, searchRingM=0.007,
+                       regripInPlace=True, refetchOnTrouble=True, pickXyz=hole,
+                       operatorGrade=graded, updateReference=False)
+    kwargs = {"ask_grade": lambda trial: "in"} if graded else {}
+    summary = run_terminal_trials(robot, request, **kwargs)
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert summary["seated"] == len(trials) == 3
+    assert all(row["troubleRefetch"] == ["search"] for row in trials)
+    grasps = [row for row in summary["rows"] if row.get("kind") == "grasp" and row["stage"] != "start"]
+    assert [(row["stage"], row["reason"], row["graspVerdict"]) for row in grasps] == [
+        ("refetch", "trouble", "held")] * 3
+    out = capsys.readouterr().out
+    assert "regrip_after_release" not in out
+    assert out.count("terminal_trials_trouble_refetch") == 3
+    # No clean seat to aim the stow at: it goes to the hole estimate and searches from there.
+    assert summary["stow"]["landingXyz"] == pytest.approx(list(SEATED))
+    assert summary["stow"]["seated"] and _stowed(robot)
+
+
+def test_a_clean_run_with_the_trouble_refetch_on_still_regrips_in_place(capsys):
+    robot = FakeTrialRig(hole_xy=SEATED[:2], capture_m=0.0042, peg_xyz=SEATED)
+    request = _request(offsetsMm=(0.0,), repeats=2, controlEvery=100, regripInPlace=True,
+                       refetchOnTrouble=True, pickXyz=SEATED)
+    summary = run_terminal_trials(robot, request)
+    stages = [row["stage"] for row in summary["rows"] if row.get("kind") == "grasp"]
+    assert stages == ["start", "regrip", "regrip", "regrip"]
+    assert "terminal_trials_trouble_refetch" not in capsys.readouterr().out
+
+
 def test_refetching_needs_somewhere_to_take_the_peg_from():
     request = _request(regripInPlace=True, refetchEvery=4, pickXyz=None)
+    with pytest.raises(TerminalTrialError, match="pickXyz"):
+        validate_terminal_trials(request, build_trial_schedule(request))
+    request = _request(regripInPlace=True, refetchOnTrouble=True, pickXyz=None)
     with pytest.raises(TerminalTrialError, match="pickXyz"):
         validate_terminal_trials(request, build_trial_schedule(request))
 

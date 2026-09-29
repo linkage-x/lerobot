@@ -188,6 +188,18 @@ class TerminalTrialsRequest:
     # fingers at trial 13 with the hole unmoved (the operator), met the mouth 40 mm up, and
     # three trials later needed a hand; one fresh pick and the next ten seated first time.
     refetchEvery: int = 0
+    # With `regripInPlace`, also take the peg anew after any trial that went badly (see
+    # `trial_trouble`) and ended with the peg in the hole, rather than closing on it in place.
+    # 09-29 10:17: a peg that met the mouth once did so again 2-3 trials later, pressed -17 to
+    # -22 N and slid ~5 mm up the fingers; each in-place re-grip kept that, and trial 14 halted.
+    # Every fresh grasp so far was followed by a clean trial.
+    refetchOnTrouble: bool = False
+    # What counts as going badly: seated this far or more above the target, mm ...
+    troubleAboveMm: float = 3.0
+    # ... or any landing pressed this hard, N below its tare. Not the 12 N first proposed: the
+    # clean 09-29 10:03 run had 8 of 25 seats at -14 to -16 N (the peg's second resting pose in
+    # the fingers), all first-landing, and those are not what to spend a fetch on.
+    troubleDfzN: float = 16.0
     # Keep hold of a peg that did not seat instead of standing it on the face. See
     # `TerminalServoRequest.releaseOnlyWhenSeated`: this is the only one of the three fixes that
     # addresses where the peg is actually lost.
@@ -598,8 +610,8 @@ def validate_terminal_trials(
         raise TerminalTrialError("maxReferenceStepM must be positive.")
     if request.refetchEvery < 0:
         raise TerminalTrialError("refetchEvery must be 0 (never) or a number of trials.")
-    if request.refetchEvery and request.pickXyz is None:
-        raise TerminalTrialError("refetchEvery takes the peg anew from pickXyz: give one.")
+    if (request.refetchEvery or request.refetchOnTrouble) and request.pickXyz is None:
+        raise TerminalTrialError("refetching takes the peg anew from pickXyz: give one.")
     if request.referenceRingM <= 0.0:
         raise TerminalTrialError(
             "referenceRingM must be positive: a reference trial has to be able to find the hole "
@@ -643,6 +655,27 @@ def validate_terminal_trials(
         # point, and this is the number that says how much room it has before it does.
         "widestCommandedMm": reach_mm,
     }
+
+
+def trial_trouble(descent: dict[str, Any], request: TerminalTrialsRequest) -> list[str]:
+    """Why a descent that ended in the hole is still not one to re-grip in place after.
+
+    `search`: the first landing missed, which on a fixed hole means the peg's tip is not where
+    it was in the fingers. `press`: some landing pressed past `troubleDfzN`, the load that slid
+    the peg up the fingers on 09-29. `high`: it stopped `troubleAboveMm` or more above the
+    target, which with the hole unmoved is that slide already done.
+    """
+
+    reasons = []
+    if int(descent.get("searchIndex") or 0) > 0:
+        reasons.append("search")
+    peaks = [attempt.get("dfzPeakN") for attempt in descent.get("searchAttempts") or []]
+    peaks = [float(value) for value in peaks + [descent.get("dfzPeakN")] if value is not None]
+    if descent.get("pressCapped") or (peaks and min(peaks) <= -request.troubleDfzN):
+        reasons.append("press")
+    if float(descent["seatedDepthErrorMm"]) >= request.troubleAboveMm:
+        reasons.append("high")
+    return reasons
 
 
 def _servo_for(
@@ -749,6 +782,7 @@ def run_terminal_trials(
     # Trials since the fingers last took the peg from above (the start grasp, a repick, a
     # refetch), as opposed to closing on it where it was let go of.
     since_fetch = 0
+    refetch_on_trouble = request.regripInPlace and request.refetchOnTrouble
 
     def emit(row: dict[str, Any]) -> None:
         rows.append(row)
@@ -833,13 +867,36 @@ def run_terminal_trials(
                 )
                 if grade["answer"] == "reset":
                     return "open"
-                return grade["answer"] == "in"
+                if grade["answer"] != "in":
+                    return False
+                return refetch_if_troubled(descent)
+
+            def refetch_if_troubled(descent: dict[str, Any]) -> bool | str:
+                """In the hole: let go without closing again if the trial went badly."""
+
+                if not refetch_on_trouble:
+                    return True
+                reasons = trial_trouble(descent, request)
+                if not reasons:
+                    return True
+                grade["trouble"] = reasons
+                return "open"
+
+            def auto_gate(descent: dict[str, Any], servo: TerminalServoRequest = servo) -> bool | str:
+                # The servo's own rule, plus the trouble refetch for a peg it called seated.
+                if descent["searchStoppedOn"] != "seated":
+                    return not servo.releaseOnlyWhenSeated
+                return refetch_if_troubled(descent)
 
             if request.operatorGrade:
                 result = execute_terminal_servo(robot, servo, release_gate=release_gate,
                                                 commanded_rotvec=anchor_rotvec)
+            elif refetch_on_trouble:
+                result = execute_terminal_servo(robot, servo, release_gate=auto_gate,
+                                                commanded_rotvec=anchor_rotvec)
             else:
                 result = execute_terminal_servo(robot, servo, commanded_rotvec=anchor_rotvec)
+            trouble = list(grade.get("trouble") or [])
             if result.get("controlLoopDied"):
                 emit({"kind": "trial", "index": spec.index, "trialKind": spec.kind, "ok": False,
                       "error": result.get("error"), "controlLoopDied": True,
@@ -908,6 +965,7 @@ def run_terminal_trials(
                 "handoffXyz": [float(value) for value in result["handoffXyz"]],
                 "released": bool(result.get("released", True)),
                 "refetch": refetch,
+                "troubleRefetch": trouble,
                 "fzTareN": result.get("fzTareN"),
                 "dfzPeakN": result.get("dfzPeakN"),
                 "dfzEndN": result.get("dfzEndN"),
@@ -951,9 +1009,11 @@ def run_terminal_trials(
             # in the fingers -- and since the peg is about to be re-gripped at exactly that
             # pose, that sum is precisely the pose the next trial should aim at.
             confirmed = row["operatorGrade"] == "in" if request.operatorGrade else verdict == "seated"
-            if confirmed and row["released"]:
+            if confirmed and row["released"] and verdict == "seated" and not trouble:
                 # Where the end of the run puts the peg back (`_stow`): the commanded landing,
                 # not where the tool stopped, since the command is what put the tool over the hole.
+                # Only a clean seat: 09-29 10:17 aimed the stow at a search landing that a crooked
+                # peg had found, graded in at 6 mm high, and the straightened peg missed it.
                 seated_landing = tuple(float(value) for value in result["searchLandingXyz"])
             if spec.kind == "reference":
                 if confirmed:
@@ -1073,10 +1133,13 @@ def run_terminal_trials(
                 _, _, width = _observation_xyz_rotvec_gripper(robot)
                 grasp = _grasp_verdict(width, state.graspReference, request)
                 attempts = 0
-            elif refetch:
+            elif refetch or trouble:
                 # In the hole, it is taken from the pick point, as a repick does and as the start
                 # grasp did. Let go of anywhere else, it is standing where the fingers opened.
                 stage = "refetch"
+                if trouble:
+                    print(f"[INFO] terminal_trials_trouble_refetch trial={spec.index:03d} "
+                          f"reasons={','.join(trouble)}", flush=True)
                 fetch_at = (
                     tuple(float(value) for value in request.pickXyz)
                     if confirmed
@@ -1110,6 +1173,7 @@ def run_terminal_trials(
                     "graspVerdict": grasp,
                     "attempts": attempts,
                     "atXyz": list(fetch_at),
+                    "reason": "trouble" if trouble else ("scheduled" if stage == "refetch" else None),
                 }
             )
             if grasp != "held":
@@ -1367,7 +1431,7 @@ def describe_schedule(request: TerminalTrialsRequest, schedule: Iterable[TrialSp
         + ("none (already held)" if request.pickXyz is None
            else ",".join(f"{value:+.4f}" for value in request.pickXyz))
         + f" grasp_attempts={request.graspAttempts} regrip_in_place={int(request.regripInPlace)} "
-        f"refetch_every={request.refetchEvery} "
+        f"refetch_every={request.refetchEvery} refetch_on_trouble={int(request.refetchOnTrouble)} "
         f"release_only_when_seated={int(request.releaseOnlyWhenSeated)} "
         f"operator_grade={int(request.operatorGrade)} fixed_hole={int(not request.updateReference)}",
     ]
