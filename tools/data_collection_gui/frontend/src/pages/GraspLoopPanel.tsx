@@ -28,9 +28,10 @@ function fmt(value: number | null | undefined, digits = 1): string {
 
 /** The grasp loop's live card: where the run is, what it has measured, and its two controls.
  *
- *  The loop grades itself, so there is nothing to fill in here. What the operator does is start
- *  it, put the peg back when the loop asks, and stop it -- at a trial boundary, which leaves the
- *  peg on the table and the arm homed, or with End session, which stops it where it stands. */
+ *  The loop grades its grasps itself. What the operator does is start it, put the peg back when
+ *  the loop asks, answer in / out for each insertion of an end-to-end run (the fingers open only
+ *  on "in"), and stop it -- at a trial boundary, which leaves the peg on the table or in the hole
+ *  and the arm homed, or with End session, which stops it where it stands. */
 export function GraspLoopPanel({
   run,
   busy,
@@ -38,7 +39,7 @@ export function GraspLoopPanel({
 }: {
   run: RolloutRun;
   busy: boolean;
-  onControl: (command: "grasp_stop" | "grasp_continue") => void;
+  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out") => void;
 }) {
   const progress: GraspLoopProgress | undefined = run.graspLoop;
   const live = run.state !== "complete" && run.state !== "error" && run.state !== "stopped";
@@ -51,6 +52,7 @@ export function GraspLoopPanel({
     );
   }
   const [low, high] = wilsonInterval(progress.held, progress.graded);
+  const [e2eLow, e2eHigh] = wilsonInterval(progress.inserted ?? 0, progress.e2eGraded ?? 0);
   const closeHeight = medianByVerdict(progress.trials, "closeAboveTargetMm");
   const lateral = medianByVerdict(progress.trials, "lateralMm");
   const done = progress.trials.length;
@@ -62,7 +64,22 @@ export function GraspLoopPanel({
     <div className="subcard">
       <h4>抓取循环 · {done} / {progress.planned}</h4>
 
-      {progress.needsOperator && (
+      {progress.needsOperator.startsWith("grade") && (
+        <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>
+            <strong>需要你判：</strong>销还夹着停在孔上。看一眼销进孔了没有——「进了」手指才张开，「没进」会夹着带回抓取点重夹。
+            <span className="hint"> {progress.needsOperator.replace(/^grade:\s*/, "")}</span>
+          </span>
+          <button type="button" className="primary" disabled={busy} onClick={() => onControl("grasp_in")}>
+            进了
+          </button>
+          <button type="button" disabled={busy} onClick={() => onControl("grasp_out")}>
+            没进
+          </button>
+        </div>
+      )}
+
+      {progress.needsOperator && !progress.needsOperator.startsWith("grade") && (
         <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           {progress.needsOperator.startsWith("reflex") ? (
             <span>
@@ -89,6 +106,20 @@ export function GraspLoopPanel({
       )}
 
       <div style={{ display: "flex", gap: 24, flexWrap: "wrap", margin: "8px 0" }}>
+        {progress.insert && (
+          <div>
+            <div className="hint">端到端（抓 + 插）</div>
+            <strong style={{ fontSize: 20 }}>
+              {progress.e2eGraded ? `${progress.inserted ?? 0} / ${progress.e2eGraded}` : "—"}
+            </strong>
+            <div className="hint">
+              {progress.e2eGraded
+                ? `${Math.round((100 * (progress.inserted ?? 0)) / progress.e2eGraded)}% · 95% CI ${Math.round(e2eLow * 100)}–${Math.round(e2eHigh * 100)}%` +
+                  (gateReading(progress.inserted ?? 0, progress.e2eGraded) ? ` · ${gateReading(progress.inserted ?? 0, progress.e2eGraded)}` : "")
+                : "no trials graded yet"}
+            </div>
+          </div>
+        )}
         {multiArm &&
           rates.map((rate) => (
             <div key={rate.arm}>
@@ -126,7 +157,9 @@ export function GraspLoopPanel({
             {progress.done
               ? "已结束"
               : progress.needsOperator
-                ? "等你放回销"
+                ? progress.needsOperator.startsWith("grade")
+                  ? "等你判进没进"
+                  : "等你放回销"
                 : current !== null
                   ? `第 ${current + 1} 条进行中`
                   : live
@@ -159,6 +192,7 @@ export function GraspLoopPanel({
               <th>#</th>
               {multiArm && <th>臂</th>}
               <th>结果</th>
+              {progress.insert && <th>插入</th>}
               <th>抬起后宽度</th>
               <th>合手高度 mm</th>
               <th>横向 mm</th>
@@ -171,6 +205,11 @@ export function GraspLoopPanel({
                 <td>{trial.trial + 1}</td>
                 {multiArm && <td>{trial.arm ?? "A"}</td>}
                 <td style={{ color: VERDICT_COLORS[trial.verdict] }}>{VERDICT_LABELS[trial.verdict] ?? trial.verdict}</td>
+                {progress.insert && (
+                  <td style={{ color: trial.inserted ? "#38a169" : trial.inserted === false ? "#e53e3e" : undefined }}>
+                    {trial.inserted ? "进了" : trial.inserted === false ? (trial.verdict === "held" ? "没进" : "—") : "未判"}
+                  </td>
+                )}
                 <td>{fmt(trial.widthLifted, 3)}</td>
                 <td>{fmt(trial.closeAboveTargetMm)}</td>
                 <td>{fmt(trial.lateralMm)}</td>

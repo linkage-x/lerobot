@@ -59,6 +59,12 @@ target: a place step converges to within 6 mm, and the funnel aims at the peg.
 
 Only the policy segment is the policy's. Everything else is the reset's own step loop, so the
 fence, the reach check and the stall detection are the ones every other motion on this rig has.
+
+End to end (v14 step 4, `insertServo`): a held grasp is not set down but carried on, homed and
+level, into the fixture's hole by step 3's servo, and graded in or out before the fingers open
+(`insert_held_peg`). In, it is let go of there -- the fixture, where the next staging fetches it
+from; out, it goes back to where it was picked and is re-gripped there as above. The rate that
+counts is then pegs in the hole over graded grasps, a miss of either layer being a miss.
 """
 
 from __future__ import annotations
@@ -100,6 +106,12 @@ from tools.fr3.scene_reset import (
     set_force_trace_path,
     traced_hold,
 )
+from tools.fr3.terminal_servo import (
+    TerminalServoRequest,
+    execute_terminal_servo,
+    validate_terminal_servo_trajectory,
+)
+from tools.fr3.terminal_trials import TERMINAL_TRIAL_STANDING_MM, classify_stop, tool_axis_tilt_deg
 
 # Midway between the widest empty reading and the narrowest held one, both measured after the
 # lift on 09-22 (0.016 and 0.036). terminal_trials uses 0.10 on the driver's note that nothing
@@ -205,6 +217,11 @@ GRASP_LOOP_ARMS = ("A", "B", "AB")
 # Steps the funnel gets once it has the arm: align, descend at 0.02 m/s from +60 to -6 mm, settle,
 # close. About 6 s when nothing goes wrong; twice that is a funnel that is stuck.
 GRASP_LOOP_FUNNEL_MAX_STEPS = 360
+# How far the hole an end-to-end run inserts into may sit from the fixture pick, in xy. A peg that
+# went in is taken out again by the next trial's ordinary staging, from `pickXyz`: the fixture *is*
+# the hole on this rig (09-28/09-29: the pick 0.364,-0.137 and the step-3 aim 0.3597,-0.1328 are
+# 6 mm apart, and the fingers open 48 mm). Further than this is some other hole.
+GRASP_LOOP_INSERT_FROM_PICK_M = 0.015
 
 
 @dataclass(frozen=True)
@@ -230,6 +247,10 @@ class GraspLoopRequest:
     openGripper: float = 1.0
     closedGripper: float = 0.0
     controlPeriodS: float = 1.0 / 30.0
+    # v14 step 4: carry every held grasp to the hole and put it in with step 3's servo (the slow
+    # descent and the ring search), instead of setting it down to be re-gripped. None ends each
+    # trial at the grasp, which is what steps 1-2 measured. See `insert_held_peg`.
+    insertServo: TerminalServoRequest | None = None
 
     @property
     def regripZ(self) -> float:
@@ -272,6 +293,15 @@ def validate_grasp_loop_request(
         raise SceneResetError("funnelMaxSteps must be positive.")
     low, high = _workspace_bounds(workspace_min, workspace_max)
     _check_xyz_in_workspace(request.pickXyz, "pickXyz", low, high)
+    if request.insertServo is not None:
+        insert = request.insertServo
+        if math.dist(insert.xyz[:2], request.pickXyz[:2]) > GRASP_LOOP_INSERT_FROM_PICK_M:
+            raise SceneResetError(
+                f"the insertion target {insert.xyz[0]:.4f},{insert.xyz[1]:.4f} is more than "
+                f"{GRASP_LOOP_INSERT_FROM_PICK_M * 1000:.0f} mm from pickXyz: a peg that went in is "
+                "fetched from pickXyz for the next trial, so the hole has to be the fixture."
+            )
+        validate_terminal_servo_trajectory(insert, workspace_min=workspace_min, workspace_max=workspace_max)
     # Every stroke centre, at table and carry height: a mask partly outside the fence is caught by
     # the sampler's retries, one entirely outside it is a mask for some other rig.
     inside = 0
@@ -622,6 +652,142 @@ def set_down_and_regrip(
     return width, released
 
 
+def insert_held_peg(
+    robot: Any,
+    request: GraspLoopRequest,
+    *,
+    trial: int,
+    close_z: float,
+    request_id: str,
+    ask_grade: OperatorGrade | None = None,
+) -> dict[str, Any]:
+    """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
+
+    The grasp is the policy's (arm B: the funnel's), carried as it is -- the insertion is measured
+    under the grasp the pick layer made, not a re-grip of it. Only the squeeze is the script's:
+    closed fully, as the step-3 servo holds its peg, because a peg pressed at up to 16 N in a
+    weaker grip slides up the fingers (09-28 trial 21). The verdict was already read at the lift.
+
+    Homed on the way, with the peg, as the reset homes: the policy's wrist can be anywhere, and a
+    leaning peg wedges (TERMINAL_TRIAL_MAX_TILT_DEG). Home is a joint keyframe, so the orientation
+    read there is level and fresh every trial, and nothing re-sends a sagged reading
+    (terminal_trials' anchor).
+
+    The target's height is `insertServo`'s for a grip at the script's own height (`regripZ`, where
+    the funnel closes too), raised by however much higher up the peg the fingers closed: more peg
+    below the fingers bottoms out that much sooner, and a stop more than 3 mm above the target
+    reads as not in. A lower grip keeps the target, and the servo stops over the floor.
+
+    Answers the descent, whether the fingers let go (only for "in", or for the servo's seated
+    verdict when nobody grades), and the grade. A peg not let go of is still held, above the hole.
+    """
+
+    assert request.insertServo is not None
+    step_request = request.step_request(request_id)
+    held = request.closedGripper
+    _clear_upward(robot, request, step_request, held, "lift_8cm_after_grasp")
+    _move_to_start(robot)
+    _xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    tilt_deg = tool_axis_tilt_deg(rotvec)
+    x, y, z = request.insertServo.xyz
+    raised_m = max(0.0, float(close_z) - request.regripZ)
+    servo = replace(
+        request.insertServo,
+        xyz=(x, y, z + raised_m),
+        holdGripper=held,
+        regripGripper=None,
+        releaseOnlyWhenSeated=False,
+        requestId=f"{request_id}#insert",
+    )
+    # Across at the handoff height first, at the reset's speed: the servo's own lateral leg keeps
+    # the height it starts from, and from home that would make its slow descent 20 cm long.
+    _run_step(robot, step_request, "align_above_target", (x, y, servo.handoffZ), rotvec, held)
+    grade: dict[str, Any] = {}
+
+    def release_gate(descent: dict[str, Any]) -> bool | str:
+        above_mm = float(descent["seatedDepthErrorMm"])
+        grade["auto"] = classify_stop(
+            above_mm,
+            float(descent["settleMm"]),
+            seated_mm=servo.searchSeatedM * 1000.0,
+            slip_mm=servo.searchSlipM * 1000.0,
+            standing_mm=TERMINAL_TRIAL_STANDING_MM,
+        )
+        if ask_grade is None:
+            grade["answer"] = None
+            return "open" if descent["searchStoppedOn"] == "seated" else False
+        grade["answer"] = ask_grade(
+            f"grade: trial {trial + 1} auto={grade['auto']} above_target_mm={above_mm:+.1f} "
+            f"search_index={int(descent.get('searchIndex') or 0)} -- is the peg in the hole? (in / out)"
+        )
+        # "open": let go with no re-grip in place; the next staging fetches it from the fixture.
+        return "open" if grade["answer"] == "in" else False
+
+    result = execute_terminal_servo(robot, servo, release_gate=release_gate, commanded_rotvec=rotvec)
+    if result.get("controlLoopDied"):
+        raise ControlLoopDiedError(str(result.get("error")))
+    if not result.get("ok"):
+        raise SceneResetError(f"insertion failed: {result.get('error')}")
+    released = bool(result.get("released"))
+    inserted: bool | None
+    if ask_grade is None:
+        inserted = released
+    else:
+        inserted = None if grade.get("answer") not in ("in", "out") else grade["answer"] == "in"
+    peaks = [a.get("dfzPeakN") for a in result.get("searchAttempts") or []] + [result.get("dfzPeakN")]
+    peaks = [float(v) for v in peaks if v is not None]
+    outcome = {
+        "inserted": inserted,
+        "released": released,
+        "grade": grade.get("answer"),
+        "autoVerdict": grade.get("auto"),
+        "aimXyz": [round(v, 5) for v in servo.xyz],
+        "raisedMm": round(raised_m * 1000.0, 1),
+        "toolTiltDeg": round(tilt_deg, 2),
+        "aboveTargetMm": round(float(result["seatedDepthErrorMm"]), 1),
+        "lateralErrorMm": round(float(result["lateralErrorMm"]), 1),
+        "stoppedOn": result.get("stoppedOn"),
+        "stoppedAtXyz": [round(float(v), 5) for v in result["stoppedAtXyz"]],
+        "searchIndex": int(result.get("searchIndex") or 0),
+        "searchStoppedOn": result.get("searchStoppedOn"),
+        "dfzPeakN": None if not peaks else round(min(peaks), 1),
+        "pressCapped": bool(result.get("pressCapped", False)),
+        "rotvec": rotvec,
+    }
+    print(
+        f"[INFO] grasp_loop_insert trial={trial} inserted={_flag(inserted)} grade={outcome['grade']} "
+        f"auto={outcome['autoVerdict']} above_target_mm={outcome['aboveTargetMm']:+.1f} "
+        f"search_index={outcome['searchIndex']} dfz_peak_n={outcome['dfzPeakN']} "
+        f"raised_mm={outcome['raisedMm']:.1f} tool_tilt_deg={tilt_deg:.2f} released={int(released)}",
+        flush=True,
+    )
+    return outcome
+
+
+def _flag(value: bool | None) -> str:
+    return "-" if value is None else str(int(bool(value)))
+
+
+def return_to_table(
+    robot: Any,
+    request: GraspLoopRequest,
+    peg_xyz: tuple[float, float, float],
+    rotvec: tuple[float, float, float],
+    *,
+    request_id: str,
+) -> None:
+    """A peg the hole did not take, still held: back over where it was picked, at carry height.
+
+    From there `set_down_and_regrip` puts it down straight below and takes it the script's way,
+    as after any held grasp -- the table spot is known clear, and above the fixture it is not.
+    """
+
+    step_request = request.step_request(request_id)
+    xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    carry_z = max(xyz[2], request.targetZ + SCENE_RESET_LIFT_M)
+    _run_step(robot, step_request, "move_to_place_above", (peg_xyz[0], peg_xyz[1], carry_z), rotvec, request.closedGripper)
+
+
 GRASP_LOOP_REFLEX_PROMPT = "reflex: the arm tripped its collision reflex and stopped"
 
 
@@ -776,6 +942,22 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "closeAboveTargetMm": {"held": by(("held",), "closeAboveTargetMm"), "empty": by(("empty",), "closeAboveTargetMm")},
         "lateralMm": {"held": by(("held",), "lateralMm"), "empty": by(("empty",), "lateralMm")},
     }
+    if any("inserted" in r for r in graded):
+        # End to end: every graded grasp is a trial of the whole task, and a held grasp whose
+        # insertion nobody graded (a stop mid-question) is the only one that is not.
+        e2e = [r for r in graded if "inserted" in r and r["inserted"] is not None]
+        inserted = sum(1 for r in e2e if r["inserted"])
+        e2e_low, e2e_high = wilson_interval(inserted, len(e2e))
+        tried = [r for r in e2e if "insert" in r]
+        out["endToEnd"] = {
+            "graded": len(e2e),
+            "inserted": inserted,
+            "rate": round(inserted / len(e2e), 3) if e2e else None,
+            "wilson95": [round(e2e_low, 3), round(e2e_high, 3)],
+            # The insertion layer alone: of the held grasps it was handed.
+            "insertedOfHeld": [inserted, len(tried)],
+            "firstLanding": sum(1 for r in tried if r["inserted"] and r["insert"].get("searchIndex") == 0),
+        }
     funnel = [r for r in graded if r.get("funnelState") is not None]
     if funnel:
         out["funnel"] = {
@@ -812,6 +994,7 @@ class GraspLoopControl:
         stop / quit   end the run at the next trial boundary (the gateway's Stop sends `quit` and
                       escalates to a signal after its grace, which is the immediate brake)
         continue / "" the peg is back in the fixture; the loop may go on
+        in / out      the answer to an insertion grade (`ask_grade`); nothing else answers one
 
     A stream that closes (stdin from /dev/null under setsid) answers any wait with "nobody is
     there", which is what an unattended run needs.
@@ -823,6 +1006,7 @@ class GraspLoopControl:
         self._stop = threading.Event()
         self._continue = threading.Event()
         self._closed = threading.Event()
+        self._answer: str | None = None
 
     def start(self) -> None:
         threading.Thread(target=self._read, name="grasp-loop-control", daemon=True).start()
@@ -837,6 +1021,9 @@ class GraspLoopControl:
                     self._stop.set()
                     self._continue.set()
                 elif word in ("continue", ""):
+                    self._continue.set()
+                elif word in ("in", "out"):
+                    self._answer = word
                     self._continue.set()
         except (OSError, ValueError):
             pass
@@ -856,11 +1043,37 @@ class GraspLoopControl:
         self._log(f"[INFO] grasp_loop_operator={'continued' if answered else 'gone'}")
         return answered
 
+    def ask_grade(self, message: str) -> str | None:
+        """"in" or "out" for the peg the arm is still holding at the hole; None on a stop or EOF.
+
+        A bare `continue` does not answer it: the fingers open on "in" only, and a click meant
+        for some other prompt must not be what lets go of the peg.
+        """
+
+        self._answer = None
+        self._continue.clear()
+        if self._closed.is_set():
+            return None
+        self._log(f"[ATTENTION] grasp_loop_needs_operator {message}")
+        answer = None
+        while True:
+            if self._stop.is_set() or self._closed.is_set():
+                break
+            if self._answer is not None:
+                answer = self._answer
+                break
+            self._continue.wait(0.2)
+            self._continue.clear()
+        self._log(f"[INFO] grasp_loop_operator={answer or 'gone'}")
+        return answer
+
 
 # The rollout runtime hands in one of these: it runs the policy from home with `handover` fed on
 # every step, and returns its status. Kept a callback so this module never imports the policy.
 PolicyTrial = Callable[[int, GraspHandover], str]
 OperatorWait = Callable[[str], bool]
+# "in" / "out" from a person looking at the peg, or None for nobody there (or a stop).
+OperatorGrade = Callable[[str], "str | None"]
 
 
 def run_grasp_loop(
@@ -871,12 +1084,17 @@ def run_grasp_loop(
     out_path: Path,
     stop_requested: Callable[[], bool] = lambda: False,
     wait_for_operator: OperatorWait | None = None,
+    ask_grade: OperatorGrade | None = None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
     A resumed run starts from the peg in the fixture, whatever the last run left: the only state
     the file records is outcomes, and the peg's position after an interrupt is not one of them.
+
+    With `request.insertServo`, a held grasp is carried on into the hole (`insert_held_peg`), and
+    `ask_grade`, when given, is asked "in" or "out" before the fingers open; without it the
+    servo's own seated verdict decides. A peg that went in is where the next staging fetches from.
     """
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1001,6 +1219,9 @@ def run_grasp_loop(
                 "commandedGripper": handover.commandedGripper,
                 "stagedS": round(staged_s, 1),
             }
+            if request.insertServo is not None:
+                # End to end: anything short of a peg in the hole is a miss of the whole task.
+                row["inserted"] = False
             if handover.closeXyz is not None:
                 row["closeAboveTargetMm"] = round((handover.closeXyz[2] - target[2]) * 1000.0, 1)
                 # From the peg as placed, not the target it was aimed at.
@@ -1029,7 +1250,22 @@ def run_grasp_loop(
                 check = check_grasp(robot, request, gripper=float(handover.commandedGripper), request_id=request_id)
                 row.update({k: v for k, v in check.items() if k != "rotvec"})
                 row["verdict"] = "held" if check["held"] else "empty"
-                if check["held"]:
+                regrip = check["held"]
+                if check["held"] and request.insertServo is not None:
+                    assert handover.closeXyz is not None
+                    insert = insert_held_peg(
+                        robot, request, trial=trial, close_z=handover.closeXyz[2],
+                        request_id=request_id, ask_grade=ask_grade,
+                    )
+                    insert_rotvec = insert.pop("rotvec")
+                    row["insert"] = insert
+                    row["inserted"] = insert["inserted"]
+                    if insert["released"]:
+                        # In the fixture, which is where the next staging takes it from.
+                        peg, regrip = "at_pick", False
+                    else:
+                        return_to_table(robot, request, peg_xyz, insert_rotvec, request_id=request_id)
+                if regrip:
                     assert handover.closeXyz is not None
                     # Re-gripped now rather than at the next trial's staging, so a run that ends
                     # here parks a peg in the script's grip like any other.
@@ -1037,7 +1273,8 @@ def run_grasp_loop(
                         robot,
                         request,
                         place_z=handover.closeXyz[2] + request.placeMarginM,
-                        gripper=float(handover.commandedGripper),
+                        # After an insertion the peg is on the script's full close, not the policy's.
+                        gripper=request.closedGripper if "insert" in row else float(handover.commandedGripper),
                         request_id=request_id,
                     )
                     regripped = grasp_is_held(width, request.closedGripper, held_width=request.heldWidth, blocked_margin=request.blockedMargin)
@@ -1050,7 +1287,7 @@ def run_grasp_loop(
                     else:
                         release_and_clear(robot, request, request_id=request_id)
                         peg = "lost"
-                else:
+                elif not check["held"]:
                     release_and_clear(robot, request, request_id=request_id)
             else:
                 # Ran out of steps without a settled close, or was stopped. Either way nothing is
@@ -1070,6 +1307,7 @@ def run_grasp_loop(
                 f"[INFO] grasp_loop_trial trial={trial} arm={arm} verdict={row['verdict']} "
                 f"width_lifted={row.get('widthLifted')} close_above_target_mm={row.get('closeAboveTargetMm')} "
                 f"lateral_mm={row.get('lateralMm')} trial_s={row['trialS']}"
+                + (f" inserted={_flag(row['inserted'])}" if "inserted" in row else "")
             )
         except Exception as exc:  # noqa: BLE001 - a motion fault ends the run, it must not end it silently
             if isinstance(exc, ControlLoopDiedError) or not control_loop_alive(robot):
@@ -1129,6 +1367,7 @@ def _write_funnel_steps(out_path: Path, trial: int, funnel: GraspFunnel) -> Path
 
 
 def _request_record(request: GraspLoopRequest) -> dict[str, Any]:
-    data = {k: v for k, v in request.__dict__.items() if k != "strokes"}
+    data = {k: v for k, v in request.__dict__.items() if k not in ("strokes", "insertServo")}
     data["strokes"] = len(request.strokes)
+    data["insertServo"] = None if request.insertServo is None else request.insertServo.payload()
     return data

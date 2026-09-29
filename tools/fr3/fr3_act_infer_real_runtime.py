@@ -492,6 +492,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-insert-pose',
+        default='',
+        help=(
+            'Roadmap v14 step 4, end to end. Carry every held grasp, homed and level, to above '
+            'this "x,y,z" (the fixture\'s hole, within 15 mm of --grasp-loop-pick-pose) and put it '
+            'in with step 3\'s servo: the slow descent, the press cap and the '
+            '--grasp-loop-insert-ring search. With --grasp-loop-attended the operator answers in '
+            'or out before the fingers open; otherwise the servo\'s seated verdict does. Blank '
+            '(default) ends each trial at the grasp.'
+        ),
+    )
+    parser.add_argument('--grasp-loop-insert-ring', type=float, default=0.007)
+    parser.add_argument(
         '--terminal-servo-handoff-z',
         type=float,
         default=0.12,
@@ -4965,6 +4978,17 @@ def run_inference(args: argparse.Namespace) -> int:
                 seed=int(args.grasp_loop_seed),
                 arms=str(args.grasp_loop_arms),
                 controlPeriodS=1.0 / policy_fps,
+                insertServo=(
+                    TerminalServoRequest(
+                        xyz=parse_terminal_servo_pose(args.grasp_loop_insert_pose),
+                        handoffZ=float(args.terminal_servo_handoff_z),
+                        searchRingM=float(args.grasp_loop_insert_ring),
+                        controlPeriodS=1.0 / policy_fps,
+                        requestId='grasp_loop_insert',
+                    )
+                    if str(args.grasp_loop_insert_pose).strip()
+                    else None
+                ),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -4974,7 +4998,14 @@ def run_inference(args: argparse.Namespace) -> int:
             f'strokes={len(grasp_loop_request.strokes)} held_width={grasp_loop_request.heldWidth:.3f} '
             f'max_policy_steps={grasp_loop_request.maxPolicySteps} '
             f'attended={grasp_loop_request.attended} '
-            f'arms={grasp_loop_request.arms} out={grasp_loop_out}'
+            f'arms={grasp_loop_request.arms} '
+            + (
+                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f '
+                % (*grasp_loop_request.insertServo.xyz, grasp_loop_request.insertServo.searchRingM)
+                if grasp_loop_request.insertServo is not None
+                else 'insert=off '
+            )
+            + f'out={grasp_loop_out}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
@@ -6329,6 +6360,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 out_path=grasp_loop_out,
                 stop_requested=lambda: stop_file.requested() or control.stop_requested(),
                 wait_for_operator=control.wait_for_operator if args.grasp_loop_attended else None,
+                ask_grade=control.ask_grade if args.grasp_loop_attended else None,
             )
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)

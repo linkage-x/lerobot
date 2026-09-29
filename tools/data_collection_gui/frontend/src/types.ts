@@ -1274,6 +1274,8 @@ export type GraspLoopTrial = {
   closeAboveTargetMm: number | null;
   lateralMm: number | null;
   trialS: number | null;
+  /** End-to-end runs: in the hole (operator's answer), not, or null for an ungraded insertion. */
+  inserted?: boolean | null;
 };
 
 export type GraspLoopProgress = {
@@ -1286,7 +1288,13 @@ export type GraspLoopProgress = {
   graded: number;
   held: number;
   byArm?: Record<string, { graded: number; held: number }>;
-  /** Non-empty while the loop is parked waiting for the peg to be put back in the fixture. */
+  /** End to end: each held grasp is carried into the hole and graded in / out. */
+  insert?: boolean;
+  /** Graded grasps whose whole task has an answer, and how many of those ended in the hole. */
+  e2eGraded?: number;
+  inserted?: number;
+  /** Non-empty while the loop is parked waiting for a person: "grade: ..." asks in / out,
+   *  "reflex..." a collision recovery, anything else the peg to be put back in the fixture. */
   needsOperator: string;
   stopRequested: boolean;
   done: boolean;
@@ -1632,6 +1640,8 @@ export type RolloutRuntimeOptions = {
   graspLoopAttended?: boolean;
   /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
   graspLoopArms?: "A" | "B" | "AB";
+  /** v14 step 4: "x,y,z" of the hole each held grasp is carried into. Blank: grasp only. */
+  graspLoopInsertPose?: string;
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.

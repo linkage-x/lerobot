@@ -137,6 +137,8 @@ export function RolloutPage() {
   const [graspLoopTrials, setGraspLoopTrials] = useState("40");
   const [graspLoopAttended, setGraspLoopAttended] = useState(true);
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
+  // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
+  const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -249,6 +251,7 @@ export function RolloutPage() {
       graspLoopTrials: modeId === "grasp_loop" ? positiveNumberOr(graspLoopTrials, 40) : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
+      graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -281,7 +284,8 @@ export function RolloutPage() {
       modeId,
       graspLoopTrials,
       graspLoopAttended,
-      graspLoopArms
+      graspLoopArms,
+      graspLoopInsertPose
     ]
   );
 
@@ -528,7 +532,7 @@ export function RolloutPage() {
   };
 
   const onControl = async (
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue"
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out"
   ) => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
@@ -1261,8 +1265,22 @@ export function RolloutPage() {
                 onChange={(event) => setGraspLoopAttended(event.target.checked)}
                 disabled={isLive}
               />
-              <span>有人在场：销被碰倒时暂停等我放回（不勾则直接停机）</span>
+              <span>有人在场：销被碰倒时暂停等我放回（不勾则直接停机）；端到端时每次插完由我判进没进</span>
             </label>
+            <label className="field">
+              <span>插入孔位 x,y,z（端到端）</span>
+              <input
+                value={graspLoopInsertPose}
+                onChange={(event) => setGraspLoopInsertPose(event.target.value)}
+                placeholder="留空 = 只抓不插"
+                disabled={isLive}
+              />
+            </label>
+            <p className="hint">
+              端到端（v14 第 4 步）：抓住后脚本合紧、带销回原位摆正，搬到孔上方 12 cm，用第 3 步的慢速下降 + 7 mm
+              搜索插入；手指张开前问你「进了 / 没进」。进了就松手，下一条从孔里取销；没进就带回抓取点放下、脚本重夹。
+              孔位须在 fixture pick 15 mm 内（孔就是 fixture）。留空则和以前一样只抓不插。
+            </p>
             <label className="field">
               <span>对照臂</span>
               <select

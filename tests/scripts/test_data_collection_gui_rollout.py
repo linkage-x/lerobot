@@ -4083,3 +4083,70 @@ def test_grasp_controls_are_refused_outside_the_grasp_loop(tmp_path: Path):
     with pytest.raises(ValueError, match="only applies to the grasp loop"):
         gateway._send_rollout_control(state, "grasp_stop")
     gateway._stop_rollout(state)
+
+
+def test_the_insertion_target_is_checked_at_start_and_passed_through():
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopInsertPose": "0.3597,-0.1328,0.058"})
+    assert options == {"FR3_GRASP_LOOP_INSERT_POSE": "0.3597,-0.1328,0.058"}
+    assert rollout_backend.sanitize_rollout_runtime_options({"graspLoopInsertPose": ""}) == {}
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopInsertPose"):
+        rollout_backend.sanitize_rollout_runtime_options({"graspLoopInsertPose": "0.36,-0.13"})
+    assert "FR3_GRASP_LOOP_INSERT_POSE" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+
+
+def test_an_end_to_end_run_counts_insertions_over_every_graded_grasp():
+    progress: dict = {}
+    for line in (
+        "[INFO] grasp_loop=configured trials=4 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=0.3597,-0.1328,0.0580 insert_ring_m=0.0070 out=g.jsonl",
+        "[INFO] grasp_loop_trial trial=0 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=1",
+        "[INFO] grasp_loop_trial trial=1 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=0",
+        "[INFO] grasp_loop_trial trial=2 arm=B verdict=empty width_lifted=0.006 close_above_target_mm=-6.0 lateral_mm=9.0 trial_s=40.0 inserted=0",
+        # A held grasp whose insertion nobody graded (a stop mid-question) is not a trial of the task.
+        "[INFO] grasp_loop_trial trial=3 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=-",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["insert"] is True
+    assert [t["inserted"] for t in progress["trials"]] == [True, False, False, None]
+    assert (progress["e2eGraded"], progress["inserted"]) == (3, 1)
+    assert progress["held"] == 3
+    # A grasp-only run says so, and carries no end-to-end count.
+    plain = rollout_backend.apply_grasp_loop_event({}, rollout_backend.parse_grasp_loop_line(
+        "[INFO] grasp_loop=configured trials=4 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=off out=g.jsonl"
+    ))
+    assert plain["insert"] is False and "inserted" not in plain
+
+
+GRADE_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] grasp_loop=configured trials=1 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=${FR3_GRASP_LOOP_INSERT_POSE:-off} insert_ring_m=0.0070 out=g.jsonl"
+echo "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500"
+echo "[ATTENTION] grasp_loop_needs_operator grade: trial 1 auto=seated above_target_mm=+1.6 search_index=0 -- is the peg in the hole? (in / out)"
+read -r word
+echo "[INFO] grasp_loop_operator=$word"
+echo "[INFO] grasp_loop_trial trial=0 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=$([ "$word" = in ] && echo 1 || echo 0)"
+echo '[INFO] grasp_loop=done halted=no summary={"graded": 1, "held": 1}'
+"""
+
+
+def test_the_page_answers_an_insertion_grade_and_only_with_in_or_out(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, GRADE_LAUNCHER)
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 1, "graspLoopAttended": True, "graspLoopInsertPose": "0.3597,-0.1328,0.058"},
+        },
+    )
+    assert _wait_for(lambda: str(state.rollout.graspLoop.get("needsOperator", "")).startswith("grade")), state.rollout.lastLines
+    assert state.rollout.graspLoop["insert"] is True
+    # "Put back, continue" is not an answer to "is it in?".
+    with pytest.raises(ValueError, match="not waiting"):
+        gateway._send_rollout_control(state, "grasp_continue")
+    with state.lock:
+        gateway._send_rollout_control(state, "grasp_in")
+    assert _wait_for(lambda: state.rollout.graspLoop.get("done") is True), state.rollout.lastLines
+    assert state.rollout.graspLoop["inserted"] == 1 and state.rollout.graspLoop["e2eGraded"] == 1
+    with pytest.raises(ValueError):
+        gateway._send_rollout_control(state, "grasp_out")

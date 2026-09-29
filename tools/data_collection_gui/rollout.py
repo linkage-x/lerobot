@@ -89,6 +89,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_TRIALS",
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
+    "FR3_GRASP_LOOP_INSERT_POSE",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
@@ -403,6 +404,15 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if grasp_arms not in ("A", "B", "AB"):
             raise RolloutError("graspLoopArms must be A (pure policy), B (GT grasp funnel) or AB (interleaved).")
         options["FR3_GRASP_LOOP_ARMS"] = grasp_arms
+    # v14 step 4: where each held grasp is carried and put in. Checked here, like the servo pose,
+    # so a typo is refused at Start rather than with a peg in the fingers.
+    insert_pose = _optional_text(raw.get("graspLoopInsertPose"))
+    if insert_pose:
+        try:
+            parse_terminal_servo_pose(insert_pose)
+        except TerminalServoError as exc:
+            raise RolloutError(f"graspLoopInsertPose is not usable: {exc}") from exc
+        options["FR3_GRASP_LOOP_INSERT_POSE"] = insert_pose
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
@@ -1070,11 +1080,12 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
                 parsed["state"] = "rolling"
                 parsed["message"] = f"Grasp loop: trial {event['trial'] + 1} running."
             elif event["type"] == "needs_operator":
-                parsed["message"] = (
-                    "Grasp loop is waiting: the arm tripped its collision reflex. Check nothing is trapped, then press Continue."
-                    if event["message"].startswith("reflex")
-                    else "Grasp loop is waiting: put the peg back in the fixture, then press Continue."
-                )
+                if event["message"].startswith("grade"):
+                    parsed["message"] = "Grasp loop is waiting: is the peg in the hole? Answer in or out."
+                elif event["message"].startswith("reflex"):
+                    parsed["message"] = "Grasp loop is waiting: the arm tripped its collision reflex. Check nothing is trapped, then press Continue."
+                else:
+                    parsed["message"] = "Grasp loop is waiting: put the peg back in the fixture, then press Continue."
             elif event["type"] == "done":
                 parsed["message"] = f"Grasp loop finished (halted: {event.get('halted') or 'no'})."
             return parsed
@@ -1124,6 +1135,7 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
             "attended": fields.get("attended") == "True",
             "arms": fields.get("arms", "A"),
             "out": fields.get("out", ""),
+            "insert": fields.get("insert", "off") not in ("", "off"),
         }
     if "grasp_loop=halted" in line:
         return {"type": "halted", "reason": fields.get("reason", ""), "details": line.split("details=", 1)[-1][:400]}
@@ -1144,6 +1156,8 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
             "closeAboveTargetMm": _grasp_number(fields.get("close_above_target_mm")),
             "lateralMm": _grasp_number(fields.get("lateral_mm")),
             "trialS": _grasp_number(fields.get("trial_s")),
+            # End-to-end runs only: 1 in the hole, 0 not, "-" a held grasp nobody graded.
+            "inserted": {"1": True, "0": False}.get(fields.get("inserted", "")),
         }
     return {}
 
@@ -1156,6 +1170,7 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         "out": "",
         "attended": False,
         "arms": "A",
+        "insert": False,
         "currentTrial": None,
         "trials": [],
         "needsOperator": "",
@@ -1168,7 +1183,10 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
     }
     kind = event.get("type")
     if kind == "configured":
-        state.update(planned=event["planned"], attended=event["attended"], out=event["out"], arms=event.get("arms", "A"))
+        state.update(
+            planned=event["planned"], attended=event["attended"], out=event["out"],
+            arms=event.get("arms", "A"), insert=bool(event.get("insert", False)),
+        )
     elif kind == "trial_start":
         state["currentTrial"] = event["trial"]
     elif kind == "trial":
@@ -1195,6 +1213,11 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         entry["graded"] += 1
         entry["held"] += t.get("verdict") == "held"
     state["byArm"] = by_arm
+    if state["insert"]:
+        # End to end: every graded grasp is a trial of the whole task; an ungraded insertion is not.
+        e2e = [t for t in graded if t.get("verdict") != "held" or t.get("inserted") is not None]
+        state["e2eGraded"] = len(e2e)
+        state["inserted"] = sum(1 for t in e2e if t.get("inserted") is True)
     return state
 
 

@@ -6424,20 +6424,29 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
     so a word here is exactly a keypress there.
     """
-    allowed = {"start", "stop", "home", "quit", "takeover", "grasp_stop", "grasp_continue"}
+    allowed = {"start", "stop", "home", "quit", "takeover", "grasp_stop", "grasp_continue", "grasp_in", "grasp_out"}
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("No rollout is running.")
-    if command in ("grasp_stop", "grasp_continue"):
-        # The grasp loop is not interactive -- it runs its own trials -- but it does read two
-        # words on the same pipe: stop at the next trial boundary, and "the peg is back".
+    if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out"):
+        # The grasp loop is not interactive -- it runs its own trials -- but it does read a few
+        # words on the same pipe: stop at the next trial boundary, "the peg is back", and, in an
+        # end-to-end run, whether the peg it is still holding at the hole went in.
         if state.rollout.mode != "grasp_loop":
             raise ValueError("That control only applies to the grasp loop.")
-        if command == "grasp_continue" and not state.rollout.graspLoop.get("needsOperator"):
-            raise ValueError("The grasp loop is not waiting for anyone.")
-        word = b"stop\n" if command == "grasp_stop" else b"continue\n"
+        waiting_for = str(state.rollout.graspLoop.get("needsOperator") or "")
+        if command == "grasp_continue" and (not waiting_for or waiting_for.startswith("grade")):
+            raise ValueError("The grasp loop is not waiting for anyone to continue it.")
+        if command in ("grasp_in", "grasp_out") and not waiting_for.startswith("grade"):
+            raise ValueError("The grasp loop is not asking for a grade.")
+        word = {
+            "grasp_stop": b"stop\n",
+            "grasp_continue": b"continue\n",
+            "grasp_in": b"in\n",
+            "grasp_out": b"out\n",
+        }[command]
         try:
             process.stdin.write(word)
             process.stdin.flush()

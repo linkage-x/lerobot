@@ -877,3 +877,248 @@ def test_a_set_down_that_meets_the_table_early_stops_pushing_and_lets_go_there(t
     ]
     assert opens and all(a["ee.z"] >= contact - 0.0025 for a in opens)
     assert [r["verdict"] for r in _trials(tmp_path / "g.jsonl")] == ["held", "held"]
+
+
+# ------------------------------------------------------------------------- end to end ---
+
+
+from tools.fr3.terminal_servo import TerminalServoRequest  # noqa: E402
+
+import tools.fr3.terminal_servo as terminal_servo  # noqa: E402
+
+
+class InsertRig(GraspRig):
+    """The grasp rig with the fixture's hole under the pick: v14 step 4's whole task.
+
+    A held peg carried over the block stops on its face unless the tool is within `capture_m`
+    of the hole, where it goes down as far as it is told; let go of there, it drops back into
+    the fixture at the pick. That is all the servo needs to tell "in" from "on the face".
+    """
+
+    def __init__(self, hole_xy=PICK[:2], capture_m=0.0042, face_above_m=0.035):
+        super().__init__()
+        self.hole_xy = tuple(hole_xy)
+        self.capture_m = capture_m
+        self.face_above_m = face_above_m
+        self.face_z = None  # set by the test to the aim's height + face_above_m
+        self.opened_at = []
+
+    def _over_hole(self, x, y):
+        return math.dist((x, y), self.hole_xy) <= self.capture_m
+
+    def send_action(self, action):
+        x, y, z = float(action["ee.x"]), float(action["ee.y"]), float(action["ee.z"])
+        near_block = math.dist((x, y), self.hole_xy) <= 0.03
+        # Only a peg coming down from above meets the face; one already below it (the fixture's
+        # own peg, lifted out) is in the hole.
+        from_above = self.xyz[2] >= self.face_z - 1e-6 if self.face_z is not None else False
+        if self.held and from_above and near_block and not self._over_hole(x, y):
+            action = {**action, "ee.z": max(z, self.face_z)}
+        was_held = self.held
+        result = super().send_action(action)
+        if was_held and not self.held:
+            self.opened_at.append(tuple(self.xyz))
+            if self._over_hole(self.xyz[0], self.xyz[1]) and self.xyz[2] < 0.1:
+                self.peg_xyz = PICK
+        return result
+
+
+def _insert_servo(**overrides):
+    fields = dict(
+        xyz=(PICK[0], PICK[1], TARGET_Z),
+        handoffZ=0.12,
+        searchRingM=0.007,
+        controlPeriodS=0.01,
+        timeoutS=2.0,
+        settleS=0.01,
+        openSettleS=0.0,
+    )
+    fields.update(overrides)
+    return TerminalServoRequest(**fields)
+
+
+@pytest.fixture
+def _fast_servo(monkeypatch):
+    monkeypatch.setattr(terminal_servo, "precise_sleep", lambda seconds: None)
+
+
+def _insert_rig(**kwargs):
+    robot = InsertRig(**kwargs)
+    # The policy closes at the peg's table height (TARGET_Z), 6 mm above the script's regripZ, so
+    # the aim is raised by that; the face is 35 mm over the aim, as the mouth is on the rig.
+    robot.face_z = TARGET_Z + 0.006 + robot.face_above_m
+    return robot
+
+
+def _grades(robot, answers, asked):
+    answers = list(answers)
+
+    def grade(message):
+        asked.append((message, robot.held))
+        return answers.pop(0)
+
+    return grade
+
+
+def test_a_held_grasp_is_carried_into_the_hole_and_let_go_only_on_the_operators_in(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    asked = []
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in", "in"], asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["held", "held"]
+    assert [r["inserted"] for r in rows] == [True, True]
+    # Asked while the peg was still in the fingers, with the servo's own reading in the question.
+    assert all(held for _message, held in asked) and len(asked) == 2
+    assert asked[0][0].startswith("grade:") and "auto=seated" in asked[0][0]
+    # Put in the hole, not re-gripped: the second trial is staged from the fixture again.
+    assert [r["staging"] for r in rows] == ["fixture", "fixture"]
+    assert "regripWidth" not in rows[0]
+    insert = rows[0]["insert"]
+    assert insert["grade"] == "in" and insert["autoVerdict"] == "seated" and insert["released"]
+    assert insert["searchIndex"] == 0
+    assert insert["raisedMm"] == pytest.approx(6.0, abs=0.1)
+    assert insert["aimXyz"][2] == pytest.approx(TARGET_Z + 0.006)
+    assert robot.move_to_start_calls >= 2
+    e2e = result["summary"]["endToEnd"]
+    assert e2e["inserted"] == 2 and e2e["graded"] == 2 and e2e["insertedOfHeld"] == [2, 2]
+    assert e2e["firstLanding"] == 2
+    assert not robot.held
+
+
+def test_out_keeps_hold_takes_the_peg_back_to_its_table_spot_and_regrips_it_there(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    asked = []
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["out", "in"], asked),
+    )
+    rows = _trials(out)
+    assert [r["inserted"] for r in rows] == [False, True]
+    assert rows[0]["insert"]["released"] is False
+    # Nothing was let go of over the block on "out".
+    assert all(math.dist(at[:2], robot.hole_xy) > 0.03 for at in robot.opened_at[:1])
+    # Set down where it was picked and taken the script's way, so the next trial is a regrip.
+    assert rows[0]["regripWidth"] == GraspRig.HELD_WIDTH
+    assert rows[1]["staging"] == "regrip"
+    assert result["summary"]["endToEnd"]["inserted"] == 1
+
+
+def test_nobody_grading_lets_the_servos_seated_verdict_decide(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+    )
+    row = _trials(out)[0]
+    assert row["inserted"] is True and row["insert"]["grade"] is None
+    assert not robot.held and robot.peg_xyz == PICK
+
+
+def test_a_first_landing_on_the_face_is_found_by_the_search(tmp_path, _fast_servo):
+    # The hole 7 mm off the aim, past the capture radius: the ring finds it.
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    insert = _trials(out)[0]["insert"]
+    assert insert["inserted"] is True and insert["searchIndex"] > 0
+
+
+def test_a_missed_grasp_is_a_miss_of_the_whole_task_and_is_never_carried_to_the_hole(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    asked = []
+    result = run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.02)]),
+        out_path=out,
+        ask_grade=_grades(robot, [], asked),
+        wait_for_operator=_put_back(robot, []),
+    )
+    row = _trials(out)[0]
+    assert row["verdict"] == "empty" and row["inserted"] is False and "insert" not in row
+    assert asked == []
+    assert result["summary"]["endToEnd"] == {
+        "graded": 1, "inserted": 0, "rate": 0.0, "wilson95": [0.0, 0.793],
+        "insertedOfHeld": [0, 0], "firstLanding": 0,
+    }
+
+
+def test_an_ungraded_insertion_is_left_out_of_the_end_to_end_rate():
+    rows = [
+        {"verdict": "held", "inserted": True, "insert": {"searchIndex": 0}},
+        {"verdict": "held", "inserted": None, "insert": {"searchIndex": 0}},
+        {"verdict": "empty", "inserted": False},
+    ]
+    e2e = summarize_grasp_loop(rows)["endToEnd"]
+    assert (e2e["graded"], e2e["inserted"], e2e["insertedOfHeld"]) == (2, 1, [1, 1])
+    # A grasp-only run has no end-to-end reading at all.
+    assert "endToEnd" not in summarize_grasp_loop([{"verdict": "held"}])
+
+
+def test_an_insertion_target_that_is_not_the_fixture_is_refused():
+    request = _request(insertServo=_insert_servo(xyz=(PICK[0] + 0.03, PICK[1], TARGET_Z)))
+    with pytest.raises(SceneResetError, match="pickXyz"):
+        validate_grasp_loop_request(request)
+    validate_grasp_loop_request(_request(insertServo=_insert_servo(xyz=(0.3597, -0.1328, 0.058))))
+
+
+def test_the_request_record_carries_the_insertion_servo_as_plain_data():
+    record = grasp_loop._request_record(_request(insertServo=_insert_servo()))
+    assert json.loads(json.dumps(record))["insertServo"]["searchRingM"] == 0.007
+    assert grasp_loop._request_record(_request())["insertServo"] is None
+
+
+def test_only_in_or_out_answers_a_grade_and_a_stop_answers_nobody():
+    import queue
+    import threading
+
+    from tools.fr3.grasp_loop import GraspLoopControl
+
+    lines: list[str] = []
+    words: "queue.Queue[str | None]" = queue.Queue()
+
+    def stream():
+        while (word := words.get()) is not None:
+            yield word
+
+    control = GraspLoopControl(stream(), log=lines.append)
+    control.start()
+    answers = []
+    asker = threading.Thread(target=lambda: answers.append(control.ask_grade("grade: trial 1")))
+    asker.start()
+    words.put("continue\n")
+    asker.join(timeout=0.5)
+    assert asker.is_alive() and answers == []
+    words.put("in\n")
+    asker.join(timeout=2)
+    assert answers == ["in"]
+    assert "[ATTENTION] grasp_loop_needs_operator grade: trial 1" in lines
+    assert "[INFO] grasp_loop_operator=in" in lines
+
+    asker = threading.Thread(target=lambda: answers.append(control.ask_grade("grade: trial 2")))
+    asker.start()
+    words.put("stop\n")
+    asker.join(timeout=2)
+    assert answers == ["in", None]
+    words.put(None)
