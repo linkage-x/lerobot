@@ -24,6 +24,7 @@ import type {
   HandEyePlanResponse,
   HandEyeSolveResponse,
   RigCheckResponse,
+  CrossCameraResponse,
   WorldFrameResponse,
   MujocoCubeMode,
   RealCubeMode,
@@ -32,7 +33,17 @@ import type {
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
-  TrackerAlignment
+  TrackerAlignment,
+  TrackerMountCaptureRow,
+  TrackerMountListResponse,
+  TrackerMountSolveResponse,
+  TrackerMountCaptureListResponse,
+  TrackerMountCaptureDeleteResponse,
+  TrackerMountRecordResponse,
+  TrackerMountSession,
+  TrackerMountSessionResponse,
+  TrackerMountChainResponse,
+  TrackerValidateResponse,
 } from "./types";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -70,6 +81,7 @@ export type GuiSnapshot = {
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   calibrationSession?: CalibrationSession;
+  trackerMountSession?: TrackerMountSession;
   markerTcp?: MarkerTcpSession;
   datasetExport: DatasetExportStatus;
   recordedDatasets: RecordedDataset[];
@@ -894,6 +906,22 @@ export class DataCollectionGuiApi {
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
 
+  /** E1p on the saved pivot samples of one BOX and one condition (one clamping). */
+  async markerTcpTrackerCheck(body: {
+    boxId: string;
+    condition: string;
+    station: string;
+    mountFit?: string;
+  }): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({
+      box_id: body.boxId,
+      condition: body.condition,
+      station: body.station,
+      mount_fit: body.mountFit ?? ""
+    });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/tracker-check?${params.toString()}`);
+  }
+
   async runMarkerTcpReport(): Promise<{ ok: boolean; error?: string }> {
     return this.calibrationSessionPost("/api/calibration/marker-tcp/report");
   }
@@ -925,10 +953,248 @@ export class DataCollectionGuiApi {
     }
   }
 
+  async fetchCrossCameraCheck(): Promise<CrossCameraResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/cross-camera`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as CrossCameraResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async runCrossCameraCheck(dataset: string): Promise<CrossCameraResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/cross-camera/run`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ dataset })
+      });
+      const payload = (await response.json()) as CrossCameraResponse;
+      return { ...payload, report: payload.report ?? null, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null };
+    }
+  }
+
   // Hand-eye (AX=XB). Both of these return the tool's own report verbatim,
   // including a non-zero returncode, because a refusal ("not observable",
   // "mis-associated") is the answer the panel has to show -- flattening it into
   // ok/failed would be how a refused solve turns back into a confident number.
+  /** Recorded episodes that carry a tracker session, with their paths resolved. */
+  async fetchTrackerMountCaptures(): Promise<TrackerMountCaptureListResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/captures`, {
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as TrackerMountCaptureListResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), episodes: [] };
+    }
+  }
+
+  /**
+   * Delete recorded captures picked from the list. The gateway plans the whole
+   * batch first and refuses all of it if any row cannot go.
+   */
+  async deleteTrackerMountCaptures(episodeDirs: string[]): Promise<TrackerMountCaptureDeleteResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/captures/delete`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ episodeDirs })
+      });
+      const payload = (await response.json()) as TrackerMountCaptureDeleteResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /** Claim the recorder for a run of parked-pose dwells; the gateway names it. */
+  async startTrackerMountSession(kind: "dwell" | "pivot" = "dwell"): Promise<TrackerMountSessionResponse> {
+    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session", { kind });
+  }
+
+  /** Release the recorder. Nothing already recorded is deleted. */
+  async cancelTrackerMountSession(): Promise<TrackerMountSessionResponse> {
+    return this.trackerMountSessionPost("/api/calibration/tracker-mount/session/cancel");
+  }
+
+  private async trackerMountSessionPost(
+    path: string,
+    body: Record<string, unknown> = {},
+  ): Promise<TrackerMountSessionResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as TrackerMountSessionResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /**
+   * Record one parked-pose take into the mount fit's own capture tree.
+   *
+   * No session name here on purpose -- the gateway holds it, so a reload cannot
+   * split one run of dwells across two names.
+   */
+  async recordTrackerMountDwell(body: {
+    poseLabel?: string;
+    seconds: number;
+  }): Promise<TrackerMountRecordResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/record`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as TrackerMountRecordResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /** Fit the mount and, optionally, grade a trajectory with it, in one call. */
+  async runTrackerMountChain(body: {
+    mode: "station" | "lever-arm" | "pivot";
+    rows: TrackerMountCaptureRow[];
+    station?: string;
+    holdout?: number;
+    /** pivot only: which cube in the marker->TCP bundle, and optionally which bundle. */
+    cube?: string;
+    markerTcp?: string;
+    mountFit?: string;
+    tcpBudgetMm?: number;
+    worldFrameId?: string;
+    trackerStationId?: string;
+    /** Fit a too-small point set, and grade with a fit that does not certify. */
+    diagnostic?: boolean;
+    validate?: {
+      dataset: string;
+      episode: string | number;
+      session: string;
+      mountFit?: string;
+      /** E1p artifact: compare TCP instead of the SMR centre. */
+      tcpFrom?: string;
+      exposureFraction?: number | "";
+    };
+  }): Promise<TrackerMountChainResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/chain`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as TrackerMountChainResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /** Station + lever-arm artifacts already on disk, newest first. */
+  async fetchTrackerMount(): Promise<TrackerMountListResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount`, {
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as TrackerMountListResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), stations: [], mounts: [] };
+    }
+  }
+
+  /**
+   * Fit T_WG across sessions, one lever arm per session.
+   *
+   * Posted as a JSON body rather than a query string because the capture is a
+   * list of rows and the CLI needs every flag repeated per row -- a flattened
+   * query is where the session/dataset/episode/mount correspondence gets
+   * silently shuffled.
+   */
+  async runTrackerMountStation(body: {
+    rows: TrackerMountCaptureRow[];
+    worldFrameId?: string;
+    trackerStationId?: string;
+    target?: string;
+  }): Promise<TrackerMountSolveResponse> {
+    return this.postTrackerMount("/api/calibration/tracker-mount/station", body);
+  }
+
+  /** Fit c alone against a frozen station: linear, and needs no rotation. */
+  async runTrackerMountLeverArm(body: {
+    rows: TrackerMountCaptureRow[];
+    station: string;
+    holdout?: number;
+    target?: string;
+  }): Promise<TrackerMountSolveResponse> {
+    return this.postTrackerMount("/api/calibration/tracker-mount/lever-arm", body);
+  }
+
+  /**
+   * Compare one episode's camera trajectory against the tracker session.
+   *
+   * The artifact lands inside the session directory, which is where the replay
+   * page already looks -- so running this is what makes the comparison show up
+   * there.
+   */
+  async runTrackerValidate(body: {
+    dataset: string;
+    episode: string | number;
+    session: string;
+    mountFit?: string;
+    tcpFrom?: string;
+    episodeDir?: string;
+    target?: string;
+    exposureFraction?: number | "";
+    readoutOffsetS?: number;
+    minCoverage?: number;
+  }): Promise<TrackerValidateResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/tracker-mount/validate`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as TrackerValidateResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), returncode: -1, report: null };
+    }
+  }
+
+  private async postTrackerMount(
+    path: string,
+    body: Record<string, unknown>
+  ): Promise<TrackerMountSolveResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as TrackerMountSolveResponse;
+      // The gateway answers 200 for a refusal on purpose: the returncode is the
+      // answer, and collapsing it into an HTTP status would lose which refusal.
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), returncode: -1, report: null };
+    }
+  }
+
   async runHandEyeSolve(params: {
     pairsPath: string;
     tFlangeBoxPath?: string;

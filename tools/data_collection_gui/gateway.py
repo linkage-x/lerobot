@@ -25,13 +25,15 @@ from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import BoundedSemaphore, Lock, Thread, Timer
+from threading import BoundedSemaphore, Condition, Lock, Thread, Timer
 from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.thor.gmsl2 import intrinsics_by_serial
+from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
@@ -186,7 +188,24 @@ class RecordingStatus:
     laserTrackerDevice: str = ""
     # Whether the beam is actually on the SMR. Gates Start Episode: an episode
     # recorded while the tracker is blind looks complete and measures nothing.
+    # The recorder only says "ready" once the session has also homed.
     laserTrackerReady: bool = False
+    # Whether this session homed. Without it every beam lock carries a range
+    # inherited from whatever reference was left behind (W2, 2026-09-21: locked
+    # and green throughout, every range 337-440 mm off). Shown on its own so the
+    # operator can tell "not homed" from "beam not on the SMR".
+    laserTrackerHomed: bool = False
+    # Homed, but the beam broke since: the current lock's range is not absolute.
+    laserTrackerBeamBroken: bool = False
+    # Which physical camera is on each port, read by the recorder off each
+    # module's EEPROM at Connect ({cam_NN: {serial, answered}}). cam_NN is the
+    # cable's port, not the camera: a swapped cable silently hands one camera
+    # another's intrinsics and extrinsics.
+    cameraIdentity: dict[str, Any] = field(default_factory=dict)
+    # Ports whose camera is not the one the production calibration was made
+    # with -- StartEpisode refuses while any are listed.
+    cameraIdentityMismatches: list[dict[str, str]] = field(default_factory=list)
+    cameraIdentityExpectedFrom: str = ""
 
 
 @dataclass
@@ -359,6 +378,58 @@ class CalibrationSession:
 
 
 @dataclass
+class TrackerMountSession:
+    """Who owns the recorder while parked poses for a mount fit are collected.
+
+    This used to live in the calibration page's React state, which made it
+    invisible to everything else, and every consequence of that bit us:
+
+    * a browser reload renamed the session mid-capture, orphaning the dwells
+      already on disk under the old name;
+    * Live Record had no way to know a mount capture was in progress, so
+      StartEpisode there would queue a task episode into the middle of one --
+      and, because the redirect resets when no capture root is given, write it
+      into the task dataset while the operator was standing at the tracker;
+    * nothing recorded *which* tracker session the dwells belong to, so the
+      solve had to guess it back from a dataset name.
+
+    Landing is the stage that matters. The tracker seals and lands its stream at
+    Disconnect, not at the end of an episode, so between the last dwell and
+    Disconnect every dwell on disk is correct and none of them is solvable.
+    """
+
+    active: bool = False
+    stage: str = "idle"  # idle | capture | landed | failed
+    sessionName: str = ""
+    captureRoot: str = ""
+    # Filled in from the recorder's own sentences rather than derived from a
+    # naming convention: the tracker is enabled per Connect, and a session that
+    # was asked for and did not answer must not be indistinguishable from one
+    # that ran.
+    trackerSessionId: str = ""
+    landedPath: str = ""
+    dwellsStarted: int = 0
+    message: str = ""
+    startedAt: str = ""
+    # "dwell": parked poses for the station and the lever arm. "pivot": the TCP
+    # pinned in the pivot socket (E1p), the SMR still on its plate. Same capture
+    # tree and the same recorder calls; the protocol written into each episode
+    # is what lets the solve tell them apart later.
+    kind: str = "dwell"
+    # When the segment in flight was started, to catch a take that is saved
+    # before it can hold a dwell (2.0 s still + 0.3 s trimmed at each end). The
+    # 2026-09-21 capture lost 4 of 15 poses to exactly this.
+    lastSegmentStartedMono: float = 0.0
+    lastSegmentSeconds: float = 0.0
+    shortSegments: int = 0
+    # Capture-time geometry per episode index, from the recorder's LT_SEGMENT
+    # lines: the parked point of a dwell, the gain of a pivot. Keyed by index
+    # so a discarded take that is re-recorded replaces its own entry; the
+    # payload keeps only the ones on disk.
+    liveSegments: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
 class MarkerTcpSample:
     id: str
     side: str
@@ -371,6 +442,12 @@ class MarkerTcpSample:
     staticTransformPath: str = ""
     note: str = ""
     createdAt: str = ""
+    # Whether this Connect had the laser tracker on, and the tracker session the
+    # sample's stream is in. A pivot sample recorded with the SMR on its plate is
+    # also an E1p capture; these say which ones are, without reopening meta.json
+    # on every snapshot. The solve reads meta.json itself.
+    laserTracker: bool = False
+    trackerSessionId: str = ""
 
 
 @dataclass
@@ -387,6 +464,9 @@ class MarkerTcpSession:
     solveSummaryPath: str = ""
     pivotReportPath: str = ""
     trackingRunPath: str = ""
+    # The last tracker check (E1p) run from this panel: production's TCP against
+    # the socket the tracker finds, on the same pivot samples.
+    trackerCheck: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -403,6 +483,7 @@ class GatewayState:
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
+    tracker_mount_session: TrackerMountSession = field(default_factory=TrackerMountSession)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -469,6 +550,18 @@ class GatewayState:
     # recorder + camera worker subprocesses. A dedicated consumer thread applies
     # them under `lock`.
     recorder_output_queue: "queue.Queue[tuple[Any, str]]" = field(default_factory=queue.Queue)
+    # Notified by that consumer, under `lock`, after each line is applied.
+    #
+    # It exists because the POST routes run inside one coarse `with state.lock`,
+    # so a handler that waits for something the consumer must apply -- the
+    # capture-root acknowledgement is the only one -- waits while holding the
+    # lock the consumer needs. That is a deadlock for exactly the length of the
+    # timeout, and it presented as "the recorder is slow": on 2026-09-21 the ack
+    # was applied 5.28 s after the recorder wrote it against a 5 s budget, then
+    # 19.6 s against a 20 s budget. Raising the budget only made it fail slower.
+    # Waiting on this condition releases `lock` while blocked, which is the whole
+    # point.
+    recorder_output_applied: Condition = field(init=False)
     # Cached results of the expensive dataset filesystem scan (298G / 600+
     # episodes on Thor takes 4-12s). A background thread refreshes these OFF the
     # lock; `_snapshot` only reads the cache, so it never walks the dataset tree
@@ -489,6 +582,11 @@ class GatewayState:
     # trajectory. Trajectory scans are expensive; processing status changes often
     # during EE generation and must not force a full dataset/trajectory rescan.
     processing_scan_signature: tuple = ()
+
+    def __post_init__(self) -> None:
+        # Bound to `lock`, so waiting on it releases exactly the lock the
+        # recorder-output consumer needs in order to satisfy the wait.
+        self.recorder_output_applied = Condition(self.lock)
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -2786,6 +2884,117 @@ def _last_rig_check(state: GatewayState) -> dict[str, Any]:
     return {"ok": True, "report": report, "baseline": _rig_check_baseline_meta(state)}
 
 
+# --- Cross-camera consistency ------------------------------------------------
+#
+# The third check, and the only one that asks whether the cameras agree *now*
+# rather than whether something changed: the self-check and world continuity
+# both carry an extrinsic that was wrong from the start inside their reference.
+# It runs on a recording of the cube moving through the workspace whose EE
+# trajectory has been generated; the analysis is metrology.cli.cross_camera_check
+# (numpy-only, so the hand-eye interpreter can run it).
+
+_CROSS_CAMERA_SUBDIR = Path("outputs") / "metrology" / "cross_camera_check"
+_CROSS_CAMERA_SIDECAR = Path("derived") / DEFAULT_TRAJ_SIDECAR_NAME
+_CROSS_CAMERA_CANDIDATES = 15
+
+
+def _cross_camera_result_path(state: GatewayState) -> Path:
+    return state.repo_root / _CROSS_CAMERA_SUBDIR / "last_result.json"
+
+
+def _cross_camera_candidates(state: GatewayState) -> list[dict[str, Any]]:
+    """Datasets with a generated trajectory, newest trajectory first."""
+    found: list[dict[str, Any]] = []
+    for dataset in _tracker_mount_capture_candidates(state, limit=None):
+        sidecar = dataset / _CROSS_CAMERA_SIDECAR
+        try:
+            poses = list(sidecar.glob("cube_pose.*.csv"))
+        except OSError:
+            continue
+        if not poses:
+            continue
+        found.append(
+            {
+                "dataset": str(dataset),
+                "name": dataset.name,
+                "trajectoryModifiedUnixS": max(_path_modified_s(p) for p in poses),
+                "cameras": sorted({p.name.split(".")[2] for p in poses if p.name.count(".") >= 3}),
+            }
+        )
+    found.sort(key=lambda entry: entry["trajectoryModifiedUnixS"], reverse=True)
+    return found[:_CROSS_CAMERA_CANDIDATES]
+
+
+def _last_cross_camera_check(state: GatewayState) -> dict[str, Any]:
+    report = _read_json_file(_cross_camera_result_path(state))
+    return {
+        "ok": True,
+        "report": report if isinstance(report, dict) else None,
+        "extrinsicsRun": state.calibration.extrinsicsRun,
+        "candidates": _cross_camera_candidates(state),
+    }
+
+
+def _run_cross_camera_check(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the check on one dataset; the report is kept as the last result.
+
+    Runs outside the state lock like the tracker fits: it reads every
+    per-camera sidecar of the dataset and takes seconds to tens of seconds on
+    Thor.
+    """
+    dataset_raw = str(payload.get("dataset") or "").strip()
+    if not dataset_raw:
+        return {"ok": False, "error": "需要选择一个已生成 EE 轨迹的数据集"}
+    dataset = _resolve_user_path(state, dataset_raw)
+    if not (dataset / _CROSS_CAMERA_SIDECAR).is_dir():
+        return {"ok": False, "error": f"{dataset.name} 还没有生成 EE 轨迹（缺 {_CROSS_CAMERA_SIDECAR}），先在回放页生成"}
+
+    out_path = _cross_camera_result_path(state)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = out_path.with_name("running.json")
+    command = [
+        str(_hand_eye_python(state)),
+        "-m",
+        "metrology.cli.cross_camera_check",
+        "--dataset",
+        str(dataset),
+        "--out",
+        str(scratch),
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)}
+
+    report = _read_json_file(scratch) if scratch.is_file() else None
+    if not isinstance(report, dict):
+        # exit 1/2 are verdicts and still write a report; no report is a crash
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"ok": False, "error": tail[-1] if tail else f"exit {proc.returncode}"}
+    # Which calibration it judged. A result about extrinsics that have since
+    # been replaced says nothing about the ones in production.
+    report["extrinsics_run"] = state.calibration.extrinsicsRun
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    scratch.unlink(missing_ok=True)
+    with state.lock:
+        level = "info" if report.get("overall") == "ok" else "warn"
+        state.log(level, f"Cross-camera check on {dataset.name}: {report.get('overall')} — {report.get('guidance', '')}")
+    return {"ok": True, "report": report}
+
+
+_CROSS_CAMERA_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/cross-camera/run": _run_cross_camera_check,
+}
+
+
 # --- Canonical world frame (roadmap Phase 2.4) -------------------------------
 #
 # A bundle adjustment fixes its gauge on whichever camera it likes, so exporting
@@ -3120,6 +3329,34 @@ def _run_world_cli(state: GatewayState, args: list[str], *, timeout: int = 300) 
     return proc.returncode, output.strip()
 
 
+def _exported_island(state: GatewayState, bundle: Path | None) -> dict[str, str]:
+    """The new-island id the exporter already stamped for this bundle, if any.
+
+    The exporter registers a solve before writing it and, on a break, names the
+    island then. Committing or freezing that solve afterwards must reuse the
+    name: on 2026-09-28 export, commit and re-freeze each minted their own id for
+    one solve, and the episodes (stamped from the reference) would have carried a
+    different world than the calibration they are tracked with.
+    """
+    if bundle is None:
+        return {}
+    wanted = str(Path(bundle).resolve())
+    for summary_path in (state.repo_root / "outputs" / "calibration").glob("*_extrinsics/summary.json"):
+        summary = _read_json_file(summary_path) or {}
+        world = summary.get("world") or {}
+        try:
+            same = str(Path(str(summary.get("source_report") or "")).resolve()) == wanted
+        except OSError:
+            same = False
+        if same and world.get("world_continuity_state") == "BROKEN" and world.get("world_frame_id"):
+            return {
+                "world_frame_id": str(world["world_frame_id"]),
+                "parent_world_frame_id": str(world.get("parent_world_frame_id") or ""),
+                "run": summary_path.parent.name,
+            }
+    return {}
+
+
 def _freeze_world_reference(state: GatewayState, *, replace: bool = False) -> dict[str, Any]:
     """Declare the current calibration to be the canonical world.
 
@@ -3145,6 +3382,11 @@ def _freeze_world_reference(state: GatewayState, *, replace: bool = False) -> di
         "--definition",
         "canonical camera-rig world (roadmap 2.4), frozen from " + str(source),
     ]
+    island = _exported_island(state, source if source.name == "extrinsics_report.json" else None)
+    if island:
+        args += ["--world-frame-id", island["world_frame_id"]]
+        if island["parent_world_frame_id"]:
+            args += ["--parent-world-frame-id", island["parent_world_frame_id"]]
     if replace:
         args.append("--replace")
     code, output = _run_world_cli(state, args)
@@ -3200,6 +3442,9 @@ def _register_world(
     if assume_stable:
         args += ["--assume-stable", *assume_stable]
     if apply_result:
+        island = _exported_island(state, bundle)
+        if island:
+            args += ["--island-world-frame-id", island["world_frame_id"]]
         args.append("--apply")
     code, output = _run_world_cli(state, args)
     # Exit code 2 is "continuity broken", which is a verdict rather than a
@@ -3261,6 +3506,9 @@ _TRACKING_CONFIG = (
     Path("third_party") / "opencv_kalibr" / "hikon_cube_tracking_offline"
     / "config_thor" / "april_cube_tracking_in_robot_base_thor.yaml"
 )
+# Trackers that read the same camera rig. Promotion keeps them on the run
+# _TRACKING_CONFIG points at; they are never the authority on what is live.
+_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,)
 
 
 def _load_active_calibration_runs(state: GatewayState) -> None:
@@ -3474,8 +3722,12 @@ def _promotion_review(state: GatewayState, production: dict[str, str]) -> dict[s
     if "extrinsics" in candidates:
         live_run = production.get("extrinsicsRun", "")
         comparison = promotion.compare_runs(
-            promotion.load_run(root / live_run, live_run) if live_run else promotion.RunPoses(),
-            promotion.load_run(root / candidates["extrinsics"], candidates["extrinsics"]),
+            promotion.load_run(root / live_run, live_run, registry=intrinsics_by_serial.REGISTRY)
+            if live_run
+            else promotion.RunPoses(),
+            promotion.load_run(
+                root / candidates["extrinsics"], candidates["extrinsics"], registry=intrinsics_by_serial.REGISTRY
+            ),
         )
         review["extrinsics"] = comparison
         review["extrinsicsBlockers"] = promotion.promotion_blockers(comparison)
@@ -3549,18 +3801,34 @@ def _promote_calibration(
         }
 
     path = state.repo_root / _TRACKING_CONFIG
+    pointers = {kind: candidates[kind] for kind in wanted}
     try:
         original = path.read_text(encoding="utf-8")
-        updated, changes = promotion.rewrite_pointers(
-            original, {kind: candidates[kind] for kind in wanted}
-        )
+        updated, changes = promotion.rewrite_pointers(original, pointers)
     except (OSError, promotion.PointerWriteError) as exc:
         return {"ok": False, "error": f"改写生产配置失败：{exc}"}
     if updated == original:
         return {"ok": False, "error": "生产配置没有变化——指针已经指向这些 run 了"}
 
+    # Every other tracking config reads the same rig. Rewritten first and all
+    # together, so a failure leaves production untouched rather than split
+    # between two calibrations (on 2026-09-28 the carrier config was left on
+    # 09-23 while the april one moved on).
+    followers: list[tuple[Path, str]] = []
+    for extra in _FOLLOWER_TRACKING_CONFIGS:
+        extra_path = state.repo_root / extra
+        if not extra_path.is_file():
+            continue
+        try:
+            text = extra_path.read_text(encoding="utf-8")
+            followers.append((extra_path, promotion.rewrite_pointers(text, pointers)[0]))
+        except (OSError, promotion.PointerWriteError) as exc:
+            return {"ok": False, "error": f"改写 {extra.name} 失败：{exc}"}
+
     try:
         promotion.write_config_atomically(path, updated)
+        for extra_path, text in followers:
+            promotion.write_config_atomically(extra_path, text)
     except OSError as exc:
         return {"ok": False, "error": f"写生产配置失败：{exc}"}
 
@@ -4008,6 +4276,12 @@ def _cancel_calibration_session(state: GatewayState) -> dict[str, Any]:
 
 def _marker_tcp_root(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "metrology" / "marker_tcp_repeatability"
+
+
+# A pivot sample is a continuous sweep about the socket, and both fits read every
+# frame of it: the camera pivot fit directly, the tracker check (E1p) every frame
+# the tracker says was seated (radial residual off its sphere). No pauses.
+_MARKER_TCP_PIVOT_PROTOCOL = "tcp_pivot_sweep"
 
 
 def _marker_tcp_session_path(state: GatewayState) -> Path | None:
@@ -4637,7 +4911,23 @@ def _marker_tcp_record_sample(
                 return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
             if state.recording.state in {"idle", "error"}:
                 return {"ok": False, "error": "相机还没连接。请先到「采集」页 Connect，再回来采 marker→TCP 样本。"}
-            _start_episode(state)
+            if _state_is_gmsl2(state):
+                # Why this episode exists, in its own meta.json. On disk a pivot
+                # sample is nine videos like any other, and the tracker-mount
+                # discovery lists every tracker-carrying episode it finds.
+                _start_episode(
+                    state,
+                    capture_intent={
+                        "purpose": "calibration_marker_tcp",
+                        "session_id": session.sessionName,
+                        "box_id": box_id_norm,
+                        "condition": condition_text,
+                        "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
+                    },
+                )
+            else:
+                _start_episode(state)
+            tracker_on = bool(state.recording.laserTracker)
             sample = MarkerTcpSample(
                 id=f"sample_{len(session.samples) + 1:03d}",
                 side=target_label,
@@ -4648,10 +4938,18 @@ def _marker_tcp_record_sample(
                 datasetRoot=state.recording.datasetRoot,
                 episodeIndex=int(state.recording.episodeIndex),
                 createdAt=datetime.now(timezone.utc).isoformat(),
+                laserTracker=tracker_on,
+                trackerSessionId=(
+                    _tracker_session_id_from_detail(state.recording.laserTrackerDetail) if tracker_on else ""
+                ),
             )
             session.samples.append(sample)
             session.pendingSampleId = sample.id
-            session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。"
+            session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。" + (
+                "跟踪仪在录：连续扫动即可，不用停；插件别抬离球窝，别断光。"
+                if tracker_on
+                else ""
+            )
         elif action in {"save", "discard"}:
             sample = _marker_tcp_pending_sample(state)
             if sample is None:
@@ -4666,10 +4964,16 @@ def _marker_tcp_record_sample(
                 _stop_recorder(state, action)
             sample.datasetRoot = state.recording.datasetRoot or sample.datasetRoot
             sample.episodeIndex = episode_index
+            if sample.laserTracker and not sample.trackerSessionId:
+                sample.trackerSessionId = _tracker_session_id_from_detail(state.recording.laserTrackerDetail)
             if action == "save":
                 sample.status = "saved"
                 sample.note = "raw recording saved; use solve to estimate marker rig->TCP, or register an external static_transform.json"
-                session.message = "样本已保存。可继续录制同一 BOX 的其它 pivot 段，或直接点击解算写入生产 bundle。"
+                session.message = "样本已保存。可继续录制同一 BOX 的其它 pivot 段，或直接点击解算写入生产 bundle。" + (
+                    "带跟踪仪的样本要等 Disconnect 之后才能跑 E1p：跟踪仪 session 那时才 seal + 落地。"
+                    if sample.laserTracker
+                    else ""
+                )
             else:
                 sample.status = "discarded"
                 sample.note = "discard requested; ignored by repeatability report"
@@ -5256,6 +5560,1542 @@ def _run_hand_eye_plan(
     }
 
 
+_TRACKER_MOUNT_SUBDIR = Path("outputs") / "laser_tracker"
+
+
+def _tracker_mount_output_root(state: GatewayState) -> Path:
+    root = state.repo_root / _TRACKER_MOUNT_SUBDIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _run_tracker_mount_command(
+    state: GatewayState, args: list[str], *, timeout_s: int = 1800
+) -> dict[str, Any]:
+    """Run ``metrology.cli.fit_tracker_mount`` and hand back its exit code.
+
+    The interpreter probe is the hand-eye one because the requirement is the
+    same: this CLI reads CSV sidecars and a tracker session with numpy and the
+    standard library, nothing else, which is what lets it run on the machine
+    holding the data.
+
+    Exit codes are carried rather than collapsed. ``2`` is a finding about the
+    setup (no dwell survived, the capture cannot determine ``c``), ``1`` is a
+    finding about the fit (it ran, it does not certify) and only ``0`` is
+    "solved and fit to use". A panel that knew only ok/failed would turn the
+    first two into the third.
+    """
+    python = _hand_eye_python(state)
+    command = [str(python), "-m", "metrology.cli.fit_tracker_mount", *args]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        cwd=str(state.repo_root),
+        env=_marker_tcp_tool_env(state),
+        check=False,
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "")[-20000:],
+        "stderr": (proc.stderr or "")[-8000:],
+        "command": command,
+    }
+
+
+def _tracker_mount_rows(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """The capture rows a fit is built from, validated as a group.
+
+    One row is one parked-pose recording: a landed tracker session, the dataset
+    and episode the cameras wrote, and the mount id. The mount id is not
+    cosmetic -- ``fit_station`` pairs poses *within* a mount, because two poses
+    taken across a re-bolting have different lever arms and differencing them
+    constrains nothing. Getting it wrong does not fail loudly; it inflates the
+    apparent conditioning with pairs that carry no information.
+    """
+    raw = payload.get("rows")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("需要至少一行采集：tracker session + 数据集 + episode + mount id")
+    rows: list[dict[str, str]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"第 {i + 1} 行不是对象")
+        session = str(item.get("session") or "").strip()
+        dataset = str(item.get("dataset") or "").strip()
+        # Not ``or ""``: episode 0 is the first segment of every capture, and a
+        # numeric 0 is falsy.
+        raw_episode = item.get("episode")
+        episode = "" if raw_episode is None else str(raw_episode).strip()
+        mount_id = str(item.get("mountId") or item.get("mount_id") or "").strip()
+        if not session or not dataset or not episode or not mount_id:
+            raise ValueError(f"第 {i + 1} 行缺字段（session / dataset / episode / mountId 都必填）")
+        try:
+            episode_index = int(episode)
+        except ValueError as exc:
+            raise ValueError(f"第 {i + 1} 行 episode 不是整数: {episode!r}") from exc
+        rows.append(
+            {
+                "session": session,
+                "dataset": dataset,
+                "episode": str(episode_index),
+                "mountId": mount_id,
+                "sessionId": str(item.get("sessionId") or item.get("session_id") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _tracker_mount_capture_args(state: GatewayState, rows: list[dict[str, str]]) -> list[str]:
+    args: list[str] = []
+    has_session_ids = any(row["sessionId"] for row in rows)
+    for row in rows:
+        session = _resolve_user_path(state, row["session"])
+        if not session.is_dir():
+            raise FileNotFoundError(f"tracker session 目录不存在: {session}")
+        dataset = _resolve_user_path(state, row["dataset"])
+        if not dataset.is_dir():
+            raise FileNotFoundError(f"数据集目录不存在: {dataset}")
+        args += [
+            "--session", str(session),
+            "--dataset", str(dataset),
+            "--episode", row["episode"],
+            "--mount-id", row["mountId"],
+        ]
+        # --session-id is repeat-once-per-session or absent entirely; a partial
+        # list is refused by the CLI, so fill the blanks rather than send some.
+        if has_session_ids:
+            args += ["--session-id", row["sessionId"] or Path(row["session"]).name]
+    return args
+
+
+_SKIPPED_EPISODE_LINE = re.compile(r"^skipped episode (\d+): (.*)$")
+
+
+def _tracker_mount_skipped(report: dict[str, Any] | None, stderr_lines: list[str]) -> list[dict[str, Any]]:
+    """Segments the fit left out, whether or not it went on to solve.
+
+    The artifact lists them (top level for pivot, per mount under ``capture``
+    for station). A refusal writes no artifact, and then the CLI's stderr is
+    the only record -- and "too few poses" is half an answer without it.
+    """
+    found: list[dict[str, Any]] = []
+    if isinstance(report, dict):
+        blocks = [report, *(c for c in report.get("capture") or [] if isinstance(c, dict))]
+        for block in blocks:
+            for key in ("episodes_skipped", "episodes_without_dwells"):
+                for item in block.get(key) or []:
+                    if isinstance(item, dict):
+                        found.append({"episode": int(item.get("episode", -1)), "why": str(item.get("why") or "")})
+    if not found:
+        for line in stderr_lines:
+            match = _SKIPPED_EPISODE_LINE.match(line)
+            if match:
+                found.append({"episode": int(match.group(1)), "why": match.group(2)})
+    return found
+
+
+def _tracker_mount_result(
+    state: GatewayState, run: dict[str, Any], out_path: Path, *, kind: str
+) -> dict[str, Any]:
+    report: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            report = json.loads(out_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = None
+    lines = (run["stderr"] or "").strip().splitlines()
+    tail = [line for line in lines if not _SKIPPED_EPISODE_LINE.match(line)]
+    error = "" if run["returncode"] == 0 else (tail[-1] if tail else "tracker mount 解算失败")
+    return {
+        "ok": run["returncode"] == 0,
+        "returncode": run["returncode"],
+        "kind": kind,
+        "report": report,
+        "reportPath": str(out_path) if out_path.is_file() else "",
+        "skipped": _tracker_mount_skipped(report, lines),
+        "summary": tail[0] if tail else "",
+        "stdout": run["stdout"],
+        "stderr": run["stderr"],
+        "error": error,
+    }
+
+
+def _require_one_mount(rows: list[dict[str, str]], mode: str) -> None:
+    """``lever-arm`` and ``pivot`` solve one plate: many segments, one mount id.
+
+    This used to read "one session" and allow exactly one row. Under the
+    one-pose-per-segment protocol a single row is a single pose, which the CLI
+    then refuses -- the same segment-versus-mount confusion that
+    ``_merge_by_mount`` fixed in the CLI, surviving one layer up.
+    """
+    mounts = sorted({row["mountId"] for row in rows})
+    if len(mounts) != 1:
+        raise ValueError(f"{mode} 一次只解一个 mount（选中的段来自 {', '.join(mounts)}）")
+
+
+def _note_tracker_mount_segment_end(state: GatewayState, action: str) -> None:
+    """Say so at once when a parked-pose segment is saved too short to be a dwell.
+
+    Found at solve time it costs a re-setup; said at the button it costs one
+    more press while the rig is still standing where it was.
+    """
+    session = state.tracker_mount_session
+    started = session.lastSegmentStartedMono
+    session.lastSegmentStartedMono = 0.0
+    if not session.active or started <= 0.0 or action != "save":
+        return
+    if session.kind == "pivot":
+        # A pivot sweep is read frame by frame; stopping it early loses
+        # attitudes, not the take.
+        return
+    elapsed = time.monotonic() - started
+    session.lastSegmentSeconds = round(elapsed, 2)
+    if elapsed < _TRACKER_MOUNT_SEGMENT_MIN_S:
+        session.shortSegments += 1
+        session.message = (
+            f"这一段只录了 {elapsed:.1f}s，装不下一个驻点（至少 {_TRACKER_MOUNT_SEGMENT_MIN_S:g}s），"
+            "解算时会被丢掉——这个姿态请重录，并静止到自动收尾。"
+        )
+        state.log("warn", f"Tracker-mount segment saved after {elapsed:.1f}s, below the dwell floor")
+
+
+_TRACKER_FIT_CUBES = ("left", "right")
+
+
+def _sidecar_solved_frames(dataset: Path, cube: str, episodes: set[int]) -> int:
+    path = _marker_tcp_sidecar_path(dataset, cube)
+    if not path.is_file():
+        return 0
+    solved = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                episode = int(float(row.get("episode_index") or -1))
+            except ValueError:
+                continue
+            if episode in episodes and str(row.get("solve_ok") or "").strip().lower() in ("1", "1.0", "true"):
+                solved += 1
+    return solved
+
+
+def _ensure_tracker_sidecars(
+    state: GatewayState, pairs: list[tuple[Path, int]], target: str = ""
+) -> str:
+    """Make production's EE trajectory current for these episodes; return the cube.
+
+    Every fit here reads that sidecar, and neither of its two failure modes was
+    the operator's to fix by hand: a capture nobody had tracked yet ("derived
+    does not exist"), and the target defaulting to ``april_cube`` while
+    production writes one sidecar per cube -- both hit the first station of
+    2026-09-24. The job is the same one the replay page and the marker->TCP E1p
+    queue, so the fit grades the labels production actually writes.
+
+    With no ``target`` the cube is the one that solved the most frames of these
+    episodes: the SMR plate is on one BOX, and only that cube is in view.
+    """
+    by_dataset: dict[Path, set[int]] = {}
+    for dataset, episode in pairs:
+        by_dataset.setdefault(dataset, set()).add(int(episode))
+    cubes = (target,) if target else _TRACKER_FIT_CUBES
+    for dataset, episodes in by_dataset.items():
+        ep_dirs = [dataset / "episodes" / f"episode_{ep:06d}" for ep in sorted(episodes)]
+        if any(_marker_tcp_sidecar_is_current(dataset, cube, ep_dirs) for cube in cubes):
+            continue
+        _queue_traj_gen(state, dataset)
+        job = _await_traj_gen(state, dataset, on_progress=lambda _text: None)
+        if job.get("status") != "complete":
+            raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
+    if target:
+        return target
+    solved = {
+        cube: sum(_sidecar_solved_frames(dataset, cube, eps) for dataset, eps in by_dataset.items())
+        for cube in _TRACKER_FIT_CUBES
+    }
+    best = max(solved, key=lambda cube: solved[cube])
+    if solved[best] == 0:
+        raise RuntimeError("这些段里哪个 cube 都没解出一帧——相机看不到钢片所在的 BOX？")
+    return best
+
+
+def _tracker_row_pairs(state: GatewayState, rows: list[dict[str, str]]) -> list[tuple[Path, int]]:
+    return [(_resolve_user_path(state, row["dataset"]), int(row["episode"])) for row in rows]
+
+
+def _run_tracker_mount_pivot(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """E1p: production's TCP against the pivot socket the tracker finds.
+
+    The one solve that can see production's ``c_TCP`` -- nothing in the cube
+    frame is fitted, so a wrong constant is not absorbed. Position only, and the
+    socket-to-TCP offset cancels in it; the report says both.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        _require_one_mount(rows, "pivot")
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError("pivot 需要一个已冻结的 station JSON 路径（同一个跟踪仪站位）")
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        cube = str(payload.get("cube") or "").strip()
+        if not cube:
+            raise ValueError("pivot 需要指明 cube（left / right）")
+        bundle_raw = str(payload.get("markerTcp") or "").strip()
+        bundle = _resolve_user_path(state, bundle_raw) if bundle_raw else _default_marker_tcp_bundle_path(state)
+        if bundle is None or not bundle.is_file():
+            raise FileNotFoundError(f"marker→TCP bundle 不存在: {bundle}")
+        args = _tracker_mount_capture_args(state, rows)
+        _ensure_tracker_sidecars(state, _tracker_row_pairs(state, rows), cube)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"pivot_{cube}_{stamp}.json"
+    args = [
+        "pivot", *args, "--station", str(station), "--marker-tcp", str(bundle),
+        "--cube", cube, "--out", str(out_path),
+        # Continuous: a segment with the beam off the SMR is listed, not fatal.
+        "--skip-episodes-without-dwells",
+    ]
+    mount_fit = str(payload.get("mountFit") or "").strip()
+    if mount_fit:
+        args += ["--mount-fit", str(_resolve_user_path(state, mount_fit))]
+    budget = str(payload.get("tcpBudgetMm") or "").strip()
+    if budget:
+        args += ["--tcp-budget-mm", budget]
+    target = str(payload.get("target") or "").strip()
+    if target:
+        args += ["--target", target]
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    result = _tracker_mount_result(state, run, out_path, kind="pivot")
+    result["stationPath"] = str(station)
+    result["markerTcpPath"] = str(bundle)
+    return result
+
+
+# --- E1p from the marker->TCP panel: the camera pivot samples, read by the tracker
+
+# What the panel draws; the rest of the artifact (per-dwell diagnostics, the
+# session dicts) stays on disk behind ``reportPath``. The snapshot carries this
+# on every poll, so it is kept to the numbers a person reads.
+_E1P_REPORT_KEYS = (
+    "n_poses",
+    "cube",
+    "mount_id",
+    "static_tcp_error_mm",
+    "tcp_budget_mm",
+    "static_p95_within_budget",
+    "c_tcp_production_mm",
+    "c_tcp_measured_mm",
+    "c_tcp_error_mm",
+    "c_tcp_error_norm_mm",
+    "d_cube_mm",
+    "split",
+    "rotation_span_deg",
+    "sphere",
+    "radius_check_mm",
+    "certifies",
+    "certify_reasons",
+    "cannot_see",
+    "smr_to_tcp_cube_mm",
+    "smr_to_tcp_norm_mm",
+    "pose_frame",
+    "bundle_calibration_id",
+    "episodes_without_dwells",
+    "episodes_skipped",
+    "sampling",
+)
+_MARKER_TCP_TRAJ_GEN_TIMEOUT_S = 7200.0
+
+
+def _marker_tcp_sidecar_path(dataset: Path, cube: str) -> Path:
+    return dataset / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / f"state_action.{cube}.csv"
+
+
+def _marker_tcp_sidecar_is_current(dataset: Path, cube: str, episode_dirs: list[Path]) -> bool:
+    """Whether production's per-cube sidecar was written after these episodes were.
+
+    A sidecar from before the last sample was saved has no rows for it, and the
+    fit would then refuse that sample for "0 camera frames" -- a message about
+    the capture for what is only a stale file.
+    """
+    sidecar = _marker_tcp_sidecar_path(dataset, cube)
+    if not sidecar.is_file():
+        return False
+    stamps = [(d / "meta.json").stat().st_mtime for d in episode_dirs if (d / "meta.json").is_file()]
+    return not stamps or sidecar.stat().st_mtime >= max(stamps)
+
+
+def _traj_gen_bundle_path(state: GatewayState, dataset: Path) -> Path:
+    """The marker->TCP bundle the dataset's EE trajectory was composed with.
+
+    The sidecar holds TCP poses, and the fit converts what it finds back into
+    the cube frame with a bundle's ``T_cube_tcp`` -- right only if it is the one
+    the tracking composed. A trajectory generated with an override bundle
+    records it in the processing meta; otherwise it is the production default.
+    """
+    meta = _load_processing_meta(dataset) or {}
+    job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
+    raw = str(job.get("marker_to_tcp_calibration_path") or "").strip() if job.get("kind") == "traj-gen" else ""
+    path = _resolve_user_path(state, raw) if raw else _default_marker_tcp_bundle_path(state)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(f"找不到 {dataset.name} 的 EE 轨迹所用的 marker→TCP bundle：{path}")
+    return path
+
+
+def _await_traj_gen(
+    state: GatewayState,
+    dataset: Path,
+    *,
+    on_progress: Callable[[str], None],
+    timeout_s: float = _MARKER_TCP_TRAJ_GEN_TIMEOUT_S,
+    poll_s: float = 2.0,
+) -> dict[str, Any]:
+    """Wait for the dataset's trajectory job and return its final record.
+
+    Waits for the process to be released *and* the status to be final: the
+    output reader drops the process before it writes "complete", and reading
+    in between would see the job as still running or, worse, as the previous
+    job's "complete".
+    """
+    key = str(dataset)
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while True:
+        with state.lock:
+            busy = key in state.processing_starting or key in state.processing_processes
+        meta = _load_processing_meta(dataset) or {}
+        job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
+        if not busy and str(job.get("status") or "") in ("complete", "failed", "error"):
+            return job
+        message = str(job.get("message") or "")
+        if message and message != last:
+            on_progress(message)
+            last = message
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成 {timeout_s:g}s 内没有结束")
+        time.sleep(poll_s)
+
+
+def _marker_tcp_tracker_rows(
+    state: GatewayState, samples: list[MarkerTcpSample], mount_id: str
+) -> tuple[list[dict[str, str]], list[str], dict[str, list[Path]]]:
+    """Fit rows for the samples that carry a landed tracker stream.
+
+    Read from each episode's meta.json, not from the sample record: the recorder
+    writes what the tracker actually did, and "asked for and failed" has to stay
+    distinguishable from "not asked for". A sample whose stream has not landed
+    refuses the whole check -- solving on the rest would quietly drop poses.
+    """
+    rows: list[dict[str, str]] = []
+    notes: list[str] = []
+    episode_dirs: dict[str, list[Path]] = {}
+    for sample in samples:
+        dataset = _resolve_user_path(state, sample.datasetRoot)
+        ep_dir = dataset / "episodes" / f"episode_{int(sample.episodeIndex):06d}"
+        if not ep_dir.is_dir():
+            raise FileNotFoundError(f"{sample.id} 的 episode 目录不存在：{ep_dir}")
+        meta = _read_json_file(ep_dir / "meta.json") or {}
+        tracker = meta.get("laser_tracker") if isinstance(meta.get("laser_tracker"), dict) else {}
+        if not tracker.get("enabled"):
+            notes.append(f"{sample.id}（ep{sample.episodeIndex}）录制时没开跟踪仪，跳过")
+            continue
+        session_id = str(tracker.get("session_id") or "")
+        session_dir = _tracker_session_dir_for(state, dataset, session_id)
+        if session_dir is None:
+            raise RuntimeError(
+                f"{sample.id} 的跟踪仪 session {session_id or '（没有 id）'} 还没落地："
+                "它在 Disconnect 时才 seal + land。先到「采集」页 Disconnect，再跑 E1p。"
+            )
+        rows.append(
+            {
+                "session": str(session_dir),
+                "dataset": str(dataset),
+                "episode": str(int(sample.episodeIndex)),
+                "mountId": mount_id,
+                "sessionId": session_id,
+            }
+        )
+        episode_dirs.setdefault(str(dataset), []).append(ep_dir)
+    return rows, notes, episode_dirs
+
+
+def _run_marker_tcp_tracker_check(
+    state: GatewayState, payload: dict[str, Any], *, background: bool = True
+) -> dict[str, Any]:
+    """E1p on the camera pivot samples of one BOX and one clamping.
+
+    The same physical act as the camera pivot -- TCP insert seated in the
+    socket, gripper turned about it -- recorded with the SMR on its plate and
+    the tracker on. The camera pivot fit reads every frame; this reads only the
+    pauses, and it grades production's labels rather than fitting a new
+    constant: nothing is written to the bundle.
+
+    One condition at a time because one clamping is one sphere: re-clamping the
+    insert moves the socket in the cube frame, and merging two clampings would
+    fit one sphere to two.
+    """
+    session = state.marker_tcp_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    if session.pendingSampleId:
+        return {"ok": False, "error": "还有样本正在录制，请先保存或丢弃当前段"}
+    if session.stage == "solving":
+        return {"ok": False, "error": "已有解算在进行中，请等它结束"}
+    try:
+        box_id_norm, target_label = _marker_tcp_target_label(box_id=str(payload.get("boxId") or ""))
+        condition = str(payload.get("condition") or "").strip()
+        if not condition:
+            raise ValueError("要指明条件：一个条件 = 一次夹持 = 一个球面")
+        cube_name, _entry, _bundle = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError(
+                "E1p 需要同一跟踪仪站位的 station：先用驻点集解出来（跟踪仪不动的话，先录 pivot 后解站位也行）"
+            )
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        mount_fit_raw = str(payload.get("mountFit") or "").strip()
+        mount_fit = _resolve_user_path(state, mount_fit_raw) if mount_fit_raw else None
+        if mount_fit is not None and not mount_fit.is_file():
+            raise FileNotFoundError(f"lever-arm JSON 不存在: {mount_fit}")
+        samples = [s for s in _marker_tcp_saved_samples(session, box_id_norm) if s.condition == condition]
+        if not samples:
+            raise ValueError(f"{target_label} · {condition} 没有 saved 样本")
+        mount_id = _marker_tcp_slug(f"{box_id_norm}_{condition}")
+        rows, notes, episode_dirs = _marker_tcp_tracker_rows(state, samples, mount_id)
+        if not rows:
+            raise ValueError(
+                f"{target_label} · {condition} 的样本录制时都没开跟踪仪。"
+                "到「采集」页打开跟踪仪开关、重新 Connect，再录。"
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+
+    plan = {
+        "box_id_norm": box_id_norm,
+        "target_label": target_label,
+        "cube_name": cube_name,
+        "condition": condition,
+        "mount_id": mount_id,
+        "station": station,
+        "mount_fit": mount_fit,
+        "rows": rows,
+        "notes": notes,
+        "episode_dirs": episode_dirs,
+    }
+    if not background:
+        return _marker_tcp_tracker_check_worker(state, plan)
+
+    session.stage = "solving"
+    session.message = f"{target_label} · {condition}：E1p 已开始（{len(rows)} 段带跟踪仪的样本）…"
+    _save_marker_tcp_session(state)
+    Thread(
+        target=_marker_tcp_tracker_check_worker,
+        args=(state, plan),
+        daemon=True,
+        name=f"marker-tcp-e1p-{_marker_tcp_slug(box_id_norm)}",
+    ).start()
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _marker_tcp_tracker_check_worker(state: GatewayState, plan: dict[str, Any]) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    target_label = plan["target_label"]
+    cube = plan["cube_name"]
+    check: dict[str, Any] = {
+        "boxId": plan["box_id_norm"],
+        "cube": cube,
+        "condition": plan["condition"],
+        "mountId": plan["mount_id"],
+        "stationPath": str(plan["station"]),
+        "mountFitPath": "" if plan["mount_fit"] is None else str(plan["mount_fit"]),
+        "samples": len(plan["rows"]),
+        "notes": list(plan["notes"]),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        # 1. Production's own labels for these samples. E1p grades what
+        #    production writes, smoother included, so the sidecar is the one the
+        #    replay page shows -- generated through the same job, not a private
+        #    tracking run that could differ from it.
+        bundle: Path | None = None
+        for dataset_text, ep_dirs in plan["episode_dirs"].items():
+            dataset = Path(dataset_text)
+            if not _marker_tcp_sidecar_is_current(dataset, cube, ep_dirs):
+                session.message = f"{target_label}：E1p 先生成 {dataset.name} 的生产 EE 轨迹（{cube}）…"
+                _save_marker_tcp_session(state)
+                _queue_traj_gen(state, dataset)
+
+                def progress(text: str, name: str = dataset.name) -> None:
+                    session.message = f"{target_label}：E1p 生成 {name} 的 EE 轨迹：{text[:160]}"
+
+                job = _await_traj_gen(state, dataset, on_progress=progress)
+                if job.get("status") != "complete":
+                    raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
+                if not _marker_tcp_sidecar_is_current(dataset, cube, ep_dirs):
+                    raise RuntimeError(
+                        f"{dataset.name} 的 EE 轨迹生成完了，但没有覆盖这些样本的 "
+                        f"{_marker_tcp_sidecar_path(dataset, cube).name}"
+                    )
+            used = _traj_gen_bundle_path(state, dataset)
+            if bundle is not None and used != bundle:
+                raise RuntimeError(
+                    f"两个数据集的 EE 轨迹用了不同的 marker→TCP bundle（{bundle} / {used}），不能放进同一次 E1p"
+                )
+            bundle = used
+        assert bundle is not None
+        check["markerTcpPath"] = str(bundle)
+
+        # 2. The fit. Sweeps are allowed to contain samples with no pause at
+        #    all; those are listed in the artifact rather than failing the run.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = _tracker_mount_output_root(state) / f"pivot_{cube}_{stamp}.json"
+        args = [
+            "pivot",
+            *_tracker_mount_capture_args(state, plan["rows"]),
+            "--station", str(plan["station"]),
+            "--marker-tcp", str(bundle),
+            "--cube", cube,
+            "--skip-episodes-without-dwells",
+            "--out", str(out_path),
+        ]
+        if plan["mount_fit"] is not None:
+            args += ["--mount-fit", str(plan["mount_fit"])]
+        session.message = f"{target_label}：E1p 拟合球窝中心，逐位姿比较生产 TCP…"
+        _save_marker_tcp_session(state)
+        result = _tracker_mount_result(state, _run_tracker_mount_command(state, args), out_path, kind="pivot")
+        report = result.get("report") if isinstance(result.get("report"), dict) else None
+        check.update(
+            {
+                # 0 certifies, 1 ran and does not certify (a finding), 2 cannot run.
+                "ok": result["returncode"] in (0, 1) and report is not None,
+                "returncode": result["returncode"],
+                "reportPath": result["reportPath"],
+                "summary": result["summary"],
+                "error": result["error"] if result["returncode"] not in (0, 1) else "",
+                "report": None if report is None else {k: report[k] for k in _E1P_REPORT_KEYS if k in report},
+            }
+        )
+        if not check["ok"]:
+            raise RuntimeError(check["error"] or "E1p 没有给出结果")
+        session.trackerCheck = check
+        session.stage = "capture"
+        session.message = f"{target_label} · {plan['condition']}：E1p 完成（{result['summary'] or out_path.name}）"
+        state.log("info", f"Marker→TCP E1p written: {out_path}")
+    except Exception as exc:  # noqa: BLE001
+        check.update({"ok": False, "error": str(exc)})
+        session.trackerCheck = check
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _run_tracker_mount_station(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit ``T_WG`` across sessions, one lever arm per session.
+
+    This is the fit that needs rotation about two non-parallel axes: differencing
+    two poses removes ``t_WG`` and leaves ``(R_i - R_j) @ c``, so a pure
+    translation pair says nothing about ``c`` at all. The CLI refuses rather than
+    returning a confident-looking answer, and the refusal names the missing
+    motion -- which is why it is surfaced verbatim instead of being reworded.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        args = _tracker_mount_capture_args(state, rows)
+        target = _ensure_tracker_sidecars(
+            state, _tracker_row_pairs(state, rows), str(payload.get("target") or "").strip()
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"station_{stamp}.json"
+    # One segment that wobbled past the dwell gate used to refuse the whole
+    # batch (2026-09-24: 1 of 20). Skipped and listed instead, as pivot does;
+    # the pose-count and geometry gates still judge what is left.
+    args = ["station", *args, "--out", str(out_path), "--skip-episodes-without-dwells"]
+    for flag, key in (("--world-frame-id", "worldFrameId"), ("--tracker-station-id", "trackerStationId")):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            args += [flag, value]
+    args += ["--target", target]
+    if payload.get("diagnostic"):
+        # Fits a point set too small to pin T_WG's rotation so the chain can
+        # run end to end; the artifact says it does not certify.
+        args.append("--allow-weak-geometry")
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    return _tracker_mount_result(state, run, out_path, kind="station")
+
+
+def _run_tracker_mount_lever_arm(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit ``c`` alone against a frozen station.
+
+    With ``T_WG`` known the problem is linear and needs no rotation at all, which
+    is what makes a fixed-attitude session usable. ``holdout`` is not decoration:
+    the poses it excludes are scored afterwards, and that held-out score is the
+    only thing separating a lever arm that predicts from one that was fitted to
+    its own noise.
+    """
+    try:
+        rows = _tracker_mount_rows(payload)
+        _require_one_mount(rows, "lever-arm")
+        station_raw = str(payload.get("station") or "").strip()
+        if not station_raw:
+            raise ValueError("需要一个已冻结的 station JSON 路径")
+        station = _resolve_user_path(state, station_raw)
+        if not station.is_file():
+            raise FileNotFoundError(f"station JSON 不存在: {station}")
+        args = _tracker_mount_capture_args(state, rows)
+        holdout = int(str(payload.get("holdout") or "0").strip() or "0")
+        if holdout < 0:
+            raise ValueError("holdout 不能为负")
+        target = _ensure_tracker_sidecars(
+            state, _tracker_row_pairs(state, rows), str(payload.get("target") or "").strip()
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _tracker_mount_output_root(state) / f"mount_{stamp}.json"
+    # Skipped and listed like station and pivot, so one wobbling segment does
+    # not refuse the rest; the holdout is then the first N of what is left.
+    args = [
+        "lever-arm", *args, "--station", str(station), "--out", str(out_path), "--target", target,
+        "--skip-episodes-without-dwells",
+    ]
+    if holdout:
+        args += ["--holdout", str(holdout)]
+
+    try:
+        run = _run_tracker_mount_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+    result = _tracker_mount_result(state, run, out_path, kind="lever_arm")
+    result["stationPath"] = str(station)
+    return result
+
+
+_TRACKER_MOUNT_CAPTURE_KIND = "tracker_mount"
+
+# One parked pose per segment. A dwell is 2.0 s of stillness after 0.3 s is
+# trimmed off each end (``fit_tracker_mount --min-dwell-s / --settle-s``), so a
+# segment shorter than 2.6 s cannot yield one at all; 4 s leaves room for the
+# hand leaving the rig. These restate the solver's floor rather than invent one.
+_TRACKER_MOUNT_SEGMENT_MIN_S = 2.6
+_TRACKER_MOUNT_SEGMENT_SUGGESTED_S = 4.0
+# A pivot segment is a continuous sweep through both rotation axes, not a pose.
+_TRACKER_MOUNT_PIVOT_SUGGESTED_S = 30.0
+_TRACKER_MOUNT_KINDS = {
+    "dwell": {
+        "protocol": "smr_parked_pose_dwell",
+        "message": (
+            "一段一个姿态：摆好、手离开，点「录一段」，静止到自动收尾。"
+            "拟合要 ≥ 15 段，要留出复核就录 20 段；姿态要绕两根不平行的轴转开。"
+        ),
+    },
+    "pivot": {
+        # Continuous since 2026-09-22: the same protocol the marker->TCP panel
+        # records, because it is the same act. Older captures say
+        # tcp_pivot_dwell and still solve.
+        "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
+        "message": (
+            "pivot：插件球头卡在球窝里，SMR 留在钢片上。连续扫动，不用停；插件别抬离球窝、别断光。"
+            "绕光束方向侧倾 ±45–60°，前后倾留在 ±25° 内；一段 20–60 s，两侧各一场。"
+        ),
+    },
+}
+
+
+def _tracker_mount_capture_root(state: GatewayState, session_name: str) -> Path:
+    """Where parked-pose episodes for a mount fit are written.
+
+    Its own tree under the calibration captures root, for the same reason
+    intrinsics and extrinsics have separate ones: these episodes are a *dwell*
+    capture and are useless as training data, so letting them land in the
+    session dataset would put a minute of a stationary rig into whatever is
+    being collected that day.
+    """
+    return _calibration_captures_root(state) / session_name / _TRACKER_MOUNT_CAPTURE_KIND
+
+
+def _tracker_mount_capture_intent(
+    session_name: str, pose_label: str, seconds: float, kind: str = "dwell"
+) -> dict[str, Any]:
+    """Why this episode exists, written where it survives a gateway restart.
+
+    On disk a parked-pose segment and a trajectory segment are the same nine
+    videos. ``purpose`` is what lets the mount fit find its own captures later
+    without the operator remembering which episode index was which.
+    """
+    return {
+        "purpose": "calibration_tracker_mount",
+        "session_id": session_name,
+        "pose_label": pose_label,
+        "protocol": _TRACKER_MOUNT_KINDS.get(kind, _TRACKER_MOUNT_KINDS["dwell"])["protocol"],
+        "segment_seconds": seconds,
+    }
+
+
+# The recorder names its tracker session in several different sentences -- at
+# Connect ("Laser tracker session lt_... -> D:\lt\lt_..."), in the beam-status
+# summaries, and at Disconnect ("Laser tracker session landed: <path>/lt_..."),
+# and it is the only identifier that ties a run of dwells to the stream they get
+# cut out of. Matching the id itself rather than any one sentence's shape.
+_TRACKER_SESSION_ID_RE = re.compile(r"\blt_\d{8}_\d{6}\b")
+
+
+def _tracker_session_id_from_detail(detail: str) -> str:
+    match = _TRACKER_SESSION_ID_RE.search(str(detail or ""))
+    return match.group(0) if match else ""
+
+
+def _note_tracker_mount_landing(state: GatewayState, output: str) -> None:
+    """Record where the tracker stream landed, and that the dwells are solvable.
+
+    Until this line arrives every dwell on disk is correct and none of them can
+    be read, because the stream they index into is still open. That is the one
+    distinction the calibration panel exists to make visible, so it is taken from
+    the recorder's own sentence rather than inferred from the recorder exiting.
+    """
+    session = state.tracker_mount_session
+    if not session.active:
+        return
+    path = output.split("landed:", 1)[-1].strip()
+    session.landedPath = path[:400]
+    session.trackerSessionId = _tracker_session_id_from_detail(path) or session.trackerSessionId
+    session.stage = "landed"
+    session.message = f"跟踪仪 session 已落地，{_tracker_mount_dwells_on_disk(session)} 段停驻可以解算了。"
+
+
+def _tracker_mount_dwells_on_disk(session: TrackerMountSession) -> int:
+    """How many dwells the recorder actually wrote under this session's root.
+
+    Counted from the episode directories rather than tracked in memory: a dwell
+    the operator discarded, and one the recorder auto-saved when its timer ran
+    out while the page was closed, both have to end up on the same number as
+    what the solve will read.
+    """
+    if not session.captureRoot:
+        return 0
+    episodes = Path(session.captureRoot) / "episodes"
+    try:
+        return sum(1 for d in episodes.iterdir() if (d / "meta.json").is_file())
+    except OSError:
+        return 0
+
+
+def _tracker_mount_session_payload(state: GatewayState) -> dict[str, Any]:
+    session = state.tracker_mount_session
+    return {
+        "active": session.active,
+        "stage": session.stage,
+        "sessionName": session.sessionName,
+        "captureRoot": session.captureRoot,
+        "trackerSessionId": session.trackerSessionId,
+        "landedPath": session.landedPath,
+        "dwellsStarted": session.dwellsStarted,
+        "dwellsOnDisk": _tracker_mount_dwells_on_disk(session),
+        "message": session.message,
+        "startedAt": session.startedAt,
+        "kind": session.kind,
+        "shortSegments": session.shortSegments,
+        "lastSegmentSeconds": session.lastSegmentSeconds,
+        "segmentMinSeconds": _TRACKER_MOUNT_SEGMENT_MIN_S,
+        "segmentSuggestedSeconds": _TRACKER_MOUNT_SEGMENT_SUGGESTED_S,
+        # Both pages render off this snapshot, so the recorder's own state has to
+        # travel with the session -- otherwise each page derives "can I record?"
+        # from a different source and they disagree on screen, which is exactly
+        # what happened on 2026-09-21.
+        "recorderState": state.recording.state,
+        "episodeInFlight": state.recording.state in _EPISODE_OPEN_STATES,
+        "live": _tracker_mount_live_geometry(session),
+    }
+
+
+def _tracker_mount_live_geometry(session: TrackerMountSession) -> dict[str, Any]:
+    """What the solves will think of the capture so far, while the rig still stands.
+
+    Only segments whose episode is on disk count, so a discarded take drops out.
+    """
+    root = Path(session.captureRoot) / "episodes" if session.captureRoot else None
+    segments = [
+        seg for idx, seg in sorted(session.liveSegments.items())
+        if root is not None and (root / f"episode_{idx:06d}" / "meta.json").is_file()
+    ]
+    points = [tuple(seg["point_mm"]) for seg in segments if seg.get("kind") == "dwell" and seg.get("point_mm")]
+    return {
+        "segments": segments,
+        "station": tracker_geometry.station_geometry(points) if points else None,
+        "thresholds": {
+            "stationMinExtentM": tracker_geometry.STATION_MIN_EXTENT_M,
+            "stationMinPlanarity": tracker_geometry.STATION_MIN_PLANARITY,
+            "pivotMinGain": tracker_geometry.PIVOT_MIN_GAIN,
+        },
+    }
+
+
+def _start_tracker_mount_session(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Claim the recorder for a run of parked-pose dwells.
+
+    The name is minted here, not in the browser, so that it survives a reload
+    and so that Live Record can see who holds the recorder.
+    """
+    if state.tracker_mount_session.active:
+        return {
+            "ok": False,
+            "error": f"已有进行中的站位采集 {state.tracker_mount_session.sessionName}",
+            "session": _tracker_mount_session_payload(state),
+        }
+    if state.calibration_session.active:
+        return {
+            "ok": False,
+            "error": "多相机标定会话正在占用录制器，先结束它。",
+            "session": _tracker_mount_session_payload(state),
+        }
+    kind = str(payload.get("kind") or "dwell").strip() or "dwell"
+    if kind not in _TRACKER_MOUNT_KINDS:
+        return {
+            "ok": False,
+            "error": f"未知的采集类型 {kind!r}（只有 dwell / pivot）",
+            "session": _tracker_mount_session_payload(state),
+        }
+    name = str(payload.get("sessionName") or "").strip() or f"tm_{time.strftime('%Y%m%d_%H%M%S')}"
+    capture_root = _tracker_mount_capture_root(state, name)
+    state.tracker_mount_session = TrackerMountSession(
+        active=True,
+        stage="capture",
+        sessionName=name,
+        captureRoot=str(capture_root),
+        # Carried over rather than re-read later: a Connect that happened before
+        # this session started is still the Connect whose tracker stream these
+        # dwells will be cut out of.
+        trackerSessionId=_tracker_session_id_from_detail(state.recording.laserTrackerDetail),
+        # The old text here ("每段内部至少 3 个停驻姿态") described the protocol
+        # before segments were merged by mount, and is what taught operators to
+        # save a long take early at every pose.
+        message=_TRACKER_MOUNT_KINDS[kind]["message"],
+        startedAt=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        kind=kind,
+    )
+    state.log("info", f"Tracker-mount session {name} started")
+    return {"ok": True, "session": _tracker_mount_session_payload(state)}
+
+
+def _cancel_tracker_mount_session(state: GatewayState) -> dict[str, Any]:
+    """Release the recorder. Does not delete anything already recorded.
+
+    Said explicitly because the dwells stay on disk and stay solvable: the
+    session object is a claim on the recorder, not the data.
+    """
+    session = state.tracker_mount_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的站位采集"}
+    name = session.sessionName
+    state.tracker_mount_session = TrackerMountSession()
+    state.log("info", f"Tracker-mount session {name} released")
+    return {"ok": True, "session": _tracker_mount_session_payload(state)}
+
+
+def _start_tracker_mount_episode(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Record one parked-pose dwell from the calibration page.
+
+    Deliberately one episode per press rather than a scripted sweep: between
+    dwells a person physically re-orients the rig, and that is the part that
+    determines whether ``c`` is observable at all. A timer that moved on by
+    itself would produce the one failure this fit cannot detect from its own
+    residual -- poses that all look alike.
+    """
+    if state.recording.state in {"idle", "error"}:
+        return {
+            "ok": False,
+            "error": "录制器还没连接。先点上面的「Connect（带跟踪仪）」，等相机和跟踪仪都就绪。",
+        }
+    session = state.tracker_mount_session
+    if not session.active:
+        return {"ok": False, "error": "还没开始一次站位采集。先点「开始一次站位采集」。"}
+    session_name = session.sessionName
+    pose_label = str(payload.get("poseLabel") or "").strip()
+    try:
+        default_s = (
+            _TRACKER_MOUNT_PIVOT_SUGGESTED_S if session.kind == "pivot" else _TRACKER_MOUNT_SEGMENT_SUGGESTED_S
+        )
+        seconds = float(payload.get("seconds") or default_s)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "每段时长必须是正数秒"}
+    if seconds < _TRACKER_MOUNT_SEGMENT_MIN_S:
+        return {
+            "ok": False,
+            "error": (
+                f"{seconds:g}s 装不下一个驻点：要 2.0 s 静止，两端还各裁掉 0.3 s，"
+                f"至少 {_TRACKER_MOUNT_SEGMENT_MIN_S:g}s，建议 {_TRACKER_MOUNT_SEGMENT_SUGGESTED_S:g}s。"
+            ),
+            "session": _tracker_mount_session_payload(state),
+        }
+
+    capture_root = Path(session.captureRoot)
+    try:
+        _start_episode(
+            state,
+            seconds,
+            capture_root=capture_root,
+            capture_intent=_tracker_mount_capture_intent(
+                session_name, pose_label, seconds, session.kind
+            ),
+            require_capture_root_ack=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.message = str(exc)
+        return {"ok": False, "error": str(exc), "session": _tracker_mount_session_payload(state)}
+    session.dwellsStarted += 1
+    session.lastSegmentStartedMono = time.monotonic()
+    session.lastSegmentSeconds = 0.0
+    # A dwell started before the tracker id was known still belongs to whatever
+    # session this Connect opened, so fill it in at the first chance instead of
+    # leaving the field empty for the whole run.
+    if not session.trackerSessionId:
+        session.trackerSessionId = _tracker_session_id_from_detail(
+            state.recording.laserTrackerDetail
+        )
+    session.message = (
+        f"第 {session.dwellsStarted} 段正在录，{seconds:g}s 后自动收尾——静止到收尾，别提前保存。"
+    )
+    return {
+        "ok": True,
+        "captureRoot": str(capture_root),
+        "episodeIndex": int(state.recording.savedEpisodes),
+        "seconds": seconds,
+        "session": _tracker_mount_session_payload(state),
+    }
+
+
+def _tracker_session_dir_for(
+    state: GatewayState, dataset: Path, session_id: str
+) -> Path | None:
+    """Where the recorder landed a tracker session, or None if it has not.
+
+    ``thor_record`` calls ``tracker.stop(land_to=<dataset_root>/laser_tracker)``
+    and the session lands as ``<that>/<session_id>``. ``<dataset_root>`` is the
+    recorder's **own session dataset**, which for a redirected capture is not
+    where the episodes went: a tracker-mount capture writes its episodes under
+    ``calibration_captures/<session>/tracker_mount`` while the stream lands under
+    ``datasets/<recorder session>/laser_tracker``. Looking only beside the
+    episodes is why a landed session read as "待 Disconnect" forever on
+    2026-09-21, on a capture that had in fact landed and was ready to solve.
+
+    So: beside the episodes first (an un-redirected capture), then across the
+    datasets root. Returning None rather than a non-existent path keeps
+    "not landed yet" and "landed somewhere else" from looking alike.
+    """
+    if not session_id:
+        return None
+    beside = dataset / "laser_tracker" / session_id
+    if beside.is_dir():
+        return beside
+    root = state.datasets_root
+    if root and root.is_dir():
+        try:
+            candidates = sorted(root.glob(f"*/laser_tracker/{session_id}"))
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def _tracker_mount_capture_candidates(state: GatewayState, limit: int | None = 40) -> list[Path]:
+    """Datasets that might hold parked-pose episodes, newest first."""
+    roots: list[Path] = []
+    calib_root = _calibration_captures_root(state)
+    if calib_root.is_dir():
+        for session_dir in calib_root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            candidate = session_dir / _TRACKER_MOUNT_CAPTURE_KIND
+            if _is_dataset_root(candidate):
+                roots.append(candidate)
+    if state.datasets_root and state.datasets_root.is_dir():
+        roots.extend(path for path in state.datasets_root.iterdir() if _is_dataset_root(path))
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in roots:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return unique if limit is None else unique[:limit]
+
+
+def _tracker_mount_discover(state: GatewayState) -> dict[str, Any]:
+    """Every recorded episode that carries a tracker session, with its paths resolved.
+
+    This replaces typing four paths into a form. It reads each episode's own
+    ``meta.json`` rather than a directory convention, because the tracker is
+    enabled per Connect and an episode that is silent about it cannot be told
+    apart later from one where the tracker was asked for and did not answer.
+
+    ``landed`` is the field that decides whether the solve can run at all. The
+    session seals and lands at **Disconnect**, not at the end of an episode, so
+    between the last dwell and Disconnect every row here is correct and none of
+    them is usable -- which is exactly the state an operator needs told.
+    """
+    return {"ok": True, "episodes": _tracker_mount_capture_rows(state)[:60]}
+
+
+def _tracker_mount_capture_rows(state: GatewayState, limit: int | None = 40) -> list[dict[str, Any]]:
+    """Every tracker-enabled episode, newest first; ``limit`` caps the datasets scanned."""
+    rows: list[dict[str, Any]] = []
+    for dataset in _tracker_mount_capture_candidates(state, limit):
+        episodes_dir = dataset / "episodes"
+        if not episodes_dir.is_dir():
+            continue
+        for ep_dir in sorted(episodes_dir.iterdir()):
+            meta_path = ep_dir / "meta.json"
+            if not meta_path.is_file():
+                continue
+            meta = _read_json_file(meta_path)
+            if not meta:
+                continue
+            tracker = meta.get("laser_tracker") or {}
+            if not isinstance(tracker, dict) or not tracker.get("enabled"):
+                continue
+            session_id = str(tracker.get("session_id") or "")
+            session_dir = _tracker_session_dir_for(state, dataset, session_id)
+            # Where it is if it landed, where it would be if it has not. The
+            # path is useful either way; "landed" is the field that decides
+            # whether the solve can run.
+            session_path = session_dir or (
+                dataset / "laser_tracker" / session_id if session_id else None
+            )
+            intent = meta.get("capture_intent") or {}
+            rows.append(
+                {
+                    "dataset": str(dataset),
+                    "datasetName": dataset.name,
+                    "episode": int(meta.get("episode_index") or 0),
+                    "episodeDir": str(ep_dir),
+                    "sessionId": session_id,
+                    "sessionPath": str(session_path) if session_path else "",
+                    # The solve cannot run until Disconnect has sealed and landed
+                    # the session; surfaced rather than discovered as a failure.
+                    "landed": session_dir is not None,
+                    "poseLabel": str(intent.get("pose_label") or ""),
+                    "purpose": str(intent.get("purpose") or ""),
+                    "protocol": str(intent.get("protocol") or ""),
+                    "segmentSeconds": float(intent.get("segment_seconds") or 0.0),
+                    "beamValidFraction": float(tracker.get("beam_valid_fraction", -1.0)),
+                    "streamAdvanced": bool(tracker.get("stream_advanced", True)),
+                    "trackerError": str(tracker.get("error") or ""),
+                    "modifiedUnixS": meta_path.stat().st_mtime,
+                }
+            )
+    rows.sort(key=lambda row: row["modifiedUnixS"], reverse=True)
+    return rows
+
+
+def _delete_tracker_mount_captures(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Delete recorded tracker captures picked from the panel's list.
+
+    Only rows the discovery itself lists can be named, so a request cannot
+    reach an arbitrary path. The whole request is planned before anything is
+    removed: one refused row refuses the batch, rather than leaving half of it
+    deleted and the operator guessing which half.
+
+    Episodes are removed **without renumbering**. The survivors keep their
+    indices because the derived pose sidecars and every fit artifact already
+    written name episodes by index; renumbering would silently repoint them at
+    other poses. The fit reads episodes by explicit index, so a gap is harmless.
+
+    A recorder dataset (under the datasets root) is different: its parquet is
+    indexed by episode, and deleting some of its episode dirs would corrupt it.
+    Those can only go as a whole, and partial deletion stays with Replay.
+
+    A tracker stream is shared by every episode of its Connect; it is removed
+    only once no remaining episode anywhere refers to it.
+    """
+    raw = payload.get("episodeDirs")
+    if not isinstance(raw, list) or not raw:
+        return {"ok": False, "error": "没有选中要删除的录制"}
+    wanted = list(dict.fromkeys(str(item) for item in raw))
+    with state.lock:
+        recorder_state = state.recording.state
+        session = state.tracker_mount_session
+        active_root = session.captureRoot if session.active else ""
+    if recorder_state in {"recording", "review", "saving", "discarding"}:
+        return {"ok": False, "error": "正在录制/保存一段，等这一段结束后再删。"}
+    connected = recorder_state not in {"idle", "error"}
+
+    rows = _tracker_mount_capture_rows(state, limit=None)
+    by_dir = {row["episodeDir"]: row for row in rows}
+    unknown = [item for item in wanted if item not in by_dir]
+    if unknown:
+        return {"ok": False, "error": f"列表里没有这些录制（可能已被删除，刷新后再试）：{', '.join(unknown)}"}
+
+    calib_root = _calibration_captures_root(state).resolve()
+    active = Path(active_root).resolve() if active_root else None
+    chosen: dict[Path, list[dict[str, Any]]] = {}
+    for item in wanted:
+        row = by_dir[item]
+        chosen.setdefault(Path(row["dataset"]), []).append(row)
+
+    plan: list[tuple[Path, list[Path] | None]] = []  # (dataset, episode dirs | None = whole)
+    for dataset, picked in chosen.items():
+        resolved = dataset.resolve()
+        if active is not None and resolved == active:
+            return {"ok": False, "error": f"{dataset.parent.name} 是进行中的站位采集，先「结束采集」再删。"}
+        if connected and any(not row["landed"] for row in picked):
+            return {
+                "ok": False,
+                "error": f"{dataset.parent.name}/{dataset.name} 的跟踪仪 session 还没落地，录制器也还连着；"
+                "先 Disconnect 让它落地（或确认它不是这次连接的），再删。",
+            }
+        picked_dirs = {Path(row["episodeDir"]).resolve() for row in picked}
+        all_dirs = {ep.resolve() for ep in (dataset / "episodes").iterdir() if ep.is_dir()}
+        whole = all_dirs <= picked_dirs
+        in_calib = resolved.parent.parent == calib_root
+        if not in_calib and not whole:
+            return {
+                "ok": False,
+                "error": f"{dataset.name} 是录制器数据集，episode 按 parquet 编号，只删其中几段会把它弄坏。"
+                "要么全选它的所有录制整组删除，要么去回放页逐个删。",
+            }
+        plan.append((dataset, None if whole else sorted(picked_dirs)))
+
+    removed: list[str] = []
+    for dataset, episode_dirs in plan:
+        if episode_dirs is None:
+            # A mount capture's dataset is the only child of its tm_<ts> dir.
+            target = dataset.parent if dataset.resolve().parent.parent == calib_root else dataset
+            shutil.rmtree(target)
+            removed.append(str(target))
+        else:
+            for ep_dir in episode_dirs:
+                shutil.rmtree(ep_dir)
+                removed.append(str(ep_dir))
+
+    # Streams that no surviving episode refers to any more.
+    still_used = {row["sessionId"] for row in _tracker_mount_capture_rows(state, limit=None)}
+    removed_streams: list[str] = []
+    for item in wanted:
+        row = by_dir[item]
+        stream = Path(row["sessionPath"]) if row["sessionPath"] else None
+        if not row["sessionId"] or row["sessionId"] in still_used or stream is None:
+            continue
+        if stream.is_dir() and stream.parent.name == "laser_tracker" and stream.name == row["sessionId"]:
+            shutil.rmtree(stream)
+            removed_streams.append(str(stream))
+    with state.lock:
+        state.log(
+            "warn",
+            f"Deleted {len(wanted)} tracker capture(s): {len(removed)} dir(s), {len(removed_streams)} tracker stream(s)",
+        )
+    return {"ok": True, "deleted": len(wanted), "removedDirs": removed, "removedStreams": removed_streams}
+
+
+def _run_tracker_mount_chain(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fit the mount and grade a trajectory with it, in one press.
+
+    The two steps are chained rather than merged: the fit has to be run on
+    parked poses that are *not* the trajectory being graded, so this passes the
+    fit's own artifact to the comparison instead of sharing state between them.
+    If the fit refuses, the comparison is not attempted -- grading a trajectory
+    against a registration that was declined is how a refusal turns back into a
+    number.
+    """
+    mode = str(payload.get("mode") or "station").strip()
+    if mode == "station":
+        fit = _run_tracker_mount_station(state, payload)
+    elif mode == "lever-arm":
+        fit = _run_tracker_mount_lever_arm(state, payload)
+    elif mode == "pivot":
+        # Static, at the TCP: there is no trajectory to grade against it, so the
+        # chain ends at the fit whatever ``validate`` asked for.
+        fit = _run_tracker_mount_pivot(state, payload)
+        pivot_result: dict[str, Any] = {"ok": bool(fit.get("ok")), "fit": fit, "validate": None}
+        if not fit.get("ok"):
+            pivot_result["error"] = fit.get("error") or "pivot 没有通过"
+        return pivot_result
+    else:
+        return {"ok": False, "error": f"未知模式 {mode!r}", "returncode": 2}
+
+    result: dict[str, Any] = {"ok": fit.get("ok", False), "fit": fit, "validate": None}
+    # Diagnostic mode goes on past "fitted, does not certify" (1) so the chain
+    # can be run end to end before the capture is good enough; never past a
+    # refusal (2), where there is no fit to grade with. The comparison then
+    # carries the fit's verdict with it rather than a certified-looking number.
+    proceed = fit.get("ok") or (payload.get("diagnostic") and fit.get("returncode") == 1)
+    if not proceed or not fit.get("reportPath"):
+        result["error"] = fit.get("error") or "拟合没有通过，未继续做 GT 比较"
+        return result
+    result["uncertifiedFit"] = not fit.get("ok")
+
+    validate_request = payload.get("validate")
+    if not isinstance(validate_request, dict) or not validate_request:
+        return result
+
+    # A station artifact is a transform, not a lever arm; only a lever-arm fit
+    # can be handed to the comparison as --mount-fit.
+    mount_fit = fit["reportPath"] if mode == "lever-arm" else str(validate_request.get("mountFit") or "")
+    validate = _run_tracker_validate(state, {**validate_request, "mountFit": mount_fit})
+    result["validate"] = validate
+    result["ok"] = bool(fit.get("ok") and validate.get("ok"))
+    if not validate.get("ok"):
+        result["error"] = validate.get("error") or "GT 比较没有通过"
+    return result
+
+
+def _production_exposure_fraction(episode_dir: Path | None = None) -> float:
+    """What the recorder actually applied to *this* episode -- not what the CLI defaults to.
+
+    Grading at a value the recorder did not use would score a trajectory that
+    was never produced: the whole point of this comparison is the labels
+    production wrote.  The recorder's value is expected to change (the sign is
+    measured as -0.5; it waits on the BOX transport delay being subtracted
+    alongside it), and one global default would then be wrong for half the
+    archive, so each episode's ``meta.json`` names the one it was recorded under:
+
+    * ``box_camera_alignment.exposure_fraction`` present -> that value;
+    * the block present without it -> 0.0 (a recorder that predates the
+      exposure column, which could not have applied any);
+    * no readable meta -> the recorder's current constant, read from the
+      recorder's own module rather than copied, which is how the two would
+      drift apart silently.
+    """
+    if episode_dir is not None:
+        try:
+            meta = json.loads((episode_dir / "meta.json").read_text(encoding="utf-8"))
+            alignment = meta.get("box_camera_alignment")
+            if isinstance(alignment, dict):
+                return float(alignment.get("exposure_fraction", 0.0))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+        return float(lr3.EXPOSURE_CENTER_FRACTION)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _tracker_validate_episode_dir(dataset: Path, episode: int) -> Path | None:
+    """The episode directory holding the Argus sidecars, if it is where it should be.
+
+    Worth auto-filling because leaving it out is not a small degradation: the
+    camera times then come from the dataset's nominal ``N/fps`` grid, which is
+    episode-local and sits up to 55 ms from the hardware SOF. That is a different
+    time base, not a slightly worse one, and a residual computed on it is not
+    comparable with one that used the sidecars.
+    """
+    candidate = dataset / "episodes" / f"episode_{int(episode):06d}"
+    return candidate if candidate.is_dir() else None
+
+
+def _run_tracker_validate(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Compare one episode's camera trajectory against the tracker session.
+
+    The artifact lands inside the session directory as
+    ``alignment_ep<N>.json`` -- which is where :func:`_tracker_alignment_payload`
+    already looks -- so running this from the calibration page is what makes the
+    comparison appear on the replay page. Writing it anywhere else would produce
+    a result that exists and cannot be found.
+
+    The response carries the verdict and drops the plot series: the artifact
+    holds up to 4000 points of two trajectories, none of which this panel draws,
+    and the replay page reads the file directly.
+    """
+    try:
+        dataset_raw = str(payload.get("dataset") or "").strip()
+        session_raw = str(payload.get("session") or "").strip()
+        if not dataset_raw or not session_raw:
+            raise ValueError("需要数据集目录和 tracker session 目录")
+        dataset = _resolve_user_path(state, dataset_raw)
+        if not dataset.is_dir():
+            raise FileNotFoundError(f"数据集目录不存在: {dataset}")
+        session = _resolve_user_path(state, session_raw)
+        if not session.is_dir():
+            raise FileNotFoundError(f"tracker session 目录不存在: {session}")
+        # Not ``or ""``: episode 0 is the first of every dataset, and 0 is falsy.
+        raw_episode = payload.get("episode")
+        episode = int(str("" if raw_episode is None else raw_episode).strip())
+        mount_fit_raw = str(payload.get("mountFit") or "").strip()
+        mount_fit = None
+        if mount_fit_raw:
+            mount_fit = _resolve_user_path(state, mount_fit_raw)
+            if not mount_fit.is_file():
+                raise FileNotFoundError(f"mount-fit JSON 不存在: {mount_fit}")
+        episode_dir_raw = str(payload.get("episodeDir") or "").strip()
+        if episode_dir_raw:
+            episode_dir = _resolve_user_path(state, episode_dir_raw)
+            if not episode_dir.is_dir():
+                raise FileNotFoundError(f"episode 目录不存在: {episode_dir}")
+        else:
+            episode_dir = _tracker_validate_episode_dir(dataset, episode)
+        exposure_fraction = payload.get("exposureFraction")
+        fraction = (
+            _production_exposure_fraction(episode_dir)
+            if exposure_fraction in (None, "")
+            else float(exposure_fraction)
+        )
+        readout_offset_s = float(payload.get("readoutOffsetS") or 0.0)
+        min_coverage = float(payload.get("minCoverage") or 0.8)
+        tcp_from_raw = str(payload.get("tcpFrom") or "").strip()
+        tcp_from = None
+        if tcp_from_raw:
+            if mount_fit is None:
+                raise ValueError("比较 TCP 需要同一块钢片的 lever-arm 结果（mount-fit）")
+            tcp_from = _resolve_user_path(state, tcp_from_raw)
+            if not tcp_from.is_file():
+                raise FileNotFoundError(f"pivot JSON 不存在: {tcp_from}")
+        target = _ensure_tracker_sidecars(
+            state, [(dataset, episode)], str(payload.get("target") or "").strip()
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    out_path = session / f"alignment_ep{episode}.json"
+    args = [
+        "--dataset", str(dataset),
+        "--episode", str(episode),
+        "--session", str(session),
+        "--min-coverage", str(min_coverage),
+        "--exposure-fraction", str(fraction),
+        "--readout-offset-s", str(readout_offset_s),
+        "--out", str(out_path),
+    ]
+    args += ["--target", target]
+    if mount_fit is not None:
+        args += ["--mount-fit", str(mount_fit)]
+    if tcp_from is not None:
+        args += ["--tcp-from", str(tcp_from)]
+    if episode_dir is not None:
+        args += ["--episode-dir", str(episode_dir)]
+
+    python = _hand_eye_python(state)
+    command = [str(python), "-m", "metrology.cli.validate_against_tracker", *args]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "returncode": 2}
+
+    report: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            report = json.loads(out_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = None
+    if report is not None:
+        report.pop("series", None)
+
+    stderr = (proc.stderr or "")[-8000:]
+    tail = stderr.strip().splitlines()
+    return {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "kind": "validate",
+        "report": report,
+        "reportPath": str(out_path) if out_path.is_file() else "",
+        "summary": tail[0] if tail else "",
+        "episodeDir": str(episode_dir) if episode_dir else "",
+        "exposureFraction": fraction,
+        "stdout": "",  # the artifact is the output; stdout is only "wrote <path>"
+        "stderr": stderr,
+        "error": "" if proc.returncode == 0 else (tail[-1] if tail else "GT 比较失败"),
+    }
+
+
+# Routed outside the state lock (see the POST handler): each can wait minutes.
+_TRACKER_MOUNT_FIT_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/tracker-mount/station": _run_tracker_mount_station,
+    "/api/calibration/tracker-mount/pivot": _run_tracker_mount_pivot,
+    "/api/calibration/tracker-mount/lever-arm": _run_tracker_mount_lever_arm,
+    "/api/calibration/tracker-mount/chain": _run_tracker_mount_chain,
+    "/api/calibration/tracker-mount/validate": _run_tracker_validate,
+}
+
+
+def _tracker_mount_artifact_summary(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload.pop("capture", None)  # per-dwell diagnostics; large and not for the panel
+    return {
+        "path": str(path),
+        "name": path.name,
+        "modifiedUnixS": path.stat().st_mtime,
+        "report": payload,
+    }
+
+
+def _tracker_mount_payload(state: GatewayState) -> dict[str, Any]:
+    """The artifacts on disk, newest first, so the panel opens with a state.
+
+    Listed rather than remembered in process memory: these fits outlive the
+    gateway, a station is explicitly meant to be reused across sessions, and a
+    panel that forgot them on restart would invite refitting a constant of the
+    room for no reason.
+    """
+    root = state.repo_root / _TRACKER_MOUNT_SUBDIR
+    stations: list[dict[str, Any]] = []
+    mounts: list[dict[str, Any]] = []
+    if root.is_dir():
+        for path in sorted(root.glob("station_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                stations.append(summary)
+        for path in sorted(root.glob("mount_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                mounts.append(summary)
+    pivots: list[dict[str, Any]] = []
+    if root.is_dir():
+        for path in sorted(root.glob("pivot_*.json")):
+            summary = _tracker_mount_artifact_summary(path)
+            if summary:
+                # The per-frame sampling is the bulk of a pivot artifact.
+                keep = (*_E1P_REPORT_KEYS, "mount_id", "pose_frame", "smr_to_tcp_pose_frame_mm")
+                summary["report"] = {k: summary["report"][k] for k in keep if k in summary["report"]}
+                pivots.append(summary)
+    stations.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    mounts.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    pivots.sort(key=lambda item: item["modifiedUnixS"], reverse=True)
+    return {
+        "ok": True,
+        "root": str(root),
+        "stations": stations[:20],
+        "mounts": mounts[:20],
+        # Only the ones that can turn a trajectory comparison into a TCP one.
+        "pivots": [p for p in pivots if "smr_to_tcp_pose_frame_mm" in p["report"]][:20],
+    }
+
+
 def _newest_calibration_dataset(state: GatewayState) -> Path | None:
     """Most recent extrinsics sweep, newest layout first.
 
@@ -5451,6 +7291,13 @@ def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[
 
     Blocking applies only when production already ships intrinsics: a first
     calibration of a fresh rig has nothing to extend and nothing to lose.
+
+    Nor does it outlive the evidence. Once an experiment solve has fitted this
+    very capture and every such camera came out with a lens the exporter takes,
+    the failure it guards against has been ruled out -- and the detections are
+    cached, so the export run does not decode anything again. Without this the
+    refusal was permanent: the only way to add a camera to production was a
+    capture that could never be exported.
     """
     production = _production_intrinsics_cameras(state)
     if intrinsics is None or not production:
@@ -5458,24 +7305,46 @@ def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[
             "cameras": [],
             "production": production,
             "uncalibrated": [],
+            "proven": [],
             "carriedForward": [],
+            "refusedFit": [],
             "blocking": False,
         }
     cameras = _capture_cameras(intrinsics)
     uncalibrated = [name for name in cameras if name not in set(production)]
-    return {
+    fitted, refused, report = _proven_intrinsics_fit(state, intrinsics)
+    proven = [name for name in uncalibrated if name in set(fitted)]
+    # A camera production does ship still takes the export down if its re-fit
+    # folds: the exporter refuses the whole run, it does not fall back to the
+    # production lens. Known only once a fit has run, and then it must block.
+    refused = [name for name in cameras if name in set(refused)]
+    payload = {
         "cameras": cameras,
         "production": production,
         "uncalibrated": uncalibrated,
+        # Already fitted from this capture, unchanged since, with a usable lens.
+        "proven": proven,
         # Not re-fitted by this capture, and kept by the export rather than lost.
         "carriedForward": [name for name in production if name not in set(cameras)],
-        "blocking": bool(uncalibrated),
+        "refusedFit": refused,
+        "blocking": len(proven) < len(uncalibrated) or bool(refused),
     }
+    if proven or refused:
+        payload["provenReport"] = report
+    return payload
 
 
 def _preflight_message(preflight: dict[str, Any]) -> str:
     """The refusal, naming the cameras and why carrying forward cannot save them."""
-    names = "、".join(preflight.get("uncalibrated") or [])
+    refused = preflight.get("refusedFit") or []
+    if refused:
+        return (
+            f"重算内参并导出会在最后一步失败：上一轮从这份采集拟合出的 {'、'.join(refused)} "
+            f"模型在画面内折返或角点反投影不出射线，导出器会拒绝整轮。"
+            f"通常是板子没走到画面四角——把这几台重录一段，板子走满四角后再解算。"
+        )
+    proven = set(preflight.get("proven") or [])
+    names = "、".join(name for name in preflight.get("uncalibrated") or [] if name not in proven)
     return (
         f"重算内参并导出会在最后一步失败：这份采集里 {names} 没有在产内参，"
         f"导出时它们必须各自拟合出可用的模型，任何一台看不到板都会让整轮作废（已解码的部分全部白跑）。"
@@ -5613,6 +7482,8 @@ def _solve_progress_line(line: str) -> tuple[bool, str]:
 # after the detection pass had already finished and been thrown away.
 _DETECTION_STRIDE = 2
 _DETECTION_MANIFEST = "manifest.json"
+# Beside the corners: which cameras a fit of them produced an exportable lens for.
+_INTRINSICS_FIT_RECORD = "intrinsics_fit.json"
 
 
 # The module ``detect_charuco`` plans with. Located from this file rather than
@@ -5714,11 +7585,79 @@ def _clear_detections(detections: Path) -> None:
     stale = [
         *detections.glob("*.npz"),
         detections / _DETECTION_MANIFEST,
+        detections / _INTRINSICS_FIT_RECORD,
         detections / _capture_intent_module().MANIFEST_FILENAME,
     ]
     for path in stale:
         with suppress(OSError):
             path.unlink()
+
+
+def _exportable_fisheye_cameras(report: Any) -> list[str]:
+    """Cameras whose fisheye model the exporter would take as it stands.
+
+    Mirrors ``export_production_calibration.export_intrinsics``: a K, exactly
+    four coefficients, and a model that neither folds inside the frame nor
+    leaves the corner without a ray.
+    """
+    entries = report.get("cameras") if isinstance(report, dict) else None
+    usable = []
+    for name, entry in (entries or {}).items():
+        block = ((entry or {}).get("models") or {}).get("fisheye") or {}
+        coefficients = block.get("D", [])
+        # Stored flat or nested ([[k1..k4]]); the exporter reshapes either way.
+        while isinstance(coefficients, list) and len(coefficients) == 1 and isinstance(coefficients[0], list):
+            coefficients = coefficients[0]
+        if "K" not in block or not isinstance(coefficients, list) or len(coefficients) != 4:
+            continue
+        try:
+            bearing = float(block.get("corner_bearing_deg", float("nan")))
+        except (TypeError, ValueError):
+            bearing = float("nan")
+        invertible = bool(block.get("corner_invertible", math.isfinite(bearing)))
+        if invertible and bool(block.get("monotonic_across_frame", False)):
+            usable.append(str(name))
+    return sorted(usable)
+
+
+def _record_intrinsics_fit(episodes: Path, detections: Path, report_path: Path) -> None:
+    """Which cameras a fit of these exact detections produced an exportable lens for.
+
+    Kept beside the detections and under the same fingerprint, so it answers for
+    this capture's videos only: re-recording a sweep changes the fingerprint and
+    the record stops counting, and re-detecting deletes it with the npz.
+    """
+    report = _read_json_file(report_path)
+    record = _detection_fingerprint(episodes)
+    fitted = (report or {}).get("cameras") if isinstance(report, dict) else None
+    record.update(
+        report=str(report_path),
+        fitted=sorted(str(name) for name in (fitted or {})),
+        exportable=_exportable_fisheye_cameras(report),
+        generatedUtc=_now_iso(),
+    )
+    with suppress(OSError):
+        (detections / _INTRINSICS_FIT_RECORD).write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def _proven_intrinsics_fit(state: GatewayState, capture: Path) -> tuple[list[str], list[str], str]:
+    """(exportable, refused, report) from an earlier fit of this capture, unchanged since.
+
+    ``refused`` is what the exporter would turn away -- fitted, but folding or
+    not inverting at the corner. Any one of them takes the whole export down.
+    """
+    record = _read_json_file(_detections_dir(state, capture) / _INTRINSICS_FIT_RECORD)
+    if not isinstance(record, dict):
+        return [], [], ""
+    current = _detection_fingerprint(capture / "episodes")
+    if record.get("stride") != current["stride"] or record.get("videos") != current["videos"]:
+        return [], [], ""
+    report = str(record.get("report") or "")
+    if not report or not Path(report).is_file():
+        return [], [], ""
+    exportable = sorted(str(name) for name in record.get("exportable") or [])
+    refused = sorted(str(name) for name in record.get("fitted") or [] if str(name) not in set(exportable))
+    return exportable, refused, report
 
 
 def _write_detection_manifest(episodes: Path, detections: Path) -> None:
@@ -5967,6 +7906,50 @@ def _annotate_intrinsics_coverage(cameras: list[dict[str, Any]], report_path: Pa
             )
 
 
+def _intrinsics_capture_targets(capture: Path) -> set[str]:
+    """Cameras an intrinsics capture swept, from each episode's capture_intent."""
+    targets: set[str] = set()
+    for meta_path in sorted((capture / "episodes").glob("episode_*/meta.json")):
+        meta = _read_json_file(meta_path) or {}
+        intent = meta.get("capture_intent") if isinstance(meta.get("capture_intent"), dict) else {}
+        if intent.get("target_camera"):
+            targets.add(str(intent["target_camera"]))
+    return targets
+
+
+def _repoint_intrinsics_json(run_dir: Path) -> None:
+    """A copied run's summary must name its own producer files, not the staging copy's."""
+    summary_path = run_dir / "summary.json"
+    summary = _read_json_file(summary_path)
+    if not isinstance(summary, dict):
+        return
+    for row in summary.get("cameras") or []:
+        old = Path(str(row.get("intrinsics_json") or ""))
+        row["intrinsics_json"] = str(run_dir / "converted" / old.parent.name / old.name)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+CALIBRATION_IDENTITY_FILE = "camera_identity.json"
+
+
+def _write_calibration_identity(extrinsics_run: Path, run_name: str, port_serials: dict[str, str]) -> None:
+    """Which module each port had when this calibration was captured.
+
+    Kept inside the run, under outputs/, rather than in the tracked expected
+    table: written on the rig, a tracked file would be overwritten by the next
+    deploy from a workstation that never saw this solve.
+    """
+    if not extrinsics_run.is_dir():
+        return
+    (extrinsics_run / CALIBRATION_IDENTITY_FILE).write_text(
+        json.dumps(
+            {"calibration": run_name, "generated_utc": _now_iso(), "source": "capture_eeprom", "ports": port_serials},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _run_extrinsics_calibration(
     state: GatewayState,
     dataset: Path,
@@ -5989,7 +7972,44 @@ def _run_extrinsics_calibration(
     calib_root = state.repo_root / "outputs" / "calibration"
     intrinsics_run = calib_root / (state.calibration.intrinsicsRun or "")
     intrinsics_source: list[str] = []
-    if intrinsics_dataset is None:
+    work = state.repo_root / "outputs" / "metrology" / run_name
+
+    # Lenses by module serial, not by port. The capture recorded which module
+    # each port had at Connect; each lens is looked up by that serial, wherever
+    # it was calibrated, and relabelled with the port it is on now. A capture
+    # from before identity recording (09-28) falls back to the old by-port path.
+    try:
+        port_serials = intrinsics_by_serial.capture_port_serials(dataset / "episodes")
+    except ValueError as exc:
+        _fail_calibration(state, str(exc))
+        return
+    staged_intrinsics: Path | None = None
+    if port_serials:
+        refit = _intrinsics_capture_targets(intrinsics_dataset) if intrinsics_dataset is not None else set()
+        sources, missing = intrinsics_by_serial.resolve_sources(sorted(set(port_serials.values())), calib_root)
+        uncovered = [cam for cam, serial in sorted(port_serials.items()) if serial in missing and cam not in refit]
+        if uncovered:
+            _fail_calibration(state, (
+                "这些相机没有已标定的内参："
+                + "、".join(f"{cam}（{port_serials[cam]}）" for cam in uncovered)
+                + "。先在标定向导里给它们录内参，再一起解算。"
+            ))
+            return
+        staged_intrinsics = work / "intrinsics_by_serial"
+        shutil.rmtree(staged_intrinsics, ignore_errors=True)
+        try:
+            intrinsics_by_serial.stage_run(port_serials, sources, staged_intrinsics)
+        except (OSError, ValueError) as exc:
+            _fail_calibration(state, f"按序列号装配内参失败：{exc}")
+            return
+        for line in intrinsics_by_serial.describe(port_serials, sources):
+            state.log("info", f"Intrinsics by serial: {line}")
+        if intrinsics_dataset is None:
+            intrinsics_source = ["--intrinsics-run", str(staged_intrinsics)]
+    else:
+        state.log("warn", "这段采集没有记录相机 EEPROM 序列号（09-28 之前录的），内参仍按端口取")
+
+    if intrinsics_dataset is None and staged_intrinsics is None:
         # Solve against the intrinsics production is actually using, not the
         # metrology report: that report lives under outputs/, which is excluded
         # from the deploy sync and so is simply absent on the rig. Using the
@@ -6007,7 +8027,6 @@ def _run_extrinsics_calibration(
             ))
             return
 
-    work = state.repo_root / "outputs" / "metrology" / run_name
     base_run = calib_root / (state.calibration.extrinsicsRun or "")
     # Two captures, two detection passes. Weighted by video count because that
     # is what the time goes into: an intrinsics capture is one sweep per camera.
@@ -6086,6 +8105,9 @@ def _run_extrinsics_calibration(
         ]
         if not _run("拟合内参…", fit_args, 3600):
             return
+        # What lets the next click export a camera production has no lens for:
+        # this fit is the evidence that it comes out of this capture usable.
+        _record_intrinsics_fit(intrinsics_dataset / "episodes", intrinsics_detections, fitted_intrinsics)
         # fisheye, not rational: the report holds both, and production declares
         # fisheye (cube_tracker.camera_model). Shipping the other one would be a
         # mismatch nothing downstream can detect.
@@ -6121,8 +8143,11 @@ def _run_extrinsics_calibration(
         ]
         # Only emit intrinsics when they were just re-fitted, or when there is no
         # production run to keep. Re-solving extrinsics alone does not touch lenses.
+        # By serial, the port -> lens assignment is new whenever a module moved,
+        # so the run production loads is always re-emitted, never kept.
         keep_intrinsics_run = (
             fitted_intrinsics is None
+            and staged_intrinsics is None
             and bool(state.calibration.intrinsicsRun)
             and intrinsics_run.is_dir()
         )
@@ -6133,8 +8158,12 @@ def _run_extrinsics_calibration(
             # run holding three lenses -- the other eight not stale, just gone.
             # Carrying them across is what makes a partial re-sweep a thing the
             # operator can actually do.
-            if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+            if staged_intrinsics is not None:
+                export_args += ["--carry-forward-intrinsics", str(staged_intrinsics)]
+            elif state.calibration.intrinsicsRun and intrinsics_run.is_dir():
                 export_args += ["--carry-forward-intrinsics", str(intrinsics_run)]
+        elif staged_intrinsics is not None:
+            pass  # copied into place after the export succeeds, below
         elif not keep_intrinsics_run:
             export_args += [
                 "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
@@ -6166,12 +8195,27 @@ def _run_extrinsics_calibration(
                 export_args += ["--align-cameras", *unmoved]
                 state.log("info", f"Base-frame alignment restricted to unmoved cameras: {', '.join(unmoved)}")
         serial_map = state.repo_root / "tools" / "thor" / "gmsl2" / "camera_serial_map.yaml"
-        if serial_map.is_file():
+        if port_serials:
+            # the capture's own EEPROM reads, not the hand-written map that
+            # never matched the hardware
+            work.mkdir(parents=True, exist_ok=True)
+            export_args += [
+                "--serial-map", str(intrinsics_by_serial.write_serial_map(port_serials, work / "camera_serial_map.yaml")),
+                "--serial-source", "eeprom",
+            ]
+        elif serial_map.is_file():
             export_args += ["--serial-map", str(serial_map)]
 
         _begin_solve_step(state, step_count, step_count, "导出生产标定…")
         if not _run("导出生产标定…", export_args, 600):
             return
+        if staged_intrinsics is not None and fitted_intrinsics is None:
+            target = calib_root / f"{run_name}_intrinsics"
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(staged_intrinsics, target)
+            _repoint_intrinsics_json(target)
+        if port_serials:
+            _write_calibration_identity(calib_root / f"{run_name}_extrinsics", run_name, port_serials)
 
     report_path = work / "extrinsics_report.json"
     try:
@@ -6326,9 +8370,9 @@ def _start_extrinsics_calibration(
             return _refuse_solve(
                 state,
                 _preflight_message(preflight),
-                hint="改用「只解算，不导出」跑这一轮：BA 会把这些相机一起解出来并给出残差，"
-                "只是不写进生产。要把它们真正并进生产内参，得先让它们在自己那一段里拟合出可用模型——"
-                "承接机制救不了没有在产内参的相机。",
+                hint="先用「只解算，不导出」跑一轮：BA 会把这些相机一起解出来并给出残差，只是不写进生产。"
+                "这几台在那一轮里拟合出可用模型后，这里就会放行导出，再点一次即可——"
+                "角点检测会直接复用，不用再等一遍解码。",
             )
 
     run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -10808,6 +12852,17 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         # acknowledgement is no longer a fact about anything. Leaving it set
         # would let the next recorder inherit a claim it never made.
         state.recording.captureRoot = ""
+        # A mount capture that is still in "capture" when the recorder is gone
+        # never saw its tracker stream land, and its dwells cannot be solved no
+        # matter how many of them are on disk. Saying so beats leaving the panel
+        # showing a capture in progress against a recorder that exited.
+        mount_session = state.tracker_mount_session
+        if mount_session.active and mount_session.stage == "capture":
+            mount_session.stage = "failed"
+            mount_session.message = (
+                "录制器已退出，但跟踪仪 session 没有落地——"
+                f"这 {_tracker_mount_dwells_on_disk(mount_session)} 段停驻没有可以对齐的跟踪仪流。"
+            )
         _set_all_device_states(
             state,
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
@@ -10937,6 +12992,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "annotation": _active_annotation(state),
         "calibration": _calibration_payload(state),
         "calibrationSession": _calibration_session_payload(state),
+        "trackerMountSession": _tracker_mount_session_payload(state),
         "markerTcp": _marker_tcp_session_payload(state),
         "recordedDatasets": recorded_datasets,
         "processing": list(state.cached_processing_items),
@@ -11570,6 +13626,11 @@ def _connect_recorder(
     state.recording.laserTrackerDetail = ""
     state.recording.laserTrackerState = "idle"
     state.recording.laserTrackerReady = False
+    state.recording.laserTrackerHomed = False
+    state.recording.laserTrackerBeamBroken = False
+    state.recording.cameraIdentity = {}
+    state.recording.cameraIdentityMismatches = []
+    state.recording.cameraIdentityExpectedFrom = ""
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -11595,7 +13656,14 @@ def _connect_recorder(
     _start_output_reader(state, state.process)
 
 
-_CAPTURE_ROOT_ACK_TIMEOUT_S = 5.0
+# The round trip is the recorder's stdin thread, its stdout pipe, the gateway
+# reader thread and the output consumer, and it measures in the low hundreds of
+# milliseconds. This budget is therefore not about latency -- it is how long an
+# operator waits with the panel greyed before a recorder that will never answer
+# is declared silent. It was 5 s, then 20 s, while the real problem was that the
+# wait deadlocked the consumer; with that fixed, a long budget buys nothing and
+# costs a frozen page.
+_CAPTURE_ROOT_ACK_TIMEOUT_S = 8.0
 
 
 def _await_capture_root(state: GatewayState, expected: Path, timeout_s: float) -> bool:
@@ -11607,15 +13675,27 @@ def _await_capture_root(state: GatewayState, expected: Path, timeout_s: float) -
     redirect exists to end -- so a caller that depends on the redirect has to see
     the acknowledgement before it records anything.
 
-    Polled without ``state.lock`` on purpose: the output consumer thread needs
-    that lock to apply the very line being waited for.
+    Waits on ``recorder_output_applied`` rather than polling, because both
+    callers reach here from a POST route that holds ``state.lock``, and the
+    consumer thread needs that same lock to apply the acknowledgement. Polling
+    here could therefore never succeed: the ack was applied the instant the wait
+    gave up and released the lock, which read from outside as a recorder that
+    answered a few hundred milliseconds too late -- twice, at two different
+    budgets. ``Condition.wait`` releases the lock while blocked, which is the
+    only thing that makes this a wait rather than a deadlock.
     """
     wanted = str(expected)
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if state.recording.captureRoot == wanted:
-            return True
-        time.sleep(0.05)
+    while state.recording.captureRoot != wanted:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            state.recorder_output_applied.wait(remaining)
+        except RuntimeError:
+            # Called without ``state.lock`` held. Nothing is being starved in
+            # that case, so plain polling is correct.
+            time.sleep(min(0.05, remaining))
     return state.recording.captureRoot == wanted
 
 
@@ -11648,15 +13728,65 @@ def _start_episode(
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
 
+    # A task episode started from Live Record while a mount capture holds the
+    # recorder does two kinds of damage at once, and neither announces itself:
+    # it clears the calibration redirect (capture_root=None below), so the
+    # segment lands in the task dataset with a stationary rig in it, and it puts
+    # a stretch of *motion* into the middle of a tracker stream whose episode
+    # boundaries the mount fit will later cut parked poses out of.
+    mount_session = state.tracker_mount_session
+    if capture_root is None and mount_session.active and mount_session.stage == "capture":
+        raise RuntimeError(
+            f"跟踪仪站位采集 {mount_session.sessionName} 正在占用录制器。"
+            "要录任务数据，先到「标定」页结束这次站位采集"
+            "（已经录下的停驻段不会被删）。"
+        )
+
+    # Every per-camera constant is keyed on the port, and the port is the cable.
+    # A camera on another camera's port gets that camera's intrinsics and
+    # extrinsics, and nothing downstream can tell (09-23 remount, found 09-28).
+    # A camera calibration sweep is exempt: re-calibrating the ports as they are
+    # now is one of the two ways out of a mismatch, and it must be recordable.
+    recalibrating = str((capture_intent or {}).get("purpose") or "") in {
+        "calibration_intrinsics",
+        "calibration_extrinsics",
+    }
+    if state.recording.cameraIdentityMismatches and not recalibrating:
+        lines = "；".join(
+            f"{m['camera']} 上是 {m['actual']}，标定时是 {m['expected']}"
+            + (f"（{m['expected']} 现在在 {m['expectedNowOn']}）" if m.get("expectedNowOn") else "")
+            for m in state.recording.cameraIdentityMismatches
+        )
+        raise RuntimeError(
+            f"相机和端口的对应关系与标定时不一致：{lines}。"
+            "把线缆插回原端口后重新 Connect；或者按现在的接法重新标定"
+            "（标定页的采集不受这条限制，内参会按序列号自动取，期望表随新外参更新）。"
+        )
+
     # An episode recorded while the tracker is blind is structurally complete and
     # metrologically empty -- 81343 rows, 0 dropped, not one measurement, which
     # is how 2026-09-20's first session went. The tracker re-homes on a timer, so
     # this clears itself as soon as the SMR is in the nest.
+    #
+    # "Ready" also requires that the session homed: a locked beam without a Home
+    # measures every distance against a stale reference (W2, 2026-09-21).
     if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        if state.recording.laserTrackerBeamBroken:
+            # A catch after a break keeps whatever range the ADM handed back;
+            # pivot lt_20260923_062953 carried +4.3 mm that way, flagged good.
+            raise RuntimeError(
+                "激光跟踪仪 Home 之后断过光，当前这段锁光没有绝对距离，录下的距离不可信。"
+                "请把 SMR 放回 home 窝，跟踪仪会自动重新 Home，设备行变绿后再 StartEpisode。"
+                "之后移动 SMR 全程别挡光。"
+            )
+        what = (
+            "尚未锁定 SMR" if state.recording.laserTrackerHomed
+            else "本次会话还没 Home 成功（没有绝对距离，录下的距离不可信）"
+        )
         raise RuntimeError(
-            "激光跟踪仪尚未锁定 SMR："
+            f"激光跟踪仪{what}："
             f"{state.recording.laserTrackerDetail or '等待中'}。"
-            "把 SMR 放进鸟巢窝，设备行变绿后再 StartEpisode"
+            "把 SMR 放进 home 窝，等 Home 成功、设备行变绿后再 StartEpisode"
             "（跟踪仪会自动重试 Home，不需要重新 Connect）。"
         )
 
@@ -11679,10 +13809,27 @@ def _start_episode(
             if capture_root is None:
                 raise RuntimeError("Cannot require a capture-root acknowledgement without a root.")
             if not _await_capture_root(state, capture_root, _CAPTURE_ROOT_ACK_TIMEOUT_S):
+                # Which silence it was decides what the operator should do, and
+                # the two have opposite fixes. Saying "deploy and reconnect" for
+                # a recorder that is merely slow throws away a working session.
+                reported = state.recording.captureRoot
+                if not reported:
+                    detail = (
+                        "它一个字都没回。多半是 Thor 上的录制器还是旧版本（不认识 capture_root）："
+                        "先 deploy，再到「采集」页重新 Connect。"
+                    )
+                else:
+                    # Deliberately not "go record a plain episode in Live
+                    # Record": while a mount session holds the recorder that is
+                    # refused, so the old advice sent the operator into a loop.
+                    detail = (
+                        f"它报告的仍是 {reported}，上一次采集的重定向还没换过来。"
+                        "再点一次「录一段停驻姿态」通常就好了；还不行就「结束采集」后重新 Connect。"
+                    )
                 raise RuntimeError(
-                    f"录制器没有确认采集目录 {capture_root}"
-                    f"（它报告的是 {state.recording.captureRoot or '（无）'}）。"
-                    "多半是 Thor 上的录制器还是旧版本：先 deploy，再到「采集」页重新 Connect。"
+                    f"等了 {_CAPTURE_ROOT_ACK_TIMEOUT_S:g}s，录制器没有确认采集目录 {capture_root}。"
+                    + detail
+                    + "本段没有开始录，跟踪仪 session 仍在跑，可以直接重试。"
                 )
         if capture_intent:
             _write_recorder_stdin(
@@ -11756,6 +13903,9 @@ def _consume_recorder_output(state: GatewayState) -> None:
                 if state.process is not process:
                     continue  # line from an already-replaced recorder
                 _apply_recorder_output(state, output)
+                # Wakes any request handler blocked on something this line may
+                # have just supplied -- see GatewayState.recorder_output_applied.
+                state.recorder_output_applied.notify_all()
         except Exception as exc:  # never let the consumer thread die
             state.log("warn", f"recorder output consumer error: {exc}")
 
@@ -12359,8 +14509,96 @@ def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240)
     return ""
 
 
+CAMERA_IDENTITY_EXPECTED = Path("tools") / "thor" / "gmsl2" / "camera_identity_expected.json"
+"""Port -> EEPROM serial the production calibration was made with, written by
+``camera_eeprom.py --write-expected`` after checking each port's factory
+intrinsics against that calibration. Absent means nothing is enforced."""
+
+
+def _load_camera_identity_expected(state: GatewayState) -> dict[str, Any]:
+    """Port -> serial the calibration in production was captured with.
+
+    The production extrinsics run carries its own table when it was solved by
+    serial; older runs fall back to the tracked table, fingerprinted by hand.
+    Production is what the tracker config names, not the in-memory pointer a
+    solve moves before anyone has promoted it.
+    """
+    run = _production_calibration_runs(state).get("extrinsicsRun") or ""
+    candidates = []
+    if run:
+        candidates.append(state.repo_root / "outputs" / "calibration" / run / CALIBRATION_IDENTITY_FILE)
+    candidates.append(state.repo_root / CAMERA_IDENTITY_EXPECTED)
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("ports"), dict):
+            return data
+    return {}
+
+
+def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> None:
+    """Compare the cameras on the ports now with those the calibration expects.
+
+    Only a serial read that differs is a mismatch. A port that did not answer
+    is unknown, not wrong -- it is shown, and does not block.
+    """
+    state.recording.cameraIdentity = identity
+    expected = _load_camera_identity_expected(state)
+    ports: dict[str, str] = {str(k): str(v) for k, v in (expected.get("ports") or {}).items()}
+    state.recording.cameraIdentityExpectedFrom = str(expected.get("calibration") or "")
+    now_at = {
+        str((v or {}).get("serial")): cam for cam, v in identity.items()
+        if isinstance(v, dict) and v.get("serial")
+    }
+    mismatches: list[dict[str, str]] = []
+    for cam, want in sorted(ports.items()):
+        live = identity.get(cam)
+        have = str(live.get("serial") or "") if isinstance(live, dict) else ""
+        if not have or have == want:
+            continue
+        mismatches.append({
+            "camera": cam,
+            "expected": want,
+            "actual": have,
+            # Where the expected camera went, if it is plugged in elsewhere.
+            "expectedNowOn": now_at.get(want, ""),
+            "actualCalibratedAs": next((c for c, s in ports.items() if s == have), ""),
+        })
+    state.recording.cameraIdentityMismatches = mismatches
+    for m in mismatches:
+        where = f"，它现在在 {m['expectedNowOn']}" if m["expectedNowOn"] else ""
+        detail = f"端口上是 {m['actual']}，标定时是 {m['expected']}{where}"
+        state.log("error", f"Camera identity: {m['camera']} {detail}")
+        _set_device_state(state, m["camera"], "error", detail)
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("LT_BEAM_BROKEN "):
+        state.recording.laserTrackerBeamBroken = output.removeprefix("LT_BEAM_BROKEN ").strip() == "1"
+        return
+    if output.startswith("LT_HOMED "):
+        state.recording.laserTrackerHomed = output.removeprefix("LT_HOMED ").strip() == "1"
+        return
+    if output.startswith("CAMERA_IDENTITY "):
+        try:
+            identity = json.loads(output.removeprefix("CAMERA_IDENTITY "))
+        except ValueError:
+            return
+        if isinstance(identity, dict):
+            _apply_camera_identity(state, identity)
+        return
+    if output.startswith("LT_SEGMENT "):
+        try:
+            seg = json.loads(output.removeprefix("LT_SEGMENT "))
+            idx = int(seg["episode"])
+        except (ValueError, KeyError, TypeError):
+            return
+        if state.tracker_mount_session.active and isinstance(seg, dict):
+            state.tracker_mount_session.liveSegments[idx] = seg
         return
     if output.startswith("LT_BEAM "):
         raw = output.removeprefix("LT_BEAM ").strip()
@@ -12396,6 +14634,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         elif "landed" in low:
             state.recording.laserTrackerState = "idle"
             state.recording.laserTrackerDetail = output.strip()[:200]
+            _note_tracker_mount_landing(state, output)
         else:
             state.recording.laserTrackerState = "running"
             state.recording.laserTrackerDetail = output.strip()[:200]
@@ -13495,6 +15734,8 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
 
     if action in ("save", "discard") and state.recording.state not in ("recording", "review"):
         raise RuntimeError(f"Cannot {action} while recorder is {state.recording.state}.")
+    if action in ("save", "discard"):
+        _note_tracker_mount_segment_end(state, action)
 
     if action == "save":
         try:
@@ -13584,11 +15825,20 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
+        if path == "/api/calibration/cross-camera":
+            _json_response(self, HTTPStatus.OK, _last_cross_camera_check(self.server.state))
+            return
         if path == "/api/calibration/world-frame":
             _json_response(self, HTTPStatus.OK, _world_frame_payload(self.server.state))
             return
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
+            return
+        if path == "/api/calibration/tracker-mount":
+            _json_response(self, HTTPStatus.OK, _tracker_mount_payload(self.server.state))
+            return
+        if path == "/api/calibration/tracker-mount/captures":
+            _json_response(self, HTTPStatus.OK, _tracker_mount_discover(self.server.state))
             return
         if path == "/api/calibration/marker-tcp":
             with self.server.state.lock:
@@ -13995,6 +16245,39 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
+        tracker_fit = _TRACKER_MOUNT_FIT_ROUTES.get(path) or _CROSS_CAMERA_ROUTES.get(path)
+        if tracker_fit is not None:
+            # Outside the state lock: a fit can first have to generate the
+            # capture's EE trajectory, which queues a job and waits on it -- both
+            # take the lock -- and the fit itself runs for minutes. Held here it
+            # froze every snapshot for the whole solve (82 s on 2026-09-24).
+            # A refusal is an answer about the capture, not a server fault: the
+            # panel renders which refusal it was, so it stays 200.
+            try:
+                result = tracker_fit(self.server.state, _read_json_body(self))
+            except Exception as exc:  # noqa: BLE001
+                with self.server.state.lock:
+                    self.server.state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/calibration/tracker-mount/captures/delete":
+            # Outside the state lock, and it has to be: the function takes that
+            # lock itself to read the recorder state, and Lock is not reentrant --
+            # routed inside the block below it deadlocked the whole gateway on
+            # its first real use (2026-09-24). rmtree of a capture's video is
+            # also far too slow to hold every snapshot poll behind.
+            try:
+                result = _delete_tracker_mount_captures(self.server.state, _read_json_body(self))
+            except Exception as exc:  # noqa: BLE001
+                with self.server.state.lock:
+                    self.server.state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return
+            status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+            _json_response(self, status, result)
+            return
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/start":
@@ -14188,6 +16471,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
+                if path == "/api/calibration/marker-tcp/tracker-check":
+                    result = _run_marker_tcp_tracker_check(
+                        self.server.state,
+                        {
+                            "boxId": (query.get("box_id", query.get("boxId", [""]))[0] or "").strip(),
+                            "condition": (query.get("condition", [""])[0] or "").strip(),
+                            "station": (query.get("station", [""])[0] or "").strip(),
+                            "mountFit": (query.get("mount_fit", query.get("mountFit", [""]))[0] or "").strip(),
+                        },
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
                 if path == "/api/calibration/hand-eye/solve":
                     result = _run_hand_eye_solve(
                         self.server.state,
@@ -14202,6 +16498,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     # report is written either way and the panel renders the
                     # verdict, so this stays 200 and carries returncode.
                     _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/tracker-mount/session":
+                    result = _start_tracker_mount_session(
+                        self.server.state, _read_json_body(self)
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/tracker-mount/session/cancel":
+                    result = _cancel_tracker_mount_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/tracker-mount/record":
+                    result = _start_tracker_mount_episode(self.server.state, _read_json_body(self))
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
                 if path == "/api/calibration/hand-eye/plan":
                     result = _run_hand_eye_plan(

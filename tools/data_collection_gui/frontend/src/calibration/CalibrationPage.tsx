@@ -31,9 +31,11 @@ import { CalibrationHistory } from "./CalibrationHistory";
 import { RigCheckPanel } from "./RigCheckPanel";
 import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
+import { CrossCameraPanel } from "./CrossCameraPanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
 import { HandEyePanel } from "./HandEyePanel";
+import { TrackerMountPanel } from "./TrackerMountPanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -191,6 +193,11 @@ export function CalibrationPage({
           if today's absolute poses can be compared with last week's. */}
       <WorldFramePanel api={api} busy={busy} />
 
+      {/* Both checks above compare with the past, so an extrinsic that was
+          wrong from the day it was solved passes them. This one compares the
+          cameras with each other, in the workspace, now. */}
+      <CrossCameraPanel api={api} busy={busy} />
+
       <CalibrationWizard
         snapshot={snapshot}
         api={api}
@@ -205,6 +212,13 @@ export function CalibrationPage({
           other half of the same constant, and the larger of the two errors: the
           rotation in production is a declared 2.0 deg that was never measured. */}
       <HandEyePanel api={api} busy={busy} />
+
+      {/* The laser tracker's own two constants. Neither is readable from CAD:
+          T_WG depends on where the tracker was parked, c on where the plate was
+          bolted this time. Sits after the marker->TCP pair deliberately -- this
+          fit absorbs exactly that constant, so it can measure everything about
+          the cube pose *except* the thing those two panels are for. */}
+      <TrackerMountPanel api={api} busy={busy} snapshot={snapshot} />
 
       {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
       {boxGroups.map((group) => (

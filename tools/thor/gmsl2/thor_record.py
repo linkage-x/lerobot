@@ -87,6 +87,8 @@ from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
+from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
+from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -130,6 +132,67 @@ BOX_SENSOR_NOMINAL_HZ = {
     "box_six_d_force": 480.0,
 }
 _MIN_HEALTHY_STREAM_HZ = 30.0
+
+
+# Capture intents whose tracker samples the calibration page previews live.
+_TRACKER_GEOMETRY_PROTOCOLS = {
+    "smr_parked_pose_dwell": "dwell",
+    "tcp_pivot_sweep": "pivot",
+}
+
+
+def _emit_tracker_segment_geometry(
+    tracker: Any, tracker_record: dict[str, Any], capture_intent: Any, ep_idx: int
+) -> None:
+    """``LT_SEGMENT <json>``: the segment's parked point, or its pivot gain.
+
+    The solves refuse a thin capture only after Disconnect, when the rig is
+    gone (2026-09-24: station extent 0.28 m, pivot gain 0.024). One more read of
+    the capture PC after the episode has ended, so it costs the cameras nothing;
+    a failure here only loses the preview.
+    """
+    if not isinstance(capture_intent, dict):
+        return
+    kind = _TRACKER_GEOMETRY_PROTOCOLS.get(str(capture_intent.get("protocol") or ""))
+    if kind is None:
+        return
+    try:
+        window = int(round(max(0.0, float(tracker_record.get("t_end_wall_s") or 0.0)
+                               - float(tracker_record.get("t_start_wall_s") or 0.0)) * 1000.0))
+        pts = tracker.segment_points(last_rows=window)
+        out: dict[str, Any] = {"episode": int(ep_idx), "kind": kind, "n": len(pts)}
+        if kind == "dwell" and pts:
+            med = tlg.median_point(pts)
+            out["point_mm"] = [round(v, 3) for v in med]
+            out["spread_mm"] = round(max(math.dist(p, med) for p in pts), 3)
+        elif kind == "pivot":
+            out.update(tlg.pivot_geometry(pts))
+        _emit("LT_SEGMENT " + json.dumps(out, separators=(",", ":")))
+    except Exception as exc:  # noqa: BLE001 -- a preview must never cost the take
+        logger.warning("tracker segment geometry failed: %s", exc)
+
+
+def _read_camera_identity(sids: list[int]) -> dict[str, Any]:
+    """``CAMERA_IDENTITY <json>``: serial and factory intrinsics per locked port.
+
+    Read before Argus opens anything, so the i2c reads never race the driver's
+    own sensor writes. The port a camera is on is the cable, not the camera
+    (2026-09-28: the 09-23 remount had swapped modules between ports, and the
+    hand-kept serial map had never matched); the gateway compares this against
+    the identity the production calibration was made with. Never fatal: without
+    sudo or with a silent EEPROM the recording goes on, unidentified, and says so.
+    """
+    try:
+        identity = ce.identity_summary(ce.read_modules(sids))
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"WARNING: camera identity not read: {type(exc).__name__}: {exc}")
+        return {}
+    _emit("CAMERA_IDENTITY " + json.dumps(
+        {name: {"serial": v.get("serial"), "answered": v.get("answered")} for name, v in identity.items()},
+        separators=(",", ":"),
+    ))
+    return identity
+
 
 
 def _box_expected_rate_summary() -> str:
@@ -603,6 +666,7 @@ def _box_camera_alignment_summary(
     raw_frame_times_s: list[float | None] | None = None,
     exposure_fraction: float = lr3.EXPOSURE_CENTER_FRACTION,
     readout_offset_s: float = lr3.READOUT_OFFSET_S,
+    exposure_spread: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Episode-level record of how BOX state was time-aligned to the cameras.
 
@@ -615,8 +679,9 @@ def _box_camera_alignment_summary(
     currently zero. ``camera_frame_times_rel`` can add
     ``exposure_fraction * exposure + readout_offset_s`` per frame, and ships
     with ``exposure_fraction = 0.0`` -- the exposure is recorded, the shift is
-    not applied, because which edge the Tegra VI stamps has not been measured
-    and the wrong sign doubles the error the right one removes.
+    not applied.  The sign is measured (-0.5, 2026-09-28), but the uncorrected
+    BOX transport delay was half-cancelled by the late SOF, so the camera half on
+    its own moves the BOX lookup further off; see ``EXPOSURE_CENTER_FRACTION``.
 
     "Not corrected" is exactly as much a claim about the data as "corrected by
     half an exposure", so both get written down. The terms in force are named
@@ -625,6 +690,14 @@ def _box_camera_alignment_summary(
     makes it reversible in either direction: an episode recorded under a default
     that later turns out to be wrong can be re-derived from this block plus the
     per-frame exposures in its sidecars, without re-recording.
+
+    ``exposure_spread`` (:func:`lr3.camera_exposure_spread`) is the part that
+    re-deriving cannot fix.  The exposure term is one number per frame for a
+    timeline the cameras share, so it is taken as their per-frame median and each
+    camera keeps ``fraction * (E_median - E_k)``.  That is a floor rather than a
+    correction waiting to be applied, and a floor is exactly the kind of thing
+    that gets assumed small once the episode is in the archive -- so it is
+    measured here, per episode, while the sidecars are still at hand.
     """
     if not frame_times_s:
         return {
@@ -641,12 +714,13 @@ def _box_camera_alignment_summary(
         return {"mode": "n_over_fps_grid", "frames_with_sof": 0}
     mean = sum(deltas) / len(deltas)
     jitter = (sum((d - mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
-    return {
+    summary: dict[str, Any] = {
         "mode": "sensor_timestamp_sof",
         "reference": (
-            "(sensor_timestamp_ns/1e9 + exposure_fraction*sensor_exposure_time_ns/1e9"
+            "(sensor_timestamp_ns/1e9 + exposure_fraction*median_k(sensor_exposure_time_ns[k])/1e9"
             " + readout_offset_s) - t0_mono_s; sensor_timestamp_ns is the hardware SOF"
-            " (CLOCK_MONOTONIC)"
+            " (CLOCK_MONOTONIC) and the exposure is the per-frame median across cameras,"
+            " since one fused pose carries one time"
         ),
         "exposure_fraction": float(exposure_fraction),
         "readout_offset_s": float(readout_offset_s),
@@ -656,6 +730,9 @@ def _box_camera_alignment_summary(
         "frames_with_sof": len(deltas),
         "frames_total": len(frame_times_s),
     }
+    if exposure_spread is not None:
+        summary["cross_camera_exposure"] = exposure_spread
+    return summary
 
 
 def _exposure_correction_ms(
@@ -699,6 +776,7 @@ def _write_episode_meta(
     wallclock_end_utc: str,
     world_frame: dict[str, Any],
     capture_intent: dict[str, Any] | None = None,
+    camera_identity: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -847,6 +925,10 @@ def _write_episode_meta(
         # ABSENT on ordinary captures on purpose: consumers must be able to tell
         # "nothing was declared" from "declared, and it was this".
         meta["capture_intent"] = capture_intent
+    if camera_identity:
+        # Which physical camera each cam_NN was, read off its EEPROM at Connect.
+        # cam_NN is the cable's port; a swapped cable is invisible without this.
+        meta["camera_identity"] = camera_identity
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
@@ -1366,6 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
     if not locked:
         _emit("ERROR: no locked GMSL2 cameras detected")
         return 1
+    camera_identity = _read_camera_identity(locked)
     _emit(f"Connecting: {len(locked)} cameras locked, probing Argus ISP...")
 
     if args.skip_argus_probe:
@@ -1426,7 +1509,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"WARNING: laser tracker: {tracker.last_error}")
         # A machine-readable line so the gateway can colour the row and gate the
         # Start button; the human sentence rides along after the pipe.
-        _emit(f"LT_BEAM {'ready' if tracker.beam_ready else 'waiting'}|{tracker.beam_summary()}")
+        # "ready" means homed AND locked: see LaserTrackerSession.ready.  LT_HOMED
+        # goes first so the gateway never shows a ready row with a stale homed flag.
+        _emit(f"LT_HOMED {int(tracker.homed)}")
+        _emit(f"LT_BEAM_BROKEN {int(tracker.beam_broken)}")
+        _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
     if box_started:
         # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
         # so the gateway renders one GUI row per (discovered box × sensor)
@@ -1917,10 +2004,15 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal tracker_beam_was
         if not tracker_started:
             return
-        now = tracker.beam_ready
+        # All three are tracked: Home succeeding, or the beam breaking into a
+        # lock with no absolute range, changes the verdict without changing
+        # beam_ready.
+        now = (tracker.beam_ready, tracker.homed, tracker.range_absolute)
         if now != tracker_beam_was:
             tracker_beam_was = now
-            _emit(f"LT_BEAM {'ready' if now else 'waiting'}|{tracker.beam_summary()}")
+            _emit(f"LT_HOMED {int(tracker.homed)}")
+            _emit(f"LT_BEAM_BROKEN {int(tracker.beam_broken)}")
+            _emit(f"LT_BEAM {'ready' if tracker.ready else 'waiting'}|{tracker.beam_summary()}")
 
     def _tick_connected_idle() -> None:
         nonlocal last_box_live_at, last_warmup_roll_at
@@ -2074,6 +2166,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"Laser tracker streaming ({tracker_record['rt_rows_total_at_stop']} "
                         f"samples so far this session)"
                     )
+                    _emit_tracker_segment_geometry(tracker, tracker_record, capture_intent, ep_idx)
 
             pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
@@ -2132,7 +2225,7 @@ def main(argv: list[str] | None = None) -> int:
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
-                    world_frame, capture_intent,
+                    world_frame, capture_intent, camera_identity,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for
@@ -2152,7 +2245,9 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup_duration_s": cleanup_duration_s,
                     "split_emit_ms": split_emit_ms,
                     "box_camera_alignment": _box_camera_alignment_summary(
-                        frame_times, cfg.cameras.fps, raw_frame_times_s=raw_frame_times
+                        frame_times, cfg.cameras.fps,
+                        raw_frame_times_s=raw_frame_times,
+                        exposure_spread=lr3.camera_exposure_spread(ep_dir),
                     ),
                 }
                 if frame_sync_payload is not None:

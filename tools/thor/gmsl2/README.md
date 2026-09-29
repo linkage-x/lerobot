@@ -29,12 +29,27 @@ default -- matches the AR0234 dtbo, which hard-codes
 `min_framerate=max_framerate=60000000` with `framerate_factor=1000000`).
 
 **Exposure-vs-period constraint.** In `trig_mode=1` the per-frame
-`exposure_us` must fit inside one PWM period minus the sensor's row-readout
-window. At 60 Hz the period is 16666 µs and AR0234 needs roughly 2 ms of
-readout headroom, so keep `exposure_us <= ~14000`. Going over makes the
-sensor miss the next trigger and fall back to ~0.8 fps. The recorder clamps
-this automatically (default cap = 0.85 * period) and logs a warning when a
-configured value is too high.
+`exposure_us` must fit inside one PWM period; going over makes the sensor miss
+the next trigger and fall back to ~0.8 fps. At 60 Hz the period is 16666 µs,
+the recorder clamps to 0.85 * period = 14166 µs automatically, and it logs a
+warning when a configured value is too high.
+
+**Readout is not part of that budget** (corrected 2026-09-21; this section used
+to say "one PWM period minus the sensor's row-readout window ... roughly 2 ms of
+readout headroom"). AR0234C is a global-shutter part with a storage node, so
+readout overlaps the next frame's integration rather than queueing behind it.
+`EOF - SOF` measures 14.677-14.686 ms across nine cameras and stays flat while
+auto-exposure swings -- that is the readout/CSI window, not an integration
+window -- and an AE exposure of ~8.7 ms (2026-09-11 blur measurement) holds a
+steady 60 fps even though 8.7 + 14.68 = 23.4 ms is well past the 16.67 ms
+period. Under `exposure + readout < period` nothing above ~2 ms of exposure
+could run at 60 fps. The old wording was a rationalization of the 15000 µs
+stall (EXPERIMENT_LOG E22), and it contradicts the measured readout.
+
+**Where the boundary actually sits is untested.** `exposure_us=9999` is known
+good and `exposure_us=15000` is known bad, so the threshold is somewhere in
+10-15 ms. The 14166 µs cap sits inside that untested gap: it is a margin, not
+a derived bound.
 
 ## Bring-up
 

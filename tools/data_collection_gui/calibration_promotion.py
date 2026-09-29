@@ -73,6 +73,11 @@ class RunPoses:
     cameras: dict[str, Matrix] = field(default_factory=dict)
     world: dict[str, Any] = field(default_factory=dict)
     rmse_px: float | None = None
+    # Port -> module serial, when the run can say. Ports are cables, not
+    # cameras: between 09-23 and 09-28 three modules rotated through
+    # cam_07/09/14, and a port-keyed comparison reported three cameras that
+    # do not exist as having moved 60-200 mm.
+    serials: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -94,7 +99,33 @@ def _as_matrix(value: Any) -> Matrix | None:
     return tuple(rows)
 
 
-def load_run(run_dir: Path, name: str = "") -> RunPoses:
+def _run_serials(run_dir: Path, registry: Path | None) -> dict[str, str]:
+    """Port -> serial for an extrinsics run, or {} when it cannot be established.
+
+    Runs exported since 09-28 carry ``camera_identity.json`` (read off the
+    modules at capture). Older ones are tied to modules through the intrinsics
+    registry, by the intrinsics run exported alongside them -- the only link
+    those runs have, since their directory names carry serials from the
+    hand-written map that never matched the hardware.
+    """
+    with suppress(OSError, json.JSONDecodeError, AttributeError):
+        ports = json.loads((run_dir / "camera_identity.json").read_text(encoding="utf-8")).get("ports")
+        if isinstance(ports, dict) and ports:
+            return {str(k): str(v).upper() for k, v in ports.items()}
+    if registry is None or not run_dir.name.endswith("_extrinsics"):
+        return {}
+    intrinsics_run = run_dir.name[: -len("_extrinsics")] + "_intrinsics"
+    with suppress(OSError, json.JSONDecodeError, AttributeError, KeyError, TypeError):
+        entries = json.loads(registry.read_text(encoding="utf-8")).get("serials") or {}
+        return {
+            str(entry["camera"]): str(serial).upper()
+            for serial, entry in entries.items()
+            if entry.get("run") == intrinsics_run
+        }
+    return {}
+
+
+def load_run(run_dir: Path, name: str = "", *, registry: Path | None = None) -> RunPoses:
     """Read one extrinsics run's per-camera poses and world declaration."""
     label = name or run_dir.name
     summary_path = run_dir / "summary.json"
@@ -128,7 +159,12 @@ def load_run(run_dir: Path, name: str = "") -> RunPoses:
         cameras=cameras,
         world=world,
         rmse_px=float(rmse) if isinstance(rmse, (int, float)) else None,
+        serials=_run_serials(run_dir, registry),
     )
+
+
+def _keyed(run: RunPoses, by_serial: bool) -> dict[str, Matrix]:
+    return {run.serials[cam] if by_serial else cam: pose for cam, pose in run.cameras.items()}
 
 
 def _translation(matrix: Matrix) -> tuple[float, float, float]:
@@ -187,9 +223,23 @@ def compare_runs(live: RunPoses, candidate: RunPoses) -> dict[str, Any]:
             "candidate": candidate.name,
         }
 
-    shared = sorted(set(live.cameras) & set(candidate.cameras))
-    added = sorted(set(candidate.cameras) - set(live.cameras))
-    removed = sorted(set(live.cameras) - set(candidate.cameras))
+    # Pair cameras by module when both runs can name every module; otherwise
+    # by port, and say so, because then a re-cabled rig reads as a moved one.
+    by_serial = all(cam in run.serials for run in (live, candidate) for cam in run.cameras)
+    live_poses, cand_poses = _keyed(live, by_serial), _keyed(candidate, by_serial)
+    if by_serial:
+        live_port = {serial: cam for cam, serial in live.serials.items() if cam in live.cameras}
+        cand_port = {serial: cam for cam, serial in candidate.serials.items() if cam in candidate.cameras}
+    else:
+        live_port = {cam: cam for cam in live.cameras}
+        cand_port = {cam: cam for cam in candidate.cameras}
+
+    def label(key: str) -> str:
+        return cand_port.get(key) or live_port.get(key) or key
+
+    shared = sorted(set(live_poses) & set(cand_poses), key=label)
+    added = sorted(label(k) for k in set(cand_poses) - set(live_poses))
+    removed = sorted(label(k) for k in set(live_poses) - set(cand_poses))
 
     pairs: list[dict[str, Any]] = []
     by_camera: dict[str, dict[str, list[float]]] = {
@@ -197,17 +247,17 @@ def compare_runs(live: RunPoses, candidate: RunPoses) -> dict[str, Any]:
     }
     for i, cam_a in enumerate(shared):
         for cam_b in shared[i + 1 :]:
-            d_live = _distance_m(live.cameras[cam_a], live.cameras[cam_b])
-            d_cand = _distance_m(candidate.cameras[cam_a], candidate.cameras[cam_b])
+            d_live = _distance_m(live_poses[cam_a], live_poses[cam_b])
+            d_cand = _distance_m(cand_poses[cam_a], cand_poses[cam_b])
             shift_mm = abs(d_cand - d_live) * 1000.0
             rot_deg = _rotation_angle_deg(
-                _relative_rotation(live.cameras[cam_a], live.cameras[cam_b]),
-                _relative_rotation(candidate.cameras[cam_a], candidate.cameras[cam_b]),
+                _relative_rotation(live_poses[cam_a], live_poses[cam_b]),
+                _relative_rotation(cand_poses[cam_a], cand_poses[cam_b]),
             )
             pairs.append(
                 {
-                    "a": cam_a,
-                    "b": cam_b,
+                    "a": label(cam_a),
+                    "b": label(cam_b),
                     "liveMm": round(d_live * 1000.0, 2),
                     "candidateMm": round(d_cand * 1000.0, 2),
                     "shiftMm": round(shift_mm, 3),
@@ -220,7 +270,10 @@ def compare_runs(live: RunPoses, candidate: RunPoses) -> dict[str, Any]:
 
     cameras = [
         {
-            "camera": cam,
+            "camera": label(cam),
+            "serial": cam if by_serial else candidate.serials.get(cam, ""),
+            # The port this module was on in the live run, when it has changed.
+            "livePort": live_port[cam] if by_serial and live_port[cam] != label(cam) else "",
             "medianBaselineShiftMm": round(statistics.median(values["baseline"]), 3),
             "maxBaselineShiftMm": round(max(values["baseline"]), 3),
             "medianRotationDeg": round(statistics.median(values["rotation"]), 4),
@@ -237,6 +290,7 @@ def compare_runs(live: RunPoses, candidate: RunPoses) -> dict[str, Any]:
         "live": live.name,
         "candidate": candidate.name,
         "cameras": cameras,
+        "pairedBy": "serial" if by_serial else "port",
         "addedCameras": added,
         "removedCameras": removed,
         "pairCount": len(pairs),

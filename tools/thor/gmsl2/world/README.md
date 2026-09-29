@@ -40,3 +40,21 @@ FR3 bases is Phase 9's `T_WB` and is measured separately.
 
 See `metrology/README.md` (§ Phase 2.4) and the roadmap's Phase 2.4 for the
 method.
+
+Since then two re-mounts minted islands with no known transform to 08-19:
+`world_20260923_143048` (09-23 re-mount, `calib_20260923_cam13refit`) and
+`world_20260928_063531` (09-28 re-install, `calib_20260928_143107`, the current
+reference). The 09-23 island was exported but never committed here, so episodes
+recorded 09-23 18:55 → 09-28 were stamped 08-19; they were corrected on
+2026-09-28 with `restamp_world.py` (below).
+
+## Correcting a stamp that is wrong
+
+The stamp records what this file said at record time. If the rig moved and the
+new world was not committed first, the stamp is wrong and cannot be recomputed
+from the episode. `python -m tools.thor.gmsl2.restamp_world <dataset roots…>
+--expect-from <id now> --to <true id> --reason "<evidence>"` records the
+decision: dry run by default (`--apply` to write), the target must be a node of
+`world_graph.json`, only episodes carrying `--expect-from` are touched, and the
+original block is kept under `world_frame.restamp.original`. The real fix is to
+commit a new island here *before* recording in it.

@@ -353,7 +353,9 @@ def test_beam_transitions_are_read_from_the_logger() -> None:
         "beam: acquired\n",
     ]))
     assert session.beam_ready is True
-    assert session.beam_summary() == "locked on the SMR"
+    assert "NOT homed" in session.beam_summary()
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.beam_summary() == "homed, locked on the SMR"
 
     session._read_logger_stdout(_Proc(["beam: lost\n"]))
     assert session.beam_ready is False
@@ -482,3 +484,226 @@ def test_a_declared_smr_size_reaches_the_logger() -> None:
     assert "--home 1.5" in logger_cmd
     assert "--adm-offset 0.25" in logger_cmd
     assert session.last_error == ""
+
+
+# --- cold start after a power cut (2026-09-21) --------------------------------
+
+
+def test_warmup_is_not_reported_as_an_smr_problem() -> None:
+    """TrackerNotWarmedUp was shown as "waiting for the SMR".
+
+    After the 2026-09-21 power cut that sentence sent the operator to the nest
+    while the only fix was to wait for the laser, and two Connects that had in
+    fact succeeded were abandoned as failures.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+    session.beam_status = "waiting (TrackerNotWarmedUp (22))"
+    summary = session.beam_summary()
+    assert "warming up" in summary
+    assert "SMR" not in summary
+    assert "retries automatically" in summary
+
+
+def test_an_unrecognised_home_error_does_not_blame_the_smr() -> None:
+    session = lts.LaserTrackerSession(_cfg())
+    session.beam_status = "waiting (AdmLowIntensity (23))"
+    summary = session.beam_summary()
+    assert "AdmLowIntensity (23)" in summary
+    assert "for the SMR" not in summary
+
+
+def _dead_logger_session(tail_line: str):
+    session = lts.LaserTrackerSession(_cfg())
+    session._logger_tail.append(tail_line)
+
+    class _Dead:
+        stdout = None
+
+        def poll(self):
+            return 1
+
+    session._logger_proc = _Dead()  # type: ignore[assignment]
+    session._count_rows = lambda _name: 0  # type: ignore[method-assign]
+    return session
+
+
+def test_a_failed_index_search_points_at_the_servo_switch() -> None:
+    session = _dead_logger_session("connection failed: IndexSearchFailed (43)")
+    assert session._await_logger() is False
+    assert "index search" in session.last_error
+    assert "Servo" in session.last_error
+
+
+def test_communication_failure_also_names_a_booting_controller() -> None:
+    """Right after power-on the same code means "not up yet", not "busy"."""
+    session = _dead_logger_session("connection failed: CommunicationFailed (13)")
+    assert session._await_logger() is False
+    assert "still booting" in session.last_error
+    assert "one client at a time" in session.last_error
+
+
+def test_a_logger_that_never_streams_is_told_to_stop(monkeypatch) -> None:
+    """Giving up on Connect must not leave the logger holding the tracker.
+
+    The logger only checks its stop-file once connected, so one still in the
+    SDK handshake at the deadline would otherwise finish connecting later and
+    keep the instrument's single client slot for up to ``session_cap_s``.
+    """
+    import subprocess
+
+    session = lts.LaserTrackerSession(_cfg())
+    ran: list[str] = []
+
+    class _Stuck:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("ssh", timeout)
+
+        def terminate(self):
+            _Stuck.terminated = True
+
+    def _fake_run(cmd, **_k):
+        ran.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(session, "_ensure_responder", lambda: None)
+    monkeypatch.setattr(session, "_spawn_probe", lambda: True)
+    monkeypatch.setattr(session, "_spawn_logger", lambda: setattr(session, "_logger_proc", _Stuck()))
+    monkeypatch.setattr(session, "_await_probe", lambda: True)
+    monkeypatch.setattr(session, "_await_logger", lambda: False)
+    monkeypatch.setattr(session, "_run", _fake_run)
+
+    assert session.start() is False
+    assert any("type nul" in c and "STOP_LOGGER" in c for c in ran)
+    assert _Stuck.terminated
+    assert session._logger_proc is None
+
+
+def test_a_ranged_lock_is_reported_with_the_step_it_moved() -> None:
+    """The operator needs the step while judging a catch, not after the session.
+
+    W2 (2026-09-22): a lock caught 337 mm long keeps it until the beam is lost,
+    so "ranged, step 337.2 mm" is the line that says this catch was bad and the
+    fit built on it would have been wrong.
+    """
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc([
+        "beam: acquired\n",
+        "lock: 0 ranged, step 337.2 mm\n",
+        "rows 12000  dropped 0   lock: 1 ranged, step 0.01 mm (target was moving)\n",
+        "lock: 2 NOT ranged (LaserBeamBroken)\n",
+    ]))
+    assert session.locks_ranged == 2 and session.locks_not_ranged == 1
+    assert session.range_status == "2 NOT ranged (LaserBeamBroken)"
+    assert session.status().range_status.startswith("2 NOT ranged")
+
+
+def test_a_session_that_never_homed_says_so() -> None:
+    """Locked-on is not homed.
+
+    W2 (2026-09-21) ran green from start to finish and never homed -- of its
+    679342 valid samples not one was at the home nest -- and every beam lock
+    inherited a range hundreds of mm off. The marker is separate for that
+    reason: "beam: acquired" must not be read as "this session has a range".
+    """
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["beam: acquired\n", "lock: 0 ranged, step 0 mm\n"]))
+    assert session.beam_ready is True
+    assert session.homed is False and session.status().homed is False
+
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.homed is True and session.status().homed is True
+
+
+def test_start_is_gated_on_home_not_only_on_the_beam() -> None:
+    """`ready` is what the recorder sends as LT_BEAM ready, and so what gates Start."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["beam: acquired\n"]))
+    assert session.ready is False
+    assert "home nest" in session.beam_summary()
+
+    session._read_logger_stdout(_Proc(["home: ok\n"]))
+    assert session.ready is True
+
+    session._read_logger_stdout(_Proc(["beam: lost\n"]))
+    assert session.ready is False  # homed stays, but a blind beam still blocks
+
+
+def test_a_beam_break_after_home_blocks_start_until_the_nest_re_homes() -> None:
+    """Pivot lt_20260923_062953 re-caught 14 mm out of the nest carried +4.3 mm."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    session._read_logger_stdout(_Proc(["home: ok\n", "range: lock 0 absolute (home)\n", "beam: acquired\n"]))
+    assert session.ready is True and session.beam_broken is False
+
+    session._read_logger_stdout(_Proc([
+        "beam: lost\n",
+        "rows 9000  dropped 0   range: lock 1 not absolute -- the beam broke; put the SMR "
+        "back in the home nest to re-home\n",
+        "beam: acquired\n",
+    ]))
+    assert session.beam_broken is True
+    assert session.ready is False
+    assert "home nest" in session.beam_summary()
+
+    session._read_logger_stdout(_Proc(["recover: re-home ok\n", "range: lock 2 absolute (home)\n"]))
+    assert session.ready is True and session.beam_broken is False
+
+
+def test_a_logger_that_does_not_report_absoluteness_is_gated_on_home_alone() -> None:
+    """An exe from before 2026-09-23 prints no `range:` lines; it must still turn green."""
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=True, smr_size="1.5"))
+    session.beam_ready, session.homed = True, True
+    assert session.range_absolute is None
+    assert session.ready is True
+
+
+def test_a_connect_that_does_not_home_says_why_it_never_gets_ready() -> None:
+    session = lts.LaserTrackerSession(_cfg(home_on_connect=False))
+    session.beam_ready = True
+    assert session.ready is False
+    assert "home_on_connect is off" in session.beam_summary()
+
+
+def test_recovery_attempts_reach_the_recorder_log(caplog) -> None:
+    """They used to live only in the in-memory tail and die with the process."""
+    session = lts.LaserTrackerSession(_cfg())
+
+    class _Proc:
+        def __init__(self, lines):
+            self.stdout = iter(lines)
+
+    with caplog.at_level("INFO", logger=lts.logger.name):
+        session._read_logger_stdout(_Proc([
+            "rows 5  dropped 0   recover: re-range TargetNotFound (7)\n",
+            "recover: tracking at the home nest without a range -- homing\n",
+            "home: nest at az -28.41 el -20.09 deg\n",
+        ]))
+    text = caplog.text
+    assert "recover: re-range TargetNotFound (7)" in text
+    assert "at the home nest without a range" in text
+    assert "home: nest at az" in text
+    assert session.homed is False  # the nest line is not the home marker

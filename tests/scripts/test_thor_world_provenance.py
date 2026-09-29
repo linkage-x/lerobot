@@ -77,12 +77,14 @@ def test_reference_without_an_id_is_incomplete(tmp_path: Path) -> None:
 def test_registration_disagreeing_with_the_reference_is_flagged(tmp_path: Path) -> None:
     _write_reference(tmp_path)
     (tmp_path / wp.WORLD_SUBDIR / wp.WORLD_REGISTRATION_FILE).write_text(
-        json.dumps({
-            "world_continuity_state": "BROKEN",
-            "generated_utc": "2026-08-20T00:00:00Z",
-            "calibration_id": "calib_20260820",
-            "world_frame_id": "world_20260820_000000",
-        }),
+        json.dumps(
+            {
+                "world_continuity_state": "BROKEN",
+                "generated_utc": "2026-08-20T00:00:00Z",
+                "calibration_id": "calib_20260820",
+                "world_frame_id": "world_20260820_000000",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -139,9 +141,13 @@ def test_a_failed_read_never_counts_as_a_world(tmp_path: Path) -> None:
 def test_repo_reference_is_readable() -> None:
     # The checked-in reference is the one Thor records against; if this stops
     # parsing, every episode recorded from this tree is unstamped.
-    block = wp.read_world_provenance(Path(__file__).resolve().parents[2])
+    repo = Path(__file__).resolve().parents[2]
+    block = wp.read_world_provenance(repo)
     assert block["status"] == wp.STATUS_OK
-    assert block["world_frame_id"] == "world_20260819_031843"
+    # The id changes on every promotion that mints an island; what must hold is
+    # that the world graph knows it, or restamping and cross-world edges cannot.
+    graph = json.loads((repo / wp.WORLD_SUBDIR / "world_graph.json").read_text(encoding="utf-8"))
+    assert block["world_frame_id"] in {node["world_frame_id"] for node in graph["nodes"]}
 
 
 def test_lr3_writer_stamps_info_json(tmp_path: Path) -> None:
@@ -151,7 +157,11 @@ def test_lr3_writer_stamps_info_json(tmp_path: Path) -> None:
     _write_reference(tmp_path / "repo")
     block = wp.read_world_provenance(tmp_path / "repo")
     writer = lr3.Lr3Writer(
-        tmp_path / "ds", repo_id="repo", task="pick", fps=2, world_frame=block,
+        tmp_path / "ds",
+        repo_id="repo",
+        task="pick",
+        fps=2,
+        world_frame=block,
     )
     writer.finalize()
 
@@ -213,3 +223,76 @@ def test_inspect_dataset_reports_an_empty_dataset(tmp_path: Path) -> None:
     code, lines = wp.inspect_dataset(tmp_path)
     assert code == 2
     assert any("no episodes" in line for line in lines)
+
+
+def _graph(root: Path) -> Path:
+    path = root / wp.WORLD_SUBDIR / "world_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "nodes": [
+                    {
+                        "world_frame_id": "world_20260923_143048",
+                        "created_utc": "2026-09-28T07:04:22Z",
+                        "calibration_id": "calib_20260923_cam13refit_extrinsics",
+                        "parent_world_frame_id": "world_20260819_031843",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_restamp_keeps_the_original_and_is_idempotent(tmp_path: Path) -> None:
+    from tools.thor.gmsl2 import restamp_world as rw
+
+    old = {"world_frame_id": "world_20260819_031843", "status": "ok", "reference_sha256": "d7de"}
+    _episode_meta(tmp_path, "episode_000000", old)
+    _episode_meta(tmp_path, "episode_000001", {"world_frame_id": "world_20260928_063531", "status": "ok"})
+    node = rw.load_world_node(_graph(tmp_path), "world_20260923_143048")
+
+    dry, _ = rw.restamp([tmp_path], expect_from="world_20260819_031843", node=node, reason="r", apply=False)
+    assert len(dry) == 1
+    assert wp.inspect_dataset(tmp_path)[0] == 1  # dry run wrote nothing: still two worlds
+
+    changed, skipped = rw.restamp(
+        [tmp_path], expect_from="world_20260819_031843", node=node, reason="mount re-installed", apply=True
+    )
+    assert len(changed) == 1 and len(skipped) == 1  # the episode from a third world is left alone
+    block = json.loads((tmp_path / "episodes/episode_000000/meta.json").read_text())["world_frame"]
+    assert wp.world_frame_id_of(block) == "world_20260923_143048"
+    assert block["restamp"]["original"] == old
+    assert block["restamp"]["reason"] == "mount re-installed"
+    assert "reference_sha256" not in block  # never copied from the file that was wrong
+
+    again, _ = rw.restamp([tmp_path], expect_from="world_20260819_031843", node=node, reason="r", apply=True)
+    assert again == []
+
+
+def test_restamp_refuses_a_world_that_is_not_in_the_graph(tmp_path: Path) -> None:
+    from tools.thor.gmsl2 import restamp_world as rw
+
+    with pytest.raises(KeyError):
+        rw.load_world_node(_graph(tmp_path), "world_20260923_999999")
+
+
+def test_restamp_rewrites_a_symlinked_meta_once(tmp_path: Path) -> None:
+    from tools.thor.gmsl2 import restamp_world as rw
+
+    src = tmp_path / "src"
+    _episode_meta(src, "episode_000000", {"world_frame_id": "world_20260819_031843", "status": "ok"})
+    derived = tmp_path / "derived" / "episodes" / "episode_000000"
+    derived.mkdir(parents=True)
+    (derived / "meta.json").symlink_to(src / "episodes/episode_000000/meta.json")
+    node = rw.load_world_node(_graph(tmp_path), "world_20260923_143048")
+
+    changed, _ = rw.restamp(
+        [src, tmp_path / "derived"], expect_from="world_20260819_031843", node=node, reason="r", apply=True
+    )
+
+    assert len(changed) == 1
+    assert (derived / "meta.json").is_symlink()
