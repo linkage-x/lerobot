@@ -182,6 +182,12 @@ class TerminalTrialsRequest:
     # standing. False keeps the older cycle (retreat with the hand open, descend again next
     # trial), which is the one that loses a peg every time a trial does not seat.
     regripInPlace: bool = False
+    # With `regripInPlace`, every this many trials let go of the peg in the hole and take it anew
+    # from `pickXyz` (the hole, on this rig) instead of closing on it where it stands. 0 never
+    # does. 09-28 18:25: after twelve clean in-place re-grips the peg sat ~6 mm off in the
+    # fingers at trial 13 with the hole unmoved (the operator), met the mouth 40 mm up, and
+    # three trials later needed a hand; one fresh pick and the next ten seated first time.
+    refetchEvery: int = 0
     # Keep hold of a peg that did not seat instead of standing it on the face. See
     # `TerminalServoRequest.releaseOnlyWhenSeated`: this is the only one of the three fixes that
     # addresses where the peg is actually lost.
@@ -590,6 +596,10 @@ def validate_terminal_trials(
         )
     if request.maxReferenceStepM <= 0.0:
         raise TerminalTrialError("maxReferenceStepM must be positive.")
+    if request.refetchEvery < 0:
+        raise TerminalTrialError("refetchEvery must be 0 (never) or a number of trials.")
+    if request.refetchEvery and request.pickXyz is None:
+        raise TerminalTrialError("refetchEvery takes the peg anew from pickXyz: give one.")
     if request.referenceRingM <= 0.0:
         raise TerminalTrialError(
             "referenceRingM must be positive: a reference trial has to be able to find the hole "
@@ -736,6 +746,9 @@ def run_terminal_trials(
     rows: list[dict[str, Any]] = []
     halted = ""
     seated_landing: tuple[float, float, float] | None = None
+    # Trials since the fingers last took the peg from above (the start grasp, a repick, a
+    # refetch), as opposed to closing on it where it was let go of.
+    since_fetch = 0
 
     def emit(row: dict[str, Any]) -> None:
         rows.append(row)
@@ -789,6 +802,14 @@ def run_terminal_trials(
                 break
 
             servo = _servo_for(request, spec, state.referenceXyz)
+            refetch = (
+                request.regripInPlace
+                and request.refetchEvery > 0
+                and since_fetch + 1 >= request.refetchEvery
+            )
+            if refetch:
+                # Let go without closing again: the peg is taken from above after the trial.
+                servo = replace(servo, regripGripper=None)
             grade: dict[str, Any] = {}
 
             def release_gate(descent: dict[str, Any], spec: TrialSpec = spec,
@@ -886,6 +907,7 @@ def run_terminal_trials(
                 "releaseXyz": list(release_xyz),
                 "handoffXyz": [float(value) for value in result["handoffXyz"]],
                 "released": bool(result.get("released", True)),
+                "refetch": refetch,
                 "fzTareN": result.get("fzTareN"),
                 "dfzPeakN": result.get("dfzPeakN"),
                 "dfzEndN": result.get("dfzEndN"),
@@ -1014,6 +1036,7 @@ def run_terminal_trials(
                 if grasp != "held":
                     halted = f"grasp_{grasp}"
                     break
+                since_fetch = 0
                 # Run again with the new grip: a crooked peg is not a good-grasp insertion, which
                 # is what step 3 measures, so it does not use up the trial. Nor is it a failure to
                 # find the hole, so the count taken above for an unconfirmed reference is undone.
@@ -1039,11 +1062,25 @@ def run_terminal_trials(
                 halted = "press_capped_twice"
                 break
 
+            stage = "regrip"
+            fetch_at = release_xyz
             if not result.get("released", True):
                 # The servo never let go, so the peg is where it always was: in the fingers.
                 _, _, width = _observation_xyz_rotvec_gripper(robot)
                 grasp = _grasp_verdict(width, state.graspReference, request)
                 attempts = 0
+            elif refetch:
+                # In the hole, it is taken from the pick point, as a repick does and as the start
+                # grasp did. Let go of anywhere else, it is standing where the fingers opened.
+                stage = "refetch"
+                fetch_at = (
+                    tuple(float(value) for value in request.pickXyz)
+                    if confirmed
+                    else (release_xyz[0], release_xyz[1],
+                          max(release_xyz[2] - request.regripDropM, request.servo.minZ))
+                )
+                width, grasp, attempts = _grasp_until_held(robot, request, fetch_at, rotvec,
+                                                           state.graspReference)
             elif request.regripInPlace:
                 # The servo closed on the peg at the pose it released it, so there is nothing to
                 # descend to: the peg is already in the fingers and re-approaching would be a
@@ -1062,18 +1099,20 @@ def run_terminal_trials(
             emit(
                 {
                     "kind": "grasp",
-                    "stage": "regrip",
+                    "stage": stage,
                     "index": spec.index,
                     "widthNormalized": width,
                     "referenceWidth": state.graspReference,
                     "graspVerdict": grasp,
                     "attempts": attempts,
-                    "atXyz": list(release_xyz),
+                    "atXyz": list(fetch_at),
                 }
             )
             if grasp != "held":
                 halted = f"grasp_{grasp}"
                 break
+            fetched = stage == "refetch" or not request.regripInPlace
+            since_fetch = 0 if fetched else since_fetch + 1
         else:
             halted = "schedule_complete"
     except _Halt:
@@ -1324,6 +1363,7 @@ def describe_schedule(request: TerminalTrialsRequest, schedule: Iterable[TrialSp
         + ("none (already held)" if request.pickXyz is None
            else ",".join(f"{value:+.4f}" for value in request.pickXyz))
         + f" grasp_attempts={request.graspAttempts} regrip_in_place={int(request.regripInPlace)} "
+        f"refetch_every={request.refetchEvery} "
         f"release_only_when_seated={int(request.releaseOnlyWhenSeated)} "
         f"operator_grade={int(request.operatorGrade)} fixed_hole={int(not request.updateReference)}",
     ]

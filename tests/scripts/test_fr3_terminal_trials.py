@@ -630,6 +630,34 @@ def test_regripping_in_place_closes_the_fingers_before_the_retreat(capsys):
     assert names.index("descend_8cm_to_pick") < names.index("regrip_after_release")
 
 
+def test_every_nth_trial_takes_the_peg_anew_from_the_pick_point_instead_of_in_place(capsys):
+    """09-28 18:25: twelve in-place re-grips, then the peg sat 6 mm off in the fingers."""
+
+    at_hole = SEATED  # on the rig the peg is picked out of the hole it is inserted into
+    robot = FakeTrialRig(hole_xy=SEATED[:2], capture_m=0.0042, peg_xyz=at_hole)
+    request = _request(offsetsMm=(0.0,), repeats=4, controlEvery=100, regripInPlace=True,
+                       refetchEvery=2, pickXyz=at_hole)
+    summary = run_terminal_trials(robot, request)
+    assert summary["haltedOn"] == "schedule_complete", summary["haltedOn"]
+    assert summary["seated"] == 5
+    stages = [row["stage"] for row in summary["rows"] if row.get("kind") == "grasp"]
+    assert stages == ["start", "regrip", "refetch", "regrip", "refetch", "regrip"]
+    trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
+    assert [row["refetch"] for row in trials] == [False, True, False, True, False]
+    refetched = [row for row in summary["rows"] if row.get("stage") == "refetch"]
+    assert all(row["graspVerdict"] == "held" and row["atXyz"] == list(at_hole) for row in refetched)
+    names = _step_names(capsys.readouterr().out)
+    # The start grasp plus one per refetch; the refetch trials let go without closing again.
+    assert names.count("descend_8cm_to_pick") == 3
+    assert names.count("regrip_after_release") == 3
+
+
+def test_refetching_needs_somewhere_to_take_the_peg_from():
+    request = _request(regripInPlace=True, refetchEvery=4, pickXyz=None)
+    with pytest.raises(TerminalTrialError, match="pickXyz"):
+        validate_terminal_trials(request, build_trial_schedule(request))
+
+
 def test_the_older_cycle_is_unchanged_when_regripping_in_place_is_off(capsys):
     robot = FakeTrialRig(hole_xy=SEATED[:2], capture_m=0.0042)
     summary = run_terminal_trials(robot, _request(controlEvery=1))

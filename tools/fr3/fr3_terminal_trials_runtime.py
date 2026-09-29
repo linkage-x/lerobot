@@ -182,6 +182,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--refetch-every",
+        type=int,
+        default=0,
+        help=(
+            "With --regrip-in-place: every this many trials, let go of the peg in the hole and "
+            "take it anew from --pick-pose instead of closing on it in place. 0 never does."
+        ),
+    )
+    parser.add_argument(
         "--regrip-drop-mm",
         type=float,
         default=0.0,
@@ -346,6 +355,7 @@ def build_request(args: argparse.Namespace) -> TerminalTrialsRequest:
         maxTiltDeg=float(args.max_tilt_deg),
         graspAttempts=int(args.grasp_attempts),
         regripInPlace=bool(args.regrip_in_place),
+        refetchEvery=int(args.refetch_every),
         releaseOnlyWhenSeated=bool(args.release_only_when_seated),
         regripDropM=float(args.regrip_drop_mm) / 1000.0,
         operatorGrade=bool(args.operator_grade),

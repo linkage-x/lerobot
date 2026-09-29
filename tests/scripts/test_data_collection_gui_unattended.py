@@ -274,14 +274,16 @@ def test_a_graded_terminal_plan_reaches_the_runtime_with_its_switches(tmp_path):
 
     planned = plan_run(tmp_path, "terminal_trials", {
         "holePose": "0.3599,-0.1333,0.0523", "offsetsMm": "0", "searchRingM": "0.007",
-        "operatorGrade": "1", "regripInPlace": "yes", "graspAttempts": "2",
+        "operatorGrade": "1", "regripInPlace": "yes", "graspAttempts": "2", "refetchEvery": "8",
     })
     request = runtime.build_request(runtime.parse_args(planned["argv"][1:]))
     assert request.operatorGrade and request.regripInPlace and not request.releaseOnlyWhenSeated
     assert request.graspAttempts == 2
+    assert request.refetchEvery == 8
     assert any(arg.startswith("--grade-file=") and arg.endswith("GRADE") for arg in planned["argv"])
     ungraded = plan_run(tmp_path, "terminal_trials", {"holePose": "0.3599,-0.1333,0.0523"})
     assert "--operator-grade" not in ungraded["argv"]
+    assert not any(arg.startswith("--refetch-every") for arg in ungraded["argv"])
     assert "--home-first" not in ungraded["argv"]
     homed = plan_run(tmp_path, "terminal_trials", {"holePose": "0.3599,-0.1333,0.0523",
                                                    "homeFirst": "1", "fixedHole": "1"})
