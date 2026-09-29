@@ -206,7 +206,14 @@ GRASP_LOOP_WIDTH_SETTLE_S = 0.3
 GRASP_LOOP_MAX_POLICY_STEPS = 450
 # The reset's own gripper command and table height, so a staged peg is the peg a rollout sees.
 GRASP_LOOP_TARGET_Z = 0.058
-GRASP_LOOP_PICK_XYZ = (0.3640, -0.1370, 0.0550)
+# The fixture is the hole, and the peg is taken from its centre: step 3's pick, where every one of
+# its 09-29 fetches held and was followed by a first-landing seat. Was 0.3640,-0.1370 (steps 1-2),
+# ~6 mm off the hole, which closed on the peg off-centre; the staging then records the *tool* as
+# where the peg stands, the funnel closes on that record, and the peg rides in the fingers 5-8 mm
+# off in a direction set by the policy's wrist and the homing turn. 09-29 14:56, 12 end-to-end
+# trials: seats scattered 7 mm either way of step 3's, three searches ran out, two face presses
+# tripped the reflex, 6/12 in.
+GRASP_LOOP_PICK_XYZ = (0.3597, -0.1328, 0.0550)
 # Radius of the stroke put around each recorded reset target when the mask has to be rebuilt
 # from a rollout log: the targets themselves are the distribution, this only fills between them.
 GRASP_LOOP_LOG_STROKE_RADIUS_M = 0.010
@@ -219,8 +226,8 @@ GRASP_LOOP_ARMS = ("A", "B", "AB")
 GRASP_LOOP_FUNNEL_MAX_STEPS = 360
 # How far the hole an end-to-end run inserts into may sit from the fixture pick, in xy. A peg that
 # went in is taken out again by the next trial's ordinary staging, from `pickXyz`: the fixture *is*
-# the hole on this rig (09-28/09-29: the pick 0.364,-0.137 and the step-3 aim 0.3597,-0.1328 are
-# 6 mm apart, and the fingers open 48 mm). Further than this is some other hole.
+# the hole on this rig (GRASP_LOOP_PICK_XYZ is step 3's pick, the hole's centre). Further than
+# this is some other hole.
 GRASP_LOOP_INSERT_FROM_PICK_M = 0.015
 # What the insertion's positioning steps (align, search lift/transfer, retreat) must reach when
 # `insertServo` names nothing: step 3's own figure (fr3_terminal_trials_runtime
