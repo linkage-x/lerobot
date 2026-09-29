@@ -307,6 +307,63 @@ def test_the_force_trace_records_every_scripted_step_and_changes_no_command(tmp_
     assert scene_reset._force_trace_path is None
 
 
+class PressRig(GraspRig):
+    """A table the tool meets above the place z: the estimate reads it as downward force, as the
+    real arm's does (09-24), 2 N per mm below the table."""
+
+    def __init__(self, table_z):
+        super().__init__()
+        self.table_z = table_z
+
+    @property
+    def external_wrench(self):
+        return (0.1, -0.2, 3.0 - 2000.0 * max(0.0, self.table_z - self.xyz[2]), 0.0, 0.0, 0.0)
+
+
+def _opened_at(robot):
+    """The z of every command that opened the fingers on a held peg."""
+
+    return [
+        after["ee.z"]
+        for before, after in zip(robot.actions, robot.actions[1:])
+        if before["gripper.pos"] < 0.5 <= after["gripper.pos"]
+    ]
+
+
+def test_a_set_down_pressing_the_table_rises_until_light_before_it_opens(tmp_path, capsys):
+    # The table 1.5 mm above the place z: 3 N at the dwell, under the 7 N cap, over 1.5 N.
+    robot = PressRig(table_z=TARGET_Z + 0.0015)
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=tmp_path / "g.jsonl")
+    out = capsys.readouterr().out
+    assert "scene_reset_unload=unloaded" in out
+    # Opened still touching the table, with the press at or under 1.5 N: 0.75 mm below it at most.
+    fixture_open = _opened_at(robot)[0]
+    assert TARGET_Z + 0.00075 - 1e-9 <= fixture_open <= TARGET_Z + 0.0015
+
+
+def test_a_light_set_down_opens_where_it_is(tmp_path, capsys):
+    robot = PressRig(table_z=TARGET_Z + 0.0005)
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=tmp_path / "g.jsonl")
+    # The fixture's set-down; the park at the end sets down lower, into this table, and is unloaded.
+    assert not [line for line in capsys.readouterr().out.splitlines() if "unload=" in line and "grasp_loop_000" in line]
+    assert _opened_at(robot)[0] == pytest.approx(TARGET_Z)
+
+
+def test_the_unload_rises_no_more_than_its_limit(tmp_path, capsys):
+    class StuckRig(GraspRig):
+        """5 N down on a held peg anywhere within 4 mm of the place z: nothing the rise undoes."""
+
+        @property
+        def external_wrench(self):
+            pressed = self.held and self.xyz[2] <= TARGET_Z + 0.004 + 1e-9
+            return (0.1, -0.2, 3.0 - (5.0 if pressed else 0.0), 0.0, 0.0, 0.0)
+
+    robot = StuckRig()
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=tmp_path / "g.jsonl")
+    assert "scene_reset_unload=limit" in capsys.readouterr().out
+    assert _opened_at(robot)[0] == pytest.approx(TARGET_Z + 0.004)
+
+
 def test_a_press_past_the_step_tolerance_is_refused():
     with pytest.raises(SceneResetError, match="placePressM"):
         validate_grasp_loop_request(_request(placePressM=0.010))

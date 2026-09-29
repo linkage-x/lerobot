@@ -112,6 +112,8 @@ from tools.fr3.scene_reset import (
     read_fz,
     set_force_trace_path,
     traced_hold,
+    unload_before_open,
+    UnloadLimits,
 )
 from tools.fr3.terminal_servo import (
     TerminalServoRequest,
@@ -175,6 +177,14 @@ GRASP_LOOP_HOVER_STILL_S = 0.3
 # the ~3 N the fast walk's own deceleration shows. Blind while the estimate reads all zeros (a
 # fifth of samples that day); the reflex recovery is what covers those.
 GRASP_LOOP_SET_DOWN_CAP_N = 7.0
+# Under the cap is not light enough to let go at. 09-29 run 173506: of the 18 fixture set-downs
+# that ended the dwell pressing 4.5 N or more below the hover tare, 11 fell over as the fingers
+# opened and the operator voided the trial; of the 45 lighter ones, 2. The place z is one number
+# while the tool meets the table 1.4 mm higher per 100 mm of x, so a peg set down far out is
+# pressed until the cap. So after the dwell the tool rises, this far per tick, until the press is
+# back under `pressN` -- about where the light ones ended, -0.2 to -1.7 N --
+# and opens there; never more than `maxM`, which would drop the peg instead.
+GRASP_LOOP_UNLOAD = UnloadLimits(pressN=1.5, stepM=0.0001, maxM=0.004)
 # Before the script closes on a standing peg, the tool has to have stopped: within this radius for
 # this long. The descent is called done up to 6 mm short while still moving, so a close started
 # then grips the peg at whatever height the arm has reached, and the next set-down meets the table
@@ -657,6 +667,11 @@ def _open_and_settle(
         robot, step_request.requestId, "dwell_before_open", request.placeDwellS, request.controlPeriodS,
         force_cap=None if cap is None or gripper is None else (cap[0], cap[1], gripper),
     )
+    if cap is not None and gripper is not None:
+        here, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        unload_before_open(
+            robot, step_request.requestId, rotvec, gripper, cap[0], request.controlPeriodS, GRASP_LOOP_UNLOAD, here[:2]
+        )
     # Opened where the arm is, not at the target: after a capped set-down the arm is holding
     # above it, and walking back down to the target would press the peg all over again.
     xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
@@ -1351,6 +1366,7 @@ def run_grasp_loop(
                     hover_m=GRASP_LOOP_HOVER_M,
                     hover_tolerance_m=GRASP_LOOP_HOVER_TOLERANCE_M,
                     hover_still_s=GRASP_LOOP_HOVER_STILL_S,
+                    unload=GRASP_LOOP_UNLOAD,
                 )
                 if reset.get("controlLoopDied"):
                     raise ControlLoopDiedError(str(reset.get("error")))

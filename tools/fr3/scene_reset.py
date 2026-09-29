@@ -746,6 +746,66 @@ def traced_hold(
     trace.flush("unloaded" if unloaded else "done")
 
 
+@dataclass(frozen=True)
+class UnloadLimits:
+    """How `unload_before_open` rises: to under `pressN` below the tare, `stepM` a tick, `maxM` at most."""
+
+    pressN: float
+    stepM: float
+    maxM: float
+
+
+def unload_before_open(
+    robot: Any,
+    request_id: str,
+    rotvec: tuple[float, float, float],
+    gripper: float,
+    tare_fz: float,
+    period_s: float,
+    limits: UnloadLimits,
+    xy: tuple[float, float],
+) -> float | None:
+    """Raise the tool, still holding, until the peg is no longer pressed into the table.
+
+    Only z moves: from where the arm is, not from its setpoint -- a press is the setpoint sitting
+    below the arm, so that alone takes most of it off -- while the setpoint keeps `xy`, so the
+    fingers do not drag the peg sideways on the table. Answers the z it last sent, or None when it
+    sent nothing: the press was already light, or the estimate could not be read.
+    """
+
+    fz = read_fz(robot)
+    if fz is None or fz - tare_fz >= -limits.pressN:
+        return None
+    start_press = fz - tare_fz
+    trace = _ForceTrace(robot, request_id, "unload_before_open")
+    xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    z = xyz[2]
+    while True:
+        _send_absolute(robot, (xy[0], xy[1], z), rotvec, gripper)
+        precise_sleep(period_s)
+        measured, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+        trace.sample(z, measured)
+        fz = read_fz(robot)
+        if fz is None:
+            outcome = "blind"
+            break
+        if fz - tare_fz >= -limits.pressN:
+            outcome = "unloaded"
+            break
+        if z + limits.stepM - xyz[2] > limits.maxM + 1e-9:
+            outcome = "limit"
+            break
+        z += limits.stepM
+    trace.flush(outcome)
+    press = "none" if fz is None else f"{fz - tare_fz:+.1f}"
+    print(
+        f"[INFO] scene_reset_unload={outcome} request_id={request_id} dfz_n={start_press:+.1f}->{press} "
+        f"raised_mm={(z - xyz[2]) * 1e3:.1f}",
+        flush=True,
+    )
+    return z
+
+
 def _scene_reset_waits_for_gripper_position(name: str) -> bool:
     # Once the peg is clamped, the measured opening is the peg thickness, not the closed command.
     # Waiting for `closedGripper` would block the lift and carry steps forever on a successful grasp.
@@ -1055,6 +1115,7 @@ def execute_scene_reset(
     hover_m: float = 0.0,
     hover_tolerance_m: float | None = None,
     hover_still_s: float | None = None,
+    unload: UnloadLimits | None = None,
 ) -> dict[str, Any]:
     """Execute the fixed-pick/random-place reset on an already connected FR3 robot.
 
@@ -1065,7 +1126,9 @@ def execute_scene_reset(
     peg that rocks on release is not dragged by fingers leaving too early. `hover_m` stops both
     descents that far above their point and waits there to within `hover_tolerance_m` (xy only,
     and still for `hover_still_s`, when that is given), so the fingers do not meet the peg or the
-    table while the arm is still closing the last few mm sideways.
+    table while the arm is still closing the last few mm sideways. `unload`, with a hover, raises
+    the tool after the dwell until the peg is no longer pressed into the table against the force
+    read at the place hover (`unload_before_open`), and opens the fingers where the arm then is.
     """
 
     current_xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
@@ -1096,6 +1159,8 @@ def execute_scene_reset(
     # own whether the peg is dropped. Seeded open: nothing has been commanded yet at this point.
     commanded_gripper = request.openGripper
     released_xyz: tuple[float, float, float] | None = None
+    # The force read parked at the place hover, which `unload` measures the press against.
+    place_tare: float | None = None
     try:
         for waypoint in build_scene_reset_waypoints(request):
             if hover_m > 0.0 and waypoint.name in ("descend_8cm_to_pick", "descend_8cm_to_place"):
@@ -1106,10 +1171,22 @@ def execute_scene_reset(
                     tolerance_m=hover_tolerance_m,
                     still_window_s=hover_still_s,
                 )
+                if hover_name == "settle_above_place" and unload is not None:
+                    place_tare = read_fz(robot)
             if waypoint.name == "open_gripper" and release_dwell_s > 0.0:
                 traced_hold(robot, request.requestId, "dwell_before_open", release_dwell_s, request.controlPeriodS)
+            step_xyz = waypoint.xyz
+            if waypoint.name == "open_gripper" and unload is not None and place_tare is not None:
+                unloaded_z = unload_before_open(
+                    robot, request.requestId, rotvec, commanded_gripper, place_tare, request.controlPeriodS,
+                    unload, (waypoint.xyz[0], waypoint.xyz[1]),
+                )
+                # Opened at the height it rose to: walking back down to the place point would
+                # press the peg into the table again while the fingers let go of it.
+                if unloaded_z is not None:
+                    step_xyz = (waypoint.xyz[0], waypoint.xyz[1], unloaded_z)
             commanded_gripper = waypoint.gripper
-            _run_step(robot, request, waypoint.name, waypoint.xyz, rotvec, waypoint.gripper)
+            _run_step(robot, request, waypoint.name, step_xyz, rotvec, waypoint.gripper)
             if waypoint.name == "open_gripper":
                 if release_settle_s > 0.0:
                     traced_hold(robot, request.requestId, "settle_after_open", release_settle_s, request.controlPeriodS)
