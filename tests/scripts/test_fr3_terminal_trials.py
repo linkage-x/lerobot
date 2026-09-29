@@ -121,10 +121,12 @@ def _request(**overrides):
 
 
 def _stowed(robot):
-    """The run's last act: the peg set down on the pick point and let go of (see `_stow`)."""
+    """The run's last act: the peg put back down the hole and let go of there (see `_stow`)."""
 
     return (not robot.held
-            and math.hypot(robot.peg_xyz[0] - PICK[0], robot.peg_xyz[1] - PICK[1]) < 1e-6)
+            and math.hypot(robot.peg_xyz[0] - robot.hole_xy[0], robot.peg_xyz[1] - robot.hole_xy[1])
+            <= robot.capture_m
+            and robot.peg_xyz[2] < robot.face_z)
 
 
 # --- the schedule -----------------------------------------------------------------------------
@@ -704,7 +706,7 @@ def test_a_graded_run_asks_before_the_fingers_open_and_lets_go_only_on_in():
     assert [trial["index"] for trial in asked] == [0, 1, 2]
     assert all(trial["autoVerdict"] == "seated" for trial in asked)
     # Asked while the peg was held: each answer is followed by exactly one release, and the run
-    # ends with one more, setting the peg down on the pick.
+    # ends with one more, putting the peg back in the hole.
     assert robot.releases == 3 + 1
     assert summary["gradeAgreement"] == {"seated_in": 3}
     trials = [row for row in summary["rows"] if row.get("kind") == "trial"]
@@ -774,14 +776,76 @@ def test_the_file_gate_waits_for_the_continue_button_after_a_reset(tmp_path):
     assert rows[0]["kind"] == "needs_operator" and rows[0]["grade"] is False
     assert rows[-1]["kind"] == "operator" and rows[-1]["continued"] is True
     assert not (tmp_path / "CONTINUE").exists()
+    rows.clear()
+    assert gate.wait_for_continue(None, "收尾") is True
+    assert rows[0]["message"] == "收尾" and rows[0]["trial"] is None
 
 
 def test_nobody_answering_ends_the_run_holding_the_peg():
     robot = CountingReleases(hole_xy=SEATED[:2], capture_m=0.0042)
     summary = run_terminal_trials(robot, _graded(), ask_grade=lambda trial: None)
     assert summary["haltedOn"] == "operator_gone"
-    # Never let go of at the hole; only put away on the pick when the run ends.
+    # Never let go of on a trial; only put back in the hole when the run ends.
     assert robot.releases == 1 and _stowed(robot)
+
+
+def _holding_over(robot, xyz):
+    robot.xyz = tuple(xyz)
+    robot.held = True
+    robot.gripper = FakeTrialRig.PEG_WIDTH
+    robot.peg_xyz = tuple(xyz)
+
+
+def test_the_stow_lands_like_a_trial_where_the_run_last_seated():
+    robot = CountingReleases(hole_xy=(SEATED[0] + 0.006, SEATED[1]), capture_m=0.0042)
+    _holding_over(robot, (SEATED[0], SEATED[1], 0.138))
+    last_seat = (SEATED[0] + 0.006, SEATED[1], SEATED[2])
+    stow = terminal_trials._stow(robot, _request(), (math.pi, 0.0, 0.0), last_seat)
+    assert stow["seated"] and stow["released"] and stow["searchIndex"] == 0
+    assert _stowed(robot) and robot.releases == 1
+
+
+def test_a_stow_that_does_not_seat_keeps_hold_and_asks_before_letting_go(capsys):
+    # The hole is out of reach of the landing and its whole search ring.
+    robot = CountingReleases(hole_xy=(SEATED[0] + 0.030, SEATED[1]), capture_m=0.0042)
+    _holding_over(robot, (SEATED[0], SEATED[1], 0.138))
+    asked = []
+
+    class Nobody:
+        def wait_for_continue(self, index, message):
+            asked.append((index, message, robot.held, tuple(robot.xyz)))
+            return False
+
+    stow = terminal_trials._stow(robot, _request(), (math.pi, 0.0, 0.0), SEATED, Nobody())
+    assert stow["seated"] is False and stow["released"] is False
+    assert robot.held and robot.releases == 0
+    # Asked while still held, stopped on the face, not lifted away.
+    [(index, message, held, where)] = asked
+    assert index is None and held and "扶住销" in message
+    assert where[2] == pytest.approx(robot.face_z, abs=0.003)
+    assert "stow_not_seated" in capsys.readouterr().out
+
+
+def test_a_stow_that_does_not_seat_lets_go_once_a_person_has_hold_of_it():
+    robot = CountingReleases(hole_xy=(SEATED[0] + 0.030, SEATED[1]), capture_m=0.0042)
+    _holding_over(robot, (SEATED[0], SEATED[1], 0.138))
+
+    class Somebody:
+        def wait_for_continue(self, index, message):
+            return True
+
+    stow = terminal_trials._stow(robot, _request(), (math.pi, 0.0, 0.0), SEATED, Somebody())
+    assert stow["seated"] is False and stow["released"] is True
+    assert not robot.held and robot.releases == 1
+
+
+def test_the_run_puts_the_peg_back_where_its_last_seated_trial_landed():
+    robot = FakeTrialRig(hole_xy=SEATED[:2])
+    request = _request(offsetsMm=(0.0,), repeats=2, controlEvery=100)
+    summary = run_terminal_trials(robot, request)
+    last = [row for row in summary["rows"] if row.get("kind") == "trial"][-1]
+    assert summary["stow"]["landingXyz"] == pytest.approx(last["aimXyz"])
+    assert summary["stow"]["released"] and _stowed(robot)
 
 
 def test_a_graded_run_without_anybody_to_ask_is_refused():

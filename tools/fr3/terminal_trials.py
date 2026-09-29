@@ -63,15 +63,17 @@ from tools.fr3.scene_reset import (
     _reach_probe,
     _robot_workspace_bounds,
     _run_step,
+    _send_absolute,
     _workspace_bounds,
-    read_fz,
 )
 from tools.fr3.terminal_servo import (
     TERMINAL_SERVO_SEARCH_RING_M,
     TerminalServoRequest,
     classify_terminal_servo_descent,
     execute_terminal_servo,
+    search_for_seat,
     terminal_servo_search_offsets,
+    terminal_servo_waypoints,
     validate_terminal_servo_trajectory,
 )
 
@@ -90,9 +92,6 @@ from tools.fr3.terminal_servo import (
 TERMINAL_TRIAL_MAX_TILT_DEG = 2.0
 
 TERMINAL_TRIAL_GRASP_FLOOR = 0.10
-# How hard the end of a run may set the peg down on the pick point, N below the reading before
-# the descent: the grasp loop's set-down cap.
-TERMINAL_TRIAL_STOW_CAP_N = 7.0
 # Above this the fingers are open, not holding: the peg reads ~0.31, open fingers ~1.0.
 TERMINAL_TRIAL_OPEN_ABOVE = 0.6
 # How far a later grasp may sit from the first one of the same run before the loop stops. The
@@ -467,33 +466,76 @@ def _holds_something(width: float, request: TerminalTrialsRequest) -> bool:
 
 
 def _stow(
-    robot: Any, request: TerminalTrialsRequest, rotvec: tuple[float, float, float] | None = None
-) -> None:
-    """Put a held peg back where runs fetch it from, and let go, before the process exits.
+    robot: Any,
+    request: TerminalTrialsRequest,
+    rotvec: tuple[float, float, float],
+    landing_xyz: tuple[float, float, float],
+    ask_help: Any = None,
+) -> dict[str, Any] | None:
+    """Put a held peg back in the hole, and let go only if it went in, before the process exits.
 
     The gripper driver's disconnect disables the motor, so whatever the fingers hold when the run
     ends falls from wherever it is: 09-28 17:17 a run halted holding the peg 8 cm over the hole
-    and dropped it on exit. Set down on the pick point with the set-down cap, since a halt can
-    mean a crooked peg that will not go all the way in; it is let go of wherever the cap stops it.
+    and dropped it on exit. The first fix set the peg down with a scripted step, and 18:25 showed
+    why that is the wrong tool: at the reset's speed the tool swung 4-6 mm sideways on the way
+    down, met the hole's mouth 37 mm above the seat, and let go there. So this is a trial's own
+    landing -- the slow descent, and the search around it -- aimed where the run last seated
+    (`landing_xyz`, a commanded pose, because that is what put the tool over the hole then).
+
+    Not seated means the fingers stay shut and the arm stays where it stopped, setpoint on the
+    tool so it does not lean on the fixture, and a person is asked to take hold of the peg
+    (`ask_help.wait_for_continue`) before it is let go of. Nobody answering leaves it held until
+    the process ends, which drops it from there: a few mm over the mouth, not from a let-go.
     """
 
     if request.pickXyz is None:
-        return
-    xyz, measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
-    rotvec = measured_rotvec if rotvec is None else rotvec
+        return None
+    xyz, _measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
     if not _holds_something(gripper, request):
-        return
-    pick = tuple(request.pickXyz)
-    hold_z = max(float(xyz[2]), _hold_z(request))
-    _run_step(robot, request, "move_to_place_above", (pick[0], pick[1], hold_z), rotvec,
-              request.closedGripper)
-    tare = read_fz(robot)
-    _run_step(robot, request, "descend_8cm_to_place", pick, rotvec, request.closedGripper,
-              force_cap=None if tare is None else (tare, TERMINAL_TRIAL_STOW_CAP_N))
-    here, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
-    _run_step(robot, request, "open_gripper", here, rotvec, request.openGripper)
-    _run_step(robot, request, "retreat_8cm", (here[0], here[1], hold_z), rotvec, request.openGripper)
-    print("[INFO] terminal_trials=stowed peg_left_at_pick=1", flush=True)
+        return None
+    servo = replace(
+        request.servo,
+        xyz=tuple(float(value) for value in landing_xyz),
+        searchRingM=request.referenceRingM,
+        holdGripper=request.closedGripper,
+        requestId=f"{request.requestId or 'terminal_trials'}#stow",
+    )
+    held = request.closedGripper
+    waypoints = dict(terminal_servo_waypoints(servo, xyz))
+    _run_step(robot, servo, "align_above_target", waypoints["align_above_target"], rotvec, held,
+              tolerance_m=servo.stepToleranceM)
+    descent = search_for_seat(robot, servo, rotvec, held)
+    stopped_at = tuple(float(value) for value in descent["stoppedAtXyz"])
+    above_mm = 1000.0 * (stopped_at[2] - servo.xyz[2])
+    seated = descent["searchStoppedOn"] == "seated"
+    outcome = {
+        "landingXyz": list(servo.xyz),
+        "stoppedAtXyz": list(stopped_at),
+        "aboveTargetMm": above_mm,
+        "searchIndex": int(descent["searchIndex"]),
+        "seated": seated,
+        "released": False,
+    }
+    if not seated:
+        _send_absolute(robot, stopped_at, rotvec, held)
+        message = (
+            f"收尾没能把销放回孔里（停在入孔深度上方 {above_mm:+.1f} mm），销还夹着。"
+            f"请扶住销再点继续，手指会张开"
+        )
+        waiter = getattr(ask_help, "wait_for_continue", None)
+        if waiter is None:
+            print(f"[ATTENTION] terminal_trials_needs_operator stow: {message}", flush=True)
+        if waiter is None or not waiter(None, message):
+            print("[WARN] terminal_trials=stow_not_seated released=0 -- the peg is still held and "
+                  "drops when this process exits", flush=True)
+            return outcome
+    _run_step(robot, request, "open_gripper", stopped_at, rotvec, request.openGripper)
+    _run_step(robot, request, "retreat_8cm", (stopped_at[0], stopped_at[1], _hold_z(request)),
+              rotvec, request.openGripper)
+    outcome["released"] = True
+    print(f"[INFO] terminal_trials=stowed seated={int(seated)} above_target_mm={above_mm:+.1f} "
+          f"search_index={outcome['searchIndex']}", flush=True)
+    return outcome
 
 
 def _park(
@@ -693,6 +735,7 @@ def run_terminal_trials(
     started = time.perf_counter()
     rows: list[dict[str, Any]] = []
     halted = ""
+    seated_landing: tuple[float, float, float] | None = None
 
     def emit(row: dict[str, Any]) -> None:
         rows.append(row)
@@ -886,6 +929,10 @@ def run_terminal_trials(
             # in the fingers -- and since the peg is about to be re-gripped at exactly that
             # pose, that sum is precisely the pose the next trial should aim at.
             confirmed = row["operatorGrade"] == "in" if request.operatorGrade else verdict == "seated"
+            if confirmed and row["released"]:
+                # Where the end of the run puts the peg back (`_stow`): the commanded landing,
+                # not where the tool stopped, since the command is what put the tool over the hole.
+                seated_landing = tuple(float(value) for value in result["searchLandingXyz"])
             if spec.kind == "reference":
                 if confirmed:
                     state.referenceFailures = 0
@@ -1038,6 +1085,7 @@ def run_terminal_trials(
     except (TimeoutError, RuntimeError) as exc:
         halted = f"step_failed: {exc}"
 
+    stow: dict[str, Any] | None = None
     try:
         if halted == "control_loop_died":
             # Every command from here would go to a controller that is not there. The arm stays
@@ -1045,7 +1093,8 @@ def run_terminal_trials(
             raise RuntimeError("control loop died; not parking")
         _park(robot, request, anchor_rotvec)
         parked = True
-        _stow(robot, request, anchor_rotvec)
+        stow = _stow(robot, request, anchor_rotvec,
+                     seated_landing if seated_landing is not None else state.referenceXyz, ask_grade)
     except Exception as exc:  # noqa: BLE001 - the summary has to survive a failed park
         parked = False
         print(f"[WARN] terminal_trials=park_failed details={exc}", flush=True)
@@ -1058,6 +1107,7 @@ def run_terminal_trials(
         "ok": halted in {"schedule_complete", "time_budget", "stop_requested"},
         "haltedOn": halted or "schedule_complete",
         "parked": parked,
+        "stow": stow,
         "trials": len(trials),
         "seated": state.seated,
         "scheduled": len(specs),
@@ -1163,9 +1213,13 @@ class FileGradeGate:
         lost peg is in the grasp-envelope runs.
         """
 
+        return self.wait_for_continue(index, f"trial {index:03d}: 销已松开。请把销摆正插回孔里")
+
+    def wait_for_continue(self, index: int | None, message: str) -> bool:
+        """Post `message` and wait for the page's continue button; True if a person pressed it."""
+
         continue_path = self.grade_path.with_name("CONTINUE")
         continue_path.unlink(missing_ok=True)
-        message = f"trial {index:03d}: 销已松开。请把销摆正插回孔里"
         self.on_row({"kind": "needs_operator", "grade": False, "trial": index, "at": time.time(),
                      "message": message})
         print(f"[ATTENTION] terminal_trials_needs_operator {message}", flush=True)
@@ -1181,7 +1235,8 @@ class FileGradeGate:
             waited += self.poll_s
         continue_path.unlink(missing_ok=True)
         self.on_row({"kind": "operator", "trial": index, "continued": answered, "at": time.time()})
-        print(f"[INFO] terminal_trials_replaced trial={index:03d} continued={int(answered)}", flush=True)
+        label = "stow" if index is None else f"{index:03d}"
+        print(f"[INFO] terminal_trials_replaced trial={label} continued={int(answered)}", flush=True)
         return answered
 
 
