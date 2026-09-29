@@ -14534,8 +14534,33 @@ def _load_camera_identity_expected(state: GatewayState) -> dict[str, Any]:
         except (OSError, ValueError):
             continue
         if isinstance(data, dict) and isinstance(data.get("ports"), dict):
-            return data
+            return _only_solved_ports(data, path.parent)
     return {}
+
+
+def _only_solved_ports(expected: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """Keep the ports the run actually solved a pose for.
+
+    The identity table lists every module that answered during the capture,
+    including one that never saw the board (2026-09-28: cam_04). Such a port has
+    no extrinsics, so tracking never reads it, and whatever is plugged into it
+    now cannot put a wrong constant into a label -- refusing to record over it
+    only blocks adding cameras (2026-09-29). Without a readable run summary the
+    table is enforced whole: an unknown solve set is not evidence of absence.
+    """
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        cameras = (summary.get("joint_solution") or {}).get("cameras")
+    except (OSError, ValueError, AttributeError):
+        return expected
+    if not isinstance(cameras, dict) or not cameras:
+        return expected
+    solved = {cam for cam, v in cameras.items() if isinstance(v, dict) and v.get("status") == "ok"}
+    ports = expected["ports"]
+    unsolved = sorted(cam for cam in ports if cam not in solved)
+    if not unsolved:
+        return expected
+    return {**expected, "ports": {c: s for c, s in ports.items() if c in solved}, "portsWithoutExtrinsics": unsolved}
 
 
 def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> None:
