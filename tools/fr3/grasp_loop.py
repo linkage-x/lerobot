@@ -229,6 +229,19 @@ GRASP_LOOP_INSERT_FROM_PICK_M = 0.015
 GRASP_LOOP_INSERT_STEP_TOLERANCE_M = 0.004
 # Above this the fingers read open, not holding: the peg reads ~0.31, open fingers ~1.0.
 GRASP_LOOP_OPEN_ABOVE = 0.6
+# How far the insertion's aim may follow the pegs that went in, from the configured hole. The
+# funnel's grip holds the peg ~7 mm off where step 3's grip from the hole held it: 09-29 14:56,
+# every first landing met the face and every seat was found at ring index 5-6, the tool at
+# 0.3526,-0.1367 against step 3's 0.3578,-0.1322 in the same hole. So each trial aims where the
+# last one went in (its commanded landing, not the tool: the tool stops ~2 mm short, and aiming at
+# where it stopped walked step 3's reference 1 mm a trial). Bounded like step 3's reference step:
+# a seat further than ring + capture radius from the hole is not one the search could have found.
+GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M = 0.012
+# How hard a landing on the face may press before the servo stops pushing. Step 3's 16 N, with
+# one landing in eight on the face, was harmless; here 5-8 face landings a trial all hit it (35
+# caps in 5 trials, peaks -20 N) and the operator watched the peg lean further with each one.
+# Contact is still read off the lag, so a lower cap costs nothing but the press.
+GRASP_LOOP_INSERT_PRESS_CAP_N = 10.0
 
 
 @dataclass(frozen=True)
@@ -667,8 +680,12 @@ def insert_held_peg(
     close_z: float,
     request_id: str,
     ask_grade: OperatorGrade | None = None,
+    aim_xy: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
+
+    `aim_xy` replaces the configured xy: where the last peg went in (see
+    GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M). None aims at `insertServo.xyz`.
 
     The grasp is the policy's (arm B: the funnel's), carried as it is -- the insertion is measured
     under the grasp the pick layer made, not a re-grip of it. Only the squeeze is the script's:
@@ -697,6 +714,8 @@ def insert_held_peg(
     _xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
     tilt_deg = tool_axis_tilt_deg(rotvec)
     x, y, z = request.insertServo.xyz
+    if aim_xy is not None:
+        x, y = float(aim_xy[0]), float(aim_xy[1])
     raised_m = max(0.0, float(close_z) - request.regripZ)
     servo = replace(
         request.insertServo,
@@ -756,6 +775,7 @@ def insert_held_peg(
         "lateralErrorMm": round(float(result["lateralErrorMm"]), 1),
         "stoppedOn": result.get("stoppedOn"),
         "stoppedAtXyz": [round(float(v), 5) for v in result["stoppedAtXyz"]],
+        "landingXyz": [round(float(v), 5) for v in result.get("searchLandingXyz") or servo.xyz],
         "searchIndex": int(result.get("searchIndex") or 0),
         "searchStoppedOn": result.get("searchStoppedOn"),
         "dfzPeakN": None if not peaks else round(min(peaks), 1),
@@ -770,6 +790,32 @@ def insert_held_peg(
         flush=True,
     )
     return outcome
+
+
+def next_insert_aim(
+    request: GraspLoopRequest,
+    rows: Iterable[dict[str, Any]],
+    current: tuple[float, float] | None = None,
+) -> tuple[float, float] | None:
+    """Where the next insertion aims: the landing of the last peg in `rows` that went in.
+
+    Within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of the configured hole, or it is not adopted. Read
+    from the row file too, so a resumed run aims where it left off.
+    """
+
+    if request.insertServo is None:
+        return None
+    hole = request.insertServo.xyz[:2]
+    aim = current
+    for row in rows:
+        insert = row.get("insert") or {}
+        landing = insert.get("landingXyz")
+        if row.get("inserted") is not True or not landing:
+            continue
+        xy = (float(landing[0]), float(landing[1]))
+        if math.dist(xy, hole) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M:
+            aim = xy
+    return aim
 
 
 def _flag(value: bool | None) -> str:
@@ -1149,6 +1195,7 @@ def run_grasp_loop(
     held_place_z: float | None = None
     held_gripper: float = request.closedGripper
     halted = ""
+    insert_aim = next_insert_aim(request, done)
 
     def write(row: dict[str, Any]) -> None:
         with out_path.open("a", encoding="utf-8") as handle:
@@ -1298,11 +1345,15 @@ def run_grasp_loop(
                     assert handover.closeXyz is not None
                     insert = insert_held_peg(
                         robot, request, trial=trial, close_z=handover.closeXyz[2],
-                        request_id=request_id, ask_grade=ask_grade,
+                        request_id=request_id, ask_grade=ask_grade, aim_xy=insert_aim,
                     )
                     insert_rotvec = insert.pop("rotvec")
                     row["insert"] = insert
                     row["inserted"] = insert["inserted"]
+                    aim = next_insert_aim(request, [row], insert_aim)
+                    if aim != insert_aim:
+                        log(f"[INFO] grasp_loop_insert_aim trial={trial} xy={aim[0]:.4f},{aim[1]:.4f}")
+                    insert_aim = aim
                     if insert["released"]:
                         # In the fixture, which is where the next staging takes it from.
                         peg, regrip = "at_pick", False

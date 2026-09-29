@@ -1191,3 +1191,45 @@ def test_a_fault_with_the_peg_held_and_nobody_there_keeps_holding_it(tmp_path, _
     assert robot.held
     assert robot.actions[-1]["gripper.pos"] == 0.0
     assert "peg_still_held" in capsys.readouterr().out
+
+
+def test_the_next_insertion_aims_where_the_last_peg_went_in(tmp_path, _fast_servo, capsys):
+    # 09-29 14:56: the funnel's grip holds the peg ~7 mm off step 3's, so the configured aim met
+    # the face every time and the ring found the hole at the same landing trial after trial.
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=3, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 3),
+        out_path=out,
+        ask_grade=_grades(robot, ["in", "in", "in"], []),
+    )
+    inserts = [r["insert"] for r in _trials(out)]
+    assert inserts[0]["searchIndex"] > 0
+    # Aimed at the first trial's seated landing from then on, and in first time.
+    assert [i["searchIndex"] for i in inserts[1:]] == [0, 0]
+    assert inserts[1]["aimXyz"][:2] == pytest.approx(inserts[0]["landingXyz"][:2])
+    assert "grasp_loop_insert_aim trial=0" in capsys.readouterr().out
+
+
+def test_the_aim_follows_only_pegs_that_went_in_and_only_so_far_from_the_hole():
+    request = _request(insertServo=_insert_servo())
+    hole = request.insertServo.xyz
+    near = {"inserted": True, "insert": {"landingXyz": [hole[0] - 0.007, hole[1], hole[2]]}}
+    out = {"inserted": False, "insert": {"landingXyz": [hole[0] + 0.007, hole[1], hole[2]]}}
+    far = {"inserted": True, "insert": {"landingXyz": [hole[0] + 0.02, hole[1], hole[2]]}}
+    assert grasp_loop.next_insert_aim(request, []) is None
+    assert grasp_loop.next_insert_aim(request, [near, out, far]) == pytest.approx((hole[0] - 0.007, hole[1]))
+    assert grasp_loop.next_insert_aim(_request(), [near]) is None
+
+
+def test_a_resumed_run_aims_where_it_left_off(tmp_path, _fast_servo):
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    common = dict(ask_grade=_grades(robot, ["in", "in"], []), out_path=out)
+    run_grasp_loop(robot, _request(trials=1, insertServo=_insert_servo()),
+                   run_policy_trial=_policy(robot, [("grasp", 0.0)]), **common)
+    run_grasp_loop(robot, _request(trials=2, insertServo=_insert_servo()),
+                   run_policy_trial=_policy(robot, [None, ("grasp", 0.0)]), **common)
+    assert [r["insert"]["searchIndex"] for r in _trials(out)][1] == 0
