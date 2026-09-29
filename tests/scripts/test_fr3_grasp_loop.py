@@ -1122,3 +1122,72 @@ def test_only_in_or_out_answers_a_grade_and_a_stop_answers_nobody():
     asker.join(timeout=2)
     assert answers == ["in", None]
     words.put(None)
+
+
+class StickyRig(InsertRig):
+    """An arm with step 3's dead-band: positioning steps park 2.2 mm short of where they aim."""
+
+    def send_action(self, action):
+        result = super().send_action(action)
+        if abs(float(action["ee.z"]) - 0.12) < 1e-9:
+            self.xyz = (self.xyz[0] - 0.0016, self.xyz[1] + 0.0012, self.xyz[2] - 0.0008)
+        return result
+
+
+def test_the_insertion_positions_to_step_threes_tolerance_not_the_servos_2mm(tmp_path, _fast_servo):
+    # 09-29 14:38: align_above_target parked 2.2 mm off against a 2.0 mm tolerance and faulted.
+    robot = _insert_rig()
+    robot.__class__ = StickyRig
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    assert _trials(out)[0]["inserted"] is True
+
+
+def test_a_fault_with_the_peg_held_keeps_it_closed_and_asks_before_letting_go(tmp_path, _fast_servo, monkeypatch):
+    robot = _insert_rig()
+
+    def fault(*args, **kwargs):
+        raise SceneResetError("scene reset step align_above_target timed out")
+
+    monkeypatch.setattr(grasp_loop, "execute_terminal_servo", fault)
+    asked = []
+
+    def operator(message):
+        asked.append((message, robot.held, robot.gripper))
+        return True
+
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=operator,
+        ask_grade=_grades(robot, [], []),
+    )
+    assert result["halted"] == "motion_fault"
+    # Still clamped when the person was asked -- the hold did not re-send the measured width --
+    # and let go only after they said they had it.
+    assert len(asked) == 1 and asked[0][0].startswith("hold:") and asked[0][1] is True
+    assert not robot.held and robot.gripper >= 0.5
+
+
+def test_a_fault_with_the_peg_held_and_nobody_there_keeps_holding_it(tmp_path, _fast_servo, monkeypatch, capsys):
+    robot = _insert_rig()
+    monkeypatch.setattr(grasp_loop, "execute_terminal_servo",
+                        lambda *a, **k: (_ for _ in ()).throw(SceneResetError("timed out")))
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=tmp_path / "e2e.jsonl",
+    )
+    assert robot.held
+    assert robot.actions[-1]["gripper.pos"] == 0.0
+    assert "peg_still_held" in capsys.readouterr().out

@@ -81,7 +81,12 @@ export function GraspLoopPanel({
 
       {progress.needsOperator && !progress.needsOperator.startsWith("grade") && (
         <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          {progress.needsOperator.startsWith("reflex") ? (
+          {progress.needsOperator.startsWith("hold") ? (
+            <span>
+              <strong>需要你：</strong>循环出错停了，销还夹在手指里（进程退出时夹爪会断电松开）。先用手扶住销，再点「已扶住，张开」——
+              手指张开后机械臂竖直抬起、回原位。
+            </span>
+          ) : progress.needsOperator.startsWith("reflex") ? (
             <span>
               <strong>需要你：</strong>机械臂触发了碰撞保护，已停住。确认手指下没有压着东西、周围安全后点「安全，恢复」——
               机械臂会松爪、竖直抬起、回原位，然后再请你放回销子。
@@ -93,7 +98,11 @@ export function GraspLoopPanel({
             </span>
           )}
           <button type="button" className="primary" disabled={busy} onClick={() => onControl("grasp_continue")}>
-            {progress.needsOperator.startsWith("reflex") ? "安全，恢复" : "已放回，继续"}
+            {progress.needsOperator.startsWith("hold")
+              ? "已扶住，张开"
+              : progress.needsOperator.startsWith("reflex")
+                ? "安全，恢复"
+                : "已放回，继续"}
           </button>
         </div>
       )}
@@ -159,7 +168,9 @@ export function GraspLoopPanel({
               : progress.needsOperator
                 ? progress.needsOperator.startsWith("grade")
                   ? "等你判进没进"
-                  : "等你放回销"
+                  : progress.needsOperator.startsWith("hold")
+                    ? "等你扶住销"
+                    : "等你放回销"
                 : current !== null
                   ? `第 ${current + 1} 条进行中`
                   : live

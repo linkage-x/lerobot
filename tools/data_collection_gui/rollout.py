@@ -1082,6 +1082,8 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
             elif event["type"] == "needs_operator":
                 if event["message"].startswith("grade"):
                     parsed["message"] = "Grasp loop is waiting: is the peg in the hole? Answer in or out."
+                elif event["message"].startswith("hold"):
+                    parsed["message"] = "Grasp loop stopped with the peg still in the fingers: take hold of it, then press Continue and the fingers open."
                 elif event["message"].startswith("reflex"):
                     parsed["message"] = "Grasp loop is waiting: the arm tripped its collision reflex. Check nothing is trapped, then press Continue."
                 else:

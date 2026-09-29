@@ -119,6 +119,7 @@ from tools.fr3.grasp_loop import (
     GRASP_LOOP_ARMS,
     GRASP_LOOP_BLOCKED_MARGIN,
     GRASP_LOOP_HELD_WIDTH,
+    GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
     GRASP_LOOP_MAX_POLICY_STEPS,
     GRASP_LOOP_PICK_XYZ,
     GRASP_LOOP_TARGET_Z,
@@ -4983,6 +4984,7 @@ def run_inference(args: argparse.Namespace) -> int:
                         xyz=parse_terminal_servo_pose(args.grasp_loop_insert_pose),
                         handoffZ=float(args.terminal_servo_handoff_z),
                         searchRingM=float(args.grasp_loop_insert_ring),
+                        stepToleranceM=GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
                         controlPeriodS=1.0 / policy_fps,
                         requestId='grasp_loop_insert',
                     )

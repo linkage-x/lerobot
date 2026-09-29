@@ -222,6 +222,13 @@ GRASP_LOOP_FUNNEL_MAX_STEPS = 360
 # the hole on this rig (09-28/09-29: the pick 0.364,-0.137 and the step-3 aim 0.3597,-0.1328 are
 # 6 mm apart, and the fingers open 48 mm). Further than this is some other hole.
 GRASP_LOOP_INSERT_FROM_PICK_M = 0.015
+# What the insertion's positioning steps (align, search lift/transfer, retreat) must reach when
+# `insertServo` names nothing: step 3's own figure (fr3_terminal_trials_runtime
+# --step-tolerance-mm). The servo's fallback, 2.0 mm, is under this arm's dead-band; 09-29 14:38
+# the first end-to-end trial parked 2.2 mm off its align point and timed out.
+GRASP_LOOP_INSERT_STEP_TOLERANCE_M = 0.004
+# Above this the fingers read open, not holding: the peg reads ~0.31, open fingers ~1.0.
+GRASP_LOOP_OPEN_ABOVE = 0.6
 
 
 @dataclass(frozen=True)
@@ -697,6 +704,7 @@ def insert_held_peg(
         holdGripper=held,
         regripGripper=None,
         releaseOnlyWhenSeated=False,
+        stepToleranceM=request.insertServo.stepToleranceM or GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
         requestId=f"{request_id}#insert",
     )
     # Across at the handoff height first, at the reset's speed: the servo's own lateral leg keeps
@@ -789,6 +797,41 @@ def return_to_table(
 
 
 GRASP_LOOP_REFLEX_PROMPT = "reflex: the arm tripped its collision reflex and stopped"
+GRASP_LOOP_HOLD_PROMPT = "hold: the run stopped with the peg still in the fingers"
+
+
+def holds_peg(width: float, request: GraspLoopRequest) -> bool:
+    """The fingers stopped on something: not shut on air, not open."""
+
+    return request.heldWidth <= float(width) < GRASP_LOOP_OPEN_ABOVE
+
+
+def hand_over_held_peg(
+    robot: Any,
+    request: GraspLoopRequest,
+    wait_for_operator: OperatorWait | None,
+    *,
+    request_id: str,
+) -> bool:
+    """A run that halts holding the peg: a person takes hold of it before the fingers open.
+
+    The gripper driver's disconnect disables the motor, so whatever the fingers hold when the
+    process ends falls from wherever it is -- 09-29 14:38 an insertion that faulted over the hole
+    dropped the peg there. Nobody to ask leaves it held until then, and says so.
+    """
+
+    if wait_for_operator is None or not wait_for_operator(
+        f"{GRASP_LOOP_HOLD_PROMPT}: take hold of it, then continue -- the fingers will open, "
+        "the arm backs straight up and homes"
+    ):
+        print("[WARN] grasp_loop=peg_still_held -- it drops when this process exits", flush=True)
+        return False
+    try:
+        release_and_clear(robot, request, request_id=request_id)
+    except Exception as exc:  # noqa: BLE001 - the halt already being reported is the one that matters
+        print(f"[WARN] grasp_loop=hand_over_failed details={exc}", flush=True)
+        return False
+    return True
 
 
 def recover_from_reflex(
@@ -1321,15 +1364,21 @@ def run_grasp_loop(
                 halted, peg = "control_loop_died", "unknown"
                 break
             # Held still rather than homed: the fingers may have the peg, and a fault is the
-            # worst moment to decide that on the loop's behalf.
+            # worst moment to decide that on the loop's behalf. A held peg is held on the closed
+            # command: re-sending the measured width (~0.31) is an *open* command to this gripper
+            # (terminal_trials `_park`, 09-28), which is how a peg is let go of by a hold.
+            held_at_fault = False
             try:
                 _xyz, _rotvec, gripper_now = _observation_xyz_rotvec_gripper(robot)
-                _hold_where_it_is(robot, gripper_now)
+                held_at_fault = holds_peg(gripper_now, request)
+                _hold_where_it_is(robot, request.closedGripper if held_at_fault else gripper_now)
             except Exception:  # noqa: BLE001 - the fault being reported is the one worth reading
                 pass
             write({"kind": "halt", "trial": trial, "reason": "motion_fault", "error": f"{type(exc).__name__}: {exc}"})
             log(f"[WARN] grasp_loop=halted trial={trial} reason=motion_fault details={exc}")
             halted, peg = "motion_fault", "unknown"
+            if held_at_fault:
+                hand_over_held_peg(robot, request, wait_for_operator, request_id=request_id)
             break
         if status in ("quit", "stopped"):
             halted = status
