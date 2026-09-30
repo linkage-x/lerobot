@@ -96,6 +96,7 @@ from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_STILL_FRAMES,
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
+    HandoverSeam,
     build_dagger_frame,
     dagger_dataset_can_load_locally,
     dagger_dataset_features,
@@ -5474,6 +5475,7 @@ def run_inference(args: argparse.Namespace) -> int:
         # the *action* quaternion written to the DAgger dataset, which is a different sequence
         # of rotations and would flip at different frames.
         previous_dagger_quaternion_xyzw: np.ndarray | None = None
+        funnel_seam = HandoverSeam()
         preview_gripper_offset: float | None = None
         latest_chunk_ee_poses: list[np.ndarray] | None = None
         camera_preview_enabled = bool(args.camera_preview_window)
@@ -6079,7 +6081,11 @@ def run_inference(args: argparse.Namespace) -> int:
                 # owns where a span starts, so this call site never has to know. The funnel's
                 # command reaches here through the same smoothing, clamp and gripper latch as the
                 # operator's, so the same inversion puts it in the dataset's action space.
-                if command_source in ('expert', 'funnel'):
+                # The funnel's first steps are its handover seam, not a correction: see HandoverSeam.
+                on_seam = command_source == 'funnel' and funnel_seam.skip(
+                    clamped=command_guard['status'] != 'pass'
+                )
+                if command_source in ('expert', 'funnel') and not on_seam:
                     dagger_action, previous_dagger_quaternion_xyzw = sent_command_to_dataset_action(
                         command_to_send,
                         T_B_Ws=T_B_Ws,

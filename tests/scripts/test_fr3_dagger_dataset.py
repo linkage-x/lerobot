@@ -28,6 +28,7 @@ from tools.fr3.dagger_dataset import (
     IS_INTERVENTION_KEY,
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
+    HandoverSeam,
     build_dagger_frame,
     dagger_dataset_can_load_locally,
     dagger_dataset_has_tasks,
@@ -758,3 +759,22 @@ def _matrix_from_quaternion(quaternion_xyzw: np.ndarray) -> np.ndarray:
             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ]
     )
+
+
+# --- the funnel's handover seam ----------------------------------------------------------------
+
+
+def test_the_first_step_of_a_scripted_takeover_is_the_seam_not_a_correction():
+    seam = HandoverSeam()
+    assert [seam.skip(clamped=c) for c in (False, False, False)] == [True, False, False]
+
+
+def test_clamped_steps_straight_after_the_handover_are_still_the_seam():
+    seam = HandoverSeam()
+    assert [seam.skip(clamped=c) for c in (True, True, False, False)] == [True, True, False, False]
+
+
+def test_a_clamp_later_in_the_takeover_is_kept():
+    # Once the seam has closed, a clamped step is the expert's own motion, bounded like any other.
+    seam = HandoverSeam()
+    assert [seam.skip(clamped=c) for c in (True, False, True, False)] == [True, False, False, False]

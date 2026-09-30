@@ -369,6 +369,31 @@ class DaggerFrameBuffer:
         return abs(gripper - reference_gripper) < STILL_GRIPPER_DELTA
 
 
+class HandoverSeam:
+    """The steps at the start of a scripted takeover that are the handover, not the expert.
+
+    Arm B's funnel takes the arm at its *measured* pose, and a moving policy's last command is
+    ahead of that: 3-8 mm on 09-30 (run 112812). Against a prev_cmd delta reference the funnel's
+    first step is that lead taken back -- clamped at the step limit, with up to a degree of yaw --
+    and nothing the policy is shown says how far ahead its own command was, so as a label it is
+    noise. The first step is skipped, and every clamped one straight after it; the first step
+    that is neither closes the seam for the rest of the rollout.
+    """
+
+    def __init__(self) -> None:
+        self._steps = 0
+        self._open = True
+
+    def skip(self, *, clamped: bool) -> bool:
+        """Whether this takeover step is still the seam. Call once per step the takeover drives."""
+        if not self._open:
+            return False
+        on_seam = self._steps == 0 or clamped
+        self._steps += 1
+        self._open = on_seam
+        return on_seam
+
+
 def build_dagger_frame(
     *,
     dataset_features: dict[str, dict],
