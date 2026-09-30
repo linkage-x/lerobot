@@ -25,6 +25,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 IS_INTERVENTION_KEY = "is_intervention"
+# Written by the recorder (tools/fr3/dagger_dataset.py EXPERT_SOURCE_PATH); read here without
+# importing it, so this tool keeps needing nothing but pandas and pyarrow.
+EXPERT_SOURCE_PATH = Path("meta") / "expert_source.json"
 BOOKKEEPING_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 
 
@@ -263,6 +266,26 @@ def qc_status(root: Path) -> str:
     return str(qc.get("status") or "").lower() or "missing"
 
 
+def labels_every_action_dim(root: Path) -> bool:
+    """Whether a correction dataset's expert commanded every action dim (a scripted expert).
+
+    In the merged view `is_intervention` is what training reads to drop the gripper from the loss
+    (`fr3_train_il_policy.intervention_unsupervised_dims_for_view`): right for a SpaceMouse
+    takeover, which holds the gripper at the policy's last command, and wrong for the grasp
+    loop's funnel, whose close is the label its episodes exist for. Such a dataset's frames are
+    written with `is_intervention = 0`; where they came from stays in `episode_source_index` and
+    `fully_labelled_dagger_roots`. No record means a takeover, as every dataset before it was.
+    """
+    path = root / EXPERT_SOURCE_PATH
+    if not path.is_file():
+        return False
+    try:
+        record = load_json(path)
+    except (OSError, json.JSONDecodeError, MergeError):
+        return False
+    return bool(record.get("labelsEveryActionDim", False))
+
+
 def intervention_feature() -> dict[str, Any]:
     return {"dtype": "float32", "shape": [1], "names": [IS_INTERVENTION_KEY]}
 
@@ -358,7 +381,12 @@ def validate_policy_ready_merge(
             {
                 "name": "dagger_dataset",
                 "status": "pass",
-                "message": f"{dagger_root.name}: {int(info.get('total_episodes') or 0)} episode(s), QC PASS",
+                "message": f"{dagger_root.name}: {int(info.get('total_episodes') or 0)} episode(s), QC PASS"
+                + (
+                    ", scripted expert: every action dim labelled (is_intervention written 0)"
+                    if labels_every_action_dim(dagger_root)
+                    else ""
+                ),
             }
         )
 
@@ -389,7 +417,7 @@ def source_task_index_map(root: Path, global_task_to_index: dict[str, int]) -> d
     return mapping
 
 
-def ensure_intervention_column(df: pd.DataFrame, *, is_dagger: bool) -> None:
+def ensure_intervention_column(df: pd.DataFrame, *, is_dagger: bool, fully_labelled: bool = False) -> None:
     """Give every row an ``is_intervention`` flag, as the scalar LeRobot will ask parquet for.
 
     A shape-``[1]`` feature is read back as a ``datasets.Value``, not a length-1 ``Sequence``
@@ -404,6 +432,10 @@ def ensure_intervention_column(df: pd.DataFrame, *, is_dagger: bool) -> None:
     An existing column is flattened rather than trusted, because a source that spelled the flag
     as a length-1 list is exactly the case that has to stop being propagated here.
     """
+    if fully_labelled:
+        # Every dim of these frames is the expert's: see `labels_every_action_dim`.
+        df[IS_INTERVENTION_KEY] = np.zeros(len(df), dtype=np.float32)
+        return
     if IS_INTERVENTION_KEY in df.columns:
         df[IS_INTERVENTION_KEY] = np.asarray(
             [float(np.reshape(value, -1)[0]) for value in df[IS_INTERVENTION_KEY]],
@@ -466,6 +498,7 @@ def merge_policy_ready_datasets(
     validation = validate_policy_ready_merge(base_view, dagger_roots, base_episodes=base_episodes)
     roots = [base_view, *dagger_roots]
     roles = ["base", *["dagger" for _ in dagger_roots]]
+    fully_labelled = {root for root in dagger_roots if labels_every_action_dim(root)}
     if overwrite and output_root.exists():
         shutil.rmtree(output_root)
     if output_root.exists():
@@ -563,7 +596,9 @@ def merge_policy_ready_datasets(
                 continue
             keep = df["episode_index"].isin(episode_map).to_numpy()
             out = df[keep].reset_index(drop=True).copy()
-            ensure_intervention_column(out, is_dagger=role == "dagger")
+            ensure_intervention_column(
+                out, is_dagger=role == "dagger", fully_labelled=role == "dagger" and root in fully_labelled
+            )
             out["episode_index"] = out["episode_index"].map(episode_map).astype(df["episode_index"].dtype)
             out["index"] = np.arange(len(out), dtype=np.int64) + frame_offset + source_written_rows
             out["task_index"] = out["task_index"].map(task_map).astype(df["task_index"].dtype)
@@ -631,6 +666,7 @@ def merge_policy_ready_datasets(
                 "merge_type": "policy_ready_dagger",
                 "base_view": str(base_view),
                 "dagger_roots": [str(root) for root in dagger_roots],
+                "fully_labelled_dagger_roots": sorted(str(root) for root in fully_labelled),
                 "base_episodes": base_episode_filter,
                 "tasks": base_tasks,
                 "features": feature_without_intervention(base_features),
@@ -646,6 +682,7 @@ def merge_policy_ready_datasets(
         "source_dataset_roots": [str(root) for root in roots],
         "base_training_view_root": str(base_view),
         "dagger_dataset_roots": [str(root) for root in dagger_roots],
+        "fully_labelled_dagger_roots": [str(root) for root in dagger_roots if root in fully_labelled],
         "base_episode_filter": base_episode_filter,
         "merge_type": "policy_ready_dagger",
         "build_id": datetime.now(timezone.utc).isoformat(timespec="seconds"),

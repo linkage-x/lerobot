@@ -424,3 +424,54 @@ def test_policy_ready_merge_refuses_prompt_mismatch(tmp_path):
 
     with pytest.raises(MergeError, match="prompt set"):
         validate_policy_ready_merge(base, [dagger])
+
+
+def test_a_scripted_experts_frames_keep_every_action_dim_in_training(tmp_path):
+    """The funnel's close is its label: its frames must not be the ones training drops the gripper on.
+
+    Training drops the gripper from the loss wherever `is_intervention` is set, because a SpaceMouse
+    takeover holds it at the policy's own command. A dataset whose recorder says its expert drove
+    every dim is written with the flag clear; a takeover's keeps it.
+    """
+    base = tmp_path / "base"
+    takeover = tmp_path / "dagger_ckpt"
+    funnel = tmp_path / "funnel_ckpt"
+    out = tmp_path / "combined"
+    _write_dataset(base, episodes=1, include_intervention=False)
+    _write_dataset(takeover, episodes=1, include_intervention=True)
+    _write_dataset(funnel, episodes=1, include_intervention=True)
+    _write_qc(takeover, "pass")
+    _write_qc(funnel, "pass")
+    _write_json(funnel / "meta" / "expert_source.json", {"expert": "grasp_funnel", "labelsEveryActionDim": True})
+
+    check = validate_policy_ready_merge(base, [takeover, funnel])
+    messages = [c["message"] for c in check["checks"] if c["name"] == "dagger_dataset"]
+    assert "every action dim labelled" in messages[1] and "every action dim labelled" not in messages[0]
+
+    merge_policy_ready_datasets(base_view=base, dagger_roots=[takeover, funnel], output_root=out, repo_id="local/c")
+
+    data = pd.concat(
+        [pq.read_table(path).to_pandas() for path in sorted((out / "data").glob("chunk-*/*.parquet"))],
+        ignore_index=True,
+    )
+    flags = data.groupby("episode_index")[IS_INTERVENTION_KEY].max().tolist()
+    assert flags == [0.0, 1.0, 0.0]
+    manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fully_labelled_dagger_roots"] == [str(funnel)]
+    # Where the frames came from is still on record.
+    assert manifest["episode_source_index"][2]["source_dataset_root"] == str(funnel)
+
+
+def test_a_dataset_with_no_expert_record_is_a_takeovers(tmp_path):
+    base = tmp_path / "base"
+    dagger = tmp_path / "dagger"
+    out = tmp_path / "combined"
+    _write_dataset(base, episodes=1, include_intervention=False)
+    _write_dataset(dagger, episodes=1, include_intervention=True)
+    _write_qc(dagger, "pass")
+    (dagger / "meta" / "expert_source.json").write_text("not json", encoding="utf-8")
+
+    merge_policy_ready_datasets(base_view=base, dagger_roots=[dagger], output_root=out, repo_id="local/c")
+
+    manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fully_labelled_dagger_roots"] == []

@@ -40,7 +40,9 @@ from tools.fr3.dagger_dataset import (
     dagger_dataset_root_is_recreatable,
     dagger_dataset_unreadable_shards,
     parquet_file_is_readable,
+    read_expert_source,
     sent_command_to_dataset_action,
+    write_expert_source,
 )
 
 
@@ -864,3 +866,20 @@ def test_a_failed_write_is_reported_on_the_callers_thread_not_raised_from_the_wr
 
     assert outcome['error'] == 'OSError: disk full'
     assert any('dagger_dataset_write_failed rollout=2' in line for line in lines)
+
+
+# --- who the expert was ------------------------------------------------------------------------
+
+
+def test_the_expert_record_round_trips_and_defaults_to_a_takeover(tmp_path):
+    assert read_expert_source(tmp_path) == {'expert': 'takeover', 'labelsEveryActionDim': False}
+    write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True)
+    assert read_expert_source(tmp_path) == {'expert': 'grasp_funnel', 'labelsEveryActionDim': True}
+
+
+def test_a_root_holding_only_metadata_and_the_expert_record_can_be_recreated(tmp_path):
+    # A session killed before its first episode leaves info, tasks and this record: no payload.
+    (tmp_path / 'meta').mkdir()
+    (tmp_path / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True)
+    assert dagger_dataset_root_is_recreatable(tmp_path)

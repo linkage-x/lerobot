@@ -106,6 +106,7 @@ from tools.fr3.dagger_dataset import (
     dagger_dataset_unreadable_shards,
     image_source_keys,
     sent_command_to_dataset_action,
+    write_expert_source,
 )
 from tools.fr3.interactive_control import InteractiveRolloutKeyboard
 from tools.fr3.scene_reset import (
@@ -4308,6 +4309,9 @@ def build_dagger_writer(
                 )
             shutil.rmtree(root)
         dataset = create_dataset()
+    if flag == '--grasp-loop-dataset-root':
+        # The funnel commands every axis, the close included: see EXPERT_SOURCE_PATH.
+        write_expert_source(root, expert='grasp_funnel', labels_every_action_dim=True)
     return dataset, DaggerEpisodeWriter(dataset, min_span_frames=int(args.dagger_min_span_frames))
 
 

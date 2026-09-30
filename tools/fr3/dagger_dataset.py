@@ -45,6 +45,7 @@ callables by the runtime, which already holds the real ones.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import json
 import os
 from pathlib import Path
 import threading
@@ -95,7 +96,14 @@ DAGGER_INFO_PATH = Path('meta/info.json')
 DAGGER_TASK_PATHS = (Path('meta/tasks.parquet'), Path('meta/tasks.jsonl'))
 DAGGER_EPISODES_DIR = Path('meta/episodes')
 DAGGER_DATA_DIR = Path('data')
-DAGGER_RECREATABLE_FILES = {DAGGER_INFO_PATH, *DAGGER_TASK_PATHS}
+# Who the expert was, beside the frames. A SpaceMouse takeover labels only the axes the operator
+# drove -- the gripper is held at the policy's last command, so training drops it from the loss on
+# `is_intervention` frames (`fr3_train_il_policy.intervention_unsupervised_dims_for_view`). A
+# scripted expert such as the grasp loop's funnel commands every axis, the close included, and
+# that close is the label its data exists for. The merge reads this file to tell the two apart;
+# a dataset without it is a takeover's.
+EXPERT_SOURCE_PATH = Path('meta/expert_source.json')
+DAGGER_RECREATABLE_FILES = {DAGGER_INFO_PATH, *DAGGER_TASK_PATHS, EXPERT_SOURCE_PATH}
 
 # The four bytes a finished parquet file ends with. A file whose footer was never written --
 # the shape a killed or still-running session leaves -- ends with frame data instead, and no
@@ -205,6 +213,31 @@ def dagger_dataset_root_is_recreatable(root: Path) -> bool:
         return False
     files = {path.relative_to(root) for path in root.rglob('*') if path.is_file()}
     return files.issubset(DAGGER_RECREATABLE_FILES)
+
+
+def write_expert_source(root: Path, *, expert: str, labels_every_action_dim: bool) -> None:
+    """Record, in the dataset, who drove its frames and whether they label every action dim."""
+    path = Path(root) / EXPERT_SOURCE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({'expert': str(expert), 'labelsEveryActionDim': bool(labels_every_action_dim)}, indent=2) + '\n',
+        encoding='utf-8',
+    )
+
+
+def read_expert_source(root: Path) -> dict[str, Any]:
+    """The dataset's expert record; a takeover's (gripper unlabelled) when it has none."""
+    path = Path(root) / EXPERT_SOURCE_PATH
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict):
+        return {'expert': 'takeover', 'labelsEveryActionDim': False}
+    return {
+        'expert': str(record.get('expert') or 'takeover'),
+        'labelsEveryActionDim': bool(record.get('labelsEveryActionDim', False)),
+    }
 
 
 def dagger_dataset_features(base_features: dict[str, dict]) -> dict[str, dict]:
