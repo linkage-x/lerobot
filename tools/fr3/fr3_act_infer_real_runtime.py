@@ -95,6 +95,7 @@ from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
     DEFAULT_MAX_STILL_FRAMES,
     DaggerEpisodeWriter,
+    BackgroundEpisodeWriter,
     DaggerFrameBuffer,
     HandoverSeam,
     build_dagger_frame,
@@ -6304,6 +6305,7 @@ def run_inference(args: argparse.Namespace) -> int:
     # is undefined if the statement above it raises, and the NameError that follows in the
     # finally would replace the error worth reading.
     dagger_encoding = ExitStack()
+    grasp_writer: BackgroundEpisodeWriter | None = None
     try:
         # The arm is connected here rather than several hundred lines earlier, because this try
         # is what owns `robot.disconnect()`. Connected outside it, any exception in between --
@@ -6445,11 +6447,27 @@ def run_inference(args: argparse.Namespace) -> int:
                 'void_trial=stdin `void` immediate_halt=SIGINT'
             )
 
-            # The funnel steps of the trial in progress, held until the loop has graded it.
-            grasp_segment: dict[str, DaggerFrameBuffer | None] = {'buffer': None}
+            # The funnel steps of the trial in progress, held until the loop has graded it, and
+            # the last write's outcome, carried into the next row.
+            grasp_segment: dict[str, Any] = {'buffer': None, 'lastWrite': None}
+            if dagger_writer is not None:
+                grasp_writer = BackgroundEpisodeWriter(dagger_writer)
+
+            def finish_grasp_write() -> None:
+                if grasp_writer is None or not grasp_writer.busy:
+                    return
+                outcome = grasp_writer.wait()
+                grasp_segment['lastWrite'] = outcome
+                print(
+                    f"[INFO] grasp_loop_dataset=written trial={outcome.get('rollout')} "
+                    f"episodes={outcome.get('episodes')} write_s={outcome.get('writeS')} wait_s={outcome.get('waitS')}"
+                )
 
             def run_grasp_trial(trial: int, handover: GraspHandover) -> str:
                 move_to_robot_init_state_if_requested(robot, robot_init_state)
+                # The last trial's write ran beside this one's staging; it finishes before the
+                # policy drives, which is the loop contention starves.
+                finish_grasp_write()
                 trace = RolloutGeometryTrace(trial + 1, trace_dir=rollout_trace_dir)
                 grasp_segment['buffer'] = (
                     DaggerFrameBuffer(
@@ -6467,26 +6485,25 @@ def run_inference(args: argparse.Namespace) -> int:
 
             def keep_grasp_segment(trial: int, row: dict[str, Any]) -> dict[str, Any] | None:
                 # Only a held grasp is a demonstration of grasping: the funnel's steps into an
-                # empty close are steps a policy should not learn. Written here, after the loop
-                # has graded the lift, with the arm parked -- never inside the control loop.
+                # empty close are steps a policy should not learn. Handed to the background
+                # writer here, after the loop has graded the lift; it runs beside the next
+                # staging (see run_grasp_trial), never beside the policy.
                 buffer, grasp_segment['buffer'] = grasp_segment['buffer'], None
-                if dagger_writer is None or buffer is None:
+                if grasp_writer is None or buffer is None:
                     return None
+                finish_grasp_write()
+                previous, grasp_segment['lastWrite'] = grasp_segment['lastWrite'], None
+                kept: dict[str, Any] = {} if previous is None else {'previousWrite': previous}
                 if row.get('verdict') != 'held':
                     print(
                         f"[INFO] grasp_loop_dataset=discarded trial={trial} verdict={row.get('verdict')} "
                         f'frames={buffer.frame_count}'
                     )
-                    return {'kept': False, 'frames': buffer.frame_count}
+                    return {'kept': False, 'frames': buffer.frame_count, **kept}
+                # Nothing is in flight here, so the count is the index this trial's episode gets.
                 first_episode = int(dagger_dataset_handle.meta.total_episodes)
-                started = time.perf_counter()
-                written = dagger_writer.write(buffer, rollout_index=trial)
-                return {
-                    'kept': True,
-                    'firstEpisode': first_episode,
-                    **written,
-                    'writeS': round(time.perf_counter() - started, 1),
-                }
+                grasp_writer.submit(buffer, rollout_index=trial)
+                return {'kept': True, 'firstEpisode': first_episode, 'frames': buffer.frame_count, **kept}
 
             run_grasp_loop(
                 robot,
@@ -6501,12 +6518,16 @@ def run_inference(args: argparse.Namespace) -> int:
                 notify=command_notifier(grasp_loop_notify_command(args.grasp_loop_notify_cmd)),
                 keep_policy_segment=keep_grasp_segment,
             )
+            finish_grasp_write()
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)
             run_policy_rollout()
     except KeyboardInterrupt:
         print('[INFO] KeyboardInterrupt received, stopping inference loop.')
     finally:
+        # A write still out must land before the dataset is finalized under it.
+        if grasp_writer is not None:
+            grasp_writer.wait()
         dagger_encoding.close()
         if interactive_keyboard is not None:
             interactive_keyboard.close()

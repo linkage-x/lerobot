@@ -45,7 +45,10 @@ callables by the runtime, which already holds the real ones.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import os
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -497,6 +500,79 @@ class DaggerEpisodeWriter:
                 'these corrections matter.'
             )
         return summary
+
+
+# The niceness the background write runs at (absolute; the control loop runs at 0). A thread's
+# nice value is its own on Linux and the encoder threads it starts inherit it, so this reaches the
+# video encode too.
+BACKGROUND_WRITE_NICE = 10
+
+
+class BackgroundEpisodeWriter:
+    """`DaggerEpisodeWriter.write`, on a thread, one at a time, for the grasp loop.
+
+    A write encodes video and took 7.5-9.8 s per trial on 09-30 (run 112812) -- a quarter of the
+    trial when it ran in line. The grasp loop's next step is the scripted staging, which does not
+    need the policy, so the write runs beside it instead; `wait` is called before the policy
+    drives again, because the policy's control loop is what CPU contention starves (09-24), and a
+    scripted step only paces.
+
+    Nothing else touches the dataset while a write is out: the next trial's frames go into a
+    buffer of their own, and `submit` waits for the previous write before starting another.
+    """
+
+    def __init__(
+        self,
+        writer: DaggerEpisodeWriter,
+        *,
+        nice: int = BACKGROUND_WRITE_NICE,
+        emit: Callable[[str], None] = print,
+    ):
+        self._writer = writer
+        self._nice = int(nice)
+        self._emit = emit
+        self._thread: threading.Thread | None = None
+        self._outcome: dict[str, Any] = {}
+
+    @property
+    def busy(self) -> bool:
+        return self._thread is not None
+
+    def submit(self, buffer: DaggerFrameBuffer, *, rollout_index: int) -> dict[str, Any] | None:
+        """Start writing `buffer`; returns the previous write's outcome if one had to be waited for."""
+        previous = self.wait()
+        outcome: dict[str, Any] = {'rollout': int(rollout_index)}
+        self._outcome = outcome
+
+        def run() -> None:
+            started = time.perf_counter()
+            try:
+                if self._nice:
+                    os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), self._nice)
+            except (AttributeError, OSError):
+                pass
+            try:
+                outcome.update(self._writer.write(buffer, rollout_index=rollout_index))
+            except Exception as exc:  # noqa: BLE001 - reported by `wait`, on the main thread
+                outcome['error'] = f'{type(exc).__name__}: {exc}'
+            outcome['writeS'] = round(time.perf_counter() - started, 1)
+
+        self._thread = threading.Thread(target=run, name=f'dagger-write-{rollout_index}', daemon=False)
+        self._thread.start()
+        return previous
+
+    def wait(self) -> dict[str, Any] | None:
+        """Block until the write in flight is on disk; its outcome, with how long this waited."""
+        if self._thread is None:
+            return None
+        started = time.perf_counter()
+        self._thread.join()
+        self._thread = None
+        outcome = dict(self._outcome)
+        outcome['waitS'] = round(time.perf_counter() - started, 1)
+        if 'error' in outcome:
+            self._emit(f"[WARN] dagger_dataset_write_failed rollout={outcome['rollout']} details={outcome['error']}")
+        return outcome
 
 
 def sent_command_to_dataset_action(

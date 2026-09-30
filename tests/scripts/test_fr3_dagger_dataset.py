@@ -15,7 +15,9 @@ looks like a policy that never quite reaches.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import threading
 
 import numpy as np
 import pyarrow as pa
@@ -26,6 +28,7 @@ from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
     DEFAULT_MAX_STILL_FRAMES,
     IS_INTERVENTION_KEY,
+    BackgroundEpisodeWriter,
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
     HandoverSeam,
@@ -778,3 +781,86 @@ def test_a_clamp_later_in_the_takeover_is_kept():
     # Once the seam has closed, a clamped step is the expert's own motion, bounded like any other.
     seam = HandoverSeam()
     assert [seam.skip(clamped=c) for c in (True, False, True, False)] == [True, False, False, False]
+
+
+# --- the grasp loop's background write ---------------------------------------------------------
+
+
+class SlowDataset(FakeDataset):
+    """Saves only when released, and notes the niceness of the thread that saved."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.nice_seen: list[int] = []
+
+    def save_episode(self, **kwargs) -> None:
+        self.nice_seen.append(os.getpriority(os.PRIO_PROCESS, threading.get_native_id()))
+        assert self.release.wait(5.0)
+        super().save_episode(**kwargs)
+
+
+def _span(frames=3):
+    buffer = DaggerFrameBuffer()
+    for _ in range(frames):
+        buffer.append({}, is_expert=True)
+    return buffer
+
+
+def test_a_submitted_write_runs_while_the_caller_goes_on_and_lands_on_wait():
+    dataset = SlowDataset()
+    writer = BackgroundEpisodeWriter(DaggerEpisodeWriter(dataset, emit=lambda _: None), emit=lambda _: None)
+
+    assert writer.submit(_span(), rollout_index=4) is None
+    # The caller is back before the episode is saved: that is the staging running beside it.
+    assert writer.busy and dataset.saved_episodes == []
+    dataset.release.set()
+    outcome = writer.wait()
+
+    assert len(dataset.saved_episodes) == 1
+    assert outcome['rollout'] == 4 and outcome['episodes'] == 1 and outcome['frames'] == 3
+    assert outcome['writeS'] >= 0.0 and outcome['waitS'] >= 0.0
+    assert not writer.busy and writer.wait() is None
+
+
+def test_writes_never_overlap_a_second_waits_for_the_first():
+    dataset = SlowDataset()
+    dataset.release.set()
+    writer = BackgroundEpisodeWriter(DaggerEpisodeWriter(dataset, emit=lambda _: None), emit=lambda _: None)
+
+    writer.submit(_span(2), rollout_index=0)
+    previous = writer.submit(_span(3), rollout_index=1)
+    writer.wait()
+
+    assert previous['rollout'] == 0 and previous['frames'] == 2
+    assert [len(episode) for episode in dataset.saved_episodes] == [2, 3]
+
+
+def test_the_write_runs_below_the_control_loops_priority():
+    dataset = SlowDataset()
+    dataset.release.set()
+    writer = BackgroundEpisodeWriter(DaggerEpisodeWriter(dataset, emit=lambda _: None), nice=5, emit=lambda _: None)
+    own = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+
+    writer.submit(_span(), rollout_index=0)
+    writer.wait()
+
+    # Absolute, not an increment; a thread already nicer than that cannot be raised back.
+    assert dataset.nice_seen == [max(own, 5)]
+    # The caller's own thread is left where it was.
+    assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) == own
+
+
+def test_a_failed_write_is_reported_on_the_callers_thread_not_raised_from_the_writers():
+    class BrokenDataset(FakeDataset):
+        def save_episode(self, **kwargs):
+            raise OSError('disk full')
+
+    lines: list[str] = []
+    writer = BackgroundEpisodeWriter(DaggerEpisodeWriter(BrokenDataset(), emit=lambda _: None), emit=lines.append)
+
+    writer.submit(_span(), rollout_index=2)
+    outcome = writer.wait()
+
+    assert outcome['error'] == 'OSError: disk full'
+    assert any('dagger_dataset_write_failed rollout=2' in line for line in lines)
