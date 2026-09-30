@@ -1164,3 +1164,21 @@ def test_resume_allows_continuing_the_same_view_past_its_saved_step(tmp_path):
     fr3_train_il_policy.assert_resume_trains_the_named_view(
         config_path, view_root=view, repo_id="local/one", steps=40000, steps_supplied=True
     )
+
+
+def test_a_merged_views_own_not_for_training_marks_become_its_training_episodes(tmp_path):
+    root = tmp_path / "view"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text(json.dumps({"total_episodes": 6}), encoding="utf-8")
+    assert fr3_train_il_policy.view_training_episodes(root) is None
+    store = {"annotations": {
+        "1": {"episode": 1, "includeInTraining": False},
+        "3": {"episode": 3, "includeInTraining": False},
+        "4": {"episode": 4, "includeInTraining": True},
+    }}
+    (root / "meta" / "gui_annotations.json").write_text(json.dumps(store), encoding="utf-8")
+    assert fr3_train_il_policy.view_training_episodes(root) == [0, 2, 4, 5]
+    store["annotations"]["9"] = {"episode": 9, "includeInTraining": False}
+    (root / "meta" / "gui_annotations.json").write_text(json.dumps(store), encoding="utf-8")
+    with pytest.raises(ValueError, match="has 6"):
+        fr3_train_il_policy.view_training_episodes(root)

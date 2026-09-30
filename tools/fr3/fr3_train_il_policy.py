@@ -791,6 +791,24 @@ def annotated_excluded_episodes(dataset_root: Path) -> set[int]:
     return excluded
 
 
+def view_training_episodes(view_root: Path) -> list[int] | None:
+    """The view's episodes minus those marked not for training *on the view itself*; None if none.
+
+    A view built here from recordings has already dropped its sources' marks, and carries none of
+    its own. A merged policy-ready view (fr3_merge_policy_ready_datasets) is built by another
+    tool that reads no marks, so the review of what it holds -- corrections judged unusable --
+    lives in its own annotation store and is applied here, as `dataset.episodes`.
+    """
+    excluded = annotated_excluded_episodes(view_root)
+    if not excluded:
+        return None
+    total = int(load_json(view_root / "meta" / "info.json").get("total_episodes") or 0)
+    unknown = sorted(episode for episode in excluded if not 0 <= episode < total)
+    if unknown:
+        raise ValueError(f"{view_root.name} marks episode(s) {unknown} not for training, but it has {total}.")
+    return [episode for episode in range(total) if episode not in excluded]
+
+
 def resolve_excluded_episodes(
     src_roots: list[Path],
     *,
@@ -1725,6 +1743,10 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
         "use_imagenet_stats": args.use_imagenet_stats,
         "video_backend": args.video_backend,
     }
+    kept = view_training_episodes(view_root) if args.respect_annotations else None
+    if kept is not None:
+        dataset_cfg["episodes"] = kept
+        print(f"[prepare] training on {len(kept)} episode(s) of {view_root.name}; the rest are marked not for training")
     if image_resize_shape is not None:
         dataset_cfg["image_transforms"] = {
             "enable": True,
