@@ -1647,6 +1647,8 @@ export type RolloutRuntimeOptions = {
   graspLoopInsertPose?: string;
   /** Record arm B's funnel steps (held grasps only) into the checkpoint's funnel_ dataset. */
   graspLoopRecord?: boolean;
+  /** Arm B: how far above the peg the funnel takes over, "h" or "low,high" mm (drawn per trial). */
+  graspLoopFunnelTakeoverDzMm?: string;
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.

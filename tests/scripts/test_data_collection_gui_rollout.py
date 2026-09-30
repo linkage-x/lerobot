@@ -4222,3 +4222,14 @@ def test_the_funnel_is_not_recorded_unless_the_page_asks(tmp_path: Path):
         funnel_dataset_fallback=tmp_path / "f",
     )
     assert "FR3_GRASP_LOOP_DATASET_ROOT" not in env
+
+
+def test_the_funnel_takeover_height_is_passed_as_one_value_or_a_range():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    assert sanitize({"graspLoopFunnelTakeoverDzMm": "60, 300"}) == {"FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM": "60,300"}
+    assert sanitize({"graspLoopFunnelTakeoverDzMm": "60"}) == {"FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM": "60"}
+    assert sanitize({"graspLoopFunnelTakeoverDzMm": ""}) == {}
+    for bad in ("300,60", "a,b", "60,120,300"):
+        with pytest.raises(rollout_backend.RolloutError, match="graspLoopFunnelTakeoverDzMm"):
+            sanitize({"graspLoopFunnelTakeoverDzMm": bad})
+    assert "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS

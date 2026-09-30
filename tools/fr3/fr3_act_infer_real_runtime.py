@@ -118,6 +118,7 @@ from tools.fr3.scene_reset import (
     pose_probe_request_from_payload,
     scene_reset_request_from_payload,
 )
+from tools.fr3.grasp_funnel import FUNNEL_ALIGN_DZ_MM
 from tools.fr3.grasp_loop import (
     GRASP_LOOP_ARMS,
     GRASP_LOOP_BLOCKED_MARGIN,
@@ -534,6 +535,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             'Command run with a message as its last argument whenever the grasp loop needs a person '
             'or ends, e.g. "notify-send FR3". Default: $FR3_NOTIFY_CMD, else the first line of '
             '~/.config/fr3/notify_cmd, else nobody.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-funnel-takeover-dz-mm',
+        default=str(int(FUNNEL_ALIGN_DZ_MM)),
+        help=(
+            "Arm B: how far above the peg (mm) the funnel takes the arm from the policy, as 'h' or "
+            "'low,high' to draw it per trial. Default the fixed 60. A range starts the recorded "
+            'corrections from every stage of the approach, where the policy does its aiming.'
         ),
     )
     parser.add_argument(
@@ -4214,6 +4224,15 @@ def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> 
     )
 
 
+def parse_funnel_takeover_dz_mm(value: str) -> tuple[float, float]:
+    """'h' or 'low,high' in mm -> (low, high); the grasp loop validates the range."""
+    parts = [part.strip() for part in str(value).split(',') if part.strip()]
+    if not 1 <= len(parts) <= 2:
+        raise ValueError(f"funnel takeover height {value!r} is neither 'h' nor 'low,high' (mm)")
+    numbers = [float(part) for part in parts]
+    return (numbers[0], numbers[-1])
+
+
 def correction_dataset_target(args: argparse.Namespace) -> tuple[Path, str, str] | None:
     """Where corrections go -- (root, repo_id, the flag that named it) -- or None for nowhere.
 
@@ -5073,6 +5092,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 ),
                 insertFollowSeat=bool(args.grasp_loop_insert_follow_seat),
                 insertViaHome=bool(args.grasp_loop_insert_via_home),
+                funnelAlignDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_takeover_dz_mm),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -5097,6 +5117,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 if grasp_loop_request.insertServo is not None
                 else 'insert=off '
             )
+            + 'funnel_takeover_dz_mm=%g..%g ' % grasp_loop_request.funnelAlignDzMm
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
@@ -6475,7 +6496,12 @@ def run_inference(args: argparse.Namespace) -> int:
                 trace = RolloutGeometryTrace(trial + 1, trace_dir=rollout_trace_dir)
                 grasp_segment['buffer'] = (
                     DaggerFrameBuffer(
-                        max_frames=int(args.dagger_max_buffered_frames),
+                        # A funnel segment is at most its step budget plus the close's settle:
+                        # never truncate one for a cap sized to a SpaceMouse correction.
+                        max_frames=max(
+                            int(args.dagger_max_buffered_frames),
+                            grasp_loop_request.funnelMaxSteps + grasp_loop_request.closeSettleSteps + 1,
+                        ),
                         max_still_frames=int(args.dagger_max_still_frames),
                     )
                     if dagger_writer is not None

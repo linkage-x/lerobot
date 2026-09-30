@@ -1746,3 +1746,47 @@ def test_without_a_recorder_the_row_has_no_dataset_field(tmp_path):
     out = tmp_path / "g.jsonl"
     run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=out)
     assert "dataset" not in _trials(out)[0]
+
+
+def test_the_takeover_height_is_drawn_per_trial_within_the_range_and_a_resume_agrees():
+    request = _request(arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4)
+    heights = [grasp_loop.funnel_align_dz_mm(request, t) for t in range(40)]
+    assert all(60.0 <= h <= 300.0 for h in heights) and max(heights) - min(heights) > 100.0
+    assert heights == [grasp_loop.funnel_align_dz_mm(request, t) for t in range(40)]
+    # The fixed default is the v14 (3) takeover, and drawing it leaves the target stream alone.
+    assert grasp_loop.funnel_align_dz_mm(_request(arms="B"), 7) == 60.0
+
+
+def test_a_takeover_range_outside_where_the_policy_drives_is_refused():
+    for bad in ((20.0, 60.0), (60.0, 400.0), (200.0, 100.0)):
+        with pytest.raises(scene_reset.SceneResetError, match="funnelAlignDzMm"):
+            grasp_loop.validate_grasp_loop_request(_request(funnelAlignDzMm=bad))
+
+
+def test_the_policys_aim_is_read_at_each_height_only_while_the_policy_drives():
+    peg = (0.40, -0.15, 0.058)
+    handover = GraspHandover(pegXyz=peg)
+    handover.funnel = grasp_loop.GraspFunnel(grasp_loop.FunnelConfig(pegXyz=peg, alignDzMm=120.0))
+    rot = (3.14, 0.0, 0.0)
+    for step, z in enumerate((0.40, 0.25, 0.20, 0.17, 0.15, 0.10)):
+        xyz = (0.43, -0.12 + 0.001 * step, z)
+        handover.observe(step, xyz, 1.0)
+        command = {"ee.x": xyz[0], "ee.y": xyz[1], "ee.z": xyz[2] - 0.01, "ee.wx": rot[0], "ee.wy": rot[1], "ee.wz": rot[2], "gripper.pos": 1.0}
+        handover.funnel.step(step, xyz, rot, command)
+    # 150 mm was crossed by the policy (z 0.20 -> 142 mm above); the funnel took over at 120 mm,
+    # so 100 and 60 were never the policy's.
+    assert set(handover.aimXy) == {"150"}
+    assert handover.aimXy["150"] == pytest.approx((0.43, -0.12 + 0.002))
+
+
+def test_the_summary_reads_the_aims_gain_on_the_peg():
+    rows = []
+    for k in range(8):
+        peg_y = -0.30 + 0.04 * k
+        rows.append({
+            "verdict": "held", "pegXyz": [0.40, peg_y, 0.058],
+            "aimXyAboveMm": {"60": [0.40 - 0.018, 0.66 * peg_y - 0.044]},
+        })
+    loc = summarize_grasp_loop(rows)["localization"]["60"]
+    assert loc["n"] == 8 and loc["gainY"] == pytest.approx(0.66, abs=0.01)
+    assert loc["errorMmP50"] > 0.0

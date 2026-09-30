@@ -28,12 +28,20 @@ brought it near the peg, and puts the fingers where P0 measured the grasp to wor
              `alignZ` and outside the capture radius, so nothing moves sideways at peg height).
              Ends when the setpoint has arrived, the measured XY error is inside `captureXyMm`,
              and the arm has stopped.
-    DESCEND  straight down to `pegXyz.z + closeDzMm`. Back to ALIGN if the XY error ever leaves
-             the capture radius. Ends when the setpoint has arrived and the arm has stopped, not
-             when the measured z reaches the target: this arm stops 1.3-2 mm short (P0).
+    DESCEND  straight down to `pegXyz.z + closeDzMm`: at `fastDescendSpeedMS` while the setpoint
+             is more than `slowBelowDzMm` above the peg, then at `descendSpeedMS`. Back to ALIGN
+             if the XY error ever leaves the capture radius. Ends when the setpoint has arrived
+             and the arm has stopped, not when the measured z reaches the target: this arm stops
+             1.3-2 mm short (P0).
     CLOSE    the fingers close where the arm stands. `GraspHandover` sees the closed command and
              takes the arm off the policy after its settle steps; the lift that grades the grasp
              is the grasp loop's, the same one arm A is graded by.
+
+Where the funnel takes over is `alignDzMm` above the peg. At the v14 (3) 60 mm the policy has
+already done its aiming: on 09-30 (344 B trials) it arrived there a median 41 mm off the peg,
+with its y aim only 0.66 of the peg's (regression to the training mean), and 82% of its lateral
+travel had happened above 150 mm. The grasp loop can therefore draw the height per trial, so the
+recorded corrections start from every stage of the approach, not only the last 6 cm.
 
 Thresholds are v14 (3): capture 8 mm (the 12 mm grid measured at ~100%, with 1.5x margin), close
 at dz = -6 (the demonstrations' 51.4 mm), settle below 2 mm/s. The peg position is the reset's
@@ -76,6 +84,11 @@ FUNNEL_ALIGN_SPEED_M_S = 0.05
 # at alignZ - 2.4 mm, and the funnel held that pose for its whole 360-step budget.
 FUNNEL_ALIGN_Z_SLACK_M = 0.006
 FUNNEL_DESCEND_SPEED_M_S = 0.02
+# Down to `FUNNEL_SLOW_BELOW_DZ_MM` above the peg, from a takeover higher than that: the align
+# speed, 1.7 mm a step at 30 Hz against the demonstrations' median 1.6. Below it the terminal
+# 0.02 m/s as ever, so a 60 mm takeover descends exactly as it always has.
+FUNNEL_FAST_DESCEND_SPEED_M_S = 0.05
+FUNNEL_SLOW_BELOW_DZ_MM = 60.0
 # Steps the settle test must hold, so one quiet frame between two moves is not a stop.
 FUNNEL_SETTLE_STEPS = 5
 
@@ -91,6 +104,8 @@ class FunnelConfig:
     settleSteps: int = FUNNEL_SETTLE_STEPS
     alignSpeedMS: float = FUNNEL_ALIGN_SPEED_M_S
     descendSpeedMS: float = FUNNEL_DESCEND_SPEED_M_S
+    fastDescendSpeedMS: float = FUNNEL_FAST_DESCEND_SPEED_M_S
+    slowBelowDzMm: float = FUNNEL_SLOW_BELOW_DZ_MM
     closedBelow: float = 0.5
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -99,6 +114,10 @@ class FunnelConfig:
     @property
     def alignZ(self) -> float:
         return self.pegXyz[2] + self.alignDzMm / 1000.0
+
+    @property
+    def slowBelowZ(self) -> float:
+        return self.pegXyz[2] + self.slowBelowDzMm / 1000.0
 
     @property
     def closeXyz(self) -> tuple[float, float, float]:
@@ -238,9 +257,8 @@ class GraspFunnel:
                     self.realigns += 1
                     self._enter(ALIGN)
                 else:
-                    self.setpoint, arrived = _walk(
-                        self.setpoint, cfg.closeXyz, cfg.descendSpeedMS * cfg.controlPeriodS
-                    )
+                    speed = cfg.fastDescendSpeedMS if self.setpoint[2] > cfg.slowBelowZ + 1e-9 else cfg.descendSpeedMS
+                    self.setpoint, arrived = _walk(self.setpoint, cfg.closeXyz, speed * cfg.controlPeriodS)
                     if arrived and self._settled(ee_xyz):
                         transition = "settled_at_close_height"
                         self.closeStep = step_idx
@@ -313,5 +331,6 @@ class GraspFunnel:
             "realigns": self.realigns,
             "maxResidualMm": round(self.maxResidualMm, 1),
             "funnelRotvec": None if self.rotvec is None else [round(v, 5) for v in self.rotvec],
+            "funnelAlignDzMm": round(cfg.alignDzMm, 1),
             "pegSource": cfg.pegSource,
         }

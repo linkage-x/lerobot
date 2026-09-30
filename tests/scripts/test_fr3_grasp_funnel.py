@@ -258,3 +258,34 @@ def test_a_single_arm_run_still_summarises_under_by_arm():
     rows = [{"verdict": "held"}, {"verdict": "empty"}]
     summary = summarize_grasp_loop(rows)
     assert summary["held"] == 1 and summary["byArm"]["A"]["graded"] == 2
+
+
+def test_a_high_takeover_descends_fast_to_60_mm_then_slow_and_still_closes_on_the_peg():
+    cfg = FunnelConfig(pegXyz=PEG, alignDzMm=250.0)
+    funnel = GraspFunnel(cfg)
+    executed, final = _simulate(funnel, (PEG[0] + 0.05, PEG[1] - 0.04, PEG[2]), start=(0.40, -0.12, 0.40), lag=0.5)
+    assert funnel.state == CLOSE and funnel.entryReason == "reached_align_z"
+    assert funnel.entryXyz[2] <= cfg.alignZ + 1e-9
+    assert math.hypot(final[0] - PEG[0], final[1] - PEG[1]) * 1000.0 <= cfg.captureXyMm
+    descend = [s for s in funnel.steps if s["funnel_state"] == DESCEND]
+    steps = [
+        (a["executed_action"][2], a["executed_action"][2] - b["executed_action"][2])
+        for a, b in zip(descend, descend[1:])
+    ]
+    fast = cfg.fastDescendSpeedMS * cfg.controlPeriodS
+    slow = cfg.descendSpeedMS * cfg.controlPeriodS
+    above = [dz for z, dz in steps if z > cfg.slowBelowZ + fast]
+    below = [dz for z, dz in steps if z < cfg.slowBelowZ and dz > 1e-9]
+    # The step log rounds to 0.01 mm, hence the tolerance.
+    assert above and all(dz == pytest.approx(fast, abs=2e-5) for dz in above)
+    assert below and all(dz <= slow + 2e-5 for dz in below)
+    assert funnel.trial_record()["funnelAlignDzMm"] == 250.0
+
+
+def test_a_60_mm_takeover_descends_at_the_terminal_speed_throughout():
+    cfg = FunnelConfig(pegXyz=PEG)
+    funnel = GraspFunnel(cfg)
+    _simulate(funnel, (PEG[0] + 0.02, PEG[1], PEG[2]), start=(0.40, -0.12, 0.20))
+    descend = [s["executed_action"][2] for s in funnel.steps if s["funnel_state"] == DESCEND]
+    drops = [a - b for a, b in zip(descend, descend[1:]) if a - b > 1e-9]
+    assert drops and max(drops) <= cfg.descendSpeedMS * cfg.controlPeriodS + 2e-5

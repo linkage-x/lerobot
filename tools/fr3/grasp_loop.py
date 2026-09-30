@@ -89,7 +89,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from lerobot.utils.rotation import Rotation
-from tools.fr3.grasp_funnel import FUNNEL_CLOSE_DZ_MM, FunnelConfig, GraspFunnel
+from tools.fr3.grasp_funnel import FUNNEL_ALIGN_DZ_MM, FUNNEL_CLOSE_DZ_MM, FunnelConfig, GraspFunnel
 from tools.fr3.scene_reset import (
     SCENE_RESET_LIFT_M,
     SceneResetError,
@@ -239,8 +239,16 @@ GRASP_LOOP_LOG_STROKE_RADIUS_M = 0.010
 # session and two arms run one after the other would each carry a different stretch of it.
 GRASP_LOOP_ARMS = ("A", "B", "AB")
 # Steps the funnel gets once it has the arm: align, descend at 0.02 m/s from +60 to -6 mm, settle,
-# close. About 6 s when nothing goes wrong; twice that is a funnel that is stuck.
-GRASP_LOOP_FUNNEL_MAX_STEPS = 360
+# close. About 6 s when nothing goes wrong from a 60 mm takeover. From 300 mm it is up to ~190 mm
+# across and 240 mm down at 0.05 m/s first (09-30 approach traces), ~13 s; 20 s is a stuck funnel.
+GRASP_LOOP_FUNNEL_MAX_STEPS = 600
+# Where the funnel may take over, in mm above the peg (`funnelAlignDzMm`): its v14 (3) 60 mm up to
+# a little below where the policy starts (~340 mm), so the policy always drives the first stretch
+# and every recorded correction starts from a state the policy itself reached.
+GRASP_LOOP_FUNNEL_ALIGN_DZ_RANGE_MM = (40.0, 320.0)
+# Heights above the peg at which the policy's aim is read (`aimXyAboveMm`): where it is still
+# travelling, where it has mostly arrived, and the funnel's v14 (3) takeover.
+GRASP_LOOP_AIM_HEIGHTS_MM = (150, 100, 60)
 # How far the hole an end-to-end run inserts into may sit from the fixture pick, in xy. A peg that
 # went in is taken out again by the next trial's ordinary staging, from `pickXyz`: the fixture *is*
 # the hole on this rig (GRASP_LOOP_PICK_XYZ is step 3's pick, the hole's centre). Further than
@@ -297,6 +305,9 @@ class GraspLoopRequest:
     attended: bool = False
     arms: str = "A"
     funnelMaxSteps: int = GRASP_LOOP_FUNNEL_MAX_STEPS
+    # Arm B: the funnel takes over this far above the peg, drawn per trial from [low, high]
+    # (`funnel_align_dz_mm`). Equal ends, the default, is the fixed v14 (3) takeover.
+    funnelAlignDzMm: tuple[float, float] = (FUNNEL_ALIGN_DZ_MM, FUNNEL_ALIGN_DZ_MM)
     seed: int = 0
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -338,6 +349,16 @@ class GraspLoopRequest:
         )
 
 
+def funnel_align_dz_mm(request: GraspLoopRequest, trial: int) -> float:
+    """This trial's takeover height. Drawn from its own stream, keyed by seed and trial, so the
+    staging targets and arms are the draws they always were, and a resumed run agrees."""
+
+    low, high = (float(v) for v in request.funnelAlignDzMm)
+    if high <= low:
+        return low
+    return random.Random(f"{request.seed}:{trial}:funnel_align_dz").uniform(low, high)
+
+
 def validate_grasp_loop_request(
     request: GraspLoopRequest,
     *,
@@ -358,6 +379,13 @@ def validate_grasp_loop_request(
         raise SceneResetError(f"arms must be one of {', '.join(GRASP_LOOP_ARMS)}, not {request.arms!r}.")
     if request.funnelMaxSteps <= 0:
         raise SceneResetError("funnelMaxSteps must be positive.")
+    low_dz, high_dz = (float(v) for v in request.funnelAlignDzMm)
+    min_dz, max_dz = GRASP_LOOP_FUNNEL_ALIGN_DZ_RANGE_MM
+    if not min_dz <= low_dz <= high_dz <= max_dz:
+        raise SceneResetError(
+            f"funnelAlignDzMm {low_dz:g},{high_dz:g} must be low <= high within {min_dz:g}..{max_dz:g} mm: "
+            "below that the fingers move across at the peg top, above it the policy never drives."
+        )
     low, high = _workspace_bounds(workspace_min, workspace_max)
     _check_xyz_in_workspace(request.pickXyz, "pickXyz", low, high)
     if request.insertServo is not None:
@@ -492,6 +520,10 @@ class GraspHandover:
     lowestNearPegM: float | None = None
     # The operator's void (the staged peg fell over), polled by the rollout loop every step.
     voidRequested: Callable[[], bool] | None = None
+    # Where the *policy* had the tool when it first came down through each of
+    # GRASP_LOOP_AIM_HEIGHTS_MM above the peg: its localisation, read the same way on either arm
+    # and never once the funnel drives. Keyed by the height in mm, as a string for the JSON row.
+    aimXy: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     def void_due(self) -> bool:
         return self.voidRequested is not None and bool(self.voidRequested())
@@ -513,6 +545,11 @@ class GraspHandover:
     def observe(self, step: int, xyz: tuple[float, float, float], commanded_gripper: float) -> bool:
         """Feed one policy step; True when the arm should be taken off the policy now."""
 
+        if self.pegXyz is not None and (self.funnel is None or not self.funnel.active):
+            above_mm = (float(xyz[2]) - self.pegXyz[2]) * 1000.0
+            for height in GRASP_LOOP_AIM_HEIGHTS_MM:
+                if str(height) not in self.aimXy and above_mm <= height:
+                    self.aimXy[str(height)] = (float(xyz[0]), float(xyz[1]))
         if self.pegXyz is not None and math.dist(xyz[:2], self.pegXyz[:2]) < GRASP_LOOP_UNTOUCHED_XY_M:
             above = float(xyz[2]) - self.pegXyz[2]
             if self.lowestNearPegM is None or above < self.lowestNearPegM:
@@ -1189,6 +1226,9 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 if r["inserted"] and int(r["insert"].get("searchTried") or int(r["insert"].get("searchIndex") or 0) + 1) == 1
             ),
         }
+    localization = summarize_aim(graded)
+    if localization:
+        out["localization"] = localization
     funnel = [r for r in graded if r.get("funnelState") is not None]
     if funnel:
         out["funnel"] = {
@@ -1198,6 +1238,41 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "xyErrorAtCloseMm": med([r["xyErrorAtCloseMm"] for r in funnel if r.get("xyErrorAtCloseMm") is not None]),
             "funnelCloseDzMm": med([r["funnelCloseDzMm"] for r in funnel if r.get("funnelCloseDzMm") is not None]),
         }
+    return out
+
+
+def summarize_aim(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The policy's localisation at each aim height: how far off, and how well it follows the peg.
+
+    `gainX`/`gainY` are the slopes of the policy's aim on the peg's position across trials. 1 is
+    an aim that moves with the peg; below 1 is an aim pulled toward the middle of where the
+    demonstrations grasped (09-30: y 0.66 at the funnel's 60 mm), which is a localisation fault
+    whatever the grasp rate says. Five trials at a height are the fewest a slope is read from.
+    """
+
+    out: dict[str, Any] = {}
+    for height in GRASP_LOOP_AIM_HEIGHTS_MM:
+        key = str(height)
+        pairs = [
+            (r["pegXyz"][:2], r["aimXyAboveMm"][key])
+            for r in rows
+            if r.get("pegXyz") and key in (r.get("aimXyAboveMm") or {})
+        ]
+        if not pairs:
+            continue
+        errors = sorted(math.dist(aim, peg) * 1000.0 for peg, aim in pairs)
+        entry: dict[str, Any] = {
+            "n": len(pairs),
+            "errorMmP50": round(statistics.median(errors), 1),
+            "errorMmP90": round(errors[min(len(errors) - 1, int(0.9 * len(errors)))], 1),
+        }
+        for axis, name in ((0, "gainX"), (1, "gainY")):
+            try:
+                fit = statistics.linear_regression([p[axis] for p, _ in pairs], [a[axis] for _, a in pairs])
+                entry[name] = round(fit.slope, 2) if len(pairs) >= 5 else None
+            except (statistics.StatisticsError, ValueError):
+                entry[name] = None
+        out[key] = entry
     return out
 
 
@@ -1507,9 +1582,13 @@ def run_grasp_loop(
                         openGripper=request.openGripper,
                         closedGripper=request.closedGripper,
                         controlPeriodS=request.controlPeriodS,
+                        alignDzMm=funnel_align_dz_mm(request, trial),
                     )
                 )
-            log(f"[INFO] grasp_loop_arm trial={trial} arm={arm}")
+            log(
+                f"[INFO] grasp_loop_arm trial={trial} arm={arm}"
+                + (f" funnel_align_dz_mm={handover.funnel.config.alignDzMm:.0f}" if handover.funnel is not None else "")
+            )
             status = run_policy_trial(trial, handover)
             row: dict[str, Any] = {
                 "kind": "trial",
@@ -1534,6 +1613,11 @@ def run_grasp_loop(
                 row["closeAboveTargetMm"] = round((handover.closeXyz[2] - target[2]) * 1000.0, 1)
                 # From the peg as placed, not the target it was aimed at.
                 row["lateralMm"] = round(math.dist(handover.closeXyz[:2], peg_xyz[:2]) * 1000.0, 1)
+            # The policy's localisation: where it had the tool at each height, and how far off.
+            row["aimXyAboveMm"] = {h: [round(v, 5) for v in xy] for h, xy in handover.aimXy.items()}
+            row["aimErrorMm"] = {
+                h: round(math.dist(xy, peg_xyz[:2]) * 1000.0, 1) for h, xy in handover.aimXy.items()
+            }
             row["lowestNearPegMm"] = (
                 None if handover.lowestNearPegM is None else round(handover.lowestNearPegM * 1000.0, 1)
             )

@@ -140,6 +140,9 @@ export function RolloutPage() {
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
   const [graspLoopRecord, setGraspLoopRecord] = useState(false);
+  // 09-30: the policy's aim is set well above the funnel's old 60 mm, so recordings draw the
+  // takeover from the whole approach by default.
+  const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -254,6 +257,8 @@ export function RolloutPage() {
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
+      graspLoopFunnelTakeoverDzMm:
+        modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -288,7 +293,8 @@ export function RolloutPage() {
       graspLoopAttended,
       graspLoopArms,
       graspLoopInsertPose,
-      graspLoopRecord
+      graspLoopRecord,
+      graspLoopFunnelTakeoverDzMm
     ]
   );
 
@@ -1300,6 +1306,19 @@ export function RolloutPage() {
             <p className="hint">
               B 臂：策略把夹爪带到销上方 6 cm（或策略自己要合手）时，漏斗接管——先水平对准复位时记下的销位，
               误差 ≤ 8 mm 且停稳后竖直降到合手高度（dz −6 mm），停稳再合手。A、B 按随机配对交错，判定方法完全相同。
+            </p>
+            <label className="field">
+              <span>漏斗接管高度 mm（B 臂，离销高度；单值固定，或 最小,最大 每次随机）</span>
+              <input
+                value={graspLoopFunnelTakeoverDzMm}
+                onChange={(event) => setGraspLoopFunnelTakeoverDzMm(event.target.value)}
+                placeholder="60 = 原来的固定高度"
+                disabled={isLive}
+              />
+            </label>
+            <p className="hint">
+              策略的瞄准在离销 150 mm 以上就基本定了（09-30：到 60 mm 时平均还偏 41 mm，y 方向只跟到销的 0.66）。
+              在 60–300 mm 之间随机接管，录下的纠正覆盖整个下降过程；60 mm 以上漏斗以 0.05 m/s 下降，以下仍是 0.02 m/s。
             </p>
             <label className="checkbox">
               <input

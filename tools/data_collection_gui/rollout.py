@@ -91,6 +91,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
     "FR3_GRASP_LOOP_DATASET_ROOT",
+    "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
@@ -426,6 +427,17 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         except TerminalServoError as exc:
             raise RolloutError(f"graspLoopInsertPose is not usable: {exc}") from exc
         options["FR3_GRASP_LOOP_INSERT_POSE"] = insert_pose
+    # Arm B's takeover height above the peg, "h" or "low,high" mm; the runtime checks the range.
+    takeover = _optional_text(raw.get("graspLoopFunnelTakeoverDzMm"))
+    if takeover:
+        parts = [part.strip() for part in takeover.split(",")]
+        try:
+            numbers = [float(part) for part in parts]
+        except ValueError:
+            numbers = []
+        if not 1 <= len(numbers) <= 2 or len(numbers) != len(parts) or numbers[0] > numbers[-1]:
+            raise RolloutError("graspLoopFunnelTakeoverDzMm must be 'h' or 'low,high' in mm, low <= high.")
+        options["FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM"] = ",".join(f"{value:g}" for value in numbers)
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         options["FR3_GRASP_LOOP_DATASET_ROOT"] = ""
