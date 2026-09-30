@@ -11,10 +11,13 @@ reach of the peg take it, and it moves with them until they open.
 
 import json
 import math
+import time
 
 import numpy as np
 
 import pytest
+
+from lerobot.utils.rotation import Rotation
 
 import tools.fr3.grasp_loop as grasp_loop
 import tools.fr3.scene_reset as scene_reset
@@ -435,11 +438,13 @@ def test_the_lift_keeps_the_policys_own_close_rather_than_squeezing_harder(tmp_p
 
 def test_the_verdict_is_taken_after_the_lift_and_not_at_the_close(tmp_path, monkeypatch):
     # Fingers that shut on the peg and lose it as it rises: clamped at the close, empty carried.
+    # Only the policy's grasp slips: one out of the fixture would now stop at the staging's own
+    # pick check, before any policy ran.
     class SlippingRig(GraspRig):
         def send_action(self, action):
             before = self.xyz[2]
             result = super().send_action(action)
-            if self.held and self.xyz[2] > before + 0.01:
+            if self.held and self.xyz[2] > before + 0.01 and math.dist(self.xyz[:2], PICK[:2]) > 0.01:
                 self.held = False
                 self.peg_xyz = (self.peg_xyz[0], self.peg_xyz[1], TARGET_Z)
                 self.gripper = self.EMPTY_WIDTH
@@ -1503,3 +1508,191 @@ def threading_wait(seconds):
     import threading
 
     threading.Event().wait(seconds)
+
+
+# ------------------------------------------------------------------ unattended checks ---
+
+
+def test_an_empty_pick_from_the_fixture_is_not_a_trial_and_hands_the_peg_to_a_person(tmp_path, _fast_servo):
+    """A peg the last "in" did not leave in the hole: the fixture pick lifts nothing."""
+
+    robot = _insert_rig()
+    robot.peg_xyz = (PICK[0] + 0.08, PICK[1], TARGET_Z)  # lying somewhere, not in the fixture
+    asked = []
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot, _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+        wait_for_operator=_put_back(robot, asked), ask_grade=_grades(robot, ["in"], []),
+    )
+    records = [json.loads(line) for line in out.read_text().splitlines()]
+    empties = [r for r in records if r.get("kind") == "pick_empty"]
+    assert len(empties) == 1 and empties[0]["pickWidth"] == pytest.approx(GraspRig.EMPTY_WIDTH)
+    # Not a trial, and not one of the planned: the one planned trial still ran, from the fixture.
+    rows = _trials(out)
+    assert len(rows) == 1 and rows[0]["inserted"] is True and rows[0]["staging"] == "fixture"
+    assert len(asked) == 1 and "fixture" in asked[0]
+    assert result["halted"] == ""
+
+
+def test_an_empty_pick_with_nobody_there_halts_rather_than_staging_nothing(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    robot.peg_xyz = (PICK[0] + 0.08, PICK[1], TARGET_Z)
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot, _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=out,
+    )
+    assert result["halted"] == "peg_lost"
+    assert _trials(out) == []
+    assert not robot.held and robot.gripper >= 0.5
+
+
+def test_the_staged_peg_is_photographed_before_the_policy_runs(tmp_path, _fast_servo):
+    robot = CameraRig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot, _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    row = _trials(out)[0]
+    assert [p.split("/")[-1] for p in row["stagedSnapshots"]] == ["trial_000_staged_wrist.png"]
+    assert (tmp_path / "e2e_peg" / "trial_000_staged_wrist.png").is_file()
+
+
+HOME_ROTVEC = (math.pi, 0.0, 0.0)
+
+
+class HomingRig(InsertRig):
+    """Home is a joint keyframe: it puts the tool level, at home, whatever it was before."""
+
+    def move_to_start(self):
+        super().move_to_start()
+        self.xyz = (0.309, 0.0, 0.397)
+        self.rotvec = HOME_ROTVEC
+
+
+def _tilted_policy(robot, plan, rotvec):
+    """The policy's wrist left a few degrees off level, as the funnel keeps it."""
+
+    inner = _policy(robot, plan)
+
+    def run(trial, handover):
+        robot.rotvec = rotvec
+        return inner(trial, handover)
+
+    return run
+
+
+def _homing_rig():
+    robot = HomingRig()
+    robot.face_z = TARGET_Z + 0.006 + robot.face_above_m
+    robot.move_to_start()
+    return robot
+
+
+def test_the_peg_goes_straight_to_the_hole_turned_level_without_homing(tmp_path, _fast_servo):
+    robot = _homing_rig()
+    tilted = tuple(float(v) for v in (Rotation.from_rotvec(np.array([0.0, 0.0, 0.07])) * Rotation.from_rotvec(np.array(HOME_ROTVEC))).as_rotvec())
+    out = tmp_path / "e2e.jsonl"
+    held_at_home = []
+    original = robot.move_to_start
+
+    def counted():
+        held_at_home.append(robot.held)
+        original()
+
+    robot.move_to_start = counted
+    run_grasp_loop(
+        robot, _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_tilted_policy(robot, [("grasp", 0.0)], tilted), out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    insert = _trials(out)[0]["insert"]
+    assert insert["inserted"] is True and insert["viaHome"] is False
+    # Homed by the staging and after the release, never while carrying the peg to the hole.
+    assert held_at_home and not any(held_at_home)
+    # Every command of the descent is at the level orientation, not the policy's.
+    level = Rotation.from_rotvec(np.array(HOME_ROTVEC)).inv()
+    descent = [
+        a for a in robot.actions
+        if a["gripper.pos"] < 0.5 and a["ee.z"] < 0.12 and math.dist((a["ee.x"], a["ee.y"]), PICK[:2]) < 0.012
+    ]
+    assert descent and all(
+        np.linalg.norm((level * Rotation.from_rotvec(np.array([a["ee.wx"], a["ee.wy"], a["ee.wz"]]))).as_rotvec()) < 1e-6
+        for a in descent
+    )
+
+
+def test_via_home_restores_the_detour(tmp_path, _fast_servo):
+    counts = {}
+    for via_home in (False, True):
+        robot = _homing_rig()
+        before = robot.move_to_start_calls
+        out = tmp_path / f"e2e_{via_home}.jsonl"
+        run_grasp_loop(
+            robot, _request(trials=1, insertServo=_insert_servo(), insertViaHome=via_home),
+            run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=out,
+            ask_grade=_grades(robot, ["in"], []),
+        )
+        counts[via_home] = robot.move_to_start_calls - before
+        assert _trials(out)[0]["insert"]["viaHome"] is via_home
+    assert counts[True] == counts[False] + 1
+
+
+def test_the_run_notifies_when_it_needs_a_person_and_when_it_ends(tmp_path):
+    robot = GraspRig()
+    sent = []
+    run_grasp_loop(
+        robot, _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.02), ("grasp", 0.0)]),
+        out_path=tmp_path / "grasp.jsonl",
+        wait_for_operator=_put_back(robot, []),
+        notify=sent.append,
+    )
+    assert sent[0].startswith("needs operator:") and "fixture" in sent[0]
+    assert sent[-1].startswith("grasp loop done") and "held 1/2" in sent[-1]
+
+
+def test_a_notify_command_gets_the_message_and_a_broken_one_costs_only_the_message(tmp_path):
+    target = tmp_path / "said.txt"
+    script = tmp_path / "say.sh"
+    script.write_text(f'#!/bin/sh\nprintf "%s" "$1" > {target}\n')
+    script.chmod(0o755)
+    logs = []
+    grasp_loop.command_notifier(str(script), log=logs.append)("peg lost")
+    for _ in range(100):
+        if target.exists() and target.read_text():
+            break
+        time.sleep(0.02)
+    assert target.read_text() == "peg lost"
+    grasp_loop.command_notifier(str(tmp_path / "missing"), log=logs.append)("x")
+    assert any("grasp_loop_notify=failed" in line for line in logs)
+    grasp_loop.command_notifier("", log=logs.append)("nobody")
+
+
+def test_the_notify_command_falls_back_to_the_config_file(tmp_path):
+    config = tmp_path / "notify_cmd"
+    assert grasp_loop.grasp_loop_notify_command("", fallback=config) == ""
+    config.write_text("\nnotify-send FR3\n")
+    assert grasp_loop.grasp_loop_notify_command("", fallback=config) == "notify-send FR3"
+    assert grasp_loop.grasp_loop_notify_command(" curl x ", fallback=config) == "curl x"
+
+
+def test_the_audit_page_lays_each_trial_beside_its_photos(tmp_path, _fast_servo):
+    from tools.fr3 import grasp_loop_audit
+
+    robot = CameraRig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot, _request(trials=2, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+        ask_grade=_grades(robot, ["in", "out"], []),
+    )
+    assert grasp_loop_audit.main([str(out)]) == 0
+    page = (tmp_path / "e2e_audit.html").read_text()
+    assert page.count('class="card"') == 2
+    assert 'src="e2e_peg/trial_000_staged_wrist.png"' in page
+    assert 'src="e2e_peg/trial_001_after_wrist.png"' in page
+    assert "插入 1/2" in page

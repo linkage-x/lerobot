@@ -15,7 +15,7 @@ import json
 import math
 import random
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:  # pragma: no cover - tests run without the full lerobot import tree in some environments
     from lerobot.utils.robot_utils import precise_sleep
@@ -823,6 +823,8 @@ def _scene_reset_waits_for_gripper_position(name: str) -> bool:
         # closed command would wait for a number a clamped peg never reaches.
         "regrip_after_release",
         "retreat_after_release",
+        # The grasp loop's turn to level at carry height, holding the peg on its way to the hole.
+        "level_wrist",
     }
 
 
@@ -1116,6 +1118,7 @@ def execute_scene_reset(
     hover_tolerance_m: float | None = None,
     hover_still_s: float | None = None,
     unload: UnloadLimits | None = None,
+    verify_pick: Callable[[float], bool] | None = None,
 ) -> dict[str, Any]:
     """Execute the fixed-pick/random-place reset on an already connected FR3 robot.
 
@@ -1129,6 +1132,8 @@ def execute_scene_reset(
     table while the arm is still closing the last few mm sideways. `unload`, with a hover, raises
     the tool after the dwell until the peg is no longer pressed into the table against the force
     read at the place hover (`unload_before_open`), and opens the fingers where the arm then is.
+    `verify_pick` is handed the finger width once the pick is lifted; False stops the reset there,
+    fingers still closed on whatever they have, with `pickEmpty` and `pickWidth` in the result.
     """
 
     current_xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
@@ -1161,6 +1166,7 @@ def execute_scene_reset(
     released_xyz: tuple[float, float, float] | None = None
     # The force read parked at the place hover, which `unload` measures the press against.
     place_tare: float | None = None
+    pick_width: float | None = None
     try:
         for waypoint in build_scene_reset_waypoints(request):
             if hover_m > 0.0 and waypoint.name in ("descend_8cm_to_pick", "descend_8cm_to_place"):
@@ -1187,6 +1193,21 @@ def execute_scene_reset(
                     step_xyz = (waypoint.xyz[0], waypoint.xyz[1], unloaded_z)
             commanded_gripper = waypoint.gripper
             _run_step(robot, request, waypoint.name, step_xyz, rotvec, waypoint.gripper)
+            if waypoint.name == "lift_8cm_after_grasp" and verify_pick is not None:
+                _xyz, _rotvec, pick_width = _observation_xyz_rotvec_gripper(robot)
+                if not verify_pick(float(pick_width)):
+                    print(
+                        f"[WARN] scene_reset=pick_empty request_id={request.requestId} width={pick_width:.3f}",
+                        flush=True,
+                    )
+                    return {
+                        "ok": False,
+                        "error": f"pick_empty: the fingers read {pick_width:.3f} lifted from the pick",
+                        "pickEmpty": True,
+                        "pickWidth": round(float(pick_width), 4),
+                        "request": request.payload(),
+                        "trajectoryQc": qc,
+                    }
             if waypoint.name == "open_gripper":
                 if release_settle_s > 0.0:
                     traced_hold(robot, request.requestId, "settle_after_open", release_settle_s, request.controlPeriodS)
@@ -1202,6 +1223,7 @@ def execute_scene_reset(
             "trajectoryQc": qc,
             "returnedToStart": bool(request.returnToStart),
             "releasedXyz": None if released_xyz is None else [round(v, 5) for v in released_xyz],
+            "pickWidth": None if pick_width is None else round(float(pick_width), 4),
         }
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the gateway
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details={exc}", flush=True)

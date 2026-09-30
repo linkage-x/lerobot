@@ -128,6 +128,8 @@ from tools.fr3.grasp_loop import (
     GraspHandover,
     GraspLoopControl,
     GraspLoopRequest,
+    command_notifier,
+    grasp_loop_notify_command,
     load_mask_strokes,
     run_grasp_loop,
     grasp_is_held,
@@ -514,6 +516,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             'Comma-separated search landing indices to try first (0 the aim, 1-8 the inner ring, '
             '9-16 the outer); the rest follow in index order. Blank lands in index order.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-insert-via-home',
+        action='store_true',
+        help='Home with the held peg before the insertion (every step-4 run to 09-30), instead of '
+        'turning level at carry height and going straight across.',
+    )
+    parser.add_argument(
+        '--grasp-loop-notify-cmd',
+        default=os.environ.get('FR3_NOTIFY_CMD', ''),
+        help=(
+            'Command run with a message as its last argument whenever the grasp loop needs a person '
+            'or ends, e.g. "notify-send FR3". Default: $FR3_NOTIFY_CMD, else the first line of '
+            '~/.config/fr3/notify_cmd, else nobody.'
         ),
     )
     parser.add_argument(
@@ -5013,6 +5030,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     else None
                 ),
                 insertFollowSeat=bool(args.grasp_loop_insert_follow_seat),
+                insertViaHome=bool(args.grasp_loop_insert_via_home),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -5025,13 +5043,14 @@ def run_inference(args: argparse.Namespace) -> int:
             f'arms={grasp_loop_request.arms} '
             + (
                 'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_search_order=%s '
-                'insert_follow_seat=%d '
+                'insert_follow_seat=%d insert_via_home=%d '
                 % (
                     *grasp_loop_request.insertServo.xyz,
                     grasp_loop_request.insertServo.searchRingM,
                     grasp_loop_request.insertServo.searchInnerRingM,
                     ','.join(str(index) for index in grasp_loop_request.insertServo.searchOrder) or 'index',
                     int(grasp_loop_request.insertFollowSeat),
+                    int(grasp_loop_request.insertViaHome),
                 )
                 if grasp_loop_request.insertServo is not None
                 else 'insert=off '
@@ -6399,6 +6418,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 ask_grade=control.ask_grade if args.grasp_loop_attended else None,
                 void_requested=control.void_requested,
                 clear_void=control.clear_void,
+                notify=command_notifier(grasp_loop_notify_command(args.grasp_loop_notify_cmd)),
             )
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)

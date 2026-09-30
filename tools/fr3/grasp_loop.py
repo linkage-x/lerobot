@@ -311,6 +311,13 @@ class GraspLoopRequest:
     # hole, and an aim off the hole is off the fixture's pick too, which is what hands the next
     # peg over in the pose the last one went in with.
     insertFollowSeat: bool = False
+    # Carry the peg from the grasp's lift straight across to the hole, turned to the level
+    # orientation read at home after the staging, instead of homing on the way (the step-4 runs
+    # up to 09-30). The home detour existed to level the wrist; the funnel keeps the policy's
+    # wrist, and over 67 grasps (173506 + 084706) that was 0.09-0.83 deg off vertical against
+    # TERMINAL_TRIAL_MAX_TILT_DEG's 2 and at most 4 deg of yaw from grasp to grasp, which the
+    # stepped turn takes out at carry height. True restores the detour.
+    insertViaHome: bool = False
 
     @property
     def regripZ(self) -> float:
@@ -737,6 +744,7 @@ def insert_held_peg(
     ask_grade: OperatorGrade | None = None,
     aim_xy: tuple[float, float] | None = None,
     snapshot_dir: Path | None = None,
+    level_rotvec: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
 
@@ -752,10 +760,12 @@ def insert_held_peg(
     closed fully, as the step-3 servo holds its peg, because a peg pressed at up to 16 N in a
     weaker grip slides up the fingers (09-28 trial 21). The verdict was already read at the lift.
 
-    Homed on the way, with the peg, as the reset homes: the policy's wrist can be anywhere, and a
-    leaning peg wedges (TERMINAL_TRIAL_MAX_TILT_DEG). Home is a joint keyframe, so the orientation
-    read there is level and fresh every trial, and nothing re-sends a sagged reading
-    (terminal_trials' anchor).
+    Levelled on the way: the policy's wrist can be anywhere, and a leaning peg wedges
+    (TERMINAL_TRIAL_MAX_TILT_DEG). With `level_rotvec` -- the orientation read at home, a joint
+    keyframe, unloaded, this trial -- the tool turns to it at carry height and goes straight
+    across (see `insertViaHome`); without it, or with `insertViaHome`, it homes with the peg and
+    reads the orientation there. Either way nothing re-sends a sagged reading (terminal_trials'
+    anchor).
 
     The target's height is `insertServo`'s for a grip at the script's own height (`regripZ`, where
     the funnel closes too), raised by however much higher up the peg the fingers closed: more peg
@@ -769,10 +779,15 @@ def insert_held_peg(
     assert request.insertServo is not None
     step_request = request.step_request(request_id)
     held = request.closedGripper
-    _clear_upward(robot, request, step_request, held, "lift_8cm_after_grasp")
-    _move_to_start(robot)
-    _xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
-    tilt_deg = tool_axis_tilt_deg(rotvec)
+    lifted_rotvec = _clear_upward(robot, request, step_request, held, "lift_8cm_after_grasp")
+    via_home = request.insertViaHome or level_rotvec is None
+    if via_home:
+        _move_to_start(robot)
+        _xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    else:
+        assert level_rotvec is not None
+        rotvec = _turn_to(robot, step_request, lifted_rotvec, level_rotvec, held)
+    tilt_deg = tool_axis_tilt_deg(_observation_xyz_rotvec_gripper(robot)[1])
     x, y, z = request.insertServo.xyz
     if aim_xy is not None:
         x, y = float(aim_xy[0]), float(aim_xy[1])
@@ -835,6 +850,7 @@ def insert_held_peg(
         "aimXyz": [round(v, 5) for v in servo.xyz],
         "raisedMm": round(raised_m * 1000.0, 1),
         "toolTiltDeg": round(tilt_deg, 2),
+        "viaHome": via_home,
         "aboveTargetMm": round(float(result["seatedDepthErrorMm"]), 1),
         "lateralErrorMm": round(float(result["lateralErrorMm"]), 1),
         "stoppedOn": result.get("stoppedOn"),
@@ -1041,6 +1057,32 @@ def _turn_wrist(
     return turned
 
 
+def _turn_to(
+    robot: Any,
+    step_request: SceneResetRequest,
+    start: tuple[float, float, float],
+    goal: tuple[float, float, float],
+    gripper: float,
+) -> tuple[float, float, float]:
+    """Turn the tool from `start` to `goal` where it stands, in small steps; answer `goal`.
+
+    Stepped for `_turn_wrist`'s reason. The steps are fractions of the one rotation between the
+    two, so a few degrees of yaw and tilt come out together, about the tool point.
+    """
+
+    xyz, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    first = Rotation.from_rotvec(np.asarray(start, dtype=np.float64))
+    delta = (Rotation.from_rotvec(np.asarray(goal, dtype=np.float64)) * first.inv()).as_rotvec()
+    ticks = max(1, round(GRASP_LOOP_TURN_S / step_request.controlPeriodS))
+    for tick in range(1, ticks + 1):
+        turned = Rotation.from_rotvec(delta * (tick / ticks)) * first
+        robot.send_action(_absolute_action(xyz, tuple(float(v) for v in turned.as_rotvec()), gripper))
+        precise_sleep(step_request.controlPeriodS)
+    goal = tuple(float(v) for v in goal)  # type: ignore[assignment]
+    _run_step(robot, step_request, "level_wrist", xyz, goal, gripper)
+    return goal
+
+
 def verified_pick(
     robot: Any,
     request: GraspLoopRequest,
@@ -1141,7 +1183,11 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "wilson95": [round(e2e_low, 3), round(e2e_high, 3)],
             # The insertion layer alone: of the held grasps it was handed.
             "insertedOfHeld": [inserted, len(tried)],
-            "firstLanding": sum(1 for r in tried if r["inserted"] and r["insert"].get("searchIndex") == 0),
+            # Landings, not ring index: with a search order the first landing need not be index 0.
+            "firstLanding": sum(
+                1 for r in tried
+                if r["inserted"] and int(r["insert"].get("searchTried") or int(r["insert"].get("searchIndex") or 0) + 1) == 1
+            ),
         }
     funnel = [r for r in graded if r.get("funnelState") is not None]
     if funnel:
@@ -1287,6 +1333,7 @@ def run_grasp_loop(
     void_requested: Callable[[], bool] | None = None,
     clear_void: Callable[[], None] = lambda: None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
+    notify: Callable[[str], None] = lambda message: None,
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
@@ -1299,7 +1346,17 @@ def run_grasp_loop(
 
     `void_requested` is the operator's void (see the module docstring); `clear_void` resets it at
     each trial's start. A voided trial does not use up one of `request.trials`.
+
+    `notify` is told whenever the run needs a person -- each wait for the operator, and the run's
+    end with why it ended -- for someone who is not watching the page (`command_notifier`).
     """
+
+    if wait_for_operator is not None:
+        operator_wait = wait_for_operator
+
+        def wait_for_operator(message: str) -> bool:
+            notify(f"needs operator: {message}")
+            return operator_wait(message)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = completed_trials(out_path)
@@ -1324,8 +1381,11 @@ def run_grasp_loop(
         f"force_trace={force_trace}"
     )
     voided = sum(1 for r in done if r.get("verdict") == "voided")
+    # Trial numbers a staging used up without a policy segment (an empty pick from the fixture).
+    skipped = 0
+    snapshot_dir = out_path.with_name(f"{out_path.stem}_peg")
     for trial in itertools.count(len(done)):
-        if trial - voided >= request.trials:
+        if trial - voided - skipped >= request.trials:
             break
         if stop_requested():
             halted = "stop_requested"
@@ -1379,9 +1439,22 @@ def run_grasp_loop(
                     hover_tolerance_m=GRASP_LOOP_HOVER_TOLERANCE_M,
                     hover_still_s=GRASP_LOOP_HOVER_STILL_S,
                     unload=GRASP_LOOP_UNLOAD,
+                    verify_pick=lambda width: grasp_is_held(
+                        width, request.closedGripper, held_width=request.heldWidth, blocked_margin=request.blockedMargin
+                    ),
                 )
                 if reset.get("controlLoopDied"):
                     raise ControlLoopDiedError(str(reset.get("error")))
+                if reset.get("pickEmpty"):
+                    # Nothing in the fixture to take: the last "in" was not, or the peg left the
+                    # hole since. Not a trial -- the policy never saw a peg -- and the peg is the
+                    # person's to find, like any lost one.
+                    write({"kind": "pick_empty", "trial": trial, "at": time.time(), "pickWidth": reset.get("pickWidth")})
+                    log(f"[WARN] grasp_loop_pick_empty trial={trial} width={reset.get('pickWidth')}")
+                    release_and_clear(robot, request, request_id=request_id)
+                    peg = "lost"
+                    skipped += 1
+                    continue
                 if not reset.get("ok"):
                     write({"kind": "halt", "trial": trial, "reason": "scene_reset_failed", "error": reset.get("error")})
                     halted = "scene_reset_failed"
@@ -1392,6 +1465,12 @@ def run_grasp_loop(
             place_offset_mm = math.dist(peg_xyz[:2], target[:2]) * 1000.0
             log(f"[INFO] grasp_loop_staged trial={trial} staging={staging} place_offset_mm={place_offset_mm:.1f}")
             staged_s = time.perf_counter() - started
+            # Staged, arm at home: the side camera sees the peg standing or not, which nothing
+            # else on the rig does; an unattended run is audited from these afterwards. Home is a
+            # joint keyframe, so its orientation, read here unloaded, is the level one the
+            # insertion turns to.
+            staged_snapshots = save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_staged")
+            _home_xyz, level_rotvec, _home_gripper = _observation_xyz_rotvec_gripper(robot)
 
             # ---- the policy's segment ----------------------------------------------------------
             arm = arm_for_trial(request, trial)
@@ -1429,6 +1508,7 @@ def run_grasp_loop(
                 "handoverStep": handover.handoverStep,
                 "commandedGripper": handover.commandedGripper,
                 "stagedS": round(staged_s, 1),
+                "stagedSnapshots": staged_snapshots,
             }
             if request.insertServo is not None:
                 # End to end: anything short of a peg in the hole is a miss of the whole task.
@@ -1467,7 +1547,7 @@ def run_grasp_loop(
                     insert = insert_held_peg(
                         robot, request, trial=trial, close_z=handover.closeXyz[2],
                         request_id=request_id, ask_grade=ask_grade, aim_xy=insert_aim,
-                        snapshot_dir=out_path.with_name(f"{out_path.stem}_peg"),
+                        snapshot_dir=snapshot_dir, level_rotvec=level_rotvec,
                     )
                     insert_rotvec = insert.pop("rotvec")
                     row["insert"] = insert
@@ -1570,6 +1650,12 @@ def run_grasp_loop(
     set_force_trace_path(None)
     summary = summarize_grasp_loop(done)
     write({"kind": "run_end", "at": time.time(), "halted": halted, "summary": summary})
+    e2e = summary.get("endToEnd") or {}
+    notify(
+        f"grasp loop {'halted: ' + halted if halted else 'done'} -- "
+        + (f"inserted {e2e.get('inserted')}/{e2e.get('graded')}, " if e2e else "")
+        + f"held {summary.get('held')}/{summary.get('graded')}, voided {summary.get('voided')} -- {out_path.name}"
+    )
     log(f"[INFO] grasp_loop=done halted={halted or 'no'} summary={json.dumps(summary, sort_keys=True)}")
     return {"halted": halted, "summary": summary}
 
@@ -1593,6 +1679,52 @@ def _write_funnel_steps(out_path: Path, trial: int, funnel: GraspFunnel) -> Path
         for record in funnel.steps:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     return path
+
+
+GRASP_LOOP_NOTIFY_FILE = Path.home() / ".config" / "fr3" / "notify_cmd"
+
+
+def grasp_loop_notify_command(given: str, *, fallback: Path = GRASP_LOOP_NOTIFY_FILE) -> str:
+    """The notify command: `given` (the flag, or $FR3_NOTIFY_CMD), else `fallback`'s first line.
+
+    The file is there so the command can change without restarting the gateway whose environment
+    the runtime inherits.
+    """
+
+    if str(given).strip():
+        return str(given).strip()
+    try:
+        return next((line.strip() for line in fallback.read_text(encoding="utf-8").splitlines() if line.strip()), "")
+    except OSError:
+        return ""
+
+
+def command_notifier(command: str, *, log: Callable[[str], None] = print) -> Callable[[str], None]:
+    """`notify` for `run_grasp_loop` that runs `command` with the message as its last argument.
+
+    Whatever reaches the operator -- `notify-send`, a `curl` to a push service, a script -- is the
+    rig's choice, not the loop's. Started and not waited for, and a command that fails costs the
+    message only: a notification must never be what stops a run. Blank notifies nobody.
+    """
+
+    import shlex
+    import subprocess
+
+    argv = shlex.split(command)
+    if not argv:
+        return lambda message: None
+
+    def notify(message: str) -> None:
+        try:
+            subprocess.Popen(
+                [*argv, message], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            log(f"[INFO] grasp_loop_notify=sent message={message}")
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log(f"[WARN] grasp_loop_notify=failed details={type(exc).__name__}: {exc}")
+
+    return notify
 
 
 def _request_record(request: GraspLoopRequest) -> dict[str, Any]:
