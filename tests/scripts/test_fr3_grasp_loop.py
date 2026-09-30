@@ -1696,3 +1696,53 @@ def test_the_audit_page_lays_each_trial_beside_its_photos(tmp_path, _fast_servo)
     assert 'src="e2e_peg/trial_000_staged_wrist.png"' in page
     assert 'src="e2e_peg/trial_001_after_wrist.png"' in page
     assert "插入 1/2" in page
+
+
+def test_each_graded_trial_is_offered_to_the_recorder_before_its_row_is_written(tmp_path):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+    offered = []
+
+    def keep(trial, row):
+        # The row is final when offered: graded, and not yet on disk.
+        offered.append((trial, row["verdict"], len(_trials(out)) if out.exists() else 0))
+        return {"kept": row["verdict"] == "held"}
+
+    run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.02)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, []),
+        keep_policy_segment=keep,
+    )
+    assert offered == [(0, "held", 0), (1, "empty", 1)]
+    assert [r["dataset"] for r in _trials(out)] == [{"kept": True}, {"kept": False}]
+
+
+def test_a_recorder_that_fails_costs_the_sample_not_the_run(tmp_path, capsys):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+
+    def keep(trial, row):
+        raise OSError("disk full")
+
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2),
+        out_path=out,
+        keep_policy_segment=keep,
+    )
+    rows = _trials(out)
+    assert result["halted"] == "" and len(rows) == 2
+    assert all(r["dataset"] == {"error": "OSError: disk full"} for r in rows)
+    assert "grasp_loop_dataset=failed trial=0" in capsys.readouterr().out
+    assert not robot.held
+
+
+def test_without_a_recorder_the_row_has_no_dataset_field(tmp_path):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)]), out_path=out)
+    assert "dataset" not in _trials(out)[0]

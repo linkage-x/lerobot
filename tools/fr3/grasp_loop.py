@@ -1334,6 +1334,7 @@ def run_grasp_loop(
     clear_void: Callable[[], None] = lambda: None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
     notify: Callable[[str], None] = lambda message: None,
+    keep_policy_segment: Callable[[int, dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
@@ -1349,6 +1350,11 @@ def run_grasp_loop(
 
     `notify` is told whenever the run needs a person -- each wait for the operator, and the run's
     end with why it ended -- for someone who is not watching the page (`command_notifier`).
+
+    `keep_policy_segment` is handed each trial's finished row just before it is written, once the
+    verdict is known: the runtime's recorder decides from it whether the policy segment it buffered
+    becomes training data, and what it returns is kept in the row as `dataset`. It runs with the
+    arm parked, so a slow video encode costs time, never control.
     """
 
     if wait_for_operator is not None:
@@ -1372,6 +1378,17 @@ def run_grasp_loop(
     def write(row: dict[str, Any]) -> None:
         with out_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def keep_segment(trial: int, row: dict[str, Any]) -> None:
+        if keep_policy_segment is None:
+            return
+        try:
+            kept = keep_policy_segment(trial, row)
+        except Exception as exc:  # noqa: BLE001 - a lost sample must not end a run holding a peg
+            kept = {"error": f"{type(exc).__name__}: {exc}"}
+            log(f"[WARN] grasp_loop_dataset=failed trial={trial} details={exc}")
+        if kept is not None:
+            row["dataset"] = kept
 
     force_trace = force_trace_path(out_path)
     set_force_trace_path(force_trace)
@@ -1529,6 +1546,7 @@ def run_grasp_loop(
                 # the peg top). Graded against the arm, then recovered with a person's say-so.
                 row["verdict"] = "collision"
                 row["trialS"] = round(time.perf_counter() - started, 1)
+                keep_segment(trial, row)
                 write(row)
                 done.append(row)
                 log(f"[WARN] grasp_loop_trial trial={trial} arm={arm} verdict=collision trial_s={row['trialS']}")
@@ -1603,6 +1621,7 @@ def run_grasp_loop(
                 row["pegUntouched"] = handover.peg_untouched()
                 if row["pegUntouched"]:
                     peg = "untouched"
+            keep_segment(trial, row)
             row["trialS"] = round(time.perf_counter() - started, 1)
             write(row)
             done.append(row)

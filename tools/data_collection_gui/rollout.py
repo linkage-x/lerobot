@@ -90,6 +90,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
+    "FR3_GRASP_LOOP_DATASET_ROOT",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
@@ -114,6 +115,18 @@ DAGGER_PREFIX = "dagger_"
 # distinction matters because the two must not collapse into one: a blank field that silently
 # meant "discard the corrections" is the failure the trace directory already taught us.
 DAGGER_STEER_ONLY = ""
+
+
+# Arm B's funnel steps, recorded by the grasp loop: the scripted expert's corrections. A dataset of
+# their own beside the operator's, not inside it -- both are is_intervention, and once merged
+# nothing would tell a SpaceMouse correction from a script's.
+FUNNEL_PREFIX = "funnel_"
+
+
+def funnel_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
+    """The default dataset for funnel steps recorded against `checkpoint_id`; see `FUNNEL_PREFIX`."""
+    flattened = checkpoint_id.replace("/", "_") or "unknown_checkpoint"
+    return repo_root / DAGGER_ROOT / f"{FUNNEL_PREFIX}{flattened}"
 
 
 def dagger_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
@@ -413,6 +426,9 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         except TerminalServoError as exc:
             raise RolloutError(f"graspLoopInsertPose is not usable: {exc}") from exc
         options["FR3_GRASP_LOOP_INSERT_POSE"] = insert_pose
+    # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
+    if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
+        options["FR3_GRASP_LOOP_DATASET_ROOT"] = ""
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
@@ -556,6 +572,7 @@ def build_rollout_command(
     preview_fps: float = PREVIEW_FPS,
     trace_dir: Path | None = None,
     dagger_dataset_fallback: Path | None = None,
+    funnel_dataset_fallback: Path | None = None,
     base_env: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """The launcher invocation for one rollout, plus the environment that configures it.
@@ -612,6 +629,11 @@ def build_rollout_command(
                     "supplied for this checkpoint."
                 )
             env["FR3_DAGGER_DATASET_ROOT"] = str(dagger_dataset_fallback)
+
+    if env.get("FR3_GRASP_LOOP_DATASET_ROOT") == "":
+        if funnel_dataset_fallback is None:
+            raise RolloutError("Recording the funnel needs a dataset directory for this checkpoint.")
+        env["FR3_GRASP_LOOP_DATASET_ROOT"] = str(funnel_dataset_fallback)
 
     env["FR3_INFER_CHECKPOINT"] = checkpoint_path
     env["FR3_MOVE_TO_START"] = "1" if move_to_start else "0"

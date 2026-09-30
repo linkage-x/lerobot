@@ -534,6 +534,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-dataset-root',
+        type=Path,
+        default=None,
+        help=(
+            "Write arm B's funnel steps (align, descend, close) to this LeRobot dataset, one "
+            'episode per held grasp, in the imitated dataset\'s own schema with is_intervention=1: '
+            'the scripted expert\'s corrections, for DAgger. Created if absent, extended if not. '
+            'Trials graded anything but held are discarded.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-dataset-repo-id',
+        type=str,
+        default=None,
+        help='repo_id for --grasp-loop-dataset-root. Defaults to the directory name.',
+    )
+    parser.add_argument(
         '--grasp-loop-insert-follow-seat',
         action='store_true',
         help='Aim each insertion where the last peg went in, not at --grasp-loop-insert-pose.',
@@ -4194,6 +4211,23 @@ def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> 
     )
 
 
+def correction_dataset_target(args: argparse.Namespace) -> tuple[Path, str, str] | None:
+    """Where corrections go -- (root, repo_id, the flag that named it) -- or None for nowhere.
+
+    Two sources write the same kind of sample: an operator's SpaceMouse takeover
+    (`--dagger-dataset-root`), and the grasp loop's funnel, arm B's scripted expert
+    (`--grasp-loop-dataset-root`). They never run together: the grasp loop refuses
+    `--dagger-takeover`.
+    """
+    if args.dagger_takeover and args.dagger_dataset_root is not None:
+        root = Path(args.dagger_dataset_root).expanduser()
+        return root, str(args.dagger_dataset_repo_id or root.name), '--dagger-dataset-root'
+    if int(args.grasp_loop_trials) > 0 and args.grasp_loop_dataset_root is not None:
+        root = Path(args.grasp_loop_dataset_root).expanduser()
+        return root, str(args.grasp_loop_dataset_repo_id or root.name), '--grasp-loop-dataset-root'
+    return None
+
+
 def build_dagger_writer(
     args: argparse.Namespace,
     *,
@@ -4210,12 +4244,12 @@ def build_dagger_writer(
     second session of corrections belongs in the same place as the first, and
     ``LeRobotDataset.create`` on an existing root raises rather than appending.
     """
-    if not args.dagger_takeover or args.dagger_dataset_root is None:
+    target = correction_dataset_target(args)
+    if target is None:
         return None
+    root, repo_id, flag = target
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    root = Path(args.dagger_dataset_root).expanduser()
-    repo_id = str(args.dagger_dataset_repo_id or root.name)
     features = dagger_dataset_features(dict(ds_meta.features))
 
     def create_dataset() -> Any:
@@ -4238,7 +4272,7 @@ def build_dagger_writer(
         mismatched = sorted(set(features) ^ set(dataset.meta.features))
         if mismatched:
             raise SystemExit(
-                f'--dagger-dataset-root {root} holds a dataset whose schema differs from '
+                f'{flag} {root} holds a dataset whose schema differs from '
                 f'{ds_meta.repo_id}: {mismatched}. Point it at a fresh directory, or at the '
                 'DAgger dataset recorded against this same view.'
             )
@@ -4259,16 +4293,16 @@ def build_dagger_writer(
                         + (f' (+{len(broken) - 5} more)' if len(broken) > 5 else '')
                     )
                     raise SystemExit(
-                        f'--dagger-dataset-root {root} holds a DAgger session that never closed '
+                        f'{flag} {root} holds a DAgger session that never closed '
                         f'its dataset: the frames and videos are on disk, but {detail}. If a '
                         'recording is still running against this root, stop it with q / the stop '
                         'button / SIGTERM and let it finalize -- never SIGKILL. Otherwise move it '
                         'aside and start a fresh directory; those corrections cannot be recovered.'
                     )
                 raise SystemExit(
-                    f'--dagger-dataset-root {root} exists but is not a loadable LeRobot dataset '
+                    f'{flag} {root} exists but is not a loadable LeRobot dataset '
                     'and contains files other than an empty DAgger metadata shell. Move it aside, '
-                    'or point --dagger-dataset-root at a fresh directory.'
+                    f'or point {flag} at a fresh directory.'
                 )
             shutil.rmtree(root)
         dataset = create_dataset()
@@ -4992,6 +5026,8 @@ def run_inference(args: argparse.Namespace) -> int:
     # load or lies outside the fence is a startup error, not a halt after the first reset.
     grasp_loop_request: GraspLoopRequest | None = None
     grasp_loop_out = Path(args.grasp_loop_out).expanduser() if args.grasp_loop_out else Path()
+    if args.grasp_loop_dataset_root is not None and int(args.grasp_loop_trials) <= 0:
+        raise SystemExit('--grasp-loop-dataset-root records the grasp loop: it needs --grasp-loop-trials.')
     if int(args.grasp_loop_trials) > 0:
         if args.interactive_rollouts or args.dagger_takeover or terminal_servo_request is not None:
             raise SystemExit(
@@ -5055,7 +5091,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 if grasp_loop_request.insertServo is not None
                 else 'insert=off '
             )
-            + f'out={grasp_loop_out}'
+            + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
@@ -6038,9 +6074,12 @@ def run_inference(args: argparse.Namespace) -> int:
                 )
 
             if dagger_buffer is not None:
-                # Offered every step, kept only when the operator was driving: the buffer owns
-                # where a span starts, so this call site never has to know.
-                if command_source == 'expert':
+                # Offered every step, kept only when an expert was driving -- the operator's
+                # SpaceMouse, or arm B's funnel, the scripted expert of the grasp loop: the buffer
+                # owns where a span starts, so this call site never has to know. The funnel's
+                # command reaches here through the same smoothing, clamp and gripper latch as the
+                # operator's, so the same inversion puts it in the dataset's action space.
+                if command_source in ('expert', 'funnel'):
                     dagger_action, previous_dagger_quaternion_xyzw = sent_command_to_dataset_action(
                         command_to_send,
                         T_B_Ws=T_B_Ws,
@@ -6221,8 +6260,7 @@ def run_inference(args: argparse.Namespace) -> int:
             'DAgger corrections cannot be written for camera(s) '
             f"{', '.join(missing_dagger_images)}: {ds_meta.repo_id} carries them but the policy "
             'does not read them, so the rollout never builds an image in the view geometry. '
-            'Point --dagger-dataset-root at a dataset matching this policy, or record without '
-            '--dagger-takeover.'
+            'Point the correction dataset at one matching this policy, or record without it.'
         )
     dagger_encode_delta, dagger_denormalize_gripper = (
         build_dagger_action_encoder(
@@ -6239,7 +6277,7 @@ def run_inference(args: argparse.Namespace) -> int:
     dagger_task = str(task_prompt or '')
     if dagger_writer is not None and not dagger_task:
         raise SystemExit(
-            '--dagger-dataset-root needs a task prompt to label the corrections with; pass '
+            'A correction dataset needs a task prompt to label the corrections with; pass '
             '--task-prompt (the dataset has more than one task).'
         )
     live_frame_emitter = LiveFrameEmitter(interval=int(args.live_frame_interval))
@@ -6401,12 +6439,48 @@ def run_inference(args: argparse.Namespace) -> int:
                 'void_trial=stdin `void` immediate_halt=SIGINT'
             )
 
+            # The funnel steps of the trial in progress, held until the loop has graded it.
+            grasp_segment: dict[str, DaggerFrameBuffer | None] = {'buffer': None}
+
             def run_grasp_trial(trial: int, handover: GraspHandover) -> str:
                 move_to_robot_init_state_if_requested(robot, robot_init_state)
                 trace = RolloutGeometryTrace(trial + 1, trace_dir=rollout_trace_dir)
-                status = run_policy_rollout(trace=trace, grasp_handover=handover)
+                grasp_segment['buffer'] = (
+                    DaggerFrameBuffer(
+                        max_frames=int(args.dagger_max_buffered_frames),
+                        max_still_frames=int(args.dagger_max_still_frames),
+                    )
+                    if dagger_writer is not None
+                    else None
+                )
+                status = run_policy_rollout(
+                    trace=trace, grasp_handover=handover, dagger_buffer=grasp_segment['buffer']
+                )
                 trace.write()
                 return status
+
+            def keep_grasp_segment(trial: int, row: dict[str, Any]) -> dict[str, Any] | None:
+                # Only a held grasp is a demonstration of grasping: the funnel's steps into an
+                # empty close are steps a policy should not learn. Written here, after the loop
+                # has graded the lift, with the arm parked -- never inside the control loop.
+                buffer, grasp_segment['buffer'] = grasp_segment['buffer'], None
+                if dagger_writer is None or buffer is None:
+                    return None
+                if row.get('verdict') != 'held':
+                    print(
+                        f"[INFO] grasp_loop_dataset=discarded trial={trial} verdict={row.get('verdict')} "
+                        f'frames={buffer.frame_count}'
+                    )
+                    return {'kept': False, 'frames': buffer.frame_count}
+                first_episode = int(dagger_dataset_handle.meta.total_episodes)
+                started = time.perf_counter()
+                written = dagger_writer.write(buffer, rollout_index=trial)
+                return {
+                    'kept': True,
+                    'firstEpisode': first_episode,
+                    **written,
+                    'writeS': round(time.perf_counter() - started, 1),
+                }
 
             run_grasp_loop(
                 robot,
@@ -6419,6 +6493,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 void_requested=control.void_requested,
                 clear_void=control.clear_void,
                 notify=command_notifier(grasp_loop_notify_command(args.grasp_loop_notify_cmd)),
+                keep_policy_segment=keep_grasp_segment,
             )
         else:
             move_to_robot_init_state_if_requested(robot, robot_init_state)

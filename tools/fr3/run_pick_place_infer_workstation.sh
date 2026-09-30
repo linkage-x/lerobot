@@ -16,6 +16,7 @@
 #     FR3_GRASP_LOOP_TRIALS (40), FR3_GRASP_LOOP_MASK, FR3_GRASP_LOOP_OUT, FR3_GRASP_LOOP_ATTENDED=1
 #     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
+#     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
 #   place it elsewhere): expert spans and the handback gap in mm, the number to read before the
@@ -445,6 +446,8 @@ case "$mode" in
     if [[ "${FR3_GRASP_LOOP_ATTENDED-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-attended); fi
     # v14 step 4: carry each held grasp into the hole (blank = grasp only, as steps 1-2).
     if [[ -n "${FR3_GRASP_LOOP_INSERT_POSE-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-pose "${FR3_GRASP_LOOP_INSERT_POSE}"); fi
+    # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).
+    if [[ -n "${FR3_GRASP_LOOP_DATASET_ROOT-}" ]]; then grasp_loop_args+=(--grasp-loop-dataset-root "${FR3_GRASP_LOOP_DATASET_ROOT}"); fi
     announce
     echo "[INFO] grasp_loop out=${grasp_loop_out} stop_at_trial_boundary=\`touch ${grasp_loop_out%.jsonl}.STOP\`"
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi

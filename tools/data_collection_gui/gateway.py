@@ -6254,6 +6254,7 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         runtime_options=runtime_options,
         trace_dir=trace_dir,
         dagger_dataset_fallback=dagger_fallback,
+        funnel_dataset_fallback=rollout_backend.funnel_dataset_dir(state.repo_root, checkpoint_id),
         base_env=_tool_env(state.repo_root),
     )
 

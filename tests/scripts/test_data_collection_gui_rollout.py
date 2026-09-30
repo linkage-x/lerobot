@@ -4200,3 +4200,25 @@ def test_the_page_voids_only_a_trial_in_flight(tmp_path: Path):
     assert state.rollout.graspLoop["trials"][0]["verdict"] == "voided"
     with pytest.raises(ValueError):
         gateway._send_rollout_control(state, "grasp_void")
+
+
+def test_recording_the_funnel_goes_to_the_checkpoints_own_funnel_dataset(tmp_path: Path):
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": True})
+    assert options == {"FR3_GRASP_LOOP_DATASET_ROOT": ""}
+    assert rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": False}) == {}
+    fallback = rollout_backend.funnel_dataset_dir(tmp_path, "job_a/020000")
+    # Beside the operator's corrections, never in them: both are is_intervention.
+    assert fallback == tmp_path / "outputs" / "datasets" / "funnel_job_a_020000"
+    assert fallback != rollout_backend.dagger_dataset_dir(tmp_path, "job_a/020000")
+    _, env = _command(tmp_path, mode="grasp_loop", runtime_options=options, funnel_dataset_fallback=fallback)
+    assert env["FR3_GRASP_LOOP_DATASET_ROOT"] == str(fallback)
+
+
+def test_the_funnel_is_not_recorded_unless_the_page_asks(tmp_path: Path):
+    _, env = _command(
+        tmp_path,
+        mode="grasp_loop",
+        base_env={"FR3_GRASP_LOOP_DATASET_ROOT": "/somewhere/left/in/a/shell"},
+        funnel_dataset_fallback=tmp_path / "f",
+    )
+    assert "FR3_GRASP_LOOP_DATASET_ROOT" not in env

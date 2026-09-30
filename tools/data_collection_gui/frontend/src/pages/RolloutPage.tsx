@@ -139,6 +139,7 @@ export function RolloutPage() {
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
+  const [graspLoopRecord, setGraspLoopRecord] = useState(false);
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -252,6 +253,7 @@ export function RolloutPage() {
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
+      graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -285,7 +287,8 @@ export function RolloutPage() {
       graspLoopTrials,
       graspLoopAttended,
       graspLoopArms,
-      graspLoopInsertPose
+      graspLoopInsertPose,
+      graspLoopRecord
     ]
   );
 
@@ -437,6 +440,7 @@ export function RolloutPage() {
         // it does get is a sentence in the notice, since it is a second action source and the
         // subcard holding it can sit unscrolled-to.
         if (options.daggerTakeover !== undefined) setDaggerTakeover(options.daggerTakeover);
+        if (options.graspLoopRecord !== undefined) setGraspLoopRecord(options.graspLoopRecord);
         if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
         if (options.daggerDatasetRoot !== undefined)
           setDaggerDatasetRoot(options.daggerDatasetRoot);
@@ -1296,6 +1300,19 @@ export function RolloutPage() {
             <p className="hint">
               B 臂：策略把夹爪带到销上方 6 cm（或策略自己要合手）时，漏斗接管——先水平对准复位时记下的销位，
               误差 ≤ 8 mm 且停稳后竖直降到合手高度（dz −6 mm），停稳再合手。A、B 按随机配对交错，判定方法完全相同。
+            </p>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopRecord}
+                onChange={(event) => setGraspLoopRecord(event.target.checked)}
+                disabled={isLive}
+              />
+              <span>录制漏斗数据：B 臂每次抓住后，把漏斗接管的那段存成一条训练数据（DAgger，is_intervention=1）</span>
+            </label>
+            <p className="hint">
+              写进 outputs/datasets/funnel_&lt;checkpoint&gt;，格式与该 checkpoint 的训练数据相同；没抓住的不存。
+              每条在插完、机械臂停稳后写入，约多几秒。
             </p>
           </div>
         )}

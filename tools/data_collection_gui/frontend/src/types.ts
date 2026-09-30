@@ -1645,6 +1645,8 @@ export type RolloutRuntimeOptions = {
   graspLoopArms?: "A" | "B" | "AB";
   /** v14 step 4: "x,y,z" of the hole each held grasp is carried into. Blank: grasp only. */
   graspLoopInsertPose?: string;
+  /** Record arm B's funnel steps (held grasps only) into the checkpoint's funnel_ dataset. */
+  graspLoopRecord?: boolean;
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.
