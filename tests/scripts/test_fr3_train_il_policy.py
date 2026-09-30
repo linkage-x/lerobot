@@ -1182,3 +1182,19 @@ def test_a_merged_views_own_not_for_training_marks_become_its_training_episodes(
     (root / "meta" / "gui_annotations.json").write_text(json.dumps(store), encoding="utf-8")
     with pytest.raises(ValueError, match="has 6"):
         fr3_train_il_policy.view_training_episodes(root)
+
+
+def test_checkpoints_are_not_uploaded_to_wandb_unless_asked(tmp_path):
+    root = tmp_path / "view"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text(json.dumps({"total_episodes": 2, "features": {}}), encoding="utf-8")
+    config_path = tmp_path / "train.json"
+
+    fr3_train_il_policy.make_train_config(_args(policy="act", wandb=True), root, "local/v", config_path)
+    assert json.loads(config_path.read_text(encoding="utf-8"))["wandb"]["disable_artifact"] is True
+
+    parser = fr3_train_il_policy.build_arg_parser()
+    args = parser.parse_args(["--no-wandb-disable-artifact"])
+    args.policy = "act"
+    fr3_train_il_policy.make_train_config(args, root, "local/v", config_path)
+    assert json.loads(config_path.read_text(encoding="utf-8"))["wandb"]["disable_artifact"] is False

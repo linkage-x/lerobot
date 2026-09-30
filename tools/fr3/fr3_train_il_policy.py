@@ -1778,7 +1778,8 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
         "save_checkpoint": True,
         "save_freq": args.save_freq,
         "tolerance_s": args.tolerance_s,
-        "wandb": {"enable": args.wandb},
+        # Checkpoints stay on disk only: see --wandb-disable-artifact.
+        "wandb": {"enable": args.wandb, "disable_artifact": bool(args.wandb_disable_artifact)},
         "wandb_log_images_n_steps": args.wandb_log_images_n_steps,
         "wandb_log_images_n_samples": args.wandb_log_images_n_samples,
     }
@@ -2296,6 +2297,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-project", default="lerobot")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
+    parser.add_argument(
+        "--wandb-disable-artifact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Do not upload each saved checkpoint to W&B as a model artifact (on by default, the "
+            "operator's call on 09-30: a pi0.5 LoRA pretrained_model is ~107 MB a save, six a run, "
+            "each also staged under ~/.local/share/wandb, and the checkpoints are on disk "
+            "already). Metrics are logged either way."
+        ),
+    )
     parser.add_argument("--wandb-log-images-n-steps", type=int, default=0)
     parser.add_argument("--wandb-log-images-n-samples", type=int, default=2)
     parser.add_argument("--use-imagenet-stats", action=argparse.BooleanOptionalAction, default=True)
@@ -2496,6 +2508,9 @@ def main() -> None:
         append_resume_override(cmd, "--log-freq", "log_freq", args.log_freq)
         append_resume_override(cmd, "--save-freq", "save_freq", args.save_freq)
         append_resume_override(cmd, "--wandb-log-images-n-steps", "wandb_log_images_n_steps", args.wandb_log_images_n_steps)
+        # Always, not only when supplied: a run saved before this default existed would resume
+        # uploading its checkpoints again.
+        cmd.append(f"--wandb.disable_artifact={'true' if args.wandb_disable_artifact else 'false'}")
         append_resume_override(
             cmd,
             "--wandb-log-images-n-samples",

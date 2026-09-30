@@ -186,6 +186,7 @@ WandB arguments:
 | `--wandb-mode` | unset | WandB mode: `online`, `offline`, or `disabled`. Use `offline` for local logging and later sync. |
 | `--wandb-project` | `lerobot` | WandB project name. |
 | `--wandb-entity` | unset | Optional WandB user or team entity. |
+| `--wandb-disable-artifact` / `--no-wandb-disable-artifact` | on | Do not upload saved checkpoints to WandB as model artifacts (default since 2026-09-30, to save space: a pi0.5 LoRA checkpoint is ~107 MB per save and is already on disk). Metrics are still logged. Also applied on `--resume`. |
 | `--wandb-log-images-n-steps` | `0` | Number of random training steps at which to log raw observation images. `0` disables image logging. |
 | `--wandb-log-images-n-samples` | `2` | Number of batch samples to log per selected image-log step. |
 
