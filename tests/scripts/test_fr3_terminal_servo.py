@@ -24,6 +24,7 @@ from tools.fr3.terminal_servo import (
     terminal_servo_arming,
     terminal_servo_search_offsets,
     terminal_servo_search_path,
+    terminal_servo_search_sequence,
     terminal_servo_waypoints,
     validate_terminal_servo_trajectory,
 )
@@ -613,6 +614,44 @@ def test_a_hole_in_the_band_the_outer_ring_misses_seats_on_the_inner_one():
         if seats:
             assert 1 <= result["searchIndex"] <= 8
             assert result["searchOffsetMm"] == pytest.approx(3.5, abs=0.1)
+
+
+def test_a_search_order_lands_its_indices_first_and_still_covers_every_landing():
+    request = _searching(searchInnerRingM=0.0035, searchOrder=(8, 7, 6, 0))
+    sequence = terminal_servo_search_sequence(request)
+    offsets = terminal_servo_search_offsets(request)
+    assert [index for index, _ in sequence][:5] == [8, 7, 6, 0, 1]
+    assert sorted(index for index, _ in sequence) == list(range(17))
+    assert all(offset == offsets[index] for index, offset in sequence)
+    # Unset, it is the generated order every run before it used.
+    assert [index for index, _ in terminal_servo_search_sequence(_searching())] == list(range(9))
+
+
+def test_a_reordered_search_seats_on_its_first_landing_and_names_it_by_ring_index():
+    """The 09-29/30 seats clustered at idx 6-8; landing there first is one landing, not nine."""
+
+    request = _searching(searchInnerRingM=0.0035, searchOrder=(8, 7, 6))
+    dx, dy = terminal_servo_search_offsets(request)[8]
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + dx, SEATED[1] + dy), capture_m=0.0015)
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+    result = execute_terminal_servo(robot, request)
+    assert result["searchStoppedOn"] == "seated"
+    assert result["searchIndex"] == 8
+    assert result["searchTried"] == 1
+    assert result["searchAttempts"][0]["landing"] == 1
+    # Across before down: nothing below the handoff height was sent off the landing's xy.
+    low = [a for a in robot.actions if float(a["ee.z"]) < request.handoffZ - 0.001]
+    assert low and all(
+        math.hypot(float(a["ee.x"]) - (SEATED[0] + dx), float(a["ee.y"]) - (SEATED[1] + dy)) < 1e-4
+        for a in low
+    )
+
+
+def test_a_search_order_that_adds_or_repeats_a_landing_is_refused():
+    for order in ((17,), (8, 8), (-1,)):
+        with pytest.raises(TerminalServoError, match="searchOrder"):
+            validate_terminal_servo_trajectory(_searching(searchInnerRingM=0.0035, searchOrder=order))
 
 
 def test_an_inner_ring_not_inside_the_outer_one_is_refused():

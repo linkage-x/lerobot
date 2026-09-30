@@ -266,6 +266,16 @@ GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M = 0.012
 # caps in 5 trials, peaks -20 N) and the operator watched the peg lean further with each one.
 # Contact is still read off the lag, so a lower cap costs nothing but the press.
 GRASP_LOOP_INSERT_PRESS_CAP_N = 10.0
+# The order the insertion search lands in, as ring indices (0 the aim, 1-8 the 3.5 mm ring from
+# 22.5 deg in 45 deg steps, 9-16 the 7 mm ring from 0 deg); the rest follow in index order. With
+# the aim fixed on the hole (09-29 173506 + 09-30 084706, 53 pegs) the seats fell unevenly: idx
+# 8/7/6 (+3.2,-1.3 / +1.3,-3.2 / -1.3,-3.2) 10/9/8, the aim 7, idx 1 and 9 6 each, idx 5 3, idx
+# 14 1, and idx 2-4 (the +y side) 0 of 40 reached. Most-seated first. A seat's landing is only
+# ever tried earlier by this, so its landings under the new order are at most its position in
+# it: 7.2 landings a peg -> <= 4.3, seated within three 13 -> >= 27 of 53; fitted on either half
+# and scored on the other, <= 5.4 and <= 4.7. Assumes a landing's outcome does not depend on the
+# presses before it; first landings off the hole seated too (152430 x4, 163333 x3).
+GRASP_LOOP_INSERT_SEARCH_ORDER: tuple[int, ...] = (8, 7, 6, 0, 1, 9, 5, 14)
 
 
 @dataclass(frozen=True)
@@ -796,7 +806,8 @@ def insert_held_peg(
             return "open" if descent["searchStoppedOn"] == "seated" else False
         grade["answer"] = ask_grade(
             f"grade: trial {trial + 1} auto={grade['auto']} above_target_mm={above_mm:+.1f} "
-            f"search_index={int(descent.get('searchIndex') or 0)} -- is the peg in the hole? (in / out)"
+            f"search_index={int(descent.get('searchIndex') or 0)} "
+            f"landing={int(descent.get('searchTried') or 1)} -- is the peg in the hole? (in / out)"
         )
         # "open": let go with no re-grip in place; the next staging fetches it from the fixture.
         return "open" if grade["answer"] == "in" else False
@@ -830,6 +841,7 @@ def insert_held_peg(
         "stoppedAtXyz": [round(float(v), 5) for v in result["stoppedAtXyz"]],
         "landingXyz": [round(float(v), 5) for v in result.get("searchLandingXyz") or servo.xyz],
         "searchIndex": int(result.get("searchIndex") or 0),
+        "searchTried": int(result.get("searchTried") or int(result.get("searchIndex") or 0) + 1),
         "searchStoppedOn": result.get("searchStoppedOn"),
         "dfzPeakN": None if not peaks else round(min(peaks), 1),
         "pressCapped": bool(result.get("pressCapped", False)),

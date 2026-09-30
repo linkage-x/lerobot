@@ -667,7 +667,7 @@ def trial_trouble(descent: dict[str, Any], request: TerminalTrialsRequest) -> li
     """
 
     reasons = []
-    if int(descent.get("searchIndex") or 0) > 0:
+    if int(descent.get("searchTried") or int(descent.get("searchIndex") or 0) + 1) > 1:
         reasons.append("search")
     peaks = [attempt.get("dfzPeakN") for attempt in descent.get("searchAttempts") or []]
     peaks = [float(value) for value in peaks + [descent.get("dfzPeakN")] if value is not None]

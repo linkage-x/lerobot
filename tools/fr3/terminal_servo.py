@@ -230,6 +230,11 @@ class TerminalServoRequest:
     # because the 7 mm ring left the 2-5 mm band unreached: grasp-loop run 152430 put five pegs in
     # a row there, and every one of the nine landings stood on the face.
     searchInnerRingM: float = 0.0
+    # Which landings come first, as indices into `terminal_servo_search_offsets`; the ones it
+    # does not name follow in that order, so a reordered search still covers every landing.
+    # Empty keeps the generated order. It exists because a peg's seat is not spread evenly
+    # round the nominal pose -- see GRASP_LOOP_INSERT_SEARCH_ORDER for the evidence.
+    searchOrder: tuple[int, ...] = ()
     searchLiftM: float = TERMINAL_SERVO_SEARCH_LIFT_M
     searchSeatedM: float = TERMINAL_SERVO_SEARCH_SEATED_M
     searchSlipM: float = TERMINAL_SERVO_SEARCH_SLIP_M
@@ -396,6 +401,22 @@ def terminal_servo_search_offsets(
     return ((0.0, 0.0),) + inner + ring(request.searchRingM, 0.0)
 
 
+def terminal_servo_search_sequence(
+    request: TerminalServoRequest,
+) -> tuple[tuple[int, tuple[float, float]], ...]:
+    """The landings in the order they are tried: (index into the offsets, offset).
+
+    `searchOrder` first, then every landing it leaves out in the generated order. The index is
+    kept rather than the position so that `searchIndex` still names a place on the rings, which
+    is what every run before the reorder recorded and what an analysis compares.
+    """
+
+    offsets = terminal_servo_search_offsets(request)
+    first = tuple(int(index) for index in request.searchOrder if 0 <= int(index) < len(offsets))
+    rest = tuple(index for index in range(len(offsets)) if index not in first)
+    return tuple((index, offsets[index]) for index in first + rest)
+
+
 def terminal_servo_search_path(
     request: TerminalServoRequest,
     current_xyz: tuple[float, float, float],
@@ -463,6 +484,14 @@ def validate_terminal_servo_trajectory(
             f"searchInnerRingM {request.searchInnerRingM:.4f} must be inside searchRingM "
             f"{request.searchRingM:.4f}: it is the ring landed first, nearer the nominal pose."
         )
+    if request.searchOrder:
+        landings = len(terminal_servo_search_offsets(request))
+        bad = [index for index in request.searchOrder if not 0 <= int(index) < landings]
+        if bad or len(set(request.searchOrder)) != len(request.searchOrder):
+            raise TerminalServoError(
+                f"searchOrder {list(request.searchOrder)} must name distinct landings in "
+                f"0..{landings - 1}: it reorders the search, it cannot add to it."
+            )
     if request.searchRingM > 0.0:
         if request.searchPoints < 3:
             raise TerminalServoError(
@@ -702,7 +731,7 @@ def search_for_seat(
     """
 
     x, y, z = request.xyz
-    offsets = terminal_servo_search_offsets(request)
+    sequence = terminal_servo_search_sequence(request)
     attempts: list[dict[str, Any]] = []
     descent: dict[str, Any] = {}
     landing = (x, y, z)
@@ -713,9 +742,16 @@ def search_for_seat(
     # prove that to know what the return statement refers to.
     reading = "standing"
     index = 0
-    for index, (dx, dy) in enumerate(offsets):
+    tried = 0
+    for tried, (index, (dx, dy)) in enumerate(sequence, start=1):
         landing = (x + dx, y + dy, z)
-        if index:
+        if tried == 1 and (dx or dy):
+            # A reordered search starts off the nominal pose, and the arm is above that pose: go
+            # across at the height it is at, before the descent, like every other landing.
+            here, _rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+            _run_step(robot, request, f"search_transfer[{index}]", (landing[0], landing[1], float(here[2])),
+                      rotvec, gripper, tolerance_m=request.stepToleranceM)
+        if tried > 1:
             lifted_z = float(descent["stoppedAtXyz"][2]) + request.searchLiftM
             _run_step(robot, request, f"search_lift[{index}]", (previous[0], previous[1], lifted_z),
                       rotvec, gripper, tolerance_m=request.stepToleranceM)
@@ -732,6 +768,7 @@ def search_for_seat(
         attempts.append(
             {
                 "index": index,
+                "landing": tried,
                 "offsetMm": 1000.0 * math.hypot(dx, dy),
                 "landingXyz": list(landing),
                 "stoppedOn": descent["stoppedOn"],
@@ -743,10 +780,10 @@ def search_for_seat(
                 "verdict": reading,
             }
         )
-        if len(offsets) > 1:
+        if len(sequence) > 1:
             print(
                 f"[INFO] terminal_servo_search=landing request_id={request.requestId} "
-                f"index={index}/{len(offsets) - 1} offset_mm={1000.0 * math.hypot(dx, dy):.1f} "
+                f"index={index}/{len(sequence) - 1} landing={tried}/{len(sequence)} offset_mm={1000.0 * math.hypot(dx, dy):.1f} "
                 f"stopped_on={descent['stoppedOn']} above_target_mm={1000.0 * above_target_m:+.1f} "
                 f"settle_s={descent['settleSeconds']:.2f} settle_mm={descent['settleMm']:+.1f}",
                 flush=True,
@@ -772,7 +809,9 @@ def search_for_seat(
         "verdict": reading,
         "searchStoppedOn": verdict,
         "searchIndex": index,
-        "searchLandings": len(offsets),
+        # How many landings it took, which with `searchOrder` is no longer `searchIndex + 1`.
+        "searchTried": tried,
+        "searchLandings": len(sequence),
         "searchOffsetMm": 1000.0 * math.hypot(landing[0] - x, landing[1] - y),
         "searchLandingXyz": list(landing),
         "searchAttempts": attempts,

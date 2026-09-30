@@ -120,6 +120,7 @@ from tools.fr3.grasp_loop import (
     GRASP_LOOP_BLOCKED_MARGIN,
     GRASP_LOOP_HELD_WIDTH,
     GRASP_LOOP_INSERT_PRESS_CAP_N,
+    GRASP_LOOP_INSERT_SEARCH_ORDER,
     GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
     GRASP_LOOP_MAX_POLICY_STEPS,
     GRASP_LOOP_PICK_XYZ,
@@ -507,6 +508,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument('--grasp-loop-insert-ring', type=float, default=0.007)
     parser.add_argument('--grasp-loop-insert-inner-ring', type=float, default=0.0035)
+    parser.add_argument(
+        '--grasp-loop-insert-search-order',
+        default=','.join(str(index) for index in GRASP_LOOP_INSERT_SEARCH_ORDER),
+        help=(
+            'Comma-separated search landing indices to try first (0 the aim, 1-8 the inner ring, '
+            '9-16 the outer); the rest follow in index order. Blank lands in index order.'
+        ),
+    )
     parser.add_argument(
         '--grasp-loop-insert-follow-seat',
         action='store_true',
@@ -4992,6 +5001,9 @@ def run_inference(args: argparse.Namespace) -> int:
                         handoffZ=float(args.terminal_servo_handoff_z),
                         searchRingM=float(args.grasp_loop_insert_ring),
                         searchInnerRingM=float(args.grasp_loop_insert_inner_ring),
+                        searchOrder=tuple(
+                            int(part) for part in str(args.grasp_loop_insert_search_order).split(',') if part.strip()
+                        ),
                         stepToleranceM=GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
                         pressCapN=GRASP_LOOP_INSERT_PRESS_CAP_N,
                         controlPeriodS=1.0 / policy_fps,
@@ -5012,11 +5024,13 @@ def run_inference(args: argparse.Namespace) -> int:
             f'attended={grasp_loop_request.attended} '
             f'arms={grasp_loop_request.arms} '
             + (
-                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_follow_seat=%d '
+                'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_search_order=%s '
+                'insert_follow_seat=%d '
                 % (
                     *grasp_loop_request.insertServo.xyz,
                     grasp_loop_request.insertServo.searchRingM,
                     grasp_loop_request.insertServo.searchInnerRingM,
+                    ','.join(str(index) for index in grasp_loop_request.insertServo.searchOrder) or 'index',
                     int(grasp_loop_request.insertFollowSeat),
                 )
                 if grasp_loop_request.insertServo is not None
