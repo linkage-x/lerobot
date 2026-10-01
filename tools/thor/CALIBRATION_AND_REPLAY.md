@@ -92,6 +92,60 @@ UI 引导使用 ChArUco A 板：`charuco_400`、12 × 9 方格、方格边长 30
 
 ## 4. 自动单 AprilTag 标定流程
 
+### 4.1 在 Thor 本机记录示教位姿并自动采集
+
+当前分支已将旧 standalone 入口拆分为两个维护中的阶段。两步都在 Thor 桌面终端
+执行；`teaching` 不打开相机，只记录机器人位姿，`capture` 再自动执行这些位姿并由
+Thor GMSL2 recorder 采集视频。给每轮标定使用一个新的、相同的 `--key`：
+
+```bash
+cd /home/nvidia/lerobot
+
+# 1. 手动拖动 FR3；按 r 记录当前位姿，按 q 保存并退出。
+bash tools/thor/run_p0_two_marker_calibration_local.sh teaching \
+  --key p0_tag6_20260930 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+
+# 2. 自动执行刚才的位姿，同时让 Thor 多相机录制。
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_20260930 \
+  --max-records all \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+第一步保存到
+`outputs/datasets/p0_tag6_20260930/teaching_pose_records.json`。第二步默认保存合并数据集到
+`outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_20260930_merged/`。
+可先在任一命令末尾添加 `--dry-run`，只检查当前路径和最终命令，不连接硬件。
+第二步会真实移动机器人；执行前必须清空整个工作区、确认急停可用并全程看护。
+
+旧 standalone 标定保存在 `outputs/calibration/.../manual_run_*/captures.json`，而不是
+`outputs/datasets/<key>/teaching_pose_records.json`。其每条记录已有
+`joint_values_rad`，可直接作为自动执行输入。例如重放 2026-09-21 的 87 个采集姿态
+并重新录制相机：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_replay_20260921 \
+  --input-json outputs/calibration/p0_single_tag_camera_calibration/manual_run_20260921T071714Z/captures.json \
+  --max-records all \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+这里的 `--key` 是新输出的名称，`--input-json` 才是实际读取的旧示教轨迹。只有在
+机器人、标定板安装和工作区仍允许这些关节位姿安全执行时才能重放。
+
+`capture` 每次启动时读取 MAX96726 当前 locked IDs，默认排除 `cam_01`、`cam_04`
+和 `cam_10`，再把其余 locked cameras 写进临时 recorder config。它还会清除
+`DISPLAY/WAYLAND_DISPLAY`，强制 Argus 使用 headless EGL；否则 Thor 桌面或 X11
+环境可能导致所有相机依次报 `DRI3` / `NvBufSurfaceMapEglImage failed`。如需临时修改
+排除集合，可使用 `--exclude-camera-ids 1,4,10`。
+
+### 4.2 一键执行采集和完整解算
+
 需要重新采集机械臂携带的单 AprilTag，并执行完整内外参流程时，在开发机执行：
 
 ```bash
