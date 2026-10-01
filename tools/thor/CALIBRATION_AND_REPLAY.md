@@ -92,6 +92,150 @@ UI 引导使用 ChArUco A 板：`charuco_400`、12 × 9 方格、方格边长 30
 
 ## 4. 自动单 AprilTag 标定流程
 
+### 4.0 Capture session、续采和合并规则
+
+相机或 FR3 base 移动后必须开始新的布局世代；不同布局的数据绝对不能联合求解。
+同一布局内，每次 manual/automatic capture 是一个独立 session，可以显式联合。
+
+目录名
+`fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged`
+容易误解：`20260921` 表示机器人姿态来源；其相机视频和实测机器人 pose 实际在
+2026-10-01 17:02 重新采集，因此它是 10 月 1 日当前布局的 round 1，不是旧布局图像。
+
+需要带多相机画面、颜色提示以及每相机 `valid/target`、`remaining` 的手动续采时，
+在 Thor 桌面终端运行：
+
+```bash
+cd /home/nvidia/lerobot
+
+bash tools/thor/run_p0_two_marker_calibration_local.sh guided \
+  --dataset-root outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged \
+  --quality-summary outputs/calibration/p0_tag6_replay_20261001_extrinsics/summary.json \
+  --target-per-camera 30 \
+  --exclude-camera-ids 1,4,10 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+程序先把 round 1 的图像、实测 `T_base_ee` 和关节值导入一个新的
+`manual_run_*` session。`--quality-summary` 用上一轮求解的严格筛选数量初始化 UI；
+如果省略，则使用 AprilTag 实时检测数量。随后 `Enter` 追加一次同步
+图像和机器人状态；`q` 仅在每台相机达到 target 后求解；`f` 强制尝试；`Esc`
+保留已提交 capture 但不求解。求解使用已有 fisheye 内参、鲁棒离群点过滤和当前
+FR3 base；质量门通过后保存候选并自动生成 XY/XZ/YZ/XYZ 四视图。默认不会修改
+active；审核后显式增加 `--activate` 才更新 active calibration。
+
+审核候选 summary 和四视图后，可完全离线激活同一 session：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh solve \
+  --solve-run latest \
+  --activate
+```
+
+若进程中断，继续同一个 manual session，不要重新导入 round 1：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh guided \
+  --resume-run latest \
+  --target-per-camera 30 \
+  --exclude-camera-ids 1,4,10 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+如果第二轮也是自动回放采集，可在纯离线模式中显式决定是否合并。只用第二轮：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh calibrate \
+  --dataset-root outputs/datasets/ROUND2_MERGED
+```
+
+合并同一布局的 round 1 + round 2：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh calibrate \
+  --dataset-root outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged \
+  --dataset-root outputs/datasets/ROUND2_MERGED
+```
+
+重复 `--dataset-root` 就是显式选择合并；程序不会自动搜索或混入其他历史数据。
+导入来源会写入 `imported_datasets.json`，重复传入同一路径会跳过，原始数据集保持
+只读不变。
+
+### 4.1 在 Thor 本机记录示教位姿并自动采集
+
+当前分支已将旧 standalone 入口拆分为两个维护中的阶段。两步都在 Thor 桌面终端
+执行；`teaching` 不打开相机，只记录机器人位姿，`capture` 再自动执行这些位姿并由
+Thor GMSL2 recorder 采集视频。给每轮标定使用一个新的、相同的 `--key`：
+
+```bash
+cd /home/nvidia/lerobot
+
+# 1. 手动拖动 FR3；按 r 记录当前位姿，按 q 保存并退出。
+bash tools/thor/run_p0_two_marker_calibration_local.sh teaching \
+  --key p0_tag6_20260930 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+
+# 2. 自动执行刚才的位姿，同时让 Thor 多相机录制。
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_20260930 \
+  --max-records all \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+第二轮如果复用第一轮 teaching pose，但需要写入新的 capture session，使用新的
+`--key`，并把原 teaching JSON 作为 `--input-json`，避免覆盖第一轮：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_current_layout_round2 \
+  --input-json outputs/datasets/p0_tag6_current_layout_round1/teaching_pose_records.json \
+  --max-records all \
+  --exclude-camera-ids 1,4,10 \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+第一步保存到
+`outputs/datasets/p0_tag6_20260930/teaching_pose_records.json`。第二步默认保存合并数据集到
+`outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_20260930_merged/`。
+可先在任一命令末尾添加 `--dry-run`，只检查当前路径和最终命令，不连接硬件。
+第二步会真实移动机器人；执行前必须清空整个工作区、确认急停可用并全程看护。
+
+旧 standalone 标定保存在 `outputs/calibration/.../manual_run_*/captures.json`，而不是
+`outputs/datasets/<key>/teaching_pose_records.json`。其每条记录已有
+`joint_values_rad`，可直接作为自动执行输入。例如重放 2026-09-21 的 87 个采集姿态
+并重新录制相机：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_replay_20260921 \
+  --input-json outputs/calibration/p0_single_tag_camera_calibration/manual_run_20260921T071714Z/captures.json \
+  --max-records all \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+这里的 `--key` 是新输出的名称，`--input-json` 才是实际读取的旧示教轨迹。只有在
+机器人、标定板安装和工作区仍允许这些关节位姿安全执行时才能重放。
+
+`capture` 每次启动时读取 MAX96726 当前 locked IDs，默认排除 `cam_01`、`cam_04`
+和 `cam_10`，再把其余 locked cameras 写进临时 recorder config。它还会清除
+`DISPLAY/WAYLAND_DISPLAY`，强制 Argus 使用 headless EGL；否则 Thor 桌面或 X11
+环境可能导致所有相机依次报 `DRI3` / `NvBufSurfaceMapEglImage failed`。如需临时修改
+排除集合，可使用 `--exclude-camera-ids 1,4,10`。
+
+### 4.2 一键执行采集和完整解算
+
 需要重新采集机械臂携带的单 AprilTag，并执行完整内外参流程时，在开发机执行：
 
 ```bash
@@ -248,6 +392,33 @@ cd /home/nvidia/lerobot
 输入的时间对齐和开合时刻，但不能恢复未记录的原始夹爪控制指令。
 
 ## 8. 日志与常见检查
+
+如果 `guided` 启动时报
+`FrankaResearch3Config.__init__() got an unexpected keyword argument 'arm_start_controller_on_connect'`，
+说明引导脚本使用的示教选项尚未在 FR3 config/backend 中实现，或 Thor 上代码同步不完整。
+修复需同时包含 `src/lerobot/robots/franka_research3/` 下的
+`config_franka_research3.py`、`franka_research3.py` 和 `backends.py`：连接时不启动位置
+控制器，随后启动 panda_py 原生示教模式；关闭后台轮询时，每次采集仍读取更新后的
+关节状态，退出时停止原生示教控制器。不能只删除报错参数，否则会丢失这些示教行为。
+
+在开发机同步修复后的代码（仅同步，不重启网关）：
+
+```bash
+cd /home/corenetic/Code/lerobot
+bash run/deploy.sh thor --sync-only
+```
+
+该异常发生前导入的记录已经保存在日志中 `[RESUME] run=...` 指向的 session。
+在 Thor 上按第 4.0 节的续采命令重试，将 `--resume-run latest` 替换成该明确目录，
+不要再次传 `--dataset-root`。例如 2026-10-02 的报错日志对应：
+
+```text
+outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z
+```
+
+只在 FR3 base、固定相机和 EE tag 安装均未移动时续采。日志中的
+`cam_03: timed out waiting for Argus buffer` 是独立的相机问题；修复上述 Python
+异常后若它持续出现，按第 2 节恢复 Argus，再继续排查同步画面。
 
 每次硬件回放的日志位于：
 
