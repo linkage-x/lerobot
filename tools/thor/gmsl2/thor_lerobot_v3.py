@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tools.thor import fr3_data
+
 logger = logging.getLogger("thor_lerobot_v3")
 
 
@@ -1035,7 +1037,7 @@ def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
             "q01": empty, "q10": empty, "q50": empty, "q90": empty, "q99": empty,
         }
 
-    if width == 1:
+    if width == 1 and not hasattr(arr.type, "value_type"):
         np_arr = arr.combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
         np_arr = np_arr.reshape(n, 1)
     else:
@@ -1063,6 +1065,7 @@ def _rows_to_table(
     *,
     state_names: tuple[str, ...] | list[str] = BOX_STATE_NAMES,
     ts_names: tuple[str, ...] | list[str] = BOX_TIMESTAMP_NAMES,
+    fr3_enabled: bool = False,
 ):
     state_width = len(state_names)
     ts_width = len(ts_names)
@@ -1076,8 +1079,7 @@ def _rows_to_table(
             flat.extend(values)
         return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=dtype), width)
 
-    return pa.table(
-        [
+    columns = [
             vector_column("observation.state", state_width, pa.float32()),
             vector_column("box.timestamps", ts_width, pa.float64()),
             pa.array([row["timestamp"] for row in rows], type=pa.float32()),
@@ -1085,9 +1087,13 @@ def _rows_to_table(
             pa.array([row["episode_index"] for row in rows], type=pa.int64()),
             pa.array([row["index"] for row in rows], type=pa.int64()),
             pa.array([row["task_index"] for row in rows], type=pa.int64()),
-        ],
-        schema=_box_table_schema(pa, state_width=state_width, ts_width=ts_width),
-    )
+        ]
+    if fr3_enabled:
+        columns.extend(vector_column(key, width, getattr(pa, dtype)())
+                       for key, (dtype, width, _) in fr3_data.FR3_COLUMNS.items())
+    return pa.table(columns, schema=_box_table_schema(
+        pa, state_width=state_width, ts_width=ts_width, fr3_enabled=fr3_enabled,
+    ))
 
 
 def _box_table_schema(
@@ -1095,8 +1101,9 @@ def _box_table_schema(
     *,
     state_width: int = len(BOX_STATE_NAMES),
     ts_width: int = len(BOX_TIMESTAMP_NAMES),
+    fr3_enabled: bool = False,
 ):
-    return pa.schema([
+    fields = [
         ("observation.state", pa.list_(pa.float32(), state_width)),
         ("box.timestamps", pa.list_(pa.float64(), ts_width)),
         ("timestamp", pa.float32()),
@@ -1104,7 +1111,10 @@ def _box_table_schema(
         ("episode_index", pa.int64()),
         ("index", pa.int64()),
         ("task_index", pa.int64()),
-    ])
+    ]
+    if fr3_enabled:
+        fields.extend(fr3_data.schema_fields(pa))
+    return pa.schema(fields)
 
 
 def _box_features(
@@ -1256,7 +1266,6 @@ class Lr3Writer:
         fps: int,
         world_frame: dict[str, Any] | None = None,
         fr3_enabled: bool = False,
-        camera_roles: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -1265,14 +1274,13 @@ class Lr3Writer:
         self.repo_id = repo_id
         self.task = task
         self.fps = int(fps)
+        self.fr3_enabled = bool(fr3_enabled)
         # Which world the poses derived from this dataset will live in. Written
         # straight through to meta/info.json; see tools/thor/gmsl2/world_provenance.py
         # for why the recorder resolves it rather than being told. None only for
         # callers outside the recorder (tests, one-off conversions), where it is
         # recorded as an explicit "unstamped" rather than omitted.
         self.world_frame = dict(world_frame) if world_frame else None
-        self.fr3_enabled = fr3_enabled
-        self.camera_roles = camera_roles
         self.pa = pa
         self.pq = pq
         self.data_dir = dataset_root / "data" / "chunk-000"
@@ -1311,7 +1319,8 @@ class Lr3Writer:
         pts_offset_s: float | None = None,
         frame_times_s: list[float | None] | None = None,
         fr3_samples: list[dict[str, Any]] | None = None,
-        t0_mono_s: float = 0.0,
+        t0_mono_s: float | None = None,
+        n_frames: int | None = None,
     ) -> Path | None:
         if self._closed:
             raise RuntimeError("cannot append to a closed Lr3Writer")
@@ -1340,19 +1349,44 @@ class Lr3Writer:
             box_ids=box_ids,
             frame_times_s=frame_times_s,
         )
+        # The online-sync accepted camera count wins over rounded duration or
+        # the low-rate BOX snapshot count. This also allows camera+FR3 capture
+        # to retain an explicit zero BOX observation when BOX samples are absent.
+        count = n_frames if n_frames is not None else len(rows)
+        if self.fr3_enabled and n_frames is None and not rows and frame_times_s is not None:
+            count = len(frame_times_s)
+        if count < 0:
+            raise ValueError("n_frames must be non-negative")
+        rows = rows[:count]
+        while len(rows) < count:
+            frame = len(rows)
+            rows.append({
+                "observation.state": list(rows[-1]["observation.state"]) if rows else [0.0] * len(state_names),
+                "box.timestamps": list(rows[-1]["box.timestamps"]) if rows else [0.0] * len(ts_names),
+                "timestamp": frame / max(self.fps, 1),
+                "frame_index": frame,
+                "episode_index": episode_index,
+                "index": self.total_frames + frame,
+                "task_index": 0,
+            })
+        if self.fr3_enabled:
+            aligned = fr3_data.align_fr3_samples(
+                fr3_samples, frame_times_s, t0_mono_s, n_frames=len(rows),
+            )
+            for row, robot_row in zip(rows, aligned, strict=True):
+                row.update(robot_row)
         if not rows:
             return None
-
-        table = _rows_to_table(self.pa, rows, state_names=state_names, ts_names=ts_names)
-        if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import append_fr3_columns
-            table = append_fr3_columns(self.pa, table, fr3_samples or [], frame_times_s or [],
-                                       t0_mono_s=t0_mono_s)
 
         if self._writer is None:
             self.state_names = state_names
             self.ts_names = ts_names
-            self._schema = table.schema
+            self._schema = _box_table_schema(
+                self.pa,
+                state_width=len(self.state_names),
+                ts_width=len(self.ts_names),
+                fr3_enabled=self.fr3_enabled,
+            )
             self._writer = self.pq.ParquetWriter(
                 self.data_path,
                 schema=self._schema,
@@ -1360,6 +1394,10 @@ class Lr3Writer:
                 use_dictionary=True,
             )
 
+        table = _rows_to_table(
+            self.pa, rows, state_names=self.state_names, ts_names=self.ts_names,
+            fr3_enabled=self.fr3_enabled,
+        )
         self._writer.write_table(table)
         n_rows = table.num_rows
         start = self.total_frames
@@ -1417,9 +1455,8 @@ class Lr3Writer:
             "task_index": _table_column_stats(table, "task_index", width=1),
         }
         if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
-            stats.update({key: _table_column_stats(table, key, width=len(names))
-                          for key, names in FR3_FEATURE_NAMES.items()})
+            stats.update({key: _table_column_stats(table, key, width=width)
+                          for key, (_, width, _) in fr3_data.FR3_COLUMNS.items()})
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_episodes(self) -> None:
@@ -1464,10 +1501,7 @@ class Lr3Writer:
             },
         }
         if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import fr3_features
-            info["features"].update(fr3_features())
-        if self.camera_roles is not None:
-            info["camera_roles"] = self.camera_roles
+            info["features"].update(fr3_data.features())
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
     def _write_tasks(self) -> None:
@@ -1491,13 +1525,11 @@ def open_box_lerobot_v3_writer(
     fps: int,
     world_frame: dict[str, Any] | None = None,
     fr3_enabled: bool = False,
-    camera_roles: dict[str, Any] | None = None,
 ) -> Lr3Writer | None:
     try:
         return Lr3Writer(
             dataset_root, repo_id=repo_id, task=task, fps=fps, world_frame=world_frame,
             fr3_enabled=fr3_enabled,
-            camera_roles=camera_roles,
         )
     except ImportError:
         return None

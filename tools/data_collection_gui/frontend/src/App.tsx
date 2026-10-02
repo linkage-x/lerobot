@@ -75,8 +75,8 @@ const workstationPageIds = new Set<PageId>([
   "dataset-export"
 ]);
 
-function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation", hasFr3 = false): boolean {
-  return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation" || hasFr3;
+function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
+  return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation";
 }
 const navPageLabels: Partial<Record<PageId, string>> = {
   dashboard: "Overview"
@@ -123,7 +123,7 @@ function App() {
   useEffect(() => {
     if (!snapshot) return;
     const profile = snapshot.deployment?.profile ?? "thor";
-    if (!pageAllowedForProfile(activePage, profile, snapshot.deployment?.capabilities.includes("fr3_bridge"))) {
+    if (!pageAllowedForProfile(activePage, profile)) {
       const fallback = (snapshot.deployment?.defaultRoute as PageId) ?? "live-record";
       window.location.hash = fallback;
       setActivePage(fallback);
@@ -256,6 +256,8 @@ function App() {
         onConnect={(backend, laserTracker) => run(() => api.connectRecording(backend, laserTracker))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
+        onStartFr3={() => run(() => api.startFr3Teleop())}
+        onStopFr3={() => run(() => api.stopFr3Teleop())}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
         onQueueTrajGen={() => queueTrajGenAndOpenProcessing(firstMissingPath)}
         onGoToProcessing={() => navigate("dataset-processing")}
@@ -425,7 +427,7 @@ function SidebarNav({
   const caliBadge = calibrationNavBadge();
   const profile = snapshot.deployment?.profile ?? "thor";
   const visibleNavGroups = navGroups
-    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile, snapshot.deployment?.capabilities.includes("fr3_bridge"))) }))
+    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile)) }))
     .filter((group) => group.ids.length > 0);
 
   const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;

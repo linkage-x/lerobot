@@ -134,6 +134,15 @@ export type RecordingStatus = {
   laserTrackerBeamBroken?: boolean;
 };
 
+/** FR3 motion belongs to the BOX recorder session and starts only on F. */
+export type Fr3TeleopStatus = {
+  enabled: boolean;
+  state: "idle" | "starting" | "moving_to_start" | "running" | "stopping" | "error";
+  message: string;
+  telemetry: Record<string, unknown>;
+  pid?: number | null;
+};
+
 export type MarkerTcpSample = {
   id: string;
   side: "left" | "right" | string;
@@ -211,26 +220,6 @@ export type TeleopStatus = {
   command?: string[];
   realRobotReady?: boolean;
   cameraViews?: TeleopCameraView[];
-  inputSource?: string;
-  wristCamera?: {
-    state: "pending" | "unconfigured" | "resolved" | "missing" | "ambiguous";
-    camera: string | null;
-    message: string;
-    selector: { serial: string; sensor_id: number | null };
-  };
-  telemetry?: {
-    q?: number[];
-    dq?: number[];
-    tau_J?: number[];
-    tau_ext_hat_filtered?: number[];
-    O_T_EE?: number[];
-    O_F_ext_hat_K?: number[];
-    measured_tcp?: number[];
-    control_command_success_rate?: number;
-    round_trip_ms?: number;
-    clock_uncertainty_s?: number;
-    gripper_measured_m?: number;
-  };
 };
 
 export type ReplayStatus = {

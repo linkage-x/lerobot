@@ -65,13 +65,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.thor.gmsl2.camera_roles import wrist_camera_names  # noqa: E402
-
 # pyarrow-only helpers shared with the recorder's box v3 writer.
 from tools.thor.gmsl2 import (  # noqa: E402
     thor_lerobot_v3 as lr3,
     world_provenance as wp,
 )
+from tools.thor import fr3_data  # noqa: E402
 
 _CHUNKS_SIZE = 1000
 _DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
@@ -211,7 +210,6 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
     if not parquet.is_file():
         return {}
     import pyarrow.parquet as pq
-    from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
 
     cols = pq.read_table(str(parquet)).to_pydict()
     by_ep: dict[int, list[dict[str, Any]]] = {}
@@ -223,13 +221,35 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
         }
         if "box.timestamps" in cols:
             row["box.timestamps"] = [float(v) for v in cols["box.timestamps"][i]]
-        for key in FR3_FEATURE_NAMES:
-            if key in cols:
-                row[key] = [float(v) for v in cols[key][i]]
+        if "fr3.valid" in cols:
+            for key in fr3_data.FR3_COLUMNS:
+                if key in cols:
+                    row[key] = cols[key][i]
         by_ep.setdefault(ep, []).append(row)
     for rows in by_ep.values():
         rows.sort(key=lambda r: r["frame_index"])
     return by_ep
+
+
+def _fr3_enabled(meta: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    block = meta.get("fr3_teleop")
+    return bool(isinstance(block, dict) and block.get("enabled")) or any("fr3.valid" in row for row in rows)
+
+
+def _fr3_rows_for_episode(
+    ep_dir: Path, meta: dict[str, Any], rows: list[dict[str, Any]], n_frames: int,
+) -> list[dict[str, list[float]]]:
+    # The recorder already used the actual camera times. Preserve that pairing
+    # by frame index, including its invalid rows and its seven-value action.
+    if any("fr3.valid" in row for row in rows):
+        return fr3_data.align_fr3_rows_by_frame_index(rows, n_frames)
+    block = meta.get("fr3_teleop") or {}
+    sync = meta.get("sync_reference") or {}
+    origin = block.get("t0_mono_s", sync.get("t0_mono_s"))
+    camera_times = lr3.camera_frame_times_rel(ep_dir, origin)
+    return fr3_data.align_fr3_samples(
+        fr3_data.load_fr3_samples(ep_dir), camera_times, origin, n_frames=n_frames,
+    )
 
 
 def _touch_sensor_key(sensor_id: str) -> str | None:
@@ -878,7 +898,6 @@ class _V3Writer:
         touch_width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
         world_frame: dict[str, Any] | None = None,
         fr3_enabled: bool = False,
-        camera_roles: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -900,8 +919,7 @@ class _V3Writer:
         self.touch_columns = list(touch_columns or [])
         self.touch_width = int(touch_width)
         self.world_frame = dict(world_frame) if world_frame else None
-        self.fr3_enabled = fr3_enabled
-        self.camera_roles = camera_roles
+        self.fr3_enabled = bool(fr3_enabled)
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -922,9 +940,7 @@ class _V3Writer:
             if not self.fr3_enabled:
                 fields.append(("action", pa.list_(pa.float32(), self.state_width)))
         if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
-            fields.extend((key, pa.list_(pa.float64() if key == "fr3.timestamps" else pa.float32(), len(names)))
-                          for key, names in FR3_FEATURE_NAMES.items())
+            fields.extend(fr3_data.schema_fields(pa))
         if self.ts_width > 0:
             fields.append(("box.timestamps", pa.list_(pa.float64(), self.ts_width)))
         for pose_col in self.pose_columns:
@@ -951,7 +967,7 @@ class _V3Writer:
         ts_rows: list[list[float]] | None = None,
         pose_rows: dict[str, list[list[float]]] | None = None,
         touch_rows: dict[str, list[list[float]]] | None = None,
-        fr3_rows: dict[str, list[list[float]]] | None = None,
+        fr3_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         start = self.total_frames
         cols: dict[str, list[Any]] = {
@@ -966,9 +982,11 @@ class _V3Writer:
             if not self.fr3_enabled:
                 cols["action"] = action_rows or [[0.0] * self.state_width] * n_frames
         if self.fr3_enabled:
-            if fr3_rows is None or any(len(rows) != n_frames for rows in fr3_rows.values()):
-                raise ValueError("FR3 export requires recorder-aligned columns for every camera frame")
-            cols.update(fr3_rows)
+            if fr3_rows is None:
+                fr3_rows = [fr3_data.empty_fr3_row() for _ in range(n_frames)]
+            if len(fr3_rows) != n_frames:
+                raise ValueError(f"FR3 row count mismatch: {len(fr3_rows)} != {n_frames}")
+            cols.update(fr3_data.columns_from_rows(fr3_rows))
         if self.ts_width > 0:
             cols["box.timestamps"] = ts_rows or [[0.0] * self.ts_width] * n_frames
         pose_rows = pose_rows or {}
@@ -1025,13 +1043,13 @@ class _V3Writer:
         if self.state_width > 0:
             names = self.state_names if self.state_names and len(self.state_names) == self.state_width else None
             features["observation.state"] = lr3._feature("float32", [self.state_width], names)
-            features["action"] = lr3._feature("float32", [self.state_width], names)
+            if not self.fr3_enabled:
+                features["action"] = lr3._feature("float32", [self.state_width], names)
+        if self.fr3_enabled:
+            features.update(fr3_data.features())
         if self.ts_width > 0:
             ts_names = self.ts_names if self.ts_names and len(self.ts_names) == self.ts_width else None
             features["box.timestamps"] = lr3._feature("float64", [self.ts_width], ts_names)
-        if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import fr3_features
-            features.update(fr3_features())
         for pose_col in self.pose_columns:
             features[pose_col.key] = _pose_feature()
         touch_names = [f"taxel_{i:03d}" for i in range(self.touch_width)]
@@ -1083,16 +1101,15 @@ class _V3Writer:
             stats["observation.state"] = lr3._table_column_stats(table, "observation.state", width=self.state_width)
             if not self.fr3_enabled:
                 stats["action"] = lr3._table_column_stats(table, "action", width=self.state_width)
+        if self.fr3_enabled:
+            stats.update({key: lr3._table_column_stats(table, key, width=width)
+                          for key, (_, width, _) in fr3_data.FR3_COLUMNS.items()})
         if self.ts_width > 0:
             stats["box.timestamps"] = lr3._table_column_stats(table, "box.timestamps", width=self.ts_width)
         for pose_col in self.pose_columns:
             stats[pose_col.key] = _pose_table_column_stats(table, pose_col.key)
         for column, _, _ in self.touch_columns:
             stats[column] = lr3._table_column_stats(table, column, width=self.touch_width)
-        if self.fr3_enabled:
-            from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
-            stats.update({key: lr3._table_column_stats(table, key, width=len(names))
-                          for key, names in FR3_FEATURE_NAMES.items()})
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_info(self) -> None:
@@ -1122,8 +1139,6 @@ class _V3Writer:
                 ),
             },
         }
-        if self.camera_roles is not None:
-            info["camera_roles"] = self.camera_roles
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
 
@@ -1154,6 +1169,13 @@ def export_task_to_v3(
     if not episodes:
         raise RuntimeError(f"Sessions for '{name}' contain no episodes")
     _emit(f"Export plan: {len(episodes)} episodes from {len(sessions)} session(s) -> {repo_id}")
+
+    box_cache = {session: _load_box_rows(session) for session in sessions}
+    fr3_modes = {_fr3_enabled(_load_meta(src.ep_dir), box_cache[src.session_dir].get(src.local_index, []))
+                 for src in episodes}
+    if len(fr3_modes) > 1:
+        raise RuntimeError("Cannot mix FR3-enabled and BOX-only episodes in one export; choose separate task datasets")
+    fr3_enabled = True in fr3_modes
 
     out_root = exports_root / export_name
     if out_root.exists():
@@ -1261,19 +1283,6 @@ def export_task_to_v3(
             "provenance and their absolute poses are not comparable across sessions"
         )
 
-    fr3_modes = {bool((_load_meta(src.ep_dir).get("fr3_teleop") or {}).get("enabled")) for src in episodes}
-    if len(fr3_modes) > 1:
-        raise ValueError("Cannot combine FR3 teleoperation and BOX-only episodes in one export")
-    fr3_enabled = True in fr3_modes
-    wrist_names = wrist_camera_names(first_meta)
-    for src in episodes:
-        source_meta = _load_meta(src.ep_dir)
-        if [c for c, _ in _camera_entries(source_meta, src.ep_dir)] == camera_keys:
-            if wrist_camera_names(source_meta) != wrist_names:
-                raise ValueError(
-                    "Cannot combine episodes with different wrist camera roles on the same video keys; "
-                    "use separate tasks/exports for different camera layouts"
-                )
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
@@ -1291,10 +1300,8 @@ def export_task_to_v3(
         touch_width=touch_width,
         world_frame=source_world_frame,
         fr3_enabled=fr3_enabled,
-        camera_roles=first_meta.get("camera_roles"),
     )
 
-    box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
     sources: list[dict[str, Any]] = []
     global_index = 0
     for src in episodes:
@@ -1355,15 +1362,6 @@ def export_task_to_v3(
                 )
                 continue
 
-        fr3_rows = None
-        if fr3_enabled:
-            from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
-            by_frame = {int(row["frame_index"]): row for row in box_cache[src.session_dir].get(src.local_index, [])}
-            if not by_frame or any(key not in row for row in by_frame.values() for key in FR3_FEATURE_NAMES):
-                raise ValueError(f"FR3 columns missing from recorder parquet: {src.ep_dir}")
-            fr3_rows = {key: [by_frame[i][key] if i in by_frame else [0.0] * len(names)
-                              for i in range(n_frames)] for key, names in FR3_FEATURE_NAMES.items()}
-
         # Transcode each camera's clip to a per-episode CFR H.264 mp4 (PTS=i/fps).
         # Cameras are independent nvv4l2 jobs, so run them concurrently (the
         # recorder already drives 10+ parallel nvv4l2 streams) — this is the main
@@ -1394,6 +1392,9 @@ def export_task_to_v3(
         )
         if not touch_samples_found:
             _emit(f"  note: {src.ep_dir.name} has no box_sensors.jsonl touch arrays; exported touch columns are zero-filled")
+        fr3_rows = _fr3_rows_for_episode(
+            src.ep_dir, meta, box_cache[src.session_dir].get(src.local_index, []), n_frames,
+        ) if fr3_enabled else None
         writer.append_episode(
             episode_index=global_index,
             n_frames=n_frames,
@@ -1415,8 +1416,6 @@ def export_task_to_v3(
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
-                "camera_roles": meta.get("camera_roles"),
-                "camera_identity": meta.get("camera_identity"),
             }
         )
         _emit(f"Episode {global_index} written ({n_frames} frames) from {src.session_dir.name}/{src.ep_dir.name}")

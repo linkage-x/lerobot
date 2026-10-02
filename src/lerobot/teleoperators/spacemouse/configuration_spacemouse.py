@@ -73,6 +73,10 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     bias_sample_sleep_s: float = 0.005
     enable_rotation: bool = True
     motion_enable_button: SpaceMouseEnableButton = SpaceMouseEnableButton.NONE
+    # Optional HID report freshness guard. Neutral idle reports can stop;
+    # nonzero motion must have recent HID input; stale buttons stop updating
+    # the gripper without interrupting otherwise idle arm control.
+    motion_input_timeout_s: float | None = None
     tool_mode: SpaceMouseToolMode = SpaceMouseToolMode.INCREMENTAL
     initial_gripper: float = 1.0
     incremental_step: float = 0.02

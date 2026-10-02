@@ -68,6 +68,7 @@ class FrankaResearch3(Robot):
         self._arm = None
         self._gripper = None
         self._kinematics = None
+        self._prepared_kinematics = None
         self._otg = None
         self._is_connected = False
         self._gripper_is_mock = False
@@ -318,17 +319,26 @@ class FrankaResearch3(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
-        arm = self.arm_driver_cls(
+        arm_kwargs = dict(
             robot_ip=self.config.robot_ip,
             damping=self.config.damping,
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
             start_controller_on_connect=self.config.arm_start_controller_on_connect,
             state_poll_frequency_hz=self.config.arm_state_poll_frequency_hz,
-            **({"realtime_enforce": True} if self.config.arm_realtime_enforce else {}),
         )
+        if self.config.arm_realtime_enforce:
+            arm_kwargs["realtime_enforce"] = True
+        if self.config.arm_require_no_automatic_recovery:
+            arm_kwargs["require_no_automatic_recovery"] = True
+            arm_kwargs["joint_position_min"] = self.config.otg_min_position
+            arm_kwargs["joint_position_max"] = self.config.otg_max_position
+        arm = self.arm_driver_cls(**arm_kwargs)
         gripper = None
-        kinematics = self._make_kinematics_driver()
+        kinematics = self._prepared_kinematics
+        self._prepared_kinematics = None
+        if kinematics is None:
+            kinematics = self._make_kinematics_driver()
         otg = None
         connected_cameras = []
 
@@ -395,7 +405,7 @@ class FrankaResearch3(Robot):
         self._otg = otg
         self._is_connected = True
         self.reset_capture_timestamp_origin()
-        if self._otg is not None:
+        if self._otg is not None and self.config.arm_start_controller_on_connect:
             self._start_otg_loop(np.asarray(arm.get_joint_positions(), dtype=np.float64))
         try:
             self.configure()
@@ -633,6 +643,17 @@ class FrankaResearch3(Robot):
         return observation
 
     @check_if_not_connected
+    def start_arm_controller(self) -> None:
+        """Start arm control after connecting without a controller and completing homing."""
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        self._arm.start_controller()
+        if self._otg is not None and not self._otg_running:
+            joints = self._read_joint_positions()
+            self._otg.reset(joints)
+            self._start_otg_loop(joints)
+
+    @check_if_not_connected
     def move_to_start(self) -> None:
         self._raise_if_otg_failed()
         self._clear_observation_state_snapshot()
@@ -643,6 +664,7 @@ class FrankaResearch3(Robot):
             raise RuntimeError("FR3 arm backend does not support move_to_start().")
 
         otg_enabled = self._otg is not None
+        otg_was_running = self._otg_running
         fallback_joint_positions_rad = self._read_joint_positions()
         if otg_enabled:
             self._stop_otg_loop()
@@ -655,6 +677,7 @@ class FrankaResearch3(Robot):
             self._reset_teleop_state()
             if otg_enabled:
                 self._otg.reset(moved_joint_positions_rad)
+            if otg_was_running:
                 self._start_otg_loop(moved_joint_positions_rad)
 
     @check_if_not_connected

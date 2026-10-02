@@ -1,347 +1,342 @@
-# FR3 teleoperation with the Thor collection box
+# Thor FR3 teleoperation through the BOX UI
 
-`bash run/deploy.sh` now selects the FR3 + Thor configuration. It keeps the
-existing Sengyun GMSL2 recorder, hardware trigger, online SOF synchronization,
-camera preview, BOX sensors, calibration, task management, save/discard,
-episode inspection, and export. The SpaceMouse can remain plugged into Thor.
+This workflow extends the BOX platform at commit
+`8ffb5bf6e1c391ea771207f628601cb753127f73`. Run `bash run/deploy.sh` on the
+development host and operate the existing **Live Record** page. Thor owns all
+connected Sengyun cameras, the BOX tactile/force/gripper sensors, the directly
+attached SpaceMouse, and the FR3 connection. The default deployment contacts
+only `nvidia@192.168.111.122`; no second workstation SSH login is required.
 
-## Architecture and FCI timing
+## Deploy and operate
 
-```mermaid
-flowchart LR
-  SM[SpaceMouse USB on Thor] --> CO[Thor recorder coordinator]
-  HS[Optional SpaceMouse on host] -->|leased TCP 18771| CO
-  CO -->|leased high-level TCP 18770| RT[RT workstation: IK and Ruckig]
-  RT --> N[Native panda_py / libfranka controller]
-  N <-->|direct wired Ethernet, 1 kHz FCI| FR3[FR3 Control]
-  RT -->|measured state and timing| CO
-  BOX[BOX gripper / tactile / force / IMU] <--> CO
-  CAM[Sengyun GMSL2 / Argus / encoder] --> DATA[Thor episode and LeRobot data]
-  CO --> DATA
-  CO --> GUI[Existing web UI gateway]
+From the development host repository root:
+
+```bash
+bash run/deploy.sh
 ```
 
-The workstation runs the native C++ controller. TCP carries bounded Cartesian
-deltas at up to 200 Hz and downsampled state; it does **not** forward FCI packets.
-No browser, camera, BOX SDK, encoder, file writer, or Python network callback
-runs inside the 1 kHz FCI callback. Thor owns one existing BOX SDK session;
-gripper commands reuse its selected device handle instead of opening a second
-client on UDP port 15000.
+Open the frontend URL printed by the script, normally `http://localhost:5173/`.
+The gateway runs on Thor at `http://192.168.111.122:8765`. Deployment syncs code
+and existing calibration inputs, restarts the gateway/owned recorder, and starts
+the host frontend. It neither installs FR3 dependencies nor opens FCI.
 
-The new arm server requires `/sys/kernel/realtime=1`, scheduling permission for
-`SCHED_FIFO`, working native dependencies, and explicitly constructs Panda
-with `RealtimeConfig.kEnforce`. The old backend's default remains compatible
-with existing workstation workflows. A single authenticated connection owns
-the server session. Deltas are consumed once through a latest-command mailbox.
+Use the existing task selection and Live Record page:
 
-Each response grants a single-use command lease with a 150 ms deadline. Expired,
-duplicate, malformed, nonfinite, or oversized commands end the session. Lost
-Thor/host input, stale state, a frozen native robot clock, native controller
-errors, or an FCI command success rate below 0.995 also stop control. Faults
-require reconnecting; there is no automatic error recovery or motion restart.
-On normal UI Stop, the arm holds and telemetry continues; on connection loss,
-the workstation disconnects the controller. The gripper is seeded from its
-fresh measured opening before switching to control mode and returns to
-collection mode on Stop/fault/shutdown.
-
-These software checks cannot guarantee that hardware/network communication
-constraints will never be violated. Commission the direct FCI link with
-`communication_test`, then repeat it and inspect telemetry under the intended
-load. Do not increase watchdog limits to conceal a bad FCI link. Franka's
-[system requirements](https://frankarobotics.github.io/docs/doc/libfranka/docs/system_requirements.html)
-and [troubleshooting guide](https://frankarobotics.github.io/docs/troubleshooting.html)
-describe the RT kernel, direct connection, latency, and communication test.
-
-## Observed hardware status, 2026-10-02
-
-- Thor `192.168.111.122` is aarch64, kernel `6.8.12-tegra`, with ordinary PREEMPT.
-  It has no `/sys/kernel/realtime` marker and no installed `panda_py`/`franky`.
-- The SpaceMouse Compact enumerates as `/dev/hidraw0` and
-  `/dev/input/by-id/usb-3Dconnexion_SpaceMouse_Compact-event-if00`.
-  A read-only open on Thor succeeded using its existing sudo access. The idle
-  device produced no report during the two-second observation.
-- A temporary aarch64 environment with **pyspacemouse 2.1.0** and the extracted
-  Ubuntu hidapi library successfully enumerated `SpaceMouseCompact`, opened it,
-  and read six zero-valued axes and both released buttons. This directly verifies
-  the Python driver on Thor. No application/system packages were installed by
-  the test; the temporary environment was removed.
-- `/dev/hidraw0` was root-owned, mode 0600. The `nvidia` account could not open
-  it normally, and Thor's application venv did not contain `pyspacemouse`.
-  Run the setup below before using teleoperation; axis directions and button
-  response still need the component check with the puck moved by the operator.
-- SSH to the existing workstation `hph@192.168.100.155` failed authentication.
-  Its RT kernel, FR3 link, native environment, and robot motion remain
-  **unverified**. No live FR3 controller or camera/BOX session was started by
-  this development validation.
-
-## Configuration and one-time setup
-
-The complete rig configuration is
-`tools/thor/gmsl2/thor_fr3_teleop.yaml`. Its camera/BOX settings copy the current
-production configuration. Future rig-specific camera changes should be applied
-to the selected configuration as well.
-
-| Item | Default |
+| Control | Result |
 | --- | --- |
-| Thor SSH / gateway | `nvidia@192.168.111.122`, HTTP `8765` |
-| Arm workstation SSH | `hph@192.168.100.155` |
-| FR3 Control IP | `192.168.1.206` |
-| Arm bridge | workstation TCP `18770` |
-| Optional host input | Thor TCP `18771` |
-| Gripper model / TCP | Corenetic BOX gripper / `corenetic_gripper_ee` |
-| Selected BOX | `fr3_teleop.gripper_box_id`; empty requires exactly one BOX |
-| Gripper full opening | `0.09 m`, normalized command range `0..1` |
-| Arm delta limits | `1 mm` per axis and `0.01 rad` per axis per command |
+| **C — Connect** | Connect all detected Sengyun cameras and the existing BOX sensors. FR3 remains inactive. |
+| **F — Start FR3** | After C completes, check the native runtime, connect FR3, execute `move_to_start`, then activate SpaceMouse control. |
+| **E — Start Episode** | Begin recording while FR3 teleoperation is running. |
+| **S — Save** | Finish and save the episode; teleoperation remains available. |
+| **D — Discard** | Finish and discard the episode; teleoperation remains available. |
+| **Stop FR3** | Stop robot control; discard an active episode. Cameras/BOX stay connected. |
+| **Esc — Exit** | End the connected recording session and stop FR3 control. |
 
-Confirm the IP, mounted gripper, URDF, TCP, workspace, opening range, and BOX ID
-before motion. Different SSH addresses/checkout paths must also be reflected
-in `run/deploy.sh`, `run/sync_to_target.sh`, and `run/prepare_fr3_bridge.sh`.
-The bridge credentials are generated in `outputs/.fr3_bridge_token` and copied
-with mode 0600 to both targets; they are excluded from repository sync.
-Use these TCP channels on the trusted rig LAN; the application token does not
-encrypt transport.
+Existing shortcuts and controls retain their BOX behavior. Shortcuts do not fire
+while typing in an input, select, or text editor. A disabled button also disables
+its shortcut. F is unavailable while connecting, moving to start, already
+running, recording, or resolving an episode.
 
-### Added Sengyun wrist camera
+F starts physical motion. Release the SpaceMouse before pressing F and keep the
+robot's user stop accessible. Wait for **running** before using the puck or E.
+SpaceMouse axes use the existing `[-raw_y, raw_x, raw_z]` translation mapping;
+buttons adjust the BOX gripper's opening. The UI displays measured joints,
+velocity, measured/external joint torque, TCP pose and estimated external wrench.
 
-The end-effector Sengyun is an additional camera in the **same Thor GMSL2
-session**, with the same trigger, preview, synchronization, recording, and
-export paths. `sensors.cameras.detect_all: true` includes newly locked ports;
-the wrist port does not have to match the workstation branch's RealSense `ee`
-ID. If you select cameras explicitly instead, add the wrist port to
-`sensors.cameras.sensor_ids` along with the scene-camera ports.
+This profile requires recent HID reports for active puck motion. Cached motion
+older than 200 ms stops teleoperation. If a held button produces only its initial
+press report, gripper increments freeze after that window; release and press
+again to continue. Neutral input stays valid, and an expired held button alone
+does not stop FR3.
 
-After installation, identify the camera on Thor **before Connect**, with no
-Argus session open:
+Esc and recorder stdin EOF stop SpaceMouse input immediately, including while
+camera save/discard processing is busy. Video finalization and session teardown
+may continue after robot input has stopped. The native runtime's ownership lock
+refuses overlapping FR3 workers for the same robot under the same login; it does
+not replace checking that another FCI application is disconnected.
 
-```bash
-cd /home/nvidia/lerobot
-PYTHONPATH=src:. .venv/bin/python -m tools.thor.gmsl2.camera_eeprom --sids 0-15
-```
+On a robot error, the UI displays the reason, stops teleoperation, and discards
+the active episode. Clear the reported condition using the robot's physical
+controls/Desk, release the SpaceMouse, and press F again. Every F attempt returns
+to start before enabling teleoperation. The program does not automatically
+recover errors or resume motion.
 
-Set its serial in `tools/thor/gmsl2/thor_fr3_teleop.yaml` on the deployment host,
-then deploy/reconnect:
-
-```yaml
-fr3_teleop:
-  # Keep the other existing fr3_teleop settings.
-  wrist_camera:
-    serial: "YOUR_WRIST_CAMERA_SERIAL"
-    sensor_id: null
-```
-
-The serial identifies the physical module and follows it to a different port
-at the next Connect. A serial selector never falls back to a different module
-on the previous port. If EEPROM reads are unavailable, use `serial: ""` and
-set `sensor_id` to the actual integer port, `0..15`; this alternative identifies
-the cable port, so update it whenever you change the connection.
-The shipped selector stays unset until the camera is installed.
-
-The Teleoperation page labels the matching active stream **FR3 wrist · cam_NN**
-and shows its resolution status. Once configured, a missing or ambiguous wrist
-camera prevents task recording; calibration captures and component checks
-remain available. Check its live image before motion. The added view joins the
-existing online full-cluster sync gate, so commissioning must include the new
-camera under full recording/preview load.
-
-Video filenames and training image keys retain their actual port names, such
-as `observation.images.cam_15`; role labels do not rename synchronization keys.
-`camera_roles` in episode `meta.json` and dataset `meta/info.json` records the
-selector, resolved name, serial, and wrist mount. Export also preserves each
-source episode's roles and camera identities in `meta/export_sources.json`.
-Keep a consistent port layout within a consolidated dataset. The existing
-exporter skips different camera sets and now refuses different wrist roles
-on the same video keys; it does not automatically remap ports across sessions.
-Other cameras retain the existing calibration identity checks.
-
-The wrist camera moves with the robot. Calibrate its intrinsics and a constant
-eye-in-hand transform to the chosen robot frame before using it for geometry.
-For a task-TCP convention, compose
-`T_base_camera(t) = T_base_tcp(t) @ T_tcp_camera` using measured, timestamped TCP
-poses. This integration records the required images and measured robot states;
-it does not solve that transform or produce dynamic camera poses automatically.
-The existing UI Hand-eye panel calibrates the marker rig to BOX, which is a
-different transform. Keep the wrist outside fixed base-camera extrinsics:
-marker-to-TCP detection excludes recorded wrist streams, and visual trajectory
-generation refuses a recorded wrist that still has fixed base extrinsics.
-
-On Thor, after code sync:
+The original camera/BOX-only profile remains available:
 
 ```bash
-cd /home/nvidia/lerobot
+bash run/deploy.sh --box-only
+bash run/deploy.sh --sync-only
+bash run/deploy.sh --no-frontend
+```
+
+`--box-only` uses `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml`; the default uses
+`tools/thor/gmsl2/thor_fr3_teleop.yaml`. The latter preserves the original camera,
+BOX, trigger, laser tracker, dataset and calibration settings and adds FR3
+configuration. Calibration pages, camera previews, task management, replay,
+trajectory processing, dataset handling and sensor diagnostics remain in the
+BOX interface.
+
+Use **Stop FR3** before taking calibration captures. Cameras and BOX remain
+connected for the existing calibration workflows without active robot control.
+
+## One-time setup on Thor
+
+Deployment and C use Thor's existing `.venv`. F launches the arm in the separate
+`.venv-fr3` interpreter configured by `fr3_teleop.runtime_python`. An unavailable
+FR3 environment produces a UI error on F and leaves camera/BOX connection usable.
+
+The checked Thor currently has kernel `6.8.12-tegra` with ordinary PREEMPT and no
+`/sys/kernel/realtime`, plus no native FR3 packages in the collection environment.
+Its route to `192.168.1.206` uses `enP2p1s0` with source `192.168.1.122`.
+Direct SpaceMouse enumeration/open/read was verified on aarch64 using
+`pyspacemouse==2.1.0`; the installed user still needs hidraw access and packages.
+These checks do not validate live robot motion or camera-loaded FCI timing.
+
+### SpaceMouse USB access
+
+Run these commands **on Thor**, after code has been synced:
+
+```bash
+cd ~/lerobot
 bash run/setup_thor_spacemouse.sh
-# Log out/in, then replug the SpaceMouse.
-PYTHONPATH=src:. .venv/bin/python -m tools.fr3.check_box_teleop spacemouse --duration-s 10
+# Replug the SpaceMouse, then log out and back in for plugdev membership.
+bash run/setup_thor_spacemouse.sh --check
 ```
 
-The script installs the verified `pyspacemouse==2.1.0`, draccus, Hugging Face
-Hub utilities, numpy, and hidapi libraries and configures
-udev/plugdev access for the supported vendor IDs. It does not connect to FR3.
-The shared Teleoperator base loads motor-calibration dependencies only when
-reading a calibration file; SpaceMouse does not need Torch/training packages
-in the Thor collection environment.
-Keep the puck released during startup bias calibration. The existing axis
-mapping is retained: translation `[-raw_y, raw_x, raw_z]`, body-frame rotation,
-and the existing incremental gripper buttons. Motion is enabled by puck motion
-after UI Start; `teleop.motion_enable_button` can select a held button if needed.
+The explicit setup installs hidapi libraries and the input dependencies in
+`.venv`, adds udev/group access, and leaves FR3 untouched. The check lists the
+device, opens it and prints axes/buttons using the owning device API in the
+pinned `pyspacemouse==2.1.0`. Use `THOR_PYTHON=/path/to/python` if the
+collection environment is elsewhere. Restart the gateway after logging back in.
 
-On the workstation, establish SSH access from the deployment host, install a
-PREEMPT_RT kernel and configure the operator's RT priority/memlock permissions
-according to Franka's requirements. Reboot into that kernel and refresh the
-login session. Install the existing native environment if absent:
+### Real-time kernel and native FR3 runtime
+
+FR3 control uses libfranka's native 1 kHz loop. F requires PREEMPT_RT and permission
+to use `SCHED_FIFO`; the worker refuses to connect when either check fails.
+Franka recommends a direct Ethernet connection to **Control's** LAN port and
+validating timing under the intended load.
+[Franka requirements and troubleshooting](https://frankarobotics.github.io/docs/troubleshooting.html)
+
+NVIDIA documents a Thor RT kernel installation/build path. Choose the instructions
+for the **installed Jetson Linux release** and verify that the Sengyun camera
+drivers, device-tree overlays and NVIDIA modules work with that RT kernel before
+commissioning FR3. Kernel/driver installation and reboot are a separate machine
+maintenance step; deployment and these setup scripts do not change the kernel.
+[NVIDIA Thor RT kernel instructions](https://docs.nvidia.com/jetson/archives/r38.2.1/DeveloperGuide/SD/Kernel/RealTimeKernel.html)
+
+After reboot, check:
 
 ```bash
-cd /home/hph/Code/lerobot
-bash tools/fr3/setup_workstation_teleop_env.sh
-export PYTHONPATH=src:.
-export LD_LIBRARY_PATH="$(.venv-fr3/bin/python -c 'import site; from pathlib import Path; print(":".join(str(Path(p)/"cmeel.prefix/lib") for p in site.getsitepackages()))'):${LD_LIBRARY_PATH:-}"
-.venv-fr3/bin/python -m tools.fr3.check_box_teleop rt
-# With the robot prepared for FCI, run the installed libfranka example:
-communication_test 192.168.1.206
+uname -a
+cat /sys/kernel/realtime       # must print 1
+ulimit -r                     # inspect realtime priority limits; preflight tests maximum FIFO priority
+ip route get 192.168.1.206
 ```
 
-The RT component check only inspects kernel/scheduler/dependencies; it does not
-open FCI. `communication_test` does open a robot control session, so run it with
-the operator present and no other FCI owner. Preserve its results when
-commissioning. The server also checks live native controller errors/success
-rate; a successful preflight alone does not establish network quality.
+Configure realtime limits for the login running the gateway according to the
+Franka setup documentation, then start a fresh login/session. A kernel whose
+name only contains `PREEMPT` does not satisfy the worker's PREEMPT_RT check.
 
-## Deploy and use the UI
+Build/provide an **aarch64 panda-py wheel for Python 3.12** whose linked libfranka
+version matches FR3's Desk system version. Generic panda-python installation
+cannot be assumed suitable: upstream documents a default libfranka 0.9.2 build
+for FER and FR3 requires a newer compatible build; its standard wheel build
+configuration targets x86_64. Use a native aarch64 source build or a verified
+matching wheel. The repository's existing `tools/fr3/setup_host_env.sh` shows
+libfranka/panda-py source-build steps, but its machine/environment defaults must
+be adapted deliberately for Thor; it is not invoked by deployment.
+[panda-py installation](https://github.com/JeanElsner/panda-py),
+[wheel architecture](https://github.com/JeanElsner/panda-py/blob/main/pyproject.toml),
+[Franka version compatibility](https://frankarobotics.github.io/docs/compatibility.html)
 
-On the development host:
+The upstream native Panda controller can call automatic error recovery when
+starting a controller or moving to start. This workflow requires a patched
+native wheel that throws on that condition and exports
+`panda_py._core.FR3_NO_AUTOMATIC_ERROR_RECOVERY = True`. The worker checks the
+compiled extension's capability before connecting. A normal upstream wheel
+fails preflight/F; setting a Python variable is not a substitute for the patch.
+
+Prepare a local checkout of the repository's inspected panda-py revision:
 
 ```bash
-bash run/deploy.sh                     # Thor USB input + workstation FCI + local UI
-bash run/deploy.sh thor --no-frontend   # same services, no local Vite UI
-bash run/deploy.sh --box-only           # original camera/BOX-only workflow
-bash run/deploy.sh workstation          # existing workstation + RealSense workflow
+git clone https://github.com/linkage-x/panda-py.git /tmp/panda-py-thor
+git -C /tmp/panda-py-thor checkout 47c304f9b8147ae7582dcfe8a97af554c363021d
+python3 run/patch_thor_panda_py.py /tmp/panda-py-thor
+python3 run/patch_thor_panda_py.py --check /tmp/panda-py-thor
 ```
 
-Deployment syncs Thor, syncs/preflights the arm workstation, provisions the
-shared token, starts the arm listener, restarts the Thor gateway, and opens the
-existing frontend at `http://localhost:5173/` (Vite may choose a free next port).
-An RT/dependency/SSH failure stops deployment before restarting the gateway.
-Starting the listener does not connect to FR3. **Live Record → Connect** opens
-the camera/BOX session and the workstation controller, initially holding.
-
-1. Open **Live Record**, select the task/dataset and press **Connect**.
-2. Open **Teleoperation**. Confirm measured joints, torques, task TCP, external
-   wrench, bridge latency/clock uncertainty, tactile pads, and BOX force.
-3. Press **Start Real Robot Teleop**. Move the puck gently and test its two
-   gripper buttons. The gripper starts from the measured opening.
-4. Use **Live Record → Start Episode**, then **Save** or **Discard**. Recording
-   and teleoperation have separate lifecycles; Save does not stop teleoperation.
-5. Use **Stop Teleop** to hold while keeping sensor/arm telemetry connected.
-   Disconnect the collection session to release FCI completely.
-
-Calibration captures keep their existing redirected roots and can run while
-FR3 is unavailable. Task captures in this configuration require FR3 telemetry;
-an arm fault discards the active episode. Use `--box-only` for camera-only or
-BOX-only task recordings. Hardware replay from this Thor gateway is refused
-because it would bypass the dedicated RT arm owner; use the separate
-workstation replay workflow. Visual episode replay and dataset export remain
-available.
-
-For host-connected SpaceMouse input:
+The helper accepts only the inspected `Panda::recover` body, replaces its native
+recovery call with an error, verifies no additional native recovery calls remain,
+releases Python's GIL while stopping the native controller, then adds the compiled
+capability. Shutdown also copies native state through Panda's mutex before using
+it. The helper refuses unknown source changes. Build the
+patched wheel **on Thor** against the installed compatible libfranka development
+files. For a libfranka installation under `/usr/local`, for example:
 
 ```bash
-bash run/deploy.sh --spacemouse-host
-# In the UI, Connect first; then run this in another host terminal:
-PYTHONPATH=src:. .venv/bin/python -m tools.fr3.box_spacemouse_sender
-# Finally press Start Real Robot Teleop in the UI.
+# Existing native build environment with Python 3.12, uv, CMake and libfranka.
+CMAKE_PREFIX_PATH=/usr/local LD_LIBRARY_PATH=/usr/local/lib \
+  uv build --wheel --python 3.12 /tmp/panda-py-thor
 ```
 
-Install the same SpaceMouse dependencies/device permissions on the host if
-needed. The sender gets the gripper baseline and session generation from Thor;
-it cannot enable the arm by itself. Losing the sender stops teleoperation.
-Restart/reconnect explicitly after a fault.
+Include your Placo/Pinocchio `cmeel.prefix` in these paths if that libfranka build
+uses its dependencies. Inspect the generated wheel's architecture/Python tag and
+install that wheel below. Source-build prerequisites and the exact libfranka
+version depend on the installed Desk/BSP versions and cannot be inferred from
+the robot IP address.
 
-## Data contract
+With a matching wheel available on Thor, provision the separate environment:
 
-Each saved episode keeps camera MKVs, online-sync metadata, `box_sensors.jsonl`
-with full tactile/force samples, and adds `fr3_state.jsonl`. The latter contains
-coherent native q/dq/torque/pose/wrench, the native robot clock, applied/input
-commands, source/receive timestamps, and clock uncertainty.
-The source monotonic timestamp is taken when the workstation copies the native
-state cache; it includes the native-to-host transport delay. It is not a
-hardware exposure timestamp, and the native robot clock is retained separately.
+```bash
+cd ~/lerobot
+bash run/setup_thor_fr3.sh --install-system-deps --install-python \
+  --panda-wheel /absolute/path/to/panda_python-compatible-aarch64.whl
+```
 
-The live session parquet retains the existing BOX `observation.state` and
-`box.timestamps`, adding:
+This explicit command installs native prerequisites, syncs LeRobot's declared
+core dependencies with kinematics/SpaceMouse, adds Ruckig and the supplied
+panda-py wheel, then runs the local preflight. It does not open FCI or move the
+robot. The FR3 adapter imports LeRobot's processor stack, so this environment is
+larger than the camera/BOX environment. Placo/Pinocchio and panda-py may require
+native aarch64 builds; resolve build/import errors before F. A successful package
+installation alone does not establish compatible firmware or realtime behavior.
 
-- `observation.fr3.q`, `.dq`, `.tau_J`, `.tau_ext_hat_filtered`: seven joint values.
-- `observation.fr3.O_T_EE`: native flange pose, **column-major**, not the task TCP.
-- `observation.fr3.tcp`: measured URDF task TCP as xyz + rotation vector.
-- `observation.fr3.O_F_ext_hat_K`: estimated external wrench in native Franka semantics.
-- `action`: commanded task TCP xyz + rotation vector + normalized gripper opening.
-- `fr3.timestamps`: source monotonic, mapped Thor monotonic, receive monotonic,
-  and clock uncertainty, all seconds.
-- `fr3.valid`, `fr3.action_valid`, `fr3.control_command_success_rate`.
+If the compatible runtime is already installed, run only:
 
-State is measured; `action` is the requested pose, before physical tracking and
-gripper travel have completed. The normalized gripper action is not a force
-command. Actual BOX distance, touch, and 6D force remain separate observations.
+```bash
+bash run/setup_thor_fr3.sh --check
+# Equivalent worker check; no robot connection:
+PYTHONPATH=src:. .venv-fr3/bin/python -m tools.thor.fr3_control_worker \
+  --check --config-path tools/thor/gmsl2/thor_fr3_teleop.yaml
+```
 
-Each TCP exchange measures the clock offset by midpoint and bounds its
-uncertainty by half the transport round trip after subtracting server handling
-time. Samples align to the existing camera exposure timestamps in Thor's
-monotonic clock. Native state polling is 200 Hz; recording is 60 Hz. This is
-not hardware synchronization between the robot and cameras.
+`--venv /path/to/environment` selects another environment for setup/check; update
+`fr3_teleop.runtime_python` in the YAML to its Python executable before deployment.
 
-A frame is invalid when capture time is absent or alignment skew plus clock
-uncertainty exceeds 25 ms. Invalid FR3 vectors use zeros with `fr3.valid=0`;
-consumers must use the validity columns instead of treating zeros as readings.
-Missing commands likewise use `fr3.action_valid=0`. Export preserves these
-columns and the real FR3 action together with videos, full tactile arrays, BOX
-state, and existing tracking sidecars. Mixed BOX-only/FR3 exports are rejected.
+## Configuration
+
+All connected Sengyun cameras use the original generic `cam_00`, `cam_01`, etc.
+`sensors.cameras.detect_all: true` discovers locked ports and probes them at C.
+A newly added end-effector camera participates in the same capture, preview,
+synchronization and export as other cameras. No wrist role or special ID is
+required in this round. Reconnect after changing camera cabling/topology.
+Adding a camera on an unused generic port works through that detection path.
+Replacing a camera on a previously calibrated port can trigger the retained BOX
+camera-identity gate; update its expected identity and repeat the relevant
+calibration before using results that depend on that calibration.
+
+The FR3 extension has these principal settings:
+
+| Setting | Default / meaning |
+| --- | --- |
+| `robot.robot_ip` | `192.168.1.206`, contacted directly from Thor only after F |
+| `robot.urdf_path` / `target_frame_name` | FR3 + Corenetic gripper model / `corenetic_gripper_ee` |
+| `fr3_teleop.runtime_python` | `.venv-fr3/bin/python`, relative to the deployed repository |
+| `fr3_teleop.control_hz` | 200 Hz Python target updates; native FCI remains 1 kHz |
+| `fr3_teleop.command_timeout_s` | 0.2 s parent command watchdog |
+| `fr3_teleop.max_state_age_s` | 0.1 s default maximum age of the native telemetry stream |
+| `fr3_teleop.startup_timeout_s` | 60 s to connect, move to start and become ready |
+| `fr3_teleop.min_success_rate` | 0.995 monitored native communication success threshold |
+| `fr3_teleop.gripper_box_id` | Blank accepts exactly one BOX; specify the real ID for multiple BOXes |
+| `fr3_teleop.gripper_max_width_m` | 0.09 m |
+
+The BOX remains owned by the existing recorder. The arm worker uses a mock
+gripper adapter internally to avoid opening a second BOX session; actual gripper
+commands and measured opening come from the recorder's existing BOX client.
+
+The pinned Panda controller has virtual joint walls originally defined for FER.
+This configuration uses a conservative FR3/common joint envelope clear of those
+walls' damping zones. The worker checks the native wall constants, initial joint
+position and each target against the configured limits. If F reports an
+out-of-range initial pose, reposition the robot using Desk into the documented
+envelope before retrying; F does not drive through the boundary to recover it.
+Only reduce this envelope for the current pinned native build:
+
+| Joint | Minimum (rad) | Maximum (rad) |
+| --- | --- | --- |
+| 1 | -2.64 | 2.64 |
+| 2 | -1.57 | 1.57 |
+| 3 | -2.70 | 2.70 |
+| 4 | -2.84 | -0.27 |
+| 5 | -2.70 | 2.70 |
+| 6 | 0.60 | 3.65 |
+| 7 | -2.70 | 2.70 |
+
+Any reduced joint envelope must still contain the compiled native move-to-start
+joint configuration; preflight checks this before FCI. Per-joint OTG dynamics
+must be finite and positive and can only be reduced from the initial caps:
+0.5 rad/s velocity, 1.0 rad/s² acceleration and 1000 rad/s³ jerk.
 
 ## Component tests and commissioning
 
-Run automated checks on the development host:
+Before the first supervised F test, configure Desk's tool/end-effector and load
+parameters and the URDF/TCP to match the mounted Corenetic gripper, added camera
+and other attachments. Check the move-to-start path with those attachments in
+place. The software's conservative limits do not establish payload or tool
+calibration for a changed physical setup.
+
+| Test | Procedure | Expected result |
+| --- | --- | --- |
+| Deploy / UI | `bash run/deploy.sh` on the host | Only Thor SSH; original BOX Live Record interface, F added |
+| Cameras / BOX | Press C before provisioning FR3 | Existing sensor connection and generic camera previews work; no robot motion |
+| SpaceMouse | `bash run/setup_thor_spacemouse.sh --check` on Thor | Device opens and supplies axes/buttons without FR3 |
+| Native readiness | `bash run/setup_thor_fr3.sh --check` on Thor | RT kernel, scheduling permission, configuration, patched native capability and imports pass without FCI |
+| F failure isolation | With a missing FR3 runtime, press F after C | Specific UI error; cameras/BOX remain connected; F can be retried |
+| Motion / input | Commission the robot, enable FCI in Desk, then press F | Move to start completes before SpaceMouse changes targets |
+| Episode controls | After F is running: E then S; E then D | First episode saved, second discarded; no automatic return-to-start on S/D |
+| Fault / retry | During a supervised test stop the robot, then clear the fault and press F | Alert, stopped motion, active episode discarded; fresh move-to-start on F |
+| Shutdown | Stop FR3, Esc, and deployment restart | Owned worker releases robot control; a new Connect/F does not compete with an orphan |
+
+Before motion commissioning, validate FCI using the compatible libfranka build's
+`communication_test` and repeat under the actual camera preview/recording/BOX
+load. **This example moves the robot** before measuring communication; follow
+its prompt and operate it as a supervised motion test.
+[communication_test source](https://github.com/frankarobotics/libfranka/blob/main/examples/communication_test.cpp)
+
+The 1 kHz controller runs in native code in its own process. Camera acquisition,
+BOX I/O, UI, SpaceMouse sampling and file writes remain outside that callback.
+Only the latest target is exchanged over local IPC; old targets are not replayed.
+Loss of the parent, stale commands/state, native controller errors or a low
+success rate stop control and require F again. These guards detect failures;
+they cannot guarantee that FCI communication constraints remain satisfied under
+unmeasured system load. Native scheduling/CPU/IRQ tuning and loaded testing are
+still required on this specific Thor/camera configuration.
+
+## Recorded data
+
+Existing per-camera MKVs, synchronized Argus timestamps, BOX force/tactile/gripper
+samples and episode metadata remain intact. FR3 recordings also include
+`fr3_state.jsonl` with measured joint position/velocity, measured joint torque,
+filtered external joint torque, configured end-effector transform, estimated external wrench,
+task TCP, command target and timing/communication information. Recording begins
+only after F reports running; errors discard incomplete episodes.
+
+The live LeRobot v3 writer and offline export preserve aligned FR3 measurements,
+pose/gripper actions and validity/timestamp fields alongside the original camera
+and BOX features. Measured TCP and the commanded target are different fields;
+the native `O_T_EE` transform is stored column-major in libfranka's convention.
+Samples outside the alignment tolerance are marked invalid rather than invented.
+The FR3-to-camera alignment tolerance defaults to 25 ms; validity fields identify
+frames without a sufficiently close measured robot sample.
+The dataset root, task overlays, calibration inputs and export UI keep their
+original BOX defaults.
+
+## Software checks without hardware
+
+From the development checkout with its Python test environment:
 
 ```bash
-PYTHONPATH=src:. .venv/bin/python -m tools.fr3.check_box_teleop config
-PYTHONPATH=src:. .venv/bin/python -m pytest \
-  tests/scripts/test_box_fr3_teleop.py tests/scripts/test_fr3_wrist_camera.py \
-  tests/scripts/test_thor_export_v3.py \
-  tests/scripts/test_thor_record_stdin.py tests/scripts/test_thor_record_meta.py \
-  tests/scripts/test_thor_lerobot_v3_pts.py tests/scripts/test_data_collection_gui_gateway.py \
-  tests/teleoperators/test_spacemouse.py tests/robots/test_franka_research3.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 HF_HOME=/tmp/lerobot-fr3-test-hf \
+  HF_DATASETS_CACHE=/tmp/lerobot-fr3-test-hf/datasets PYTHONPATH=src:. \
+  .venv/bin/python -m pytest -q tests/scripts/test_thor_fr3_*.py \
+  tests/teleoperators/test_spacemouse.py tests/robots/test_franka_research3.py
+
 cd tools/data_collection_gui/frontend
 npm test
 npm run build
 ```
 
-These tests use fake robots. Localhost sockets must be permitted for the
-bridge/gateway tests. Hardware tests are separate:
-
-| Component | Check | Passing evidence |
-| --- | --- | --- |
-| SpaceMouse | `check_box_teleop spacemouse --duration-s 10` on its USB host | Open succeeds as operator; six axes and both buttons respond |
-| RT host | `check_box_teleop rt` | RT kernel, SCHED_FIFO permission, native imports pass |
-| FCI network | `communication_test <robot_ip>` on dedicated workstation | Communication results meet Franka requirements under load |
-| Sengyun | Existing `recover_argus.sh`, then UI Connect/short recording | Detected cameras preview; online full-cluster sync manifest passes |
-| Wrist Sengyun | EEPROM identification, configured selector, UI preview; short save/export | Correct wrist label/serial, wrist video key and metadata preserved, sync passes with the extra camera |
-| BOX | UI Device Manager/live sensor cards | Distance/touch/force advance; expected rates remain healthy in control mode |
-| Gripper | Start at mid-opening, then small button commands | No startup close/open jump; measured distance follows; Stop restores mode 0 |
-| Combined recording | Save a 5–10 s episode, inspect/replay/export | Videos/tactile/force present; FR3 torque columns and validity present |
-| Link failure | Stop sender or disconnect bridge during a supervised trial | Motion stops, UI faults, active task episode discarded, no auto-resume |
-| Load | Record all required cameras with UI previews and BOX sensors active | FCI success stays above configured floor; no communication violations |
-
-Check `outputs/logs/fr3_box_arm_server.log` on the workstation, and the existing
-gateway/recorder logs under `outputs/logs/data_collection_gui` on Thor.
-`FR3_LIVE` errors explain lease, native, state age, clock, or gripper failures.
-The current BOX stream expectations remain gripper 120 Hz, force 480 Hz, IMU
-240 Hz, and tactile 60 Hz per pad. Validate these after entering mode 1 as
-well as in collection mode; firmware behavior has not been verified here.
-
-Development validation completed: **556 Python tests passed, one skipped;
-212 frontend tests passed; frontend production build, shipped config, shell
-syntax, and patch whitespace checks passed.** The Python bridge tests use fake
-robots; these results do not qualify the actual FR3 communication link.
-
-Wrist-camera update validation: **432 affected Python tests and 212 frontend
-tests passed; the UI production build and config check passed.** The camera
-role/export tests cover a different wrist port, serial-based remapping,
-unavailable/ambiguous identities, recording metadata, and fixed-extrinsics
-refusal. Physical capture with the added wrist module remains to be tested
-after installation.
+These checks use fake robot/USB devices, temporary files and local IPC. They
+verify startup order, input/state watchdogs, fault/discard/retry, command bounds,
+ownership, recording/export and deployment routing. They do not certify physical
+motion or loaded FCI timing; use the commissioning procedures above for that.

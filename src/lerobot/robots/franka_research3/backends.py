@@ -35,6 +35,19 @@ from lerobot.model.kinematics import RobotKinematics
 logger = logging.getLogger(__name__)
 
 
+def require_native_no_automatic_recovery() -> None:
+    """Require a verified native build whose internal recovery calls fail closed."""
+    from panda_py import _core
+
+    if getattr(_core, "FR3_NO_AUTOMATIC_ERROR_RECOVERY", None) is not True:
+        raise RuntimeError(
+            "FR3 requires the patched panda-py wheel with native "
+            "FR3_NO_AUTOMATIC_ERROR_RECOVERY=True. Patch the local source with "
+            "run/patch_thor_panda_py.py, rebuild the compatible aarch64 wheel, and install it "
+            "in .venv-fr3. Internal panda-py controller/homing recovery must be disabled."
+        )
+
+
 class ArmDriver(Protocol):
     def connect(self) -> None: ...
 
@@ -157,6 +170,9 @@ class PandaPyArmDriver:
     state_poll_frequency_hz: float = 200.0
     start_controller_on_connect: bool = True
     realtime_enforce: bool = False
+    require_no_automatic_recovery: bool = False
+    joint_position_min: tuple[float, ...] | None = None
+    joint_position_max: tuple[float, ...] | None = None
 
     def __post_init__(self):
         try:
@@ -180,11 +196,24 @@ class PandaPyArmDriver:
         # timestamp them by when they were read *from the arm* rather than by when it happened
         # to pick them up -- those differ by up to one poll period.
         self._cached_joint_positions_at_s: float | None = None
-        self._cached_telemetry: dict[str, Any] = {}
+        self._cached_telemetry: dict[str, Any] | None = None
+        self._moving_to_start = False
+        if (self.joint_position_min is None) != (self.joint_position_max is None):
+            raise ValueError("Both arm command joint position bounds are required together.")
+        if self.joint_position_min is not None:
+            lower = np.asarray(self.joint_position_min, dtype=np.float64)
+            upper = np.asarray(self.joint_position_max, dtype=np.float64)
+            if lower.shape != (7,) or upper.shape != (7,) or not np.all(np.isfinite([lower, upper])):
+                raise ValueError("Arm command bounds must each contain seven finite values.")
+            if np.any(lower >= upper):
+                raise ValueError("Arm command lower bounds must be smaller than upper bounds.")
 
     def connect(self) -> None:
+        if self.require_no_automatic_recovery:
+            require_native_no_automatic_recovery()
         if self.realtime_enforce:
             from panda_py import libfranka
+
             self._robot = self._panda_cls(self.robot_ip, realtime_config=libfranka.RealtimeConfig.kEnforce)
         else:
             self._robot = self._panda_cls(self.robot_ip)
@@ -229,11 +258,20 @@ class PandaPyArmDriver:
         A backend that does not report ``robot_mode`` is left alone rather than assumed healthy
         or assumed broken -- there is nothing to check against.
         """
+        if bool(getattr(state, "current_errors", False)):
+            raise RuntimeError(
+                f"FR3 at {self.robot_ip} has active native errors. Clear the error in Desk before retrying."
+            )
         mode = getattr(state, "robot_mode", None)
         if mode is None:
             return
         mode_name = getattr(mode, "name", str(mode))
         remedy = self._UNCONTROLLABLE_ARM_MODES.get(mode_name)
+        if self.require_no_automatic_recovery and mode_name not in {"kIdle", "kMove"}:
+            raise RuntimeError(
+                f"FR3 at {self.robot_ip} cannot move in {mode_name}. "
+                "Clear the condition in Desk before pressing F again."
+            )
         if remedy is not None:
             raise RuntimeError(f"FR3 at {self.robot_ip} cannot start a controller: {remedy}")
         logger.info("FR3 arm at %s accepts control (robot_mode=%s)", self.robot_ip, mode_name)
@@ -253,6 +291,28 @@ class PandaPyArmDriver:
         current_joint_positions = self._refresh_joint_positions_cache(state)
         self._controller.set_control(current_joint_positions)
         self._robot.start_controller(self._controller)
+
+    def start_controller(self) -> None:
+        """Activate the native controller after an explicitly requested homing move."""
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        if self._controller is not None:
+            return
+        state = self._robot.get_state()
+        self._assert_arm_accepts_control(state)
+        self._start_controller(state)
+
+    def stop_motion(self) -> None:
+        """Cancel native homing/control, including a homing call running in another thread.
+
+        This is a software stop. The operator's physical stop remains independent.
+        """
+        robot = self._robot
+        if robot is None:
+            return
+        if self._moving_to_start:
+            robot.get_robot().stop()
+        self._stop_controller()
 
     def _stop_controller(self) -> None:
         if self._robot is not None and (self._controller is not None or self._teaching_mode_active):
@@ -289,19 +349,21 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
-        telemetry: dict[str, Any] = {"sample_monotonic_s": sampled_at_s}
-        robot_time = getattr(state, "time", None)
-        if robot_time is not None and hasattr(robot_time, "to_sec"):
-            telemetry["robot_time_s"] = float(robot_time.to_sec())
-        for key in ("q", "dq", "tau_J", "tau_ext_hat_filtered", "O_T_EE", "O_F_ext_hat_K"):
+        telemetry: dict[str, Any] = {"q": joint_positions.tolist(), "sample_monotonic_s": time.monotonic()}
+        for key in ("dq", "tau_J", "tau_ext_hat_filtered", "O_T_EE", "O_F_ext_hat_K"):
             value = getattr(state, key, None)
             if value is not None:
                 telemetry[key] = np.asarray(value, dtype=np.float64).reshape(-1).tolist()
-        success_rate = getattr(state, "control_command_success_rate", None)
-        if success_rate is not None:
-            telemetry["control_command_success_rate"] = float(success_rate)
+        native_time = getattr(state, "time", None)
+        to_sec = getattr(native_time, "to_sec", None)
+        if callable(to_sec):
+            telemetry["robot_time_s"] = float(to_sec())
         mode = getattr(state, "robot_mode", None)
-        telemetry["robot_mode"] = getattr(mode, "name", str(mode))
+        if mode is not None:
+            telemetry["robot_mode"] = getattr(mode, "name", str(mode))
+        success = getattr(state, "control_command_success_rate", None)
+        if success is not None:
+            telemetry["control_command_success_rate"] = float(success)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
@@ -309,11 +371,16 @@ class PandaPyArmDriver:
         return joint_positions
 
     def get_telemetry(self) -> dict[str, Any]:
-        """Copy one coherent native state snapshot without another FCI connection."""
-        if self._robot is not None:
-            self._robot.raise_error()
+        """Copy one coherent native state and propagate asynchronous controller faults."""
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        self._robot.raise_error()
+        if self.state_poll_frequency_hz <= 0:
+            self._refresh_joint_positions_cache()
         with self._state_lock:
-            return {key: list(value) if isinstance(value, list) else value
+            if self._cached_telemetry is None:
+                raise RuntimeError("FR3 state has not been sampled.")
+            return {key: value.copy() if isinstance(value, list) else value
                     for key, value in self._cached_telemetry.items()}
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
@@ -373,6 +440,7 @@ class PandaPyArmDriver:
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None
+            self._cached_telemetry = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
@@ -400,18 +468,29 @@ class PandaPyArmDriver:
     def set_joint_positions(self, joint_positions: np.ndarray) -> None:
         if self._controller is None:
             raise RuntimeError("Arm backend is not connected.")
-        self._controller.set_control(np.asarray(joint_positions, dtype=np.float64))
+        target = np.asarray(joint_positions, dtype=np.float64)
+        if self.joint_position_min is not None:
+            if target.shape != (7,) or not np.all(np.isfinite(target)):
+                raise ValueError("FR3 native joint target must contain seven finite values.")
+            if np.any(target < np.asarray(self.joint_position_min)) or np.any(target > np.asarray(self.joint_position_max)):
+                raise RuntimeError("FR3 joint command exceeds the configured conservative bounds.")
+        self._controller.set_control(target)
 
     def move_to_start(self) -> None:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        self._assert_arm_accepts_control(self._robot.get_state())
         controller_was_running = self._controller is not None
         if controller_was_running:
             self._stop_controller()
         try:
-            self._robot.move_to_start()
+            self._moving_to_start = True
+            result = self._robot.move_to_start()
+            if result is False:
+                raise RuntimeError("FR3 move_to_start did not complete successfully.")
             self._refresh_joint_positions_cache()
         finally:
+            self._moving_to_start = False
             if controller_was_running:
                 self._start_controller()
 

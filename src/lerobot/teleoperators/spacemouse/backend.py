@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -27,6 +29,8 @@ class SpaceMouseReading:
     translation: np.ndarray
     rotation: np.ndarray
     buttons: tuple[bool, bool]
+    report_age_s: float | None = None
+    report_timestamp: float | None = None
 
 
 class SpaceMouseDriver(Protocol):
@@ -40,8 +44,15 @@ class SpaceMouseDriver(Protocol):
 @dataclass
 class PySpaceMouseDriver:
     device_id: int
+    motion_input_timeout_s: float | None = None
 
     def __post_init__(self):
+        if self.motion_input_timeout_s is not None and (
+            isinstance(self.motion_input_timeout_s, bool)
+            or not math.isfinite(self.motion_input_timeout_s)
+            or self.motion_input_timeout_s <= 0
+        ):
+            raise ValueError("motion_input_timeout_s must be finite and positive when enabled")
         try:
             import pyspacemouse
         except Exception as e:  # pragma: no cover - exercised with real hardware only
@@ -51,6 +62,8 @@ class PySpaceMouseDriver:
 
         self._pyspacemouse = pyspacemouse
         self._device = None
+        self._last_report_timestamp = None
+        self._last_report_advance_s = None
 
     def _list_devices(self) -> list[object]:
         if hasattr(self._pyspacemouse, "list_devices"):
@@ -97,11 +110,38 @@ class PySpaceMouseDriver:
             )
             reason = f" Last open error: {self._open_error!r}." if self._open_error is not None else ""
             raise ConnectionError(f"Could not open SpaceMouse device {self.device_id}. {hint}{reason}")
+        if self.motion_input_timeout_s is not None:
+            try:
+                # Verify timestamp support during USB initialization, before a
+                # caller can proceed to open FCI. PySpaceMouse's -1 sentinel
+                # is permitted until the first report arrives while neutral.
+                self._report_age(self._device.read())
+            except Exception:
+                self.disconnect()
+                raise
 
     def disconnect(self) -> None:
         if self._device is not None:
             self._device.close()
             self._device = None
+        self._last_report_timestamp = None
+        self._last_report_advance_s = None
+
+    def _report_age(self, state) -> tuple[float, float]:
+        timestamp = getattr(state, "t", None)
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+            raise ConnectionError("SpaceMouse HID report timestamp is unavailable; input freshness cannot be checked")
+        timestamp = float(timestamp)
+        if timestamp < 0 and timestamp != -1.0:
+            raise ConnectionError("SpaceMouse HID report timestamp is invalid")
+        if self._last_report_timestamp is not None and timestamp < self._last_report_timestamp:
+            raise ConnectionError("SpaceMouse HID report timestamp moved backwards; reconnect the device")
+        now = time.monotonic()
+        if self._last_report_timestamp is None or timestamp > self._last_report_timestamp:
+            self._last_report_advance_s = now
+        self._last_report_timestamp = timestamp
+        age = max(0.0, now - self._last_report_advance_s)
+        return age, timestamp
 
     def describe(self) -> str:
         """Report the detected model and its button map.
@@ -133,9 +173,18 @@ class PySpaceMouseDriver:
         if self._device is None:
             raise RuntimeError("SpaceMouse backend is not connected.")
         state = self._device.read()
+        report_age = report_timestamp = None
+        if self.motion_input_timeout_s is not None:
+            report_age, report_timestamp = self._report_age(state)
         if state is None:
             return None
         translation = np.array([state.x, state.y, state.z], dtype=np.float64)
         rotation = np.array([state.roll, state.pitch, state.yaw], dtype=np.float64)
         buttons = (bool(state.buttons[0]), bool(state.buttons[1]))
-        return SpaceMouseReading(translation=translation, rotation=rotation, buttons=buttons)
+        return SpaceMouseReading(
+            translation=translation,
+            rotation=rotation,
+            buttons=buttons,
+            report_age_s=report_age,
+            report_timestamp=report_timestamp,
+        )

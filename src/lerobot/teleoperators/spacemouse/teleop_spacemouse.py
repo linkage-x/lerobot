@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -95,17 +96,21 @@ class SpaceMouseTeleop(Teleoperator):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
-        driver = self.driver_cls(device_id=self.config.device_id)
+        driver_args: dict[str, Any] = {"device_id": self.config.device_id}
+        if self.config.motion_input_timeout_s is not None:
+            driver_args["motion_input_timeout_s"] = self.config.motion_input_timeout_s
+        driver = self.driver_cls(**driver_args)
         try:
             driver.connect()
+            self._driver = driver
+            self._translation_bias, self._rotation_bias = self._estimate_idle_bias()
         except Exception:
             try:
                 driver.disconnect()
             except Exception:
                 pass
+            self._driver = None
             raise
-        self._driver = driver
-        self._translation_bias, self._rotation_bias = self._estimate_idle_bias()
         self._is_connected = True
 
     def _estimate_idle_bias(self) -> tuple[np.ndarray, np.ndarray]:
@@ -377,6 +382,28 @@ class SpaceMouseTeleop(Teleoperator):
         # deadbanded, motion enable/disable is determined directly from the zeroed
         # delta instead of a separate hysteresis/release-decay state machine.
         motion_detected = bool(np.any(active_mask))
+        input_fresh = True
+        if self.config.motion_input_timeout_s is not None:
+            # Check before updating either the Cartesian increment or the
+            # gripper. Raw idle bias/noise below calibrated deadzones is legal
+            # even when the device stops sending neutral HID reports.
+            if reading.report_age_s is None or reading.report_timestamp is None:
+                raise RuntimeError("SpaceMouse backend did not supply HID input freshness information")
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                for value in (reading.report_age_s, reading.report_timestamp)
+            ) or reading.report_age_s < 0 or (reading.report_timestamp < 0 and reading.report_timestamp != -1.0):
+                raise RuntimeError("SpaceMouse backend supplied invalid HID input freshness information")
+            input_fresh = (
+                reading.report_timestamp >= 0 and reading.report_age_s <= self.config.motion_input_timeout_s
+            )
+            if motion_detected and not input_fresh:
+                raise RuntimeError("SpaceMouse active HID input is stale; release/reconnect the device, then restart teleoperation")
+            if not input_fresh:
+                # Some devices send button reports only on press/release.
+                # Freeze a held button's target once its last report expires;
+                # cached button state must not keep incrementing the gripper.
+                button_0 = button_1 = False
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
             motion_enabled = motion_detected and button_0
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
@@ -386,8 +413,9 @@ class SpaceMouseTeleop(Teleoperator):
         self._motion_active = motion_detected
 
         if not motion_enabled:
-            self._update_gripper(button_0, button_1)
-            self._filter_gripper_command(self._last_gripper)
+            if input_fresh:
+                self._update_gripper(button_0, button_1)
+                self._filter_gripper_command(self._last_gripper)
             enabled_out = False
             self._prev_motion_detected = motion_detected
             self._prev_motion_enabled = motion_enabled

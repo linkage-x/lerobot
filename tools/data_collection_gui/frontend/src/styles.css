@@ -4371,6 +4371,61 @@ button.danger {
   padding: 8px 10px;
 }
 
+.fr3-status-panel {
+  border: 1px solid #dbe3ed;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  padding: 12px;
+}
+
+.fr3-status-heading {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.fr3-fault-message {
+  background: #fef3f2;
+  border-left: 3px solid #b42318;
+  border-radius: 4px;
+  color: #912018;
+  margin: 8px 0;
+  padding: 8px 10px;
+}
+
+.fr3-telemetry summary {
+  cursor: pointer;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.fr3-table-scroll {
+  overflow-x: auto;
+}
+
+.fr3-table-scroll table {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 12px 0;
+  width: 100%;
+}
+
+.fr3-table-scroll th,
+.fr3-table-scroll td {
+  border-bottom: 1px solid #e5eaf0;
+  padding: 6px 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.fr3-vector-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 /* Homed is its own line: "not homed" and "beam off the SMR" need different
    actions, and W2 looked green while never having homed. */
 .tracker-home-state {

@@ -8,8 +8,7 @@
 #   bash run/deploy.sh workstation
 #   bash run/deploy.sh workstation --sync-only
 #   bash run/deploy.sh thor --no-frontend
-#   bash run/deploy.sh --box-only              # camera/BOX collection only
-#   bash run/deploy.sh --spacemouse-host       # host USB -> Thor -> FR3 workstation
+#   bash run/deploy.sh --box-only               # original BOX/camera profile
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -20,10 +19,9 @@ target_explicit=false
 sync_only=false
 no_frontend=false
 box_only=false
-input_source=thor
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
@@ -39,8 +37,6 @@ for arg in "$@"; do
     --sync-only) sync_only=true ;;
     --no-frontend) no_frontend=true ;;
     --box-only) box_only=true ;;
-    --fr3) box_only=false ;;
-    --spacemouse-host) input_source=host ;;
     -h|--help)
       usage
       exit 0
@@ -53,14 +49,19 @@ for arg in "$@"; do
   esac
 done
 
+if $box_only && [[ "$target" != "thor" ]]; then
+  echo "ERROR: --box-only is a Thor deployment option" >&2
+  exit 2
+fi
+
 case "$target" in
   thor)
     remote="nvidia@192.168.111.122"
     remote_dir="/home/nvidia/lerobot"
     profile="thor"
-    config_path="tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
-    if ! $box_only; then
-      config_path="tools/thor/gmsl2/thor_fr3_teleop.yaml"
+    config_path="tools/thor/gmsl2/thor_fr3_teleop.yaml"
+    if $box_only; then
+      config_path="tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
     fi
     gateway_target="http://192.168.111.122:8765"
     ;;
@@ -123,21 +124,17 @@ if $sync_only; then
 fi
 
 echo "==> Restarting ${profile} gateway on ${remote}..."
-if [[ "$target" == "thor" ]] && ! $box_only; then
-  bash "$script_dir/prepare_fr3_bridge.sh"
-fi
 # flock -n reports a lock conflict with -E's exit code, so a failure inside the
 # remote script stays distinguishable from "someone else is deploying".
 restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path' '$input_source'" \
+  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path'" \
   <<'REMOTE' || restart_rc=$?
 set -euo pipefail
 
 repo_dir="$1"
 profile="$2"
 config_path="$3"
-input_source="$4"
 gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
 
 matching_pids() {
@@ -161,6 +158,30 @@ for name in os.listdir("/proc"):
     except OSError:
         continue
     if pattern in " ".join(args):
+        print(name)
+PY
+}
+
+# Match the native worker's module or script argument exactly. A text search
+# would also match an editor, a diagnostics command, or this deploy shell.
+fr3_worker_pids() {
+  python3 - <<'PY'
+import os
+
+MODULE = "tools.thor.fr3_control_worker"
+SCRIPT = "tools/thor/fr3_control_worker.py"
+for name in os.listdir("/proc"):
+    if not name.isdigit() or int(name) == os.getpid():
+        continue
+    try:
+        args = [item.decode("utf-8", "ignore") for item in open(f"/proc/{name}/cmdline", "rb").read().split(b"\0") if item]
+    except OSError:
+        continue
+    if not args or not os.path.basename(args[0]).startswith("python"):
+        continue
+    module_match = any(flag == "-m" and mod == MODULE for flag, mod in zip(args, args[1:]))
+    script_match = any(arg == SCRIPT or arg.endswith("/" + SCRIPT) for arg in args[1:])
+    if module_match or script_match:
         print(name)
 PY
 }
@@ -201,12 +222,32 @@ stop_pids() {
   pids="$("$@" || true)"
   if [[ -n "$pids" ]]; then
     echo "$pids" | xargs -r kill 2>/dev/null || true
+  else
+    return 0
+  fi
+  # The Thor recorder may be waiting for native homing/controller shutdown.
+  # Do not cut that short with the previous one-second forced termination.
+  for _ in 1 2 3 4 5 6 7 8; do
     sleep 1
-  fi
-  pids="$("$@" || true)"
-  if [[ -n "$pids" ]]; then
-    echo "$pids" | xargs -r kill -9 2>/dev/null || true
-  fi
+    pids="$("$@" || true)"
+    [[ -n "$pids" ]] || return 0
+  done
+  echo "$pids" | xargs -r kill -9 2>/dev/null || true
+}
+
+# Give libfranka's native controller time to finish its shutdown before a
+# remaining orphan is forcibly removed. The recorder normally does this first.
+stop_fr3_workers() {
+  local pids
+  pids="$(fr3_worker_pids || true)"
+  [[ -n "$pids" ]] || return 0
+  echo "$pids" | xargs -r kill 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    pids="$(fr3_worker_pids || true)"
+    [[ -n "$pids" ]] || return 0
+  done
+  echo "$pids" | xargs -r kill -9 2>/dev/null || true
 }
 
 # gateway.py redirects stdout/stderr into its own gateway_<ts>_<pid>.log inside
@@ -233,6 +274,7 @@ stop_pids gateway_pids
 # with the just-synced code instead of a stale orphan clashing over the hardware.
 if [[ "$profile" == "thor" ]]; then
   stop_pids matching_pids "tools/thor/gmsl2/thor_record.py"
+  stop_fr3_workers
 else
   stop_pids matching_pids "tools/fr3/fr3_mujoco_teleop.py"
 fi
@@ -280,7 +322,7 @@ fi
 # the X11 platform against "" and every Argus camera fails preflight with
 # "Could not get EGL display connection" / NvBufSurfaceMapEglImage failed,
 # while an unset DISPLAY takes the headless path and captures fine.
-gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1 FR3_INPUT_SOURCE="$input_source")
+gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1)
 if [[ -n "$display" ]]; then
   gateway_env+=(DISPLAY="$display")
 fi

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession, Fr3TeleopStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+import { hasActiveCalibrationCapture, recordingControlAvailability, recordingShortcutAction } from "./recordingControls";
+export { recordingControlAvailability } from "./recordingControls";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
   const grouped = useMemo(() => {
@@ -127,21 +129,58 @@ export function RecorderLogStream({ lines }: { lines: string[] }) {
   );
 }
 
-// Single source of truth for which record controls are available in a given
-// recorder state. Shared by the RecordingPanel buttons AND the LiveRecord
-// keyboard shortcuts, so a shortcut can never fire an action that a disabled
-// button wouldn't.
-export function recordingControlAvailability(status: RecordingStatus) {
-  const isConnected =
-    status.pid != null ||
-    ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
-  return {
-    isConnected,
-    canConnect: !isConnected,
-    canStartEpisode: status.state === "armed",
-    canResolveEpisode: status.state === "recording" || status.state === "review",
-    canExit: isConnected,
-  };
+function telemetryVector(telemetry: Record<string, unknown>, key: string): unknown[] {
+  return Array.isArray(telemetry[key]) ? telemetry[key] as unknown[] : [];
+}
+
+function telemetryNumber(value: unknown, precision = 3): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(precision) : "—";
+}
+
+export function Fr3StatusPanel({ status }: { status: Fr3TeleopStatus }) {
+  const telemetry = status.telemetry ?? {};
+  const jointColumns = ["q", "dq", "tau_J", "tau_ext_hat_filtered"].map((key) => telemetryVector(telemetry, key));
+  const tcp = telemetryVector(telemetry, "measured_tcp").length
+    ? telemetryVector(telemetry, "measured_tcp") : telemetryVector(telemetry, "tcp");
+  const wrench = telemetryVector(telemetry, "O_F_ext_hat_K");
+  const dot = status.state === "running" ? "running" : status.state === "error" ? "error"
+    : status.state === "idle" ? "idle" : "warning";
+  return (
+    <div className="fr3-status-panel">
+      <div className="fr3-status-heading">
+        <strong>FR3 SpaceMouse teleoperation</strong>
+        <span className="state-pill"><StatusDot state={dot} />{stateLabel(status.state)}</span>
+      </div>
+      <p className={status.state === "error" ? "fr3-fault-message" : "panel-note"} role={status.state === "error" ? "alert" : "status"}>
+        {status.message}
+      </p>
+      {status.state === "error" && (
+        <p className="fr3-fault-message">{status.pid != null
+          ? "FR3 worker shutdown is not confirmed. Stop the robot using its hardware controls and resolve the remaining worker process before retrying F."
+          : "Fix the reported problem and clear any robot fault. Release the SpaceMouse, then press F to move to start and resume."}</p>
+      )}
+      <details className="fr3-telemetry">
+        <summary>Measured joints, torque and end effector</summary>
+        {status.state !== "running" && <p className="panel-note">Measurements are available while FR3 teleoperation is running.</p>}
+        <div className="fr3-table-scroll">
+          <table>
+            <thead><tr><th>Joint</th><th>q (rad)</th><th>dq (rad/s)</th><th>Torque (Nm)</th><th>External torque (Nm)</th></tr></thead>
+            <tbody>{Array.from({ length: 7 }, (_, i) => (
+              <tr key={i}><th>{i + 1}</th>{jointColumns.map((values, column) => <td key={column}>{telemetryNumber(values[i])}</td>)}</tr>
+            ))}</tbody>
+          </table>
+        </div>
+        <div className="fr3-vector-grid">
+          <Metric label="Measured TCP xyz (m)" value={[0, 1, 2].map((i) => telemetryNumber(tcp[i], 4)).join(", ")} />
+          <Metric label="Measured TCP rotation vector (rad)" value={[3, 4, 5].map((i) => telemetryNumber(tcp[i], 4)).join(", ")} />
+          <Metric label="External force xyz (N)" value={[0, 1, 2].map((i) => telemetryNumber(wrench[i])).join(", ")} />
+          <Metric label="External torque xyz (Nm)" value={[3, 4, 5].map((i) => telemetryNumber(wrench[i])).join(", ")} />
+          <Metric label="FCI command success rate" value={telemetryNumber(telemetry.control_command_success_rate, 5)} />
+          <Metric label="Measured gripper opening (m)" value={telemetryNumber(telemetry.gripper_measured_m, 4)} />
+        </div>
+      </details>
+    </div>
+  );
 }
 
 const syncStatusLabels: Record<string, string> = {
@@ -187,7 +226,11 @@ export function RecordingPanel({
   logLines,
   backendPicker,
   laserTrackerToggle,
-  mountSession
+  mountSession,
+  fr3Teleop,
+  onStartFr3,
+  onStopFr3,
+  calibrationCapture = false,
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -200,6 +243,10 @@ export function RecordingPanel({
   laserTrackerToggle?: React.ReactNode;
   /** A calibration capture holding the recorder; see TrackerMountSession. */
   mountSession?: TrackerMountSession;
+  fr3Teleop?: Fr3TeleopStatus;
+  onStartFr3?: () => void;
+  onStopFr3?: () => void;
+  calibrationCapture?: boolean;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   // Only while the tracker is actually switched on for this session: an episode
@@ -224,8 +271,8 @@ export function RecordingPanel({
   const mountBlockReason = mountHeld
     ? `跟踪仪站位采集 ${mountSession?.sessionName ?? ""} 正在占用录制器`
     : "";
-  const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
-    recordingControlAvailability(status);
+  const { isConnected, canConnect, canStartEpisode, canResolveEpisode, canExit, canStartFr3, canStopFr3 } =
+    recordingControlAvailability(status, fr3Teleop, mountSession, busy, calibrationCapture);
   const isGmsl = config.rigType === "gmsl2";
   const panelTitle = backendPicker ? "FR3 Record" : isGmsl ? "GMSL2 Record" : "Handheld Record";
 
@@ -239,6 +286,7 @@ export function RecordingPanel({
         </span>
       </div>
       {backendPicker}
+      {fr3Teleop?.enabled && <Fr3StatusPanel status={fr3Teleop} />}
       {isGmsl && <HardwareSyncBadge config={config} />}
       <div className="config-grid">
         <Metric label="Config" value={config.configPath} />
@@ -274,21 +322,31 @@ export function RecordingPanel({
           要录任务数据，先到「标定」页结束这次站位采集——已经录下的停驻段不会被删。
         </p>
       )}
+      {calibrationCapture && !mountHeld && (
+        <p className="tracker-wait-banner">A calibration capture owns this recorder. Finish it on the Calibration page before starting FR3 or recording a task episode.</p>
+      )}
+      {fr3Teleop?.enabled && fr3Teleop.state !== "running" && status.state === "armed" && (
+        <p className="tracker-wait-banner">Press F to move FR3 to the configured start pose and enable SpaceMouse motion. Press E afterwards to record.</p>
+      )}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
-        <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        <button disabled={!canConnect} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        {fr3Teleop?.enabled && (
+          <button disabled={!canStartFr3} onClick={onStartFr3} title="F: move FR3 to start, then enable SpaceMouse motion">Start FR3 <kbd>F</kbd></button>
+        )}
         <button
-          disabled={busy || !canStartEpisode || trackerBlocking || mountHeld}
+          disabled={!canStartEpisode}
           onClick={onStart}
-          title={mountHeld ? mountBlockReason : trackerBlocking ? trackerBlockReason : "Shortcut: E"}
+          title={calibrationCapture ? "Finish the active calibration capture first" : mountHeld ? mountBlockReason : trackerBlocking ? trackerBlockReason : "Shortcut: E"}
         >
           StartEpisode <kbd>E</kbd>
         </button>
-        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
-        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
-        <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
+        <button disabled={!canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
+        <button disabled={!canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
+        {fr3Teleop?.enabled && <button disabled={!canStopFr3} onClick={onStopFr3} title="Stop FR3 motion; discard any active episode">Stop FR3</button>}
+        <button disabled={!canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
       </div>
       <div className="summary-grid">
         <Metric label="Frame" value={`${status.frameIndex}/${status.targetFrames}`} />
@@ -315,6 +373,8 @@ export function LiveRecordPage({
   onConnect,
   onStart,
   onStop,
+  onStartFr3,
+  onStopFr3,
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
@@ -325,6 +385,8 @@ export function LiveRecordPage({
   onConnect: (backend?: RecordingBackend, laserTracker?: boolean) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
+  onStartFr3: () => void;
+  onStopFr3: () => void;
   onOpenInReplay: () => void;
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
@@ -362,38 +424,33 @@ export function LiveRecordPage({
   // while the operator is typing in an input/textarea/select.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.repeat || event.isComposing) return;
-      if (event.ctrlKey || event.metaKey || event.altKey) return;
       const el = document.activeElement as HTMLElement | null;
       const tag = el?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable) return;
-      if (busy) return;
-      const controls = recordingControlAvailability(snapshot.recording);
-      const key = event.key.toLowerCase();
-      if (key === "c" && controls.canConnect) {
-        event.preventDefault();
+      const editable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(el?.isContentEditable);
+      const controls = recordingControlAvailability(snapshot.recording, snapshot.fr3Teleop, snapshot.trackerMountSession, busy, hasActiveCalibrationCapture(snapshot));
+      const action = recordingShortcutAction(event, controls, editable);
+      if (!action) return;
+      event.preventDefault();
+      if (action === "connect") {
         onConnect(
           supportsBackendChoice ? selectedBackend : undefined,
           hasLaserTracker ? laserTracker : undefined,
         );
-      } else if (key === "e" && controls.canStartEpisode
-                 && !(snapshot.recording.laserTracker && !snapshot.recording.laserTrackerReady)) {
-        event.preventDefault();
+      } else if (action === "startFr3") {
+        onStartFr3();
+      } else if (action === "startEpisode") {
         onStart();
-      } else if (key === "s" && controls.canResolveEpisode) {
-        event.preventDefault();
+      } else if (action === "save") {
         onStop("save");
-      } else if (key === "d" && controls.canResolveEpisode) {
-        event.preventDefault();
+      } else if (action === "discard") {
         onStop("discard");
-      } else if (event.key === "Escape" && controls.canExit) {
-        event.preventDefault();
+      } else if (action === "exit") {
         onStop("exit");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, hasLaserTracker, laserTracker]);
+  }, [busy, snapshot.recording, snapshot.fr3Teleop, snapshot.trackerMountSession, snapshot.calibrationSession, snapshot.markerTcp, onConnect, onStart, onStop, onStartFr3, supportsBackendChoice, selectedBackend, hasLaserTracker, laserTracker]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -456,7 +513,9 @@ export function LiveRecordPage({
     <div className="page-stack">
       <PageHeader
         title="Live Record"
-        subtitle={supportsBackendChoice
+        subtitle={snapshot.fr3Teleop?.enabled
+          ? "C connects Sengyun cameras and BOX sensors · F moves FR3 to start and enables SpaceMouse · E records · S saves · D discards"
+          : supportsBackendChoice
           ? `FR3 SpaceMouse capture on the ${selectedBackend === "sim" ? "MuJoCo twin" : "real arm"}; both write the same dataset schema`
           : snapshot.configSummary.rigType === "gmsl2"
             ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
@@ -488,6 +547,10 @@ export function LiveRecordPage({
           laserTrackerToggle={laserTrackerToggle}
           onStart={onStart}
           onStop={onStop}
+          fr3Teleop={snapshot.fr3Teleop}
+          onStartFr3={onStartFr3}
+          onStopFr3={onStopFr3}
+          calibrationCapture={hasActiveCalibrationCapture(snapshot)}
           logLines={logLines}
           backendPicker={backendPicker}
           mountSession={snapshot.trackerMountSession}
@@ -511,4 +574,3 @@ export function LiveRecordPage({
     </div>
   );
 }
-

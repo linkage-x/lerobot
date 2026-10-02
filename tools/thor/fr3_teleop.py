@@ -1,294 +1,363 @@
-"""FR3 coordinator owned by the Thor recorder's existing camera/BOX session."""
+"""FR3 lifecycle owned by the existing Thor camera/BOX recorder.
+
+C constructs this coordinator without opening USB or FCI. F creates a fresh
+native worker on the same host. Cameras and BOX never enter that worker.
+"""
 from __future__ import annotations
 
 from collections import deque
 import json
 import math
+import os
 from pathlib import Path
+import select
 import socket
+import subprocess
 import threading
 import time
 
-from tools.fr3.box_teleop_protocol import (
-    BridgeClient, JsonConnection, Lease, authenticate, neutral_action, read_token, validate_action,
-)
+from tools.thor.fr3_ipc import JsonChannel
 
 
-def gripper_client(box, box_id: str):
-    # BoxPool exposes collection operations publicly; its per-device client
-    # handles already own the SDK socket. Keep this adaptation in one place.
-    targets = [(bid, client) for bid, client in box._clients if not box_id or bid == box_id]
-    if len(targets) != 1:
-        raise RuntimeError("FR3 gripper requires exactly one BOX; configure gripper_box_id for multi-box rigs")
-    return targets[0][1]
+def gripper_client(pool, box_id: str):
+    clients = list(pool._clients)
+    if box_id:
+        matching = [client for name, client in clients if name == box_id]
+        if len(matching) != 1:
+            raise RuntimeError(f"Configured FR3 gripper BOX {box_id!r} is not connected")
+        return matching[0]
+    if len(clients) != 1:
+        raise RuntimeError("Set fr3_teleop.gripper_box_id when multiple BOX devices are connected")
+    return clients[0][1]
 
 
-def make_spacemouse(config: dict, initial_gripper: float):
+def measured_opening(client, max_width_m: float) -> float:
+    sample = client.read()
+    sensor = (sample.get("sensors") or {}).get("box_gripper") or {}
+    status = ((sample.get("status") or {}).get("sensor_status") or {}).get("box_gripper") or {}
+    value = sensor.get("distance_m")
+    if status.get("fresh") is not True or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise RuntimeError("BOX gripper opening is unavailable or stale; check the sensor stream")
+    if not 0 <= value <= max_width_m + 0.005:
+        raise RuntimeError("BOX gripper opening is outside its configured physical range")
+    return max(0.0, min(float(value), max_width_m))
+
+
+def make_spacemouse(config: dict, opening: float, repo_root: Path):
     from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig
     from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
-    raw = dict(config)
+
+    raw = dict(config.get("teleop") or {})
     raw.pop("type", None)
-    raw["initial_gripper"] = initial_gripper
+    raw["initial_gripper"] = opening
+    raw["calibration_dir"] = repo_root / "outputs" / "calibration" / "spacemouse"
     device = SpaceMouseTeleop(SpaceMouseTeleopConfig(**raw))
     device.connect()
     return device
 
 
+def native_environment(repo_root: Path, runtime_python: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join((str(repo_root / "src"), str(repo_root), env.get("PYTHONPATH", "")))
+    libraries = sorted((runtime_python.parent.parent / "lib").glob("python*/site-packages/cmeel.prefix/lib"))
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([*(str(path) for path in libraries), env.get("LD_LIBRARY_PATH", "")])
+    return env
+
+
+def pending_worker_error(channel: JsonChannel) -> str:
+    """Preserve a queued native error when the peer closes immediately after it."""
+    for _ in range(16):
+        if b"\n" not in channel.buffer and not select.select([channel.sock], [], [], 0)[0]:
+            break
+        try:
+            packet = channel.receive()
+        except (EOFError, OSError, ValueError):
+            break
+        if packet.get("state") == "error":
+            return str(packet.get("message") or "FR3 controller error")
+    return ""
+
+
 class ThorFr3Session:
-    def __init__(self, config: dict, box, emit=print):
+    def __init__(self, config: dict, config_path: Path, repo_root: Path, box, *, emit=print):
+        self.config = config
         self.settings = config["fr3_teleop"]
-        self.teleop_config = config["teleop"]
+        self.config_path = config_path.resolve()
+        self.repo_root = repo_root.resolve()
         self.box = box
         self.emit = emit
         self.lock = threading.RLock()
         self.stop = threading.Event()
-        self.active = False
-        self.error = ""
-        self.state = {}
-        self.device = None
-        self.remote_action = None
-        self.remote_at_s = 0.0
-        self.remote_connected = False
-        self.input_epoch = 0
-        self.gripper = 1.0
-        self.measured_gripper_m = None
-        self.gripper_client = None
-        self.gripper_mode = False
-        self.last_gripper_at_s = 0.0
-        self.last_gripper_m = None
         self.thread = None
-        self.input_thread = None
-        self.input_listener = None
+        self.process = None
+        self.state = "idle"
+        self.error = ""
+        self.telemetry = {}
+        self.pid = None
+        self.recording = False
+        self.episode_interrupted = False
         self.history = deque(maxlen=200)
-        self.recording = None
-        self.max_samples = int(self.settings.get("max_episode_samples", 240000))
-        self.token = read_token(self.settings["token_file"])
-        self.bridge = BridgeClient(self.settings["arm_host"], int(self.settings["arm_port"]), self.token,
-                                   float(self.settings.get("command_timeout_s", 0.15)))
+        self.samples = []
+        self.publish("idle", "Sensors connected. Press F to move FR3 to start and enable SpaceMouse")
 
-    def start(self) -> None:
-        self.bridge.connect()
-        self.thread = threading.Thread(target=self._run, name="thor-fr3-coordinator", daemon=True)
-        self.thread.start()
-        if self.settings.get("input_source", "thor") == "host":
-            self.input_listener = socket.socket()
-            self.input_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.input_listener.bind((self.settings.get("input_bind", "0.0.0.0"),
-                                      int(self.settings.get("input_port", 18771))))
-            self.input_listener.listen(1)
-            self.input_listener.settimeout(0.2)
-            self.input_thread = threading.Thread(target=self._serve_input, name="thor-spacemouse-input", daemon=True)
-            self.input_thread.start()
-
-    def _read_gripper(self) -> float:
-        client = gripper_client(self.box, str(self.settings.get("gripper_box_id", "")))
-        snap = client.read()
-        data = snap.get("sensors", {}).get("box_gripper", {})
-        status = snap.get("status", {}).get("sensor_status", {}).get("box_gripper", {})
-        distance = data.get("distance_m")
-        if distance is None or not math.isfinite(distance) or not status.get("fresh", False):
-            raise RuntimeError("BOX gripper opening is unavailable or stale")
-        self.gripper_client = client
-        self.measured_gripper_m = float(distance)
-        return float(distance)
-
-    def set_active(self, active: bool) -> None:
+    def publish(self, state: str, message: str) -> None:
         with self.lock:
-            if not active:
-                self.active = False
-                if self.device is not None:
-                    self.device.disconnect()
-                    self.device = None
-                self._release_gripper()
-                self._emit_status()
+            self.state = state
+            payload = {"enabled": True, "state": state, "message": message,
+                       "telemetry": self.telemetry if state == "running" else {}, "pid": self.pid}
+        self.emit("FR3_LIVE " + json.dumps(payload, separators=(",", ":"), allow_nan=False))
+
+    def request_start(self) -> None:
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
                 return
-            if self.error or self.stop.is_set() or not self.state:
-                raise RuntimeError(self.error or "FR3 state is not ready; reconnect devices")
-            if self.active:
+            if self.process is not None and self.process.poll() is None:
+                self.publish("error", "The previous FR3 worker is still stopping. Exit and restart the session before retrying F")
                 return
-            distance = self._read_gripper()
-            self.gripper = min(1.0, max(0.0, distance / float(self.settings.get("gripper_max_width_m", 0.09))))
-            if self.settings.get("input_source", "thor") == "thor":
-                self.device = make_spacemouse(self.teleop_config, self.gripper)
-            elif not self.remote_connected:
-                raise RuntimeError("Start the host SpaceMouse sender before starting teleoperation")
-            try:
-                # Seed the actual opening before and immediately after the firmware mode switch.
-                self.gripper_client.set_clamp_pos(distance)
-                if self.gripper_client.set_mode(1) != 0:
-                    raise RuntimeError("BOX could not enter gripper control mode")
-                self.gripper_mode = True
-                if self.gripper_client.set_clamp_pos(distance) != 0:
-                    raise RuntimeError("BOX could not hold the measured gripper opening")
-                self.last_gripper_m = distance
-                self.last_gripper_at_s = time.monotonic()
-                self.active = True
-                self.input_epoch += 1
-                self.remote_action = None
-                self.remote_at_s = time.monotonic()
-            except Exception:
-                self.set_active(False)
-                raise
-            self._emit_status()
+            self.stop.clear()
+            self.error = ""
+            self.telemetry = {}
+            self.history.clear()
+            self.publish("starting", "Preparing FR3 and SpaceMouse; keep the puck released")
+            self.thread = threading.Thread(target=self._run, name="thor-fr3-coordinator", daemon=True)
+            self.thread.start()
 
-    def _release_gripper(self) -> None:
-        if self.gripper_mode and self.gripper_client is not None:
-            try:
-                distance = self._read_gripper()
-                self.gripper_client.set_clamp_pos(distance)
-            finally:
-                self.gripper_client.set_mode(0)
-                self.gripper_mode = False
-
-    def _emit_status(self) -> None:
-        payload = {"state": "error" if self.error else "running" if self.active else "idle",
-                   "backend": "real", "realRobotReady": bool(self.state) and not self.error,
-                   "message": self.error or ("FR3 teleoperation active" if self.active else "FR3 telemetry connected; motion disabled"),
-                   "telemetry": self.state, "inputSource": self.settings.get("input_source", "thor")}
-        self.emit("FR3_LIVE " + json.dumps(payload, allow_nan=False, separators=(",", ":")))
-
-    def _run(self) -> None:
-        interval = 1.0 / float(self.settings.get("control_hz", 200))
-        last_emit_s = 0.0
-        try:
-            while not self.stop.is_set():
-                started = time.monotonic()
-                with self.lock:
-                    if self.error:
-                        raise RuntimeError(self.error)
-                    active = self.active
-                    action = neutral_action(self.gripper)
-                    if active:
-                        if self.device is not None:
-                            action = self.device.get_action()
-                        else:
-                            if started - self.remote_at_s > float(self.settings.get("command_timeout_s", 0.15)):
-                                raise TimeoutError("Host SpaceMouse input watchdog expired")
-                            action = self.remote_action or action
-                            self.remote_action = None  # consume each host delta once
-                        action = validate_action(action)
-                    try:
-                        self._read_gripper()
-                    except RuntimeError:
-                        self.measured_gripper_m = None
-                        if active:
-                            raise  # freshness gate during control, not only at startup
-                    reply = self.bridge.exchange(action, active=active)
-                    state = reply["state"]
-                    source_s = float(state["sample_monotonic_s"])
-                    mapped_s = source_s + reply["clock_offset_s"]
-                    age_s = reply["receiver_monotonic_s"] - mapped_s
-                    uncertainty_s = reply["clock_uncertainty_s"]
-                    if uncertainty_s > float(self.settings.get("max_clock_uncertainty_ms", 20)) / 1000:
-                        raise RuntimeError("FR3 bridge clock uncertainty exceeds limit")
-                    if age_s + uncertainty_s > float(self.settings.get("max_state_age_ms", 100)) / 1000:
-                        raise RuntimeError("FR3 bridge state is stale")
-                    self.gripper = action["gripper"]
-                    now = time.monotonic()
-                    if active and now - self.last_gripper_at_s >= 1 / 15:
-                        target = self.gripper * float(self.settings.get("gripper_max_width_m", 0.09))
-                        if abs(target - self.last_gripper_m) >= 0.0005:
-                            if self.gripper_client.set_clamp_pos(target) != 0:
-                                raise RuntimeError("BOX gripper command failed")
-                            self.last_gripper_m = target
-                        self.last_gripper_at_s = now
-                    sample = {**state, "thor_sample_monotonic_s": mapped_s,
-                              "receiver_monotonic_s": reply["receiver_monotonic_s"],
-                              "clock_uncertainty_s": uncertainty_s, "round_trip_ms": reply["round_trip_ms"],
-                              "gripper_command": self.gripper, "teleop_active": active,
-                              "gripper_measured_m": self.measured_gripper_m,
-                              "input_action": action}
-                    self.state = sample
-                    self.history.append(sample)
-                    if self.recording is not None:
-                        if len(self.recording) >= self.max_samples:
-                            raise RuntimeError("FR3 episode sample limit exceeded; save shorter episodes")
-                        self.recording.append(sample)
-                    if now - last_emit_s >= 0.1:
-                        self._emit_status()
-                        last_emit_s = now
-                self.stop.wait(max(0.0, interval - (time.monotonic() - started)))
-        except Exception as exc:
-            with self.lock:
-                self.error = str(exc)
-                try:
-                    self.set_active(False)
-                except Exception:
-                    pass
-                self._emit_status()
+    def request_stop(self) -> None:
+        with self.lock:
+            if self.recording:
+                self.episode_interrupted = True
             self.stop.set()
-        finally:
-            self.bridge.close()  # loss of owner stops the workstation controller
+            if self.thread is not None and self.thread.is_alive():
+                self.publish("stopping", "Stopping FR3; cameras and BOX remain connected")
 
-    def _serve_input(self) -> None:
-        while not self.stop.is_set():
-            try:
-                sock, _ = self.input_listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            connection = JsonConnection(sock, 2.0)
-            try:
-                authenticate(connection.receive(), self.token)
-                lease = Lease(float(self.settings.get("command_timeout_s", 0.15)))
-                connection.timeout_s = lease.timeout_s
-                with self.lock:
-                    self.remote_connected = True
-                connection.send({"lease": lease.issue(), "gripper": self.gripper, "active": self.active,
-                                 "epoch": self.input_epoch})
-                while not self.stop.is_set():
-                    packet = connection.receive()
-                    received_s = time.monotonic()
-                    lease.accept(packet)
-                    action = validate_action(packet.get("action"))
-                    with self.lock:
-                        self.remote_action = action if packet.get("epoch") == self.input_epoch and self.active else None
-                        self.remote_at_s = time.monotonic()
-                    connection.send({"sequence": packet["sequence"], "lease": lease.issue(),
-                                     "gripper": self.gripper, "active": self.active,
-                                     "epoch": self.input_epoch,
-                                     "server_received_s": received_s, "server_sent_s": time.monotonic()})
-            except Exception as exc:
-                self.emit(f"Host SpaceMouse input disconnected: {exc}")
-            finally:
-                sock.close()
-                with self.lock:
-                    self.remote_connected = False
-                    self.remote_action = None
-                    if self.active:
-                        self.error = "Host SpaceMouse disconnected; reconnect devices"
-                        self.set_active(False)
+    @property
+    def running(self) -> bool:
+        with self.lock:
+            return self.state == "running" and not self.stop.is_set() and not self.error
 
     def start_recording(self) -> None:
         with self.lock:
-            self.recording = list(self.history)
+            if not self.running:
+                raise RuntimeError("Press F and wait for FR3 teleoperation before recording")
+            self.samples = list(self.history)
+            self.recording = True
+            self.episode_interrupted = False
 
-    def stop_recording(self) -> list[dict]:
+    def stop_recording(self) -> tuple[list[dict], bool]:
         with self.lock:
-            samples = self.recording or []
-            self.recording = None
-            return samples
+            self.recording = False
+            samples, self.samples = self.samples, []
+            return samples, self.episode_interrupted
+
+    def _sample(self, state: dict, opening: float, gripper: float) -> None:
+        sample = {**state, "receiver_monotonic_s": time.monotonic(),
+                  "gripper_measured_m": opening, "gripper_command": gripper}
+        with self.lock:
+            self.telemetry = sample
+            self.history.append(sample)
+            if self.recording:
+                if len(self.samples) >= int(self.settings.get("max_episode_samples", 240000)):
+                    raise RuntimeError("FR3 episode sample limit exceeded")
+                self.samples.append(sample)
+
+    def _spawn_worker(self):
+        raw = Path(self.settings.get("runtime_python", ".venv-fr3/bin/python"))
+        python = raw if raw.is_absolute() else self.repo_root / raw
+        if not python.is_file() or not os.access(python, os.X_OK):
+            raise RuntimeError(f"FR3 runtime is missing: {python}. Run run/setup_thor_fr3.sh explicitly on Thor")
+        parent, child = socket.socketpair()
+        channel = JsonChannel(parent)
+        log_dir = self.repo_root / "outputs" / "logs" / "fr3_teleop"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log = (log_dir / f"native_{time.time_ns()}.log").open("wb")
+        try:
+            process = subprocess.Popen(
+                [str(python), "-m", "tools.thor.fr3_control_worker", "--config-path", str(self.config_path),
+                 "--ipc-fd", str(child.fileno())],
+                cwd=self.repo_root, env=native_environment(self.repo_root, python),
+                pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            channel.close()
+            raise
+        finally:
+            child.close()
+            log.close()
+        self.process = process
+        self.pid = process.pid
+        return process, channel
+
+    def _run(self) -> None:
+        process = channel = device = client = None
+        gripper_mode = False
+        failure = ""
+        try:
+            width = float(self.settings.get("gripper_max_width_m", 0.09))
+            if not math.isfinite(width) or width <= 0:
+                raise ValueError("gripper_max_width_m must be finite and positive")
+            control_hz = float(self.settings.get("control_hz", 200))
+            if not math.isfinite(control_hz) or not 1 < control_hz <= 500:
+                raise ValueError("fr3_teleop.control_hz must be finite and in (1, 500]")
+            client = gripper_client(self.box, str(self.settings.get("gripper_box_id") or ""))
+            opening = measured_opening(client, width)
+            device = make_spacemouse(self.config, opening / width, self.repo_root)
+            if self.stop.is_set():
+                return
+            process, channel = self._spawn_worker()
+            interval = 1 / control_hz
+            startup_deadline = time.monotonic() + float(self.settings.get("startup_timeout_s", 60))
+            ready = False
+            last_state_s = last_publish_s = last_gripper_s = 0.0
+            last_heartbeat_s = 0.0
+            last_position = None
+            last_native = None
+            gripper = opening / width
+            while not self.stop.is_set():
+                started = time.monotonic()
+                if not ready and started > startup_deadline:
+                    raise TimeoutError("FR3 startup timed out; check FCI, robot mode, and native worker log")
+                # The native worker sends low-rate telemetry, never pixels or
+                # BOX packets. Bound draining so input delivery cannot starve.
+                for _ in range(16):
+                    if b"\n" not in channel.buffer and not select.select([channel.sock], [], [], 0)[0]:
+                        break
+                    try:
+                        packet = channel.receive()
+                    except socket.timeout:
+                        break
+                    state = packet.get("state")
+                    if state == "error":
+                        raise RuntimeError(packet.get("message") or "FR3 controller error")
+                    if state == "stopped":
+                        raise RuntimeError(packet.get("message") or "FR3 worker stopped")
+                    if state in ("starting", "moving_to_start") and not ready:
+                        self.publish(state, str(packet.get("message") or "Preparing FR3"))
+                    if state == "running":
+                        telemetry = packet.get("telemetry") or {}
+                        if not telemetry:
+                            continue
+                        last_state_s = time.monotonic()
+                        first_sample = not ready
+                        if not ready:
+                            # Homing completed. Seed the real BOX gripper from
+                            # its measured opening, then enable control once.
+                            opening = measured_opening(client, width)
+                            gripper = opening / width
+                            device.sync_gripper_baseline(gripper)
+                            if client.set_clamp_pos(opening) != 0:
+                                raise RuntimeError("BOX rejected the initial gripper hold")
+                            gripper_mode = True
+                            if client.set_mode(1) != 0 or client.set_clamp_pos(opening) != 0:
+                                raise RuntimeError("BOX could not enter gripper control mode")
+                            ready = True
+                            last_position = opening
+                        source_s = telemetry.get("sample_monotonic_s")
+                        if source_s != last_native:
+                            # Record the target accepted by BOX's rate-limited
+                            # command path, rather than a pending mouse value.
+                            self._sample(telemetry, opening, last_position / width)
+                            last_native = source_s
+                        if first_sample:
+                            self.publish("running", "FR3 is at start. SpaceMouse control is active; press E to record")
+                if process.poll() is not None:
+                    raise RuntimeError(f"FR3 worker exited ({process.returncode}); inspect outputs/logs/fr3_teleop")
+                if ready:
+                    if time.monotonic() - last_state_s > float(self.settings.get("max_state_age_s", 0.1)):
+                        raise RuntimeError("FR3 telemetry stopped arriving")
+                    opening = measured_opening(client, width)
+                    action = device.get_action()
+                    gripper = float(action["gripper"])
+                    if not math.isfinite(gripper) or not 0 <= gripper <= 1:
+                        raise ValueError("SpaceMouse gripper command is invalid")
+                    channel.send({"op": "action", "action": action, "sent_monotonic_s": time.monotonic()})
+                    position = gripper * width
+                    if started - last_gripper_s >= 1 / 15 and (last_position is None or abs(position - last_position) >= 0.0005):
+                        if client.set_clamp_pos(position) != 0:
+                            raise RuntimeError("BOX rejected the gripper command")
+                        last_gripper_s, last_position = started, position
+                else:
+                    # Native imports may briefly hold their process's GIL.
+                    # Startup needs a liveness signal, not a 200 Hz backlog.
+                    if started - last_heartbeat_s >= 0.05:
+                        channel.send({"op": "heartbeat", "sent_monotonic_s": time.monotonic()})
+                        last_heartbeat_s = started
+                if ready and started - last_publish_s >= 0.1:
+                    self.publish("running", "SpaceMouse control active; E records, S saves, D discards")
+                    last_publish_s = started
+                self.stop.wait(max(0.0, interval - (time.monotonic() - started)))
+        except Exception as exc:
+            failure = pending_worker_error(channel) if channel is not None else ""
+            failure = failure or str(exc)
+            with self.lock:
+                self.error = failure
+                if self.recording:
+                    self.episode_interrupted = True
+            self.publish("stopping", f"{failure}; stopping FR3 before allowing a retry")
+        finally:
+            self.stop.set()
+            if channel is not None:
+                try:
+                    channel.send({"op": "stop"})
+                except Exception:
+                    pass
+                channel.close()
+            if gripper_mode and client is not None:
+                try:
+                    if client.set_mode(0) != 0:
+                        raise RuntimeError("BOX rejected collection mode")
+                except Exception as exc:
+                    failure = failure or f"Could not restore BOX collection mode: {exc}"
+            if process is not None:
+                try:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=2)
+                except Exception as exc:
+                    failure = failure or f"Could not stop the native FR3 worker: {exc}"
+            if device is not None:
+                try:
+                    device.disconnect()
+                except Exception:
+                    pass
+            with self.lock:
+                still_alive = process is not None and process.poll() is None
+                self.process = process if still_alive else None
+                self.pid = process.pid if still_alive else None
+                if still_alive:
+                    failure = f"{failure or 'FR3 shutdown failed'}; native worker {process.pid} is still alive"
+                self.telemetry = {}
+                # Cleanup is complete before exposing F again. A new request
+                # must not be lost because this final status emitter is alive.
+                self.thread = None
+                if failure:
+                    self.error = failure
+                    if self.recording:
+                        self.episode_interrupted = True
+                    self.publish("error", f"{failure}. Clear the robot/Desk error, then press F to retry")
+                else:
+                    self.publish("idle", "FR3 stopped. Sensors remain connected; press F to move to start again")
 
     def close(self) -> None:
-        self.stop.set()
-        if self.input_listener is not None:
-            self.input_listener.close()
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-        if self.input_thread is not None:
-            self.input_thread.join(timeout=1.0)
-        self.bridge.close()
-        self.set_active(False)
+        self.request_stop()
+        thread = self.thread
+        if thread is not None:
+            thread.join(timeout=8)
+            if thread.is_alive():
+                raise RuntimeError("FR3 coordinator did not stop; inspect the native worker")
+        if self.process is not None and self.process.poll() is None:
+            raise RuntimeError(f"Native FR3 worker {self.process.pid} has not exited; a second controller will be refused")
 
 
-def write_fr3_samples(episode_dir: Path, samples: list[dict], t0_mono_s: float) -> dict:
-    path = episode_dir / "fr3_state.jsonl"
-    with path.open("w") as stream:
+def write_fr3_samples(ep_dir: Path, samples: list[dict]) -> Path:
+    path = ep_dir / "fr3_state.jsonl"
+    with path.open("w") as output:
         for sample in samples:
-            stream.write(json.dumps({**sample, "t_relative_s": sample["thor_sample_monotonic_s"] - t0_mono_s},
-                                    allow_nan=False, separators=(",", ":")) + "\n")
-    return {"enabled": True, "samples": len(samples), "state_file": path.name,
-            "clock": "workstation CLOCK_MONOTONIC mapped to Thor with request/response midpoint",
-            "t0_monotonic_s": t0_mono_s,
-            "max_clock_uncertainty_ms": max((s["clock_uncertainty_s"] * 1000 for s in samples), default=None)}
+            output.write(json.dumps(sample, separators=(",", ":"), allow_nan=False) + "\n")
+    return path

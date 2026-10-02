@@ -7,7 +7,6 @@ from tools.thor.box_sdk import box_client as bc
 from tools.thor.gmsl2 import argus_frame_sync as afs
 from tools.thor.gmsl2 import gmsl2_record as gr
 from tools.thor.gmsl2 import persistent_session as ps
-from tools.thor.gmsl2.camera_roles import resolve_camera_roles
 
 
 def _load_thor_record_module():
@@ -102,21 +101,11 @@ def test_thor_record_meta_records_connect_stream_errors(tmp_path: Path) -> None:
         wallclock_start_utc="2026-07-03T00:00:00+00:00",
         wallclock_end_utc="2026-07-03T00:00:01+00:00",
         world_frame={"world_frame_id": "world_20260819_031843", "status": "ok"},
-        camera_identity={"cam_06": {"serial": "WRIST_MODULE"}},
-        camera_roles=resolve_camera_roles(
-            {"fr3_teleop": {"wrist_camera": {"serial": "WRIST_MODULE"}}},
-            [{"name": "cam_06", "sensor_id": 6}],
-            {"cam_06": {"serial": "WRIST_MODULE"}},
-        ),
     )
 
     meta = json.loads(meta_path.read_text())
     assert meta["world_frame"]["world_frame_id"] == "world_20260819_031843"
     assert meta["active_camera_sids"] == [6]
-    assert meta["camera_roles"]["camera"] == "cam_06"
-    assert meta["camera_roles"]["cameras"]["cam_06"]["role"] == "wrist"
-    assert meta["camera_identity"]["cam_06"]["serial"] == "WRIST_MODULE"
-    assert meta["cameras"][0]["file"] == "cam_06.mkv"
     assert meta["argus_failed_sids"] == []
     assert meta["connect_failed_sids"] == [3]
     assert meta["connect_stream_errors"] == [

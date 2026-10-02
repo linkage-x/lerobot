@@ -19,6 +19,7 @@ import type {
   TrackingTarget,
   RecordedDataset,
   RecordingStatus,
+  Fr3TeleopStatus,
   ReplayStatus,
   ReplayTimeline,
   HandEyePlanResponse,
@@ -76,6 +77,7 @@ export type GuiSnapshot = {
   configSummary: ConfigSummary;
   devices: DeviceStatus[];
   recording: RecordingStatus;
+  fr3Teleop?: Fr3TeleopStatus;
   replay: ReplayStatus;
   teleop: TeleopStatus;
   annotation: EpisodeAnnotation;
@@ -144,6 +146,7 @@ export class DataCollectionGuiApi {
       queueDepth: 0,
       message: "Ready to launch handheld recorder"
     },
+    fr3Teleop: { enabled: false, state: "idle", message: "FR3 teleoperation is disabled in this configuration", telemetry: {} },
     replay: {
       state: "idle",
       dataset: handheldConfigSummary.repoId,
@@ -306,6 +309,20 @@ export class DataCollectionGuiApi {
     };
     this.snapshot.devices = this.snapshot.devices.map((device) => ({ ...device, state: "running" }));
     this.log("info", "Episode recording started");
+    return this.getSnapshot();
+  }
+
+  async startFr3Teleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/fr3/teleop/start");
+    if (remote) return remote;
+    this.applyRemoteCommandError("/api/fr3/teleop/start", "Gateway unavailable; reconnect before starting FR3 motion");
+    return this.getSnapshot();
+  }
+
+  async stopFr3Teleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/fr3/teleop/stop");
+    if (remote) return remote;
+    this.applyRemoteCommandError("/api/fr3/teleop/stop", "Gateway unavailable; FR3 stop was not acknowledged");
     return this.getSnapshot();
   }
 
@@ -1635,7 +1652,11 @@ export class DataCollectionGuiApi {
   private applyRemoteCommandError(endpoint: string, message: string) {
     const command = endpoint.split("?")[0].split("/").filter(Boolean).at(-1) ?? "command";
     this.commandFailure = { endpoint, command, message };
-    if (endpoint.includes("/handheld/record/")) {
+    if (endpoint.includes("/fr3/teleop/")) {
+      if (this.snapshot.fr3Teleop) {
+        this.snapshot.fr3Teleop = { ...this.snapshot.fr3Teleop, message: `FR3 ${command} failed: ${message}` };
+      }
+    } else if (endpoint.includes("/handheld/record/")) {
       this.snapshot.recording = {
         ...this.snapshot.recording,
         state: "error",

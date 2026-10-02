@@ -159,9 +159,8 @@ class Teleoperator(abc.ABC):
         Args:
             fpath (Path | None): Optional path to the calibration file. Defaults to `self.calibration_fpath`.
         """
-        fpath = self.calibration_fpath if fpath is None else fpath
         from lerobot.motors.motors_bus import MotorCalibration
-
+        fpath = self.calibration_fpath if fpath is None else fpath
         with open(fpath) as f, draccus.config_type("json"):
             self.calibration = draccus.load(dict[str, MotorCalibration], f)
 

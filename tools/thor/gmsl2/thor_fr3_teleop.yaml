@@ -288,9 +288,9 @@ laser_tracker:
   land: true
 
 dataset:
-  repo_id: local/thor_fr3_spacemouse
-  single_task: FR3 SpaceMouse teleoperation with Sengyun and BOX sensors
-  root: outputs/datasets/thor_fr3_spacemouse
+  repo_id: local/thor_gmsl2_Nch_v1
+  single_task: Thor GMSL2 detected-camera capture
+  root: outputs/datasets/thor_gmsl2_Nch_v1
   # The orchestrator writes one MKV per camera per episode plus
   # `episode_<idx>/meta.json` describing the cameras, codecs, wallclock
   # timestamps, and hardware-sync settings. There is no LeRobotDataset
@@ -314,56 +314,61 @@ display_data: true
 play_sounds: false
 resume: false
 
-# The same Thor camera/BOX recorder owns gripper control and telemetry logging.
-# The arm host must be directly wired to FR3 Control with PREEMPT_RT + rtprio.
-# These are the existing workstation defaults; change robot_ip and task TCP
-# to match the installed gripper before hardware commissioning.
+
+# Direct-Thor FR3 extension. The camera, BOX, dataset and calibration settings
+# above are the unchanged BOX profile. C connects those sensors; only F starts
+# this robot runtime, moves to the start pose, and enables the SpaceMouse.
 robot:
   type: franka_research3
   robot_ip: 192.168.1.206
+  # BOX remains owned by thor_record.py; the arm worker never opens BOX or Argus.
+  gripper_backend: mock
+  allow_mock_gripper: true
   urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
   target_frame_name: corenetic_gripper_ee
+  cameras: {}
   workspace_min: [0.2, -0.6, 0.05]
   workspace_max: [0.9, 0.6, 0.8]
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   ik_solver: placo
   use_otg: true
+  otg_control_frequency: 200.0
+  otg_async_control_frequency: 1000.0
   otg_max_velocity: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-  otg_max_acceleration: [1, 1, 1, 1, 1, 1, 1]
-  otg_max_jerk: [1000, 1000, 1000, 1000, 1000, 1000, 1000]
+  otg_max_acceleration: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  otg_max_jerk: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+  # Conservative common envelope for FR3 and the pinned native Panda virtual
+  # walls, with clearance from their damping zones. Initial q and every native
+  # target must stay inside this envelope; F refuses an out-of-range start.
+  otg_min_position: [-2.64, -1.57, -2.70, -2.84, -2.70, 0.60, -2.70]
+  otg_max_position: [2.64, 1.57, 2.70, -0.27, 2.70, 3.65, 2.70]
 
 teleop:
   type: spacemouse
-  frequency: 200
   device_id: 0
-  tool_mode: incremental
-  incremental_step: 0.02
+  frequency: 200
+  # Existing SpaceMouse driver defaults: debias, deadzones and [-y, x, z].
   translation_scale: 0.000615
   rotation_scale: 0.000648
+  translation_axis_map: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+  rotation_axis_map: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
   enable_rotation: true
+  motion_enable_button: none
+  motion_input_timeout_s: 0.2
+  tool_mode: incremental
+  incremental_step: 0.02
 
 fr3_teleop:
   enabled: true
-  # The added end-effector Sengyun uses the same GMSL2 recorder as the rig.
-  # Prefer its EEPROM serial: it follows the camera if its port changes.
-  # Otherwise set sensor_id to the actual port (0..15). Leave unset until fitted.
-  # A configured wrist camera must stream before task recording can start.
-  wrist_camera:
-    serial: ""
-    sensor_id: null
-  input_source: thor             # thor USB or host sender via leased TCP
-  input_bind: 0.0.0.0
-  input_port: 18771
-  arm_host: 192.168.100.155
-  arm_bind: 0.0.0.0
-  arm_port: 18770
-  token_file: outputs/.fr3_bridge_token
+  # Repo-relative on Thor. This separate environment is only needed for F;
+  # deployment and C continue to use the existing collection environment.
+  runtime_python: .venv-fr3/bin/python
   control_hz: 200
-  command_timeout_s: 0.15
-  max_clock_uncertainty_ms: 20
-  max_state_age_ms: 100
+  command_timeout_s: 0.2
+  startup_timeout_s: 60.0
   min_success_rate: 0.995
-  max_episode_samples: 240000
-  gripper_box_id: ""              # must name one box when several are connected
+  # Leave blank only for a single discovered BOX. For multiple boxes, set the
+  # discovered ID of the BOX physically attached to the FR3 gripper.
+  gripper_box_id: ""
   gripper_max_width_m: 0.09

@@ -757,3 +757,172 @@ def test_pyspacemouse_driver_raises_when_device_index_out_of_range(monkeypatch):
 
     with pytest.raises(ConnectionError, match="out of range"):
         driver.connect()
+
+
+def _timestamped_device(monkeypatch, *, timestamp=5.0, x=0.0, buttons=(0, 0)):
+    from lerobot.teleoperators.spacemouse import backend
+
+    state = types.SimpleNamespace(t=timestamp, x=x, y=0.0, z=0.0, roll=0.0, pitch=0.0, yaw=0.0, buttons=buttons)
+    clock = [100.0]
+    class Device:
+        closed = False
+        def read(self):
+            return state
+        def close(self):
+            self.closed = True
+    device = Device()
+    monkeypatch.setitem(sys.modules, "pyspacemouse", types.SimpleNamespace(
+        get_connected_devices=lambda: ["SpaceMouse Compact"], open=lambda **_: device,
+    ))
+    monkeypatch.setattr(backend.time, "monotonic", lambda: clock[0])
+    return state, clock, device
+
+
+def _guarded_teleop(monkeypatch, *, timestamp=5.0, x=0.0, buttons=(0, 0)):
+    state, clock, raw = _timestamped_device(monkeypatch, timestamp=timestamp, x=x, buttons=buttons)
+    device = SpaceMouseTeleop(SpaceMouseTeleopConfig(
+        motion_input_timeout_s=0.2, bias_sample_count=0, move_time=0.0,
+        tool_mode=SpaceMouseToolMode.INCREMENTAL, initial_gripper=0.5,
+    ))
+    device.connect()
+    return device, state, clock, raw
+
+
+def test_cached_active_motion_expires_despite_continued_python_polling(monkeypatch):
+    device, _, clock, _ = _guarded_teleop(monkeypatch, x=0.1)
+    try:
+        assert device.get_action()["enabled"] is True
+        clock[0] += 0.21
+        with pytest.raises(RuntimeError, match="active HID input is stale"):
+            device.get_action()
+    finally:
+        device.disconnect()
+
+
+def test_timestamp_advancement_renews_motion_even_with_identical_axis_values(monkeypatch):
+    device, state, clock, _ = _guarded_teleop(monkeypatch, x=0.1)
+    try:
+        clock[0] += 0.3
+        state.t += 0.001
+        assert device.get_action()["enabled"] is True
+        clock[0] += 0.1
+        assert device.get_action()["enabled"] is True
+    finally:
+        device.disconnect()
+
+
+@pytest.mark.parametrize("timestamp", [-1.0, 5.0])
+def test_cached_neutral_idle_without_reports_remains_legal(monkeypatch, timestamp):
+    device, _, clock, _ = _guarded_teleop(monkeypatch, timestamp=timestamp)
+    try:
+        clock[0] += 3600
+        assert device.get_action()["enabled"] is False
+    finally:
+        device.disconnect()
+
+
+def test_debiased_deadzone_noise_does_not_trigger_stale_motion(monkeypatch):
+    import numpy as np
+
+    device, state, clock, _ = _guarded_teleop(monkeypatch, x=0.51)
+    try:
+        device._translation_bias = np.array([0.5, 0.0, 0.0])
+        clock[0] += 1.0
+        assert device.get_action()["enabled"] is False
+        state.x = 0.6
+        with pytest.raises(RuntimeError, match="active HID input is stale"):
+            device.get_action()
+    finally:
+        device.disconnect()
+
+
+@pytest.mark.parametrize("buttons", [(1, 0), (0, 1)])
+@pytest.mark.parametrize("tool_mode", [SpaceMouseToolMode.INCREMENTAL, SpaceMouseToolMode.BINARY])
+def test_cached_pressed_buttons_freeze_gripper_without_faulting_idle_arm(monkeypatch, buttons, tool_mode):
+    device, state, clock, _ = _guarded_teleop(monkeypatch, buttons=buttons)
+    device.config.tool_mode = tool_mode
+    device.config.gripper_cmd_ema_alpha = 0.5
+    try:
+        previous_action = device.get_action()
+        previous_gripper = device._last_gripper
+        clock[0] += 0.21
+        for _ in range(20):
+            action = device.get_action()
+            assert action["enabled"] is False
+            assert action["gripper"] == previous_action["gripper"]
+        assert device._last_gripper == previous_gripper
+        # A new report, including the next press, can renew gripper input.
+        state.t += 0.001
+        resumed = device.get_action()
+        assert resumed["enabled"] is False
+        if tool_mode == SpaceMouseToolMode.INCREMENTAL:
+            assert device._last_gripper != previous_gripper
+    finally:
+        device.disconnect()
+
+
+@pytest.mark.parametrize("timestamp", [None, float("nan"), float("inf"), True])
+def test_missing_report_timestamp_fails_usb_initialization_and_releases_hid(monkeypatch, timestamp):
+    _, _, raw = _timestamped_device(monkeypatch, timestamp=timestamp)
+    device = SpaceMouseTeleop(SpaceMouseTeleopConfig(motion_input_timeout_s=0.2))
+    with pytest.raises(ConnectionError, match="timestamp is unavailable"):
+        device.connect()
+    assert raw.closed and not device.is_connected and device._driver is None
+
+
+def test_hid_timestamp_regression_is_a_fault(monkeypatch):
+    device, state, _, _ = _guarded_teleop(monkeypatch)
+    try:
+        state.t -= 1
+        with pytest.raises(ConnectionError, match="moved backwards"):
+            device.get_action()
+    finally:
+        device.disconnect()
+
+
+def test_activity_without_a_first_hid_report_is_rejected(monkeypatch):
+    device, state, _, _ = _guarded_teleop(monkeypatch, timestamp=-1.0)
+    try:
+        state.buttons = (1, 0)
+        assert device.get_action()["gripper"] == 0.5
+        state.x = 0.1
+        with pytest.raises(RuntimeError, match="active HID input is stale"):
+            device.get_action()
+    finally:
+        device.disconnect()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("report_age_s", float("nan")), ("report_age_s", float("inf")), ("report_age_s", -0.1),
+    ("report_age_s", True), ("report_timestamp", float("nan")),
+    ("report_timestamp", float("inf")), ("report_timestamp", -2.0), ("report_timestamp", True),
+])
+def test_guard_rejects_invalid_custom_backend_metadata_before_commands(teleop, field, value):
+    teleop.config.motion_input_timeout_s = 0.2
+    teleop.connect()
+    metadata = {"report_age_s": 0.0, "report_timestamp": 5.0, field: value}
+    teleop._driver.readings.append(SpaceMouseReading(
+        translation=[0.1, 0.0, 0.0], rotation=[0.0, 0.0, 0.0], buttons=(True, False), **metadata,
+    ))
+    before = teleop._last_gripper
+    with pytest.raises(RuntimeError, match="invalid HID input freshness"):
+        teleop.get_action()
+    assert teleop._last_gripper == before
+
+
+def test_guard_remains_optional_for_original_profiles_without_timestamps(monkeypatch):
+    _, _, raw = _timestamped_device(monkeypatch, timestamp=None, x=0.1)
+    device = SpaceMouseTeleop(SpaceMouseTeleopConfig(bias_sample_count=0))
+    device.connect()
+    assert device.get_action()["enabled"] is True
+    device.disconnect()
+    assert raw.closed
+
+
+def test_idle_bias_failure_releases_hid_before_caller_can_start_fci(monkeypatch):
+    _, _, raw = _timestamped_device(monkeypatch)
+    device = SpaceMouseTeleop(SpaceMouseTeleopConfig(motion_input_timeout_s=0.2))
+    monkeypatch.setattr(device, "_estimate_idle_bias", lambda: (_ for _ in ()).throw(RuntimeError("HID read failed")))
+    with pytest.raises(RuntimeError, match="HID read failed"):
+        device.connect()
+    assert raw.closed and not device.is_connected and device._driver is None
