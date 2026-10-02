@@ -92,6 +92,83 @@ UI 引导使用 ChArUco A 板：`charuco_400`、12 × 9 方格、方格边长 30
 
 ## 4. 自动单 AprilTag 标定流程
 
+### 4.0 Capture session、续采和合并规则
+
+相机或 FR3 base 移动后必须开始新的布局世代；不同布局的数据绝对不能联合求解。
+同一布局内，每次 manual/automatic capture 是一个独立 session，可以显式联合。
+
+目录名
+`fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged`
+容易误解：`20260921` 表示机器人姿态来源；其相机视频和实测机器人 pose 实际在
+2026-10-01 17:02 重新采集，因此它是 10 月 1 日当前布局的 round 1，不是旧布局图像。
+
+需要带多相机画面、颜色提示以及每相机 `valid/target`、`remaining` 的手动续采时，
+在 Thor 桌面终端运行：
+
+```bash
+cd /home/nvidia/lerobot
+
+bash tools/thor/run_p0_two_marker_calibration_local.sh guided \
+  --dataset-root outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged \
+  --quality-summary outputs/calibration/p0_tag6_replay_20261001_extrinsics/summary.json \
+  --target-per-camera 30 \
+  --exclude-camera-ids 1,4,10 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+程序先把 round 1 的图像、实测 `T_base_ee` 和关节值导入一个新的
+`manual_run_*` session。`--quality-summary` 用上一轮求解的严格筛选数量初始化 UI；
+如果省略，则使用 AprilTag 实时检测数量。随后 `Enter` 追加一次同步
+图像和机器人状态；`q` 仅在每台相机达到 target 后求解；`f` 强制尝试；`Esc`
+保留已提交 capture 但不求解。求解使用已有 fisheye 内参、鲁棒离群点过滤和当前
+FR3 base；质量门通过后保存候选并自动生成 XY/XZ/YZ/XYZ 四视图。默认不会修改
+active；审核后显式增加 `--activate` 才更新 active calibration。
+
+审核候选 summary 和四视图后，可完全离线激活同一 session：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh solve \
+  --solve-run latest \
+  --activate
+```
+
+若进程中断，继续同一个 manual session，不要重新导入 round 1：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh guided \
+  --resume-run latest \
+  --target-per-camera 30 \
+  --exclude-camera-ids 1,4,10 \
+  --detection-workers 1 \
+  --frame-bus-every-n 30 \
+  --detection-scale 0.25 \
+  --execute \
+  --confirmation P0_TWO_MARKER_TEACHING
+```
+
+如果第二轮也是自动回放采集，可在纯离线模式中显式决定是否合并。只用第二轮：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh calibrate \
+  --dataset-root outputs/datasets/ROUND2_MERGED
+```
+
+合并同一布局的 round 1 + round 2：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh calibrate \
+  --dataset-root outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged \
+  --dataset-root outputs/datasets/ROUND2_MERGED
+```
+
+重复 `--dataset-root` 就是显式选择合并；程序不会自动搜索或混入其他历史数据。
+导入来源会写入 `imported_datasets.json`，重复传入同一路径会跳过，原始数据集保持
+只读不变。
+
 ### 4.1 在 Thor 本机记录示教位姿并自动采集
 
 当前分支已将旧 standalone 入口拆分为两个维护中的阶段。两步都在 Thor 桌面终端
@@ -111,6 +188,19 @@ bash tools/thor/run_p0_two_marker_calibration_local.sh teaching \
 bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
   --key p0_tag6_20260930 \
   --max-records all \
+  --execute \
+  --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
+```
+
+第二轮如果复用第一轮 teaching pose，但需要写入新的 capture session，使用新的
+`--key`，并把原 teaching JSON 作为 `--input-json`，避免覆盖第一轮：
+
+```bash
+bash tools/thor/run_p0_two_marker_calibration_local.sh capture \
+  --key p0_tag6_current_layout_round2 \
+  --input-json outputs/datasets/p0_tag6_current_layout_round1/teaching_pose_records.json \
+  --max-records all \
+  --exclude-camera-ids 1,4,10 \
   --execute \
   --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE
 ```

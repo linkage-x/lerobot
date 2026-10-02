@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local-on-Thor entry point for the current P0 single-AprilTag calibration
-# capture workflow.  The historical standalone p0_two_marker_calibration.py is
-# no longer present on the production branch; the maintained workflow is split
-# into teaching-pose recording and automatic pose execution + Thor recording.
+# Local-on-Thor entry point for guided/manual and automatic P0 single-AprilTag
+# calibration capture workflows.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -15,13 +13,19 @@ CAPTURE_SCRIPT="third_party/opencv_kalibr/fr3_calibration/batch_execute_pose_and
 CAPTURE_CONFIG="third_party/opencv_kalibr/fr3_calibration/host/execute_pose_and_capture_thor_gmsl2_apriltag.host.yaml"
 RECORDER_CONFIG="third_party/opencv_kalibr/fr3_calibration/host/thor_gmsl2_calibration.yaml"
 CAMERA_CONFIG_HELPER="tools/thor/prepare_p0_calibration_recorder_config.py"
+GUIDED_SCRIPT="tools/thor/p0_two_marker_calibration.py"
 FR3_URDF="src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf"
+CURRENT_INTRINSICS="outputs/calibration/calib_20260929_163033_intrinsics/summary.json"
 
 usage() {
   cat <<'EOF'
 Run this script in a terminal on Thor itself.
 
 Usage:
+  bash tools/thor/run_p0_two_marker_calibration_local.sh guided \
+    [--dataset-root ROOT ...] --execute --confirmation P0_TWO_MARKER_TEACHING \
+    [-- guided calibration overrides]
+
   bash tools/thor/run_p0_two_marker_calibration_local.sh teaching \
     --key NAME --execute --confirmation P0_TWO_MARKER_TEACHING [-- recorder overrides]
 
@@ -29,7 +33,18 @@ Usage:
     --key NAME [--key NAME ...] [--input-json PATH] [--max-records N|all] \
     --execute --confirmation P0_TWO_MARKER_AUTOMATIC_CAPTURE [-- capture overrides]
 
+  bash tools/thor/run_p0_two_marker_calibration_local.sh calibrate \
+    --dataset-root ROOT [--dataset-root ROOT ...] [-- solver overrides]
+
+  bash tools/thor/run_p0_two_marker_calibration_local.sh solve \
+    --solve-run PATH|latest [--activate]
+
 Modes:
+  guided    Live multi-camera AprilTag UI plus zero-stiffness FR3 teaching.
+            Enter commits images and measured robot state; q solves when all
+            cameras reach the target. --dataset-root imports existing automatic
+            captures first, so the UI displays accumulated valid/remaining counts.
+
   teaching  Put FR3 in teaching mode. Press r to save a robot pose and q to
             save/quit. No cameras are opened. Poses are written to
             outputs/datasets/NAME/teaching_pose_records.json.
@@ -37,6 +52,12 @@ Modes:
   capture   Automatically execute the saved poses and record the current Thor
             GMSL2 camera set. One --key uses the teaching JSON above; --key may
             be repeated to combine several existing teaching trajectories.
+
+  calibrate Offline import and robust solve of one or more same-layout automatic
+            capture datasets. Repeating --dataset-root explicitly enables merge.
+
+  solve     Re-solve an existing guided/manual session without cameras or FR3.
+            Add --activate only after reviewing a passing candidate.
 
 Wrapper options:
   --key NAME             Dataset/trajectory key. Required; repeatable in capture mode.
@@ -46,7 +67,9 @@ Wrapper options:
                          MAX96726 locked set (default: 1,4,10).
   --max-records N|all    Capture at most N saved poses (default: 30).
   --merged-root PATH     Capture-mode merged dataset output path.
-  --execute              Required hardware authorization.
+  --dataset-root PATH    Existing automatic capture dataset. Repeat to combine
+                         capture rounds in guided/calibrate mode.
+  --execute              Required hardware authorization except calibrate mode.
   --confirmation TOKEN   Mode-specific confirmation token shown above.
   --dry-run              Print the resolved command without touching hardware.
   -h, --help             Show this help.
@@ -95,14 +118,15 @@ case "${mode}" in
     usage
     exit 0
     ;;
-  teaching|capture) ;;
+  guided|teaching|capture|calibrate|solve) ;;
   *)
-    die "unknown mode '${mode}'; expected teaching or capture"
+    die "unknown mode '${mode}'; expected guided, teaching, capture, calibrate, or solve"
     ;;
 esac
 shift
 
 keys=()
+dataset_roots=()
 max_records="30"
 merged_root=""
 input_json=""
@@ -127,6 +151,15 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--max-records requires a value"
       max_records="$2"
       shift 2
+      ;;
+    --dataset-root)
+      [[ $# -ge 2 ]] || die "--dataset-root requires a value"
+      dataset_roots+=("$2")
+      shift 2
+      ;;
+    --dataset-root=*)
+      dataset_roots+=("${1#*=}")
+      shift
       ;;
     --max-records=*)
       max_records="${1#*=}"
@@ -192,32 +225,48 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ ${#keys[@]} -gt 0 ]] || die "${mode} mode requires --key NAME"
-for key in "${keys[@]}"; do
-  [[ -n "${key}" ]] || die "--key must not be empty"
-  [[ "${key}" != */* && "${key}" != *..* ]] || die "--key must be a simple dataset name, got '${key}'"
-done
+if [[ "${mode}" == "teaching" || "${mode}" == "capture" ]]; then
+  [[ ${#keys[@]} -gt 0 ]] || die "${mode} mode requires --key NAME"
+  for key in "${keys[@]}"; do
+    [[ -n "${key}" ]] || die "--key must not be empty"
+    [[ "${key}" != */* && "${key}" != *..* ]] || die "--key must be a simple dataset name, got '${key}'"
+  done
+elif [[ ${#keys[@]} -gt 0 ]]; then
+  die "--key is only valid in teaching/capture mode"
+fi
+
+if [[ "${mode}" == "calibrate" && ${#dataset_roots[@]} -eq 0 ]]; then
+  die "calibrate mode requires at least one --dataset-root PATH"
+fi
+if [[ "${mode}" != "guided" && "${mode}" != "calibrate" && ${#dataset_roots[@]} -gt 0 ]]; then
+  die "--dataset-root is only valid in guided/calibrate mode"
+fi
+if [[ "${mode}" == "solve" ]] && ! has_forwarded_prefix "--solve-run"; then
+  die "solve mode requires --solve-run PATH|latest"
+fi
 
 if [[ "${mode}" == "teaching" && ${#keys[@]} -ne 1 ]]; then
   die "teaching mode accepts exactly one --key"
 fi
-if [[ "${mode}" == "teaching" && -n "${input_json}" ]]; then
+if [[ "${mode}" != "capture" && -n "${input_json}" ]]; then
   die "--input-json is only valid in capture mode"
 fi
 if [[ -n "${input_json}" && ${#keys[@]} -ne 1 ]]; then
   die "capture with --input-json accepts exactly one --key"
 fi
 
-if [[ "${mode}" == "teaching" ]]; then
+if [[ "${mode}" == "teaching" || "${mode}" == "guided" ]]; then
   required_confirmation="P0_TWO_MARKER_TEACHING"
-else
+elif [[ "${mode}" == "capture" ]]; then
   required_confirmation="P0_TWO_MARKER_AUTOMATIC_CAPTURE"
   if [[ "${max_records}" != "all" && ! "${max_records}" =~ ^[1-9][0-9]*$ ]]; then
     die "--max-records must be a positive integer or 'all'"
   fi
+else
+  required_confirmation=""
 fi
 
-if ! ${dry_run}; then
+if [[ "${mode}" == "guided" || "${mode}" == "teaching" || "${mode}" == "capture" ]] && ! ${dry_run}; then
   ${execute} || die "hardware run requires --execute"
   [[ "${confirmation}" == "${required_confirmation}" ]] || \
     die "hardware run requires --confirmation ${required_confirmation}"
@@ -243,6 +292,7 @@ for required_path in \
   "${REPO_ROOT}/${CAPTURE_CONFIG}" \
   "${REPO_ROOT}/${RECORDER_CONFIG}" \
   "${REPO_ROOT}/${CAMERA_CONFIG_HELPER}" \
+  "${REPO_ROOT}/${GUIDED_SCRIPT}" \
   "${REPO_ROOT}/${FR3_URDF}"; do
   [[ -e "${required_path}" ]] || die "required current-repo path is missing: ${required_path}"
 done
@@ -273,7 +323,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "${mode}" == "teaching" ]]; then
+if [[ "${mode}" == "guided" || "${mode}" == "calibrate" || "${mode}" == "solve" ]]; then
+  if [[ "${mode}" == "guided" && -z "${DISPLAY:-}" ]]; then
+    if [[ -S /tmp/.X11-unix/X0 ]]; then
+      export DISPLAY=:0
+    elif ! ${dry_run}; then
+      die "guided mode requires the Thor desktop DISPLAY; /tmp/.X11-unix/X0 is missing"
+    fi
+  fi
+  command=(
+    "${python_bin}"
+    "${GUIDED_SCRIPT}"
+  )
+  if ! has_forwarded_prefix "--existing"; then
+    command+=("--existing" "recalibrate")
+  fi
+  if ! has_forwarded_prefix "--intrinsics-summary"; then
+    command+=("--intrinsics-summary" "${CURRENT_INTRINSICS}")
+  fi
+  if ! has_forwarded_prefix "--urdf"; then
+    command+=("--urdf" "${REPO_ROOT}/${FR3_URDF}")
+  fi
+  if ! has_forwarded_prefix "--recorder-config"; then
+    command+=("--recorder-config" "${REPO_ROOT}/${RECORDER_CONFIG}")
+  fi
+  for dataset_root in "${dataset_roots[@]}"; do
+    command+=("--merge-dataset" "${dataset_root}")
+  done
+  if [[ "${mode}" == "guided" ]]; then
+    IFS=',' read -r -a excluded_ids <<< "${exclude_camera_ids}"
+    for sensor_id in "${excluded_ids[@]}"; do
+      [[ "${sensor_id}" =~ ^[0-9]+$ ]] || die "invalid camera id in --exclude-camera-ids: ${sensor_id}"
+      command+=("--exclude-camera" "cam_$(printf '%02d' "$((10#${sensor_id}))")")
+    done
+    command+=("--execute" "--confirmation" "${confirmation}")
+    echo "[MODE] guided multi-camera teaching capture with accumulated per-camera counts"
+    echo "[SAFETY] FR3 enters zero-stiffness teaching; support the arm and keep the E-stop ready."
+  elif [[ "${mode}" == "calibrate" ]]; then
+    command+=("--solve-merged-datasets")
+    echo "[MODE] offline robust calibration from explicitly selected same-layout datasets"
+  else
+    echo "[MODE] offline solve of an existing guided/manual capture session"
+  fi
+  command+=("${forwarded_args[@]}")
+elif [[ "${mode}" == "teaching" ]]; then
   key="${keys[0]}"
   output_json="outputs/datasets/${key}/teaching_pose_records.json"
   command=(
@@ -288,7 +381,7 @@ if [[ "${mode}" == "teaching" ]]; then
   command+=("${forwarded_args[@]}")
   echo "[MODE] teaching pose capture; cameras remain closed"
   echo "[OUTPUT] ${REPO_ROOT}/${output_json}"
-else
+elif [[ "${mode}" == "capture" ]]; then
   # NVIDIA Argus must use headless EGL. A local desktop DISPLAY or an SSH X11
   # DISPLAY makes EGL select X/DRI3 and causes NvBufSurfaceMapEglImage to fail
   # for every camera in sequence.

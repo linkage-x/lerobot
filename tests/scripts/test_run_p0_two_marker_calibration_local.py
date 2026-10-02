@@ -61,6 +61,54 @@ def test_capture_accepts_standalone_calibration_captures_json() -> None:
     assert "--execution.max_records" not in result.stdout
 
 
+def test_guided_dry_run_imports_existing_dataset_and_uses_live_ui() -> None:
+    dataset = "outputs/datasets/current_layout_round_1_merged"
+    result = _run(
+        "guided",
+        "--dataset-root",
+        dataset,
+        "--dry-run",
+        "--target-per-camera=30",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "p0_two_marker_calibration.py" in result.stdout
+    assert f"--merge-dataset {dataset}" in result.stdout
+    assert "--exclude-camera cam_01" in result.stdout
+    assert "--exclude-camera cam_04" in result.stdout
+    assert "--exclude-camera cam_10" in result.stdout
+    assert "--target-per-camera=30" in result.stdout
+
+
+def test_calibrate_dry_run_explicitly_combines_selected_capture_rounds() -> None:
+    first = "outputs/datasets/current_layout_round_1_merged"
+    second = "outputs/datasets/current_layout_round_2_merged"
+    result = _run(
+        "calibrate",
+        "--dataset-root",
+        first,
+        "--dataset-root",
+        second,
+        "--dry-run",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--solve-merged-datasets" in result.stdout
+    assert result.stdout.count("--merge-dataset") == 2
+    assert first in result.stdout
+    assert second in result.stdout
+    assert "--execute" not in result.stdout
+
+
+def test_solve_mode_is_offline_and_can_activate_reviewed_candidate() -> None:
+    result = _run("solve", "--solve-run", "latest", "--activate", "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert "--solve-run latest" in result.stdout
+    assert "--activate" in result.stdout
+    assert "--execute" not in result.stdout
+
+
 def test_hardware_run_requires_explicit_authorization() -> None:
     result = _run("capture", "--key", "p0_test")
 
