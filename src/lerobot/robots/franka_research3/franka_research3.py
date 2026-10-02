@@ -323,6 +323,8 @@ class FrankaResearch3(Robot):
             damping=self.config.damping,
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
+            start_controller_on_connect=self.config.arm_start_controller_on_connect,
+            state_poll_frequency_hz=self.config.arm_state_poll_frequency_hz,
         )
         gripper = None
         kinematics = self._make_kinematics_driver()

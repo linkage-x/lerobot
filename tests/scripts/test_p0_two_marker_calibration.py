@@ -11,6 +11,7 @@ from tools.thor.p0_two_marker_calibration import (
     _camera_id,
     _excluded_sensor_ids,
     _locked_sensor_ids,
+    _make_robot,
     _make_recorder_config,
     _irq_cpu_from_interrupts,
     _merge_lerobot_datasets_into_run,
@@ -24,6 +25,22 @@ from tools.thor.p0_two_marker_calibration import (
     _run_robot_only_control_test,
     _select_sensor_ids,
 )
+
+
+def test_guided_robot_uses_supported_config_without_connecting(tmp_path, monkeypatch):
+    from tools.thor import p0_two_marker_calibration as calibration
+
+    urdf = tmp_path / "fr3.urdf"
+    urdf.write_text("<robot/>", encoding="utf-8")
+    monkeypatch.setattr(calibration, "make_robot_from_config", lambda config: config)
+
+    config = _make_robot("192.168.1.206", urdf)
+
+    assert config.robot_ip == "192.168.1.206"
+    assert config.arm_start_controller_on_connect is False
+    assert config.arm_state_poll_frequency_hz == 0.0
+    assert config.use_otg is False
+    assert config.gripper_backend == "mock"
 
 
 def _write_resume_capture(run_dir: Path, capture_index: int = 0) -> None:

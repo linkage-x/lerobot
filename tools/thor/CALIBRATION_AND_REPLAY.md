@@ -393,6 +393,33 @@ cd /home/nvidia/lerobot
 
 ## 8. 日志与常见检查
 
+如果 `guided` 启动时报
+`FrankaResearch3Config.__init__() got an unexpected keyword argument 'arm_start_controller_on_connect'`，
+说明引导脚本使用的示教选项尚未在 FR3 config/backend 中实现，或 Thor 上代码同步不完整。
+修复需同时包含 `src/lerobot/robots/franka_research3/` 下的
+`config_franka_research3.py`、`franka_research3.py` 和 `backends.py`：连接时不启动位置
+控制器，随后启动 panda_py 原生示教模式；关闭后台轮询时，每次采集仍读取更新后的
+关节状态，退出时停止原生示教控制器。不能只删除报错参数，否则会丢失这些示教行为。
+
+在开发机同步修复后的代码（仅同步，不重启网关）：
+
+```bash
+cd /home/corenetic/Code/lerobot
+bash run/deploy.sh thor --sync-only
+```
+
+该异常发生前导入的记录已经保存在日志中 `[RESUME] run=...` 指向的 session。
+在 Thor 上按第 4.0 节的续采命令重试，将 `--resume-run latest` 替换成该明确目录，
+不要再次传 `--dataset-root`。例如 2026-10-02 的报错日志对应：
+
+```text
+outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z
+```
+
+只在 FR3 base、固定相机和 EE tag 安装均未移动时续采。日志中的
+`cam_03: timed out waiting for Argus buffer` 是独立的相机问题；修复上述 Python
+异常后若它持续出现，按第 2 节恢复 Argus，再继续排查同步画面。
+
 每次硬件回放的日志位于：
 
 ```text
