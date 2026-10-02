@@ -325,6 +325,7 @@ class FrankaResearch3(Robot):
             filter_coeff=self.config.filter_coeff,
             start_controller_on_connect=self.config.arm_start_controller_on_connect,
             state_poll_frequency_hz=self.config.arm_state_poll_frequency_hz,
+            **({"realtime_enforce": True} if self.config.arm_realtime_enforce else {}),
         )
         gripper = None
         kinematics = self._make_kinematics_driver()

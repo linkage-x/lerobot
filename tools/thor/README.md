@@ -1,5 +1,10 @@
 # Thor 部署与操作入口
 
+FR3 + SpaceMouse + Sengyun + BOX 触觉/力采集请参阅
+[FR3 Thor 遥操作与组件测试](../../docs/thor_fr3_teleoperation.md)。
+`bash run/deploy.sh` 默认选择该配置；仅采集 BOX/相机时使用
+`bash run/deploy.sh --box-only`。
+
 外参标定、轨迹生成、机器人回放和夹爪同步诊断请参阅
 [Thor 外参标定与 P0 机器人回放操作指南](CALIBRATION_AND_REPLAY.md)。
 

@@ -259,6 +259,8 @@ class TeleopStatus:
     lastOutput: str = ""
     command: list[str] = field(default_factory=list)
     realRobotReady: bool = False
+    telemetry: dict[str, Any] = field(default_factory=dict)
+    inputSource: str = ""
     cameraViews: list[dict[str, Any]] = field(
         default_factory=lambda: [
             {"id": "external", "label": "External", "source": "D435I", "fps": 30, "deviceId": "side"},
@@ -12837,6 +12839,11 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.recording.pid = None
         state.recording.frameIndex = 0 if process.returncode == 0 else state.recording.frameIndex
         state.recording.queueDepth = 0
+        if _thor_fr3_enabled(state):
+            state.teleop.state = "idle" if process.returncode == 0 else "error"
+            state.teleop.realRobotReady = False
+            state.teleop.telemetry = {}
+            state.teleop.message = "FR3 disconnected with the collection session"
         if isinstance(state.device_preview.get("box"), dict):
             state.device_preview["box"] = {**state.device_preview["box"], "active": False}
         summary = (
@@ -12973,7 +12980,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     _refresh_mujoco_validation_current(state)
 
     return {
-        "deployment": {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]},
+        "deployment": _deployment_payload(state),
         "gateway": {
             "configPath": str(state.config_path),
             "pid": state.recording.pid,
@@ -13185,6 +13192,14 @@ def _start_fr3_sim_teleop(state: GatewayState) -> None:
 
 
 def _start_fr3_real_teleop(state: GatewayState) -> None:
+    if _thor_fr3_enabled(state):
+        process = _ensure_recorder_running(state)
+        if not state.teleop.realRobotReady:
+            raise RuntimeError(state.teleop.message or "FR3 telemetry is not ready; reconnect devices")
+        _write_recorder_stdin(process, "fr3_start\n")
+        state.teleop.state = "starting"
+        state.teleop.message = "Starting SpaceMouse and BOX gripper control"
+        return
     process = state.teleop_process
     if process is not None and process.poll() is None:
         state.teleop.message = "An FR3 teleop session is already active"
@@ -13225,6 +13240,13 @@ def _start_fr3_real_teleop(state: GatewayState) -> None:
 
 
 def _stop_fr3_teleop(state: GatewayState) -> None:
+    if _thor_fr3_enabled(state):
+        process = state.process
+        if process is not None and process.poll() is None:
+            _write_recorder_stdin(process, "fr3_stop\n")
+        state.teleop.state = "idle"
+        state.teleop.message = "Stopping FR3 teleoperation; telemetry remains connected"
+        return
     process = state.teleop_process
     if process is not None and process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
@@ -14600,6 +14622,21 @@ def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> Non
 
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
+    if output.startswith("FR3_LIVE "):
+        try:
+            payload = json.loads(output.removeprefix("FR3_LIVE "))
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        for key in ("state", "backend", "realRobotReady", "message", "telemetry", "inputSource"):
+            if key in payload:
+                setattr(state.teleop, key, payload[key])
+        _set_device_state(state, "fr3", "running" if state.teleop.realRobotReady else "error",
+                          state.teleop.message)
+        _set_device_state(state, "spacemouse", "running" if state.teleop.state == "running" else "idle",
+                          f"SpaceMouse input: {state.teleop.inputSource}")
+        return
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
     if output.startswith("LT_BEAM_BROKEN "):
@@ -15614,6 +15651,9 @@ def _start_real_replay(
     end_effector_mode: str = "corenetic_gripper_ee",
     override_mujoco_failure: bool = False,
 ) -> None:
+    if _thor_fr3_enabled(state):
+        raise RuntimeError("Hardware replay for this FR3 rig must run on its dedicated RT workstation; "
+                           "the Thor acquisition gateway supports visual replay and export")
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
@@ -16372,7 +16412,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/teleop/start-real":
-                    if self.server.state.profile != "workstation":
+                    if self.server.state.profile != "workstation" and not _thor_fr3_enabled(self.server.state):
                         _json_response(
                             self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
                         )
@@ -16381,7 +16421,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/teleop/stop":
-                    if self.server.state.profile != "workstation":
+                    if self.server.state.profile != "workstation" and not _thor_fr3_enabled(self.server.state):
                         _json_response(
                             self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
                         )
@@ -16721,6 +16761,18 @@ class DataCollectionGuiServer(ThreadingHTTPServer):
         self.state = state
 
 
+def _thor_fr3_enabled(state: GatewayState) -> bool:
+    return state.profile == "thor" and bool((state.config.get("fr3_teleop") or {}).get("enabled", False))
+
+
+def _deployment_payload(state: GatewayState) -> dict[str, Any]:
+    result = {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]}
+    if _thor_fr3_enabled(state):
+        result.update(label="Thor FR3 + BOX Acquisition", defaultRoute="teleoperation",
+                      capabilities=[*result["capabilities"], "fr3", "spacemouse", "fr3_bridge"])
+    return result
+
+
 def make_state(
     repo_root: Path,
     config_path: Path,
@@ -16757,6 +16809,15 @@ def make_state(
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
+    if _thor_fr3_enabled(state):
+        state.teleop.backend = "real"
+        state.teleop.robotModel = "fr3_corenetic_gripper"
+        state.teleop.targetFrameName = str((config.get("robot") or {}).get("target_frame_name", ""))
+        state.teleop.inputSource = os.environ.get("FR3_INPUT_SOURCE", config["fr3_teleop"].get("input_source", "thor"))
+        state.teleop.message = "Connect devices in Live Record, then start FR3 teleoperation"
+        state.teleop.cameraViews = [{"id": d["id"], "deviceId": d["id"], "label": d["label"],
+                                    "source": "Sengyun GMSL2", "fps": d["fps"]}
+                                   for d in state.devices if d["kind"] == "camera"]
     _load_active_calibration_runs(state)
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)

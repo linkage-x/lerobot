@@ -211,6 +211,20 @@ export type TeleopStatus = {
   command?: string[];
   realRobotReady?: boolean;
   cameraViews?: TeleopCameraView[];
+  inputSource?: string;
+  telemetry?: {
+    q?: number[];
+    dq?: number[];
+    tau_J?: number[];
+    tau_ext_hat_filtered?: number[];
+    O_T_EE?: number[];
+    O_F_ext_hat_K?: number[];
+    measured_tcp?: number[];
+    control_command_success_rate?: number;
+    round_trip_ms?: number;
+    clock_uncertainty_s?: number;
+    gripper_measured_m?: number;
+  };
 };
 
 export type ReplayStatus = {

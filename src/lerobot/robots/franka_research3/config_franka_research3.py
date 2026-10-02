@@ -83,6 +83,7 @@ class FrankaResearch3Config(RobotConfig):
     filter_coeff: float | None = None
     # Guided calibration starts the native teaching controller after connecting.
     arm_start_controller_on_connect: bool = True
+    arm_realtime_enforce: bool = False
     arm_state_poll_frequency_hz: float = 200.0
     camera_max_age_ms: float = 100.0
     # Frames whose cameras disagree by more than this are refused outright -- and it aborts the

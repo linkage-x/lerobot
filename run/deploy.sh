@@ -8,6 +8,8 @@
 #   bash run/deploy.sh workstation
 #   bash run/deploy.sh workstation --sync-only
 #   bash run/deploy.sh thor --no-frontend
+#   bash run/deploy.sh --box-only              # camera/BOX collection only
+#   bash run/deploy.sh --spacemouse-host       # host USB -> Thor -> FR3 workstation
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -17,9 +19,11 @@ target="thor"
 target_explicit=false
 sync_only=false
 no_frontend=false
+box_only=false
+input_source=thor
 
 usage() {
-  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
@@ -34,6 +38,9 @@ for arg in "$@"; do
       ;;
     --sync-only) sync_only=true ;;
     --no-frontend) no_frontend=true ;;
+    --box-only) box_only=true ;;
+    --fr3) box_only=false ;;
+    --spacemouse-host) input_source=host ;;
     -h|--help)
       usage
       exit 0
@@ -52,6 +59,9 @@ case "$target" in
     remote_dir="/home/nvidia/lerobot"
     profile="thor"
     config_path="tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
+    if ! $box_only; then
+      config_path="tools/thor/gmsl2/thor_fr3_teleop.yaml"
+    fi
     gateway_target="http://192.168.111.122:8765"
     ;;
   workstation)
@@ -113,17 +123,21 @@ if $sync_only; then
 fi
 
 echo "==> Restarting ${profile} gateway on ${remote}..."
+if [[ "$target" == "thor" ]] && ! $box_only; then
+  bash "$script_dir/prepare_fr3_bridge.sh"
+fi
 # flock -n reports a lock conflict with -E's exit code, so a failure inside the
 # remote script stays distinguishable from "someone else is deploying".
 restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path'" \
+  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path' '$input_source'" \
   <<'REMOTE' || restart_rc=$?
 set -euo pipefail
 
 repo_dir="$1"
 profile="$2"
 config_path="$3"
+input_source="$4"
 gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
 
 matching_pids() {
@@ -266,7 +280,7 @@ fi
 # the X11 platform against "" and every Argus camera fails preflight with
 # "Could not get EGL display connection" / NvBufSurfaceMapEglImage failed,
 # while an unset DISPLAY takes the headless path and captures fine.
-gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1)
+gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1 FR3_INPUT_SOURCE="$input_source")
 if [[ -n "$display" ]]; then
   gateway_env+=(DISPLAY="$display")
 fi

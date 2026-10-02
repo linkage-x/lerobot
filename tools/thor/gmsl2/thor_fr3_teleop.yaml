@@ -1,0 +1,362 @@
+# Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras + BOX 采集板
+# (gripper, IMU, trigger, six-d force, two Paxini touch pads).
+#
+# The default recording path is the online-synchronized Libargus recorder:
+#
+#     Argus BufferOutputStream
+#       -> same-buffer SOF metadata
+#       -> full SOF cluster alignment across cameras
+#       -> hardware encoder
+#       -> per-camera MKV
+#
+# Python's job is to (a) decide which sensor-ids to record, (b) start/stop the
+# recorder around each episode, (c) talk UDP to the BOX 采集板 MCU via the
+# vendored `box_sdk` wheel and snapshot its sensors into the episode metadata,
+# and (d) check the recorder's online sync manifest before saving the episode.
+# The frame pixels never enter the Python process.
+#
+# AR0234 + this board's dtbo is hard-locked to 1920x1080 @ 60 fps
+# (min/max/default_framerate = 60000000, framerate_factor = 1000000 in
+# dtb/SG2_AR0234C_G2F/...overlay.dtbo).
+
+# `recorder.script` is what the data-collection GUI's gateway spawns when
+# the operator presses Connect. Default points at the Thor orchestrator
+# below; override here if you're integrating a different recorder.
+recorder:
+  script: tools/thor/gmsl2/thor_record.py
+
+sensors:
+  cameras:
+    # `detect_all: true` runs `tools/thor/gmsl2/check_max96726_locks.sh` at
+    # session start and uses every sid the MAX96726 reports as locked. The
+    # recorder additionally probes each locked sid through nvarguscamerasrc
+    # and drops any that fail to open. Override with `sensor_ids: [0, 4, ...]`
+    # to pin a specific subset.
+    detect_all: true
+    sensor_ids: []        # only used when detect_all is false
+    name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
+    spawn_stagger_s: 1.0  # delay between sequential camera worker startups; keeps Argus/NVMM allocation from overlapping
+    connect_stable_s: 2.0  # after each PLAYING transition, wait and poll for immediate EOS/TIMEOUT before starting the next camera
+    connect_first_fragment_timeout_s: 3.0  # after PLAYING, require the first warmup MKV fragment to open; catches false PLAYING with no frames
+    connect_timeout_s: 120.0  # global wall-clock budget for Connect, including retry/auto-recover; 0 disables
+    two_phase_connect: false  # PR7: spawn all workers to PAUSED at once (overlaps ~1.2s/worker python+Gst.init), then serialize only PAUSED->PLAYING. PAUSED opens no Argus session so Phase 1 is contention-free; the risky bring-up stays serialized. Cuts ~N*startup off Connect. Default off pending field burn-in.
+    preview_spawn_stagger_s: 0.8  # idle-only Device Manager preview stagger; recorder-owned preview uses recording_preview_stagger_s below
+    recording_preview_enabled: true  # argus_metadata: idle preview JPEGs are produced by session-owned gst-launch processes and stopped before each episode; legacy splitmux attaches preview branches inside recorder workers
+    recording_preview_on_demand: true  # only enable preview while the frontend grid is polling camera.jpg; false = eager enable at Connect
+    recording_preview_idle_ttl_s: 6.0  # on-demand: disable previews after this many seconds without a viewer-demand heartbeat from the gateway (must exceed the gateway's ~1s heartbeat cadence)
+    recording_preview_stagger_s: 0.5  # preview creation cadence
+    recording_preview_stale_s: 3.0  # restart a preview branch if its JPEG has not refreshed within this many seconds
+    recording_preview_watchdog_s: 2.0  # how often the recorder checks preview JPEG freshness
+    stream_health_poll_s: 1.0  # while connected but idle, poll recording streams for EOS/TIMEOUT at this cadence
+    stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
+    # Fallback metadata-backend frame sync gate. The argus_metadata backend
+    # writes one `<camera>.argus_frame_metadata.csv` sidecar per episode.
+    # thor_record.py aligns all cameras by SOF TSC before saving, then rewrites
+    # the videos to the accepted common frame window. These flags are forced on
+    # only when defaults.recorder_backend=argus_metadata.
+    argus_frame_sync:
+      enabled: true
+      required: true
+      # virtual_cluster = build a common SOF-time grid from all cameras instead
+      # of treating one camera's frame sequence as the truth. Set to "camera"
+      # only for diagnostics/fallback with reference_camera below.
+      reference_strategy: virtual_cluster
+      reference_camera: ""
+      tolerance_ms: 1.0
+      cadence_tolerance_ms: 1.0
+      # false = skip expensive ffprobe frame-count scans after materialization.
+      # The metadata sync gate and ffmpeg -frames:v target still enforce equal
+      # logical output frame counts. Set true for strict burn-in QC.
+      materialize_verify: false
+      materialize_workers: 2
+      report_name: argus_frame_alignment.json
+
+    # Production online sync backend. This recorder aligns frames before they
+    # enter the encoder, so saved videos should already have equal frame counts
+    # and do not require post-save ffmpeg materialization.
+    online_sync:
+      enabled: true
+      sync_source: sof_tsc_ns
+      tolerance_ms: 1.0
+      startup_full_clusters: 60
+      # Per-camera Argus acquire timeout while forming a full SOF cluster. At
+      # 60 Hz a healthy camera should produce the next frame within ~16.7 ms;
+      # 1000 ms is intentionally generous but fails much faster than the old
+      # hard-coded 8 s when one stream stops delivering buffers.
+      frame_timeout_ms: 1000
+      # Connect/preflight budgets are intentionally shorter than the episode
+      # stop/mux-close timeout. A wedged 8-camera preflight should fail fast
+      # and expose logs instead of blocking the UI for the full 120s Connect
+      # deadline.
+      preflight_timeout_s: 30.0
+      single_preflight_timeout_s: 10.0
+      missing_frame_policy: fail_episode
+      stop_mode: full_cluster
+      # Optional recorder-owned live frame bus for online inference. Leave
+      # disabled for pure recording. When enabled, the recorder publishes the
+      # latest accepted full SOF cluster as NV12 frames plus latest_cluster.json;
+      # consumers read only from this bus and must not open Argus themselves.
+      frame_bus_dir: ""
+      frame_bus_every_n: 1
+      # UI preview uses a separate on-demand frame bus so it cannot disable or
+      # throttle the online-inference bus. The recorder publishes this bus only
+      # while the UI viewer is polling preview frames; Python converts the
+      # synchronized NV12 cluster into /dev/shm/lerobot_preview/*.jpg.
+      preview_frame_bus_dir: /dev/shm/lerobot_online_sync_preview
+      preview_frame_bus_every_n: 12
+
+    # Per-camera capture/encoding defaults. Libargus handles capture/ISP and
+    # the hardware H.265 encoder writes a complete MKV per camera per episode.
+    defaults:
+      pipeline: argus          # 'argus' = NVIDIA Argus camera stack + ISP
+      # argus_online_sync: production default. One Libargus owner aligns full
+      # SOF clusters before hardware encoding; UI start/stop/save API stays the same.
+      # argus_metadata: fallback path. Records video plus per-frame metadata,
+      # then trims/materializes videos by SOF timestamps after recording.
+      # gstreamer_splitmux: legacy fallback, no Libargus metadata sync gate.
+      recorder_backend: argus_online_sync
+      sensor_mode: 0
+      width: 1920
+      height: 1080
+      fps: 60                  # must match the AR0234 dtbo (60 only)
+      # AR0234 sensor controls applied via v4l2-ctl before recording.
+      # Defaults match the user's verified-good state on this rig; set to 0
+      # to leave the kernel driver's defaults in place. Do not reuse this
+      # driver-unit gain as nvarguscamerasrc gainrange. Argus gain is a
+      # separate 0..4 float scale and is disabled by default here.
+      exposure_us: 0
+      gain: 0
+      argus_gain: 0.0
+      replay_warmup_s: 1.0  # preview skips the first second while Argus ISP/AWB color settles; raw MKV frames are kept
+      # Hardware encoder configuration -- consumed by nvv4l2h265enc.
+      codec: h265
+      bitrate_kbps: 20000
+      iframe_interval: 60      # one keyframe per second @60 fps
+      preset_level: 1          # 1=UltraFastPreset, 4=SlowPreset (NV preset enum)
+      control_rate: 1          # 1 = constant-bitrate, 0 = variable
+      profile: main            # h265: main / main10 ; h264: high / main / baseline
+      container: mkv           # mkv or mp4 (matroskamux / qtmux)
+
+  hardware_sync:
+    # Hardware-sync ENABLED by default for production synchronized capture.
+    # The recorder arms the PWM trigger and pushes trig_mode/exposure/gain via
+    # v4l2-ctl before Connect finishes. This assumes the SG16A trigger input is
+    # wired and the host has passwordless sudo for `sh pwm.sh` / `v4l2-ctl`.
+    # Keep `sensor_trig_mode: 1` and make sure `exposure_us` fits inside one
+    # PWM period; the recorder auto-clamps to 0.85 * (1e6 / fps) and warns if
+    # not.
+    # In slave mode at 60 Hz (period = 16666 us) keep `exposure_us` <= ~14000.
+    enabled: true
+    sdk_dir: tools/thor/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
+    setup_script: pwm.sh        # relative to sdk_dir, or absolute path
+    fps: 60                     # PWM frequency in Hz (only used when enabled)
+    sensor_trig_mode: 1         # 0 = free_run (default), 1 = slave (PWM-edge locked)
+    trig_pin: 0x00020007        # written to each camera via v4l2-ctl when enabled
+    # Informational only -- recorded in episode meta.json.
+    pwm_chip: pwmchip6 # vendor's suggested default; confirm with `ls /sys/class/pwm` and `tools/thor/gmsl2/sdk/pwm.sh --status`
+    pwm_id: 0
+
+# BOX 采集板 SDK over UDP. See `tools/thor/box_sdk/README.md` for the install
+# steps (apt + setup_env.sh + pip install the wheel). UDP ports are pinned
+# to 15000 in both directions per the vendor docs (`需求整理 §5.1`).
+#
+# bind_ip MUST be 0.0.0.0 (wildcard): the v3 firmware box gets a DHCP address
+# on any subnet (e.g. 192.168.122.75) and streams to whatever host address it
+# learned from our command packets -- which the kernel picks by route, not from
+# bind_ip. Binding to a specific address (the old fixed 192.168.2.45) silently
+# receives NOTHING whenever the box is off that subnet -> 0 box samples, frozen
+# observation.state/action. See TROUBLESHOOTING.md §8/§9. remote_ip is only the
+# initial start() target; BoxClient.start() then discover()s + register_device()s
+# the box's real address, so a stale value here is corrected automatically.
+#
+# `expected_devices` is the full set the gateway will surface on the
+# frontend; `BoxClient.detect()` then trims it to whichever subset is
+# actually publishing (a rig may have zero, one, or two Paxini touch pads
+# attached). Set `enabled: false` for camera-only sessions.
+box_collection:
+  enabled: true
+  bind_ip: "0.0.0.0"       # wildcard -- box IP is DHCP/dynamic (see note above)
+  bind_port: 15000
+  remote_ip: "192.168.2.60"  # initial target only; discover() corrects to the real box
+  remote_port: 15000
+  sdk_dir: tools/thor/box_sdk
+  sdk_setup_script: setup_env.sh
+  urdf_relpath: share/monte_gripper.urdf
+  startup_mode: 0          # 0 = collection (trigger-controlled), 1 = control
+  poll_interval_s: 0.001   # 1 kHz idle/Connect poll; exposes 480 Hz six_d_force in rate reports
+  record_poll_interval_s: 0.0005  # 2 kHz recording wait; absorbs Python sleep jitter for 480 Hz six_d_force
+  stale_threshold_s: 1.0   # consider a sensor offline after this gap
+  expected_devices:
+    - box_gripper
+    - box_imu
+    - box_trigger
+    - box_six_d_force
+    - box_touch_left
+    - box_touch_right
+
+# Multi-box form. The flat block above is the single-box special case. Since SDK
+# v4.0 the recorder always broadcast-enumerates the BOXes on the subnet and
+# builds one view per discovered device (sensor set included), so this list is
+# only the fallback for when the broadcast finds nothing -- and the place to pin
+# a `box_id`, which namespaces that box's sensor IDs (box0/box_gripper,
+# box1/box_gripper, ...). `discovery:` is vestigial: `static` and `sdk` behave
+# identically. See tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md §0.
+#
+# box_collection:
+#   enabled: true
+#   discovery: static          # static | sdk -- same behaviour, kept for compat
+#   boxes:
+#     - box_id: box0
+#       bind_ip: "0.0.0.0"
+#       remote_ip: "192.168.2.60"
+#       expected_devices: [box_gripper, box_imu, box_trigger]
+#     - box_id: box1
+#       bind_ip: "0.0.0.0"
+#       remote_ip: "192.168.2.61"
+#       expected_devices: [box_gripper, box_imu, box_trigger]
+
+# When Connect finds nvargus-daemon in a wedged state, the recorder can run
+# `tools/thor/gmsl2/recover_argus.sh` automatically and reconnect once,
+# instead of asking the operator to ssh in and run it by hand. Trigger
+# conditions: connect() raised (every worker dead) OR fewer than
+# `threshold_fraction` of the verified cameras came up. Capped by
+# `max_attempts` (default 1) so a permanently broken rig doesn't loop.
+auto_recover:
+  enabled: true
+  # Path passed as `--sdk` to recover_argus.sh. Defaults to
+  # `hardware_sync.sdk_dir` when unset. Operators with the vendor SDK in a
+  # non-default location override here.
+  sdk_dir: ~/Desktop/SG16A_AGTH_G3Y_A1
+  threshold_fraction: 0.6
+  max_attempts: 1
+  timeout_s: 300
+
+# Laser tracker (API Radian Pro), driven by Connect / Start Episode like any
+# other device. It is not on Thor: the vendor SDK runs on the Windows capture PC
+# and the two clocks are married offline by the QPC <-> CLOCK_MONOTONIC fit, so
+# this block is an ssh target rather than a device address.
+#
+# `enabled: false` is the right default. The tracker is a shared instrument that
+# admits ONE client at a time, so most sessions must not touch it -- the GUI's
+# per-session toggle is what turns it on for a GT run, and it overrides this.
+# When it is on and the instrument is unavailable, Connect still succeeds and
+# the cameras still record; the tracker row goes red and each episode warns.
+#
+# Requires Thor to hold an authorised key for the capture PC
+# (~/.ssh/id_ed25519_lt -> C:\ProgramData\ssh\administrators_authorized_keys).
+laser_tracker:
+  enabled: false
+  win_host: 18713@192.168.147.72
+  ssh_key: ~/.ssh/id_ed25519_lt
+  # Where the staged python tools and the sessions live ON THE CAPTURE PC.
+  # Note this is D:, not the C:\lt that deploy_windows.sh defaults to.
+  win_root: 'D:\lt'
+  logger_exe: 'D:\sdk\collector_win\bin\lt_realtime_logger.exe'
+  tracker_ip: 192.168.0.168
+  # What the capture PC probes back to for the clock link.
+  thor_host: 192.168.111.122
+  responder_port: 17123
+  probe_interval_s: 0.01
+  # Backstops only; the stop-file ends both in normal operation. They exist so a
+  # gateway that died without cleaning up cannot strand a process over there.
+  session_cap_s: 86400
+  # The SDK handshake alone measured 15-16 s on 2026-09-20, which is why one
+  # stream spans the whole Connect window instead of one per episode.
+  logger_ready_timeout_s: 60
+  # Connect homes the tracker itself, so nobody has to open SA/RadianCAL first.
+  # Homing is the ONLY way out of Position mode -- that mode holds the gimbal and
+  # cannot track, so an SMR placed in the beam is not acquired while it lasts.
+  #
+  # Precondition: the SMR must be sitting in the home nest when Connect is
+  # pressed. If it is not, Home fails with NoSmrAtHomePosition, the recorder
+  # says so, and the cameras still record.
+  #
+  # smr_size is required whenever home_on_connect is true and is NEVER guessed:
+  # homing against the wrong nominal radius is a metrology error, not a crash.
+  # The routine that enables the tracker's optical switch. Without it the only
+  # valid samples a session produces are the ones Home left behind while the SMR
+  # was still in the nest: lift it, break the beam once, and az/el/dist keep
+  # updating while x/y/z are zeroed for as long as you care to wave it. That
+  # cost two whole episodes on 2026-09-20. 1 ms is the SDK maximum and matches
+  # the 1 kHz feed; 0 disables it, for A/B only.
+  measure_ms: 1
+  home_on_connect: true
+  smr_size: '1.5'         # '1.5' | '0.5' | '7/8'  -- REQUIRED, never guessed
+  adm_offset_mm: 0.0      # only for a solid SMR
+  # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
+  # against its manifest before the recorder exits.
+  land: true
+
+dataset:
+  repo_id: local/thor_fr3_spacemouse
+  single_task: FR3 SpaceMouse teleoperation with Sengyun and BOX sensors
+  root: outputs/datasets/thor_fr3_spacemouse
+  # The orchestrator writes one MKV per camera per episode plus
+  # `episode_<idx>/meta.json` describing the cameras, codecs, wallclock
+  # timestamps, and hardware-sync settings. There is no LeRobotDataset
+  # parquet (the GUI consumer reads the MKV streams + meta.json directly).
+  fps: 60
+  num_episodes: 0              # 0 = unlimited; press the GUI's Save/Stop
+  # Length of one episode. The recorder ends and auto-saves it when this
+  # elapses; the GUI's Save button only ends it earlier. The calibration
+  # wizard overrides it per episode (`episode_time:<seconds>` on stdin)
+  # because a board sweep is paced by the operator, not by this number.
+  episode_time_s: 20
+  # Legacy gstreamer_splitmux only: while Connected but not recording, the
+  # persistent pipelines keep streaming into a throwaway warmup fragment under
+  # <root>/_warmup. The default argus_metadata backend starts one recorder
+  # process per episode and does not keep long-lived warmup fragments.
+  warmup_roll_s: 30            # idle roll+prune cadence in seconds; 0 disables
+  warmup_keep_last_n: 3        # warmup fragments kept per camera each prune
+  push_to_hub: false
+
+display_data: true
+play_sounds: false
+resume: false
+
+# The same Thor camera/BOX recorder owns gripper control and telemetry logging.
+# The arm host must be directly wired to FR3 Control with PREEMPT_RT + rtprio.
+# These are the existing workstation defaults; change robot_ip and task TCP
+# to match the installed gripper before hardware commissioning.
+robot:
+  type: franka_research3
+  robot_ip: 192.168.1.206
+  urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
+  target_frame_name: corenetic_gripper_ee
+  workspace_min: [0.2, -0.6, 0.05]
+  workspace_max: [0.9, 0.6, 0.8]
+  max_target_delta_pos: [0.001, 0.001, 0.001]
+  max_target_delta_rot: [0.01, 0.01, 0.01]
+  ik_solver: placo
+  use_otg: true
+  otg_max_velocity: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+  otg_max_acceleration: [1, 1, 1, 1, 1, 1, 1]
+  otg_max_jerk: [1000, 1000, 1000, 1000, 1000, 1000, 1000]
+
+teleop:
+  type: spacemouse
+  frequency: 200
+  device_id: 0
+  tool_mode: incremental
+  incremental_step: 0.02
+  translation_scale: 0.000615
+  rotation_scale: 0.000648
+  enable_rotation: true
+
+fr3_teleop:
+  enabled: true
+  input_source: thor             # thor USB or host sender via leased TCP
+  input_bind: 0.0.0.0
+  input_port: 18771
+  arm_host: 192.168.100.155
+  arm_bind: 0.0.0.0
+  arm_port: 18770
+  token_file: outputs/.fr3_bridge_token
+  control_hz: 200
+  command_timeout_s: 0.15
+  max_clock_uncertainty_ms: 20
+  max_state_age_ms: 100
+  min_success_rate: 0.995
+  max_episode_samples: 240000
+  gripper_box_id: ""              # must name one box when several are connected
+  gripper_max_width_m: 0.09

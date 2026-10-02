@@ -418,6 +418,7 @@ def _read_stdin_loop(
     on_episode_time: Callable[[float], None] | None = None,
     on_capture_root: Callable[[str], None] | None = None,
     on_capture_intent: Callable[[str], None] | None = None,
+    on_fr3_teleop: Callable[[bool], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -448,6 +449,9 @@ def _read_stdin_loop(
             # and drop.
             if on_demand is not None:
                 on_demand()
+        elif stripped in ("fr3_start", "fr3_stop"):
+            if on_fr3_teleop is not None:
+                on_fr3_teleop(stripped == "fr3_start")
         elif cmd_key == "cali_6dforce":
             # Out-of-band 6D force-sensor calibration request from the gateway
             # (Device Manager button). Like preview_demand it's a side-effect,
@@ -1765,6 +1769,23 @@ def main(argv: list[str] | None = None) -> int:
             "Device Manager grid is open)"
         )
 
+    fr3 = None
+    fr3_settings = raw_yaml.get("fr3_teleop") or {}
+    fr3_enabled = bool(fr3_settings.get("enabled", False))
+    if fr3_enabled:
+        from tools.thor.fr3_teleop import ThorFr3Session
+        if os.environ.get("FR3_INPUT_SOURCE"):
+            fr3_settings["input_source"] = os.environ["FR3_INPUT_SOURCE"]
+        try:
+            fr3 = ThorFr3Session(raw_yaml, box, emit=_emit)
+            fr3.start()
+        except Exception as exc:
+            if fr3 is not None:
+                fr3.close()
+            fr3 = None
+            _emit("FR3_LIVE " + json.dumps({"state": "error", "backend": "real", "realRobotReady": False,
+                                           "message": f"FR3 bridge unavailable: {exc}"}))
+
     lr3_writer: lr3.Lr3Writer | None = None
     if box_cfg.enabled:
         try:
@@ -1774,6 +1795,7 @@ def main(argv: list[str] | None = None) -> int:
                 task=cfg.single_task,
                 fps=cfg.fps,
                 world_frame=world_frame,
+                fr3_enabled=fr3_enabled,
             )
             if lr3_writer is None:
                 logger.warning("BOX LeRobot v3 writer disabled; pyarrow is unavailable")
@@ -1880,13 +1902,24 @@ def main(argv: list[str] | None = None) -> int:
             return
         pending_capture_intent = payload
 
+    def _note_fr3_teleop(active: bool) -> None:
+        try:
+            if fr3 is None:
+                raise RuntimeError("FR3 bridge is unavailable; check the control host and reconnect devices")
+            fr3.set_active(active)
+        except Exception as exc:
+            if fr3 is not None:
+                fr3.error = str(exc)
+            _emit("FR3_LIVE " + json.dumps({"state": "error", "backend": "real", "realRobotReady": False,
+                                           "message": str(exc)}))
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
         args=(
             cmd_queue, stop_event, _note_preview_demand,
             _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
             _trigger_touch_cali, _note_episode_time,
-            _note_capture_root, _note_capture_intent,
+            _note_capture_root, _note_capture_intent, _note_fr3_teleop,
         ),
         daemon=True, name="thor-record-stdin",
     )
@@ -2048,6 +2081,16 @@ def main(argv: list[str] | None = None) -> int:
             if cmd.kind == "quit":
                 break
 
+            # Calibration captures use a redirected root and can keep working
+            # while the arm host is unavailable. Task episodes require FR3 state.
+            record_fr3 = fr3_enabled and _active_capture_root() == cfg.dataset_root
+            if record_fr3 and (fr3 is None or fr3.error or not fr3.state):
+                _emit("ERROR: FR3 telemetry unavailable; reconnect devices before recording")
+                _emit(f"Episode {_next_index_for(_active_capture_root())} ready")
+                continue
+            if record_fr3 and fr3 is not None:
+                fr3.start_recording()
+
             # Resolved per episode, not once per session: the gateway can
             # redirect the destination between episodes (capture_root) without
             # the Argus session being touched.
@@ -2103,6 +2146,10 @@ def main(argv: list[str] | None = None) -> int:
             stop_reason = "operator_save"
             while True:
                 now = time.monotonic()
+                if record_fr3 and fr3 is not None and fr3.error:
+                    stop_reason = "fr3_fault"
+                    _emit(f"ERROR: FR3 telemetry failed; episode discarded: {fr3.error}")
+                    break
                 elapsed = time.time() - t_start
                 if elapsed >= target_s:
                     stop_reason = "duration_reached"
@@ -2147,6 +2194,7 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.05)
 
             capture_end_wall_s = time.time()
+            fr3_samples = fr3.stop_recording() if record_fr3 and fr3 is not None else []
             capture_end_mono_s = time.monotonic()
             wall_end = datetime.now(timezone.utc).isoformat()
             duration_s = capture_end_wall_s - t_start
@@ -2269,6 +2317,10 @@ def main(argv: list[str] | None = None) -> int:
                     else {"enabled": bool(lt_cfg.enabled), "error": tracker.last_error}
                 )
                 _annotate_episode_meta(meta_path, annotations)
+                if record_fr3:
+                    from tools.thor.fr3_teleop import write_fr3_samples
+                    fr3_meta = write_fr3_samples(ep_dir, fr3_samples, handle.t0_mono_s)
+                    _annotate_episode_meta(meta_path, {"fr3_teleop": fr3_meta})
                 has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
                 if has_recorded_samples:
                     _write_sensor_samples(ep_dir, recorded_samples, t_start)
@@ -2309,6 +2361,8 @@ def main(argv: list[str] | None = None) -> int:
                             t0_wall_s=t_start,
                             pts_offset_s=pts_offset,
                             frame_times_s=frame_times,
+                            **({"fr3_samples": fr3_samples, "t0_mono_s": handle.t0_mono_s}
+                               if fr3_enabled else {}),
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
@@ -2373,6 +2427,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"Episode {_next_index_for(_active_capture_root())} ready")
     finally:
         stop_event.set()
+        if fr3 is not None:
+            try:
+                fr3.close()
+            except Exception as exc:
+                logger.warning("FR3 shutdown failed: %s", exc)
         # Stop the preview controller before tearing down pcs so it can't call
         # enable/disable/refresh on a session being disconnected underneath it.
         if preview_thread is not None:

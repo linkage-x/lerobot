@@ -156,6 +156,7 @@ class PandaPyArmDriver:
     filter_coeff: float | None = None
     state_poll_frequency_hz: float = 200.0
     start_controller_on_connect: bool = True
+    realtime_enforce: bool = False
 
     def __post_init__(self):
         try:
@@ -179,9 +180,14 @@ class PandaPyArmDriver:
         # timestamp them by when they were read *from the arm* rather than by when it happened
         # to pick them up -- those differ by up to one poll period.
         self._cached_joint_positions_at_s: float | None = None
+        self._cached_telemetry: dict[str, Any] = {}
 
     def connect(self) -> None:
-        self._robot = self._panda_cls(self.robot_ip)
+        if self.realtime_enforce:
+            from panda_py import libfranka
+            self._robot = self._panda_cls(self.robot_ip, realtime_config=libfranka.RealtimeConfig.kEnforce)
+        else:
+            self._robot = self._panda_cls(self.robot_ip)
         # One state read serves both the mode gate and the controller's initial setpoint. The
         # state reader starts polling immediately afterwards, so a second round-trip here would
         # only add latency to the connect path.
@@ -283,10 +289,32 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
+        telemetry: dict[str, Any] = {"sample_monotonic_s": sampled_at_s}
+        robot_time = getattr(state, "time", None)
+        if robot_time is not None and hasattr(robot_time, "to_sec"):
+            telemetry["robot_time_s"] = float(robot_time.to_sec())
+        for key in ("q", "dq", "tau_J", "tau_ext_hat_filtered", "O_T_EE", "O_F_ext_hat_K"):
+            value = getattr(state, key, None)
+            if value is not None:
+                telemetry[key] = np.asarray(value, dtype=np.float64).reshape(-1).tolist()
+        success_rate = getattr(state, "control_command_success_rate", None)
+        if success_rate is not None:
+            telemetry["control_command_success_rate"] = float(success_rate)
+        mode = getattr(state, "robot_mode", None)
+        telemetry["robot_mode"] = getattr(mode, "name", str(mode))
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
+            self._cached_telemetry = telemetry
         return joint_positions
+
+    def get_telemetry(self) -> dict[str, Any]:
+        """Copy one coherent native state snapshot without another FCI connection."""
+        if self._robot is not None:
+            self._robot.raise_error()
+        with self._state_lock:
+            return {key: list(value) if isinstance(value, list) else value
+                    for key, value in self._cached_telemetry.items()}
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Cached joint positions together with when they were read from the arm.

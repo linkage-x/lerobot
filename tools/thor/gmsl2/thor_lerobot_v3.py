@@ -1255,6 +1255,7 @@ class Lr3Writer:
         task: str,
         fps: int,
         world_frame: dict[str, Any] | None = None,
+        fr3_enabled: bool = False,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -1269,6 +1270,7 @@ class Lr3Writer:
         # callers outside the recorder (tests, one-off conversions), where it is
         # recorded as an explicit "unstamped" rather than omitted.
         self.world_frame = dict(world_frame) if world_frame else None
+        self.fr3_enabled = fr3_enabled
         self.pa = pa
         self.pq = pq
         self.data_dir = dataset_root / "data" / "chunk-000"
@@ -1306,6 +1308,8 @@ class Lr3Writer:
         t0_wall_s: float = 0.0,
         pts_offset_s: float | None = None,
         frame_times_s: list[float | None] | None = None,
+        fr3_samples: list[dict[str, Any]] | None = None,
+        t0_mono_s: float = 0.0,
     ) -> Path | None:
         if self._closed:
             raise RuntimeError("cannot append to a closed Lr3Writer")
@@ -1337,14 +1341,16 @@ class Lr3Writer:
         if not rows:
             return None
 
+        table = _rows_to_table(self.pa, rows, state_names=state_names, ts_names=ts_names)
+        if self.fr3_enabled:
+            from tools.fr3.box_teleop_data import append_fr3_columns
+            table = append_fr3_columns(self.pa, table, fr3_samples or [], frame_times_s or [],
+                                       t0_mono_s=t0_mono_s)
+
         if self._writer is None:
             self.state_names = state_names
             self.ts_names = ts_names
-            self._schema = _box_table_schema(
-                self.pa,
-                state_width=len(self.state_names),
-                ts_width=len(self.ts_names),
-            )
+            self._schema = table.schema
             self._writer = self.pq.ParquetWriter(
                 self.data_path,
                 schema=self._schema,
@@ -1352,7 +1358,6 @@ class Lr3Writer:
                 use_dictionary=True,
             )
 
-        table = _rows_to_table(self.pa, rows, state_names=self.state_names, ts_names=self.ts_names)
         self._writer.write_table(table)
         n_rows = table.num_rows
         start = self.total_frames
@@ -1409,6 +1414,10 @@ class Lr3Writer:
             "index": _table_column_stats(table, "index", width=1),
             "task_index": _table_column_stats(table, "task_index", width=1),
         }
+        if self.fr3_enabled:
+            from tools.fr3.box_teleop_data import FR3_FEATURE_NAMES
+            stats.update({key: _table_column_stats(table, key, width=len(names))
+                          for key, names in FR3_FEATURE_NAMES.items()})
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_episodes(self) -> None:
@@ -1433,7 +1442,7 @@ class Lr3Writer:
         n_eps = len(self._episode_rows)
         info = {
             "codebase_version": "v3.0",
-            "robot_type": "thor_gmsl2_box",
+            "robot_type": "thor_gmsl2_box_fr3" if self.fr3_enabled else "thor_gmsl2_box",
             "repo_id": self.repo_id,
             "total_episodes": int(n_eps),
             "total_frames": int(self.total_frames),
@@ -1452,6 +1461,9 @@ class Lr3Writer:
                 "note": "writer was constructed without world provenance",
             },
         }
+        if self.fr3_enabled:
+            from tools.fr3.box_teleop_data import fr3_features
+            info["features"].update(fr3_features())
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
     def _write_tasks(self) -> None:
@@ -1474,10 +1486,12 @@ def open_box_lerobot_v3_writer(
     task: str,
     fps: int,
     world_frame: dict[str, Any] | None = None,
+    fr3_enabled: bool = False,
 ) -> Lr3Writer | None:
     try:
         return Lr3Writer(
             dataset_root, repo_id=repo_id, task=task, fps=fps, world_frame=world_frame,
+            fr3_enabled=fr3_enabled,
         )
     except ImportError:
         return None

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import abc
 import builtins
 from pathlib import Path
@@ -19,12 +21,12 @@ from typing import TYPE_CHECKING, Any
 
 import draccus
 
-from lerobot.motors.motors_bus import MotorCalibration
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, TELEOPERATORS
 
 from .config import TeleoperatorConfig
 
 if TYPE_CHECKING:
+    from lerobot.motors.motors_bus import MotorCalibration
     from lerobot.processor import RobotAction
 else:
     RobotAction = dict[str, Any]
@@ -158,6 +160,8 @@ class Teleoperator(abc.ABC):
             fpath (Path | None): Optional path to the calibration file. Defaults to `self.calibration_fpath`.
         """
         fpath = self.calibration_fpath if fpath is None else fpath
+        from lerobot.motors.motors_bus import MotorCalibration
+
         with open(fpath) as f, draccus.config_type("json"):
             self.calibration = draccus.load(dict[str, MotorCalibration], f)
 

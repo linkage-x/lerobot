@@ -75,8 +75,8 @@ const workstationPageIds = new Set<PageId>([
   "dataset-export"
 ]);
 
-function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
-  return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation";
+function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation", hasFr3 = false): boolean {
+  return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation" || hasFr3;
 }
 const navPageLabels: Partial<Record<PageId, string>> = {
   dashboard: "Overview"
@@ -123,7 +123,7 @@ function App() {
   useEffect(() => {
     if (!snapshot) return;
     const profile = snapshot.deployment?.profile ?? "thor";
-    if (!pageAllowedForProfile(activePage, profile)) {
+    if (!pageAllowedForProfile(activePage, profile, snapshot.deployment?.capabilities.includes("fr3_bridge"))) {
       const fallback = (snapshot.deployment?.defaultRoute as PageId) ?? "live-record";
       window.location.hash = fallback;
       setActivePage(fallback);
@@ -425,7 +425,7 @@ function SidebarNav({
   const caliBadge = calibrationNavBadge();
   const profile = snapshot.deployment?.profile ?? "thor";
   const visibleNavGroups = navGroups
-    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile)) }))
+    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile, snapshot.deployment?.capabilities.includes("fr3_bridge"))) }))
     .filter((group) => group.ids.length > 0);
 
   const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;

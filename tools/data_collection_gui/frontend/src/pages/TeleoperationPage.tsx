@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type { TeleopCameraView } from "../types";
+import { api } from "../apiClient";
+import { ForceSensorCard, TactileSensorCard } from "../calibration/SensorMonitors";
 
 const defaultCameraViews: TeleopCameraView[] = [
   { id: "external", label: "External", source: "D435I", fps: 30, deviceId: "side" },
@@ -94,25 +96,32 @@ export function TeleoperationPage({
   cameraUrl: (view: TeleopCameraView, backend: TeleopBackend) => string;
 }) {
   const teleop = snapshot.teleop;
+  const thorFr3 = snapshot.deployment?.capabilities.includes("fr3_bridge") ?? false;
+  const telemetry = teleop.realRobotReady ? teleop.telemetry : undefined;
   const sessionActive = teleop.state === "running" || teleop.state === "starting";
   const [selectedBackend, setSelectedBackend] = useState<TeleopBackend>(teleop.backend);
   const statusState = sessionActive ? "running" : teleop.state === "error" ? "error" : "idle";
-  const cameraViews = teleop.cameraViews?.length ? teleop.cameraViews : defaultCameraViews;
+  const cameraViews = thorFr3
+    ? snapshot.devices.filter((d) => d.kind === "camera").map((d) => ({
+        id: d.id, deviceId: d.id, label: d.label, source: "Sengyun GMSL2", fps: d.fps || 60
+      }))
+    : teleop.cameraViews?.length ? teleop.cameraViews : defaultCameraViews;
   const workstationDevices = snapshot.devices.filter((device) =>
     ["robot", "gripper", "teleoperator", "camera"].includes(device.kind)
   );
   const detectedDeviceCount = workstationDevices.filter((device) => device.state === "running").length;
-  const realCameraActive = selectedBackend === "real";
+  const realCameraActive = selectedBackend === "real" && (!thorFr3 || snapshot.recording.state !== "idle");
   const simCameraActive =
     selectedBackend === "mujoco" && sessionActive && teleop.backend === "mujoco";
 
   useEffect(() => {
-    if (sessionActive) setSelectedBackend(teleop.backend);
-  }, [sessionActive, teleop.backend]);
+    if (sessionActive || thorFr3) setSelectedBackend(thorFr3 ? "real" : teleop.backend);
+  }, [sessionActive, teleop.backend, thorFr3]);
 
   return (
     <div className="page-stack">
-      <PageHeader title="FR3 Pika Teleoperation" subtitle="workstation control and observation" />
+      <PageHeader title={thorFr3 ? "FR3 + Thor Teleoperation" : "FR3 Pika Teleoperation"}
+        subtitle={thorFr3 ? "SpaceMouse · Sengyun cameras · BOX tactile and force" : "workstation control and observation"} />
       <section className="panel teleop-panel">
         <div className="panel-heading">
           <h2>Control Session</h2>
@@ -121,7 +130,7 @@ export function TeleoperationPage({
         <div className="mujoco-mode-picker teleop-backend-picker" role="group" aria-label="Teleoperation backend">
           <button
             className={selectedBackend === "mujoco" ? "active" : ""}
-            disabled={busy || sessionActive}
+            disabled={busy || sessionActive || thorFr3}
             onClick={() => setSelectedBackend("mujoco")}
             type="button"
           >
@@ -159,22 +168,51 @@ export function TeleoperationPage({
             </strong>
           </div>
           <div><span>PID</span><strong>{sessionActive ? teleop.pid ?? "-" : "-"}</strong></div>
-          <div><span>Cameras</span><strong>D435I external · D405 wrist</strong></div>
+          <div><span>Cameras</span><strong>{thorFr3 ? "Sengyun GMSL2" : "D435I external · D405 wrist"}</strong></div>
         </div>
         <div className="control-row">
           <button
-            disabled={busy || sessionActive}
+            disabled={busy || sessionActive || (thorFr3 && !teleop.realRobotReady)}
             onClick={selectedBackend === "real" ? onStartRealTeleop : onStartSimTeleop}
           >
             {selectedBackend === "real" ? "Start Real Robot Teleop" : "Start MuJoCo Teleop"}
           </button>
           <button className="danger" disabled={busy || !sessionActive} onClick={onStopTeleop}>Stop Teleop</button>
         </div>
-        {selectedBackend === "real" && !sessionActive ? (
+        {thorFr3 ? (
+          <div className="teleop-gate-note">Connect devices in Live Record first. Start enables SpaceMouse and gripper control;
+            Stop keeps telemetry connected. Use Live Record to save or discard episodes. Input: {teleop.inputSource || "thor"}.</div>
+        ) : selectedBackend === "real" && !sessionActive ? (
           <div className="teleop-gate-note">FCI availability is reported by the control process after launch; it does not gate this action or the camera streams.</div>
         ) : null}
         <div className="teleop-message">{teleop.message}</div>
       </section>
+
+      {thorFr3 ? <section className="panel">
+        <div className="panel-heading"><h2>Measured FR3 State</h2><span>{teleop.realRobotReady ? "Live" : "Disconnected"}</span></div>
+        <div className="summary-grid">
+          <Metric label="FCI command success" value={telemetry?.control_command_success_rate != null
+            ? `${(telemetry.control_command_success_rate * 100).toFixed(2)}%` : "—"} />
+          <Metric label="Bridge round trip" value={telemetry?.round_trip_ms != null ? `${telemetry.round_trip_ms.toFixed(2)} ms` : "—"} />
+          <Metric label="Clock uncertainty" value={telemetry?.clock_uncertainty_s != null
+            ? `±${(telemetry.clock_uncertainty_s * 1000).toFixed(2)} ms` : "—"} />
+          <Metric label="Measured gripper opening" value={telemetry?.gripper_measured_m != null
+            ? `${(telemetry.gripper_measured_m * 1000).toFixed(1)} mm` : "—"} />
+        </div>
+        <table><thead><tr><th>Joint</th><th>Position (rad)</th><th>Velocity (rad/s)</th><th>Torque (N·m)</th><th>External torque (N·m)</th></tr></thead>
+          <tbody>{Array.from({ length: 7 }, (_, i) => <tr key={i}><td>{i + 1}</td>
+            {[telemetry?.q, telemetry?.dq, telemetry?.tau_J, telemetry?.tau_ext_hat_filtered].map((v, j) =>
+              <td key={j}>{v?.[i]?.toFixed(4) ?? "—"}</td>)}</tr>)}</tbody></table>
+        <p>Measured task TCP [x, y, z (m), rotation vector (rad)]: {telemetry?.measured_tcp?.map((v) => v.toFixed(4)).join(", ") || "—"}</p>
+        <p>FR3 estimated external wrench [Fx, Fy, Fz (N), Mx, My, Mz (N·m)]: {telemetry?.O_F_ext_hat_K?.map((v) => v.toFixed(3)).join(", ") || "—"}</p>
+      </section> : null}
+
+      {thorFr3 ? <section className="panel">
+        <div className="panel-heading"><h2>Gripper Tactile and Force</h2></div>
+        <div className="teleop-device-grid">{snapshot.devices.filter((d) => d.id.endsWith("box_six_d_force") || d.id.includes("box_touch_")).map((device) =>
+          device.id.endsWith("box_six_d_force") ? <ForceSensorCard key={device.id} api={api} device={device} />
+            : <TactileSensorCard key={device.id} api={api} device={device} />)}</div>
+      </section> : null}
 
       <section className="panel teleop-observation-panel">
         <div className="panel-heading">
@@ -196,7 +234,7 @@ export function TeleoperationPage({
 
       <section className="panel">
         <div className="panel-heading">
-          <h2>Workstation I/O</h2>
+          <h2>{thorFr3 ? "Thor / FR3 I/O" : "Workstation I/O"}</h2>
           <span>{detectedDeviceCount}/{workstationDevices.length} detected</span>
         </div>
         <div className="teleop-device-grid">
