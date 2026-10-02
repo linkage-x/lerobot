@@ -212,6 +212,12 @@ export type TeleopStatus = {
   realRobotReady?: boolean;
   cameraViews?: TeleopCameraView[];
   inputSource?: string;
+  wristCamera?: {
+    state: "pending" | "unconfigured" | "resolved" | "missing" | "ambiguous";
+    camera: string | null;
+    message: string;
+    selector: { serial: string; sensor_id: number | null };
+  };
   telemetry?: {
     q?: number[];
     dq?: number[];

@@ -88,6 +88,7 @@ from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
+from tools.thor.gmsl2 import camera_roles as cr  # noqa: E402
 from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
@@ -781,6 +782,7 @@ def _write_episode_meta(
     world_frame: dict[str, Any],
     capture_intent: dict[str, Any] | None = None,
     camera_identity: dict[str, Any] | None = None,
+    camera_roles: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -933,6 +935,9 @@ def _write_episode_meta(
         # Which physical camera each cam_NN was, read off its EEPROM at Connect.
         # cam_NN is the cable's port; a swapped cable is invisible without this.
         meta["camera_identity"] = camera_identity
+    if camera_roles is not None:
+        # Roles do not rename cam_NN videos or the existing sync keys.
+        meta["camera_roles"] = camera_roles
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
@@ -1420,6 +1425,8 @@ def main(argv: list[str] | None = None) -> int:
     with args.config_path.open() as f:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
+    if (raw_yaml.get("fr3_teleop") or {}).get("enabled"):
+        cr.wrist_camera_selector(raw_yaml)
     box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
     # Tri-state on purpose: the yaml declares the hardware and defaults to off,
     # --laser-tracker / --no-laser-tracker is the GUI toggle for this session,
@@ -1729,6 +1736,15 @@ def main(argv: list[str] | None = None) -> int:
         _emit(f"Cameras (active): {', '.join(active_camera_ids)}")
     _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
 
+    camera_roles = None
+    if (raw_yaml.get("fr3_teleop") or {}).get("enabled"):
+        camera_roles = cr.resolve_camera_roles(
+            raw_yaml,
+            [{"name": f"{cfg.name_prefix}_{sid:02d}", "sensor_id": sid} for sid in pcs.active_sids],
+            camera_identity,
+        )
+        _emit("CAMERA_ROLES " + json.dumps(camera_roles, separators=(",", ":")))
+
     # --- recorder-owned preview lifecycle (on-demand) -------------------
     # Previews are a lossy tee branch off each recording pipeline. Keeping 11
     # nvvidconv+jpegenc branches attached and running 24/7 adds steady VIC/NVMM
@@ -1796,6 +1812,7 @@ def main(argv: list[str] | None = None) -> int:
                 fps=cfg.fps,
                 world_frame=world_frame,
                 fr3_enabled=fr3_enabled,
+                camera_roles=camera_roles,
             )
             if lr3_writer is None:
                 logger.warning("BOX LeRobot v3 writer disabled; pyarrow is unavailable")
@@ -2084,6 +2101,21 @@ def main(argv: list[str] | None = None) -> int:
             # Calibration captures use a redirected root and can keep working
             # while the arm host is unavailable. Task episodes require FR3 state.
             record_fr3 = fr3_enabled and _active_capture_root() == cfg.dataset_root
+            if record_fr3 and camera_roles is not None:
+                # Recheck active streams: a failed wrist must not silently
+                # produce an otherwise healthy task episode with no wrist video.
+                camera_roles = cr.resolve_camera_roles(
+                    raw_yaml,
+                    [{"name": f"{cfg.name_prefix}_{sid:02d}", "sensor_id": sid} for sid in pcs.active_sids],
+                    camera_identity,
+                )
+                _emit("CAMERA_ROLES " + json.dumps(camera_roles, separators=(",", ":")))
+                try:
+                    cr.require_wrist_camera(camera_roles)
+                except RuntimeError as exc:
+                    _emit(f"ERROR: {exc}; reconnect cameras before recording")
+                    _emit(f"Episode {_next_index_for(_active_capture_root())} ready")
+                    continue
             if record_fr3 and (fr3 is None or fr3.error or not fr3.state):
                 _emit("ERROR: FR3 telemetry unavailable; reconnect devices before recording")
                 _emit(f"Episode {_next_index_for(_active_capture_root())} ready")
@@ -2274,6 +2306,7 @@ def main(argv: list[str] | None = None) -> int:
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
                     world_frame, capture_intent, camera_identity,
+                    camera_roles,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for

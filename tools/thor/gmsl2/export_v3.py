@@ -65,6 +65,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tools.thor.gmsl2.camera_roles import wrist_camera_names  # noqa: E402
+
 # pyarrow-only helpers shared with the recorder's box v3 writer.
 from tools.thor.gmsl2 import (  # noqa: E402
     thor_lerobot_v3 as lr3,
@@ -876,6 +878,7 @@ class _V3Writer:
         touch_width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
         world_frame: dict[str, Any] | None = None,
         fr3_enabled: bool = False,
+        camera_roles: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -898,6 +901,7 @@ class _V3Writer:
         self.touch_width = int(touch_width)
         self.world_frame = dict(world_frame) if world_frame else None
         self.fr3_enabled = fr3_enabled
+        self.camera_roles = camera_roles
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -1118,6 +1122,8 @@ class _V3Writer:
                 ),
             },
         }
+        if self.camera_roles is not None:
+            info["camera_roles"] = self.camera_roles
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
 
@@ -1259,6 +1265,15 @@ def export_task_to_v3(
     if len(fr3_modes) > 1:
         raise ValueError("Cannot combine FR3 teleoperation and BOX-only episodes in one export")
     fr3_enabled = True in fr3_modes
+    wrist_names = wrist_camera_names(first_meta)
+    for src in episodes:
+        source_meta = _load_meta(src.ep_dir)
+        if [c for c, _ in _camera_entries(source_meta, src.ep_dir)] == camera_keys:
+            if wrist_camera_names(source_meta) != wrist_names:
+                raise ValueError(
+                    "Cannot combine episodes with different wrist camera roles on the same video keys; "
+                    "use separate tasks/exports for different camera layouts"
+                )
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
@@ -1276,6 +1291,7 @@ def export_task_to_v3(
         touch_width=touch_width,
         world_frame=source_world_frame,
         fr3_enabled=fr3_enabled,
+        camera_roles=first_meta.get("camera_roles"),
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -1399,6 +1415,8 @@ def export_task_to_v3(
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
+                "camera_roles": meta.get("camera_roles"),
+                "camera_identity": meta.get("camera_identity"),
             }
         )
         _emit(f"Episode {global_index} written ({n_frames} frames) from {src.session_dir.name}/{src.ep_dir.name}")

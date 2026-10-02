@@ -345,6 +345,13 @@ teleop:
 
 fr3_teleop:
   enabled: true
+  # The added end-effector Sengyun uses the same GMSL2 recorder as the rig.
+  # Prefer its EEPROM serial: it follows the camera if its port changes.
+  # Otherwise set sensor_id to the actual port (0..15). Leave unset until fitted.
+  # A configured wrist camera must stream before task recording can start.
+  wrist_camera:
+    serial: ""
+    sensor_id: null
   input_source: thor             # thor USB or host sender via leased TCP
   input_bind: 0.0.0.0
   input_port: 18771

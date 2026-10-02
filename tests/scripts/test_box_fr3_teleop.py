@@ -193,7 +193,8 @@ def test_alignment_uses_capture_time_and_uncertainty():
 
 def test_writer_preserves_box_fields_and_adds_fr3_across_episodes(tmp_path):
     import pyarrow.parquet as pq
-    writer = Lr3Writer(tmp_path, repo_id="local/test", task="test", fps=60, fr3_enabled=True)
+    roles = {"camera": "cam_15", "cameras": {"cam_15": {"role": "wrist", "serial": "WRIST_MODULE"}}}
+    writer = Lr3Writer(tmp_path, repo_id="local/test", task="test", fps=60, fr3_enabled=True, camera_roles=roles)
     for episode in range(2):
         writer.append_episode(episode_index=episode, snapshots=[{"t_relative_s": 0, "sensors": {}}],
                               duration_s=1 / 60, frame_times_s=[0], fr3_samples=[sample()], t0_mono_s=100)
@@ -204,6 +205,7 @@ def test_writer_preserves_box_fields_and_adds_fr3_across_episodes(tmp_path):
     assert "observation.state" in table.column_names
     assert table["fr3.valid"].to_pylist() == [[1], [1]]
     info = json.loads((tmp_path / "meta/info.json").read_text())
+    assert info["camera_roles"] == roles
     assert info["features"]["observation.fr3.tau_J"]["shape"] == [7]
     assert info["features"]["action"]["names"][-1] == "gripper.pos"
 

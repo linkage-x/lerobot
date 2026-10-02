@@ -19,6 +19,7 @@ def main(argv=None):
         from lerobot.robots.franka_research3.config_franka_research3 import FrankaResearch3Config
         from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig
         from tools.fr3.box_teleop_protocol import Lease
+        from tools.thor.gmsl2.camera_roles import wrist_camera_selector
         from xml.etree import ElementTree
         config = yaml.safe_load(args.config_path.read_text())
         robot = dict(config["robot"])
@@ -33,7 +34,8 @@ def main(argv=None):
         Lease(float(config["fr3_teleop"]["command_timeout_s"]))
         if config["fr3_teleop"]["input_source"] not in ("thor", "host"):
             raise ValueError("input_source must be thor or host")
-        print("FR3 config, task TCP, SpaceMouse config, and timeout: OK")
+        wrist_camera_selector(config)
+        print("FR3 config, task TCP, SpaceMouse config, wrist camera selector, and timeout: OK")
         return 0
     # This lightweight check only needs numpy + pyspacemouse, not torch/FR3.
     from lerobot.teleoperators.spacemouse.backend import PySpaceMouseDriver

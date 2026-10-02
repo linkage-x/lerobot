@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.thor.gmsl2 import intrinsics_by_serial
+from tools.thor.gmsl2 import camera_roles as cr
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -261,6 +262,7 @@ class TeleopStatus:
     realRobotReady: bool = False
     telemetry: dict[str, Any] = field(default_factory=dict)
     inputSource: str = ""
+    wristCamera: dict[str, Any] = field(default_factory=dict)
     cameraViews: list[dict[str, Any]] = field(
         default_factory=lambda: [
             {"id": "external", "label": "External", "source": "D435I", "fps": 30, "deviceId": "side"},
@@ -4703,9 +4705,11 @@ def _marker_tcp_tracking_cameras(state: GatewayState, subset_root: Path, episode
     the cost proportional to what the solve can actually use.
     """
     per_episode: list[set[str]] = []
+    moving: set[str] = set()
     for episode in episodes:
         episode_dir = subset_root / "episodes" / f"episode_{episode:06d}"
         per_episode.append({path.stem for path in episode_dir.glob("cam_*.mkv")})
+        moving.update(cr.wrist_camera_names(_read_json_file(episode_dir / "meta.json") or {}))
     recorded = set.intersection(*per_episode) if per_episode else set()
     if not recorded:
         raise FileNotFoundError(f"选中的 episode 里没有所有段共有的 cam_*.mkv：{subset_root}")
@@ -4722,7 +4726,7 @@ def _marker_tcp_tracking_cameras(state: GatewayState, subset_root: Path, episode
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     joint = summary.get("joint_solution") if isinstance(summary.get("joint_solution"), dict) else {}
     calibrated = joint.get("cameras") if isinstance(joint.get("cameras"), dict) else {}
-    usable = sorted(recorded & set(calibrated))
+    usable = sorted((recorded & set(calibrated)) - moving)
     if not usable:
         raise ValueError(
             f"录制到的相机 {sorted(recorded)} 和已标定的相机 {sorted(calibrated)} 没有交集，无法解算"
@@ -9799,6 +9803,29 @@ def _ee_trajectory_command(
         raise FileNotFoundError(f"EE trajectory runner not found: {runner_path}")
     if not config_path.is_file():
         raise FileNotFoundError(f"EE trajectory config not found: {config_path}")
+    moving = cr.wrist_camera_names(_read_json_file(dataset_root / "meta" / "info.json") or {})
+    for episode in _gmsl2_episode_dirs(dataset_root):
+        moving.update(cr.wrist_camera_names(_read_json_file(episode / "meta.json") or {}))
+    if moving:
+        cfg = _load_yaml_mapping(config_path)
+        calib = cfg.get("calibration") or {}
+        summary_path = (_resolve_user_path(state, str(calib.get("root_dir", "outputs/calibration")))
+                        / str(calib.get("fixed_camera_run_name", "")) / "summary.json")
+        summary = _read_json_file(summary_path)
+        if not isinstance(summary, dict):
+            raise FileNotFoundError(f"Cannot check wrist exclusion: {summary_path}")
+        calibrated: set[str] = set()
+        for block in (((summary.get("joint_solution") or {}).get("cameras") or {}), summary.get("cameras") or {}):
+            if isinstance(block, dict):
+                calibrated.update(block)
+        mapping = calib.get("stream_to_camera_name") or {}
+        unsafe = {name for name in moving if mapping.get(name, name) in calibrated}
+        if unsafe:
+            raise ValueError(
+                f"Moving wrist cameras {sorted(unsafe)} have fixed base extrinsics; "
+                "exclude them from the fixed-camera calibration before generating visual trajectories. "
+                "Measured FR3 telemetry and wrist video remain available."
+            )
     if marker_to_tcp_calibration_path is not None:
         config_path = _write_ee_trajectory_override_config(
             state, dataset_root, marker_to_tcp_calibration_path, base_config_path=config_path
@@ -13653,6 +13680,8 @@ def _connect_recorder(
     state.recording.cameraIdentity = {}
     state.recording.cameraIdentityMismatches = []
     state.recording.cameraIdentityExpectedFrom = ""
+    if _thor_fr3_enabled(state):
+        _reset_thor_camera_roles(state)
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
@@ -13773,6 +13802,8 @@ def _start_episode(
         "calibration_intrinsics",
         "calibration_extrinsics",
     }
+    if _thor_fr3_enabled(state) and capture_root is None and not recalibrating:
+        cr.require_wrist_camera(state.teleop.wristCamera)
     if state.recording.cameraIdentityMismatches and not recalibrating:
         lines = "；".join(
             f"{m['camera']} 上是 {m['actual']}，标定时是 {m['expected']}"
@@ -14622,6 +14653,14 @@ def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> Non
 
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
+    if output.startswith("CAMERA_ROLES "):
+        try:
+            roles = json.loads(output.removeprefix("CAMERA_ROLES "))
+        except ValueError:
+            return
+        if isinstance(roles, dict) and _thor_fr3_enabled(state):
+            _apply_thor_camera_roles(state, roles)
+        return
     if output.startswith("FR3_LIVE "):
         try:
             payload = json.loads(output.removeprefix("FR3_LIVE "))
@@ -16765,6 +16804,49 @@ def _thor_fr3_enabled(state: GatewayState) -> bool:
     return state.profile == "thor" and bool((state.config.get("fr3_teleop") or {}).get("enabled", False))
 
 
+def _reset_thor_camera_roles(state: GatewayState) -> None:
+    selector = cr.wrist_camera_selector(state.config)
+    configured = bool(selector["serial"] or selector["sensor_id"] is not None)
+    state.teleop.wristCamera = {
+        "selector": selector, "state": "pending" if configured else "unconfigured", "camera": None,
+        "message": "Connect cameras to identify the wrist camera" if configured
+                   else "Set the wrist camera serial or sensor ID after installation",
+    }
+    for device in state.devices:
+        if device["kind"] == "camera" and "sensor_id" in device.get("config", {}):
+            device["label"] = f"GMSL2 sensor-id {device['config']['sensor_id']}"
+            device["config"].pop("camera_role", None)
+    state.teleop.cameraViews = [
+        {"id": d["id"], "deviceId": d["id"], "label": d["label"], "source": "Sengyun GMSL2", "fps": d["fps"]}
+        for d in state.devices if d["kind"] == "camera"
+    ]
+
+
+def _apply_thor_camera_roles(state: GatewayState, roles: dict[str, Any]) -> None:
+    state.teleop.wristCamera = roles
+    cameras = roles.get("cameras") or {}
+    defaults = ((state.config.get("sensors") or {}).get("cameras") or {}).get("defaults") or {}
+    for device in state.devices:
+        if device["kind"] == "camera" and "sensor_id" in device.get("config", {}):
+            device["label"] = f"GMSL2 sensor-id {device['config']['sensor_id']}"
+            device["config"].pop("camera_role", None)
+    # The gateway may have started before the new wrist module was plugged in.
+    # The recorder's active roster, not the startup detection, is authoritative.
+    for name, role in cameras.items():
+        device = next((d for d in state.devices if d["id"] == name and d["kind"] == "camera"), None)
+        if device is None:
+            device = {"id": name, "kind": "camera", "state": "running", "fps": int(defaults.get("fps") or 60),
+                      "latencyMs": 0, "detail": _format_device_detail(defaults),
+                      "config": {**defaults, "sensor_id": role.get("sensor_id")}}
+            state.devices.append(device)
+        device["label"] = f"FR3 wrist · {name}" if role.get("role") == "wrist" else f"GMSL2 sensor-id {role.get('sensor_id')}"
+        device["config"]["camera_role"] = role
+    state.teleop.cameraViews = [
+        {"id": d["id"], "deviceId": d["id"], "label": d["label"], "source": "Sengyun GMSL2", "fps": d["fps"]}
+        for d in state.devices if d["kind"] == "camera" and d["id"] in cameras
+    ]
+
+
 def _deployment_payload(state: GatewayState) -> dict[str, Any]:
     result = {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]}
     if _thor_fr3_enabled(state):
@@ -16815,9 +16897,7 @@ def make_state(
         state.teleop.targetFrameName = str((config.get("robot") or {}).get("target_frame_name", ""))
         state.teleop.inputSource = os.environ.get("FR3_INPUT_SOURCE", config["fr3_teleop"].get("input_source", "thor"))
         state.teleop.message = "Connect devices in Live Record, then start FR3 teleoperation"
-        state.teleop.cameraViews = [{"id": d["id"], "deviceId": d["id"], "label": d["label"],
-                                    "source": "Sengyun GMSL2", "fps": d["fps"]}
-                                   for d in state.devices if d["kind"] == "camera"]
+        _reset_thor_camera_roles(state)
     _load_active_calibration_runs(state)
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)

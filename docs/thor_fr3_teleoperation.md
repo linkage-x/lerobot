@@ -101,6 +101,69 @@ with mode 0600 to both targets; they are excluded from repository sync.
 Use these TCP channels on the trusted rig LAN; the application token does not
 encrypt transport.
 
+### Added Sengyun wrist camera
+
+The end-effector Sengyun is an additional camera in the **same Thor GMSL2
+session**, with the same trigger, preview, synchronization, recording, and
+export paths. `sensors.cameras.detect_all: true` includes newly locked ports;
+the wrist port does not have to match the workstation branch's RealSense `ee`
+ID. If you select cameras explicitly instead, add the wrist port to
+`sensors.cameras.sensor_ids` along with the scene-camera ports.
+
+After installation, identify the camera on Thor **before Connect**, with no
+Argus session open:
+
+```bash
+cd /home/nvidia/lerobot
+PYTHONPATH=src:. .venv/bin/python -m tools.thor.gmsl2.camera_eeprom --sids 0-15
+```
+
+Set its serial in `tools/thor/gmsl2/thor_fr3_teleop.yaml` on the deployment host,
+then deploy/reconnect:
+
+```yaml
+fr3_teleop:
+  # Keep the other existing fr3_teleop settings.
+  wrist_camera:
+    serial: "YOUR_WRIST_CAMERA_SERIAL"
+    sensor_id: null
+```
+
+The serial identifies the physical module and follows it to a different port
+at the next Connect. A serial selector never falls back to a different module
+on the previous port. If EEPROM reads are unavailable, use `serial: ""` and
+set `sensor_id` to the actual integer port, `0..15`; this alternative identifies
+the cable port, so update it whenever you change the connection.
+The shipped selector stays unset until the camera is installed.
+
+The Teleoperation page labels the matching active stream **FR3 wrist · cam_NN**
+and shows its resolution status. Once configured, a missing or ambiguous wrist
+camera prevents task recording; calibration captures and component checks
+remain available. Check its live image before motion. The added view joins the
+existing online full-cluster sync gate, so commissioning must include the new
+camera under full recording/preview load.
+
+Video filenames and training image keys retain their actual port names, such
+as `observation.images.cam_15`; role labels do not rename synchronization keys.
+`camera_roles` in episode `meta.json` and dataset `meta/info.json` records the
+selector, resolved name, serial, and wrist mount. Export also preserves each
+source episode's roles and camera identities in `meta/export_sources.json`.
+Keep a consistent port layout within a consolidated dataset. The existing
+exporter skips different camera sets and now refuses different wrist roles
+on the same video keys; it does not automatically remap ports across sessions.
+Other cameras retain the existing calibration identity checks.
+
+The wrist camera moves with the robot. Calibrate its intrinsics and a constant
+eye-in-hand transform to the chosen robot frame before using it for geometry.
+For a task-TCP convention, compose
+`T_base_camera(t) = T_base_tcp(t) @ T_tcp_camera` using measured, timestamped TCP
+poses. This integration records the required images and measured robot states;
+it does not solve that transform or produce dynamic camera poses automatically.
+The existing UI Hand-eye panel calibrates the marker rig to BOX, which is a
+different transform. Keep the wrist outside fixed base-camera extrinsics:
+marker-to-TCP detection excludes recorded wrist streams, and visual trajectory
+generation refuses a recorded wrist that still has fixed base extrinsics.
+
 On Thor, after code sync:
 
 ```bash
@@ -238,7 +301,8 @@ Run automated checks on the development host:
 ```bash
 PYTHONPATH=src:. .venv/bin/python -m tools.fr3.check_box_teleop config
 PYTHONPATH=src:. .venv/bin/python -m pytest \
-  tests/scripts/test_box_fr3_teleop.py tests/scripts/test_thor_export_v3.py \
+  tests/scripts/test_box_fr3_teleop.py tests/scripts/test_fr3_wrist_camera.py \
+  tests/scripts/test_thor_export_v3.py \
   tests/scripts/test_thor_record_stdin.py tests/scripts/test_thor_record_meta.py \
   tests/scripts/test_thor_lerobot_v3_pts.py tests/scripts/test_data_collection_gui_gateway.py \
   tests/teleoperators/test_spacemouse.py tests/robots/test_franka_research3.py -q
@@ -256,6 +320,7 @@ bridge/gateway tests. Hardware tests are separate:
 | RT host | `check_box_teleop rt` | RT kernel, SCHED_FIFO permission, native imports pass |
 | FCI network | `communication_test <robot_ip>` on dedicated workstation | Communication results meet Franka requirements under load |
 | Sengyun | Existing `recover_argus.sh`, then UI Connect/short recording | Detected cameras preview; online full-cluster sync manifest passes |
+| Wrist Sengyun | EEPROM identification, configured selector, UI preview; short save/export | Correct wrist label/serial, wrist video key and metadata preserved, sync passes with the extra camera |
 | BOX | UI Device Manager/live sensor cards | Distance/touch/force advance; expected rates remain healthy in control mode |
 | Gripper | Start at mid-opening, then small button commands | No startup close/open jump; measured distance follows; Stop restores mode 0 |
 | Combined recording | Save a 5–10 s episode, inspect/replay/export | Videos/tactile/force present; FR3 torque columns and validity present |
@@ -273,3 +338,10 @@ Development validation completed: **556 Python tests passed, one skipped;
 212 frontend tests passed; frontend production build, shipped config, shell
 syntax, and patch whitespace checks passed.** The Python bridge tests use fake
 robots; these results do not qualify the actual FR3 communication link.
+
+Wrist-camera update validation: **432 affected Python tests and 212 frontend
+tests passed; the UI production build and config check passed.** The camera
+role/export tests cover a different wrist port, serial-based remapping,
+unavailable/ambiguous identities, recording metadata, and fixed-extrinsics
+refusal. Physical capture with the added wrist module remains to be tested
+after installation.

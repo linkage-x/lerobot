@@ -1256,6 +1256,7 @@ class Lr3Writer:
         fps: int,
         world_frame: dict[str, Any] | None = None,
         fr3_enabled: bool = False,
+        camera_roles: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -1271,6 +1272,7 @@ class Lr3Writer:
         # recorded as an explicit "unstamped" rather than omitted.
         self.world_frame = dict(world_frame) if world_frame else None
         self.fr3_enabled = fr3_enabled
+        self.camera_roles = camera_roles
         self.pa = pa
         self.pq = pq
         self.data_dir = dataset_root / "data" / "chunk-000"
@@ -1464,6 +1466,8 @@ class Lr3Writer:
         if self.fr3_enabled:
             from tools.fr3.box_teleop_data import fr3_features
             info["features"].update(fr3_features())
+        if self.camera_roles is not None:
+            info["camera_roles"] = self.camera_roles
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
     def _write_tasks(self) -> None:
@@ -1487,11 +1491,13 @@ def open_box_lerobot_v3_writer(
     fps: int,
     world_frame: dict[str, Any] | None = None,
     fr3_enabled: bool = False,
+    camera_roles: dict[str, Any] | None = None,
 ) -> Lr3Writer | None:
     try:
         return Lr3Writer(
             dataset_root, repo_id=repo_id, task=task, fps=fps, world_frame=world_frame,
             fr3_enabled=fr3_enabled,
+            camera_roles=camera_roles,
         )
     except ImportError:
         return None

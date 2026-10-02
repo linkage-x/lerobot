@@ -102,7 +102,7 @@ export function TeleoperationPage({
   const [selectedBackend, setSelectedBackend] = useState<TeleopBackend>(teleop.backend);
   const statusState = sessionActive ? "running" : teleop.state === "error" ? "error" : "idle";
   const cameraViews = thorFr3
-    ? snapshot.devices.filter((d) => d.kind === "camera").map((d) => ({
+    ? teleop.cameraViews ?? snapshot.devices.filter((d) => d.kind === "camera").map((d) => ({
         id: d.id, deviceId: d.id, label: d.label, source: "Sengyun GMSL2", fps: d.fps || 60
       }))
     : teleop.cameraViews?.length ? teleop.cameraViews : defaultCameraViews;
@@ -169,6 +169,9 @@ export function TeleoperationPage({
           </div>
           <div><span>PID</span><strong>{sessionActive ? teleop.pid ?? "-" : "-"}</strong></div>
           <div><span>Cameras</span><strong>{thorFr3 ? "Sengyun GMSL2" : "D435I external · D405 wrist"}</strong></div>
+          {thorFr3 && teleop.wristCamera && (
+            <div><span>Wrist camera</span><strong>{teleop.wristCamera.camera ?? teleop.wristCamera.state}</strong></div>
+          )}
         </div>
         <div className="control-row">
           <button
@@ -186,6 +189,7 @@ export function TeleoperationPage({
           <div className="teleop-gate-note">FCI availability is reported by the control process after launch; it does not gate this action or the camera streams.</div>
         ) : null}
         <div className="teleop-message">{teleop.message}</div>
+        {thorFr3 && teleop.wristCamera && <div className="teleop-message">{teleop.wristCamera.message}</div>}
       </section>
 
       {thorFr3 ? <section className="panel">

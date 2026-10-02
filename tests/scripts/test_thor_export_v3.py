@@ -699,3 +699,43 @@ def test_export_refuses_stamped_mixed_with_legacy_unstamped(tmp_path):
         )
 
     assert "<unstamped>" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("change_wrist_role", [False, True])
+def test_export_preserves_wrist_identity_and_refuses_role_changes(tmp_path, monkeypatch, change_wrist_role):
+    from tools.thor.gmsl2.camera_roles import resolve_camera_roles
+
+    datasets = tmp_path / "datasets"
+    cams = ("cam_00", "cam_15")
+    for i, name in enumerate(("teleop_20261002_090000", "teleop_20261002_091000")):
+        session = _make_video_session(datasets, name, {0: 1}, cams=cams, w=16, h=16, fps=30, with_box=False)
+        path = session / "episodes/episode_000000/meta.json"
+        meta = json.loads(path.read_text())
+        identity = {"cam_00": {"serial": "SCENE"}, "cam_15": {"serial": "WRIST"}}
+        meta["camera_roles"] = resolve_camera_roles(
+            {"fr3_teleop": {"wrist_camera": {"serial": "SCENE" if change_wrist_role and i else "WRIST"}}},
+            [{"name": "cam_00", "sensor_id": 0}, {"name": "cam_15", "sensor_id": 15}], identity,
+        )
+        meta["camera_identity"] = identity
+        path.write_text(json.dumps(meta))
+
+    def fake_transcode(_source, destination, _codec, _fps):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+    kwargs = {"datasets_root": datasets, "exports_root": tmp_path / "exports", "base_name": "teleop",
+              "repo_id": "local/teleop", "task": "test"}
+    if change_wrist_role:
+        with pytest.raises(ValueError, match="different wrist camera roles"):
+            export_v3.export_task_to_v3(**kwargs)
+        return
+    out = export_v3.export_task_to_v3(**kwargs)
+    info = json.loads((out / "meta/info.json").read_text())
+    assert info["camera_roles"]["camera"] == "cam_15"
+    assert "observation.images.cam_15" in info["features"]
+    assert (out / "videos/observation.images.cam_15/chunk-000/file-000.mp4").is_file()
+    sources = json.loads((out / "meta/export_sources.json").read_text())["episodes"]
+    assert len(sources) == 2
+    assert all(source["camera_roles"]["camera"] == "cam_15" for source in sources)
+    assert all(source["camera_identity"]["cam_15"]["serial"] == "WRIST" for source in sources)
