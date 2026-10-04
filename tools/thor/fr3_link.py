@@ -13,9 +13,10 @@ import math
 import time
 
 PROTOCOL = 1
-LINK_TIMEOUT_S = 0.2
+LINK_TIMEOUT_S = 0.4
 MAX_RTT_S = 0.1
 MAX_UNCERTAINTY_S = 0.01
+MAX_TELEMETRY_AGE_S = 0.2
 TOKEN_PATH = "outputs/secrets/fr3_host.token"
 
 
@@ -46,8 +47,13 @@ class ClockMap:
     def update(self, t0, t1, t2, t3):
         t0, t1, t2, t3 = map(finite, (t0, t1, t2, t3))
         rtt = (t3 - t0) - (t2 - t1)
-        if t3 < t0 or t2 < t1 or rtt < -1e-6 or t3 - t0 > MAX_RTT_S:
-            raise RuntimeError("FR3 host link round trip exceeds 100 ms or has invalid timestamps")
+        if t3 < t0 or t2 < t1 or rtt < -1e-6 or t3 - t0 > LINK_TIMEOUT_S:
+            raise RuntimeError("FR3 host link lease expired or has invalid timestamps")
+        if t3 - t0 > MAX_RTT_S:
+            # One delayed SSH scheduling turn is not a valid clock probe. Use
+            # an earlier low-RTT observation instead of poisoning the clock
+            # fit or tearing down a healthy native controller.
+            return self.estimate(t3)
         self.probes.append((t3, max(0., rtt), ((t1 - t0) + (t2 - t3)) / 2))
         while self.probes and t3 - self.probes[0][0] > 5:
             self.probes.popleft()
@@ -63,12 +69,16 @@ class ClockMap:
             raise RuntimeError("FR3 host clock uncertainty exceeds 10 ms")
         return offset, uncertainty, rtt
 
-    def translate(self, sample, now):
+    def translate(self, sample, now, *, drop_stale=False):
         offset, uncertainty, rtt = self.estimate(now)
         source = finite(sample["sample_monotonic_s"])
         mapped = source - offset
         # Allow only the stated estimation uncertainty, never silently clamp.
-        if mapped > now + uncertainty or now - mapped + uncertainty > LINK_TIMEOUT_S:
+        if mapped > now + uncertainty:
+            raise RuntimeError("FR3 host telemetry is stale or future-dated")
+        if now - mapped + uncertainty > MAX_TELEMETRY_AGE_S:
+            if drop_stale:
+                return None
             raise RuntimeError("FR3 host telemetry is stale or future-dated")
         result = {**sample, "host_sample_monotonic_s": source,
                   "host_receiver_monotonic_s": sample.get("receiver_monotonic_s"),

@@ -168,10 +168,14 @@ gripper travel. This is software synchronization, not camera hardware triggering
 PTP. Uncertainty includes half RTT plus a 200 ppm allowance for estimate age;
 network asymmetry remains a source of error.
 
-A round trip over 100 ms, clock uncertainty over 10 ms, or host/Thor lease older
-than 200 ms ends the session. The dataset's existing 25 ms nearest-camera-sample
-budget includes clock uncertainty; samples outside that budget remain invalid.
-The native worker retains its tighter local state-age check.
+The host/Thor data-link lease is 400 ms. An isolated round trip over 100 ms is
+excluded from the clock fit when a recent good probe exists; a missing good
+probe for five seconds or uncertainty over 10 ms ends the session. Telemetry
+older than 200 ms is omitted and logged as delayed, never written with a fresh
+timestamp. If no fresh host state arrives within the 400 ms lease, teleoperation
+stops. The dataset's existing 25 ms nearest-camera-sample budget includes clock
+uncertainty; samples outside that budget remain invalid. The host native FCI
+input watchdog remains 200 ms, and its 1 kHz control loop stays local to the host.
 
 ## One-time host setup
 

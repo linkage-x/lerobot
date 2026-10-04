@@ -38,6 +38,21 @@ def test_clock_mapping_handles_unrelated_monotonic_origins_and_uncertainty():
         clock.translate({"sample_monotonic_s": 490}, 100.004)
 
 
+def test_one_delayed_link_turn_reuses_a_good_clock_probe_and_drops_stale_data():
+    clock = ClockMap()
+    baseline = clock.update(100, 501.001, 501.002, 100.003)
+    # A 279 ms scheduler pause is within the bounded link lease, but its
+    # timestamps are unsuitable for synchronizing recorded robot samples.
+    offset, uncertainty, rtt = clock.update(100.01, 501.011, 501.012, 100.29)
+    assert offset == pytest.approx(baseline[0])
+    assert rtt == pytest.approx(baseline[2])
+    assert uncertainty > baseline[1]
+    assert len(clock.probes) == 1
+    assert clock.translate({"sample_monotonic_s": 501.01}, 100.29, drop_stale=True) is None
+    with pytest.raises(RuntimeError, match="future-dated"):
+        clock.translate({"sample_monotonic_s": 502.0}, 100.29, drop_stale=True)
+
+
 @pytest.mark.parametrize("times", [(1, 2, 2, 1.11), (1, 2, 1.9, 1.001), (1, 2, 2, 1.03)])
 def test_clock_rejects_delayed_or_invalid_probes(times):
     with pytest.raises(RuntimeError):
@@ -123,6 +138,7 @@ class FakeHostSession(ThorFr3Session):
     def __init__(self, *args, **kwargs):
         self.message = "idle"
         self.commands_done = threading.Event()
+        self.pause_samples = threading.Event()
         self.closed = False
         super().__init__(*args, **kwargs)
         self.instances.append(self)
@@ -145,8 +161,9 @@ class FakeHostSession(ThorFr3Session):
                     self.home_requested.clear()
                     self.history.clear()
                 client.read()
-                self._sample({"sample_monotonic_s": time.monotonic(), "q": [1.] * 7,
-                              "control_command_success_rate": 1.}, .045, .06 / .09)
+                if not self.pause_samples.is_set():
+                    self._sample({"sample_monotonic_s": time.monotonic(), "q": [1.] * 7,
+                                  "control_command_success_rate": 1.}, .045, .06 / .09)
                 self.publish("running", "fake ready")
                 self.stop.wait(.01)
         except RuntimeError:
@@ -221,6 +238,53 @@ def test_f_remote_lifecycle_record_gripper_stop_and_fresh_retry(tmp_path, monkey
         assert FakeHostSession.instances[-1].closed
         assert client.calls[-1] == ("mode", 0)
     assert errors == []
+
+
+def test_short_cached_host_telemetry_gap_does_not_abort_the_link(tmp_path, monkeypatch):
+    config = {"fr3_teleop": {"gripper_max_width_m": .09}, "robot": {}, "teleop": {}}
+    token = tmp_path / "outputs/secrets/fr3_host.token"
+    token.parent.mkdir(parents=True)
+    token.write_text("test-token")
+    hosts = []
+    notices = []
+
+    def connect(*_args, **_kwargs):
+        thor_sock, host_sock = socket.socketpair()
+        def serve():
+            channel = JsonChannel(host_sock, .4)
+            try:
+                serve_session(channel, channel.receive(), config, Path("fake.yaml"), tmp_path, FakeHostSession)
+            finally:
+                channel.close()
+        thread = threading.Thread(target=serve)
+        thread.start()
+        hosts.append(thread)
+        return thor_sock
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    session = RemoteFr3Session(config, tmp_path / "fake.yaml", tmp_path,
+                               SimpleNamespace(_clients=[("box", Box())]), emit=notices.append)
+    try:
+        session.request_start()
+        deadline = time.monotonic() + 3
+        while not session.running and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert session.running, session.error
+        fake = FakeHostSession.instances[-1]
+        fake.pause_samples.set()
+        time.sleep(.26)
+        assert session.running, session.error
+        initial = session.history[-1]["host_sample_monotonic_s"]
+        fake.pause_samples.clear()
+        deadline = time.monotonic() + 1
+        while session.history[-1]["host_sample_monotonic_s"] == initial and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert session.history[-1]["host_sample_monotonic_s"] > initial
+        assert any("telemetry delayed" in item for item in notices)
+        assert any("telemetry recovered" in item for item in notices)
+    finally:
+        session.close()
+        hosts[-1].join(2)
 
 
 def test_host_rejects_config_mismatch_before_session_creation(tmp_path):

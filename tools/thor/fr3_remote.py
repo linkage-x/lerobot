@@ -5,7 +5,9 @@ import socket
 import time
 
 from tools.thor.fr3_ipc import JsonChannel
-from tools.thor.fr3_link import ClockMap, LINK_TIMEOUT_S, PROTOCOL, TOKEN_PATH, config_digest, finite
+from tools.thor.fr3_link import (
+    ClockMap, LINK_TIMEOUT_S, MAX_TELEMETRY_AGE_S, PROTOCOL, TOKEN_PATH, config_digest, finite,
+)
 from tools.thor.fr3_teleop import ThorFr3Session, gripper_client, measured_opening
 
 
@@ -74,6 +76,8 @@ class RemoteFr3Session(ThorFr3Session):
                 raise RuntimeError(hello.get("message") or "FR3 host handshake failed")
             clock = ClockMap()
             ack, last_sample = None, None
+            last_fresh_at = 0.0
+            telemetry_delayed = False
             last_publish = 0.
             deadline = time.monotonic() + float(self.settings.get("startup_timeout_s", 60))
             ready = False
@@ -112,11 +116,22 @@ class RemoteFr3Session(ThorFr3Session):
                 if state == "running":
                     if not telemetry:
                         raise RuntimeError("Host reported running without FR3 telemetry")
-                    sample = clock.translate(telemetry, t3)
-                    if sample["host_sample_monotonic_s"] != last_sample:
-                        self._sample(sample, opening, sample["gripper_command"])
-                        last_sample = sample["host_sample_monotonic_s"]
-                    ready = True
+                    source = finite(telemetry["sample_monotonic_s"])
+                    if source != last_sample:
+                        sample = clock.translate(telemetry, t3, drop_stale=True)
+                        if sample is not None:
+                            self._sample(sample, opening, sample["gripper_command"])
+                            last_sample = source
+                            last_fresh_at = t3
+                            ready = True
+                            if telemetry_delayed:
+                                self.emit("FR3 host telemetry recovered; fresh samples resumed")
+                                telemetry_delayed = False
+                    if ready and t3 - last_fresh_at > MAX_TELEMETRY_AGE_S and not telemetry_delayed:
+                        self.emit("WARNING: FR3 host telemetry delayed; omitting stale samples until the link recovers")
+                        telemetry_delayed = True
+                    if ready and t3 - last_fresh_at > LINK_TIMEOUT_S:
+                        raise RuntimeError("FR3 host telemetry stopped advancing within the link lease")
                 if not ready and t3 > deadline:
                     raise TimeoutError("Host FR3 startup timed out")
                 ack = commands.apply(response.get("gripper_rpc"), clock, time.monotonic())
