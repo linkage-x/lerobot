@@ -88,7 +88,7 @@ sensors:
       # stop/mux-close timeout. A wedged 8-camera preflight should fail fast
       # and expose logs instead of blocking the UI for the full 120s Connect
       # deadline.
-      preflight_timeout_s: 30.0
+      preflight_timeout_s: 70.0
       single_preflight_timeout_s: 10.0
       missing_frame_policy: fail_episode
       stop_mode: full_cluster
