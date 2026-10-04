@@ -76,6 +76,26 @@ def test_heartbeat_cannot_keep_a_missing_spacemouse_input_alive():
         mailbox.check()
 
 
+def test_return_to_start_clears_input_and_keeps_parent_watchdog_active():
+    now = [1.0]
+    mailbox = worker.InputMailbox(worker.Settings(command_timeout_s=0.2), clock=lambda: now[0])
+    mailbox.accept({"op": "heartbeat", "sent_monotonic_s": now[0]})
+    mailbox.activate()
+    mailbox.accept({"op": "action", "sent_monotonic_s": now[0], "action": action(target_x=0.0005)})
+    mailbox.accept({"op": "home", "sent_monotonic_s": now[0]})
+    assert mailbox.take_home_request()
+    assert mailbox.consume() is None
+    now[0] = 1.15
+    mailbox.accept({"op": "heartbeat", "sent_monotonic_s": now[0]})
+    mailbox.check()  # No SpaceMouse action is required during the native move.
+    now[0] = 1.36
+    with pytest.raises(RuntimeError, match="heartbeat expired"):
+        mailbox.check()
+    mailbox.accept({"op": "heartbeat", "sent_monotonic_s": now[0]})
+    mailbox.activate()
+    assert not mailbox.take_home_request()
+
+
 def test_expired_queued_heartbeat_cannot_extend_control_lease():
     now = [1.0]
     mailbox = worker.InputMailbox(worker.Settings(), clock=lambda: now[0])
@@ -137,6 +157,7 @@ class FakeRobot:
         self.frozen_clock = frozen_clock
         self.initial_robot_time = time.monotonic()
         self.release_move = threading.Event()
+        self.moving = False
         self.actions = []
 
     def connect(self):
@@ -145,14 +166,22 @@ class FakeRobot:
 
     def move_to_start(self):
         self.events.append("move_to_start")
-        if self.blocked_homing:
-            assert self.release_move.wait(1)
-        if self.homing_failure:
-            raise RuntimeError("Robot reflex during homing")
+        self.moving = True
+        try:
+            if self.blocked_homing:
+                assert self.release_move.wait(1)
+            if self.homing_failure:
+                raise RuntimeError("Robot reflex during homing")
+        finally:
+            self.moving = False
 
     def start_arm_controller(self):
         self.events.append("controller")
         self._otg_running = True
+
+    def _stop_otg_loop(self):
+        self.events.append("stop_otg")
+        self._otg_running = False
 
     def send_action(self, act):
         self.events.append("action")
@@ -160,7 +189,8 @@ class FakeRobot:
 
     def stop_motion(self):
         self.events.append("stop")
-        self.release_move.set()
+        if self.moving:
+            self.release_move.set()
 
     def disconnect(self):
         self.events.append("disconnect")
@@ -241,6 +271,48 @@ def test_f_orders_connect_home_controller_and_consumes_each_delta_once():
         harness.close()
     assert harness.result == [0]
     assert robot.events[-1] == "disconnect"
+
+
+def test_episode_return_stops_controller_homes_and_requalifies_before_actions():
+    robot = FakeRobot()
+    harness = WorkerHarness(robot)
+    try:
+        harness.until("running")
+        harness.keep_input_alive = True
+        harness.parent.send({"op": "home", "sent_monotonic_s": time.monotonic()})
+        harness.until("moving_to_start")
+        harness.until("running")
+        assert robot.events.count("move_to_start") == 2
+        assert robot.events.count("controller") == 2
+        assert robot.events.index("stop_otg") < robot.events.index("stop") < robot.events.index("move_to_start", 3)
+        harness.parent.send(packet(action=action(target_x=0.0004)))
+        deadline = time.monotonic() + 0.2
+        while not robot.actions and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert robot.actions
+    finally:
+        harness.close()
+    assert harness.result == [0]
+
+
+def test_stop_during_episode_return_does_not_restart_native_controller():
+    robot = FakeRobot()
+    harness = WorkerHarness(robot)
+    try:
+        harness.until("running")
+        robot.blocked_homing = True
+        harness.parent.send({"op": "home", "sent_monotonic_s": time.monotonic()})
+        harness.until("moving_to_start")
+        deadline = time.monotonic() + 0.3
+        while not robot.moving and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert robot.moving
+        harness.parent.send({"op": "stop"})
+        harness.until("stopped")
+        assert robot.events.count("controller") == 1
+    finally:
+        harness.close()
+    assert harness.result == [0]
 
 
 def test_stop_cancels_native_homing_and_never_activates_teleoperation():

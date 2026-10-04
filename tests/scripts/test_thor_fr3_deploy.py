@@ -147,13 +147,18 @@ def test_redeploy_allows_eight_seconds_for_owned_robot_shutdown(deployment_tree,
     assert events[-1] == "kill -9 999999"
 
 
-def test_fr3_profile_keeps_box_camera_dataset_configuration_exactly():
+def test_fr3_profile_keeps_box_camera_configuration_and_sets_thirty_second_episodes():
     baseline = REPO / "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
     profile = REPO / "tools/thor/gmsl2/thor_fr3_teleop.yaml"
-    assert profile.read_text().startswith(baseline.read_text())
     old = yaml.safe_load(baseline.read_text())
     new = yaml.safe_load(profile.read_text())
-    assert {key: new[key] for key in old} == old
+    assert {key: new[key] for key in old if key != "dataset"} == {
+        key: old[key] for key in old if key != "dataset"
+    }
+    assert {key: new["dataset"][key] for key in old["dataset"] if key != "episode_time_s"} == {
+        key: value for key, value in old["dataset"].items() if key != "episode_time_s"
+    }
+    assert new["dataset"]["episode_time_s"] == 30
     assert new["sensors"]["cameras"]["detect_all"] is True
     assert new["sensors"]["cameras"]["sensor_ids"] == []
     assert "wrist_camera" not in new["fr3_teleop"]

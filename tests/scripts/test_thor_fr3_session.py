@@ -47,12 +47,15 @@ class Mouse:
     def __init__(self):
         self.closed = False
         self.baseline = None
+        self.active = False
+        self.neutral_input = False
 
     def sync_gripper_baseline(self, value):
         self.baseline = value
 
     def get_action(self):
-        return {"enabled": False, "target_x": 0, "target_y": 0, "target_z": 0,
+        self.neutral_input = not self.active
+        return {"enabled": self.active, "target_x": 0, "target_y": 0, "target_z": 0,
                 "target_wx": 0, "target_wy": 0, "target_wz": 0, "gripper": self.baseline}
 
     def disconnect(self):
@@ -89,6 +92,9 @@ class LocalWorker:
                 self.commands.append(packet)
                 if packet["op"] == "stop":
                     return
+                if packet["op"] == "home":
+                    self.native.send({"state": "moving_to_start", "message": "Returning to start"})
+                    time.sleep(0.04)
                 time.sleep(0.005)
         except (EOFError, OSError):
             pass
@@ -165,6 +171,46 @@ def test_c_is_sensor_only_f_starts_e_s_preserve_teleop_and_fault_allows_f_retry(
     value.close()
     assert value.state == "idle" and mice[1].closed
     assert any(json.loads(line.removeprefix("FR3_LIVE "))["state"] == "moving_to_start" for line in output)
+
+
+def test_completed_episode_homes_and_requires_released_mouse_before_next_recording(session):
+    value, _, mice, workers, _ = session
+    value.request_start()
+    wait_for(lambda: value.running)
+    value.start_recording()
+    wait_for(lambda: len(value.samples) > 2)
+    samples, interrupted = value.stop_recording()
+    assert samples and not interrupted
+    mice[0].active = True
+    assert value.request_home()
+    assert not value.running
+    with pytest.raises(RuntimeError, match="returning to start"):
+        value.start_recording()
+    wait_for(lambda: any(command["op"] == "home" for command in workers[0].commands))
+    time.sleep(0.1)
+    assert value.state == "moving_to_start"
+    assert not value.running
+    mice[0].active = False
+    wait_for(lambda: value.running)
+    value.start_recording()
+    wait_for(lambda: len(value.samples) > 2)
+    assert not value.stop_recording()[1]
+
+
+def test_fault_during_episode_return_allows_fresh_f_retry(session):
+    value, _, mice, workers, _ = session
+    value.request_start()
+    wait_for(lambda: value.running)
+    assert value.request_home()
+    mice[0].active = True
+    wait_for(lambda: any(command["op"] == "home" for command in workers[0].commands))
+    workers[0].error.set()
+    wait_for(lambda: value.state == "error")
+    assert value.home_requested.is_set()
+    value.request_start()
+    wait_for(lambda: value.running)
+    assert not value.home_requested.is_set()
+    assert len(workers) == 2
 
 
 def test_stale_box_cancels_f_before_native_start(session):

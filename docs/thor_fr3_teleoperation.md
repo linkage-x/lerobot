@@ -30,9 +30,9 @@ Use the existing task selection and Live Record page:
 | **C — Connect** | Connect the Sengyun cameras checked on Live Record and, if checked, the BOX board. FR3 remains inactive. |
 | **Select all except FR3 and laser** | Check every detected camera and the BOX board, and turn off the laser tracker choice. |
 | **F — Start FR3** | After C completes, check the native runtime, connect FR3, execute `move_to_start`, then activate SpaceMouse control. |
-| **E — Start Episode** | Begin recording while FR3 teleoperation is running. |
-| **S — Save** | Finish and save the episode; teleoperation remains available. |
-| **D — Discard** | Finish and discard the episode; teleoperation remains available. |
+| **E — Start Episode** | Begin a 30-second recording while FR3 teleoperation is running. |
+| **S — Save** | End and save early, then return FR3 to its start pose. |
+| **D — Discard** | End and discard, then return FR3 to its start pose. |
 | **Stop FR3** | Stop robot control; discard an active episode. Cameras/BOX stay connected. |
 | **Esc — Exit** | End the connected recording session and stop FR3 control. |
 
@@ -40,6 +40,14 @@ Existing shortcuts and controls retain their BOX behavior. Shortcuts do not fire
 while typing in an input, select, or text editor. A disabled button also disables
 its shortcut. F is unavailable while connecting, moving to start, already
 running, recording, or resolving an episode.
+
+When an episode reaches 30 seconds, the recorder stops and saves it automatically.
+Save, discard, and automatic completion request a fresh return to start **after**
+recording stops. The return is excluded from the episode data. Release the
+SpaceMouse; the UI shows the move in progress and E is unavailable until the
+robot is back at start and the puck is neutral. A robot or link fault during
+the return stops teleoperation and requires the usual Desk recovery and F retry.
+Calibration captures may specify their own episode length.
 
 Before C, choose individual camera IDs on **Live Record**. At least one camera
 must be selected because the Thor episode recorder uses camera frames as its
@@ -585,7 +593,7 @@ calibration for a changed physical setup.
 | Native readiness | `bash run/setup_thor_fr3.sh --check` on Thor | Selected scheduling policy, configuration, patched native capability and imports pass without FCI |
 | F failure isolation | With a missing FR3 runtime, press F after C | Specific UI error; cameras/BOX remain connected; F can be retried |
 | Motion / input | Commission the robot, enable FCI in Desk, then press F | Move to start completes before SpaceMouse changes targets |
-| Episode controls | After F is running: E then S; E then D | First episode saved, second discarded; no automatic return-to-start on S/D |
+| Episode controls | After F is running: E then S; E then D; E then wait 30 seconds | Each episode ends before FR3 returns to start; E remains disabled during the return |
 | Fault / retry | During a supervised test stop the robot, then clear the fault and press F | Alert, stopped motion, active episode discarded; fresh move-to-start on F |
 | Shutdown | Stop FR3, Esc, and deployment restart | Owned worker releases robot control; a new Connect/F does not compete with an orphan |
 

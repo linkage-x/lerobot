@@ -77,10 +77,14 @@ class RemoteFr3Session(ThorFr3Session):
             last_publish = 0.
             deadline = time.monotonic() + float(self.settings.get("startup_timeout_s", 60))
             ready = False
+            home_sent = home_started = False
             while not self.stop.is_set():
                 tick = time.monotonic()
                 opening = measured_opening(client, width)
                 op = "probe" if seq < 8 else ("start" if seq == 8 else "tick")
+                if ready and self.home_requested.is_set() and not home_sent:
+                    op = "home"
+                    home_sent = True
                 t0 = time.monotonic()
                 channel.send({"op": op, "seq": seq, "echo_host_s": previous_tx,
                               "opening_m": opening, "ack": ack})
@@ -95,6 +99,15 @@ class RemoteFr3Session(ThorFr3Session):
                 state = response.get("state")
                 if seq >= 8 and state == "idle":
                     raise RuntimeError("Host controller stopped; press F for a new session")
+                if state == "moving_to_start" and home_sent:
+                    home_started = True
+                if state == "running" and self.home_requested.is_set():
+                    if not home_started:
+                        state = "moving_to_start"  # An older running reply cannot complete this return.
+                    else:
+                        self.home_requested.clear()
+                        self.history.clear()
+                        home_sent = home_started = False
                 telemetry = response.get("telemetry") or {}
                 if state == "running":
                     if not telemetry:

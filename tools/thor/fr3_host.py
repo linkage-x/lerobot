@@ -55,7 +55,7 @@ def serve_session(channel, hello, config, config_path, root, session_factory=Hos
         while True:
             request = channel.receive()
             rx = time.monotonic()
-            if request.get("seq") != seq or request.get("op") not in ("probe", "start", "tick", "stop"):
+            if request.get("seq") != seq or request.get("op") not in ("probe", "start", "tick", "home", "stop"):
                 raise ValueError("Invalid FR3 host session sequence or operation")
             if previous_tx is not None:
                 if request.get("echo_host_s") != previous_tx or rx - previous_tx > LINK_TIMEOUT_S:
@@ -73,6 +73,9 @@ def serve_session(channel, hello, config, config_path, root, session_factory=Hos
                     raise ValueError("FR3 start requires a fresh qualified clock session")
                 started = True
                 session.request_start()
+            elif request["op"] == "home":
+                if not started or not session.request_home():
+                    raise ValueError("FR3 return-to-start requires active teleoperation")
             elif request["op"] == "tick" and not started:
                 raise ValueError("F start was not requested")
             with session.lock, box.condition:

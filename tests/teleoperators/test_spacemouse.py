@@ -837,6 +837,7 @@ def test_cached_active_motion_pauses_until_new_hid_report(monkeypatch):
         for _ in range(20):
             action = device.get_action()
             assert action["enabled"] is False
+            assert device.neutral_input is False  # A stale held puck cannot unlock post-episode control.
             assert all(action[key] == 0.0 for key in (
                 "target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz"
             ))
@@ -864,6 +865,7 @@ def test_cached_neutral_idle_without_reports_remains_legal(monkeypatch, timestam
     try:
         clock[0] += 3600
         assert device.get_action()["enabled"] is False
+        assert device.neutral_input is True
     finally:
         device.disconnect()
 
@@ -897,6 +899,7 @@ def test_cached_pressed_buttons_freeze_gripper_without_faulting_idle_arm(monkeyp
         for _ in range(20):
             action = device.get_action()
             assert action["enabled"] is False
+            assert device.neutral_input is False
             assert action["gripper"] == previous_action["gripper"]
         assert device._last_gripper == previous_gripper
         # A new report, including the next press, can renew gripper input.

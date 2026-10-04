@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import io
 import threading
+from types import SimpleNamespace
+
+import pytest
 
 from tools.thor.gmsl2 import thor_record as tr
 
@@ -76,6 +79,23 @@ def test_next_episode_length_falls_back_to_the_config():
 
 def test_next_episode_length_keeps_unlimited_meaning_unlimited():
     assert tr._next_episode_length_s(0.0, 0.0) == 0.0
+
+
+@pytest.mark.parametrize("reason", ["save", "discard", "duration_reached"])
+def test_normal_episode_end_requests_fr3_return_to_start(reason):
+    calls = []
+    fr3 = SimpleNamespace(request_home=lambda: calls.append(reason) or True)
+    assert tr._request_fr3_home_after_episode(fr3, stop_reason=reason, interrupted=False)
+    assert calls == [reason]
+
+
+@pytest.mark.parametrize("reason", ["fr3_interrupted", "stream_exit", "quit"])
+def test_fault_or_exit_never_requests_automatic_robot_motion(reason):
+    calls = []
+    fr3 = SimpleNamespace(request_home=lambda: calls.append(reason) or True)
+    assert not tr._request_fr3_home_after_episode(fr3, stop_reason=reason, interrupted=False)
+    assert not tr._request_fr3_home_after_episode(fr3, stop_reason="save", interrupted=True)
+    assert not calls
 
 
 def test_capture_root_is_applied_as_a_side_effect_not_a_queued_command():

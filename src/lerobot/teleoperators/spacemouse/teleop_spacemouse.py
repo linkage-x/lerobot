@@ -55,6 +55,7 @@ class SpaceMouseTeleop(Teleoperator):
         self._driver = None
         self._is_connected = False
         self._motion_active = False
+        self.neutral_input = False
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
         self._filtered_gripper = self._last_gripper
@@ -361,6 +362,7 @@ class SpaceMouseTeleop(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
+        self.neutral_input = False
         if reading is None:
             self._motion_active = False
             # Log if enabled output just went True->False (transition to stop)
@@ -380,6 +382,9 @@ class SpaceMouseTeleop(Teleoperator):
         abs_data = np.abs(data)
         active_mask = abs_data >= threshold
         data = np.where(active_mask, data, 0.0)
+        # Keep raw held motion visible to post-episode homing even when the
+        # HID freshness guard makes the outgoing action safely disabled.
+        self.neutral_input = not bool(np.any(data)) and not any(reading.buttons)
         if not self.config.enable_rotation:
             data[3:] = 0.0
         if self.config.separate_translation_rotation:
@@ -479,6 +484,7 @@ class SpaceMouseTeleop(Teleoperator):
             self._driver = None
             self._is_connected = False
             self._motion_active = False
+            self.neutral_input = False
             self._last_button_raw = None
             self._debounced_buttons.fill(0.0)
             self._button_change_time = 0.0

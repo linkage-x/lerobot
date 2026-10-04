@@ -92,6 +92,8 @@ class ThorFr3Session:
         self.emit = emit
         self.lock = threading.RLock()
         self.stop = threading.Event()
+        self.home_requested = threading.Event()
+        self.home_requested_at_s = 0.0
         self.thread = None
         self.process = None
         self.state = "idle"
@@ -120,6 +122,8 @@ class ThorFr3Session:
                 self.publish("error", "The previous FR3 worker is still stopping. Exit and restart the session before retrying F")
                 return
             self.stop.clear()
+            self.home_requested.clear()
+            self.home_requested_at_s = 0.0
             self.error = ""
             self.telemetry = {}
             self.history.clear()
@@ -135,13 +139,26 @@ class ThorFr3Session:
             if self.thread is not None and self.thread.is_alive():
                 self.publish("stopping", "Stopping FR3; cameras and BOX remain connected")
 
+    def request_home(self) -> bool:
+        """Return after a completed episode without closing cameras or BOX."""
+        with self.lock:
+            if self.state != "running" or self.stop.is_set() or self.error or self.recording:
+                return False
+            self.history.clear()
+            self.home_requested_at_s = time.monotonic()
+            self.home_requested.set()
+            self.publish("moving_to_start", "Episode ended; returning FR3 to start. Release SpaceMouse")
+            return True
+
     @property
     def running(self) -> bool:
         with self.lock:
-            return self.state == "running" and not self.stop.is_set() and not self.error
+            return self.state == "running" and not self.home_requested.is_set() and not self.stop.is_set() and not self.error
 
     def start_recording(self) -> None:
         with self.lock:
+            if self.home_requested.is_set():
+                raise RuntimeError("FR3 is returning to start; release SpaceMouse and wait before recording")
             if not self.running:
                 raise RuntimeError("Press F and wait for FR3 teleoperation before recording")
             self.samples = list(self.history)
@@ -214,6 +231,8 @@ class ThorFr3Session:
             interval = 1 / control_hz
             startup_deadline = time.monotonic() + float(self.settings.get("startup_timeout_s", 60))
             ready = False
+            home_sent = home_started = home_resumed = False
+            home_telemetry = None
             last_state_s = last_publish_s = last_gripper_s = 0.0
             last_heartbeat_s = 0.0
             last_position = None
@@ -223,6 +242,9 @@ class ThorFr3Session:
                 started = time.monotonic()
                 if not ready and started > startup_deadline:
                     raise TimeoutError("FR3 startup timed out; check FCI, robot mode, and native worker log")
+                if (self.home_requested.is_set() and not home_resumed
+                        and started - self.home_requested_at_s > float(self.settings.get("startup_timeout_s", 60))):
+                    raise TimeoutError("FR3 return to start timed out; check FCI and the native worker log")
                 # The native worker sends low-rate telemetry, never pixels or
                 # BOX packets. Bound draining so input delivery cannot starve.
                 for _ in range(16):
@@ -237,13 +259,22 @@ class ThorFr3Session:
                         raise RuntimeError(packet.get("message") or "FR3 controller error")
                     if state == "stopped":
                         raise RuntimeError(packet.get("message") or "FR3 worker stopped")
-                    if state in ("starting", "moving_to_start") and not ready:
+                    if state in ("starting", "moving_to_start") and (not ready or self.home_requested.is_set()):
+                        if ready and state == "moving_to_start":
+                            home_started = True
                         self.publish(state, str(packet.get("message") or "Preparing FR3"))
                     if state == "running":
                         telemetry = packet.get("telemetry") or {}
                         if not telemetry:
                             continue
                         last_state_s = time.monotonic()
+                        if self.home_requested.is_set():
+                            if home_started:
+                                if not home_resumed:
+                                    self.publish("moving_to_start", "FR3 is at start; release SpaceMouse to resume")
+                                home_resumed = True
+                                home_telemetry = telemetry
+                            continue
                         first_sample = not ready
                         if not ready:
                             # Homing completed. Seed the real BOX gripper from
@@ -269,27 +300,60 @@ class ThorFr3Session:
                 if process.poll() is not None:
                     raise RuntimeError(f"FR3 worker exited ({process.returncode}); inspect outputs/logs/fr3_teleop")
                 if ready:
-                    if time.monotonic() - last_state_s > float(self.settings.get("max_state_age_s", 0.1)):
+                    if (not self.home_requested.is_set() or home_resumed) and time.monotonic() - last_state_s > float(self.settings.get("max_state_age_s", 0.1)):
                         raise RuntimeError("FR3 telemetry stopped arriving")
                     opening = measured_opening(client, width)
-                    action = device.get_action()
-                    self.last_action = {**action, "sample_monotonic_s": time.monotonic()}
-                    gripper = float(action["gripper"])
-                    if not math.isfinite(gripper) or not 0 <= gripper <= 1:
-                        raise ValueError("SpaceMouse gripper command is invalid")
-                    channel.send({"op": "action", "action": action, "sent_monotonic_s": time.monotonic()})
-                    position = gripper * width
-                    if started - last_gripper_s >= 1 / 15 and (last_position is None or abs(position - last_position) >= 0.0005):
-                        if client.set_clamp_pos(position) != 0:
-                            raise RuntimeError("BOX rejected the gripper command")
-                        last_gripper_s, last_position = started, position
+                    if self.home_requested.is_set():
+                        if not home_sent:
+                            channel.send({"op": "home", "sent_monotonic_s": time.monotonic()})
+                            home_sent = True
+                        elif home_resumed:
+                            # Hold the arm and BOX gripper until the puck is
+                            # released. Native input watchdog still receives
+                            # fresh, explicitly disabled actions after homing.
+                            device.get_action()
+                            released = device.neutral_input
+                            hold = {
+                                "enabled": False,
+                                **dict.fromkeys(("target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz"), 0.0),
+                                "gripper": opening / width,
+                            }
+                            channel.send({"op": "action", "action": hold, "sent_monotonic_s": time.monotonic()})
+                            if released:
+                                device.sync_gripper_baseline(opening / width)
+                                gripper = opening / width
+                                last_position = opening
+                                self.history.clear()
+                                self.last_action = {**hold, "sample_monotonic_s": time.monotonic()}
+                                if home_telemetry is not None:
+                                    self._sample(home_telemetry, opening, gripper)
+                                    last_native = home_telemetry.get("sample_monotonic_s")
+                                self.home_requested.clear()
+                                home_sent = home_started = home_resumed = False
+                                home_telemetry = None
+                                self.publish("running", "FR3 is at start. SpaceMouse control is active; press E to record")
+                        elif started - last_heartbeat_s >= 0.05:
+                            channel.send({"op": "heartbeat", "sent_monotonic_s": time.monotonic()})
+                            last_heartbeat_s = started
+                    else:
+                        action = device.get_action()
+                        self.last_action = {**action, "sample_monotonic_s": time.monotonic()}
+                        gripper = float(action["gripper"])
+                        if not math.isfinite(gripper) or not 0 <= gripper <= 1:
+                            raise ValueError("SpaceMouse gripper command is invalid")
+                        channel.send({"op": "action", "action": action, "sent_monotonic_s": time.monotonic()})
+                        position = gripper * width
+                        if started - last_gripper_s >= 1 / 15 and (last_position is None or abs(position - last_position) >= 0.0005):
+                            if client.set_clamp_pos(position) != 0:
+                                raise RuntimeError("BOX rejected the gripper command")
+                            last_gripper_s, last_position = started, position
                 else:
                     # Native imports may briefly hold their process's GIL.
                     # Startup needs a liveness signal, not a 200 Hz backlog.
                     if started - last_heartbeat_s >= 0.05:
                         channel.send({"op": "heartbeat", "sent_monotonic_s": time.monotonic()})
                         last_heartbeat_s = started
-                if ready and started - last_publish_s >= 0.1:
+                if ready and not self.home_requested.is_set() and started - last_publish_s >= 0.1:
                     self.publish("running", "SpaceMouse control active; E records, S saves, D discards")
                     last_publish_s = started
                 self.stop.wait(max(0.0, interval - (time.monotonic() - started)))

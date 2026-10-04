@@ -139,6 +139,11 @@ class FakeHostSession(ThorFr3Session):
             assert client.set_clamp_pos(.06) == 0
             self.commands_done.set()
             while not self.stop.is_set():
+                if self.home_requested.is_set():
+                    self.publish("moving_to_start", "fake returning")
+                    self.stop.wait(.04)
+                    self.home_requested.clear()
+                    self.history.clear()
                 client.read()
                 self._sample({"sample_monotonic_s": time.monotonic(), "q": [1.] * 7,
                               "control_command_success_rate": 1.}, .045, .06 / .09)
@@ -198,6 +203,12 @@ def test_f_remote_lifecycle_record_gripper_stop_and_fresh_retry(tmp_path, monkey
         assert samples and not interrupted
         assert samples[-1]["clock_sync_valid"]
         assert samples[-1]["gripper_command"] == pytest.approx(2 / 3)
+        assert session.request_home()
+        assert not session.running
+        deadline = time.monotonic() + 3
+        while not session.running and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert session.running, session.error
         if disconnect:
             sockets[-1].shutdown(socket.SHUT_RDWR)
             deadline = time.monotonic() + 2

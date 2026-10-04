@@ -280,6 +280,7 @@ class InputMailbox:
         self.last_parent_at = float("-inf")
         self.last_action_at = clock()
         self.latest_action: dict[str, Any] | None = None
+        self.home_requested = False
         self.running = False
         self.watchdog_enabled = False
 
@@ -293,7 +294,7 @@ class InputMailbox:
     def accept(self, packet: dict[str, Any]) -> bool:
         now = self.clock()
         op = packet.get("op")
-        if op not in {"heartbeat", "action", "stop"}:
+        if op not in {"heartbeat", "action", "home", "stop"}:
             raise ValueError(f"Unknown FR3 IPC operation: {op!r}.")
         if op == "stop":
             return False
@@ -308,7 +309,15 @@ class InputMailbox:
                 # lease. A following fresh heartbeat is checked before FCI.
                 return True
             raise RuntimeError("FR3 input expired in the local IPC channel.")
-        if op == "action":
+        if op == "home":
+            with self.lock:
+                if not self.running or self.home_requested:
+                    raise ValueError("FR3 return-to-start requires active teleoperation.")
+                self.last_parent_at = max(self.last_parent_at, float(sent))
+                self.running = False
+                self.latest_action = None
+                self.home_requested = True
+        elif op == "action":
             action = packet.get("action")
             if not isinstance(action, dict) or not isinstance(action.get("enabled"), bool):
                 raise ValueError("FR3 action must contain a boolean enabled field.")
@@ -344,6 +353,12 @@ class InputMailbox:
             action = self.latest_action
             self.latest_action = None
             return action
+
+    def take_home_request(self) -> bool:
+        with self.lock:
+            requested = self.home_requested
+            self.home_requested = False
+            return requested
 
 
 class InputReceiver:
@@ -586,6 +601,23 @@ def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any]
         while not receiver.stopped.is_set():
             tick = time.monotonic()
             receiver.require_live()
+            if mailbox.take_home_request():
+                status("moving_to_start", "Returning FR3 to start after the episode.")
+                # End the active OTG/native controller before the blocking
+                # native move. No SpaceMouse action is accepted until a fresh
+                # controller window qualifies after the return.
+                robot._stop_otg_loop()
+                robot._arm.stop_motion()
+                receiver.require_live()
+                robot.move_to_start()
+                receiver.require_live()
+                robot.start_arm_controller()
+                receiver.require_live()
+                last_telemetry, guard = wait_for_control_ready(robot, settings, receiver, telemetry_reader)
+                mailbox.activate()
+                status("running", "FR3 returned to start; release SpaceMouse before the next episode.")
+                next_report_at = time.monotonic() + 1 / settings.telemetry_hz
+                continue
             last_telemetry = telemetry_reader(robot)
             guard.check(last_telemetry, active=True)
             action = mailbox.consume()

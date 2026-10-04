@@ -562,10 +562,20 @@ def _next_episode_length_s(pending_s: float, config_s: float) -> float:
     A per-episode override from the gateway (``episode_time:<seconds>``) wins
     over ``dataset.episode_time_s``; 0 means "until the operator stops it". The
     override is consumed by the episode that starts next, so it can never leak
-    into the one after it -- the calibration wizard asks for a 30 s board sweep
-    without changing what an ordinary capture is worth.
+    into the one after it -- a calibration sweep can use a different duration
+    without changing ordinary captures.
     """
     return pending_s if pending_s > 0 else config_s
+
+
+def _request_fr3_home_after_episode(fr3, *, stop_reason: str, interrupted: bool) -> bool:
+    """Return only after normal capture ends; faults must await operator recovery."""
+    return bool(
+        fr3 is not None
+        and not interrupted
+        and stop_reason in {"save", "discard", "duration_reached"}
+        and fr3.request_home()
+    )
 
 
 def _wait_for_command(
@@ -2232,6 +2242,9 @@ def main(argv: list[str] | None = None) -> int:
 
             pcs.stop_episode(handle)
             fr3_samples, fr3_interrupted = fr3.stop_recording() if record_fr3 else ([], False)
+            if _request_fr3_home_after_episode(fr3 if record_fr3 else None,
+                                                stop_reason=stop_reason, interrupted=fr3_interrupted):
+                _emit("FR3 returning to start after episode; release SpaceMouse before recording again")
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
             pts_offset = _pts_offset_from_handle(handle)
 
