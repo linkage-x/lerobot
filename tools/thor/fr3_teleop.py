@@ -60,7 +60,9 @@ def native_environment(repo_root: Path, runtime_python: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join((str(repo_root / "src"), str(repo_root), env.get("PYTHONPATH", "")))
     libraries = sorted((runtime_python.parent.parent / "lib").glob("python*/site-packages/cmeel.prefix/lib"))
-    env["LD_LIBRARY_PATH"] = os.pathsep.join([*(str(path) for path in libraries), env.get("LD_LIBRARY_PATH", "")])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([str(runtime_python.parent.parent / "lib"),
+                                             *(str(path) for path in libraries),
+                                             env.get("LD_LIBRARY_PATH", "")])
     return env
 
 
@@ -98,6 +100,7 @@ class ThorFr3Session:
         self.episode_interrupted = False
         self.history = deque(maxlen=200)
         self.samples = []
+        self.last_action = {}
         self.publish("idle", "Sensors connected. Press F to move FR3 to start and enable SpaceMouse")
 
     def publish(self, state: str, message: str) -> None:
@@ -151,7 +154,8 @@ class ThorFr3Session:
 
     def _sample(self, state: dict, opening: float, gripper: float) -> None:
         sample = {**state, "receiver_monotonic_s": time.monotonic(),
-                  "gripper_measured_m": opening, "gripper_command": gripper}
+                  "gripper_measured_m": opening, "gripper_command": gripper,
+                  "spacemouse_action": self.last_action}
         with self.lock:
             self.telemetry = sample
             self.history.append(sample)
@@ -164,7 +168,7 @@ class ThorFr3Session:
         raw = Path(self.settings.get("runtime_python", ".venv-fr3/bin/python"))
         python = raw if raw.is_absolute() else self.repo_root / raw
         if not python.is_file() or not os.access(python, os.X_OK):
-            raise RuntimeError(f"FR3 runtime is missing: {python}. Run run/setup_thor_fr3.sh explicitly on Thor")
+            raise RuntimeError(f"FR3 runtime is missing: {python}. Run run/setup_thor_fr3.sh on the controller computer")
         parent, child = socket.socketpair()
         channel = JsonChannel(parent)
         log_dir = self.repo_root / "outputs" / "logs" / "fr3_teleop"
@@ -267,6 +271,7 @@ class ThorFr3Session:
                         raise RuntimeError("FR3 telemetry stopped arriving")
                     opening = measured_opening(client, width)
                     action = device.get_action()
+                    self.last_action = {**action, "sample_monotonic_s": time.monotonic()}
                     gripper = float(action["gripper"])
                     if not math.isfinite(gripper) or not 0 <= gripper <= 1:
                         raise ValueError("SpaceMouse gripper command is invalid")
@@ -304,8 +309,7 @@ class ThorFr3Session:
                 channel.close()
             if gripper_mode and client is not None:
                 try:
-                    if client.set_mode(0) != 0:
-                        raise RuntimeError("BOX rejected collection mode")
+                    self._restore_gripper_mode(client)
                 except Exception as exc:
                     failure = failure or f"Could not restore BOX collection mode: {exc}"
             if process is not None:
@@ -344,6 +348,10 @@ class ThorFr3Session:
                                  "clear a robot fault in Desk only if one is reported, then press F to retry")
                 else:
                     self.publish("idle", "FR3 stopped. Sensors remain connected; press F to move to start again")
+
+    def _restore_gripper_mode(self, client) -> None:
+        if client.set_mode(0) != 0:
+            raise RuntimeError("BOX rejected collection mode")
 
     def close(self) -> None:
         self.request_stop()

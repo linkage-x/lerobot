@@ -111,6 +111,52 @@ def test_sensor_connected_status_does_not_claim_arm_running(state):
     assert [device["state"] for device in value.devices] == ["idle", "idle", "running"]
 
 
+def test_c_uses_selected_cameras_and_box_without_starting_fr3(state, monkeypatch):
+    value, _ = state
+    value.recording.state = "idle"
+    value.devices = [
+        {"id": f"cam_{sid:02d}", "kind": "camera", "state": "idle", "config": {"sensor_id": sid}}
+        for sid in (6, 7, 8)
+    ] + [
+        {"id": "box_gripper", "kind": "box_collection", "state": "idle"},
+        {"id": "fr3", "kind": "robot", "state": "idle"},
+        {"id": "spacemouse", "kind": "teleoperator", "state": "idle"},
+    ]
+    commands = []
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **_: commands.append(command) or SimpleNamespace(pid=42, poll=lambda: None))
+    monkeypatch.setattr(gateway, "_venv_python", lambda *_args, **_kwargs: Path("/tmp/python"))
+    monkeypatch.setattr(gateway, "_recorder_env", lambda *_args: {})
+    monkeypatch.setattr(gateway, "_start_output_reader", lambda *_args: None)
+    gateway._connect_recorder(value, camera_ids=[6, 7], box_enabled=True, laser_tracker=False)
+    assert "--sensor-ids=6,7" in commands[0]
+    assert "--no-box" not in commands[0]
+    assert value.recording.selectedCameraIds == ["cam_06", "cam_07"]
+    assert value.recording.boxEnabled is True
+    assert [device["state"] for device in value.devices] == ["warning", "warning", "idle", "warning", "idle", "idle"]
+    gateway._mark_connected_devices(value, "camera", "cam_06, cam_07")
+    gateway._set_active_device_states(value, "running")
+    assert [device["state"] for device in value.devices] == ["running", "running", "idle", "running", "idle", "idle"]
+
+
+def test_camera_only_c_disables_f_and_rejects_unavailable_camera(state, monkeypatch):
+    value, written = state
+    value.recording.state = "idle"
+    value.devices = [{"id": "cam_06", "kind": "camera", "state": "idle", "config": {"sensor_id": 6}}]
+    with pytest.raises(ValueError, match="not available"):
+        gateway._connect_recorder(value, camera_ids=[7], box_enabled=False)
+    commands = []
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **_: commands.append(command) or SimpleNamespace(pid=42, poll=lambda: None))
+    monkeypatch.setattr(gateway, "_venv_python", lambda *_args, **_kwargs: Path("/tmp/python"))
+    monkeypatch.setattr(gateway, "_recorder_env", lambda *_args: {})
+    monkeypatch.setattr(gateway, "_start_output_reader", lambda *_args: None)
+    gateway._connect_recorder(value, camera_ids=[6], box_enabled=False)
+    assert "--sensor-ids=6" in commands[0] and "--no-box" in commands[0]
+    value.recording.state = "armed"
+    with pytest.raises(RuntimeError, match="requires the BOX gripper"):
+        gateway._start_thor_fr3(value)
+    assert not written
+
+
 def test_box_only_configuration_keeps_e_without_f(state):
     value, written = state
     value.fr3_teleop.enabled = False

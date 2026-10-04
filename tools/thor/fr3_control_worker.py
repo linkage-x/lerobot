@@ -169,7 +169,7 @@ def check_realtime(mode: str = "enforce") -> None:
     realtime_path = Path("/sys/kernel/realtime")
     if not realtime_path.is_file() or realtime_path.read_text().strip() != "1":
         raise RuntimeError(
-            "FR3 requires a PREEMPT_RT kernel on this Thor. /sys/kernel/realtime is not 1; "
+            "FR3 requires a PREEMPT_RT kernel on this controller computer. /sys/kernel/realtime is not 1; "
             "sensor capture remains available. Install and validate a compatible RT kernel before pressing F."
         )
     previous_policy = os.sched_getscheduler(0)
@@ -178,7 +178,7 @@ def check_realtime(mode: str = "enforce") -> None:
         priority = os.sched_get_priority_max(os.SCHED_FIFO)
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
     except PermissionError as exc:
-        raise RuntimeError("FR3 needs SCHED_FIFO permission (rtprio limits or CAP_SYS_NICE) on Thor.") from exc
+        raise RuntimeError("FR3 needs SCHED_FIFO permission (rtprio limits or CAP_SYS_NICE) on the controller computer.") from exc
     finally:
         os.sched_setscheduler(0, previous_policy, previous_parameters)
 

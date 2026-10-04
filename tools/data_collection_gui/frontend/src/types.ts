@@ -95,6 +95,8 @@ export type ConfigSummary = {
 
 export type RecordingStatus = {
   state: "idle" | "connecting" | "armed" | "recording" | "review" | "saving" | "discarding" | "error";
+  selectedCameraIds?: string[] | null;
+  boxEnabled?: boolean;
   datasetRoot: string;
   repoId: string;
   episodeIndex: number;

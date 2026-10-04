@@ -381,6 +381,12 @@ elif [[ $restart_rc -ne 0 ]]; then
   exit "$restart_rc"
 fi
 
+if [[ "$target" == "thor" ]] && ! $box_only; then
+  if ! bash "$script_dir/start_host_fr3.sh"; then
+    echo "WARN: host FR3 service unavailable; camera/BOX UI remains available. Fix the host setup before F." >&2
+  fi
+fi
+
 if $no_frontend; then
   echo "==> ${target} gateway ready at ${gateway_target} (--no-frontend)."
   exit 0

@@ -34,6 +34,7 @@ describe("BOX capture and explicit FR3 motion", () => {
     const running = recordingControlAvailability(record(), fr3("running"));
     expect(recordingShortcutAction(key("F"), running)).toBeNull();
     expect(recordingShortcutAction(key("E"), running)).toBe("startEpisode");
+    expect(recordingControlAvailability({ ...record(), boxEnabled: false }, fr3()).canStartFr3).toBe(false);
   });
 
   it.each(["starting", "moving_to_start", "stopping"] as const)("prevents F and E while motion is %s", (state) => {
@@ -145,6 +146,15 @@ describe("visible recording controls", () => {
 
 afterEach(() => vi.unstubAllGlobals());
 describe("FR3 API acknowledgement", () => {
+  it("sends only the selected Thor cameras and BOX choice with C", async () => {
+    vi.stubGlobal("window", { setTimeout });
+    const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new DataCollectionGuiApi();
+    await api.connectRecording(undefined, false, { cameraIds: [6, 7], boxEnabled: true });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/handheld/record/connect?laser_tracker=0&camera_ids=6%2C7&box=1");
+  });
+
   it("uses the same gateway routes and refuses to simulate a successful start on network loss", async () => {
     vi.stubGlobal("window", { setTimeout });
     const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));

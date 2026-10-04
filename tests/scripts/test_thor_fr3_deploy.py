@@ -23,6 +23,9 @@ def deployment_tree(tmp_path):
     (checkout / "run").mkdir(parents=True)
     for name in ("deploy.sh", "sync_to_target.sh", "setup_thor_fr3.sh", "setup_thor_spacemouse.sh"):
         shutil.copy2(REPO / "run" / name, checkout / "run" / name)
+    (checkout / "run/start_host_fr3.sh").write_text(
+        '#!/bin/bash\nprintf "host-fr3 start\\n" >> "$DEPLOY_TEST_LOG"\n'
+    )
     vite = checkout / "tools/data_collection_gui/frontend/node_modules/.bin/vite"
     vite.parent.mkdir(parents=True)
     vite.write_text("#!/bin/sh\nexit 0\n")
@@ -86,6 +89,8 @@ def test_default_deploy_only_contacts_thor_and_starts_box_frontend(deployment_tr
     assert "apt-get" not in commands + script.read_text()
     assert "uv sync" not in commands + script.read_text()
     assert "fr3_control_worker --" not in script.read_text()
+    assert "host-fr3 start" in commands
+    assert commands.index("flock -n") < commands.index("host-fr3 start") < commands.index("npm run")
 
 
 def test_box_only_preserves_original_profile(deployment_tree):
@@ -95,6 +100,7 @@ def test_box_only_preserves_original_profile(deployment_tree):
     assert "tools/thor/gmsl2/thor_fr3_teleop.yaml" not in commands
     assert "npm " not in commands
     assert "192.168.100.155" not in commands
+    assert "host-fr3 start" not in commands
 
 
 def test_sync_only_does_not_restart_or_start_robot(deployment_tree):
@@ -105,6 +111,7 @@ def test_sync_only_does_not_restart_or_start_robot(deployment_tree):
     assert "flock" not in commands
     assert not script.exists()
     assert "npm " not in commands
+    assert "host-fr3 start" not in commands
 
 
 def test_restart_lock_conflict_remains_distinct(deployment_tree):

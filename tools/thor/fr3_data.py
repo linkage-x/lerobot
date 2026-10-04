@@ -120,7 +120,10 @@ def align_fr3_samples(
     for sample in fr3_samples or []:
         source = _number(sample.get("sample_monotonic_s"))
         receive = _number(sample.get("receiver_monotonic_s"))
-        if source is not None and source > 0 and receive is not None and receive >= source:
+        uncertainty = _number(sample.get("clock_uncertainty_s", 0))
+        if sample.get("clock_sync_valid", True) is not True or uncertainty is None or not 0 <= uncertainty <= .01:
+            continue
+        if source is not None and source > 0 and receive is not None and receive + uncertainty >= source:
             ordered.append((source, sample))
     ordered.sort(key=lambda pair: pair[0])
     times = [time for time, _ in ordered]
@@ -134,9 +137,9 @@ def align_fr3_samples(
         at = bisect.bisect_left(times, target)
         candidates = [i for i in (at - 1, at) if 0 <= i < len(times)]
         nearest = min(candidates, key=lambda i: abs(times[i] - target))
-        if abs(times[nearest] - target) > max_skew_s + 1e-12:
-            continue
         sample = ordered[nearest][1]
+        if abs(times[nearest] - target) + float(sample.get("clock_uncertainty_s", 0)) > max_skew_s + 1e-12:
+            continue
         row = result[frame]
         row["fr3.timestamps"] = [times[nearest], float(sample["receiver_monotonic_s"])]
         observations = {column: _vector(sample.get(raw_key), FR3_COLUMNS[column][1])

@@ -2,9 +2,9 @@
 
 This workflow extends the BOX platform at commit
 `8ffb5bf6e1c391ea771207f628601cb753127f73`. Run `bash run/deploy.sh` on the
-development host and operate the existing **Live Record** page. Thor owns all
-connected Sengyun cameras, the BOX tactile/force/gripper sensors, the directly
-attached SpaceMouse, and the FR3 connection. The default deployment contacts
+development host and operate the existing **Live Record** page. The host owns
+the USB SpaceMouse and FR3 FCI connection. Thor owns the selected Sengyun
+cameras, BOX tactile/force/gripper sensors, gripper actuation and recording. The default deployment contacts
 only `nvidia@192.168.111.122`; no second workstation SSH login is required.
 
 ## Deploy and operate
@@ -18,13 +18,17 @@ bash run/deploy.sh
 Open the frontend URL printed by the script, normally `http://localhost:5173/`.
 The gateway runs on Thor at `http://192.168.111.122:8765`. Deployment syncs code
 and existing calibration inputs, restarts the gateway/owned recorder, and starts
-the host frontend. It neither installs FR3 dependencies nor opens FCI.
+the host frontend and idle FR3 host service. It also establishes a host-initiated
+SSH reverse tunnel; Thor never SSHes to the host. It neither installs FR3
+dependencies nor opens FCI. If host setup fails, camera/BOX UI remains usable;
+F reports the unavailable host link.
 
 Use the existing task selection and Live Record page:
 
 | Control | Result |
 | --- | --- |
-| **C — Connect** | Connect all detected Sengyun cameras and the existing BOX sensors. FR3 remains inactive. |
+| **C — Connect** | Connect the Sengyun cameras checked on Live Record and, if checked, the BOX board. FR3 remains inactive. |
+| **Select all except FR3 and laser** | Check every detected camera and the BOX board, and turn off the laser tracker choice. |
 | **F — Start FR3** | After C completes, check the native runtime, connect FR3, execute `move_to_start`, then activate SpaceMouse control. |
 | **E — Start Episode** | Begin recording while FR3 teleoperation is running. |
 | **S — Save** | Finish and save the episode; teleoperation remains available. |
@@ -37,6 +41,29 @@ while typing in an input, select, or text editor. A disabled button also disable
 its shortcut. F is unavailable while connecting, moving to start, already
 running, recording, or resolving an episode.
 
+Before C, choose individual camera IDs on **Live Record**. At least one camera
+must be selected because the Thor episode recorder uses camera frames as its
+timeline. The BOX board is one SDK connection for gripper, force, touch, IMU and
+trigger; its streams cannot be connected independently from this UI. Unchecking
+BOX allows camera-only capture and disables F because FR3 gripper control needs
+the BOX. The selection is fixed for a connected session; disconnect to change it.
+FR3 and SpaceMouse are activated only by F, and the laser tracker has its own
+separate checkbox. The top-bar and Dashboard connection links open Live Record
+so the choice is visible before C.
+
+To compare camera load during commissioning, select two known connected IDs
+(for example `cam_06` and `cam_07` on the current Thor wiring), leave BOX checked
+and laser off, then press C and F with the SpaceMouse released. Compare the FR3
+FCI success rate with the full-camera session. FCI fault checks retain the same
+threshold for both runs; a two-camera success only shows that camera load
+contributes, and a repeated 0.99 fault points to host scheduling or FCI network
+timing that still needs investigation.
+
+On 2026-10-04, a neutral test with only `cam_06`, `cam_07` and BOX connected
+still stopped after about three seconds of active control when the FCI rate
+reached 0.99 (configured limit 0.995). Reducing camera count alone therefore
+did not resolve this Thor's current FCI timing fault.
+
 F starts physical motion. Release the SpaceMouse before pressing F and keep the
 robot's user stop accessible. Wait for **running** before using the puck or E.
 SpaceMouse axes use the existing `[-raw_y, raw_x, raw_z]` translation mapping;
@@ -44,10 +71,10 @@ buttons adjust the BOX gripper's opening. The UI displays measured joints,
 velocity, measured/external joint torque, TCP pose and estimated external wrench.
 
 This profile requires recent HID reports for active puck motion. Cached motion
-older than 200 ms stops teleoperation. If a held button produces only its initial
-press report, gripper increments freeze after that window; release and press
-again to continue. Neutral input stays valid, and an expired held button alone
-does not stop FR3.
+older than 200 ms sends zero arm motion and holds the gripper until a fresh HID
+report arrives. If a held button produces only its initial press report,
+gripper increments freeze after that window; release and press again to continue.
+Neutral input may stop sending reports while remaining valid.
 
 Esc and recorder stdin EOF stop SpaceMouse input immediately, including while
 camera save/discard processing is busy. Video finalization and session teardown
@@ -79,7 +106,149 @@ BOX interface.
 Use **Stop FR3** before taking calibration captures. Cameras and BOX remain
 connected for the existing calibration workflows without active robot control.
 
-## One-time setup on Thor
+## Host controller and approximate synchronization
+
+The default `fr3_teleop.execution_host: host` splits ownership as follows:
+
+```text
+Host: SpaceMouse -> 100 Hz input/IK targets -> native 1 kHz FCI -> FR3
+                |                     |
+                + gripper targets     + joint/TCP/torque telemetry
+                           authenticated SSH link (50 Hz)
+                                      |
+Thor: cameras + BOX sensors <- recorder/coordinator -> BOX gripper SDK
+```
+
+The native FCI worker remains a separate **host** process with same-machine
+IPC. Camera encoding, BOX polling and network serialization stay outside it.
+Host/Thor controller config digests must match. The original `0.995` FCI guard,
+workspace/joint/delta limits, native watchdog and no-automatic-recovery patch
+are unchanged. Moving machines reduces shared CPU load; it does not prove that
+a non-RT host meets every 1 ms FCI deadline.
+
+F opens a fresh authenticated session, qualifies eight clock probes, then starts
+the host SpaceMouse/native worker. Gripper targets use the existing bounded
+incremental button behavior, max 15 commands/second and a 0.5 mm deadband.
+Thor validates range, sequence and age, calls the BOX SDK, and returns its real
+acknowledgement. The recorded gripper target is the last acknowledged command.
+A lost or stale link disables further commands and stops the host worker; Thor
+restores BOX collection mode. A retry always requires a fresh F session. No
+commands are queued for replay across reconnects.
+
+Each 50 Hz request/response carries four monotonic timestamps: Thor send,
+host receive, host send, Thor receive. The minimum-RTT estimate from the last
+five seconds maps host state time into Thor's clock domain. Every raw sidecar
+sample retains `host_sample_monotonic_s`, `host_receiver_monotonic_s`,
+`sample_monotonic_s` (Thor estimate), `receiver_monotonic_s` (actual Thor arrival),
+`clock_host_minus_thor_s`, `clock_rtt_s`, `clock_uncertainty_s` and
+`clock_sync_valid`. `spacemouse_action` includes both mapped and original input
+timestamps. `gripper_ack` retains the command sequence, requested opening,
+host send time, estimated Thor send time and actual Thor SDK acknowledgement
+time (`thor_applied_s`); it marks SDK acceptance, not physical completion of the
+gripper travel. This is software synchronization, not camera hardware triggering or
+PTP. Uncertainty includes half RTT plus a 200 ppm allowance for estimate age;
+network asymmetry remains a source of error.
+
+A round trip over 100 ms, clock uncertainty over 10 ms, or host/Thor lease older
+than 200 ms ends the session. The dataset's existing 25 ms nearest-camera-sample
+budget includes clock uncertainty; samples outside that budget remain invalid.
+The native worker retains its tighter local state-age check.
+
+## One-time host setup
+
+Plug SpaceMouse into **corenetic**, keep Thor and host network connections, and
+ensure the host routes directly to `192.168.11.102`. On this machine `eno2`
+uses `192.168.11.44`. Its kernel is `6.8.0-138-generic` (PREEMPT_DYNAMIC, not RT);
+the profile retains the explicitly selected `realtime_mode: ignore`.
+
+Use a host-native x86_64 wheel built with the same inspected patch below,
+against the installed FR3-compatible libfranka version. Do not install Thor's
+aarch64 wheel on the host. The wheel built here is
+`outputs/wheels/panda_python-0.8.1-cp312-cp312-linux_x86_64.whl`, against
+libfranka 0.15.0. The existing setup helper also works on the host:
+
+```bash
+bash run/setup_thor_fr3.sh --install-python \
+  --panda-wheel outputs/wheels/panda_python-0.8.1-cp312-cp312-linux_x86_64.whl
+bash run/setup_thor_fr3.sh --check
+THOR_PYTHON=.venv-fr3/bin/python bash run/setup_thor_spacemouse.sh --check
+# Explicit scheduling permission setup; no robot connection or motion:
+bash run/setup_host_fr3_permissions.sh --install
+bash run/deploy.sh
+```
+
+The host `.venv-fr3` was provisioned with Python 3.12, pyspacemouse 2.1.0,
+Placo and Ruckig, and the patched wheel passed preflight without opening FCI.
+The installed system libfranka needs fmt ABI 9; its existing local
+`anaconda3/lib/libfmt.so.9.1.0` was copied into `.venv-fr3/lib/libfmt.so.9`.
+The launcher includes that directory and the environment's `cmeel.prefix/lib`
+in the native library search path. Recreating the environment may require
+restoring this ABI-matching library (never substitute a different soname).
+The SpaceMouse Compact `256f:c635` has a host udev rule for plugdev access.
+
+The scheduling helper permits this account to request FIFO priority up to 99
+in future logins. It writes an opt-in marker under `outputs/secrets`; for an
+older desktop login, deployment uses `sudo -n prlimit` only on the newly spawned
+host service so its native children inherit that ceiling. If sudo is unavailable,
+log out/in before F. Python sensor/network threads themselves remain normal
+scheduled threads.
+
+`deploy.sh` starts the host service bound to `127.0.0.1:18766` and forwards
+Thor's loopback port through the existing SSH credentials. A random token in
+`outputs/secrets/fr3_host.token` is copied over SSH with mode 0600; never commit
+or share that directory. No new public listener or host SSH password is needed.
+The service and tunnel remain running when the frontend exits or `--no-frontend`
+is used; neither starts motion by itself. Stop FR3/exit the session before
+redeploying. A busy host service refuses the idle-only restart.
+
+## Test the split workflow
+
+1. Run the two component checks above. The SpaceMouse check should print the
+   device name, six neutral axes and released buttons. The runtime check should
+   pass without FCI connection. Check host route with `ip route get 192.168.11.102`.
+2. Run `bash run/deploy.sh`. For a no-motion link check, run on Thor:
+   `cd ~/lerobot && .venv/bin/python -m tools.thor.fr3_remote`.
+   This performs 100 clock probes and cannot start the controller. On Live
+   Record select two cameras plus BOX and press
+   C. The host service remains idle, with no native FR3 worker or open SpaceMouse.
+3. Release the puck and press F. Check host `outputs/logs/fr3_teleop/host.log` and
+   `native_*.log` if startup fails. Only a reported robot fault requires Desk
+   recovery. Link/runtime/clock errors need their own fix.
+4. After running, move the puck gently and test both gripper buttons. Verify
+   actual opening updates on Thor. Press E, record, then S; repeat with D.
+   Compare FCI success with two cameras and with your full desired selection.
+5. Inspect the saved `fr3_state.jsonl`: finite offset/RTT/uncertainty, valid mapped
+   times, real torque/pose values and acknowledged gripper targets. Camera-aligned
+   `fr3.valid` and `fr3.action_valid` must reflect the skew budget.
+6. With the robot stationary and the operator at the stop control, test a
+   deliberate link interruption. Both sides must stop, the UI must show an error,
+   and reconnecting alone must not resume motion. Restore the link via deployment
+   and explicitly press F only after the area is ready.
+
+No-hardware regression suite (socketpairs and fake BOX/arm):
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=src:. .venv/bin/python -m pytest -q \
+  tests/scripts/test_thor_fr3_link.py tests/scripts/test_thor_fr3_session.py \
+  tests/scripts/test_thor_fr3_control_worker.py tests/scripts/test_thor_fr3_data.py \
+  tests/scripts/test_thor_fr3_deploy.py
+```
+
+Validation on 2026-10-04: host SpaceMouse open/read and native/kinematics preflight
+passed; a read-only host FCI connection returned `kIdle`, no current errors, and
+valid joint positions. The deployed SSH link completed 100 probes: median RTT
+0.618 ms, maximum 0.871 ms, estimated uncertainty 0.549 ms. These measurements
+were taken while idle, not during camera recording. With camera 6/7 and BOX
+connected (no episode recording), another 100 probes measured median 0.625 ms,
+maximum 0.899 ms and estimated uncertainty 0.442 ms. The test session was then
+cleanly disconnected. Sustained host-driven motion
+and loaded recording stability still require the operator F trial above.
+
+## Legacy direct-Thor setup and commissioning history
+
+The material below describes `execution_host: thor` and earlier direct-Thor
+tests. The default is now `execution_host: host`; use the host setup above.
+The native safety limits and controller implementation are shared.
 
 Deployment and C use Thor's existing `.venv`. F launches the arm in the separate
 `.venv-fr3` interpreter configured by `fr3_teleop.runtime_python`. An unavailable

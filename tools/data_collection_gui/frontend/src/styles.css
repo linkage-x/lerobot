@@ -4335,6 +4335,65 @@ button.danger {
 /* Laser tracker: a per-session opt-in, not a rig property. Rendered as a quiet
    row rather than a button pair because the answer is "no" on most days, and
    the sentence under it is the part an operator actually needs. */
+.sensor-picker {
+  background: #f5f8fb;
+  border: 1px solid #dbe3ed;
+  border-radius: 8px;
+  margin: 12px 0;
+  padding: 12px;
+}
+
+.sensor-picker-heading {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.sensor-picker-heading small {
+  color: #5b6875;
+  display: block;
+  margin-top: 3px;
+}
+
+.sensor-picker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sensor-picker fieldset {
+  border: 0;
+  margin: 10px 0;
+  padding: 0;
+}
+
+.sensor-picker legend {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.sensor-picker-cameras {
+  display: grid;
+  gap: 6px 12px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.sensor-picker label {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.sensor-picker label small {
+  color: #5b6875;
+}
+
+.sensor-picker-box {
+  font-weight: 600;
+}
+
 .laser-tracker-toggle {
   align-items: center;
   background: #e9eff2;

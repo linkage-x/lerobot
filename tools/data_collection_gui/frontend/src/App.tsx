@@ -253,7 +253,7 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={(backend, laserTracker) => run(() => api.connectRecording(backend, laserTracker))}
+        onConnect={(backend, laserTracker, sensors) => run(() => api.connectRecording(backend, laserTracker, sensors))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onStartFr3={() => run(() => api.startFr3Teleop())}
@@ -326,7 +326,7 @@ function App() {
       <DashboardPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={() => run(() => api.connectRecording())}
+        onConnect={() => navigate("live-record")}
         onNavigate={navigate}
       />
     ) : (
@@ -341,7 +341,7 @@ function App() {
           <p>
             {workstationProfile
               ? `FR3 + Pika · SpaceMouse · ${snapshot.devices.filter((d) => d.kind === "camera").length} RealSense cameras`
-              : `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`}
+              : `Thor GMSL2 · ${snapshot.recording.selectedCameraIds?.length ?? snapshot.devices.filter((d) => d.kind === "camera").length} cameras selected · ${snapshot.configSummary.fps} fps`}
           </p>
         </div>
         <div className="topbar-status">
@@ -365,9 +365,9 @@ function App() {
                   className="topbar-btn topbar-btn-primary"
                   disabled={busy}
                   title="连接录制器（按当前绑定 Task 启动，供录制 / 标定 / 设备预览共用）"
-                  onClick={() => run(() => api.connectRecording())}
+                  onClick={() => navigate("live-record")}
                 >
-                  Connect
+                  Choose sensors
                 </button>
               )}
             </span>

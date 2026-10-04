@@ -263,7 +263,11 @@ export class DataCollectionGuiApi {
     return structuredClone(this.snapshot);
   }
 
-  async connectRecording(backend?: "real" | "sim", laserTracker?: boolean): Promise<GuiSnapshot> {
+  async connectRecording(
+    backend?: "real" | "sim",
+    laserTracker?: boolean,
+    sensors?: { cameraIds: number[]; boxEnabled: boolean },
+  ): Promise<GuiSnapshot> {
     // The workstation profile picks between the hardware FR3 and its MuJoCo twin here; the
     // Thor profile has a single rig and sends no backend at all.
     const params = new URLSearchParams();
@@ -272,6 +276,10 @@ export class DataCollectionGuiApi {
     // "whatever the config says", so a rig without the toggle keeps its default
     // instead of having the tracker silently switched off.
     if (laserTracker !== undefined) params.set("laser_tracker", laserTracker ? "1" : "0");
+    if (sensors) {
+      params.set("camera_ids", sensors.cameraIds.join(","));
+      params.set("box", sensors.boxEnabled ? "1" : "0");
+    }
     const query = params.toString();
     const endpoint = query
       ? `/api/handheld/record/connect?${query}`

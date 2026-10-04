@@ -1402,6 +1402,8 @@ def main(argv: list[str] | None = None) -> int:
                          "bring-up on dev hosts without the SG16A")
     ap.add_argument("--skip-argus-probe", action="store_true",
                     help="trust the MAX96726 lock list verbatim")
+    ap.add_argument("--sensor-ids", type=str, default=None,
+                    help="comma-separated GMSL2 sensor IDs selected for this session")
     ap.add_argument("--no-box", action="store_true",
                     help="ignore the YAML box_collection block (camera-only)")
     # Tri-state: neither flag defers to the yaml.  The GUI sends one explicitly
@@ -1423,6 +1425,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     cfg = gr.load_config(args.config_path)
+    if args.sensor_ids is not None:
+        raw_ids = args.sensor_ids.split(",")
+        if not raw_ids or any(not value.isdecimal() for value in raw_ids):
+            ap.error("--sensor-ids requires comma-separated non-negative integer IDs")
+        selected_ids = [int(value) for value in raw_ids]
+        if len(set(selected_ids)) != len(selected_ids) or any(sid > 15 for sid in selected_ids):
+            ap.error("--sensor-ids must contain distinct GMSL2 IDs in 0..15")
+        cfg.detect_all = False
+        cfg.sensor_ids = selected_ids
     if cfg.cameras.recorder_backend == "argus_metadata":
         cfg.argus_frame_sync.enabled = True
         cfg.argus_frame_sync.required = True
@@ -1785,7 +1796,15 @@ def main(argv: list[str] | None = None) -> int:
     fr3_enabled = bool((raw_yaml.get("fr3_teleop") or {}).get("enabled", False))
     if fr3_enabled:
         from tools.thor.fr3_teleop import ThorFr3Session
-        fr3 = ThorFr3Session(raw_yaml, args.config_path, repo_root, box, emit=_emit)
+        execution_host = raw_yaml["fr3_teleop"].get("execution_host", "thor")
+        if execution_host == "host":
+            from tools.thor.fr3_remote import RemoteFr3Session
+            session_class = RemoteFr3Session
+        elif execution_host == "thor":
+            session_class = ThorFr3Session
+        else:
+            raise ValueError("fr3_teleop.execution_host must be 'host' or 'thor'")
+        fr3 = session_class(raw_yaml, args.config_path, repo_root, box, emit=_emit)
 
     lr3_writer: lr3.Lr3Writer | None = None
     if box_cfg.enabled:
@@ -2304,9 +2323,15 @@ def main(argv: list[str] | None = None) -> int:
                     from tools.thor.fr3_teleop import write_fr3_samples
                     write_fr3_samples(ep_dir, fr3_samples)
                     annotations["fr3_teleop"] = {
-                        "enabled": True, "host": "thor", "samples": len(fr3_samples),
+                        "enabled": True, "host": raw_yaml["fr3_teleop"].get("execution_host", "thor"),
+                        "samples": len(fr3_samples),
                         "t0_mono_s": handle.t0_mono_s,
-                        "source_timestamp": "native state copied into the Thor monotonic clock",
+                        "source_timestamp": (
+                            "host native state mapped to Thor CLOCK_MONOTONIC by four-timestamp SSH probes; "
+                            "raw host time, offset, RTT and uncertainty retained per sample"
+                            if raw_yaml["fr3_teleop"].get("execution_host") == "host"
+                            else "native state copied into the Thor monotonic clock"
+                        ),
                         "robot_ip": (raw_yaml.get("robot") or {}).get("robot_ip"),
                         "target_frame": (raw_yaml.get("robot") or {}).get("target_frame_name"),
                         "O_T_EE_order": "column_major", "O_T_EE_frame": "libfranka configured end-effector",

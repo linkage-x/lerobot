@@ -168,6 +168,9 @@ class RecordingStatus:
     recentOutput: list[str] = field(default_factory=list)
     # Workstation profile only: which robot the recorder is driving ("real" or "sim").
     backend: str = DEFAULT_RECORD_BACKEND
+    # Thor Connect choices; None means a legacy client requested the YAML camera set.
+    selectedCameraIds: list[str] | None = None
+    boxEnabled: bool = True
     # Latest per-episode timestamp-synchronisation verdict parsed from the recorder's SYNC
     # lines. Kept on the recording status (not a separate poll) so the operator sees an
     # alignment problem on the episode that caused it, while the rig is still set up.
@@ -13009,7 +13012,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         },
         "configSummary": _config_summary(state.config, state.config_path),
         "devices": [
-            {**device, "state": "running" if recording_state == "recording" and device["state"] != "error" else device["state"]}
+            {**device, "state": "running" if recording_state == "recording" and device["state"] != "error"
+             and _selected_for_recorder(state, device) else device["state"]}
             for device in state.devices
         ],
         "recording": asdict(state.recording),
@@ -13324,8 +13328,23 @@ def _set_all_device_states(state: GatewayState, device_state: str) -> None:
 
 def _set_active_device_states(state: GatewayState, device_state: str) -> None:
     for device in state.devices:
-        if device.get("state") != "error":
+        if device.get("state") != "error" and _selected_for_recorder(state, device):
             device["state"] = device_state
+
+
+def _selected_for_recorder(state: GatewayState, device: dict[str, Any]) -> bool:
+    if state.profile != "thor":
+        return True
+    kind = device.get("kind")
+    if kind == "camera" and state.recording.selectedCameraIds is not None:
+        return str(device.get("id")) in state.recording.selectedCameraIds
+    if kind == "box_collection":
+        return state.recording.boxEnabled
+    if kind == "laser_tracker":
+        return state.recording.laserTracker
+    if kind in ("robot", "teleoperator"):
+        return False  # FR3 and SpaceMouse only become active after F.
+    return True
 
 
 def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> None:
@@ -13340,11 +13359,14 @@ def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> Non
     }
     if not connected_ids:
         for device in configured:
-            device["state"] = "error"
+            device["state"] = "error" if _selected_for_recorder(state, device) else "idle"
         return
 
     for device in configured:
-        device["state"] = "running" if str(device.get("id")) in connected_ids else "error"
+        device["state"] = (
+            "idle" if not _selected_for_recorder(state, device)
+            else "running" if str(device.get("id")) in connected_ids else "error"
+        )
 
 
 def _mark_failed_camera_devices(state: GatewayState, failed_ids: set[str]) -> None:
@@ -13461,6 +13483,8 @@ def _start_thor_fr3(state: GatewayState) -> None:
     process = _ensure_recorder_running(state)
     if state.recording.state != "armed":
         raise RuntimeError("Connect sensors with C and finish the current episode before pressing F")
+    if not state.recording.boxEnabled:
+        raise RuntimeError("FR3 teleoperation requires the BOX gripper connection; reconnect with BOX selected")
     if state.fr3_teleop.state not in ("idle", "error"):
         raise RuntimeError("FR3 is already starting or active; stop it before moving to start again")
     if any(session.active and session.stage == "capture" for session in
@@ -13620,12 +13644,29 @@ def _connect_recorder(
     *,
     backend: str | None = None,
     laser_tracker: bool | None = None,
+    camera_ids: list[int] | None = None,
+    box_enabled: bool | None = None,
 ) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
 
     is_workstation = state.profile == "workstation"
+    if camera_ids is not None or box_enabled is not None:
+        if state.profile != "thor" or "thor_record" not in str(_recorder_script(state)[0]):
+            raise ValueError("Sensor selection is available only for the Thor GMSL2 recorder")
+    if camera_ids is not None:
+        if not camera_ids or len(set(camera_ids)) != len(camera_ids) or any(
+            isinstance(sid, bool) or not isinstance(sid, int) or not 0 <= sid <= 15 for sid in camera_ids
+        ):
+            raise ValueError("Select at least one distinct GMSL2 camera ID in 0..15")
+        available = {
+            int(device["config"]["sensor_id"])
+            for device in state.devices
+            if device.get("kind") == "camera" and "sensor_id" in device.get("config", {})
+        }
+        if not set(camera_ids) <= available:
+            raise ValueError(f"Selected cameras are not available: {sorted(set(camera_ids) - available)}")
     if backend is not None:
         if backend not in RECORD_BACKENDS:
             raise ValueError(f"Recording backend must be one of {RECORD_BACKENDS}, got {backend!r}")
@@ -13649,6 +13690,10 @@ def _connect_recorder(
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+        if camera_ids is not None:
+            command.append("--sensor-ids=" + ",".join(str(sid) for sid in camera_ids))
+        if box_enabled is False:
+            command.append("--no-box")
         # Only the GMSL2 recorder knows the flag. Sent explicitly (never
         # omitted) once the operator has expressed a preference, so the choice
         # they made in the UI is not quietly overridden by the yaml.
@@ -13681,6 +13726,11 @@ def _connect_recorder(
     )
     state.process_started_at_s = time.monotonic()
     state.recording.state = "connecting"
+    camera_prefix = str(((state.config.get("sensors") or {}).get("cameras") or {}).get("name_prefix") or "cam")
+    state.recording.selectedCameraIds = (
+        [f"{camera_prefix}_{sid:02d}" for sid in camera_ids] if camera_ids is not None else None
+    )
+    state.recording.boxEnabled = box_enabled is not False
     state.recording.pid = state.process.pid
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
@@ -13716,6 +13766,9 @@ def _connect_recorder(
     # Force the first viewer poll of the new session to send a demand heartbeat.
     state.recorder_preview_demand_sent_s = 0.0
     _set_all_device_states(state, "warning")
+    for device in state.devices:
+        if not _selected_for_recorder(state, device):
+            device["state"] = "idle"
     if is_workstation and state.recording.backend == "sim":
         # Nothing physical is opened in a sim session. Leaving the hardware rows at "warning"
         # (the Connect default) would imply the gateway is still waiting on an FR3 that was
@@ -16221,7 +16274,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path
-        query = parse_qs(parsed_url.query)
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
         # Recording is available in both profiles now: Thor drives the handheld/GMSL2 rig,
         # the workstation drives the FR3 SpaceMouse recorder. Only the BOX-sensor calibration
         # endpoints remain Thor-specific, since no BOX exists on the workstation.
@@ -16260,6 +16313,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 else False if raw_lt in ("0", "false", "off", "no")
                 else None
             )
+            raw_camera_ids = query.get("camera_ids", [None])[0]
+            requested_camera_ids = None
+            if raw_camera_ids is not None:
+                pieces = raw_camera_ids.split(",")
+                if not pieces or any(not piece.isdecimal() for piece in pieces):
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "camera_ids must be comma-separated GMSL2 IDs"})
+                    return
+                requested_camera_ids = [int(piece) for piece in pieces]
+            raw_box = query.get("box", [None])[0]
+            if raw_box not in (None, "0", "1"):
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "box must be 0 or 1"})
+                return
+            requested_box = None if raw_box is None else raw_box == "1"
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
@@ -16277,6 +16343,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             state,
                             backend=requested_backend,
                             laser_tracker=requested_laser_tracker,
+                            camera_ids=requested_camera_ids,
+                            box_enabled=requested_box,
                         )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)

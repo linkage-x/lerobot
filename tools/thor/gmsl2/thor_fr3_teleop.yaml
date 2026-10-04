@@ -315,7 +315,7 @@ play_sounds: false
 resume: false
 
 
-# Direct-Thor FR3 extension. The camera, BOX, dataset and calibration settings
+# Host-controller FR3 extension. The camera, BOX, dataset and calibration settings
 # above are the unchanged BOX profile. C connects those sensors; only F starts
 # this robot runtime, moves to the start pose, and enables the SpaceMouse.
 robot:
@@ -361,10 +361,14 @@ teleop:
 
 fr3_teleop:
   enabled: true
-  # Match the working Thor native replay: explicitly use libfranka kIgnore.
+  # Host owns SpaceMouse + native FCI; Thor owns cameras, BOX and recording.
+  # deploy.sh starts the authenticated SSH link. Use thor only for legacy mode.
+  execution_host: host
+  # Keep the explicitly commissioned non-RT mode; moving control to the host
+  # still requires a loaded FCI timing trial. No success-rate guard is relaxed.
   # Set enforce for PREEMPT_RT + SCHED_FIFO preflight and native kEnforce.
   realtime_mode: ignore
-  # Repo-relative on Thor. This separate environment is only needed for F;
+  # Repo-relative on the controller host. This separate environment is needed for F;
   # deployment and C continue to use the existing collection environment.
   runtime_python: .venv-fr3/bin/python
   control_hz: 100

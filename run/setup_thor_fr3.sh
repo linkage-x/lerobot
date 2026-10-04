@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run on Thor. Default/--check validates the local FR3 runtime without FCI.
+# Run on the FR3 control computer (host or Thor). Default/--check validates the local FR3 runtime without FCI.
 # Provision explicitly with --install-system-deps and/or --install-python.
 set -euo pipefail
 
@@ -19,7 +19,7 @@ Usage: bash run/setup_thor_fr3.sh [options]
   --check                 Validate dependencies, configuration and RT permission; no FCI (default)
   --install-system-deps   Explicitly install native build/runtime packages
   --install-python        Explicitly create/sync the separate FR3 Python environment
-  --panda-wheel PATH      Patched, compatible aarch64 panda-py wheel (required with --install-python)
+  --panda-wheel PATH      Patched panda-py wheel matching this CPU/Python (required with --install-python)
   --venv PATH             FR3 environment, default .venv-fr3 (also set fr3_teleop.runtime_python)
   --config-path PATH      Thor profile YAML
   --help                  Show this help
@@ -49,7 +49,7 @@ done
 
 if $install_python; then
   if [[ ! -f "$panda_wheel" || "$panda_wheel" != *.whl ]]; then
-    echo "ERROR: --install-python requires --panda-wheel /path/to/aarch64.whl" >&2
+    echo "ERROR: --install-python requires --panda-wheel /path/to/compatible.whl" >&2
     echo "Patch panda-py and build against the libfranka version compatible with FR3's Desk system version." >&2
     echo "See docs/thor_fr3_teleoperation.md; generic PyPI panda-python is not selected automatically." >&2
     exit 2
@@ -107,6 +107,8 @@ PY
 if [[ -n "$cmeel_lib" ]]; then
   export LD_LIBRARY_PATH="$cmeel_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+venv_absolute="$(cd "$venv_path" && pwd)"
+export LD_LIBRARY_PATH="$venv_absolute/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Reject an unpatched wheel even when this machine's RT kernel still needs
 # commissioning. Importing the extension does not instantiate a robot.
@@ -121,10 +123,10 @@ except Exception as exc:
     raise SystemExit(1)
 PY
 then
-  echo "Use run/patch_thor_panda_py.py on the inspected source and rebuild/install its aarch64 wheel." >&2
+  echo "Use run/patch_thor_panda_py.py on the inspected source and rebuild/install its host-native wheel." >&2
   exit 1
 fi
 
-echo "==> Checking direct-Thor FR3 runtime (no robot connection or motion)..."
+echo "==> Checking local FR3 runtime (no robot connection or motion)..."
 exec env PYTHONPATH=src:. "$runtime_python" -m tools.thor.fr3_control_worker \
   --check --config-path "$config_path"

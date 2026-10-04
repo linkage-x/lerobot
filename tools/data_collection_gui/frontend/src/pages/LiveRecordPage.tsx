@@ -177,6 +177,12 @@ export function Fr3StatusPanel({ status }: { status: Fr3TeleopStatus }) {
           <Metric label="External torque xyz (Nm)" value={[3, 4, 5].map((i) => telemetryNumber(wrench[i])).join(", ")} />
           <Metric label="FCI command success rate" value={telemetryNumber(telemetry.control_command_success_rate, 5)} />
           <Metric label="Measured gripper opening (m)" value={telemetryNumber(telemetry.gripper_measured_m, 4)} />
+          {typeof telemetry.clock_rtt_s === "number" && <>
+            <Metric label="Host–Thor round trip (ms)" value={telemetryNumber(telemetry.clock_rtt_s * 1000, 2)} />
+            <Metric label="Clock uncertainty (ms)" value={telemetryNumber(
+              typeof telemetry.clock_uncertainty_s === "number" ? telemetry.clock_uncertainty_s * 1000 : null, 2,
+            )} />
+          </>}
         </div>
       </details>
     </div>
@@ -221,10 +227,12 @@ export function RecordingPanel({
   config,
   busy,
   onConnect,
+  connectAllowed = true,
   onStart,
   onStop,
   logLines,
   backendPicker,
+  sensorSelection,
   laserTrackerToggle,
   mountSession,
   fr3Teleop,
@@ -236,10 +244,12 @@ export function RecordingPanel({
   config: ConfigSummary;
   busy: boolean;
   onConnect: () => void;
+  connectAllowed?: boolean;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   logLines?: string[];
   backendPicker?: React.ReactNode;
+  sensorSelection?: React.ReactNode;
   laserTrackerToggle?: React.ReactNode;
   /** A calibration capture holding the recorder; see TrackerMountSession. */
   mountSession?: TrackerMountSession;
@@ -297,6 +307,7 @@ export function RecordingPanel({
         <Metric label="Encoding" value={`${config.vcodec || "raw"}${config.streamingEncoding ? ", streaming" : ""}`} />
       </div>
       {isGmsl && <CameraEncodingInfo config={config} />}
+      {sensorSelection}
       {laserTrackerToggle}
       {status.laserTracker && isConnected && (
         <p
@@ -332,7 +343,7 @@ export function RecordingPanel({
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
-        <button disabled={!canConnect} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        <button disabled={!canConnect || !connectAllowed} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
         {fr3Teleop?.enabled && (
           <button disabled={!canStartFr3} onClick={onStartFr3} title="F: move FR3 to start, then enable SpaceMouse motion">Start FR3 <kbd>F</kbd></button>
         )}
@@ -382,7 +393,7 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: (backend?: RecordingBackend, laserTracker?: boolean) => void;
+  onConnect: (backend?: RecordingBackend, laserTracker?: boolean, sensors?: { cameraIds: number[]; boxEnabled: boolean }) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onStartFr3: () => void;
@@ -398,6 +409,10 @@ export function LiveRecordPage({
   // booked by someone else the row is still there and the answer is still no.
   const hasLaserTracker = snapshot.devices.some((d) => d.kind === "laser_tracker");
   const [laserTracker, setLaserTracker] = useState(false);
+  const thorGmsl = snapshot.deployment?.profile === "thor" && snapshot.configSummary.rigType === "gmsl2";
+  const cameraDevices = snapshot.devices.filter((device) => device.kind === "camera" && typeof device.config?.sensor_id === "number");
+  const [pickedCameraIds, setPickedCameraIds] = useState<string[] | null>(null);
+  const [boxEnabled, setBoxEnabled] = useState(true);
   // Only the FR3 workstation has two robots behind one recorder; Thor's rig is singular and
   // must keep sending Connect with no backend at all.
   const supportsBackendChoice = snapshot.deployment?.profile === "workstation";
@@ -410,6 +425,27 @@ export function LiveRecordPage({
   const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
     snapshot.recording.state
   );
+  const allCameraIds = cameraDevices.map((device) => device.id);
+  const selectedCameraIds = recorderConnected && snapshot.recording.selectedCameraIds
+    ? snapshot.recording.selectedCameraIds
+    : (pickedCameraIds ?? allCameraIds).filter((id) => allCameraIds.includes(id));
+  const selectedBoxEnabled = recorderConnected ? snapshot.recording.boxEnabled !== false : boxEnabled;
+  const connectSensors = thorGmsl ? {
+    cameraIds: cameraDevices
+      .filter((device) => selectedCameraIds.includes(device.id))
+      .map((device) => Number(device.config?.sensor_id)),
+    boxEnabled: selectedBoxEnabled,
+  } : undefined;
+  const noCamerasSelected = thorGmsl && connectSensors?.cameraIds.length === 0;
+
+  const connectSelected = () => {
+    if (noCamerasSelected) return;
+    onConnect(
+      supportsBackendChoice ? selectedBackend : undefined,
+      hasLaserTracker ? laserTracker : undefined,
+      connectSensors,
+    );
+  };
   // The backend keeps a per-session ring buffer (RecordingStatus.recentOutput)
   // and clears it when the operator clicks Connect, so we can render it
   // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
@@ -432,10 +468,7 @@ export function LiveRecordPage({
       if (!action) return;
       event.preventDefault();
       if (action === "connect") {
-        onConnect(
-          supportsBackendChoice ? selectedBackend : undefined,
-          hasLaserTracker ? laserTracker : undefined,
-        );
+        connectSelected();
       } else if (action === "startFr3") {
         onStartFr3();
       } else if (action === "startEpisode") {
@@ -450,7 +483,7 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, snapshot.fr3Teleop, snapshot.trackerMountSession, snapshot.calibrationSession, snapshot.markerTcp, onConnect, onStart, onStop, onStartFr3, supportsBackendChoice, selectedBackend, hasLaserTracker, laserTracker]);
+  }, [busy, snapshot.recording, snapshot.fr3Teleop, snapshot.trackerMountSession, snapshot.calibrationSession, snapshot.markerTcp, onConnect, onStart, onStop, onStartFr3, connectSelected]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -488,6 +521,60 @@ export function LiveRecordPage({
     </label>
   ) : undefined;
 
+  const sensorSelection = thorGmsl ? (
+    <section className="sensor-picker" aria-label="Sensors to connect with C">
+      <div className="sensor-picker-heading">
+        <div>
+          <strong>Sensors for Connect (C)</strong>
+          <small>{selectedCameraIds.length} / {cameraDevices.length} cameras selected</small>
+        </div>
+        <div className="sensor-picker-actions">
+          <button type="button" disabled={busy || recorderConnected} onClick={() => setPickedCameraIds([])}>
+            Clear cameras
+          </button>
+          <button
+            type="button"
+            disabled={busy || recorderConnected}
+            onClick={() => { setPickedCameraIds(null); setBoxEnabled(true); setLaserTracker(false); }}
+          >
+            Select all except FR3 and laser
+          </button>
+        </div>
+      </div>
+      <fieldset disabled={busy || recorderConnected}>
+        <legend>Sengyun cameras</legend>
+        <div className="sensor-picker-cameras">
+          {cameraDevices.map((device) => (
+            <label key={device.id}>
+              <input
+                type="checkbox"
+                checked={selectedCameraIds.includes(device.id)}
+                onChange={(event) => setPickedCameraIds((current) => {
+                  const next = current ?? allCameraIds;
+                  return event.target.checked
+                    ? [...new Set([...next, device.id])]
+                    : next.filter((id) => id !== device.id);
+                })}
+              />
+              {device.id} <small>(sensor ID {String(device.config?.sensor_id)})</small>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <label className="sensor-picker-box">
+        <input
+          type="checkbox"
+          checked={selectedBoxEnabled}
+          disabled={busy || recorderConnected}
+          onChange={(event) => setBoxEnabled(event.target.checked)}
+        />
+        BOX board <small>gripper, force, touch, IMU and trigger share one connection</small>
+      </label>
+      <p className="panel-note">FR3 and SpaceMouse start separately with F. BOX is required for F.</p>
+      {noCamerasSelected && <p className="tracker-wait-banner">Select at least one camera before pressing C.</p>}
+    </section>
+  ) : undefined;
+
   const backendPicker = supportsBackendChoice ? (
     <div className="mujoco-mode-picker" role="group" aria-label="Recording backend">
       <button
@@ -514,7 +601,7 @@ export function LiveRecordPage({
       <PageHeader
         title="Live Record"
         subtitle={snapshot.fr3Teleop?.enabled
-          ? "C connects Sengyun cameras and BOX sensors · F moves FR3 to start and enables SpaceMouse · E records · S saves · D discards"
+          ? "C connects selected Sengyun cameras and BOX sensors · F moves FR3 to start and enables SpaceMouse · E records · S saves · D discards"
           : supportsBackendChoice
           ? `FR3 SpaceMouse capture on the ${selectedBackend === "sim" ? "MuJoCo twin" : "real arm"}; both write the same dataset schema`
           : snapshot.configSummary.rigType === "gmsl2"
@@ -538,12 +625,9 @@ export function LiveRecordPage({
           status={snapshot.recording}
           config={snapshot.configSummary}
           busy={busy}
-          onConnect={() =>
-            onConnect(
-              supportsBackendChoice ? selectedBackend : undefined,
-              hasLaserTracker ? laserTracker : undefined,
-            )
-          }
+          onConnect={connectSelected}
+          connectAllowed={!noCamerasSelected}
+          sensorSelection={sensorSelection}
           laserTrackerToggle={laserTrackerToggle}
           onStart={onStart}
           onStop={onStop}

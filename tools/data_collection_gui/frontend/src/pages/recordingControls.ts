@@ -31,6 +31,7 @@ export function recordingControlAvailability(
     canResolveEpisode: !busy && (status.state === "recording" || status.state === "review"),
     canExit: !busy && isConnected,
     canStartFr3: !busy && Boolean(fr3?.enabled) && status.state === "armed" && !captureHeld
+      && status.boxEnabled !== false
       && (fr3?.state === "idle" || fr3?.state === "error"),
     canStopFr3: !busy && Boolean(fr3?.enabled)
       && ["starting", "moving_to_start", "running"].includes(fr3?.state ?? "idle"),
