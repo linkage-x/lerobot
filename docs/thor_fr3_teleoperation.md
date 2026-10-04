@@ -73,8 +73,10 @@ return to neutral. Release the puck fully before a deliberate rotation-only
 gesture. This prevents incidental tilt and the release tail from rotating the
 EE during an X/Y/Z translation. `separate_translation_rotation: false` restores
 simultaneous 6-DOF control; `enable_rotation: false` disables rotation entirely.
-Rotation deadzones are 0.12 and rotation gain is 0.000324 per input update;
-translation gain is unchanged. `robot.ik_orientation_weight: 1.0` strengthens
+Rotation deadzones are 0.12. The FR3 profile doubles the SpaceMouse gains to
+0.00123 translation and 0.000648 rotation per input update, and raises the
+translation command cap to 0.002 m per axis so larger inputs are not clipped.
+The gripper button step is unchanged. `robot.ik_orientation_weight: 1.0` strengthens
 the IK orientation target. These hold the commanded orientation; physical
 tracking error still depends on the controller and robot load. The UI displays measured joints,
 velocity, measured/external joint torque, TCP pose and estimated external wrench.

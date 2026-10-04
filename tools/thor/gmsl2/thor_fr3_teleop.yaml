@@ -329,7 +329,7 @@ robot:
   cameras: {}
   workspace_min: [0.2, -0.6, 0.05]
   workspace_max: [0.9, 0.6, 0.8]
-  max_target_delta_pos: [0.001, 0.001, 0.001]
+  max_target_delta_pos: [0.002, 0.002, 0.002]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   ik_solver: placo
   ik_orientation_weight: 1.0
@@ -350,8 +350,9 @@ teleop:
   device_id: 0
   frequency: 100
   # Existing SpaceMouse driver defaults: debias, deadzones and [-y, x, z].
-  translation_scale: 0.000615
-  rotation_scale: 0.000324
+  # Double the previous FR3 SpaceMouse motion per input update.
+  translation_scale: 0.00123
+  rotation_scale: 0.000648
   threshold_wx: 0.12
   threshold_wy: 0.12
   threshold_wz: 0.12

@@ -17,6 +17,9 @@
 import pytest
 import sys
 import types
+from pathlib import Path
+
+import yaml
 
 from lerobot.teleoperators.spacemouse import SpaceMouseTeleop, SpaceMouseTeleopConfig
 from lerobot.teleoperators.spacemouse.backend import PySpaceMouseDriver, SpaceMouseReading
@@ -98,6 +101,44 @@ def test_get_action_maps_axes_and_scales(teleop):
     assert action["target_wx"] == pytest.approx(0.5 * teleop.rotation_scale_vector[0])
     assert action["target_wy"] == pytest.approx(-0.6 * teleop.rotation_scale_vector[1])
     assert action["target_wz"] == pytest.approx(0.7 * teleop.rotation_scale_vector[2])
+
+
+def test_thor_fr3_profile_doubles_motion_without_translation_clipping(monkeypatch):
+    profile_path = Path(__file__).resolve().parents[2] / "tools/thor/gmsl2/thor_fr3_teleop.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    raw = dict(profile["teleop"])
+    raw.pop("type")
+    raw.update(bias_sample_count=0, motion_input_timeout_s=None)
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    device = SpaceMouseTeleop(SpaceMouseTeleopConfig(**raw))
+    device.connect()
+    try:
+        device._driver.readings.extend(
+            [
+                SpaceMouseReading(translation=[0.3, -1.0, 0.5], rotation=[0.0, 0.0, 0.0], buttons=(False, False)),
+                SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0], buttons=(False, False)),
+                SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.5, -0.6, 0.7], buttons=(False, False)),
+            ]
+        )
+        translation = device.get_action()
+        device.get_action()  # Release the translation gesture before rotation.
+        rotation = device.get_action()
+    finally:
+        device.disconnect()
+
+    translation_inputs = (1.0, 0.3, 0.5)
+    rotation_inputs = (0.5, -0.6, 0.7)
+    for axis, value, calibration, limit in zip(
+        "xyz", translation_inputs, device.TRANSLATION_AXIS_CALIBRATION,
+        profile["robot"]["max_target_delta_pos"], strict=True,
+    ):
+        actual = translation[f"target_{axis}"]
+        assert actual == pytest.approx(value * 2 * 0.000615 * calibration)
+        assert abs(actual) <= limit
+    for axis, value, calibration in zip(
+        ("wx", "wy", "wz"), rotation_inputs, device.ROTATION_AXIS_CALIBRATION, strict=True,
+    ):
+        assert rotation[f"target_{axis}"] == pytest.approx(value * 2 * 0.000324 * calibration)
 
 
 def test_connect_estimates_idle_bias_and_cancels_idle_reading(monkeypatch):
