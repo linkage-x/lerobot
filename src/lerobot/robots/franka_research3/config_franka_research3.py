@@ -83,8 +83,8 @@ class FrankaResearch3Config(RobotConfig):
     filter_coeff: float | None = None
     # Guided calibration starts the native teaching controller after connecting.
     arm_start_controller_on_connect: bool = True
-    # Thor teleoperation explicitly opts into native libfranka real-time enforcement.
-    arm_realtime_enforce: bool = False
+    # None preserves the backend default; True/False explicitly select kEnforce/kIgnore.
+    arm_realtime_enforce: bool | None = None
     arm_require_no_automatic_recovery: bool = False
     arm_state_poll_frequency_hz: float = 200.0
     camera_max_age_ms: float = 100.0

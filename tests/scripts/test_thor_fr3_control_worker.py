@@ -35,6 +35,7 @@ def telemetry(*, robot_time=None, **overrides):
 @pytest.mark.parametrize("overrides", [
     {"control_hz": float("nan")}, {"control_hz": 501}, {"telemetry_hz": 51},
     {"command_timeout_s": 0}, {"min_success_rate": 1.01}, {"max_state_age_s": -1},
+    {"realtime_mode": "ignored"}, {"realtime_mode": False}, {"realtime_mode": None},
 ])
 def test_worker_rejects_invalid_safety_settings(overrides):
     with pytest.raises(ValueError):
@@ -308,13 +309,50 @@ def test_frozen_native_clock_faults_despite_live_heartbeat_and_actions():
     robot = FakeRobot(frozen_clock=True)
     harness = WorkerHarness(robot, configuration={"fr3_teleop": {"max_state_age_s": 0.03}})
     try:
-        harness.until("running")
         harness.keep_input_alive = True
-        message, _ = harness.until("error")
+        message, seen = harness.until("error")
         assert "clock stopped" in message["message"]
+        assert not any(item["state"] == "running" for item in seen)
     finally:
         harness.close()
     assert harness.result == [1] and robot.events[-1] == "disconnect"
+
+
+def test_startup_waits_for_full_native_window_and_valid_rate_before_input():
+    robot = FakeRobot()
+    start = [None]
+
+    def state():
+        now = time.monotonic()
+        if "controller" in robot.events:
+            start[0] = start[0] or now
+        elapsed = now - start[0] if start[0] is not None else 0
+        return telemetry(control_command_success_rate=0.0 if elapsed < 0.02 else 0.99 if elapsed < 0.12 else 1.0)
+
+    robot.state = state
+    harness = WorkerHarness(robot)
+    try:
+        harness.until("running")
+        assert time.monotonic() - start[0] >= 0.12
+        assert not robot.actions
+    finally:
+        harness.close()
+    assert harness.result == [0]
+
+
+def test_startup_rate_that_never_qualifies_stops_without_spacemouse_actions(monkeypatch):
+    monkeypatch.setattr(worker, "CONTROL_READY_TIMEOUT_S", 0.15)
+    robot = FakeRobot()
+    robot.state = lambda: telemetry(control_command_success_rate=0.99)
+    harness = WorkerHarness(robot)
+    try:
+        message, seen = harness.until("error")
+        assert "success rate=0.99" in message["message"]
+        assert not any(item["state"] == "running" for item in seen)
+        assert not robot.actions
+    finally:
+        harness.close()
+    assert harness.result == [1]
 
 
 def test_parent_watchdog_cancels_a_homing_move_before_controller_activation():
@@ -358,7 +396,8 @@ def test_nonfinite_native_state_reports_specific_fault_through_ipc():
     assert harness.result == [1] and "controller" not in robot.events
 
 
-def test_native_driver_explicitly_enforces_realtime_and_caches_one_state(monkeypatch):
+@pytest.mark.parametrize("realtime_enforce", [True, False])
+def test_native_driver_explicitly_selects_realtime_and_caches_one_state(monkeypatch, realtime_enforce):
     from lerobot.robots.franka_research3.backends import PandaPyArmDriver
 
     instances = []
@@ -382,16 +421,17 @@ def test_native_driver_explicitly_enforces_realtime_and_caches_one_state(monkeyp
                 raise RuntimeError("native reflex")
 
     enforce = object()
+    ignore = object()
     monkeypatch.setitem(sys.modules, "panda_py", types.SimpleNamespace(
         Panda=Panda, controllers=types.SimpleNamespace(),
-        libfranka=types.SimpleNamespace(RealtimeConfig=types.SimpleNamespace(kEnforce=enforce)),
+        libfranka=types.SimpleNamespace(RealtimeConfig=types.SimpleNamespace(kEnforce=enforce, kIgnore=ignore)),
     ))
-    driver = PandaPyArmDriver("192.168.1.206", realtime_enforce=True,
+    driver = PandaPyArmDriver("192.168.1.206", realtime_enforce=realtime_enforce,
                               start_controller_on_connect=False, state_poll_frequency_hz=200)
     driver._start_state_reader = lambda: None
     driver.connect()
     try:
-        assert instances[0].kwargs == {"realtime_config": enforce}
+        assert instances[0].kwargs == {"realtime_config": enforce if realtime_enforce else ignore}
         first = driver.get_telemetry()
         instances[0].state.q[:] = 100
         instances[0].state.tau_J[:] = 200
@@ -407,14 +447,23 @@ def test_native_driver_explicitly_enforces_realtime_and_caches_one_state(monkeyp
         driver.disconnect()
 
 
-def test_check_cli_validates_prerequisites_without_calling_connect(monkeypatch):
+@pytest.mark.parametrize("mode", ["enforce", "ignore"])
+def test_check_cli_validates_prerequisites_without_calling_connect(monkeypatch, mode):
     events = []
-    monkeypatch.setattr(worker, "load_config", lambda _path: {})
-    monkeypatch.setattr(worker, "check_realtime", lambda: events.append("RT"))
+    monkeypatch.setattr(worker, "load_config", lambda _path: {"fr3_teleop": {"realtime_mode": mode}})
+    monkeypatch.setattr(worker, "check_realtime", lambda mode: events.append(mode))
     robot = types.SimpleNamespace(connect=lambda: pytest.fail("--check opened FCI"))
     monkeypatch.setattr(worker, "build_robot", lambda _config, _path: events.append("native+IK") or robot)
     assert worker.main(["--config-path", "unused.yaml", "--check"]) == 0
-    assert events == ["RT", "native+IK"]
+    assert events == [mode, "native+IK"]
+
+
+def test_explicit_ignore_skips_host_rt_requirements(monkeypatch):
+    monkeypatch.setattr(worker, "Path", lambda _path: pytest.fail("ignore checked RT kernel"))
+    monkeypatch.setattr(worker.os, "sched_setscheduler", lambda *_args: pytest.fail("ignore changed scheduler"))
+    worker.check_realtime("ignore")
+    with pytest.raises(ValueError, match="Unknown"):
+        worker.check_realtime("ignored")
 
 
 def test_check_realtime_restores_scheduler_and_refuses_ordinary_kernel(monkeypatch):
@@ -449,7 +498,8 @@ def test_unpatched_native_wheel_is_rejected_before_constructing_panda(monkeypatc
     assert not calls
 
 
-def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypatch):
+@pytest.mark.parametrize("mode", ["enforce", "ignore"])
+def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypatch, mode):
     from lerobot.robots.franka_research3.franka_research3 import FrankaResearch3
 
     monkeypatch.setitem(sys.modules, "panda_py", types.SimpleNamespace(
@@ -462,7 +512,7 @@ def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypa
     ))
     monkeypatch.setitem(sys.modules, "ruckig", types.SimpleNamespace())
     monkeypatch.setattr(FrankaResearch3, "_make_kinematics_driver", lambda _self: object())
-    robot = worker.build_robot({"robot": {
+    robot = worker.build_robot({"fr3_teleop": {"realtime_mode": mode}, "robot": {
         "type": "franka_research3", "robot_ip": "192.168.1.206",
         "urdf_path": "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf",
         "gripper_backend": "franka_hand", "allow_mock_gripper": True,
@@ -475,7 +525,7 @@ def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypa
     assert robot.config.gripper_backend == "mock"
     assert robot.config.allow_mock_gripper is False
     assert not robot.cameras
-    assert robot.config.arm_realtime_enforce is True
+    assert robot.config.arm_realtime_enforce is (mode == "enforce")
     assert robot.config.arm_require_no_automatic_recovery is True
     assert robot.config.arm_start_controller_on_connect is False
     assert robot.is_connected is False

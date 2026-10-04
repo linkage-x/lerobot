@@ -85,12 +85,15 @@ Deployment and C use Thor's existing `.venv`. F launches the arm in the separate
 `.venv-fr3` interpreter configured by `fr3_teleop.runtime_python`. An unavailable
 FR3 environment produces a UI error on F and leaves camera/BOX connection usable.
 
-The checked Thor currently has kernel `6.8.12-tegra` with ordinary PREEMPT and no
-`/sys/kernel/realtime`, plus no native FR3 packages in the collection environment.
-Its route to `192.168.1.206` uses `enP2p1s0` with source `192.168.1.122`.
+The checked Thor has kernel `6.8.12-tegra` with ordinary PREEMPT and no
+`/sys/kernel/realtime`. The supplied profile explicitly selects
+`fr3_teleop.realtime_mode: ignore`, matching the working native replay.
+The robot address is `192.168.11.102`, reached through `enP2p1s0` from
+`192.168.11.100`; the previous `192.168.1.206` address did not respond.
 Direct SpaceMouse enumeration/open/read was verified on aarch64 using
-`pyspacemouse==2.1.0`; the installed user still needs hidraw access and packages.
-These checks do not validate live robot motion or camera-loaded FCI timing.
+`pyspacemouse==2.1.0`. Thor's current collection account has USB access and the
+required packages. The live F test below covers homing and a short neutral-input
+hold; sustained recording and user-driven motion still need operational testing.
 
 ### SpaceMouse USB access
 
@@ -111,8 +114,37 @@ collection environment is elsewhere. Restart the gateway after logging back in.
 
 ### Real-time kernel and native FR3 runtime
 
-FR3 control uses libfranka's native 1 kHz loop. F requires PREEMPT_RT and permission
-to use `SCHED_FIFO`; the worker refuses to connect when either check fails.
+FR3 control uses libfranka's native 1 kHz loop. The runtime supports two explicit
+values of `fr3_teleop.realtime_mode`:
+
+- `ignore`: the supplied Thor profile uses native `RealtimeConfig.kIgnore` and
+  skips the host PREEMPT_RT/SCHED_FIFO gate, as requested for the replay-compatible
+  setup. This does not establish a real-time timing guarantee. Joint bounds,
+  command/state watchdogs, native robot errors and the FCI success-rate check
+  remain enforced.
+- `enforce`: require PREEMPT_RT and SCHED_FIFO permission, and pass native
+  `RealtimeConfig.kEnforce`. This is the worker default when the setting is absent.
+  Unknown values are rejected before connecting.
+
+[libfranka's scheduling option](https://frankarobotics.github.io/libfranka/latest/classfranka_1_1Robot.html)
+controls whether unavailable real-time scheduling raises an exception.
+Even in `ignore` mode, libfranka attempts to give its control thread FIFO
+priority. A login with `ulimit -r` equal to `0` prevents that attempt from
+succeeding. The kernel-name bypass therefore does not guarantee that FCI timing
+will meet `fr3_teleop.min_success_rate` under camera load. Scheduling permissions
+are a separate host setting; changing the YAML does not grant them.
+With operator approval, this Thor now has `/etc/security/limits.d/90-lerobot-fr3.conf`
+containing `nvidia - rtprio 99`. New logins inherit that limit. The active
+gateway/recorder limits were also updated so their next FR3 worker inherited it
+without restarting sensor capture. Verify with `ulimit -r` in a new Thor SSH
+login (expected `99`); the live test confirmed FIFO priority 99 in the worker.
+
+After homing, the worker holds its current native joint target while it waits
+for at least 100 ms of advancing active-controller state and a success rate
+at or above `0.995`. This allows the native last-100-command metric to initialize.
+SpaceMouse increments stay disabled until this check passes; startup aborts
+after one second if it cannot qualify. During teleoperation the existing
+per-sample success-rate limit, state freshness checks and input watchdogs apply.
 Franka recommends a direct Ethernet connection to **Control's** LAN port and
 validating timing under the intended load.
 [Franka requirements and troubleshooting](https://frankarobotics.github.io/docs/troubleshooting.html)
@@ -124,18 +156,18 @@ commissioning FR3. Kernel/driver installation and reboot are a separate machine
 maintenance step; deployment and these setup scripts do not change the kernel.
 [NVIDIA Thor RT kernel instructions](https://docs.nvidia.com/jetson/archives/r38.2.1/DeveloperGuide/SD/Kernel/RealTimeKernel.html)
 
-After reboot, check:
+For `realtime_mode: enforce`, after reboot check:
 
 ```bash
 uname -a
 cat /sys/kernel/realtime       # must print 1
 ulimit -r                     # inspect realtime priority limits; preflight tests maximum FIFO priority
-ip route get 192.168.1.206
+ip route get 192.168.11.102
 ```
 
 Configure realtime limits for the login running the gateway according to the
 Franka setup documentation, then start a fresh login/session. A kernel whose
-name only contains `PREEMPT` does not satisfy the worker's PREEMPT_RT check.
+name only contains `PREEMPT` does not satisfy the worker's `enforce` check.
 
 Build/provide an **aarch64 panda-py wheel for Python 3.12** whose linked libfranka
 version matches FR3's Desk system version. Generic panda-python installation
@@ -213,6 +245,23 @@ PYTHONPATH=src:. .venv-fr3/bin/python -m tools.thor.fr3_control_worker \
 `--venv /path/to/environment` selects another environment for setup/check; update
 `fr3_teleop.runtime_python` in the YAML to its Python executable before deployment.
 
+The 2026-10-04 Thor setup built the inspected source revision with
+`run/patch_thor_panda_py.py` against installed libfranka 0.15.0. The resulting
+wheel is stored on Thor at
+`outputs/wheels/panda_python-0.8.1-cp312-cp312-linux_aarch64.whl` and installed in
+`.venv-fr3`. Its compiled no-automatic-recovery capability and the full
+`bash run/setup_thor_fr3.sh --check` preflight passed in `ignore` mode.
+The replaced package was backed up under `outputs/runtime_backups/fr3_20261004`.
+Live connection to `192.168.11.102` returned idle mode, no current robot errors,
+and valid joint/torque/pose data. With 11 cameras and BOX sensors connected, the
+final F test moved to start, entered SpaceMouse control with the puck released
+for five seconds, then stopped cleanly. All 44 sampled UI telemetry packets
+reported `control_command_success_rate=1.0`; the configured limit stayed `0.995`.
+The final direct state read showed `kIdle` and no current errors. The test report
+is `outputs/logs/fr3_teleop/live_check_ready_20261004.json` on Thor and the host.
+No episode was recorded in this test. The initial startup-rate failures were
+resolved with the approved FIFO permissions and startup qualification above.
+
 ## Configuration
 
 All connected Sengyun cameras use the original generic `cam_00`, `cam_01`, etc.
@@ -229,9 +278,10 @@ The FR3 extension has these principal settings:
 
 | Setting | Default / meaning |
 | --- | --- |
-| `robot.robot_ip` | `192.168.1.206`, contacted directly from Thor only after F |
+| `robot.robot_ip` | `192.168.11.102`, the working replay address, contacted directly from Thor after F |
 | `robot.urdf_path` / `target_frame_name` | FR3 + Corenetic gripper model / `corenetic_gripper_ee` |
 | `fr3_teleop.runtime_python` | `.venv-fr3/bin/python`, relative to the deployed repository |
+| `fr3_teleop.realtime_mode` | `ignore` in this Thor profile; `enforce` requires PREEMPT_RT and SCHED_FIFO |
 | `fr3_teleop.control_hz` | 200 Hz Python target updates; native FCI remains 1 kHz |
 | `fr3_teleop.command_timeout_s` | 0.2 s parent command watchdog |
 | `fr3_teleop.max_state_age_s` | 0.1 s default maximum age of the native telemetry stream |
@@ -280,7 +330,7 @@ calibration for a changed physical setup.
 | Deploy / UI | `bash run/deploy.sh` on the host | Only Thor SSH; original BOX Live Record interface, F added |
 | Cameras / BOX | Press C before provisioning FR3 | Existing sensor connection and generic camera previews work; no robot motion |
 | SpaceMouse | `bash run/setup_thor_spacemouse.sh --check` on Thor | Device opens and supplies axes/buttons without FR3 |
-| Native readiness | `bash run/setup_thor_fr3.sh --check` on Thor | RT kernel, scheduling permission, configuration, patched native capability and imports pass without FCI |
+| Native readiness | `bash run/setup_thor_fr3.sh --check` on Thor | Selected scheduling policy, configuration, patched native capability and imports pass without FCI |
 | F failure isolation | With a missing FR3 runtime, press F after C | Specific UI error; cameras/BOX remain connected; F can be retried |
 | Motion / input | Commission the robot, enable FCI in Desk, then press F | Move to start completes before SpaceMouse changes targets |
 | Episode controls | After F is running: E then S; E then D | First episode saved, second discarded; no automatic return-to-start on S/D |

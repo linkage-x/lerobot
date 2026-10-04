@@ -169,7 +169,7 @@ class PandaPyArmDriver:
     filter_coeff: float | None = None
     state_poll_frequency_hz: float = 200.0
     start_controller_on_connect: bool = True
-    realtime_enforce: bool = False
+    realtime_enforce: bool | None = None
     require_no_automatic_recovery: bool = False
     joint_position_min: tuple[float, ...] | None = None
     joint_position_max: tuple[float, ...] | None = None
@@ -211,10 +211,11 @@ class PandaPyArmDriver:
     def connect(self) -> None:
         if self.require_no_automatic_recovery:
             require_native_no_automatic_recovery()
-        if self.realtime_enforce:
+        if self.realtime_enforce is not None:
             from panda_py import libfranka
 
-            self._robot = self._panda_cls(self.robot_ip, realtime_config=libfranka.RealtimeConfig.kEnforce)
+            mode = libfranka.RealtimeConfig.kEnforce if self.realtime_enforce else libfranka.RealtimeConfig.kIgnore
+            self._robot = self._panda_cls(self.robot_ip, realtime_config=mode)
         else:
             self._robot = self._panda_cls(self.robot_ip)
         # One state read serves both the mode gate and the controller's initial setpoint. The

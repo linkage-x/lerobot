@@ -327,8 +327,8 @@ class FrankaResearch3(Robot):
             start_controller_on_connect=self.config.arm_start_controller_on_connect,
             state_poll_frequency_hz=self.config.arm_state_poll_frequency_hz,
         )
-        if self.config.arm_realtime_enforce:
-            arm_kwargs["realtime_enforce"] = True
+        if self.config.arm_realtime_enforce is not None:
+            arm_kwargs["realtime_enforce"] = self.config.arm_realtime_enforce
         if self.config.arm_require_no_automatic_recovery:
             arm_kwargs["require_no_automatic_recovery"] = True
             arm_kwargs["joint_position_min"] = self.config.otg_min_position

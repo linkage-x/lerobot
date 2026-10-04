@@ -36,6 +36,9 @@ SAFE_JOINT_LOWER = (-2.64, -1.57, -2.70, -2.84, -2.70, 0.60, -2.70)
 SAFE_JOINT_UPPER = (2.64, 1.57, 2.70, -0.27, 2.70, 3.65, 2.70)
 NATIVE_WALL_MARGIN = (0.25, 0.19, 0.19, 0.19, 0.08, 0.08, 0.08)
 OTG_DYNAMIC_LIMITS = {"otg_max_velocity": 0.5, "otg_max_acceleration": 1.0, "otg_max_jerk": 1000.0}
+CONTROL_READY_TIMEOUT_S = 1.0
+# libfranka reports success over the last 100 native 1 kHz commands.
+CONTROL_RATE_WINDOW_S = 0.1
 
 
 class ArmOwnershipLock:
@@ -81,6 +84,7 @@ _PROCESS_OWNERSHIP_LOCKS: list[ArmOwnershipLock] = []
 
 @dataclass(frozen=True)
 class Settings:
+    realtime_mode: str = "enforce"
     control_hz: float = 200.0
     telemetry_hz: float = 50.0
     command_timeout_s: float = 0.2
@@ -96,6 +100,7 @@ class Settings:
         section = config.get("fr3_teleop", {})
         robot = config.get("robot", {})
         result = cls(
+            realtime_mode=section.get("realtime_mode", "enforce"),
             control_hz=float(section.get("control_hz", 200)),
             telemetry_hz=float(section.get("telemetry_hz", 50)),
             command_timeout_s=float(section.get("command_timeout_s", 0.2)),
@@ -106,6 +111,8 @@ class Settings:
             joint_lower=tuple(robot.get("otg_min_position") or SAFE_JOINT_LOWER),
             joint_upper=tuple(robot.get("otg_max_position") or SAFE_JOINT_UPPER),
         )
+        if result.realtime_mode not in ("enforce", "ignore"):
+            raise ValueError("fr3_teleop.realtime_mode must be 'enforce' or 'ignore'.")
         limits = (("control_hz", 1, 500), ("telemetry_hz", 1, 50),
                   ("command_timeout_s", 0.05, 0.5), ("max_state_age_s", 0.005, 0.5),
                   ("min_success_rate", 0, 1))
@@ -151,8 +158,14 @@ def load_config(path: str) -> dict[str, Any]:
     return config
 
 
-def check_realtime() -> None:
-    """Fail before any FCI connection if this host cannot enforce real-time control."""
+def check_realtime(mode: str = "enforce") -> None:
+    """Apply the selected host scheduling policy before opening FCI."""
+    if mode == "ignore":
+        print("FR3 realtime_mode=ignore: using libfranka kIgnore on this host; "
+              "FCI timing and fault checks remain active.", flush=True)
+        return
+    if mode != "enforce":
+        raise ValueError("Unknown FR3 real-time mode")
     realtime_path = Path("/sys/kernel/realtime")
     if not realtime_path.is_file() or realtime_path.read_text().strip() != "1":
         raise RuntimeError(
@@ -221,7 +234,7 @@ def build_robot(config: dict[str, Any], config_path: str):
         urdf = repository_path if repository_path.is_file() else Path(config_path).resolve().parent / urdf
     raw.update(
         urdf_path=str(urdf), cameras={}, gripper_backend="mock", allow_mock_gripper=False,
-        arm_start_controller_on_connect=False, arm_realtime_enforce=True,
+        arm_start_controller_on_connect=False, arm_realtime_enforce=settings.realtime_mode == "enforce",
         arm_require_no_automatic_recovery=True,
     )
     robot_config = draccus.decode(FrankaResearch3Config, raw)
@@ -415,7 +428,10 @@ class StateGuard:
                 raise RuntimeError("FR3 native control loop is no longer active.")
             success = state.get("control_command_success_rate")
             if success is None or not math.isfinite(success) or not self.settings.min_success_rate <= success <= 1:
-                raise RuntimeError("FR3 FCI control command success rate fell below its configured limit.")
+                raise RuntimeError(
+                    f"FR3 FCI control command success rate {success!r} is below the configured "
+                    f"limit {self.settings.min_success_rate}."
+                )
 
 
 def read_telemetry(robot) -> dict[str, Any]:
@@ -434,8 +450,38 @@ def read_telemetry(robot) -> dict[str, Any]:
     return state
 
 
+def wait_for_control_ready(robot, settings: Settings, receiver, telemetry_reader):
+    """Qualify a fresh native hold window before accepting SpaceMouse increments."""
+    guard = StateGuard(settings)
+    deadline = time.monotonic() + CONTROL_READY_TIMEOUT_S
+    first_active_time = None
+    while True:
+        receiver.require_live()
+        state = telemetry_reader(robot)
+        guard.check(state, active=False)
+        if time.monotonic() - guard.last_advance_at > settings.max_state_age_s:
+            raise RuntimeError("FR3 native robot clock stopped advancing during controller startup.")
+        rate = state.get("control_command_success_rate")
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or not 0 <= rate <= 1:
+            raise RuntimeError("FR3 controller startup reported an invalid FCI success rate.")
+        if state["robot_mode"] == "kMove":
+            if first_active_time is None:
+                first_active_time = state["robot_time_s"]
+            if state["robot_time_s"] - first_active_time >= CONTROL_RATE_WINDOW_S and rate >= settings.min_success_rate:
+                guard.check(state, active=True)
+                return state, guard
+        else:
+            first_active_time = None
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"FR3 controller did not qualify within {CONTROL_READY_TIMEOUT_S}s: "
+                f"mode={state['robot_mode']}, FCI success rate={rate}, required={settings.min_success_rate}."
+            )
+        receiver.stopped.wait(1 / settings.control_hz)
+
+
 def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any] | None = None,
-               robot_factory: Callable | None = None, preflight: Callable[[], None] = check_realtime,
+               robot_factory: Callable | None = None, preflight: Callable[[], None] | None = None,
                telemetry_reader: Callable = read_telemetry) -> int:
     """One F activation, then exit. A retry is a fresh process after operator recovery."""
     robot = None
@@ -455,7 +501,7 @@ def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any]
 
     previous_handlers: dict[int, Any] = {}
     try:
-        status("starting", "Checking Thor real-time prerequisites.")
+        status("starting", "Checking Thor runtime prerequisites.")
         # Receive heartbeats before any heavyweight native/training imports.
         configuration = config if config is not None else load_config(config_path)
         settings = Settings.from_config(configuration)
@@ -467,7 +513,10 @@ def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any]
             for signum in (signal.SIGTERM, signal.SIGINT):
                 previous_handlers[signum] = signal.getsignal(signum)
                 signal.signal(signum, lambda _signum, _frame: receiver.cancel("Stopped by user."))
-        preflight()
+        if preflight is not None:
+            preflight()
+        else:
+            check_realtime(settings.realtime_mode)
         receiver.require_live()
         robot = (robot_factory or build_robot)(configuration, config_path)
         receiver.begin_control()
@@ -481,20 +530,7 @@ def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any]
         receiver.require_live()
         robot.start_arm_controller()
         receiver.require_live()
-        guard = StateGuard(settings)
-        deadline = time.monotonic() + settings.max_state_age_s
-        # The state reader may still hold the idle sample from before controller
-        # startup. Wait for a native active sample, without issuing an increment.
-        while True:
-            receiver.require_live()
-            last_telemetry = telemetry_reader(robot)
-            guard.check(last_telemetry, active=False)
-            if last_telemetry.get("robot_mode") == "kMove":
-                guard.check(last_telemetry, active=True)
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError("FR3 native controller did not become active after homing.")
-            receiver.stopped.wait(1 / settings.control_hz)
+        last_telemetry, guard = wait_for_control_ready(robot, settings, receiver, telemetry_reader)
         mailbox.activate()
         status("running", "FR3 teleoperation is active.")
         next_report_at = time.monotonic() + 1 / settings.telemetry_hz
@@ -555,13 +591,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         try:
             config = load_config(args.config_path)
-            Settings.from_config(config)
-            check_realtime()
+            settings = Settings.from_config(config)
+            check_realtime(settings.realtime_mode)
             build_robot(config, args.config_path)
         except Exception as exc:
             print(f"FR3 preflight failed: {exc}", file=sys.stderr)
             return 1
-        print("FR3 real-time/native/kinematics preflight passed; no FCI connection was opened.")
+        print(f"FR3 native/kinematics preflight passed (realtime_mode={settings.realtime_mode}); "
+              "no FCI connection was opened.")
         return 0
     if args.ipc_fd is None:
         parser.error("--ipc-fd is required unless --check is used.")

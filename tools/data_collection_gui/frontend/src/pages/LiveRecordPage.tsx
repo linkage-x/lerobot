@@ -157,7 +157,7 @@ export function Fr3StatusPanel({ status }: { status: Fr3TeleopStatus }) {
       {status.state === "error" && (
         <p className="fr3-fault-message">{status.pid != null
           ? "FR3 worker shutdown is not confirmed. Stop the robot using its hardware controls and resolve the remaining worker process before retrying F."
-          : "Fix the reported problem and clear any robot fault. Release the SpaceMouse, then press F to move to start and resume."}</p>
+          : "Fix the reported problem. Clear a robot fault in Desk if one is reported. Release the SpaceMouse, then press F to retry."}</p>
       )}
       <details className="fr3-telemetry">
         <summary>Measured joints, torque and end effector</summary>

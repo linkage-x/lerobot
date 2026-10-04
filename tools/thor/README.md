@@ -28,6 +28,10 @@ FR3 故障时页面告警并停止运动；排除物理/Desk 故障后，再按 
 FR3 原生运行环境、SpaceMouse USB 权限、实时内核、测试步骤和数据字段见
 [Thor FR3 SpaceMouse 操作指南](../../docs/thor_fr3_teleoperation.md)。
 FR3 依赖缺失不会阻止部署或 `C` 连接传感器；`F` 会显示具体原因。
+当前 Thor FR3 配置使用回放相同的 `192.168.11.102` 地址，以及
+`fr3_teleop.realtime_mode: ignore`（libfranka `kIgnore`），不再强制要求
+PREEMPT_RT。关节范围、通信超时和原生故障检查仍生效。需要严格实时检查时，
+将该项改为 `enforce`。先在 Thor 执行 `bash run/setup_thor_fr3.sh --check`。
 
 如果某几路相机无法启动，在 Thor 执行：
 

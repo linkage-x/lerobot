@@ -340,7 +340,8 @@ class ThorFr3Session:
                     self.error = failure
                     if self.recording:
                         self.episode_interrupted = True
-                    self.publish("error", f"{failure}. Clear the robot/Desk error, then press F to retry")
+                    self.publish("error", f"{failure.rstrip('. ')}. Fix the reported problem; "
+                                 "clear a robot fault in Desk only if one is reported, then press F to retry")
                 else:
                     self.publish("idle", "FR3 stopped. Sensors remain connected; press F to move to start again")
 

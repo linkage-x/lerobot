@@ -320,7 +320,7 @@ resume: false
 # this robot runtime, moves to the start pose, and enables the SpaceMouse.
 robot:
   type: franka_research3
-  robot_ip: 192.168.1.206
+  robot_ip: 192.168.11.102
   # BOX remains owned by thor_record.py; the arm worker never opens BOX or Argus.
   gripper_backend: mock
   allow_mock_gripper: true
@@ -361,6 +361,9 @@ teleop:
 
 fr3_teleop:
   enabled: true
+  # Match the working Thor native replay: explicitly use libfranka kIgnore.
+  # Set enforce for PREEMPT_RT + SCHED_FIFO preflight and native kEnforce.
+  realtime_mode: ignore
   # Repo-relative on Thor. This separate environment is only needed for F;
   # deployment and C continue to use the existing collection environment.
   runtime_python: .venv-fr3/bin/python
