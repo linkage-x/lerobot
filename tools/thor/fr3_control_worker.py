@@ -236,6 +236,7 @@ def build_robot(config: dict[str, Any], config_path: str):
         urdf_path=str(urdf), cameras={}, gripper_backend="mock", allow_mock_gripper=False,
         arm_start_controller_on_connect=False, arm_realtime_enforce=settings.realtime_mode == "enforce",
         arm_require_no_automatic_recovery=True,
+        arm_state_poll_frequency_hz=settings.control_hz,
     )
     robot_config = draccus.decode(FrankaResearch3Config, raw)
     for key, ceiling in OTG_DYNAMIC_LIMITS.items():

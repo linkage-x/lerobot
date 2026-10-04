@@ -788,13 +788,19 @@ def _guarded_teleop(monkeypatch, *, timestamp=5.0, x=0.0, buttons=(0, 0)):
     return device, state, clock, raw
 
 
-def test_cached_active_motion_expires_despite_continued_python_polling(monkeypatch):
-    device, _, clock, _ = _guarded_teleop(monkeypatch, x=0.1)
+def test_cached_active_motion_pauses_until_new_hid_report(monkeypatch):
+    device, state, clock, _ = _guarded_teleop(monkeypatch, x=0.1)
     try:
         assert device.get_action()["enabled"] is True
         clock[0] += 0.21
-        with pytest.raises(RuntimeError, match="active HID input is stale"):
-            device.get_action()
+        for _ in range(20):
+            action = device.get_action()
+            assert action["enabled"] is False
+            assert all(action[key] == 0.0 for key in (
+                "target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz"
+            ))
+        state.t += 0.001
+        assert device.get_action()["enabled"] is True
     finally:
         device.disconnect()
 
@@ -830,8 +836,9 @@ def test_debiased_deadzone_noise_does_not_trigger_stale_motion(monkeypatch):
         clock[0] += 1.0
         assert device.get_action()["enabled"] is False
         state.x = 0.6
-        with pytest.raises(RuntimeError, match="active HID input is stale"):
-            device.get_action()
+        assert device.get_action()["enabled"] is False
+        state.t += 0.001
+        assert device.get_action()["enabled"] is True
     finally:
         device.disconnect()
 
@@ -886,7 +893,7 @@ def test_activity_without_a_first_hid_report_is_rejected(monkeypatch):
         state.buttons = (1, 0)
         assert device.get_action()["gripper"] == 0.5
         state.x = 0.1
-        with pytest.raises(RuntimeError, match="active HID input is stale"):
+        with pytest.raises(RuntimeError, match="motion before its first HID report"):
             device.get_action()
     finally:
         device.disconnect()

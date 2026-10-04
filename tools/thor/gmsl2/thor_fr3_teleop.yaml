@@ -347,7 +347,7 @@ robot:
 teleop:
   type: spacemouse
   device_id: 0
-  frequency: 200
+  frequency: 100
   # Existing SpaceMouse driver defaults: debias, deadzones and [-y, x, z].
   translation_scale: 0.000615
   rotation_scale: 0.000648
@@ -367,7 +367,7 @@ fr3_teleop:
   # Repo-relative on Thor. This separate environment is only needed for F;
   # deployment and C continue to use the existing collection environment.
   runtime_python: .venv-fr3/bin/python
-  control_hz: 200
+  control_hz: 100
   command_timeout_s: 0.2
   startup_timeout_s: 60.0
   min_success_rate: 0.995

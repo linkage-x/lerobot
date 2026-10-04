@@ -282,7 +282,7 @@ The FR3 extension has these principal settings:
 | `robot.urdf_path` / `target_frame_name` | FR3 + Corenetic gripper model / `corenetic_gripper_ee` |
 | `fr3_teleop.runtime_python` | `.venv-fr3/bin/python`, relative to the deployed repository |
 | `fr3_teleop.realtime_mode` | `ignore` in this Thor profile; `enforce` requires PREEMPT_RT and SCHED_FIFO |
-| `fr3_teleop.control_hz` | 200 Hz Python target updates; native FCI remains 1 kHz |
+| `fr3_teleop.control_hz` | 100 Hz Python target updates and native state reads; native FCI remains 1 kHz |
 | `fr3_teleop.command_timeout_s` | 0.2 s parent command watchdog |
 | `fr3_teleop.max_state_age_s` | 0.1 s default maximum age of the native telemetry stream |
 | `fr3_teleop.startup_timeout_s` | 60 s to connect, move to start and become ready |
@@ -346,6 +346,9 @@ its prompt and operate it as a supervised motion test.
 The 1 kHz controller runs in native code in its own process. Camera acquisition,
 BOX I/O, UI, SpaceMouse sampling and file writes remain outside that callback.
 Only the latest target is exchanged over local IPC; old targets are not replayed.
+If a SpaceMouse HID report stops advancing, the arm receives zero motion and the
+gripper holds its last command until a fresh report arrives. A released mouse
+may legitimately send no reports; a brief report gap does not require pressing F.
 Loss of the parent, stale commands/state, native controller errors or a low
 success rate stop control and require F again. These guards detect failures;
 they cannot guarantee that FCI communication constraints remain satisfied under

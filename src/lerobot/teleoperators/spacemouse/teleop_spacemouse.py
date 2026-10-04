@@ -397,13 +397,19 @@ class SpaceMouseTeleop(Teleoperator):
             input_fresh = (
                 reading.report_timestamp >= 0 and reading.report_age_s <= self.config.motion_input_timeout_s
             )
-            if motion_detected and not input_fresh:
-                raise RuntimeError("SpaceMouse active HID input is stale; release/reconnect the device, then restart teleoperation")
+            if motion_detected and reading.report_timestamp < 0:
+                raise RuntimeError("SpaceMouse reported motion before its first HID report")
             if not input_fresh:
-                # Some devices send button reports only on press/release.
-                # Freeze a held button's target once its last report expires;
-                # cached button state must not keep incrementing the gripper.
-                button_0 = button_1 = False
+                # pyspacemouse returns its cached state when the HID device
+                # sends no report. A brief gap is not a disconnect, but the
+                # cached axes must never keep moving the arm. Pause motion
+                # and gripper updates until a fresh device timestamp arrives.
+                self._motion_active = False
+                self._prev_motion_detected = False
+                self._prev_motion_enabled = False
+                self._prev_enabled_out = False
+                self._prev_motion_active = False
+                return self._zero_action()
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
             motion_enabled = motion_detected and button_0
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:

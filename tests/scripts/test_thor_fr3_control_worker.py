@@ -512,7 +512,7 @@ def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypa
     ))
     monkeypatch.setitem(sys.modules, "ruckig", types.SimpleNamespace())
     monkeypatch.setattr(FrankaResearch3, "_make_kinematics_driver", lambda _self: object())
-    robot = worker.build_robot({"fr3_teleop": {"realtime_mode": mode}, "robot": {
+    robot = worker.build_robot({"fr3_teleop": {"realtime_mode": mode, "control_hz": 100}, "robot": {
         "type": "franka_research3", "robot_ip": "192.168.1.206",
         "urdf_path": "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf",
         "gripper_backend": "franka_hand", "allow_mock_gripper": True,
@@ -528,6 +528,7 @@ def test_worker_forces_isolated_gripper_cameras_and_native_safety_flags(monkeypa
     assert robot.config.arm_realtime_enforce is (mode == "enforce")
     assert robot.config.arm_require_no_automatic_recovery is True
     assert robot.config.arm_start_controller_on_connect is False
+    assert robot.config.arm_state_poll_frequency_hz == 100
     assert robot.is_connected is False
     gripper = robot._make_gripper_driver()
     gripper.connect()
