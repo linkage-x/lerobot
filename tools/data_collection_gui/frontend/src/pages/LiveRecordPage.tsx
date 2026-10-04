@@ -154,6 +154,12 @@ export function Fr3StatusPanel({ status }: { status: Fr3TeleopStatus }) {
       <p className={status.state === "error" ? "fr3-fault-message" : "panel-note"} role={status.state === "error" ? "alert" : "status"}>
         {status.message}
       </p>
+      {status.state === "running" && telemetry.fci_quality_warning === true && (
+        <p className="tracker-wait-banner" role="status">
+          FCI timing warning: success {telemetryNumber(telemetry.control_command_success_rate, 3)}.
+          Brief packet loss detected; sustained degradation will stop teleoperation.
+        </p>
+      )}
       {status.state === "error" && (
         <p className="fr3-fault-message">{status.pid != null
           ? "FR3 worker shutdown is not confirmed. Stop the robot using its hardware controls and resolve the remaining worker process before retrying F."
@@ -176,6 +182,7 @@ export function Fr3StatusPanel({ status }: { status: Fr3TeleopStatus }) {
           <Metric label="External force xyz (N)" value={[0, 1, 2].map((i) => telemetryNumber(wrench[i])).join(", ")} />
           <Metric label="External torque xyz (Nm)" value={[3, 4, 5].map((i) => telemetryNumber(wrench[i])).join(", ")} />
           <Metric label="FCI command success rate" value={telemetryNumber(telemetry.control_command_success_rate, 5)} />
+          <Metric label="Lowest FCI rate this session" value={telemetryNumber(telemetry.fci_min_observed_success_rate, 5)} />
           <Metric label="Measured gripper opening (m)" value={telemetryNumber(telemetry.gripper_measured_m, 4)} />
           {typeof telemetry.clock_rtt_s === "number" && <>
             <Metric label="Host–Thor round trip (ms)" value={telemetryNumber(telemetry.clock_rtt_s * 1000, 2)} />

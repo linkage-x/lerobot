@@ -18,6 +18,11 @@ chmod 700 outputs/secrets
 # Refuse to kill a busy controller. A live connection cannot answer this request.
 "$python_bin" -m tools.thor.fr3_host --shutdown-if-idle
 sleep 0.2
+if "$python_bin" -c 'import yaml; from pathlib import Path; c=yaml.safe_load(Path("tools/thor/gmsl2/thor_fr3_teleop.yaml").read_text()); raise SystemExit(0 if c["fr3_teleop"].get("host_performance_governor", False) else 1)'; then
+  if ! bash run/setup_host_fr3_permissions.sh --performance; then
+    echo "WARN: could not set host performance governor; fix host scheduling before F." >&2
+  fi
+fi
 umask 077
 if [[ ! -s outputs/secrets/fr3_host.token ]]; then
   "$python_bin" -c 'import secrets; from pathlib import Path; Path("outputs/secrets/fr3_host.token").write_text(secrets.token_hex(32))'

@@ -67,7 +67,16 @@ did not resolve this Thor's current FCI timing fault.
 F starts physical motion. Release the SpaceMouse before pressing F and keep the
 robot's user stop accessible. Wait for **running** before using the puck or E.
 SpaceMouse axes use the existing `[-raw_y, raw_x, raw_z]` translation mapping;
-buttons adjust the BOX gripper's opening. The UI displays measured joints,
+buttons adjust the BOX gripper's opening. The profile now separates translation
+and rotation: any translation suppresses rotational input until all six axes
+return to neutral. Release the puck fully before a deliberate rotation-only
+gesture. This prevents incidental tilt and the release tail from rotating the
+EE during an X/Y/Z translation. `separate_translation_rotation: false` restores
+simultaneous 6-DOF control; `enable_rotation: false` disables rotation entirely.
+Rotation deadzones are 0.12 and rotation gain is 0.000324 per input update;
+translation gain is unchanged. `robot.ik_orientation_weight: 1.0` strengthens
+the IK orientation target. These hold the commanded orientation; physical
+tracking error still depends on the controller and robot load. The UI displays measured joints,
 velocity, measured/external joint torque, TCP pose and estimated external wrench.
 
 This profile requires recent HID reports for active puck motion. Cached motion
@@ -121,9 +130,9 @@ Thor: cameras + BOX sensors <- recorder/coordinator -> BOX gripper SDK
 
 The native FCI worker remains a separate **host** process with same-machine
 IPC. Camera encoding, BOX polling and network serialization stay outside it.
-Host/Thor controller config digests must match. The original `0.995` FCI guard,
-workspace/joint/delta limits, native watchdog and no-automatic-recovery patch
-are unchanged. Moving machines reduces shared CPU load; it does not prove that
+Host/Thor controller config digests must match. The FCI quality target is
+`0.995`, with the bounded warning policy described below. Workspace/joint/delta
+limits, native watchdog and no-automatic-recovery patch remain active. Moving machines reduces shared CPU load; it does not prove that
 a non-RT host meets every 1 ms FCI deadline.
 
 F opens a fresh authenticated session, qualifies eight clock probes, then starts
@@ -186,6 +195,14 @@ in the native library search path. Recreating the environment may require
 restoring this ABI-matching library (never substitute a different soname).
 The SpaceMouse Compact `256f:c635` has a host udev rule for plugdev access.
 
+The profile sets `host_performance_governor: true`; deployment reapplies the
+host CPU `performance` governor with noninteractive sudo and reports a warning
+if it cannot. This increases host power use; set the option false to manage CPU
+policy yourself. `--performance` on the scheduling helper applies it manually.
+The pre-test governor snapshot was saved in
+`/tmp/lerobot-host-fr3-governors-before.json` (all 20 policies were `powersave`).
+The native worker limits OpenMP/BLAS pools to one thread for small 7-DOF IK.
+
 The scheduling helper permits this account to request FIFO priority up to 99
 in future logins. It writes an opt-in marker under `outputs/secrets`; for an
 older desktop login, deployment uses `sudo -n prlimit` only on the newly spawned
@@ -243,6 +260,70 @@ connected (no episode recording), another 100 probes measured median 0.625 ms,
 maximum 0.899 ms and estimated uncertainty 0.442 ms. The test session was then
 cleanly disconnected. Sustained host-driven motion
 and loaded recording stability still require the operator F trial above.
+
+## FCI quality policy and 2026-10-04 follow-up validation
+
+SpaceMouse reports are user input; this profile polls them at 100 Hz and sends
+telemetry over the host/Thor link at 50 Hz. Regardless of input frequency,
+libfranka must keep its native FCI loop at 1 kHz. A slower mouse does not relax
+robot communication deadlines. `control_command_success_rate` reports the last
+100 native commands: 0.98 means two missed commands in that window, not a
+20 Hz SpaceMouse issue. See [libfranka's state definition](https://raw.githubusercontent.com/frankarobotics/libfranka/0.15.0/include/franka/robot_state.h)
+and [Franka timing guidance](https://frankarobotics.github.io/docs/troubleshooting.html).
+
+The previous application guard stopped on every sample below 0.995. The host
+profile now keeps 0.995 as the target and startup qualification threshold, but
+allows a **warning for up to 0.2 seconds** at rates from 0.98 up to that target.
+Below 0.98 stops immediately; continuous below-target readings for 0.2 seconds
+also stop. These are application tuning choices, not manufacturer-certified
+safety thresholds. Native reflexes, communication constraints, local state/input
+watchdogs and joint/workspace bounds remain active. Do not lower this setting
+to mask a native `communication_constraints_violation` fault. Omitting
+`success_rate_grace_s` preserves the legacy immediate-stop policy.
+
+Live Record shows a warning during a dip and retains the lowest observed rate
+for the session. Sidecars retain `fci_quality_warning`, `fci_below_target_s`,
+`fci_quality_dips`, and `fci_min_observed_success_rate`, so short dips are not
+hidden by a later recovery to 1.0.
+
+Investigation found the host service still had an rtprio ceiling of 0, CPU
+policies were `powersave`, and both FR3 and Thor traffic use `eno2`. FIFO ceiling
+99 is now installed for corenetic and inherited by new native workers;
+performance governors are configured as above. The host profile now requires
+FIFO permission even with `realtime_mode: ignore`; if that permission is lost,
+F refuses before connecting or homing. `--check` from an old desktop terminal
+with `ulimit -r = 0` also refuses: use a fresh login after permission setup.
+There were no NIC hardware
+error counters indicating cable corruption. Shared-NIC contention remains a
+possible source of jitter: a dedicated direct FR3 cable/NIC is preferable.
+`enp7s0` exists but currently has no link; no IPs or routes were changed.
+
+The user's three-camera recording contained 1,321 telemetry samples with FCI
+rate 1.0 throughout. Of 1,043 samples commanding translation, 981 also commanded
+rotation. This established input cross-coupling as a major contributor to the
+reported unwanted rotation. With the new IK weight, an offline URDF check over
+±5 cm X/Y targets had maximum orientation residual below 0.0001 degrees and
+position residual below 0.023 mm. That checks the kinematic target, not physical
+servo tracking.
+
+With all 11 cameras connected and their previews fetched at up to 5 Hz each,
+a user-approved 15-second native neutral hold passed: 750 telemetry samples,
+minimum/mean FCI rate 1.0, no below-target samples, and confirmed FIFO priority
+99 native threads. The worker exited cleanly. Result and samples:
+`outputs/diagnostics/fr3_host_20261004/neutral_all_cameras.json`.
+This was a zero-input hold with preview traffic, not a moving-arm or full video
+recording endurance test. Repeat an operator motion/recording trial for final
+operational acceptance; the non-RT kernel remains a limitation.
+
+The explicit repeatable neutral test performs physical homing, then forces all
+Cartesian increments to zero; it never opens SpaceMouse or actuates BOX:
+
+```bash
+# Run from a login with ulimit -r = 99. Stop other FR3 control first.
+PYTHONPATH=src:. .venv-fr3/bin/python -m tools.thor.fr3_neutral_check \
+  --confirm-motion --seconds 15 \
+  --output outputs/diagnostics/fr3_neutral_repeat.json
+```
 
 ## Legacy direct-Thor setup and commissioning history
 
@@ -455,7 +536,7 @@ The FR3 extension has these principal settings:
 | `fr3_teleop.command_timeout_s` | 0.2 s parent command watchdog |
 | `fr3_teleop.max_state_age_s` | 0.1 s default maximum age of the native telemetry stream |
 | `fr3_teleop.startup_timeout_s` | 60 s to connect, move to start and become ready |
-| `fr3_teleop.min_success_rate` | 0.995 monitored native communication success threshold |
+| `fr3_teleop.min_success_rate` | 0.995 startup/quality target; host profile allows a 0.2 s warning at rates ≥0.98 |
 | `fr3_teleop.gripper_box_id` | Blank accepts exactly one BOX; specify the real ID for multiple BOXes |
 | `fr3_teleop.gripper_max_width_m` | 0.09 m |
 
@@ -525,6 +606,20 @@ unmeasured system load. Native scheduling/CPU/IRQ tuning and loaded testing are
 still required on this specific Thor/camera configuration.
 
 ## Recorded data
+
+Videos are saved **on Thor**, even when SpaceMouse and FR3 control run on the
+host. Raw camera files are under
+`/home/nvidia/lerobot/outputs/datasets/<dataset>/episodes/episode_000000/cam_XX.mkv`.
+The raw capture does not require a top-level `videos/` directory; that layout is
+used by video export. The host's `outputs/datasets` is not automatically mirrored.
+In the UI, select the dataset and episode in **Episode Replay**, then use the
+**Replay Inspector** camera tiles and Play. The first video request creates an
+H.264 `.mp4` playback cache beside each original H.265 `.mkv`; allow time for
+that conversion. The original recordings are retained.
+
+For `thor_gmsl2_3ch_v1_20261004_164412`, episode 0 was verified to contain
+`cam_03.mkv`, `cam_07.mkv` and `cam_13.mkv`: each has 1,191 readable frames,
+1920×1080 at 60 fps, duration 19.85 seconds, and approximately 49.9 MB.
 
 Existing per-camera MKVs, synchronized Argus timestamps, BOX force/tactile/gripper
 samples and episode metadata remain intact. FR3 recordings also include

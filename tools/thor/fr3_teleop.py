@@ -58,6 +58,8 @@ def make_spacemouse(config: dict, opening: float, repo_root: Path):
 
 def native_environment(repo_root: Path, runtime_python: Path) -> dict[str, str]:
     env = dict(os.environ)
+    # Small 7-DOF IK operations do not benefit from competing BLAS/OpenMP pools.
+    env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
     env["PYTHONPATH"] = os.pathsep.join((str(repo_root / "src"), str(repo_root), env.get("PYTHONPATH", "")))
     libraries = sorted((runtime_python.parent.parent / "lib").glob("python*/site-packages/cmeel.prefix/lib"))
     env["LD_LIBRARY_PATH"] = os.pathsep.join([str(runtime_python.parent.parent / "lib"),

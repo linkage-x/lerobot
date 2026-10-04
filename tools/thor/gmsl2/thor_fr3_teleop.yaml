@@ -332,6 +332,7 @@ robot:
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   ik_solver: placo
+  ik_orientation_weight: 1.0
   use_otg: true
   otg_control_frequency: 200.0
   otg_async_control_frequency: 1000.0
@@ -350,7 +351,11 @@ teleop:
   frequency: 100
   # Existing SpaceMouse driver defaults: debias, deadzones and [-y, x, z].
   translation_scale: 0.000615
-  rotation_scale: 0.000648
+  rotation_scale: 0.000324
+  threshold_wx: 0.12
+  threshold_wy: 0.12
+  threshold_wz: 0.12
+  separate_translation_rotation: true
   translation_axis_map: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
   rotation_axis_map: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
   enable_rotation: true
@@ -364,10 +369,15 @@ fr3_teleop:
   # Host owns SpaceMouse + native FCI; Thor owns cameras, BOX and recording.
   # deploy.sh starts the authenticated SSH link. Use thor only for legacy mode.
   execution_host: host
+  # Reapply performance governor on host deployment; uses sudo -n and warns on failure.
+  host_performance_governor: true
   # Keep the explicitly commissioned non-RT mode; moving control to the host
-  # still requires a loaded FCI timing trial. No success-rate guard is relaxed.
+  # still requires a loaded FCI timing trial. Native FCI deadlines are unchanged.
   # Set enforce for PREEMPT_RT + SCHED_FIFO preflight and native kEnforce.
   realtime_mode: ignore
+  # Allow the commissioned non-RT kernel, but never silently fall back to
+  # ordinary scheduling if the native FIFO permission is lost after reboot.
+  require_fifo: true
   # Repo-relative on the controller host. This separate environment is needed for F;
   # deployment and C continue to use the existing collection environment.
   runtime_python: .venv-fr3/bin/python
@@ -375,6 +385,10 @@ fr3_teleop:
   command_timeout_s: 0.2
   startup_timeout_s: 60.0
   min_success_rate: 0.995
+  # Brief isolated losses warn; persistent losses or a dip below 0.98 stop.
+  # These are application diagnostics, not a change to libfranka's 1 kHz loop.
+  success_rate_grace_s: 0.2
+  success_rate_hard_floor: 0.98
   # Leave blank only for a single discovered BOX. For multiple boxes, set the
   # discovered ID of the BOX physically attached to the FR3 gripper.
   gripper_box_id: ""

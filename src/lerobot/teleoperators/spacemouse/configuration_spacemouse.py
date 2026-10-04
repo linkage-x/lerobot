@@ -72,6 +72,9 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     bias_sample_count: int = 30
     bias_sample_sleep_s: float = 0.005
     enable_rotation: bool = True
+    # Translation suppresses rotation until all six axes return to neutral.
+    # Rotation-only gestures remain available after releasing the puck.
+    separate_translation_rotation: bool = False
     motion_enable_button: SpaceMouseEnableButton = SpaceMouseEnableButton.NONE
     # Optional HID report freshness guard. A stale report produces zero arm
     # motion and holds the gripper until a new report arrives. Neutral idle

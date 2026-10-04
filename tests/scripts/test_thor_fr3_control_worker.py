@@ -697,3 +697,50 @@ def test_backend_refuses_nonfinite_or_out_of_bounds_native_joint_commands(monkey
 def test_excessive_or_invalid_dynamic_limits_fail_before_native_initialization(key, value):
     with pytest.raises(ValueError, match="initial Thor preset"):
         worker.Settings.from_config({"robot": {key: [value] * 7}})
+
+
+def test_success_rate_grace_warns_on_isolated_loss_but_stops_sustained_loss():
+    now = [10.]
+    settings = worker.Settings(success_rate_grace_s=.2, success_rate_hard_floor=.98)
+    guard = worker.StateGuard(settings, clock=lambda: now[0])
+    def check(rate):
+        state = telemetry(robot_time=now[0], sample_monotonic_s=now[0], control_command_success_rate=rate)
+        guard.check(state, active=True)
+        return state
+    assert check(.98)["fci_quality_warning"]
+    now[0] += .15
+    assert not check(1.)["fci_quality_warning"]
+    now[0] += .01
+    assert check(.99)["fci_below_target_s"] == 0
+    now[0] += .21
+    with pytest.raises(RuntimeError, match="grace"):
+        check(.99)
+
+
+def test_success_rate_grace_never_bypasses_floor_or_native_mode():
+    settings = worker.Settings(success_rate_grace_s=.2)
+    for changes in ({"control_command_success_rate": .97}, {"robot_mode": "kReflex"},
+                    {"control_command_success_rate": float("nan")}, {"control_command_success_rate": True}):
+        with pytest.raises(RuntimeError):
+            worker.StateGuard(settings).check(telemetry(**changes), active=True)
+
+
+@pytest.mark.parametrize("changes", [
+    {"success_rate_grace_s": -.1}, {"success_rate_grace_s": float("nan")},
+    {"success_rate_grace_s": .6}, {"success_rate_hard_floor": 0},
+    {"success_rate_hard_floor": float("nan")},
+    {"success_rate_grace_s": .2, "success_rate_hard_floor": 1.},
+])
+def test_success_rate_policy_config_validation(changes):
+    with pytest.raises(ValueError):
+        worker.Settings.from_config({"fr3_teleop": changes})
+
+
+def test_non_rt_profile_can_require_fifo_before_native_import_or_robot_connect(monkeypatch):
+    monkeypatch.setattr(worker, "load_config", lambda _: {"fr3_teleop": {"realtime_mode": "ignore", "require_fifo": True}})
+    monkeypatch.setattr(worker, "check_realtime", lambda _: None)
+    def denied():
+        raise RuntimeError("FR3 needs SCHED_FIFO permission")
+    monkeypatch.setattr(worker, "check_fifo_permission", denied)
+    monkeypatch.setattr(worker, "build_robot", lambda *_: pytest.fail("Must reject missing FIFO before native setup"))
+    assert worker.main(["--config-path", "unused", "--check"]) == 1

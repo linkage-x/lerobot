@@ -85,11 +85,16 @@ _PROCESS_OWNERSHIP_LOCKS: list[ArmOwnershipLock] = []
 @dataclass(frozen=True)
 class Settings:
     realtime_mode: str = "enforce"
+    require_fifo: bool = False
     control_hz: float = 200.0
     telemetry_hz: float = 50.0
     command_timeout_s: float = 0.2
     max_state_age_s: float = 0.1
     min_success_rate: float = 0.995
+    # Default preserves the legacy immediate guard. A profile can allow a
+    # bounded warning interval while retaining an immediate lower floor.
+    success_rate_grace_s: float = 0.0
+    success_rate_hard_floor: float = 0.98
     delta_pos: tuple[float, ...] = (0.001, 0.001, 0.001)
     delta_rot: tuple[float, ...] = (0.01, 0.01, 0.01)
     joint_lower: tuple[float, ...] = SAFE_JOINT_LOWER
@@ -101,11 +106,14 @@ class Settings:
         robot = config.get("robot", {})
         result = cls(
             realtime_mode=section.get("realtime_mode", "enforce"),
+            require_fifo=section.get("require_fifo", False),
             control_hz=float(section.get("control_hz", 200)),
             telemetry_hz=float(section.get("telemetry_hz", 50)),
             command_timeout_s=float(section.get("command_timeout_s", 0.2)),
             max_state_age_s=float(section.get("max_state_age_s", 0.1)),
             min_success_rate=float(section.get("min_success_rate", 0.995)),
+            success_rate_grace_s=float(section.get("success_rate_grace_s", 0.0)),
+            success_rate_hard_floor=float(section.get("success_rate_hard_floor", 0.98)),
             delta_pos=tuple(robot.get("max_target_delta_pos") or (0.001,) * 3),
             delta_rot=tuple(robot.get("max_target_delta_rot") or (0.01,) * 3),
             joint_lower=tuple(robot.get("otg_min_position") or SAFE_JOINT_LOWER),
@@ -113,6 +121,8 @@ class Settings:
         )
         if result.realtime_mode not in ("enforce", "ignore"):
             raise ValueError("fr3_teleop.realtime_mode must be 'enforce' or 'ignore'.")
+        if type(result.require_fifo) is not bool:
+            raise ValueError("fr3_teleop.require_fifo must be a boolean")
         limits = (("control_hz", 1, 500), ("telemetry_hz", 1, 50),
                   ("command_timeout_s", 0.05, 0.5), ("max_state_age_s", 0.005, 0.5),
                   ("min_success_rate", 0, 1))
@@ -120,6 +130,12 @@ class Settings:
             value = getattr(result, key)
             if not math.isfinite(value) or not lower < value <= upper:
                 raise ValueError(f"fr3_teleop.{key} must be finite and in ({lower}, {upper}].")
+        if not math.isfinite(result.success_rate_grace_s) or not 0 <= result.success_rate_grace_s <= 0.5:
+            raise ValueError("success_rate_grace_s must be finite and in [0, 0.5]")
+        if not math.isfinite(result.success_rate_hard_floor) or not 0 < result.success_rate_hard_floor <= 1:
+            raise ValueError("success_rate_hard_floor must be finite and in (0, 1]")
+        if result.success_rate_grace_s and result.success_rate_hard_floor > result.min_success_rate:
+            raise ValueError("success_rate_hard_floor must not exceed min_success_rate with grace enabled")
         for key in ("delta_pos", "delta_rot"):
             values = getattr(result, key)
             if len(values) != 3 or any(not math.isfinite(v) or v <= 0 for v in values):
@@ -172,13 +188,20 @@ def check_realtime(mode: str = "enforce") -> None:
             "FR3 requires a PREEMPT_RT kernel on this controller computer. /sys/kernel/realtime is not 1; "
             "sensor capture remains available. Install and validate a compatible RT kernel before pressing F."
         )
+    check_fifo_permission()
+
+
+def check_fifo_permission() -> None:
+    """Check native scheduling permission independently of PREEMPT_RT support."""
     previous_policy = os.sched_getscheduler(0)
     previous_parameters = os.sched_getparam(0)
     try:
         priority = os.sched_get_priority_max(os.SCHED_FIFO)
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
     except PermissionError as exc:
-        raise RuntimeError("FR3 needs SCHED_FIFO permission (rtprio limits or CAP_SYS_NICE) on the controller computer.") from exc
+        raise RuntimeError("FR3 needs SCHED_FIFO permission on the controller computer. "
+                           "Run run/setup_host_fr3_permissions.sh --install and redeploy "
+                           "(or log out/in); no robot recovery is needed for this setup error.") from exc
     finally:
         os.sched_setscheduler(0, previous_policy, previous_parameters)
 
@@ -395,6 +418,9 @@ class StateGuard:
         self.clock = clock
         self.last_robot_time: float | None = None
         self.last_advance_at = clock()
+        self.low_rate_since: float | None = None
+        self.minimum_rate = 1.0
+        self.quality_dips = 0
 
     def check(self, state: dict[str, Any], *, active: bool) -> None:
         now = self.clock()
@@ -428,10 +454,30 @@ class StateGuard:
             if mode != "kMove":
                 raise RuntimeError("FR3 native control loop is no longer active.")
             success = state.get("control_command_success_rate")
-            if success is None or not math.isfinite(success) or not self.settings.min_success_rate <= success <= 1:
+            if isinstance(success, bool) or not isinstance(success, (int, float)) or not math.isfinite(success) or not 0 <= success <= 1:
+                raise RuntimeError("FR3 FCI control command success rate is invalid")
+            low = success < self.settings.min_success_rate
+            if low and self.low_rate_since is None:
+                self.low_rate_since = now
+                self.quality_dips += 1
+            elif not low:
+                self.low_rate_since = None
+            low_duration = 0.0 if self.low_rate_since is None else now - self.low_rate_since
+            self.minimum_rate = min(self.minimum_rate, success)
+            state["fci_min_observed_success_rate"] = self.minimum_rate
+            state["fci_quality_dips"] = self.quality_dips
+            state["fci_quality_warning"] = low
+            state["fci_below_target_s"] = low_duration
+            state["fci_target_success_rate"] = self.settings.min_success_rate
+            state["fci_hard_floor"] = self.settings.success_rate_hard_floor
+            if low and (self.settings.success_rate_grace_s == 0
+                        or success < self.settings.success_rate_hard_floor
+                        or low_duration >= self.settings.success_rate_grace_s):
                 raise RuntimeError(
                     f"FR3 FCI control command success rate {success!r} is below the configured "
-                    f"limit {self.settings.min_success_rate}."
+                    f"limit {self.settings.min_success_rate} for {low_duration:.3f}s "
+                    f"(grace {self.settings.success_rate_grace_s:.3f}s, immediate floor "
+                    f"{self.settings.success_rate_hard_floor})."
                 )
 
 
@@ -518,6 +564,8 @@ def run_worker(channel: JsonChannel, config_path: str, *, config: dict[str, Any]
             preflight()
         else:
             check_realtime(settings.realtime_mode)
+            if settings.require_fifo and settings.realtime_mode == "ignore":
+                check_fifo_permission()
         receiver.require_live()
         robot = (robot_factory or build_robot)(configuration, config_path)
         receiver.begin_control()
@@ -594,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config(args.config_path)
             settings = Settings.from_config(config)
             check_realtime(settings.realtime_mode)
+            if settings.require_fifo and settings.realtime_mode == "ignore":
+                check_fifo_permission()
             build_robot(config, args.config_path)
         except Exception as exc:
             print(f"FR3 preflight failed: {exc}", file=sys.stderr)

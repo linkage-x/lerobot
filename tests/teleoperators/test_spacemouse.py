@@ -933,3 +933,35 @@ def test_idle_bias_failure_releases_hid_before_caller_can_start_fci(monkeypatch)
     with pytest.raises(RuntimeError, match="HID read failed"):
         device.connect()
     assert raw.closed and not device.is_connected and device._driver is None
+
+
+def test_translation_gesture_suppresses_rotation_until_full_neutral(teleop):
+    teleop.config.separate_translation_rotation = True
+    teleop.connect()
+    for translation, rotation, expected in [
+        ([.5, .4, 0], [.6, 0, 0], "translation"),
+        ([0, 0, 0], [.3, 0, 0], "hold"),  # release tail must not rotate
+        ([0, 0, 0], [0, 0, 0], "hold"),
+        ([0, 0, 0], [.3, 0, 0], "rotation"),
+        ([.4, 0, 0], [.3, 0, 0], "translation"),
+    ]:
+        teleop._driver.readings.append(SpaceMouseReading(translation=translation, rotation=rotation, buttons=(False, False)))
+        action = teleop.get_action()
+        if expected == "translation":
+            assert any(action[k] for k in ("target_x", "target_y", "target_z"))
+            assert all(action[k] == 0 for k in ("target_wx", "target_wy", "target_wz"))
+        elif expected == "rotation":
+            assert action["target_wx"] > 0
+            assert all(action[k] == 0 for k in ("target_x", "target_y", "target_z"))
+        else:
+            assert not action["enabled"]
+
+
+def test_separated_translation_keeps_gripper_buttons(teleop):
+    teleop.config.separate_translation_rotation = True
+    teleop.connect()
+    teleop.sync_gripper_baseline(.5)
+    teleop._driver.readings.append(SpaceMouseReading(translation=[.5, 0, 0], rotation=[.5, 0, 0], buttons=(True, False)))
+    action = teleop.get_action()
+    assert action["gripper"] != .5
+    assert action["target_wx"] == 0

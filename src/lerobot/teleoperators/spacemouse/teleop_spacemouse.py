@@ -65,6 +65,7 @@ class SpaceMouseTeleop(Teleoperator):
         self._button_press_times = np.full(2, float("-inf"), dtype=np.float64)
         self._translation_bias = np.zeros(3, dtype=np.float64)
         self._rotation_bias = np.zeros(3, dtype=np.float64)
+        self._translation_gesture = False
         # State-change tracking for targeted debug logging
         self._prev_motion_detected = False
         self._prev_motion_enabled = False
@@ -96,6 +97,7 @@ class SpaceMouseTeleop(Teleoperator):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
+        self._translation_gesture = False
         driver_args: dict[str, Any] = {"device_id": self.config.device_id}
         if self.config.motion_input_timeout_s is not None:
             driver_args["motion_input_timeout_s"] = self.config.motion_input_timeout_s
@@ -378,10 +380,21 @@ class SpaceMouseTeleop(Teleoperator):
         abs_data = np.abs(data)
         active_mask = abs_data >= threshold
         data = np.where(active_mask, data, 0.0)
+        if not self.config.enable_rotation:
+            data[3:] = 0.0
+        if self.config.separate_translation_rotation:
+            # Do not let a small rotational release tail become a new rotation
+            # command at the end of a translation. Require full neutral first.
+            if not np.any(data):
+                self._translation_gesture = False
+            elif np.any(data[:3]):
+                self._translation_gesture = True
+            if self._translation_gesture:
+                data[3:] = 0.0
         # Match the HIROL 3D-mouse teleop behavior more closely: once each axis is
         # deadbanded, motion enable/disable is determined directly from the zeroed
         # delta instead of a separate hysteresis/release-decay state machine.
-        motion_detected = bool(np.any(active_mask))
+        motion_detected = bool(np.any(data))
         input_fresh = True
         if self.config.motion_input_timeout_s is not None:
             # Check before updating either the Cartesian increment or the
