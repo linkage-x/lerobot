@@ -5,3 +5,9 @@
 [submodule "tools/thor/box_sdk"]
 	path = tools/thor/box_sdk
 	url = git@github.com:linkage-x/box-sdk.git
+[submodule "third_party/Track4World"]
+	path = third_party/Track4World
+	url = git@github.com:linkage-x/Track4World.git
+[submodule "third_party/Fast-FoundationStereo"]
+	path = third_party/Fast-FoundationStereo
+	url = https://github.com/NVlabs/Fast-FoundationStereo.git
