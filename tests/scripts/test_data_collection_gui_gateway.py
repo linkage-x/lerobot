@@ -1776,7 +1776,9 @@ class _FakeTrackerSession:
         self.recording = []
         self.stopped = threading.Event()
 
+    @property
     def ready(self):
+        # A property on lts.LaserTrackerSession: calling it is a TypeError on every snapshot.
         return self._ready
 
     def beam_summary(self):
@@ -1789,6 +1791,16 @@ class _FakeTrackerSession:
     def stop_recording(self):
         self.stopped.set()
         return {}
+
+
+def test_fake_tracker_matches_the_real_session_interface():
+    from tools.thor.gmsl2 import laser_tracker_session as lts
+
+    assert isinstance(lts.LaserTrackerSession.ready, property)
+    assert isinstance(_FakeTrackerSession.ready, property)
+    assert callable(lts.LaserTrackerSession.beam_summary)
+    assert callable(lts.LaserTrackerSession.start_recording)
+    assert callable(lts.LaserTrackerSession.stop_recording)
 
 
 def _held_real_replay_state(tmp_path):

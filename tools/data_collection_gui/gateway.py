@@ -15962,8 +15962,13 @@ def _refresh_replay_tracker_status(state: GatewayState) -> None:
     session = state.replay_tracker
     if session is None or state.replay.realTrackerState not in ("waiting", "ready"):
         return
-    state.replay.realTrackerState = "ready" if session.ready() else "waiting"
-    state.replay.realTrackerDetail = session.beam_summary()
+    # Runs inside every snapshot: an optional instrument must never take the whole GUI down.
+    try:
+        state.replay.realTrackerState = "ready" if session.ready else "waiting"
+        state.replay.realTrackerDetail = session.beam_summary()
+    except Exception as exc:  # noqa: BLE001
+        state.replay.realTrackerState = "error"
+        state.replay.realTrackerDetail = f"tracker status unavailable: {type(exc).__name__}: {exc}"
 
 
 def _land_replay_tracker(state: GatewayState, session: Any, run_dir: Path, *, publish: bool = True) -> None:
@@ -16014,7 +16019,7 @@ def _execute_real_replay(state: GatewayState) -> None:
         session = state.replay_tracker
         if session is None or state.replay.realTrackerState in ("warming", "error", ""):
             raise RuntimeError(f"Laser tracker is not connected: {state.replay.realTrackerDetail or 'not started'}")
-        if not session.ready():
+        if not session.ready:
             raise RuntimeError(f"Laser tracker is not ready: {session.beam_summary()}")
         if not session.start_recording(int(state.replay.episode), time.time()):
             raise RuntimeError(f"Laser tracker refused to start recording: {session.last_error}")
