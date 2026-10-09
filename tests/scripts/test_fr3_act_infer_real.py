@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.cameras.configs import ColorMode, Cv2Backends
@@ -987,3 +988,69 @@ def test_preview_and_real_alignment_share_step0_policy_observation_state():
         preview_policy_observation['observation.state'],
         real_policy_observation['observation.state'],
     )
+
+
+def _info(world: str = '', link: str | None = None) -> dict:
+    info: dict = {'world_frame': {'world_frame_id': world}} if world else {}
+    if link is not None:
+        info['tcp_frame'] = {'link': link}
+    return info
+
+
+def _resolve_alignment(requested='auto', policy=None, alignment=None, target='link_lt_gripper_tcp'):
+    policy = _info() if policy is None else policy
+    return fr3_act_infer_real_runtime.resolve_dataset_alignment(
+        requested=requested,
+        policy_info=policy,
+        alignment_info=policy if alignment is None else alignment,
+        target_frame_name=target,
+    )
+
+
+def test_dataset_alignment_keeps_the_start_pose_estimate_unless_the_training_data_is_in_fr3_base():
+    fr3 = _info('fr3_base', 'link_lt_gripper_tcp')
+    camera_world = _info('world_20260928_063531', 'link_lt_gripper_tcp')
+    # FR3-native recordings carry no stamp, camera-world exports carry a world id: both keep
+    # the start-pose estimate they have always used.
+    assert _resolve_alignment(policy=_info()) == 'start_pose'
+    assert _resolve_alignment(policy=camera_world) == 'start_pose'
+    # fr3_base demos are still moved to the arm by default -- they were mostly recorded out of reach.
+    assert _resolve_alignment(policy=fr3) == 'start_position'
+    assert _resolve_alignment('absolute', policy=fr3) == 'absolute'
+    assert _resolve_alignment('start_pose', policy=fr3) == 'start_pose'
+    with pytest.raises(ValueError, match='--target-world fr3_base'):
+        _resolve_alignment('absolute', policy=camera_world)
+
+
+def test_dataset_alignment_in_fr3_base_requires_the_ik_target_to_be_the_labelled_link():
+    with pytest.raises(ValueError, match='--target-frame-name link_lt_gripper_tcp'):
+        _resolve_alignment(policy=_info('fr3_base', 'link_lt_gripper_tcp'), target='pika_gripper_ee')
+    with pytest.raises(ValueError, match='tcp_frame.link'):
+        _resolve_alignment(policy=_info('fr3_base', ''))
+
+
+def test_dataset_alignment_reads_the_training_frame_not_a_re_exported_source():
+    # The IL view keeps the frame it was built from; its source has since been re-exported.
+    with pytest.raises(ValueError, match='re-exported since the view was built'):
+        _resolve_alignment(
+            policy=_info('world_20260928_063531', 'link_lt_gripper_tcp'),
+            alignment=_info('fr3_base', 'link_lt_gripper_tcp'),
+        )
+
+
+def test_start_position_alignment_moves_the_demos_without_turning_them():
+    rotation = fr3_act_infer_real_runtime.Rotation.from_rotvec([0.0, 0.0, 0.3]).as_matrix()
+    contract = np.eye(4)
+    contract[:3, 3] = [1.2, 0.7, 0.8]
+    live = np.eye(4)
+    live[:3, :3] = rotation  # the arm starts turned 17 deg from the demos' mean start
+    live[:3, 3] = [0.5, 0.0, 0.4]
+
+    shift = fr3_act_infer_real_runtime.dataset_alignment_transform('start_position', live, contract)
+    assert np.allclose(shift[:3, :3], np.eye(3))
+    assert np.allclose(shift[:3, 3], [-0.7, -0.7, -0.4])
+    assert np.allclose(fr3_act_infer_real_runtime.dataset_alignment_transform('absolute', live, contract), np.eye(4))
+    # The legacy estimate turns everything by the start-orientation difference.
+    legacy = fr3_act_infer_real_runtime.dataset_alignment_transform('start_pose', live, contract)
+    assert np.allclose(legacy[:3, :3], rotation)
+    assert np.allclose(legacy @ contract, live)

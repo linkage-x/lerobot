@@ -2767,6 +2767,8 @@ def test_export_command_builds_args_from_task(tmp_path):
     assert command[command.index("--task") + 1] == "pick the cube"
     assert command[command.index("--datasets-root") + 1] == str(datasets_root)
     assert "--overwrite" in command
+    # The frame is not an operator choice: the FR3 base whenever an edge reaches it.
+    assert command[command.index("--target-world") + 1] == "auto"
     assert command[1].endswith("tools/thor/gmsl2/export_v3.py")
 
 
@@ -2819,6 +2821,7 @@ def test_approved_dataset_export_command_uses_actual_camera_count_for_output_nam
     assert command[command.index("--output-name") + 1] == "thor_gmsl2_8ch_v1_20260713_075106"
     assert command[command.index("--repo-id") + 1] == "local/thor_gmsl2_8ch_v1_20260713_075106"
     assert out_root == state.exports_root / "thor_gmsl2_8ch_v1_20260713_075106"
+    assert command[command.index("--target-world") + 1] == "auto"
 
 
 def test_approved_dataset_export_command_scopes_to_selected_session(tmp_path):

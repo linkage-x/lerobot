@@ -76,6 +76,29 @@ records the source world block and the edge in `info.json`'s `world_frame`.
 Without an edge connecting the two worlds the export is refused, never treated
 as an identity.
 
+The GUI's exports pass `--target-world auto`: `fr3_base` when an edge reaches
+it, otherwise the recorded world, and the "Export complete" line names which.
+It is not offered as a choice, because the consumer (the FR3) fixes it.
+`info.json` also gets `tcp_frame` (the URDF link the ee poses carry, from each
+session's tracking-run summary), since deployment has to drive that same link.
+
+On the arm, `tools/fr3/fr3_act_infer_real_runtime.py --dataset-alignment`
+reads the frame from the policy's own training view (not from a source
+re-exported since then), and picks how `T(B,W_s)` is obtained:
+
+- `start_pose` (unstamped or camera-world data): all 6 DoF come from one start
+  pose, so a start-orientation error turns the whole trajectory.
+- `start_position` (the default for `fr3_base` data): the rotation is the
+  measured one, and the demos are only shifted to the arm's start position.
+  As of 10-09 most box demos are 1.1–1.3 m from the base, beyond the FR3's
+  reach, so they have to be moved.
+- `absolute`: identity. Use it only for demos recorded inside the arm's reach.
+
+Both `fr3_base` modes refuse to run unless the IK target is `tcp_frame.link`.
+For the box labels that is `link_lt_gripper_tcp` (corenetic URDF), and its
+origin is the insert-v2 socket centre, not that link's origin. The offset
+between the two is still unrecorded (see the 0929 marker->TCP bundle).
+
 The edge is valid only while the rig cameras stay at their 0928 poses and the
 FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
 `register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between

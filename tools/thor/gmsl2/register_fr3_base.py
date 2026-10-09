@@ -50,7 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 
 REPORT_SCHEMA = "fr3_base_registration_report/v1"
-DEFAULT_TARGET_WORLD = "fr3_base"
+DEFAULT_TARGET_WORLD = wp.FR3_BASE_WORLD_ID
 TAG_ID = 6
 
 #: Verdict gates.  The out-of-sample tag-centre p95 is the number that matters:

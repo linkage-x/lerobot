@@ -8716,6 +8716,10 @@ def _export_command(state: GatewayState, task: dict[str, Any]) -> tuple[list[str
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
+        # Not an operator choice: the poses are for the FR3, so they go to its base
+        # frame whenever a measured edge reaches it (export_v3 keeps the recorded
+        # world and says so otherwise, and info.json records which it was).
+        "--target-world", "auto",
     ]
     return command, out_root
 
@@ -8754,6 +8758,10 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
+        # Not an operator choice: the poses are for the FR3, so they go to its base
+        # frame whenever a measured edge reaches it (export_v3 keeps the recorded
+        # world and says so otherwise, and info.json records which it was).
+        "--target-world", "auto",
     ]
     return command, out_root
 

@@ -61,6 +61,15 @@ WORLD_REFERENCE_FILE = "world_reference.json"
 WORLD_REGISTRATION_FILE = "world_registration.json"
 WORLD_GRAPH_FILE = "world_graph.json"
 
+#: The arm's base frame as a node of ``world_graph.json``.  It is the frame the
+#: FR3 commands in, so a dataset stamped with it replays on the arm without any
+#: transform being estimated at deploy time; tools/fr3/fr3_act_infer_real_runtime.py
+#: keys on this id.
+FR3_BASE_WORLD_ID = "fr3_base"
+#: ``export_v3 --target-world`` value meaning: FR3_BASE_WORLD_ID when a recorded
+#: edge reaches it from the episodes' world, else the world they were recorded in.
+TARGET_WORLD_AUTO = "auto"
+
 #: Value of ``world_frame["status"]``.
 STATUS_OK = "ok"
 STATUS_MISSING = "missing"

@@ -707,7 +707,9 @@ def test_export_refuses_stamped_mixed_with_legacy_unstamped(tmp_path):
 _EDGE_T = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
 
 
-def _tracked_world_session(tmp_path: Path, monkeypatch, *, edges: list[dict]) -> tuple[Path, Path]:
+def _tracked_world_session(
+    tmp_path: Path, monkeypatch, *, edges: list[dict], tcp_link: str | None = None
+) -> tuple[Path, Path]:
     datasets = tmp_path / "datasets"
     datasets.mkdir()
     session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
@@ -739,6 +741,20 @@ def _tracked_world_session(tmp_path: Path, monkeypatch, *, edges: list[dict]) ->
         json.dumps({"version": 1, "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}], "edges": edges}),
         encoding="utf-8",
     )
+    if tcp_link is not None:
+        run_dir = repo_root / "outputs" / "tracking_analysis" / f"{session.name}_thor_april_tracking_in_robot_base"
+        run_dir.mkdir(parents=True)
+        (run_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "ee_from_cube": {
+                        "target_parent_link": tcp_link,
+                        "marker_to_tcp_calibration_path": "config_thor/marker_to_tcp_calibration_test.json",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
     monkeypatch.setattr(export_v3, "_REPO_ROOT", repo_root)
     monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 2)
 
@@ -799,3 +815,50 @@ def test_export_refuses_a_target_world_with_no_edge(tmp_path, monkeypatch):
             target_world="fr3_base",
         )
     assert not (exports / "pick_and_place" / "data").exists()
+
+
+def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("pyarrow")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T, "method": "test"}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="link_lt_gripper_tcp")
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="auto",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "fr3_base"
+    # Deployment commands these poses absolutely, so it has to know which link they are on.
+    assert info["tcp_frame"]["link"] == "link_lt_gripper_tcp"
+    assert info["tcp_frame"]["marker_to_tcp_calibrations"] == ["config_thor/marker_to_tcp_calibration_test.json"]
+    # The GUI shows the last line, so the frame has to be on it.
+    assert "(world frame: fr3_base)" in capsys.readouterr().out.strip().splitlines()[-1]
+
+
+def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_path, monkeypatch, capsys):
+    pq = pytest.importorskip("pyarrow.parquet")
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[])
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="auto",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    # No tracking summary: the link is unknown, which deployment in fr3_base refuses.
+    assert info["tcp_frame"]["link"] == ""
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
+    printed = capsys.readouterr().out
+    assert "No registration edge reaches fr3_base from world_a" in printed
+    assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
