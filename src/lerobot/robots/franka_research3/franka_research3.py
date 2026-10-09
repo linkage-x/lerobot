@@ -276,6 +276,7 @@ class FrankaResearch3(Robot):
                 bind_port=self.config.corenetic_bind_port,
                 remote_ip=self.config.corenetic_remote_ip,
                 remote_port=self.config.corenetic_remote_port,
+                device_id=self.config.corenetic_device_id,
                 sdk_dir=self.config.corenetic_sdk_dir,
                 urdf_relpath=self.config.corenetic_urdf_relpath,
                 max_width_m=self.config.gripper_max_width_mm / 1000.0,

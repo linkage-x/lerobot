@@ -34,8 +34,9 @@ class FakeBoxClient:
 def test_corenetic_connect_reads_real_width_before_control_and_holds_it(monkeypatch) -> None:
     clients: list[FakeBoxClient] = []
 
-    def make_client(config):
+    def make_client(config, **kwargs):
         client = FakeBoxClient(config)
+        client.kwargs = kwargs
         clients.append(client)
         return client
 
@@ -59,3 +60,23 @@ def test_corenetic_connect_reads_real_width_before_control_and_holds_it(monkeypa
     assert driver.get_position() == pytest.approx(0.7)
 
     driver.disconnect()
+
+
+def test_corenetic_driver_pins_the_arm_box_and_says_so_when_it_is_absent(monkeypatch) -> None:
+    seen: list[dict] = []
+
+    class _Absent(FakeBoxClient):
+        def start(self) -> bool:
+            return False
+
+    def make_client(config, **kwargs):
+        seen.append(kwargs)
+        return _Absent(config)
+
+    module = SimpleNamespace(BoxClientConfig=lambda **kwargs: SimpleNamespace(**kwargs), BoxClient=make_client)
+    monkeypatch.setattr(backends, "_import_box_client", lambda: module)
+
+    driver = backends.CoreneticGripperHardwareDriver(device_id=596523097)
+    with pytest.raises(ConnectionError, match="device_id=596523097"):
+        driver.connect()
+    assert seen == [{"device_id": 596523097}]

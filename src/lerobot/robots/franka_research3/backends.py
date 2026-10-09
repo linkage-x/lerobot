@@ -538,6 +538,7 @@ class CoreneticGripperHardwareDriver:
     bind_port: int = 15000
     remote_ip: str = "192.168.2.60"
     remote_port: int = 15000
+    device_id: int | None = None
     sdk_dir: str = "tools/thor/box_sdk"
     urdf_relpath: str = "share/monte_gripper.urdf"
     max_width_m: float = 0.09
@@ -584,11 +585,12 @@ class CoreneticGripperHardwareDriver:
             stale_threshold_s=self.stale_threshold_s,
             expected_devices=["box_gripper"],
         )
-        client = self._box_client_module.BoxClient(cfg)
+        client = self._box_client_module.BoxClient(cfg, device_id=self.device_id)
         if not client.start():
+            pinned = "" if self.device_id is None else f" Pinned device_id={self.device_id}: is that BOX on and answering?"
             raise ConnectionError(
                 "Could not start Corenetic gripper client. Check BOX SDK installation, "
-                f"host bind {self.bind_ip}:{self.bind_port}, and BOX MCU {self.remote_ip}:{self.remote_port}."
+                f"host bind {self.bind_ip}:{self.bind_port}, and BOX MCU {self.remote_ip}:{self.remote_port}.{pinned}"
             )
         self._client = client
 

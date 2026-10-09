@@ -1098,6 +1098,43 @@ def test_discover_boxes_returns_empty_when_wheel_missing(monkeypatch):
     assert box_client.discover_boxes() == []
 
 
+def _two_boxes_on_the_bench(fake_box_module):
+    created: list[_FakeBox] = []
+
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        created.append(b)
+        return b
+
+    fake_box_module.Box = _factory  # type: ignore[assignment]
+    # 2026-10-09: the handheld BOX that recorded and the BOX on the FR3, both on Thor.
+    # IP order puts the arm's first today; DHCP can swap that tomorrow.
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=596523097, sn="box", ip="192.168.2.134", capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=1819152274, sn="box", ip="192.168.216.196", capabilities=box_client.CAP_GRIPPER),
+    ]
+    return created
+
+
+def test_box_client_drives_the_pinned_device_not_the_first_discovered(fake_box_module):
+    created = _two_boxes_on_the_bench(fake_box_module)
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01), device_id=1819152274)
+    assert client.start() is True
+    try:
+        assert client.set_clamp_pos(0.03) == 0
+    finally:
+        client.stop()
+    assert created[-1].clamp_cmds == [(0.03, 1819152274)]
+
+
+def test_box_client_refuses_to_stand_in_for_a_pinned_device_that_is_absent(fake_box_module):
+    created = _two_boxes_on_the_bench(fake_box_module)
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01), device_id=42)
+    assert client.start() is False
+    assert created[-1].stopped
+    assert created[-1].clamp_cmds == [] and created[-1].mode == {}
+
+
 def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):
     fake_box_module.discover = lambda **kw: [
         _FakeDiscovered(device_id=107, sn="SN-7", ip="192.168.2.61",
