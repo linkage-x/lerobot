@@ -48,6 +48,39 @@ reference). The 09-23 island was exported but never committed here, so episodes
 recorded 09-23 18:55 → 09-28 were stamped 08-19; they were corrected on
 2026-09-28 with `restamp_world.py` (below).
 
+### The FR3 base (2026-10-09)
+
+`fr3_base` is a node with one edge, `world_20260928_063531 -> fr3_base`. It is
+**not** a world anything is recorded in. The reference keeps naming the camera
+island, and the edge says how to leave it. The edge was solved by
+`register_fr3_base.py solve` from the 10-02 P0 single-tag run
+(`outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z`,
+137 captures, FR3 `T_base_tcp` + tag6 on the tool), with the cameras **held at
+their 0928 poses**:
+
+- Reprojection error is 1.98 px RMS. The fitted tag scale is 0.991, so the
+  printed "160 mm" tag is about 158.6 mm.
+- Out of sample, a fold's edge predicts the other fold's tag, and the fixed
+  cameras measure where it actually is. The tag-centre error is
+  p50 1.9–2.0 / p95 4.1–4.2 mm, and that is roughly what a re-expressed pose
+  is off by in the workspace. In-sample it is p50 1.5 / p95 2.9 mm.
+
+The P0 run's own solution frees the cameras, which makes the FR3 base a new
+world. Pointing production at it without also changing this reference would
+stamp FR3-base poses with the island's id (linkage-x/lerobot#51).
+
+To use it, run `export_v3.py --target-world fr3_base`. This re-expresses
+`observation.ee_pose.*.base`, `action.ee_pose.*.base` and
+`observation.cube_pose.*.base` (camera-frame columns are untouched), and
+records the source world block and the edge in `info.json`'s `world_frame`.
+Without an edge connecting the two worlds the export is refused, never treated
+as an identity.
+
+The edge is valid only while the rig cameras stay at their 0928 poses and the
+FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
+`register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between
+worlds that are already connected.
+
 ## Correcting a stamp that is wrong
 
 The stamp records what this file said at record time. If the rig moved and the

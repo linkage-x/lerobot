@@ -296,3 +296,78 @@ def test_restamp_rewrites_a_symlinked_meta_once(tmp_path: Path) -> None:
 
     assert len(changed) == 1
     assert (derived / "meta.json").is_symlink()
+
+
+# ------------------------------------------------- cross-world registration ---
+
+
+def _rz(deg: float, t=(0.0, 0.0, 0.0)) -> list[list[float]]:
+    import math
+
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return [[c, -s, 0.0, t[0]], [s, c, 0.0, t[1]], [0.0, 0.0, 1.0, t[2]], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _edge(a: str, b: str, T: list[list[float]]) -> dict:
+    return {"from_world_frame_id": a, "to_world_frame_id": b, "T_to_from": T, "method": f"{a}->{b}"}
+
+
+def test_world_transform_composes_and_walks_edges_backwards() -> None:
+    np = pytest.importorskip("numpy")
+    a_to_b, b_to_c = _rz(30, (1, 0, 0)), _rz(-75, (0, 2, 0.5))
+    graph = {"edges": [_edge("a", "b", a_to_b), _edge("c", "b", np.linalg.inv(b_to_c).tolist())]}
+
+    T, path = wp.world_transform(graph, "a", "c")
+    assert np.allclose(T, np.asarray(b_to_c) @ np.asarray(a_to_b), atol=1e-12)
+    assert [hop["traversed_reversed"] for hop in path] == [False, True]
+    back, _ = wp.world_transform(graph, "c", "a")
+    assert np.allclose(np.asarray(back) @ np.asarray(T), np.eye(4), atol=1e-12)
+    assert wp.world_transform(graph, "a", "a") == ([[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)], [])
+
+
+def test_unconnected_worlds_have_no_transform_not_an_identity() -> None:
+    assert wp.world_transform({"edges": [_edge("a", "b", _rz(10))]}, "a", "z") is None
+    assert wp.world_transform({"edges": []}, "a", "b") is None
+
+
+def test_a_non_rigid_edge_is_refused() -> None:
+    bad = _rz(10)
+    bad[0][0] *= 1.01
+    with pytest.raises(ValueError, match="not a rigid transform"):
+        wp.world_transform({"edges": [_edge("a", "b", bad)]}, "a", "b")
+
+
+def test_transform_pose7_matches_the_matrix_product() -> None:
+    np = pytest.importorskip("numpy")
+
+    def mat(pose):
+        x, y, z, qx, qy, qz, qw = pose
+        T = np.eye(4)
+        T[:3, :3] = [
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+        ]
+        T[:3, 3] = [x, y, z]
+        return T
+
+    q = np.array([0.3, -0.5, 0.1, 0.8])
+    q /= np.linalg.norm(q)
+    pose = [0.4, -0.2, 0.9, *q]
+    # A 121 deg edge like the real one, plus a near-180 deg one (Shepperd's other branches).
+    for T in (_rz(121, (1.2, 0.01, 0.74)), [[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]):
+        out = wp.transform_pose7(T, pose)
+        assert np.allclose(mat(out), np.asarray(T) @ mat(pose), atol=1e-12)
+    nan_pose = [float("nan")] * 7
+    assert all(v != v for v in wp.transform_pose7(_rz(10), nan_pose))
+
+
+def test_repo_graph_reaches_the_fr3_base_from_the_current_world() -> None:
+    # The FR3 base enters as an edge, not as a redefinition of the world: the
+    # reference keeps naming the camera island and the graph says how to get out.
+    repo = Path(__file__).resolve().parents[2]
+    block = wp.read_world_provenance(repo)
+    found = wp.world_transform(wp.read_world_graph(repo), block["world_frame_id"], "fr3_base")
+    assert found is not None
+    T, path = found
+    assert path and path[-1]["to_world_frame_id"] == "fr3_base"
