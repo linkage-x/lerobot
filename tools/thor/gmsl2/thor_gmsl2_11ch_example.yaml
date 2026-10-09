@@ -246,7 +246,7 @@ auto_recover:
 # (~/.ssh/id_ed25519_lt -> C:\ProgramData\ssh\administrators_authorized_keys).
 laser_tracker:
   enabled: false
-  win_host: 18713@192.168.147.72
+  win_host: 18713@192.168.1.227
   ssh_key: ~/.ssh/id_ed25519_lt
   # Where the staged python tools and the sessions live ON THE CAPTURE PC.
   # Note this is D:, not the C:\lt that deploy_windows.sh defaults to.
