@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -43,6 +44,19 @@ def _recorder_config(tmp_path: Path, *, recorder_backend: str) -> gr.RecorderCon
 
 def _streams(*sids: int) -> list[ps.StreamConfig]:
     return [ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in sids]
+
+
+def test_argus_recorder_env_removes_graphical_displays(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("KEEP_ME", "yes")
+
+    env = aos._argus_recorder_env()
+
+    assert "DISPLAY" not in env
+    assert "WAYLAND_DISPLAY" not in env
+    assert env["KEEP_ME"] == "yes"
+    assert os.environ["DISPLAY"] == ":0"
 
 
 class _PreflightSession(ams.ArgusMetadataCameraSession):

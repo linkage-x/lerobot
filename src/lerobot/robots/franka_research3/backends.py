@@ -155,6 +155,7 @@ class PandaPyArmDriver:
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
     state_poll_frequency_hz: float = 200.0
+    start_controller_on_connect: bool = True
 
     def __post_init__(self):
         try:
@@ -169,6 +170,7 @@ class PandaPyArmDriver:
         self._controllers = controllers
         self._robot = None
         self._controller = None
+        self._teaching_mode_active = False
         self._state_lock = threading.Lock()
         self._state_reader_stop = threading.Event()
         self._state_reader_thread: threading.Thread | None = None
@@ -185,7 +187,10 @@ class PandaPyArmDriver:
         # only add latency to the connect path.
         state = self._robot.get_state()
         self._assert_arm_accepts_control(state)
-        self._start_controller(state)
+        if self.start_controller_on_connect:
+            self._start_controller(state)
+        else:
+            self._refresh_joint_positions_cache(state)
         self._start_state_reader()
 
     # Modes libfranka's control loop cannot start from, and what the operator has to do about
@@ -230,6 +235,8 @@ class PandaPyArmDriver:
     def _start_controller(self, state: Any | None = None) -> None:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active:
+            self._stop_controller()
         self._controller = self._controllers.JointPosition()
         if self.damping is not None:
             self._controller.set_damping(self.damping)
@@ -242,9 +249,28 @@ class PandaPyArmDriver:
         self._robot.start_controller(self._controller)
 
     def _stop_controller(self) -> None:
-        if self._robot is not None and self._controller is not None:
+        if self._robot is not None and (self._controller is not None or self._teaching_mode_active):
             self._robot.stop_controller()
             self._controller = None
+            self._teaching_mode_active = False
+
+    def enter_teaching_mode(self, damping: list[float] | None = None) -> None:
+        """Start panda_py's native teaching controller without position targets."""
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        teaching_mode = getattr(self._robot, "teaching_mode", None)
+        if not callable(teaching_mode):
+            raise RuntimeError("Installed panda_py does not provide Panda.teaching_mode().")
+        joint_damping = np.asarray([0.0] * 7 if damping is None else damping, dtype=np.float64)
+        if joint_damping.shape != (7,) or not np.all(np.isfinite(joint_damping)) or np.any(joint_damping < 0):
+            raise ValueError("Teaching damping must contain seven finite, non-negative values.")
+        self._assert_arm_accepts_control(self._robot.get_state())
+        self._stop_controller()
+        # Mark ownership before the native call so disconnect also cleans up a
+        # controller that starts and then raises during startup.
+        self._teaching_mode_active = True
+        teaching_mode(True, joint_damping)
+        self._refresh_joint_positions_cache()
 
     def _refresh_joint_positions_cache(self, state: Any | None = None) -> np.ndarray:
         """Seed the cache from ``state`` when the caller already has one, else read a fresh one."""
@@ -272,6 +298,10 @@ class PandaPyArmDriver:
         """
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active and self.state_poll_frequency_hz <= 0:
+            # The native teaching loop updates Panda's state. Read that state on
+            # demand rather than reusing the Python cache seeded at connect.
+            self._refresh_joint_positions_cache()
         with self._state_lock:
             cached = None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
             sampled_at_s = self._cached_joint_positions_at_s
@@ -319,6 +349,8 @@ class PandaPyArmDriver:
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
+        if self._teaching_mode_active and self.state_poll_frequency_hz <= 0:
+            return self._refresh_joint_positions_cache()
         with self._state_lock:
             cached_joint_positions = (
                 None if self._cached_joint_positions is None else self._cached_joint_positions.copy()

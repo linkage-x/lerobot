@@ -202,6 +202,97 @@ def test_connect_disconnect(robot):
     assert not robot.is_connected
 
 
+def test_connect_forwards_teaching_options_to_arm_backend(robot, monkeypatch):
+    received = {}
+
+    class TeachingArmDriver(DummyArmDriver):
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", TeachingArmDriver)
+    robot.config.use_otg = False
+    robot.config.arm_start_controller_on_connect = False
+    robot.config.arm_state_poll_frequency_hz = 0.0
+    robot.connect()
+
+    assert received["start_controller_on_connect"] is False
+    assert received["state_poll_frequency_hz"] == 0.0
+
+
+@pytest.mark.parametrize("frequency", [-1.0, float("nan"), float("inf")])
+def test_arm_poll_frequency_rejects_invalid_values(frequency):
+    with pytest.raises(ValueError, match="arm_state_poll_frequency_hz"):
+        FrankaResearch3Config(arm_state_poll_frequency_hz=frequency)
+
+
+@pytest.mark.parametrize("start_controller_on_connect", [False, True])
+@pytest.mark.parametrize("fail_teaching_start", [False, True])
+def test_native_teaching_reads_moved_joints_and_stops_on_disconnect(
+    monkeypatch, start_controller_on_connect, fail_teaching_start
+):
+    class JointPosition:
+        def set_control(self, joints):
+            del joints
+
+    class Panda:
+        def __init__(self, robot_ip):
+            del robot_ip
+            self.state = types.SimpleNamespace(q=np.zeros(7), robot_mode=types.SimpleNamespace(name="kIdle"))
+            self.events = []
+
+        def get_state(self):
+            return self.state
+
+        def start_controller(self, controller):
+            del controller
+            self.events.append("position")
+
+        def stop_controller(self):
+            self.events.append("stop")
+
+        def teaching_mode(self, active, damping):
+            assert active is True
+            np.testing.assert_array_equal(damping, np.zeros(7))
+            self.events.append("teaching")
+            if fail_teaching_start:
+                raise RuntimeError("teaching startup failed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(Panda=Panda, controllers=types.SimpleNamespace(JointPosition=JointPosition)),
+    )
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=0.0,
+        start_controller_on_connect=start_controller_on_connect,
+    )
+    driver.connect()
+    panda = driver._robot
+    expected_events = ["position", "stop"] if start_controller_on_connect else []
+    assert panda.events == (["position"] if start_controller_on_connect else [])
+    assert driver._state_reader_thread is None
+
+    if fail_teaching_start:
+        with pytest.raises(RuntimeError, match="teaching startup failed"):
+            driver.enter_teaching_mode([0.0] * 7)
+    else:
+        driver.enter_teaching_mode([0.0] * 7)
+        _, first_timestamp = driver.get_joint_positions_with_timestamp()
+        panda.state.q = np.arange(7, dtype=np.float64)
+        np.testing.assert_array_equal(driver.get_joint_positions(), panda.state.q)
+        joints, second_timestamp = driver.get_joint_positions_with_timestamp()
+        np.testing.assert_array_equal(joints, panda.state.q)
+        assert second_timestamp > first_timestamp
+        assert driver._controller is None
+
+    driver.disconnect()
+    assert panda.events == expected_events + ["teaching", "stop"]
+    assert driver._teaching_mode_active is False
+    assert driver._robot is None
+
+
 def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeypatch):
     class DummyJointPositionController:
         def __init__(self):

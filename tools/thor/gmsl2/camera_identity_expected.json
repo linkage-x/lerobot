@@ -1,19 +1,15 @@
 {
-  "calibration": "calib_20260923_cam13refit_intrinsics",
-  "generated_utc": "2026-09-28T04:06:21+00:00",
-  "match_px": 8.0,
+  "calibration": "p0_single_tag_camera_calibration/manual_run_20261002T014903Z/camera_calibration",
+  "source": "joint_solution.cameras[].intrinsics_path in camera_calibration/summary.json",
+  "temporary": true,
   "ports": {
     "cam_03": "H120K-I05130020",
     "cam_06": "H120K-I05130024",
-    "cam_07": "H120K-I05130058",
+    "cam_07": "H120K-I05130031",
     "cam_08": "H120K-I05130066",
-    "cam_09": "H120K-I05130060",
+    "cam_09": "H120K-I05130058",
     "cam_12": "H120K-I05130067",
     "cam_13": "H120K-I05130029",
-    "cam_14": "H120K-I05130031"
-  },
-  "not_identified": {
-    "unread": [],
-    "ambiguous": []
+    "cam_14": "H120K-I05130060"
   }
 }

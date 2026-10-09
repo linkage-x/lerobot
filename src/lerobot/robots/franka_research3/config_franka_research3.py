@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from lerobot.cameras import CameraConfig
@@ -80,6 +81,9 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    # Guided calibration starts the native teaching controller after connecting.
+    arm_start_controller_on_connect: bool = True
+    arm_state_poll_frequency_hz: float = 200.0
     camera_max_age_ms: float = 100.0
     # Frames whose cameras disagree by more than this are refused outright -- and it aborts the
     # whole episode, not the frame. 20 ms rather than 15 is set by the *sim* twin, not by this
@@ -100,6 +104,8 @@ class FrankaResearch3Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if not math.isfinite(self.arm_state_poll_frequency_hz) or self.arm_state_poll_frequency_hz < 0:
+            raise ValueError("arm_state_poll_frequency_hz must be finite and non-negative (0 disables polling).")
         if self.gripper_backend not in {"pika", "das", "franka_hand", "corenetic", "mock"}:
             raise ValueError("gripper_backend must be one of 'pika', 'das', 'franka_hand', 'corenetic', or 'mock'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
