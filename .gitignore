@@ -167,6 +167,10 @@ wandb/
 data/
 outputs/
 
+# Local Track4World datasets and model checkpoints
+/third_party/Track4World/data/
+/third_party/Track4World/checkpoints/
+
 # Translations
 *.mo
 *.pot
