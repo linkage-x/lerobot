@@ -1,8 +1,0 @@
-pyserial
-numpy
-opencv-python
-pyrealsense2
-pysurvive
-wxpython
-Gooey
-
