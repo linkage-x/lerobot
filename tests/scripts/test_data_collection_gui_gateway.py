@@ -1637,6 +1637,10 @@ def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     video_path = Path(command[command.index("--render-video") + 1])
     assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
 
+    # Seeded and approached the way the real replay starts, or the preview shows another joint branch.
+    assert command[command.index("--initial-joints") + 1] == "fr3_start"
+    assert command[command.index("--initial-approach") + 1] == "guarded"
+
     both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
     assert both_command[both_command.index("--cube") + 1] == "both"
     both_report = Path(both_command[both_command.index("--report-json") + 1])
@@ -1692,6 +1696,50 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
     row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
     assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
+
+
+def test_thor_preflight_checks_the_replay_arm_not_the_workstation_arm(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway._replay_status_from_config({}),
+    )
+    # Nothing configured: the Thor cube-replay FR3, the one the replay panel shows.
+    assert state.replay.realRobotIp == gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP
+    assert gateway._real_robot_ip(state) == gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP
+    command = gateway._real_preflight_command(state)
+    assert f"--robot-ip={gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP}" in command
+    # Whatever the panel last used wins.
+    state.replay.realRobotIp = "192.168.11.105"
+    assert gateway._real_robot_ip(state) == "192.168.11.105"
+    # The workstation keeps its own default.
+    state.profile = "workstation"
+    assert gateway._real_robot_ip(state) == gateway.DEFAULT_REAL_ROBOT_IP
+
+
+def test_thor_defaults_to_the_corenetic_end_effector_and_reads_the_trajectory_link(tmp_path):
+    assert gateway._replay_status_from_config({}).realEndEffectorMode == "corenetic_gripper_ee"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20261009_102307"
+    assert gateway._trajectory_tcp_link(state, dataset_root) == ""
+    run_dir = gateway._tracking_run_dir(state, dataset_root)
+    run_dir.mkdir(parents=True)
+    (run_dir / "summary.json").write_text(
+        json.dumps({"ee_from_cube": {"target_parent_link": "link_lt_gripper_tcp", "target_child_link": "corenetic_gripper_ee"}}),
+        encoding="utf-8",
+    )
+    # The CSV holds the child link; that is what the arm must drive.
+    assert gateway._trajectory_tcp_link(state, dataset_root) == "corenetic_gripper_ee"
+    assert gateway.REAL_REPLAY_TARGET_FRAMES["corenetic_gripper_ee"] == "corenetic_gripper_ee"
+    assert gateway.REAL_REPLAY_TARGET_FRAMES["pika_gripper_ee"] != "corenetic_gripper_ee"
 
 
 def test_fr3_facing_replays_refuse_a_world_with_no_edge_to_the_arm(tmp_path):
@@ -2256,7 +2304,8 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--input.dataset_pose_name=left" in command
     assert "--robot.robot_ip=192.168.1.99" in command
     assert "--replay.episode_index=0" in command
-    assert "--replay.initial_pose_mode=current" in command
+    # Starts from move_to_start(), the seed the MuJoCo preview used.
+    assert "--replay.initial_pose_mode=robot_start" in command
     assert "--replay.fail_on_unreached_initial_pose=true" in command
     assert "--end_effector.mode=robot_config" in command
 

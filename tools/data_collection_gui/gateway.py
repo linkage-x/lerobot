@@ -10814,6 +10814,22 @@ def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
     return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}{DEFAULT_TRACKING_RUN_SUFFIX}"
 
 
+# The robot frame each real-replay end-effector mode drives (corenetic goes through the
+# replay yaml's robot config, whose target_frame_name is corenetic_gripper_ee).
+REAL_REPLAY_TARGET_FRAMES = {
+    "corenetic_gripper_ee": "corenetic_gripper_ee",
+    "pika_gripper_ee": "pika_task_tcp",
+    "fr3_ee": "fr3_ee",
+}
+
+
+def _trajectory_tcp_link(state: GatewayState, dataset_root: Path) -> str:
+    """The URDF link the session's EE poses are on, from its tracking run ("" if unknown)."""
+    summary = _load_json_file(_tracking_run_dir(state, dataset_root) / "summary.json")
+    ee_from_cube = summary.get("ee_from_cube") if isinstance(summary.get("ee_from_cube"), dict) else {}
+    return str(ee_from_cube.get("target_child_link") or ee_from_cube.get("target_parent_link") or "")
+
+
 def _median_number(values: list[float]) -> float | None:
     finite = sorted(value for value in values if math.isfinite(value))
     if not finite:
@@ -15115,6 +15131,13 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         "hardware",
         "--robot-spacing-m",
         str(DEFAULT_MUJOCO_ROBOT_SPACING_M),
+        # Start where the real replay starts (move_to_start) and walk to frame 0 under the
+        # same joint-jump guard: the arm is redundant, so a preview seeded anywhere else
+        # can show a joint path the arm will not take.
+        "--initial-joints",
+        "fr3_start",
+        "--initial-approach",
+        "guarded",
         "--report-json",
         str(report_path),
         "--render-video",
@@ -15285,7 +15308,9 @@ def _real_replay_command(
         f"--input.dataset_pose_name={cube_mode}",
         f"--robot.robot_ip={robot_ip}",
         f"--replay.episode_index={int(state.replay.episode)}",
-        "--replay.initial_pose_mode=current",
+        # From the arm's start pose, not wherever it was left: that is the seed the MuJoCo
+        # preview validated, so the joint path executed is the one that was checked.
+        "--replay.initial_pose_mode=robot_start",
         "--replay.fail_on_unreached_initial_pose=true",
         f"--end_effector.mode={'fr3_ee' if end_effector_mode == 'fr3_ee' else 'robot_config'}",
     ]
@@ -15307,7 +15332,13 @@ def _real_replay_command(
 def _real_robot_ip(state: GatewayState) -> str:
     replay = _replay_config(state.config)
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
-    return str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_REAL_ROBOT_IP)
+    if state.profile == "workstation":
+        return str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_REAL_ROBOT_IP)
+    # Thor: the arm the replay panel shows (and real replay last used), so a standalone
+    # Preflight checks the same FR3 the replay will drive -- never the workstation's.
+    return str(
+        state.replay.realRobotIp or replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_CUBE_REPLAY_ROBOT_IP
+    )
 
 
 def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
@@ -15748,6 +15779,16 @@ def _start_real_replay(
         episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
         if not episode_poses.get(cube_mode):
             raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
+
+        # Absolute poses put the labelled point on whatever frame the arm drives; another
+        # tool's TCP there is a different physical point, so refuse instead of approximating.
+        trajectory_link = _trajectory_tcp_link(state, dataset_root)
+        driven_frame = REAL_REPLAY_TARGET_FRAMES[end_effector_mode]
+        if trajectory_link and trajectory_link != driven_frame:
+            raise RuntimeError(
+                f"The EE trajectory is on {trajectory_link}, but end effector {end_effector_mode} drives "
+                f"{driven_frame}; select the end effector that matches the tracked gripper."
+            )
 
     selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
@@ -16418,6 +16459,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/preflight":
+                    preflight_ip = query.get("robot_ip", [""])[0].strip()
+                    if preflight_ip:
+                        self.server.state.replay.realRobotIp = _validated_robot_ip(preflight_ip, "Robot IP")
                     _preflight_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
@@ -16452,7 +16496,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         query.get("cube", ["right"])[0],
                         query.get("robot_ip", [""])[0],
-                        query.get("end_effector", ["pika_gripper_ee"])[0],
+                        query.get("end_effector", [self.server.state.replay.realEndEffectorMode])[0],
                         str(query.get("override_mujoco_failure", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
                     )

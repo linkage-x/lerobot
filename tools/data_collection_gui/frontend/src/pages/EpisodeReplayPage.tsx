@@ -5,6 +5,18 @@ import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingS
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
 
+const REAL_REPLAY_TARGET_FRAMES: Record<RealEndEffectorMode, string> = {
+  corenetic_gripper_ee: "corenetic_gripper_ee",
+  pika_gripper_ee: "pika_task_tcp",
+  fr3_ee: "fr3_ee"
+};
+
+const REAL_REPLAY_GRIPPER_LABELS: Record<RealEndEffectorMode, string> = {
+  corenetic_gripper_ee: "Corenetic gripper",
+  pika_gripper_ee: "Pika gripper",
+  fr3_ee: "FR3 flange"
+};
+
 export function ReplayPanel({
   status,
   busy,
@@ -102,8 +114,11 @@ export function RealRobotReplayPanel({
   const validation = status.mujocoValidation;
   const validationMode = validation?.cubeMode ?? status.mujocoCubeMode;
   const mode: RealCubeMode = validationMode === "left" ? "left" : "right";
-  const endEffectorMode: RealEndEffectorMode = "pika_gripper_ee";
-  const [robotIp, setRobotIp] = useState(status.realRobotIp || "192.168.1.206");
+  // The gateway derives the end effector from its robot config (Thor: corenetic) and refuses one
+  // that does not match the tracked trajectory's link; this page only shows and forwards it.
+  const endEffectorMode: RealEndEffectorMode = status.realEndEffectorMode ?? "corenetic_gripper_ee";
+  const targetFrame = REAL_REPLAY_TARGET_FRAMES[endEffectorMode];
+  const [robotIp, setRobotIp] = useState(status.realRobotIp || "");
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
@@ -199,11 +214,11 @@ export function RealRobotReplayPanel({
         <div className="real-robot-settings">
           <div className="teleop-config-grid">
             <div><span>Robot</span><strong>Franka Research 3</strong></div>
-            <div><span>End effector</span><strong>Pika gripper · pika_task_tcp</strong></div>
+            <div><span>End effector</span><strong>{REAL_REPLAY_GRIPPER_LABELS[endEffectorMode]} · {targetFrame}</strong></div>
           </div>
           <label className="real-robot-ip-field">
             <span>Robot IP</span>
-            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.1.206" />
+            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.11.102" />
           </label>
           <button className="danger real-robot-run" disabled={disabled} onClick={() => setOverridePromptOpen(true)} type="button">
             {status.state === "replaying" ? "Real-robot replay running…" : "Run real-robot replay"}
@@ -220,7 +235,7 @@ export function RealRobotReplayPanel({
                   ? "Enter a valid robot IPv4 address."
                   : validationFailedButReviewable
                     ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
+                    : `The gateway preflights this FR3, moves it to its start pose, brings ${targetFrame} to frame 0, then streams the trajectory.`}
           </p>
         </div>
         <div className="realsense-monitor replay-camera-compare">
@@ -306,7 +321,7 @@ export function RealRobotReplayPanel({
               {validationFailedButReviewable ? "MuJoCo validation failed" : "Confirm real-robot replay"}
             </h3>
             <p>
-              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>pika_task_tcp</strong> on <strong>{robotIp.trim()}</strong>.
+              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>{targetFrame}</strong> on <strong>{robotIp.trim()}</strong>.
             </p>
             <p>{validationFailedButReviewable ? "The recorded trajectory did not meet the simulation limits:" : "MuJoCo passed within these limits:"}</p>
             <ul>
