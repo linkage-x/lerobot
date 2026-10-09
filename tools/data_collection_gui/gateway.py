@@ -13861,6 +13861,11 @@ def _start_episode(
     # "Ready" also requires that the session homed: a locked beam without a Home
     # measures every distance against a stale reference (W2, 2026-09-21).
     if state.recording.laserTracker and not state.recording.laserTrackerReady:
+        if state.recording.laserTrackerState == "error":
+            raise RuntimeError(
+                f"激光跟踪仪不可用，不能开录：{state.recording.laserTrackerDetail or '连接或采集失败'}。"
+                "请先检查采集机网络、SSH 和跟踪仪服务，恢复后退出录制器并重新 Connect。"
+            )
         if state.recording.laserTrackerBeamBroken:
             # A catch after a break keeps whatever range the ADM handed back;
             # pivot lt_20260923_062953 carried +4.3 mm that way, flagged good.
@@ -14745,6 +14750,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             state.recording.laserTrackerDevice = output[len("Laser tracker: "):].strip()[:200]
         elif low.startswith("warning:"):
             state.recording.laserTrackerState = "error"
+            state.recording.laserTrackerReady = False
             state.recording.laserTrackerDetail = output.split(":", 1)[-1].strip()[:200]
         elif "landed" in low:
             state.recording.laserTrackerState = "idle"
