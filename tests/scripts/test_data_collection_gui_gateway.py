@@ -240,6 +240,30 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     return written
 
 
+@pytest.mark.parametrize("previously_ready", [False, True])
+def test_start_episode_names_tracker_connection_failure(tmp_path, monkeypatch, previously_ready):
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+    state.recording.laserTrackerReady = previously_ready
+    state.recording.laserTrackerHomed = previously_ready
+    gateway._apply_recorder_output(
+        state,
+        "WARNING: laser tracker unavailable, recording without it: "
+        r"cannot create D:\lt\lt_20261008_065259: "
+        "ssh: connect to host 192.168.147.72 port 22: No route to host",
+    )
+
+    assert state.recording.laserTrackerState == "error"
+    assert state.recording.laserTrackerReady is False
+    with pytest.raises(RuntimeError, match="激光跟踪仪不可用") as exc:
+        gateway._start_episode(state)
+    assert "No route to host" in str(exc.value)
+    assert "重新 Connect" in str(exc.value)
+    assert "home 窝" not in str(exc.value)
+    assert written == []
+
+
 def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
     """Homed, then the beam broke: the lock's range is not absolute any more."""
     state = _marker_tcp_gateway_state(tmp_path)
