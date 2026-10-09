@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.thor.gmsl2 import intrinsics_by_serial
+from tools.thor.gmsl2 import laser_tracker_session as lts
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 from tools.thor.gmsl2 import world_provenance as wp
 
@@ -85,6 +86,9 @@ DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP = 1.0
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
+# Seed of the Thor MuJoCo preview: where move_to_start() (initial_pose_mode=robot_start)
+# leaves the real arm. Validations recorded with any other seed are stale.
+MUJOCO_PREVIEW_INITIAL_JOINTS = "fr3_start"
 # EE trajectory generation now tracks gmsl2 (Thor) datasets with AprilTag cubes
 # instead of the legacy Hikon-camera route. The gateway runs on Thor, so it
 # invokes the local runner directly (no SSH / copy-back) -- the runner picks the
@@ -238,6 +242,14 @@ class ReplayStatus:
     realEndEffectorMode: str = "corenetic_gripper_ee"
     mujocoOverrideAccepted: bool = False
     realReplayLog: list[str] = field(default_factory=list)
+    # Two-step real replay (Thor): "moving_to_start" -> "at_start" (arm held at frame 0,
+    # waiting for Execute) -> "executing" -> "finished"; "" when no real replay is live.
+    realPhase: str = ""
+    # Laser tracker recorded alongside the trajectory, for real-robot GT.
+    realRecordTracker: bool = False
+    realTrackerState: str = ""  # "", warming, ready, waiting, recording, landing, landed, error
+    realTrackerDetail: str = ""
+    realRunDir: str = ""
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
     # selection on the same slot but swaps in different frames/videos. The UI
@@ -502,6 +514,8 @@ class GatewayState:
     processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
+    # Laser tracker session owned by a real replay (not the recorder's), see _start_real_replay.
+    replay_tracker: Any = None
     log_dir: Path | None = None
     gateway_log_path: Path | None = None
     recorder_log_path: Path | None = None
@@ -683,6 +697,7 @@ def _new_mujoco_validation(
         "message": message,
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cubeMode": str(state.replay.mujocoCubeMode),
+        "initialJoints": "" if state.profile == "workstation" else MUJOCO_PREVIEW_INITIAL_JOINTS,
     }
 
 
@@ -756,6 +771,12 @@ def _load_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, e
                 and float(item.get("maxPositionThresholdMm")) == max_pos_mm
                 and float(item.get("maxRotationThresholdDeg")) == max_rot_deg
                 and str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) == str(state.replay.mujocoCubeMode)
+                # Thor: only a preview seeded where the real replay starts says anything about
+                # the joint path the arm will take; older ones (DAS seed) must be re-run.
+                and (
+                    state.profile == "workstation"
+                    or str(item.get("initialJoints") or "") == MUJOCO_PREVIEW_INITIAL_JOINTS
+                )
             )
         except (TypeError, ValueError, OSError):
             matches = False
@@ -12974,6 +12995,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
         )
 
+    _refresh_replay_tracker_status(state)
     replay_process = state.replay_process
     if replay_process is not None and replay_process.poll() is not None:
         replay_kind = state.replay_process_kind or "mujoco"
@@ -12992,6 +13014,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
                 "complete" if replay_process.returncode == 0 else "error",
                 f"real replay exited with code {replay_process.returncode}",
             )
+            state.replay.realPhase = ""
+            _finish_replay_tracker(state)
             state.replay.safety = "locked"
             state.replay.state = "complete" if replay_process.returncode == 0 else "aborted"
             if state.replay.lastOutput:
@@ -14303,6 +14327,7 @@ def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[s
                 state.log("info", f"mujoco replay: {output}")
             else:
                 _append_real_replay_log(state, "replay", output)
+                _apply_real_replay_marker(state, output)
                 state.log("info", f"real replay: {output}")
 
 
@@ -15135,7 +15160,7 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         # same joint-jump guard: the arm is redundant, so a preview seeded anywhere else
         # can show a joint path the arm will not take.
         "--initial-joints",
-        "fr3_start",
+        MUJOCO_PREVIEW_INITIAL_JOINTS,
         "--initial-approach",
         "guarded",
         "--report-json",
@@ -15174,6 +15199,10 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         raise RuntimeError("MuJoCo report belongs to a different episode.")
     if str(report.get("cube_mode") or "") != selected_cube_mode:
         raise RuntimeError("MuJoCo report belongs to a different cube selection.")
+    if state.profile != "workstation" and str(report.get("initial_joints") or "") != MUJOCO_PREVIEW_INITIAL_JOINTS:
+        raise RuntimeError(
+            "MuJoCo report was not seeded at the FR3 start pose the real replay starts from; run MuJoCo again."
+        )
     if int(report.get("fps", 0)) != int(state.replay.fps or 30):
         raise RuntimeError("MuJoCo report FPS does not match the selected episode.")
 
@@ -15276,6 +15305,7 @@ def _real_replay_command(
     cube_mode: str,
     robot_ip: str,
     end_effector_mode: str = "corenetic_gripper_ee",
+    run_dir: Path | None = None,
 ) -> list[str]:
     if state.profile == "workstation":
         return _fr3_real_replay_command(state, dataset_root, robot_ip)
@@ -15312,8 +15342,12 @@ def _real_replay_command(
         # preview validated, so the joint path executed is the one that was checked.
         "--replay.initial_pose_mode=robot_start",
         "--replay.fail_on_unreached_initial_pose=true",
+        # Two steps: stop at frame 0 and stream only on "go" (Execute) over stdin.
+        "--replay.hold_at_trajectory_start=true",
         f"--end_effector.mode={'fr3_ee' if end_effector_mode == 'fr3_ee' else 'robot_config'}",
     ]
+    if run_dir is not None:
+        command.append(f"--replay.report_json_path={run_dir / 'real_replay_report.json'}")
     if end_effector_mode == "pika_gripper_ee":
         robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
         urdf_path, _sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
@@ -15740,7 +15774,13 @@ def _start_real_replay(
     robot_ip: str = "",
     end_effector_mode: str = "corenetic_gripper_ee",
     override_mujoco_failure: bool = False,
+    record_tracker: bool = False,
 ) -> None:
+    """Thor: step 1 of a real replay -- move the arm to the trajectory start and hold there.
+
+    Streaming waits for ``_execute_real_replay``. With ``record_tracker`` the laser tracker
+    connects now, so its ~16 s handshake overlaps the move instead of delaying Execute.
+    """
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
@@ -15817,12 +15857,18 @@ def _start_real_replay(
             f"max_position={validation.get('maxPositionErrorMm')}mm "
             f"max_rotation={validation.get('maxRotationErrorDeg')}deg",
         )
-    command = _real_replay_command(state, dataset_root, cube_mode, selected_ip, end_effector_mode)
-    _append_real_replay_log(state, "launch", "preflight passed; starting initial-pose-first replay process")
+    run_dir = None if workstation else _real_replay_run_dir(dataset_root, state.replay.episode, cube_mode)
+    if record_tracker and workstation:
+        raise RuntimeError("Laser tracker recording during real replay is a Thor feature.")
+    if record_tracker:
+        _check_replay_tracker_available(state)
+    command = _real_replay_command(state, dataset_root, cube_mode, selected_ip, end_effector_mode, run_dir)
+    _append_real_replay_log(state, "launch", "preflight passed; moving to the trajectory start")
     try:
         process = subprocess.Popen(
             command,
             cwd=state.repo_root,
+            stdin=None if workstation else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -15833,6 +15879,13 @@ def _start_real_replay(
         _stop_realsense_preview(state)
         _append_real_replay_log(state, "error", "failed to spawn real replay process")
         raise
+    state.replay.realPhase = "" if workstation else "moving_to_start"
+    state.replay.realRunDir = "" if run_dir is None else str(run_dir)
+    state.replay.realRecordTracker = bool(record_tracker)
+    state.replay.realTrackerState = ""
+    state.replay.realTrackerDetail = ""
+    if record_tracker and run_dir is not None:
+        _start_replay_tracker(state, run_dir)
     state.replay_process = process
     state.replay_process_kind = "real"
     state.replay_started_at_s = time.monotonic()
@@ -15855,6 +15908,145 @@ def _start_real_replay(
     _start_replay_output_reader(state, process)
 
 
+def _real_replay_run_dir(dataset_root: Path, episode: int, cube_mode: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return (
+        dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / "real_replay"
+        / f"{stamp}_episode_{int(episode):06d}_{cube_mode}"
+    )
+
+
+def _check_replay_tracker_available(state: GatewayState) -> None:
+    recorder = state.process
+    if recorder is not None and recorder.poll() is None and state.recording.laserTracker:
+        raise RuntimeError(
+            "The recorder holds the laser tracker (connected with tracker on). Disconnect it, or "
+            "connect without the tracker, before recording the tracker during a real replay."
+        )
+    cfg = lts.config_from_yaml_dict(state.config.get("laser_tracker"), enabled_override=True)
+    if not cfg.enabled:
+        raise RuntimeError("The gateway config has no usable laser_tracker block (win_host).")
+
+
+def _start_replay_tracker(state: GatewayState, run_dir: Path) -> None:
+    cfg = lts.config_from_yaml_dict(state.config.get("laser_tracker"), enabled_override=True)
+    session = lts.LaserTrackerSession(cfg, repo_root=state.repo_root)
+    state.replay_tracker = session
+    state.replay.realTrackerState = "warming"
+    state.replay.realTrackerDetail = f"connecting {session.session_id} (the SDK handshake takes ~16 s)"
+    _append_real_replay_log(state, "tracker", state.replay.realTrackerDetail)
+    Thread(
+        target=_connect_replay_tracker,
+        args=(state, session, run_dir),
+        daemon=True,
+        name=f"replay-tracker-{session.session_id}",
+    ).start()
+
+
+def _connect_replay_tracker(state: GatewayState, session: Any, run_dir: Path) -> None:
+    connected = session.start()  # blocking ssh work: never under state.lock
+    with state.lock:
+        still_wanted = state.replay_tracker is session
+        if still_wanted:
+            state.replay.realTrackerState = "waiting" if connected else "error"
+            state.replay.realTrackerDetail = (
+                session.beam_summary() if connected else (session.last_error or "tracker connect failed")
+            )
+            _append_real_replay_log(state, "tracker", state.replay.realTrackerDetail)
+    if not still_wanted:
+        # The replay ended while the tracker was still connecting: release it, keep what it has.
+        _land_replay_tracker(state, session, run_dir, publish=False)
+
+
+def _refresh_replay_tracker_status(state: GatewayState) -> None:
+    session = state.replay_tracker
+    if session is None or state.replay.realTrackerState not in ("waiting", "ready"):
+        return
+    state.replay.realTrackerState = "ready" if session.ready() else "waiting"
+    state.replay.realTrackerDetail = session.beam_summary()
+
+
+def _land_replay_tracker(state: GatewayState, session: Any, run_dir: Path, *, publish: bool = True) -> None:
+    result = session.stop(land_to=run_dir / "laser_tracker")
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "laser_tracker_result.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    except OSError as exc:
+        result.setdefault("last_error", f"could not write result: {exc}")
+    if not publish:
+        return
+    with state.lock:
+        error = str(result.get("last_error") or "")
+        state.replay.realTrackerState = "error" if error and not result.get("landed_to") else "landed"
+        state.replay.realTrackerDetail = error or f"landed to {result.get('landed_to') or run_dir / 'laser_tracker'}"
+        _append_real_replay_log(state, "tracker", state.replay.realTrackerDetail)
+
+
+def _finish_replay_tracker(state: GatewayState) -> None:
+    """Called under state.lock when a real replay ends for any reason."""
+    session = state.replay_tracker
+    if session is None:
+        return
+    state.replay_tracker = None
+    if state.replay.realTrackerState == "warming":
+        # _connect_replay_tracker releases and lands it once start() returns.
+        state.replay.realTrackerState = "cancelled"
+        state.replay.realTrackerDetail = "the replay ended before the tracker connected; its session is released"
+        return
+    state.replay.realTrackerState = "landing"
+    state.replay.realTrackerDetail = "sealing and copying the tracker session"
+    Thread(
+        target=_land_replay_tracker,
+        args=(state, session, Path(state.replay.realRunDir)),
+        daemon=True,
+        name=f"replay-tracker-land-{session.session_id}",
+    ).start()
+
+
+def _execute_real_replay(state: GatewayState) -> None:
+    """Step 2: stream the trajectory from the start the arm is holding."""
+    process = state.replay_process
+    if process is None or state.replay_process_kind != "real" or process.poll() is not None or process.stdin is None:
+        raise RuntimeError("No real replay is holding at a trajectory start.")
+    if state.replay.realPhase != "at_start":
+        raise RuntimeError("The arm has not reached the trajectory start yet.")
+    if state.replay.realRecordTracker:
+        session = state.replay_tracker
+        if session is None or state.replay.realTrackerState in ("warming", "error", ""):
+            raise RuntimeError(f"Laser tracker is not connected: {state.replay.realTrackerDetail or 'not started'}")
+        if not session.ready():
+            raise RuntimeError(f"Laser tracker is not ready: {session.beam_summary()}")
+        if not session.start_recording(int(state.replay.episode), time.time()):
+            raise RuntimeError(f"Laser tracker refused to start recording: {session.last_error}")
+        state.replay.realTrackerState = "recording"
+        state.replay.realTrackerDetail = f"recording {session.session_id}"
+    process.stdin.write("go\n")
+    process.stdin.flush()
+    process.stdin.close()
+    state.replay.realPhase = "executing"
+    state.replay.message = "Executing the trajectory"
+    _append_real_replay_log(
+        state, "execute", "streaming the trajectory" + (" with the laser tracker" if state.replay.realRecordTracker else "")
+    )
+
+
+def _close_replay_tracker_window(state: GatewayState) -> None:
+    session = state.replay_tracker
+    if session is None or state.replay.realTrackerState != "recording":
+        return
+    state.replay.realTrackerState = "recorded"
+    Thread(target=session.stop_recording, daemon=True, name=f"replay-tracker-stop-{session.session_id}").start()
+
+
+def _apply_real_replay_marker(state: GatewayState, output: str) -> None:
+    if output.startswith("REPLAY_AT_TRAJECTORY_START"):
+        state.replay.realPhase = "at_start"
+        state.replay.message = "Holding at the trajectory start; Execute to stream the trajectory"
+    elif output.startswith("REPLAY_TRAJECTORY_END") or output.startswith("REPLAY_TRAJECTORY_SKIPPED"):
+        state.replay.realPhase = "finished"
+        _close_replay_tracker_window(state)
+
+
 def _abort_replay(state: GatewayState) -> None:
     process = state.replay_process
     replay_kind = state.replay_process_kind or "replay"
@@ -15869,6 +16061,8 @@ def _abort_replay(state: GatewayState) -> None:
     if replay_kind == "real":
         _stop_realsense_preview(state)
         _append_real_replay_log(state, "abort", "operator stopped real replay")
+        state.replay.realPhase = ""
+        _finish_replay_tracker(state)
     if replay_kind == "mujoco" and state.replay.mujocoValidation:
         state.replay.mujocoValidation["status"] = "failed"
         state.replay.mujocoValidation["message"] = "MuJoCo validation aborted before completion"
@@ -16499,7 +16693,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         query.get("end_effector", [self.server.state.replay.realEndEffectorMode])[0],
                         str(query.get("override_mujoco_failure", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
+                        record_tracker=str(query.get("record_tracker", ["false"])[0]).strip().lower()
+                        in ("1", "true", "yes", "on"),
                     )
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/execute-real":
+                    _execute_real_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/teleop/start-sim":
@@ -16844,7 +17044,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
-            if path == "/api/replay/start-real":
+            if path in ("/api/replay/start-real", "/api/replay/execute-real"):
                 _append_real_replay_log(self.server.state, "error", str(exc))
             self.server.state.log("warn", f"{path} failed: {exc}")
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})

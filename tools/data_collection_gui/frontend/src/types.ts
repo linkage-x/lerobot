@@ -241,6 +241,12 @@ export type ReplayStatus = {
   realEndEffectorMode?: RealEndEffectorMode;
   mujocoOverrideAccepted?: boolean;
   realReplayLog?: string[];
+  // Thor two-step real replay: move to the trajectory start, then Execute.
+  realPhase?: RealReplayPhase;
+  realRecordTracker?: boolean;
+  realTrackerState?: RealTrackerState;
+  realTrackerDetail?: string;
+  realRunDir?: string;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -276,6 +282,18 @@ export type MujocoValidation = {
 export type MujocoCubeMode = "left" | "right" | "both";
 export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
 export type RealEndEffectorMode = "pika_gripper_ee" | "corenetic_gripper_ee" | "fr3_ee";
+export type RealReplayPhase = "" | "moving_to_start" | "at_start" | "executing" | "finished";
+export type RealTrackerState =
+  | ""
+  | "warming"
+  | "waiting"
+  | "ready"
+  | "recording"
+  | "recorded"
+  | "landing"
+  | "landed"
+  | "cancelled"
+  | "error";
 
 export type RealSensePreviewCameraStatus = {
   cameraKey: string;

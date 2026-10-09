@@ -454,17 +454,25 @@ export class DataCollectionGuiApi {
     cubeMode: RealCubeMode,
     robotIp: string,
     endEffectorMode: RealEndEffectorMode,
-    overrideMujocoFailure = false
+    overrideMujocoFailure = false,
+    recordTracker = false
   ): Promise<GuiSnapshot> {
     const params = new URLSearchParams({
       cube: cubeMode,
       robot_ip: robotIp,
       end_effector: endEffectorMode,
-      override_mujoco_failure: String(overrideMujocoFailure)
+      override_mujoco_failure: String(overrideMujocoFailure),
+      record_tracker: String(recordTracker)
     });
     const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
     if (remote) return remote;
     throw new Error("Gateway unavailable; real-robot replay cannot start.");
+  }
+
+  async executeRealCubeReplay(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/replay/execute-real");
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; the trajectory cannot be executed.");
   }
 
   async fetchMujocoPreview(

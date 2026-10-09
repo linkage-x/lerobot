@@ -1930,6 +1930,18 @@ button.danger {
   gap: 12px;
 }
 
+.real-robot-tracker-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.real-robot-tracker-toggle input {
+  margin-top: 2px;
+}
+
 .real-robot-ip-field {
   display: grid;
   gap: 5px;

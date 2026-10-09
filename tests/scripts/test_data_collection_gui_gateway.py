@@ -1742,6 +1742,137 @@ def test_thor_defaults_to_the_corenetic_end_effector_and_reads_the_trajectory_li
     assert gateway.REAL_REPLAY_TARGET_FRAMES["pika_gripper_ee"] != "corenetic_gripper_ee"
 
 
+class _RecordingStdin:
+    def __init__(self):
+        self.written = ""
+        self.closed = False
+
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _HeldReplayProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.stdin = _RecordingStdin()
+
+    def poll(self):
+        return None
+
+
+class _FakeTrackerSession:
+    session_id = "lt_test"
+    last_error = ""
+
+    def __init__(self, ready):
+        self._ready = ready
+        self.recording = []
+        self.stopped = threading.Event()
+
+    def ready(self):
+        return self._ready
+
+    def beam_summary(self):
+        return "beam ready" if self._ready else "beam not locked"
+
+    def start_recording(self, episode, t_wall):
+        self.recording.append(episode)
+        return True
+
+    def stop_recording(self):
+        self.stopped.set()
+        return {}
+
+
+def _held_real_replay_state(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(episode=3),
+    )
+    state.replay_process = _HeldReplayProcess()
+    state.replay_process_kind = "real"
+    state.replay.realPhase = "moving_to_start"
+    return state
+
+
+def test_thor_real_replay_holds_at_the_trajectory_start_and_reports_into_a_run_dir(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]}],
+    )
+    run_dir = gateway._real_replay_run_dir(dataset_root, 0, "right")
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102", run_dir=run_dir)
+    assert "--replay.hold_at_trajectory_start=true" in command
+    assert f"--replay.report_json_path={run_dir / 'real_replay_report.json'}" in command
+    assert run_dir.parent == dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME / "real_replay"
+
+
+def test_real_replay_executes_only_from_the_trajectory_start(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    with pytest.raises(RuntimeError, match="not reached the trajectory start"):
+        gateway._execute_real_replay(state)
+    assert state.replay_process.stdin.written == ""
+
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True position_error_mm=3.10")
+    assert state.replay.realPhase == "at_start"
+    gateway._execute_real_replay(state)
+
+    assert state.replay_process.stdin.written == "go\n"
+    assert state.replay_process.stdin.closed
+    assert state.replay.realPhase == "executing"
+    gateway._apply_real_replay_marker(state, "REPLAY_TRAJECTORY_END t_monotonic_ns=1 completed=True")
+    assert state.replay.realPhase == "finished"
+
+
+def test_real_replay_with_tracker_waits_for_a_ready_tracker_and_brackets_the_trajectory(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.replay.realRecordTracker = True
+    session = _FakeTrackerSession(ready=False)
+    state.replay_tracker = session
+    state.replay.realTrackerState = "waiting"
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True")
+
+    # No ground truth without a homed, locked beam: the arm keeps holding.
+    with pytest.raises(RuntimeError, match="not ready: beam not locked"):
+        gateway._execute_real_replay(state)
+    assert state.replay_process.stdin.written == ""
+
+    session._ready = True
+    gateway._refresh_replay_tracker_status(state)
+    assert state.replay.realTrackerState == "ready"
+    gateway._execute_real_replay(state)
+    assert session.recording == [3]
+    assert state.replay.realTrackerState == "recording"
+    assert state.replay_process.stdin.written == "go\n"
+
+    gateway._apply_real_replay_marker(state, "REPLAY_TRAJECTORY_END t_monotonic_ns=1 completed=True")
+    assert session.stopped.wait(2.0)
+    assert state.replay.realTrackerState == "recorded"
+
+
+def test_real_replay_tracker_is_refused_while_the_recorder_holds_it(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.process = _HeldReplayProcess()
+    state.recording.laserTracker = True
+    with pytest.raises(RuntimeError, match="recorder holds the laser tracker"):
+        gateway._check_replay_tracker_available(state)
+    state.recording.laserTracker = False
+    with pytest.raises(RuntimeError, match="no usable laser_tracker block"):
+        gateway._check_replay_tracker_available(state)
+    state.config = {"laser_tracker": {"win_host": "18713@192.168.1.227"}}
+    gateway._check_replay_tracker_available(state)
+
+
 def test_fr3_facing_replays_refuse_a_world_with_no_edge_to_the_arm(tmp_path):
     state, dataset_root = _stamped_replay_dataset(tmp_path, edges=[])
 
@@ -2361,6 +2492,7 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
             "cube_mode": "left",
             "episode_index": 0,
             "fps": 30,
+            "initial_joints": "fr3_start",
             "robots": {
                 "left": {
                     "frames": [{"frame_index": 0}, {"frame_index": 1}],
@@ -2387,6 +2519,14 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         ),
         selected_replay_root=dataset_root,
     )
+
+    # A preview seeded anywhere but the real replay's start pose cannot be approved.
+    stale = json.loads(report_path.read_text(encoding="utf-8"))
+    report_path.write_text(json.dumps({**stale, "initial_joints": "das_start"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="FR3 start pose"):
+        gateway._approve_mujoco_report(state, "left")
+    report_path.write_text(json.dumps(stale), encoding="utf-8")
+    video_path.write_bytes(b"rendered")
 
     gateway._approve_mujoco_report(state, "left")
 
