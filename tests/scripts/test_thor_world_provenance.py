@@ -1,6 +1,8 @@
 """World provenance: the one field an episode cannot be given afterwards."""
 
+import csv
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -371,3 +373,30 @@ def test_repo_graph_reaches_the_fr3_base_from_the_current_world() -> None:
     assert found is not None
     T, path = found
     assert path and path[-1]["to_world_frame_id"] == "fr3_base"
+
+
+def test_reexpress_pose_csv_moves_every_pose_group_by_its_episode(tmp_path):
+    src = tmp_path / "state_action.right.csv"
+    src.write_text(
+        "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw,"
+        "action_x_m,action_y_m,action_z_m,action_qx,action_qy,action_qz,action_qw,gripper\n"
+        "0,0,0.1,0.2,0.3,0,0,0,1,1.0,0.0,0.0,0,0,0,1,0.5\n"
+        "0,1,nan,nan,nan,nan,nan,nan,nan,1.0,0.0,0.0,0,0,0,1,0.5\n",
+        encoding="utf-8",
+    )
+    # 90 deg about z, then (1, 2, 3).
+    T = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+    dst = tmp_path / "out" / "state_action.right.csv"
+
+    assert wp.reexpress_pose_csv(src, dst, {0: T}) == 2
+
+    rows = list(csv.DictReader(dst.open()))
+    assert [float(rows[0][k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    assert float(rows[0]["state_qz"]) == pytest.approx(math.sqrt(0.5))
+    assert [float(rows[0][k]) for k in ("action_x_m", "action_y_m", "action_z_m")] == pytest.approx([1.0, 3.0, 3.0])
+    assert rows[0]["gripper"] == "0.5"
+    # A gap stays a gap rather than becoming the edge's translation.
+    assert math.isnan(float(rows[1]["state_x_m"]))
+
+    with pytest.raises(RuntimeError, match="episode 0 has no transform"):
+        wp.reexpress_pose_csv(src, dst, {1: T})

@@ -997,7 +997,7 @@ def _info(world: str = '', link: str | None = None) -> dict:
     return info
 
 
-def _resolve_alignment(requested='auto', policy=None, alignment=None, target='link_lt_gripper_tcp'):
+def _resolve_alignment(requested='auto', policy=None, alignment=None, target='corenetic_gripper_ee'):
     policy = _info() if policy is None else policy
     return fr3_act_infer_real_runtime.resolve_dataset_alignment(
         requested=requested,
@@ -1008,8 +1008,8 @@ def _resolve_alignment(requested='auto', policy=None, alignment=None, target='li
 
 
 def test_dataset_alignment_keeps_the_start_pose_estimate_unless_the_training_data_is_in_fr3_base():
-    fr3 = _info('fr3_base', 'link_lt_gripper_tcp')
-    camera_world = _info('world_20260928_063531', 'link_lt_gripper_tcp')
+    fr3 = _info('fr3_base', 'corenetic_gripper_ee')
+    camera_world = _info('world_20260928_063531', 'corenetic_gripper_ee')
     # FR3-native recordings carry no stamp, camera-world exports carry a world id: both keep
     # the start-pose estimate they have always used.
     assert _resolve_alignment(policy=_info()) == 'start_pose'
@@ -1023,8 +1023,8 @@ def test_dataset_alignment_keeps_the_start_pose_estimate_unless_the_training_dat
 
 
 def test_dataset_alignment_in_fr3_base_requires_the_ik_target_to_be_the_labelled_link():
-    with pytest.raises(ValueError, match='--target-frame-name link_lt_gripper_tcp'):
-        _resolve_alignment(policy=_info('fr3_base', 'link_lt_gripper_tcp'), target='pika_gripper_ee')
+    with pytest.raises(ValueError, match='--target-frame-name corenetic_gripper_ee'):
+        _resolve_alignment(policy=_info('fr3_base', 'corenetic_gripper_ee'), target='pika_gripper_ee')
     with pytest.raises(ValueError, match='tcp_frame.link'):
         _resolve_alignment(policy=_info('fr3_base', ''))
 
@@ -1033,8 +1033,8 @@ def test_dataset_alignment_reads_the_training_frame_not_a_re_exported_source():
     # The IL view keeps the frame it was built from; its source has since been re-exported.
     with pytest.raises(ValueError, match='re-exported since the view was built'):
         _resolve_alignment(
-            policy=_info('world_20260928_063531', 'link_lt_gripper_tcp'),
-            alignment=_info('fr3_base', 'link_lt_gripper_tcp'),
+            policy=_info('world_20260928_063531', 'corenetic_gripper_ee'),
+            alignment=_info('fr3_base', 'corenetic_gripper_ee'),
         )
 
 

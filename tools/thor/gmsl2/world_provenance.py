@@ -46,6 +46,7 @@ interpreter that must not import numpy or cv2 to write a json field.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -411,6 +412,53 @@ def reexpressed_world_frame(
         "T_target_source": T_target_source,
         "edges": edges_used,
     }
+
+
+_POSE7_SUFFIXES = ("_x_m", "_y_m", "_z_m", "_qx", "_qy", "_qz", "_qw")
+
+
+def reexpress_pose_csv(
+    src: Path | str,
+    dst: Path | str,
+    transform_by_episode: Mapping[int, list[list[float]]],
+) -> int:
+    """Copy a tracking ``state_action`` CSV with every pose7 column group moved by its episode's T.
+
+    A group is any ``<prefix>_x_m ... <prefix>_qw`` set (``state``, ``action``, ...).
+    Non-finite poses stay gaps. A row whose ``episode_index`` has no transform raises:
+    leaving it as recorded would mix two worlds in one file. Returns the row count.
+    """
+    with Path(src).open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    prefixes = [
+        name[: -len("_x_m")]
+        for name in fieldnames
+        if name.endswith("_x_m") and all(name[: -len("_x_m")] + sfx in fieldnames for sfx in _POSE7_SUFFIXES)
+    ]
+    for row in rows:
+        episode = int(float(row.get("episode_index") or 0))
+        if episode not in transform_by_episode:
+            raise RuntimeError(f"{src}: episode {episode} has no transform")
+        T = transform_by_episode[episode]
+        for prefix in prefixes:
+            keys = [prefix + sfx for sfx in _POSE7_SUFFIXES]
+            try:
+                pose = [float(row[k]) for k in keys]
+            except (TypeError, ValueError):
+                continue
+            if all(math.isfinite(v) for v in pose):
+                row.update({k: repr(v) for k, v in zip(keys, transform_pose7(T, pose), strict=True)})
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(dst)
+    return len(rows)
 
 
 def inspect_dataset(dataset_root: Path | str) -> tuple[int, list[str]]:

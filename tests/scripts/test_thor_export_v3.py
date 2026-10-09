@@ -748,7 +748,9 @@ def _tracked_world_session(
             json.dumps(
                 {
                     "ee_from_cube": {
-                        "target_parent_link": tcp_link,
+                        # The bundle lands on the parent; the CSV holds the child.
+                        "target_parent_link": "link_lt_gripper_tcp",
+                        "target_child_link": tcp_link,
                         "marker_to_tcp_calibration_path": "config_thor/marker_to_tcp_calibration_test.json",
                     }
                 }
@@ -820,7 +822,7 @@ def test_export_refuses_a_target_world_with_no_edge(tmp_path, monkeypatch):
 def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_path, monkeypatch, capsys):
     pytest.importorskip("pyarrow")
     edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T, "method": "test"}
-    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="link_lt_gripper_tcp")
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
 
     out = export_v3.export_task_to_v3(
         datasets_root=datasets,
@@ -834,7 +836,7 @@ def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_p
     info = json.loads((out / "meta" / "info.json").read_text())
     assert info["world_frame"]["world_frame_id"] == "fr3_base"
     # Deployment commands these poses absolutely, so it has to know which link they are on.
-    assert info["tcp_frame"]["link"] == "link_lt_gripper_tcp"
+    assert info["tcp_frame"]["link"] == "corenetic_gripper_ee"
     assert info["tcp_frame"]["marker_to_tcp_calibrations"] == ["config_thor/marker_to_tcp_calibration_test.json"]
     # The GUI shows the last line, so the frame has to be on it.
     assert "(world frame: fr3_base)" in capsys.readouterr().out.strip().splitlines()[-1]

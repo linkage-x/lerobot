@@ -95,9 +95,13 @@ re-exported since then), and picks how `T(B,W_s)` is obtained:
 - `absolute`: identity. Use it only for demos recorded inside the arm's reach.
 
 Both `fr3_base` modes refuse to run unless the IK target is `tcp_frame.link`.
-For the box labels that is `link_lt_gripper_tcp` (corenetic URDF), and its
-origin is the insert-v2 socket centre, not that link's origin. The offset
-between the two is still unrecorded (see the 0929 marker->TCP bundle).
+For the box labels that is `corenetic_gripper_ee`, which is what the tracker
+hops to from the bundle's `link_lt_gripper_tcp` (an R_x(pi) turn). Run with
+`--robot-urdf-path src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
+--target-frame-name corenetic_gripper_ee`. The labels' origin is the insert-v2
+socket centre, not that link's origin, and the offset between the two is still
+unrecorded (see the 0929 marker->TCP bundle). `start_position` keeps the error
+from that offset small.
 
 The edge is valid only while the rig cameras stay at their 0928 poses and the
 FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and

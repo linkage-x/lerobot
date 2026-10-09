@@ -1621,6 +1621,70 @@ def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     assert both_video.name == "mujoco_preview.both.episode_000002.mp4"
 
 
+def _stamped_replay_dataset(tmp_path: Path, *, edges: list[dict]) -> tuple[gateway.GatewayState, Path]:
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20261009_102307"
+    meta_dir = dataset_root / "episodes" / "episode_000000"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(json.dumps({"world_frame": {"world_frame_id": "world_a", "status": "ok"}}), encoding="utf-8")
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.right.csv").write_text(
+        "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.1,0.2,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    world_dir = repo_root / "tools" / "thor" / "gmsl2" / "world"
+    world_dir.mkdir(parents=True)
+    (world_dir / "world_graph.json").write_text(
+        json.dumps({"version": 1, "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}], "edges": edges}),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", episode=0, fps=60),
+    )
+    return state, dataset_root
+
+
+def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
+    # 90 deg about z, then (1, 2, 3): T_fr3_base_world_a.
+    edge_matrix = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": edge_matrix}],
+    )
+    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
+
+    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
+    real = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
+
+    # The camera-world sidecar is never what the arm (simulated or real) is given.
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
+    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real
+    row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
+
+
+def test_fr3_facing_replays_refuse_a_world_with_no_edge_to_the_arm(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(tmp_path, edges=[])
+
+    with pytest.raises(RuntimeError, match="no registration edge"):
+        gateway._mujoco_replay_command(state, dataset_root, "right")
+    with pytest.raises(RuntimeError, match="no registration edge"):
+        gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
+
+    # A block that is not ok means the world is unknown -- not the legacy robot-base frame.
+    meta = dataset_root / "episodes" / "episode_000000" / "meta.json"
+    meta.write_text(json.dumps({"world_frame": {"world_frame_id": "", "status": "missing"}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="no usable world stamp"):
+        gateway._mujoco_replay_command(state, dataset_root, "right")
+
+
 def test_save_annotation_persists_episode_metadata(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

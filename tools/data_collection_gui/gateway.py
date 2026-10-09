@@ -34,6 +34,7 @@ from urllib.request import urlopen
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
+from tools.thor.gmsl2 import world_provenance as wp
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
@@ -9203,6 +9204,81 @@ def _save_annotation(state: GatewayState, payload: dict[str, Any]) -> None:
     state.log("info", f"Saved annotation for {dataset_root.name} episode {episode}")
 
 
+# Where the FR3-facing copy of a session's trajectory lives. The sidecar holds poses
+# in the world the session was recorded in -- for world_20260928_063531 that is the
+# camera island (cam_14 at the origin), not the arm's base -- so anything that hands
+# them to the FR3 (MuJoCo preview, offline IK QC, real replay) reads this copy instead.
+FR3_BASE_TRAJECTORY_SUBDIR = "fr3_base"
+
+
+def _fr3_base_trajectory_dir_path(dataset_root: Path) -> Path:
+    return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / FR3_BASE_TRAJECTORY_SUBDIR
+
+
+def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | None:
+    """Write the sidecar's state_action CSVs re-expressed in fr3_base; return their dir.
+
+    None when no episode has a ``world_frame`` block at all: those predate world
+    provenance, when the tracker's world *was* the robot base, so their poses go to the
+    FR3 as recorded. Raises when a block is not ``ok`` (the world is unknown, not the
+    base) or a stamped world has no registration edge to fr3_base -- handing such poses
+    to the arm unchanged drives it to coordinates of another frame, and MuJoCo would
+    even call that reachable.
+    """
+    sidecar = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+    blocks: dict[int, Any] = {}
+    for meta_path in sorted((dataset_root / "episodes").glob("episode_*/meta.json")):
+        try:
+            index = int(meta_path.parent.name.split("_")[-1])
+        except ValueError:
+            continue
+        blocks[index] = _load_json_file(meta_path).get("world_frame")
+    if all(block is None for block in blocks.values()):
+        return None
+    graph = wp.read_world_graph(repo_root)
+    transforms: dict[int, list[list[float]]] = {}
+    routes: dict[str, Any] = {}
+    for index, block in blocks.items():
+        world = wp.world_frame_id_of(block)
+        if not world:
+            raise RuntimeError(
+                f"episode {index} of {dataset_root.name} has no usable world stamp "
+                f"({wp.describe(block)}); its frame is unknown, so it cannot be replayed on the FR3"
+            )
+        if world == wp.FR3_BASE_WORLD_ID:
+            transforms[index] = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+            continue
+        found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
+        if found is None:
+            raise RuntimeError(
+                f"episode {index} was recorded in {world} and no registration edge in "
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {wp.FR3_BASE_WORLD_ID}; "
+                "its poses cannot be given to the FR3"
+            )
+        transforms[index] = found[0]
+        routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
+    out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
+    written = []
+    for src in sorted(sidecar.glob("state_action.*.csv")):
+        wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
+        written.append(src.name)
+    (out_dir / "frame.json").write_text(
+        json.dumps(
+            {"world_frame_id": wp.FR3_BASE_WORLD_ID, "from": routes, "files": written},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return out_dir
+
+
+def _fr3_trajectory_csv(dataset_root: Path, repo_root: Path, cube: str) -> Path:
+    """The state_action CSV of ``cube`` in the frame the FR3 commands in."""
+    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
+    root = fr3_dir if fr3_dir is not None else dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+    return root / f"state_action.{cube}.csv"
+
+
 def _run_fr3_ik_qc(
     dataset_root: Path,
     *,
@@ -9222,6 +9298,12 @@ def _run_fr3_ik_qc(
             "message": "No left/right FR3 EE trajectory sidecar is available for offline IK evaluation.",
             "cubes": [],
         }
+    try:
+        fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
+    except RuntimeError as exc:
+        return {"status": "fail", "message": str(exc), "cubes": []}
+    if fr3_dir is not None:
+        cube_paths = {cube: fr3_dir / path.name for cube, path in cube_paths.items()}
 
     script_path = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
     config_path = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
@@ -15003,6 +15085,7 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
     report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
     video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
+    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, state.repo_root)
     command = [
         str(_mujoco_replay_python(state)),
         str(
@@ -15013,7 +15096,7 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
             / "replay_cube_pose_in_robot_base_mujoco.py"
         ),
         "--dataset-root",
-        str(dataset_root),
+        str(fr3_dir if fr3_dir is not None else dataset_root),
         "--cube",
         selected_cube_mode,
         "--episode-index",
@@ -15053,7 +15136,10 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         raise RuntimeError(f"Run MuJoCo {selected_cube_mode} first; no report exists for this episode.")
     if not video_path.is_file():
         raise RuntimeError(f"MuJoCo report exists but its native video is missing: {video_path}")
-    if Path(str(report.get("dataset_root") or "")).resolve() != dataset_root.resolve():
+    if Path(str(report.get("dataset_root") or "")).resolve() not in {
+        dataset_root.resolve(),
+        _fr3_base_trajectory_dir_path(dataset_root).resolve(),
+    }:
         raise RuntimeError("MuJoCo report belongs to a different dataset.")
     if int(report.get("episode_index", -1)) != int(state.replay.episode):
         raise RuntimeError("MuJoCo report belongs to a different episode.")
@@ -15168,12 +15254,8 @@ def _real_replay_command(
     # run_replay_cube_pose_on_thor.sh wrapper here would make Thor SSH back into
     # itself and depend on an unrelated self-SSH key. Invoke the same underlying
     # replay runtime locally with the exact selected sidecar and episode.
-    csv_path = (
-        dataset_root
-        / "derived"
-        / DEFAULT_TRAJ_SIDECAR_NAME
-        / f"state_action.{cube_mode}.csv"
-    )
+    # Same FR3-frame copy the MuJoCo validation ran on, so the arm executes what was checked.
+    csv_path = _fr3_trajectory_csv(dataset_root, state.repo_root, cube_mode)
     command = [
         str(_mujoco_replay_python(state)),
         str(

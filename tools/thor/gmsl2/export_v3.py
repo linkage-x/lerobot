@@ -660,9 +660,12 @@ def _tracking_run_dir(session_dir: Path) -> Path:
 def _tcp_frame_of_session(session_dir: Path) -> dict[str, str]:
     """Which physical point the session's ee poses are, as its tracking run recorded it.
 
-    ``link`` is the URDF link whose axes the poses carry; the origin is whatever the
-    marker->TCP bundle defines (for bundle 0929, the socket centre of insert v2 --
-    not that link's origin). Empty strings when the run left no summary.
+    ``link`` is the URDF link whose axes the poses carry. The bundle lands on
+    ``target_parent_link`` and the tracker then hops to ``target_child_link`` when one is
+    configured (Thor: link_lt_gripper_tcp -> corenetic_gripper_ee, an R_x(pi) turn), so
+    the child is what the CSV holds. The origin is whatever the marker->TCP bundle
+    defines (for bundle 0929, the socket centre of insert v2 -- not the link's origin).
+    Empty strings when the run left no summary.
     """
     summary = _tracking_run_dir(session_dir) / "summary.json"
     try:
@@ -670,7 +673,7 @@ def _tcp_frame_of_session(session_dir: Path) -> dict[str, str]:
     except (OSError, json.JSONDecodeError):
         ee_from_cube = {}
     return {
-        "link": str(ee_from_cube.get("target_parent_link") or ""),
+        "link": str(ee_from_cube.get("target_child_link") or ee_from_cube.get("target_parent_link") or ""),
         "marker_to_tcp_calibration": str(ee_from_cube.get("marker_to_tcp_calibration_path") or ""),
     }
 
