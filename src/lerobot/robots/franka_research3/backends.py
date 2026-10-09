@@ -179,6 +179,7 @@ class PandaPyArmDriver:
         # timestamp them by when they were read *from the arm* rather than by when it happened
         # to pick them up -- those differ by up to one poll period.
         self._cached_joint_positions_at_s: float | None = None
+        self._cached_external_torques: np.ndarray | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -283,10 +284,18 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
+        tau_ext = getattr(state, "tau_ext_hat_filtered", None)
+        external_torques = None if tau_ext is None else np.asarray(tau_ext, dtype=np.float64)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
+            self._cached_external_torques = external_torques
         return joint_positions
+
+    def get_external_joint_torques(self) -> np.ndarray | None:
+        """libfranka's filtered external-torque estimate from the latest cached state, if any."""
+        with self._state_lock:
+            return None if self._cached_external_torques is None else self._cached_external_torques.copy()
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Cached joint positions together with when they were read from the arm.
@@ -345,6 +354,7 @@ class PandaPyArmDriver:
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None
+            self._cached_external_torques = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:

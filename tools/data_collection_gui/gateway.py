@@ -9236,6 +9236,9 @@ def _fr3_base_trajectory_dir_path(dataset_root: Path) -> Path:
     return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / FR3_BASE_TRAJECTORY_SUBDIR
 
 
+DATASET_GRIPPER_WIDTH_NAME = "box_gripper.distance_m"
+
+
 def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | None:
     """Write the sidecar's state_action CSVs re-expressed in fr3_base; return their dir.
 
@@ -9280,17 +9283,91 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
     out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
     written = []
+    widths = _dataset_gripper_widths(dataset_root)
+    gripper_rows: dict[str, int] = {}
     for src in sorted(sidecar.glob("state_action.*.csv")):
         wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
+        gripper_rows[src.name] = _fill_gripper_width_column(out_dir / src.name, widths)
         written.append(src.name)
     (out_dir / "frame.json").write_text(
         json.dumps(
-            {"world_frame_id": wp.FR3_BASE_WORLD_ID, "from": routes, "files": written},
+            {
+                "world_frame_id": wp.FR3_BASE_WORLD_ID,
+                "from": routes,
+                "files": written,
+                "gripper_width": {"source": f"observation.state[{DATASET_GRIPPER_WIDTH_NAME}]", "rows": gripper_rows},
+            },
             indent=2,
         ),
         encoding="utf-8",
     )
     return out_dir
+
+
+def _dataset_gripper_widths(dataset_root: Path) -> dict[tuple[int, int], float]:
+    """The BOX jaw opening (m) per ``(episode_index, frame_index)``, or {} when not recorded.
+
+    The tracker writes poses only and leaves the sidecar's ``gripper_width_m`` NaN; the
+    opening lives in the episode parquet. The corenetic gripper on the FR3 is commanded
+    in the same metres, so this is what the arm's gripper replays.
+    """
+    info = _load_json_file(dataset_root / "meta" / "info.json")
+    features = info.get("features") if isinstance(info.get("features"), dict) else {}
+    names = (features.get("observation.state") or {}).get("names")
+    if isinstance(names, dict):
+        names = next(iter(names.values()), [])
+    if not isinstance(names, list) or DATASET_GRIPPER_WIDTH_NAME not in names:
+        return {}
+    column = names.index(DATASET_GRIPPER_WIDTH_NAME)
+    import pyarrow.parquet as pq
+
+    widths: dict[tuple[int, int], float] = {}
+    for data_file in sorted((dataset_root / "data").glob("chunk-*/file-*.parquet")):
+        table = pq.read_table(data_file, columns=["episode_index", "frame_index", "observation.state"])
+        for episode, frame, state_vec in zip(
+            table.column("episode_index").to_pylist(),
+            table.column("frame_index").to_pylist(),
+            table.column("observation.state").to_pylist(),
+            strict=True,
+        ):
+            if not state_vec or len(state_vec) <= column or state_vec[column] is None:
+                continue
+            width = float(state_vec[column])
+            if math.isfinite(width):
+                widths[(int(episode), int(frame))] = width
+    return widths
+
+
+def _fill_gripper_width_column(csv_path: Path, widths: dict[tuple[int, int], float]) -> int:
+    """Fill the NaN ``gripper_width_m`` cells of ``csv_path`` from ``widths``; return rows that carry one."""
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if "gripper_width_m" not in fieldnames:
+        fieldnames.append("gripper_width_m")
+    carried = 0
+    for row in rows:
+        try:
+            recorded = float(row.get("gripper_width_m") or "nan")
+        except ValueError:
+            recorded = math.nan
+        if not math.isfinite(recorded):
+            try:
+                key = (int(float(row.get("episode_index") or 0)), int(float(row["frame_index"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key not in widths:
+                continue
+            row["gripper_width_m"] = repr(widths[key])
+        carried += 1
+    tmp = csv_path.with_name(csv_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(csv_path)
+    return carried
 
 
 def _fr3_trajectory_csv(dataset_root: Path, repo_root: Path, cube: str) -> Path:
@@ -16008,6 +16085,42 @@ def _finish_replay_tracker(state: GatewayState) -> None:
     ).start()
 
 
+# The tracker's home nest sits ~158 mm from the head: lt_20261009_092828 was "ready"
+# (homed, locked) and recorded 157.7 mm for a whole Execute while the arm moved. Any
+# beam closer than this is on the nest, not on the SMR the arm carries.
+TRACKER_HOME_NEST_MAX_MM = 300.0
+TRACKER_NEST_CHECK_ROWS = 500
+
+
+def _replay_tracker_nest_problem(state: GatewayState) -> str:
+    """Why Execute must not start the tracker recording yet, or "" (blocking ssh: no lock held).
+
+    ``ready`` only says the range is absolute: Home leaves the beam locked on the nest,
+    and a recording taken there is a dwell, not the arm's trajectory.
+    """
+    with state.lock:
+        session = state.replay_tracker if state.replay.realRecordTracker else None
+    if session is None:
+        return ""
+    try:
+        if not session.ready:
+            return ""  # _execute_real_replay names what the tracker is waiting for
+        stats = session.beam_stats(last_rows=TRACKER_NEST_CHECK_ROWS)
+    except Exception as exc:  # noqa: BLE001
+        return f"could not read where the tracker beam is: {type(exc).__name__}: {exc}"
+    if int(stats.get("rows") or 0) <= 0:
+        return "could not read where the tracker beam is (no recent stream rows)"
+    if float(stats.get("valid", -1.0)) < 0.5:
+        return f"the tracker beam is not measuring (valid {max(0.0, float(stats['valid'])) * 100:.0f}% of the last {stats['rows']} rows)"
+    nest_mm = float(stats.get("dist_max_mm", -1.0))
+    if 0.0 <= nest_mm < TRACKER_HOME_NEST_MAX_MM:
+        return (
+            f"the SMR is still in the tracker's home nest ({nest_mm:.0f} mm from the head): carry it "
+            "out of the nest with the beam locked and seat it on the arm's SMR mount, then Execute"
+        )
+    return ""
+
+
 def _execute_real_replay(state: GatewayState) -> None:
     """Step 2: stream the trajectory from the start the arm is holding."""
     process = state.replay_process
@@ -16639,6 +16752,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
             _json_response(self, status, result)
             return
+        if path == "/api/replay/execute-real":
+            # Reading where the beam is takes an ssh round trip to the capture PC: outside the lock.
+            problem = _replay_tracker_nest_problem(self.server.state)
+            if problem:
+                with self.server.state.lock:
+                    _append_real_replay_log(self.server.state, "error", problem)
+                    self.server.state.log("warn", f"{path} refused: {problem}")
+                _json_response(self, HTTPStatus.CONFLICT, {"error": problem})
+                return
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/start":

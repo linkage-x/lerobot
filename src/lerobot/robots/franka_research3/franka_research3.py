@@ -450,6 +450,11 @@ class FrankaResearch3(Robot):
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
 
+    def get_external_joint_torques(self) -> np.ndarray | None:
+        """Estimated external joint torques (N*m) when the arm backend reports them."""
+        getter = getattr(self._arm, "get_external_joint_torques", None)
+        return getter() if callable(getter) else None
+
     def _read_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Joint positions and when they were read from the arm, not when we picked them up.
 

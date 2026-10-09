@@ -1698,6 +1698,48 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
     assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
 
 
+def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
+    )
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    # The tracker leaves gripper_width_m NaN: the opening lives in the episode parquet.
+    (sidecar / "state_action.right.csv").write_text(
+        "episode_index,frame_index,gripper_width_m,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,nan,0.1,0.2,0.3,0,0,0,1\n"
+        "0,1,nan,0.1,0.2,0.3,0,0,0,1\n"
+        "0,2,nan,0.1,0.2,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "meta").mkdir()
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"features": {"observation.state": {"names": ["box_trigger.travel_pct", "box_gripper.distance_m"]}}}),
+        encoding="utf-8",
+    )
+    data_dir = dataset_root / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({
+            "episode_index": [0, 0, 0],
+            "frame_index": [0, 1, 2],
+            "observation.state": [[0.0, 0.0887], [100.0, 0.0323], [100.0, float("nan")]],
+        }),
+        data_dir / "file-000.parquet",
+    )
+
+    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+
+    rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(r["gripper_width_m"]) for r in rows[:2]] == pytest.approx([0.0887, 0.0323])
+    assert rows[2]["gripper_width_m"] == "nan"  # no opening recorded: the replay falls back, not 0
+    assert json.loads((fr3_dir / "frame.json").read_text())["gripper_width"]["rows"] == {"state_action.right.csv": 2}
+
+
 def test_thor_preflight_checks_the_replay_arm_not_the_workstation_arm(tmp_path):
     state = gateway.GatewayState(
         repo_root=tmp_path,
@@ -1784,6 +1826,11 @@ class _FakeTrackerSession:
     def beam_summary(self):
         return "beam ready" if self._ready else "beam not locked"
 
+    beam_dist_mm = 1500.0
+
+    def beam_stats(self, *, last_rows=0, sample_bytes=200_000):
+        return {"rows": 500, "valid": 1.0, "tracking": 1.0, "dist_min_mm": self.beam_dist_mm, "dist_max_mm": self.beam_dist_mm}
+
     def start_recording(self, episode, t_wall):
         self.recording.append(episode)
         return True
@@ -1799,6 +1846,7 @@ def test_fake_tracker_matches_the_real_session_interface():
     assert isinstance(lts.LaserTrackerSession.ready, property)
     assert isinstance(_FakeTrackerSession.ready, property)
     assert callable(lts.LaserTrackerSession.beam_summary)
+    assert callable(lts.LaserTrackerSession.beam_stats)
     assert callable(lts.LaserTrackerSession.start_recording)
     assert callable(lts.LaserTrackerSession.stop_recording)
 
@@ -1870,6 +1918,23 @@ def test_real_replay_with_tracker_waits_for_a_ready_tracker_and_brackets_the_tra
     gateway._apply_real_replay_marker(state, "REPLAY_TRAJECTORY_END t_monotonic_ns=1 completed=True")
     assert session.stopped.wait(2.0)
     assert state.replay.realTrackerState == "recorded"
+
+
+def test_real_replay_execute_refuses_a_tracker_beam_still_on_the_home_nest(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.replay.realRecordTracker = True
+    session = _FakeTrackerSession(ready=True)
+    state.replay_tracker = session
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True")
+
+    # Homed and locked, but on the nest: lt_20261009_092828 recorded 157.7 mm for a whole run.
+    session.beam_dist_mm = 157.7
+    assert "home nest (158 mm" in gateway._replay_tracker_nest_problem(state)
+    session.beam_dist_mm = 1840.0
+    assert gateway._replay_tracker_nest_problem(state) == ""
+    state.replay.realRecordTracker = False
+    session.beam_dist_mm = 157.7
+    assert gateway._replay_tracker_nest_problem(state) == ""  # not recording the tracker: no gate
 
 
 def test_real_replay_tracker_is_refused_while_the_recorder_holds_it(tmp_path):

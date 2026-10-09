@@ -282,6 +282,12 @@ export function RealRobotReplayPanel({
           {status.realRecordTracker && status.realTrackerDetail ? (
             <p className="panel-note">{status.realTrackerDetail}</p>
           ) : null}
+          {status.realRecordTracker && phase === "at_start" ? (
+            <p className="panel-note">
+              Ready means homed, and Home leaves the beam on the nest. Carry the SMR out of the nest with the beam
+              locked and seat it on the arm before Execute; Execute refuses a beam still at the nest.
+            </p>
+          ) : null}
           <button className="danger real-robot-run" disabled={!canExecute} onClick={onExecute} type="button">
             {phase === "executing" ? "2 · Executing trajectory…" : "2 · Execute trajectory"}
           </button>

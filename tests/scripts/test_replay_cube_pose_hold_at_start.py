@@ -57,3 +57,42 @@ def test_the_hold_times_out(monkeypatch):
     finally:
         os.close(write_fd)
         stdin.close()
+
+
+def test_csv_trajectory_carries_the_recorded_gripper_opening(tmp_path):
+    csv_path = tmp_path / "state_action.right.csv"
+    csv_path.write_text(
+        "episode_index,frame_index,gripper_width_m,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.09,0.5,0,0.3,0,0,0,1\n"
+        "0,1,0.0323,0.5,0,0.3,0,0,0,1\n"
+        "0,2,nan,0.5,0,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    cfg = replay.TrajectoryInputConfig(source="csv", csv_path=str(csv_path), pose_prefix="state")
+    episodes, summary = replay._load_csv_episode_trajectories(cfg)
+    # Metres over the corenetic jaw's 90 mm: the arm's gripper is commanded the same opening.
+    assert [t.gripper_pos for t in episodes[0].targets] == pytest.approx([1.0, 0.0323 / 0.09, None], nan_ok=True)
+    assert episodes[0].targets[2].gripper_pos is None
+    assert summary["gripper_width_rows"] == 2
+    runtime = replay.ReplayRuntimeConfig(use_dataset_gripper_for_replay=True, gripper_pos=1.0)
+    assert replay._get_target_gripper_command(episodes[0].targets[1], runtime, 1.0) == pytest.approx(0.0323 / 0.09)
+    assert replay._get_target_gripper_command(episodes[0].targets[2], runtime, 1.0) == 1.0
+
+
+def test_thor_profile_replays_the_dataset_gripper():
+    import yaml
+
+    profile = yaml.safe_load(_SCRIPT.with_name("replay_cube_pose_in_robot_base.thor.yaml").read_text())
+    assert profile["replay"]["use_dataset_gripper_for_replay"] is True
+
+
+def test_external_torques_are_nan_when_the_robot_cannot_report_them():
+    class _Robot:
+        pass
+
+    class _Fr3:
+        def get_external_joint_torques(self):
+            return [0, 0, 0, 0, 0, 9.0, 0]
+
+    assert all(v != v for v in replay._external_joint_torques(_Robot()))
+    assert replay._external_joint_torques(_Fr3())[5] == 9.0
