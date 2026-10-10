@@ -171,6 +171,31 @@ def test_joint_start_homes_then_ramps_to_the_planned_start_joints():
     assert result["ramp_s"] == pytest.approx(1.99 / 20.0, rel=1e-3)
 
 
+class _SaggingRobot(_JointRobot):
+    """Joint impedance: the soft wrist settles 0.0212 rad short of its command (10-10 on Thor)."""
+
+    def send_joint_positions(self, target):
+        super().send_joint_positions(target)
+        self.joints[6] -= 0.0212
+
+
+def test_joint_start_accepts_the_wrist_sag_joint_impedance_leaves():
+    planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
+    cfg = replay.ReplayRuntimeConfig(
+        initial_pose_mode="joint_start",
+        initial_joint_positions=planned,
+        initial_joint_max_velocity_rad_s=20.0,
+        initial_joint_pose_timeout_s=0.5,
+        command_interval_s=0.005,
+        home_settle_time_s=0.0,
+    )
+    result = replay._prepare_initial_robot_pose(_SaggingRobot([0.0] * 7), cfg)
+    assert result["reached"] is True
+    assert result["final_joint_error_rad"][6] == pytest.approx(0.0212)
+    # das_start keeps its own, tighter tolerance.
+    assert cfg.initial_joint_pose_tolerance_rad < 0.0212 < cfg.joint_start_tolerance_rad
+
+
 def test_joint_start_needs_seven_start_joints():
     with pytest.raises(ValueError, match="needs replay.initial_joint_positions"):
         replay.ReplayRuntimeConfig(initial_pose_mode="joint_start")
