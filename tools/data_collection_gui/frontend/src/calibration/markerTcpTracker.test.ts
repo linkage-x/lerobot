@@ -64,6 +64,21 @@ describe("e1pSamples", () => {
 });
 
 describe("trackerLink", () => {
+  it("reports a connection failure before suggesting Home", () => {
+    const link = trackerLink({
+      ...LIVE,
+      laserTrackerState: "error",
+      laserTrackerReady: false,
+      laserTrackerHomed: false,
+      laserTrackerDetail: "ssh: connect to host 192.168.147.72 port 22: No route to host",
+    });
+    expect(link.dot).toBe("warning");
+    expect(link.text).toContain("跟踪仪不可用");
+    expect(link.text).toContain("No route to host");
+    expect(link.text).toContain("重新 Connect");
+    expect(link.text).not.toContain("home 窝");
+  });
+
   it("says what to change to make the next sample count for E1p", () => {
     expect(trackerLink(DISCONNECTED).dot).toBe("idle");
     expect(trackerLink({ state: "armed", laserTracker: false }).text).toContain("跟踪仪开关");

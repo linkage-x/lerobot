@@ -48,6 +48,66 @@ reference). The 09-23 island was exported but never committed here, so episodes
 recorded 09-23 18:55 → 09-28 were stamped 08-19; they were corrected on
 2026-09-28 with `restamp_world.py` (below).
 
+### The FR3 base (2026-10-09)
+
+`fr3_base` is a node with one edge, `world_20260928_063531 -> fr3_base`. It is
+**not** a world anything is recorded in. The reference keeps naming the camera
+island, and the edge says how to leave it. The edge was solved by
+`register_fr3_base.py solve` from the 10-02 P0 single-tag run
+(`outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z`,
+137 captures, FR3 `T_base_tcp` + tag6 on the tool), with the cameras **held at
+their 0928 poses**:
+
+- Reprojection error is 1.98 px RMS. The fitted tag scale is 0.991, so the
+  printed "160 mm" tag is about 158.6 mm.
+- Out of sample, a fold's edge predicts the other fold's tag, and the fixed
+  cameras measure where it actually is. The tag-centre error is
+  p50 1.9–2.0 / p95 4.1–4.2 mm, and that is roughly what a re-expressed pose
+  is off by in the workspace. In-sample it is p50 1.5 / p95 2.9 mm.
+
+The P0 run's own solution frees the cameras, which makes the FR3 base a new
+world. Pointing production at it without also changing this reference would
+stamp FR3-base poses with the island's id (linkage-x/lerobot#51).
+
+To use it, run `export_v3.py --target-world fr3_base`. This re-expresses
+`observation.ee_pose.*.base`, `action.ee_pose.*.base` and
+`observation.cube_pose.*.base` (camera-frame columns are untouched), and
+records the source world block and the edge in `info.json`'s `world_frame`.
+Without an edge connecting the two worlds the export is refused, never treated
+as an identity.
+
+The GUI's exports pass `--target-world auto`: `fr3_base` when an edge reaches
+it, otherwise the recorded world, and the "Export complete" line names which.
+It is not offered as a choice, because the consumer (the FR3) fixes it.
+`info.json` also gets `tcp_frame` (the URDF link the ee poses carry, from each
+session's tracking-run summary), since deployment has to drive that same link.
+
+On the arm, `tools/fr3/fr3_act_infer_real_runtime.py --dataset-alignment`
+reads the frame from the policy's own training view (not from a source
+re-exported since then), and picks how `T(B,W_s)` is obtained:
+
+- `start_pose` (unstamped or camera-world data): all 6 DoF come from one start
+  pose, so a start-orientation error turns the whole trajectory.
+- `start_position` (the default for `fr3_base` data): the rotation is the
+  measured one, and the demos are only shifted to the arm's start position.
+  As of 10-09 most box demos are 1.1–1.3 m from the base, beyond the FR3's
+  reach, so they have to be moved.
+- `absolute`: identity. Use it only for demos recorded inside the arm's reach.
+
+Both `fr3_base` modes refuse to run unless the IK target is `tcp_frame.link`.
+For the box labels that is `corenetic_gripper_ee`, which is what the tracker
+hops to from the bundle's `link_lt_gripper_tcp` (an R_x(pi) turn). Run with
+`--robot-urdf-path src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
+--target-frame-name corenetic_gripper_ee`. The labels' origin is the insert-v2
+socket centre, not that link's origin, and the offset between the two is still
+unrecorded (see the 0929 marker->TCP bundle). `start_position` keeps the error
+from that offset small.
+
+The edge is valid only while the rig cameras stay at their 0928 poses and the
+FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
+`register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between
+worlds that are already connected.
+
 ## Correcting a stamp that is wrong
 
 The stamp records what this file said at record time. If the rig moved and the

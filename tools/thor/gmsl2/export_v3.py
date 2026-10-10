@@ -657,6 +657,27 @@ def _tracking_run_dir(session_dir: Path) -> Path:
     return _REPO_ROOT / "outputs" / "tracking_analysis" / f"{session_dir.name}{_TRACKING_RUN_SUFFIX}"
 
 
+def _tcp_frame_of_session(session_dir: Path) -> dict[str, str]:
+    """Which physical point the session's ee poses are, as its tracking run recorded it.
+
+    ``link`` is the URDF link whose axes the poses carry. The bundle lands on
+    ``target_parent_link`` and the tracker then hops to ``target_child_link`` when one is
+    configured (Thor: link_lt_gripper_tcp -> corenetic_gripper_ee, an R_x(pi) turn), so
+    the child is what the CSV holds. The origin is whatever the marker->TCP bundle
+    defines (for bundle 0929, the socket centre of insert v2 -- not the link's origin).
+    Empty strings when the run left no summary.
+    """
+    summary = _tracking_run_dir(session_dir) / "summary.json"
+    try:
+        ee_from_cube = json.loads(summary.read_text(encoding="utf-8")).get("ee_from_cube") or {}
+    except (OSError, json.JSONDecodeError):
+        ee_from_cube = {}
+    return {
+        "link": str(ee_from_cube.get("target_child_link") or ee_from_cube.get("target_parent_link") or ""),
+        "marker_to_tcp_calibration": str(ee_from_cube.get("marker_to_tcp_calibration_path") or ""),
+    }
+
+
 def _state_action_csv(session_dir: Path, cube: str) -> Path:
     return _sidecar_dir(session_dir) / f"state_action.{cube}.csv"
 
@@ -794,6 +815,23 @@ def _load_tracking_pose_rows(
     return out
 
 
+#: Pose kinds expressed in the world frame; ``cube_camera`` is in its camera's
+#: frame and does not move with the world.
+_WORLD_POSE_KINDS = frozenset({"ee_state", "ee_action", "cube_base"})
+
+
+def _reexpress_world_pose_rows(
+    pose_rows: dict[str, list[list[float]]],
+    pose_columns: list[_PoseColumn],
+    T_target_source: list[list[float]],
+) -> dict[str, list[list[float]]]:
+    world_keys = {col.key for col in pose_columns if col.kind in _WORLD_POSE_KINDS}
+    return {
+        key: [wp.transform_pose7(T_target_source, row) for row in rows] if key in world_keys else rows
+        for key, rows in pose_rows.items()
+    }
+
+
 def _pose_table_column_stats(table, col_name: str) -> dict[str, list[Any]]:
     import numpy as np
 
@@ -871,6 +909,7 @@ class _V3Writer:
         touch_columns: tuple[tuple[str, str, str], ...] | None = None,
         touch_width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
         world_frame: dict[str, Any] | None = None,
+        tcp_frame: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -892,6 +931,7 @@ class _V3Writer:
         self.touch_columns = list(touch_columns or [])
         self.touch_width = int(touch_width)
         self.world_frame = dict(world_frame) if world_frame else None
+        self.tcp_frame = dict(tcp_frame) if tcp_frame else None
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -1093,10 +1133,34 @@ class _V3Writer:
                 ),
             },
         }
+        if self.tcp_frame is not None:
+            info["tcp_frame"] = self.tcp_frame
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
 
 # ------------------------------------------------------------------ export ---
+
+
+def _dataset_tcp_frame(episodes: list[EpisodeSource]) -> dict[str, Any]:
+    """info.json's ``tcp_frame``: the link the ee poses are expressed on.
+
+    Deployment in fr3_base commands these poses absolutely, so the arm's IK target
+    must be the same link; a dataset whose sessions disagree records ``link: ""``
+    and is refused there rather than averaged here.
+    """
+    per_session = {src.session_dir.name: _tcp_frame_of_session(src.session_dir) for src in episodes}
+    links = {frame["link"] for frame in per_session.values()}
+    return {
+        "link": links.pop() if len(links) == 1 else "",
+        "marker_to_tcp_calibrations": sorted(
+            {frame["marker_to_tcp_calibration"] for frame in per_session.values()} - {""}
+        ),
+        "sessions": per_session,
+        "note": (
+            "orientation is this URDF link's; the origin is the one the marker->TCP "
+            "calibration defines, which need not be the link's origin"
+        ),
+    }
 
 
 def export_task_to_v3(
@@ -1109,6 +1173,7 @@ def export_task_to_v3(
     output_name: str | None = None,
     overwrite: bool = False,
     jobs: int = _DEFAULT_JOBS,
+    target_world: str | None = None,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
@@ -1230,6 +1295,51 @@ def export_task_to_v3(
             "provenance and their absolute poses are not comparable across sessions"
         )
 
+    # Re-expressing in another world goes through a recorded edge of
+    # world_graph.json or not at all: an unstamped source has no world to start
+    # from, and two unconnected worlds have no transform -- neither may fall back
+    # to an identity, which would relabel the poses without moving them.
+    # "auto" is what the GUI asks for. The poses are for the FR3, which commands in
+    # its own base frame; when a measured edge reaches it, using it here is what lets
+    # deployment skip guessing that transform from one start pose. Without an edge
+    # the recorded world is kept -- the stamp below says so, and deployment falls
+    # back to start-pose alignment on any dataset not stamped fr3_base.
+    if target_world == wp.TARGET_WORLD_AUTO:
+        reachable = bool(world_frame_id) and (
+            world_frame_id == wp.FR3_BASE_WORLD_ID
+            or wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, wp.FR3_BASE_WORLD_ID)
+            is not None
+        )
+        target_world = wp.FR3_BASE_WORLD_ID if reachable else None
+        if not reachable:
+            _emit(
+                f"No registration edge reaches {wp.FR3_BASE_WORLD_ID} from "
+                f"{world_frame_id or 'unstamped episodes'}; keeping the recorded world"
+            )
+
+    output_world_frame = source_world_frame
+    T_target_source: list[list[float]] | None = None
+    if target_world and target_world != world_frame_id:
+        if not world_frame_id or source_world_frame is None:
+            raise RuntimeError(
+                f"cannot re-express in {target_world}: the source episodes carry no world frame id"
+            )
+        found = wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, target_world)
+        if found is None:
+            raise RuntimeError(
+                f"no registration edge connects {world_frame_id} to {target_world} in "
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}"
+            )
+        T_target_source, edges_used = found
+        output_world_frame = wp.reexpressed_world_frame(
+            source_world_frame, target_world, T_target_source, edges_used
+        )
+        route = " -> ".join([world_frame_id, *(
+            hop["from_world_frame_id"] if hop["traversed_reversed"] else hop["to_world_frame_id"]
+            for hop in edges_used
+        )])
+        _emit(f"Re-expressing world-frame poses in {target_world} via {route}")
+
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
@@ -1245,7 +1355,8 @@ def export_task_to_v3(
         pose_columns=pose_columns,
         touch_columns=_TOUCH_ARRAY_COLUMNS,
         touch_width=touch_width,
-        world_frame=source_world_frame,
+        world_frame=output_world_frame,
+        tcp_frame=_dataset_tcp_frame(episodes) if pose_columns else None,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -1330,6 +1441,8 @@ def export_task_to_v3(
             if pose_columns
             else None
         )
+        if pose_rows is not None and T_target_source is not None:
+            pose_rows = _reexpress_world_pose_rows(pose_rows, pose_columns, T_target_source)
         touch_rows, touch_samples_found = _align_touch_rows(
             src.ep_dir,
             n_frames,
@@ -1356,6 +1469,7 @@ def export_task_to_v3(
                 "source_episode": src.ep_dir.name,
                 "frames": n_frames,
                 "world_frame_id": wp.world_frame_id_of(meta.get("world_frame")),
+                "exported_world_frame_id": wp.world_frame_id_of(output_world_frame),
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
@@ -1382,7 +1496,10 @@ def export_task_to_v3(
         ),
         encoding="utf-8",
     )
-    _emit(f"Export complete: {global_index} episodes at {out_root}")
+    _emit(
+        f"Export complete: {global_index} episodes at {out_root} "
+        f"(world frame: {wp.world_frame_id_of(output_world_frame) or 'unstamped'})"
+    )
     return out_root
 
 
@@ -1399,6 +1516,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task", required=True, help="single_task prompt string")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--jobs", type=int, default=_DEFAULT_JOBS, help="parallel camera transcodes")
+    ap.add_argument(
+        "--target-world",
+        default=None,
+        help="re-express world-frame poses in this world (e.g. fr3_base) through a "
+        "registration edge of tools/thor/gmsl2/world/world_graph.json; 'auto' picks "
+        "fr3_base when an edge reaches it and keeps the recorded world otherwise; "
+        "default keeps the world the episodes were recorded in",
+    )
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stderr)
@@ -1412,6 +1537,7 @@ def main(argv: list[str] | None = None) -> int:
             output_name=args.output_name,
             overwrite=args.overwrite,
             jobs=args.jobs,
+            target_world=args.target_world,
         )
     except Exception as exc:  # noqa: BLE001
         _emit(f"ERROR: {exc}")

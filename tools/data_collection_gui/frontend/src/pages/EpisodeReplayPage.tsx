@@ -5,6 +5,39 @@ import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingS
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
 
+const REAL_REPLAY_TARGET_FRAMES: Record<RealEndEffectorMode, string> = {
+  corenetic_gripper_ee: "corenetic_gripper_ee",
+  pika_gripper_ee: "pika_task_tcp",
+  fr3_ee: "fr3_ee"
+};
+
+const REAL_REPLAY_PHASE_LABELS: Record<string, string> = {
+  "": "idle",
+  moving_to_start: "moving to trajectory start",
+  at_start: "holding at trajectory start",
+  executing: "executing trajectory",
+  finished: "trajectory finished"
+};
+
+const REAL_TRACKER_STATE_LABELS: Record<string, string> = {
+  "": "off",
+  warming: "connecting (~16 s)",
+  waiting: "connected, not ready",
+  ready: "ready",
+  recording: "recording",
+  recorded: "recorded",
+  landing: "saving session",
+  landed: "saved",
+  cancelled: "cancelled",
+  error: "error"
+};
+
+const REAL_REPLAY_GRIPPER_LABELS: Record<RealEndEffectorMode, string> = {
+  corenetic_gripper_ee: "Corenetic gripper",
+  pika_gripper_ee: "Pika gripper",
+  fr3_ee: "FR3 flange"
+};
+
 export function ReplayPanel({
   status,
   busy,
@@ -93,19 +126,31 @@ function validIpv4(value: string): boolean {
 export function RealRobotReplayPanel({
   status,
   busy,
-  onStart
+  onStart,
+  onExecute
 }: {
   status: ReplayStatus;
   busy: boolean;
-  onStart: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
+  onStart: (
+    mode: RealCubeMode,
+    robotIp: string,
+    endEffectorMode: RealEndEffectorMode,
+    overrideMujocoFailure: boolean,
+    recordTracker: boolean
+  ) => void;
+  onExecute: () => void;
 }) {
   const validation = status.mujocoValidation;
   const validationMode = validation?.cubeMode ?? status.mujocoCubeMode;
   const mode: RealCubeMode = validationMode === "left" ? "left" : "right";
-  const endEffectorMode: RealEndEffectorMode = "pika_gripper_ee";
-  const [robotIp, setRobotIp] = useState(status.realRobotIp || "192.168.1.206");
+  // The gateway derives the end effector from its robot config (Thor: corenetic) and refuses one
+  // that does not match the tracked trajectory's link; this page only shows and forwards it.
+  const endEffectorMode: RealEndEffectorMode = status.realEndEffectorMode ?? "corenetic_gripper_ee";
+  const targetFrame = REAL_REPLAY_TARGET_FRAMES[endEffectorMode];
+  const [robotIp, setRobotIp] = useState(status.realRobotIp || "");
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
+  const [recordTracker, setRecordTracker] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
@@ -129,6 +174,10 @@ export function RealRobotReplayPanel({
   const active = status.state === "replaying" || status.state === "sim_replay";
   const disabled =
     busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+  const phase = status.realPhase ?? "";
+  const trackerState = status.realTrackerState ?? "";
+  const trackerBlocksExecute = Boolean(status.realRecordTracker) && trackerState !== "ready";
+  const canExecute = !busy && status.state === "replaying" && phase === "at_start" && !trackerBlocksExecute;
   const datasetPath = status.datasetRoot || status.dataset;
   const timelineCameraKeys = timeline?.cameraKeys ?? [];
   const cameraMatches = (cameraStatus?.cameras ?? []).filter((camera): camera is RealSensePreviewCameraStatus =>
@@ -186,27 +235,61 @@ export function RealRobotReplayPanel({
     setOverridePromptOpen(false);
     setMonitorRequested(true);
     setCameraStatus({ available: null, running: true, error: "Connecting to RealSense…" });
-    onStart(mode, robotIp.trim(), endEffectorMode, overrideMujocoFailure);
+    onStart(mode, robotIp.trim(), endEffectorMode, overrideMujocoFailure, recordTracker);
   };
 
   return (
     <section className="panel real-robot-panel">
       <div className="panel-heading">
         <h2>Real Robot Replay</h2>
-        <span>FR3 · Pika gripper · recorded end-effector trajectory</span>
+        <span>FR3 · {REAL_REPLAY_GRIPPER_LABELS[endEffectorMode]} · recorded end-effector trajectory</span>
       </div>
       <div className="real-robot-layout">
         <div className="real-robot-settings">
           <div className="teleop-config-grid">
             <div><span>Robot</span><strong>Franka Research 3</strong></div>
-            <div><span>End effector</span><strong>Pika gripper · pika_task_tcp</strong></div>
+            <div><span>End effector</span><strong>{REAL_REPLAY_GRIPPER_LABELS[endEffectorMode]} · {targetFrame}</strong></div>
           </div>
           <label className="real-robot-ip-field">
             <span>Robot IP</span>
-            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.1.206" />
+            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.11.102" />
+          </label>
+          <label className="real-robot-tracker-toggle">
+            <input
+              checked={recordTracker}
+              disabled={disabled}
+              onChange={(event) => setRecordTracker(event.target.checked)}
+              type="checkbox"
+            />
+            <span>Record the laser tracker while the trajectory executes (real-robot GT)</span>
           </label>
           <button className="danger real-robot-run" disabled={disabled} onClick={() => setOverridePromptOpen(true)} type="button">
-            {status.state === "replaying" ? "Real-robot replay running…" : "Run real-robot replay"}
+            {phase === "moving_to_start"
+              ? "1 · Moving to trajectory start…"
+              : active
+                ? "1 · Holding at trajectory start"
+                : "1 · Move to trajectory start"}
+          </button>
+          <div className="teleop-config-grid real-robot-phase">
+            <div><span>Phase</span><strong>{REAL_REPLAY_PHASE_LABELS[phase] ?? phase}</strong></div>
+            {status.realRecordTracker ? (
+              <div>
+                <span>Laser tracker</span>
+                <strong>{REAL_TRACKER_STATE_LABELS[trackerState] ?? trackerState}</strong>
+              </div>
+            ) : null}
+          </div>
+          {status.realRecordTracker && status.realTrackerDetail ? (
+            <p className="panel-note">{status.realTrackerDetail}</p>
+          ) : null}
+          {status.realRecordTracker && phase === "at_start" ? (
+            <p className="panel-note">
+              Ready means homed, and Home leaves the beam on the nest. Carry the SMR out of the nest with the beam
+              locked and seat it on the arm before Execute; Execute refuses a beam still at the nest.
+            </p>
+          ) : null}
+          <button className="danger real-robot-run" disabled={!canExecute} onClick={onExecute} type="button">
+            {phase === "executing" ? "2 · Executing trajectory…" : "2 · Execute trajectory"}
           </button>
           <p className="panel-note">
             {status.datasetKind === "exported"
@@ -220,7 +303,10 @@ export function RealRobotReplayPanel({
                   ? "Enter a valid robot IPv4 address."
                   : validationFailedButReviewable
                     ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
+                    : phase === "at_start" && trackerBlocksExecute
+                      ? "Holding at the trajectory start. Execute unlocks once the laser tracker is homed and locked on."
+                      : `Step 1 preflights this FR3, moves it to its start pose and brings ${targetFrame} to frame 0, ` +
+                        "then holds. Step 2 streams the trajectory. Abort stops either step."}
           </p>
         </div>
         <div className="realsense-monitor replay-camera-compare">
@@ -306,7 +392,7 @@ export function RealRobotReplayPanel({
               {validationFailedButReviewable ? "MuJoCo validation failed" : "Confirm real-robot replay"}
             </h3>
             <p>
-              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>pika_task_tcp</strong> on <strong>{robotIp.trim()}</strong>.
+              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>{targetFrame}</strong> on <strong>{robotIp.trim()}</strong>.
             </p>
             <p>{validationFailedButReviewable ? "The recorded trajectory did not meet the simulation limits:" : "MuJoCo passed within these limits:"}</p>
             <ul>
@@ -320,7 +406,7 @@ export function RealRobotReplayPanel({
             <p>
               {validationFailedButReviewable
                 ? "Proceeding may cause unexpected or unsafe robot motion. Do you want to run the real robot anyway?"
-                : "A simulation pass does not guarantee safe hardware motion. Do you want to run the real robot?"}
+                : "A simulation pass does not guarantee safe hardware motion. The arm will move to the trajectory start and hold there; nothing streams until you press Execute. Proceed?"}
             </p>
             <div className="danger-modal-actions">
               <button autoFocus onClick={() => setOverridePromptOpen(false)} type="button">No, cancel</button>
@@ -900,6 +986,7 @@ export function EpisodeReplayPage({
   onMujocoReplay,
   onApproveMujoco,
   onRealReplay,
+  onExecuteRealReplay,
   onAbort,
   onSelectDataset,
   onSelectEpisode,
@@ -913,7 +1000,14 @@ export function EpisodeReplayPage({
   onPreflight: () => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
-  onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
+  onRealReplay: (
+    mode: RealCubeMode,
+    robotIp: string,
+    endEffectorMode: RealEndEffectorMode,
+    overrideMujocoFailure: boolean,
+    recordTracker: boolean
+  ) => void;
+  onExecuteRealReplay: () => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
@@ -971,7 +1065,7 @@ export function EpisodeReplayPage({
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}
         cubeSelection={cubeSelection}
       />
-      <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} />
+      <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} onExecute={onExecuteRealReplay} />
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}

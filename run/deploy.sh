@@ -63,12 +63,13 @@ case "$target" in
     ;;
 esac
 
+# Always complete incremental replacement before touching a running service.
+bash "$script_dir/sync_to_target.sh" "$target"
+
 if [[ "$target" == "thor" ]]; then
   calibration_paths=(
     "outputs/calibration/thor_gmsl2_intrinisics_dict_0720"
     "outputs/calibration/thor_gmsl2_extrinisics_robot_base_0720"
-    "outputs/calibration/calib_20260929_163033_intrinsics"
-    "outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z/camera_calibration"
   )
   require_ee_calibration=false
   case "${REQUIRE_EE_CALIBRATION:-}" in
@@ -78,7 +79,7 @@ if [[ "$target" == "thor" ]]; then
   calibration_sync_incomplete=false
   warn_or_fail_calibration_sync() {
     local message="$1"
-    if $require_ee_calibration || $calibration_is_active; then
+    if $require_ee_calibration; then
       echo "ERROR: ${message}" >&2
       exit 1
     fi
@@ -88,12 +89,6 @@ if [[ "$target" == "thor" ]]; then
 
   echo "==> Syncing Thor EE-trajectory calibration inputs..."
   for calibration_path in "${calibration_paths[@]}"; do
-    calibration_is_active=false
-    case "$calibration_path" in
-      outputs/calibration/calib_20260929_163033_intrinsics|\
-      outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z/camera_calibration)
-        calibration_is_active=true ;;
-    esac
     local_calibration_dir="${repo_root}/${calibration_path}"
     if [[ ! -f "${local_calibration_dir}/summary.json" ]]; then
       warn_or_fail_calibration_sync "calibration summary not found: ${local_calibration_dir}/summary.json"
@@ -111,10 +106,6 @@ if [[ "$target" == "thor" ]]; then
     echo "WARN: EE-trajectory calibration inputs are incomplete; deployment will continue." >&2
   fi
 fi
-
-# Stage the active calibration before syncing tracker YAML, so a missing input
-# cannot leave production pointing at a run that is absent on Thor.
-bash "$script_dir/sync_to_target.sh" "$target"
 
 if $sync_only; then
   echo "==> ${target} incremental sync complete (--sync-only)."

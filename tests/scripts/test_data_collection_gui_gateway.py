@@ -240,6 +240,30 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     return written
 
 
+@pytest.mark.parametrize("previously_ready", [False, True])
+def test_start_episode_names_tracker_connection_failure(tmp_path, monkeypatch, previously_ready):
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+    state.recording.laserTrackerReady = previously_ready
+    state.recording.laserTrackerHomed = previously_ready
+    gateway._apply_recorder_output(
+        state,
+        "WARNING: laser tracker unavailable, recording without it: "
+        r"cannot create D:\lt\lt_20261008_065259: "
+        "ssh: connect to host 192.168.147.72 port 22: No route to host",
+    )
+
+    assert state.recording.laserTrackerState == "error"
+    assert state.recording.laserTrackerReady is False
+    with pytest.raises(RuntimeError, match="激光跟踪仪不可用") as exc:
+        gateway._start_episode(state)
+    assert "No route to host" in str(exc.value)
+    assert "重新 Connect" in str(exc.value)
+    assert "home 窝" not in str(exc.value)
+    assert written == []
+
+
 def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
     """Homed, then the beam broke: the lock's range is not absolute any more."""
     state = _marker_tcp_gateway_state(tmp_path)
@@ -1613,12 +1637,350 @@ def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     video_path = Path(command[command.index("--render-video") + 1])
     assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
 
+    # Seeded at the start planned for the whole episode -- the joints the real replay moves to.
+    assert command[command.index("--initial-joints") + 1] == "trajectory_start"
+
     both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
     assert both_command[both_command.index("--cube") + 1] == "both"
     both_report = Path(both_command[both_command.index("--report-json") + 1])
     assert both_report.name == "mujoco_preview.both.episode_000002.json"
     both_video = Path(both_command[both_command.index("--render-video") + 1])
     assert both_video.name == "mujoco_preview.both.episode_000002.mp4"
+
+
+def _stamped_replay_dataset(tmp_path: Path, *, edges: list[dict]) -> tuple[gateway.GatewayState, Path]:
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20261009_102307"
+    meta_dir = dataset_root / "episodes" / "episode_000000"
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "meta.json").write_text(json.dumps({"world_frame": {"world_frame_id": "world_a", "status": "ok"}}), encoding="utf-8")
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.right.csv").write_text(
+        "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.1,0.2,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    world_dir = repo_root / "tools" / "thor" / "gmsl2" / "world"
+    world_dir.mkdir(parents=True)
+    (world_dir / "world_graph.json").write_text(
+        json.dumps({"version": 1, "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}], "edges": edges}),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", episode=0, fps=60),
+    )
+    return state, dataset_root
+
+
+def _write_planned_mujoco_start(dataset_root, cube, episode=0):
+    """A MuJoCo preview report carrying the start joints the real replay is handed."""
+    report_path = gateway._mujoco_preview_report_path(dataset_root, episode, cube)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {cube: {"trajectory_start": {"feasible": True, "joints_rad": [0.1] * 7}}},
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
+    # 90 deg about z, then (1, 2, 3): T_fr3_base_world_a.
+    edge_matrix = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": edge_matrix}],
+    )
+    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
+
+    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
+    _write_planned_mujoco_start(dataset_root, "right")
+    real = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
+
+    # The camera-world sidecar is never what the arm (simulated or real) is given.
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
+    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real
+    row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
+
+
+def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
+    )
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    # The tracker leaves gripper_width_m NaN: the opening lives in the episode parquet.
+    (sidecar / "state_action.right.csv").write_text(
+        "episode_index,frame_index,gripper_width_m,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,nan,0.1,0.2,0.3,0,0,0,1\n"
+        "0,1,nan,0.1,0.2,0.3,0,0,0,1\n"
+        "0,2,nan,0.1,0.2,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "meta").mkdir()
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"features": {"observation.state": {"names": ["box_trigger.travel_pct", "box_gripper.distance_m"]}}}),
+        encoding="utf-8",
+    )
+    data_dir = dataset_root / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({
+            "episode_index": [0, 0, 0],
+            "frame_index": [0, 1, 2],
+            "observation.state": [[0.0, 0.0887], [100.0, 0.0323], [100.0, float("nan")]],
+        }),
+        data_dir / "file-000.parquet",
+    )
+
+    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+
+    rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(r["gripper_width_m"]) for r in rows[:2]] == pytest.approx([0.0887, 0.0323])
+    assert rows[2]["gripper_width_m"] == "nan"  # no opening recorded: the replay falls back, not 0
+    # The trigger rides along: it tells a jaw stopped by the tube from one opened to that width.
+    assert [float(r["gripper_trigger_pct"]) for r in rows] == [0.0, 100.0, 100.0]
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["gripper_width"]["rows"] == {"state_action.right.csv": 2}
+    assert frame["gripper_trigger"]["rows"] == {"state_action.right.csv": 3}
+
+
+def test_thor_preflight_checks_the_replay_arm_not_the_workstation_arm(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway._replay_status_from_config({}),
+    )
+    # Nothing configured: the Thor cube-replay FR3, the one the replay panel shows.
+    assert state.replay.realRobotIp == gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP
+    assert gateway._real_robot_ip(state) == gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP
+    command = gateway._real_preflight_command(state)
+    assert f"--robot-ip={gateway.DEFAULT_CUBE_REPLAY_ROBOT_IP}" in command
+    # Whatever the panel last used wins.
+    state.replay.realRobotIp = "192.168.11.105"
+    assert gateway._real_robot_ip(state) == "192.168.11.105"
+    # The workstation keeps its own default.
+    state.profile = "workstation"
+    assert gateway._real_robot_ip(state) == gateway.DEFAULT_REAL_ROBOT_IP
+
+
+def test_thor_defaults_to_the_corenetic_end_effector_and_reads_the_trajectory_link(tmp_path):
+    assert gateway._replay_status_from_config({}).realEndEffectorMode == "corenetic_gripper_ee"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20261009_102307"
+    assert gateway._trajectory_tcp_link(state, dataset_root) == ""
+    run_dir = gateway._tracking_run_dir(state, dataset_root)
+    run_dir.mkdir(parents=True)
+    (run_dir / "summary.json").write_text(
+        json.dumps({"ee_from_cube": {"target_parent_link": "link_lt_gripper_tcp", "target_child_link": "corenetic_gripper_ee"}}),
+        encoding="utf-8",
+    )
+    # The CSV holds the child link; that is what the arm must drive.
+    assert gateway._trajectory_tcp_link(state, dataset_root) == "corenetic_gripper_ee"
+    assert gateway.REAL_REPLAY_TARGET_FRAMES["corenetic_gripper_ee"] == "corenetic_gripper_ee"
+    assert gateway.REAL_REPLAY_TARGET_FRAMES["pika_gripper_ee"] != "corenetic_gripper_ee"
+
+
+class _RecordingStdin:
+    def __init__(self):
+        self.written = ""
+        self.closed = False
+
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _HeldReplayProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.stdin = _RecordingStdin()
+
+    def poll(self):
+        return None
+
+
+class _FakeTrackerSession:
+    session_id = "lt_test"
+    last_error = ""
+
+    def __init__(self, ready):
+        self._ready = ready
+        self.recording = []
+        self.stopped = threading.Event()
+
+    @property
+    def ready(self):
+        # A property on lts.LaserTrackerSession: calling it is a TypeError on every snapshot.
+        return self._ready
+
+    def beam_summary(self):
+        return "beam ready" if self._ready else "beam not locked"
+
+    beam_dist_mm = 1500.0
+
+    def beam_stats(self, *, last_rows=0, sample_bytes=200_000):
+        return {"rows": 500, "valid": 1.0, "tracking": 1.0, "dist_min_mm": self.beam_dist_mm, "dist_max_mm": self.beam_dist_mm}
+
+    def start_recording(self, episode, t_wall):
+        self.recording.append(episode)
+        return True
+
+    def stop_recording(self):
+        self.stopped.set()
+        return {}
+
+
+def test_fake_tracker_matches_the_real_session_interface():
+    from tools.thor.gmsl2 import laser_tracker_session as lts
+
+    assert isinstance(lts.LaserTrackerSession.ready, property)
+    assert isinstance(_FakeTrackerSession.ready, property)
+    assert callable(lts.LaserTrackerSession.beam_summary)
+    assert callable(lts.LaserTrackerSession.beam_stats)
+    assert callable(lts.LaserTrackerSession.start_recording)
+    assert callable(lts.LaserTrackerSession.stop_recording)
+
+
+def _held_real_replay_state(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(episode=3),
+    )
+    state.replay_process = _HeldReplayProcess()
+    state.replay_process_kind = "real"
+    state.replay.realPhase = "moving_to_start"
+    return state
+
+
+def test_thor_real_replay_holds_at_the_trajectory_start_and_reports_into_a_run_dir(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]}],
+    )
+    run_dir = gateway._real_replay_run_dir(dataset_root, 0, "right")
+    _write_planned_mujoco_start(dataset_root, "right")
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102", run_dir=run_dir)
+    assert "--replay.hold_at_trajectory_start=true" in command
+    assert f"--replay.report_json_path={run_dir / 'real_replay_report.json'}" in command
+    assert run_dir.parent == dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME / "real_replay"
+
+
+def test_real_replay_executes_only_from_the_trajectory_start(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    with pytest.raises(RuntimeError, match="not reached the trajectory start"):
+        gateway._execute_real_replay(state)
+    assert state.replay_process.stdin.written == ""
+
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True position_error_mm=3.10")
+    assert state.replay.realPhase == "at_start"
+    gateway._execute_real_replay(state)
+
+    assert state.replay_process.stdin.written == "go\n"
+    assert state.replay_process.stdin.closed
+    assert state.replay.realPhase == "executing"
+    gateway._apply_real_replay_marker(state, "REPLAY_TRAJECTORY_END t_monotonic_ns=1 completed=True")
+    assert state.replay.realPhase == "finished"
+
+
+def test_real_replay_with_tracker_waits_for_a_ready_tracker_and_brackets_the_trajectory(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.replay.realRecordTracker = True
+    session = _FakeTrackerSession(ready=False)
+    state.replay_tracker = session
+    state.replay.realTrackerState = "waiting"
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True")
+
+    # No ground truth without a homed, locked beam: the arm keeps holding.
+    with pytest.raises(RuntimeError, match="not ready: beam not locked"):
+        gateway._execute_real_replay(state)
+    assert state.replay_process.stdin.written == ""
+
+    session._ready = True
+    gateway._refresh_replay_tracker_status(state)
+    assert state.replay.realTrackerState == "ready"
+    gateway._execute_real_replay(state)
+    assert session.recording == [3]
+    assert state.replay.realTrackerState == "recording"
+    assert state.replay_process.stdin.written == "go\n"
+
+    gateway._apply_real_replay_marker(state, "REPLAY_TRAJECTORY_END t_monotonic_ns=1 completed=True")
+    assert session.stopped.wait(2.0)
+    assert state.replay.realTrackerState == "recorded"
+
+
+def test_real_replay_execute_refuses_a_tracker_beam_still_on_the_home_nest(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.replay.realRecordTracker = True
+    session = _FakeTrackerSession(ready=True)
+    state.replay_tracker = session
+    gateway._apply_real_replay_marker(state, "REPLAY_AT_TRAJECTORY_START reached=True")
+
+    # Homed and locked, but on the nest: lt_20261009_092828 recorded 157.7 mm for a whole run.
+    session.beam_dist_mm = 157.7
+    assert "home nest (158 mm" in gateway._replay_tracker_nest_problem(state)
+    session.beam_dist_mm = 1840.0
+    assert gateway._replay_tracker_nest_problem(state) == ""
+    state.replay.realRecordTracker = False
+    session.beam_dist_mm = 157.7
+    assert gateway._replay_tracker_nest_problem(state) == ""  # not recording the tracker: no gate
+
+
+def test_real_replay_tracker_is_refused_while_the_recorder_holds_it(tmp_path):
+    state = _held_real_replay_state(tmp_path)
+    state.process = _HeldReplayProcess()
+    state.recording.laserTracker = True
+    with pytest.raises(RuntimeError, match="recorder holds the laser tracker"):
+        gateway._check_replay_tracker_available(state)
+    state.recording.laserTracker = False
+    with pytest.raises(RuntimeError, match="no usable laser_tracker block"):
+        gateway._check_replay_tracker_available(state)
+    state.config = {"laser_tracker": {"win_host": "18713@192.168.1.227"}}
+    gateway._check_replay_tracker_available(state)
+
+
+def test_fr3_facing_replays_refuse_a_world_with_no_edge_to_the_arm(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(tmp_path, edges=[])
+
+    with pytest.raises(RuntimeError, match="no registration edge"):
+        gateway._mujoco_replay_command(state, dataset_root, "right")
+    with pytest.raises(RuntimeError, match="no registration edge"):
+        gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
+
+    # A block that is not ok means the world is unknown -- not the legacy robot-base frame.
+    meta = dataset_root / "episodes" / "episode_000000" / "meta.json"
+    meta.write_text(json.dumps({"world_frame": {"world_frame_id": "", "status": "missing"}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="no usable world stamp"):
+        gateway._mujoco_replay_command(state, dataset_root, "right")
 
 
 def test_save_annotation_persists_episode_metadata(monkeypatch, tmp_path):
@@ -2150,6 +2512,16 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     gateway._finish_mujoco_validation(state, 0)
     gateway._preflight_replay(state)
+    planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {"left": {"trajectory_start": {"feasible": True, "joints_rad": planned}}},
+        }),
+        encoding="utf-8",
+    )
     command = gateway._real_replay_command(
         state,
         dataset_root,
@@ -2168,7 +2540,9 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--input.dataset_pose_name=left" in command
     assert "--robot.robot_ip=192.168.1.99" in command
     assert "--replay.episode_index=0" in command
-    assert "--replay.initial_pose_mode=current" in command
+    # move_to_start(), then a joint move to the start the MuJoCo preview planned and checked.
+    assert "--replay.initial_pose_mode=joint_start" in command
+    assert f"--replay.initial_joint_positions=[{','.join(repr(v) for v in planned)}]" in command
     assert "--replay.fail_on_unreached_initial_pose=true" in command
     assert "--end_effector.mode=robot_config" in command
 
@@ -2204,6 +2578,27 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--skip-gripper" in preflight_command
 
 
+def test_real_replay_refuses_a_mujoco_report_without_a_feasible_trajectory_start(tmp_path):
+    dataset_root = tmp_path / "ds"
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 3, "right")
+    report_path.parent.mkdir(parents=True)
+
+    report_path.write_text(json.dumps({"initial_joints": "fr3_start", "robots": {"right": {}}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Run MuJoCo right again"):
+        gateway._mujoco_trajectory_start_joints(dataset_root, 3, "right")
+
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {"right": {"trajectory_start": {"feasible": False, "joints_rad": [0.0] * 7,
+                                                      "reason": "j6 within 0.020 rad of its limit"}}},
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="j6 within"):
+        gateway._mujoco_trajectory_start_joints(dataset_root, 3, "right")
+
+
 def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
@@ -2224,6 +2619,7 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
             "cube_mode": "left",
             "episode_index": 0,
             "fps": 30,
+            "initial_joints": "trajectory_start",
             "robots": {
                 "left": {
                     "frames": [{"frame_index": 0}, {"frame_index": 1}],
@@ -2250,6 +2646,14 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         ),
         selected_replay_root=dataset_root,
     )
+
+    # A preview seeded anywhere but the real replay's start pose cannot be approved.
+    stale = json.loads(report_path.read_text(encoding="utf-8"))
+    report_path.write_text(json.dumps({**stale, "initial_joints": "das_start"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="planned trajectory start"):
+        gateway._approve_mujoco_report(state, "left")
+    report_path.write_text(json.dumps(stale), encoding="utf-8")
+    video_path.write_bytes(b"rendered")
 
     gateway._approve_mujoco_report(state, "left")
 
@@ -2767,6 +3171,8 @@ def test_export_command_builds_args_from_task(tmp_path):
     assert command[command.index("--task") + 1] == "pick the cube"
     assert command[command.index("--datasets-root") + 1] == str(datasets_root)
     assert "--overwrite" in command
+    # The frame is not an operator choice: the FR3 base whenever an edge reaches it.
+    assert command[command.index("--target-world") + 1] == "auto"
     assert command[1].endswith("tools/thor/gmsl2/export_v3.py")
 
 
@@ -2819,6 +3225,7 @@ def test_approved_dataset_export_command_uses_actual_camera_count_for_output_nam
     assert command[command.index("--output-name") + 1] == "thor_gmsl2_8ch_v1_20260713_075106"
     assert command[command.index("--repo-id") + 1] == "local/thor_gmsl2_8ch_v1_20260713_075106"
     assert out_root == state.exports_root / "thor_gmsl2_8ch_v1_20260713_075106"
+    assert command[command.index("--target-world") + 1] == "auto"
 
 
 def test_approved_dataset_export_command_scopes_to_selected_session(tmp_path):

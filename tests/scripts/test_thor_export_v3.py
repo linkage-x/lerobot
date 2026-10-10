@@ -699,3 +699,168 @@ def test_export_refuses_stamped_mixed_with_legacy_unstamped(tmp_path):
         )
 
     assert "<unstamped>" in str(excinfo.value)
+
+
+# ------------------------------------------------- re-expression in a world ---
+
+# 90 deg about z, then (1, 2, 3): T_target_source of the test edge.
+_EDGE_T = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _tracked_world_session(
+    tmp_path: Path, monkeypatch, *, edges: list[dict], tcp_link: str | None = None
+) -> tuple[Path, Path]:
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
+    ep_dir = session / "episodes" / "episode_000000"
+    meta = json.loads((ep_dir / "meta.json").read_text())
+    meta["world_frame"] = {"world_frame_id": "world_a", "status": "ok", "reference_sha256": "abc"}
+    (ep_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    _write_box_parquet(session, {0: 2}, state_width=4)
+    _write_online_sync_manifest(ep_dir, ("cam_00",), n_frames=2)
+    sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.left.csv").write_text(
+        """episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw,action_x_m,action_y_m,action_z_m,action_qx,action_qy,action_qz,action_qw
+0,0,0.1,0.2,0.3,0,0,0,1,1.0,0.0,0.0,0,0,0,1
+0,1,nan,nan,nan,nan,nan,nan,nan,1.0,0.0,0.0,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+    (sidecar / "cube_pose.left.cam_00.csv").write_text(
+        """episode_index,frame_index,cube_name,stream_key,cube_cam_x_m,cube_cam_y_m,cube_cam_z_m,cube_cam_qx,cube_cam_qy,cube_cam_qz,cube_cam_qw
+0,0,left,cam_00,2.1,2.2,2.3,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    world_dir = repo_root / "tools" / "thor" / "gmsl2" / "world"
+    world_dir.mkdir(parents=True)
+    (world_dir / "world_graph.json").write_text(
+        json.dumps({"version": 1, "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}], "edges": edges}),
+        encoding="utf-8",
+    )
+    if tcp_link is not None:
+        run_dir = repo_root / "outputs" / "tracking_analysis" / f"{session.name}_thor_april_tracking_in_robot_base"
+        run_dir.mkdir(parents=True)
+        (run_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "ee_from_cube": {
+                        # The bundle lands on the parent; the CSV holds the child.
+                        "target_parent_link": "link_lt_gripper_tcp",
+                        "target_child_link": tcp_link,
+                        "marker_to_tcp_calibration_path": "config_thor/marker_to_tcp_calibration_test.json",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 2)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+    return datasets, tmp_path / "exports"
+
+
+def test_export_reexpresses_world_poses_through_a_graph_edge(tmp_path, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T, "method": "test"}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge])
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="fr3_base",
+    )
+
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    state = table.column("observation.ee_pose.left.base").to_pylist()
+    # (0.1, 0.2, 0.3) -> (1 - 0.2, 2 + 0.1, 3 + 0.3); identity orientation -> 90 deg about z.
+    s = math.sqrt(0.5)
+    assert state[0] == pytest.approx([0.8, 2.1, 3.3, 0.0, 0.0, s, s])
+    # An untracked frame stays a gap; it must not become the edge's translation.
+    assert all(math.isnan(v) for v in state[1])
+    assert table.column("action.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([1.0, 3.0, 3.0])
+    # Camera-frame poses do not move with the world.
+    assert table.column("observation.cube_pose.left.camera.cam_00").to_pylist()[0][:3] == pytest.approx([2.1, 2.2, 2.3])
+
+    world = json.loads((out / "meta" / "info.json").read_text())["world_frame"]
+    assert world["world_frame_id"] == "fr3_base"
+    assert world["reexpressed_from"]["world_frame_id"] == "world_a"
+    assert world["T_target_source"] == _EDGE_T
+    assert [hop["method"] for hop in world["edges"]] == ["test"]
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
+    assert sources[0]["world_frame_id"] == "world_a"
+    assert sources[0]["exported_world_frame_id"] == "fr3_base"
+
+
+def test_export_refuses_a_target_world_with_no_edge(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[])
+
+    with pytest.raises(RuntimeError, match="no registration edge connects world_a to fr3_base"):
+        export_v3.export_task_to_v3(
+            datasets_root=datasets,
+            exports_root=exports,
+            base_name="pick_and_place",
+            repo_id="local/pick_and_place",
+            task="pick the cube",
+            target_world="fr3_base",
+        )
+    assert not (exports / "pick_and_place" / "data").exists()
+
+
+def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("pyarrow")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T, "method": "test"}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="auto",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "fr3_base"
+    # Deployment commands these poses absolutely, so it has to know which link they are on.
+    assert info["tcp_frame"]["link"] == "corenetic_gripper_ee"
+    assert info["tcp_frame"]["marker_to_tcp_calibrations"] == ["config_thor/marker_to_tcp_calibration_test.json"]
+    # The GUI shows the last line, so the frame has to be on it.
+    assert "(world frame: fr3_base)" in capsys.readouterr().out.strip().splitlines()[-1]
+
+
+def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_path, monkeypatch, capsys):
+    pq = pytest.importorskip("pyarrow.parquet")
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[])
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="auto",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    # No tracking summary: the link is unknown, which deployment in fr3_base refuses.
+    assert info["tcp_frame"]["link"] == ""
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
+    printed = capsys.readouterr().out
+    assert "No registration edge reaches fr3_base from world_a" in printed
+    assert "(world frame: world_a)" in printed.strip().splitlines()[-1]

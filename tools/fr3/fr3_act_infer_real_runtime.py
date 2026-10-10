@@ -76,6 +76,18 @@ _DEFAULT_OPENCV_BACKEND = Cv2Backends.V4L2
 _OBS_IMAGES_PREFIX = 'observation.images.'
 _DEFAULT_FIRST_FRAME_MAX_POS_DELTA_MM = 30.0
 _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
+# tools/thor/gmsl2/world_provenance.FR3_BASE_WORLD_ID: a dataset whose info.json
+# world_frame carries this id was re-expressed in the arm's base frame through a
+# measured registration edge, so the rotation of T(B,W_s) is known (identity)
+# rather than read off one start orientation.
+_FR3_BASE_WORLD_ID = 'fr3_base'
+# How T(B,W_s) is obtained:
+#   start_pose     -- all 6 DoF from matching the live start pose to the dataset start contract
+#   start_position -- rotation identity (fr3_base data), translation from the start positions:
+#                     the demos are moved to the arm, but not turned by a start-orientation error
+#   absolute       -- identity (fr3_base data): the arm goes where the demos were
+_DATASET_ALIGNMENT_CHOICES = ('auto', 'start_pose', 'start_position', 'absolute')
+_FR3_BASE_ALIGNMENTS = ('start_position', 'absolute')
 _DEFAULT_MAX_STEP_POS_DELTA_MM = 5.0
 _DEFAULT_MAX_STEP_ROT_DELTA_DEG = 3.0
 _DEFAULT_DATASET_START_GRIPPER_TOLERANCE = 0.05
@@ -189,6 +201,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Camera config YAML. Defaults to the OpenCV-based FR3 inference camera config.',
     )
     parser.add_argument('--dataset-root', default=None, help='Optional dataset root override.')
+    parser.add_argument(
+        '--dataset-alignment',
+        choices=_DATASET_ALIGNMENT_CHOICES,
+        default='auto',
+        help=(
+            "How T(B,W_s) is obtained. 'start_pose': all 6 DoF from the live start pose vs the dataset "
+            "start contract. 'start_position' (fr3_base datasets): measured rotation, translation from the "
+            "start positions. 'absolute' (fr3_base datasets): identity -- only for demos recorded inside the "
+            "arm's reach. 'auto' (default): start_position for fr3_base datasets, else start_pose."
+        ),
+    )
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
     parser.add_argument(
         '--policy-n-action-steps',
@@ -662,6 +685,74 @@ def resolve_alignment_dataset_root_and_state_key(dataset_root: Path) -> tuple[Pa
     source_root = _resolve_existing_dataset_root(source_dataset_root)
     source_info = _load_dataset_info(source_root)
     return source_root, _infer_source_state_key(manifest, source_info)
+
+
+def _world_frame_id(info: dict[str, Any]) -> str:
+    return str((info.get('world_frame') or {}).get('world_frame_id') or '')
+
+
+def resolve_dataset_alignment(
+    *,
+    requested: str,
+    policy_info: dict[str, Any],
+    alignment_info: dict[str, Any],
+    target_frame_name: str,
+) -> str:
+    """Pick how T(B,W_s) is obtained; returns one of 'start_pose', 'start_position', 'absolute'.
+
+    The frame is read from the dataset the policy was trained on: an IL view copies its
+    source's info.json at build time, while the source itself may since have been
+    re-exported in another frame. The fr3_base modes command the label orientation as is,
+    which is only right when the arm's IK target is the link those labels are expressed
+    on; start-pose alignment absorbs a mismatch there at the start, these do not.
+    """
+    if requested not in _DATASET_ALIGNMENT_CHOICES:
+        raise ValueError(f'--dataset-alignment must be one of {_DATASET_ALIGNMENT_CHOICES}, got {requested!r}')
+    trained_world = _world_frame_id(policy_info)
+    alignment_world = _world_frame_id(alignment_info)
+    if trained_world and alignment_world and trained_world != alignment_world:
+        raise ValueError(
+            f'the policy was trained on poses in {trained_world} but its start-contract source dataset is '
+            f'now in {alignment_world} (re-exported since the view was built); rebuild the view and retrain, '
+            'or point --dataset-root at a source exported in the training frame'
+        )
+    if requested == 'start_pose':
+        return 'start_pose'
+    if trained_world != _FR3_BASE_WORLD_ID:
+        if requested in _FR3_BASE_ALIGNMENTS:
+            raise ValueError(
+                f"--dataset-alignment {requested} needs a training dataset in {_FR3_BASE_WORLD_ID}, not "
+                f"{trained_world or 'an unstamped frame'}; export it with --target-world fr3_base (the GUI does "
+                'when an edge exists) and retrain'
+            )
+        return 'start_pose'
+    tcp_link = str((policy_info.get('tcp_frame') or alignment_info.get('tcp_frame') or {}).get('link') or '')
+    if not tcp_link:
+        raise ValueError(
+            'the training dataset is in fr3_base but does not record a single tcp_frame.link, so it is unknown '
+            'which link the arm must put on those poses; re-export it, or pass --dataset-alignment start_pose'
+        )
+    if tcp_link != target_frame_name:
+        raise ValueError(
+            f'the training poses are on link {tcp_link} but the IK target is {target_frame_name}; pass '
+            f'--robot-urdf-path <URDF containing {tcp_link}> --target-frame-name {tcp_link}, '
+            'or --dataset-alignment start_pose to keep estimating the transform'
+        )
+    return 'start_position' if requested == 'auto' else requested
+
+
+def dataset_alignment_transform(
+    mode: str, current_start_pose: np.ndarray, dataset_start_pose_contract: np.ndarray
+) -> np.ndarray:
+    """T(B,W_s) for a mode returned by resolve_dataset_alignment."""
+    if mode == 'start_pose':
+        return current_start_pose @ _invert_pose(dataset_start_pose_contract)
+    T_B_Ws = np.eye(4, dtype=np.float64)
+    if mode == 'start_position':
+        T_B_Ws[:3, 3] = current_start_pose[:3, 3] - dataset_start_pose_contract[:3, 3]
+    elif mode != 'absolute':
+        raise ValueError(f'unknown dataset alignment {mode!r}')
+    return T_B_Ws
 
 
 def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
@@ -2955,6 +3046,16 @@ def run_inference(args: argparse.Namespace) -> int:
         args.robot_urdf_path,
         args.target_frame_name,
     )
+    policy_dataset_info = _load_dataset_info(dataset_root)
+    alignment_dataset_info = (
+        policy_dataset_info if alignment_dataset_root == dataset_root else _load_dataset_info(alignment_dataset_root)
+    )
+    dataset_alignment = resolve_dataset_alignment(
+        requested=args.dataset_alignment,
+        policy_info=policy_dataset_info,
+        alignment_info=alignment_dataset_info,
+        target_frame_name=target_frame_name,
+    )
     controller_stiffness = _parse_optional_float_tuple(
         args.controller_stiffness,
         expected_len=7,
@@ -3039,6 +3140,18 @@ def run_inference(args: argparse.Namespace) -> int:
     if alignment_dataset_root != dataset_root:
         print(f'[INFO] alignment_dataset_root={alignment_dataset_root}')
     print(f'[INFO] alignment_state_key={alignment_state_key}')
+    print(
+        f'[INFO] dataset_alignment={dataset_alignment} '
+        f"trained_world={_world_frame_id(policy_dataset_info) or '<unstamped>'} "
+        f'ik_target={target_frame_name}'
+    )
+    if dataset_alignment == 'start_pose' and _world_frame_id(policy_dataset_info).startswith('world_'):
+        print(
+            '[WARN] the training poses are in camera world '
+            f'{_world_frame_id(policy_dataset_info)}; T(B,W_s) will be estimated from one start pose, so a start '
+            'orientation error rotates the whole trajectory about the start. Re-export with --target-world fr3_base '
+            'to take the rotation from the measured edge instead.'
+        )
     print(f'[INFO] policy_device={device}')
     print(f'[INFO] policy_fps={policy_fps:.3f}')
     print('[INFO] policy_image_keys=' + ', '.join(required_image_keys) if required_image_keys else '[INFO] policy_image_keys=<none>')
@@ -3215,7 +3328,9 @@ def run_inference(args: argparse.Namespace) -> int:
             )
             if T_B_Ws is None:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
-                T_B_Ws = current_start_pose_i @ _invert_pose(dataset_start_pose_contract)
+                T_B_Ws = dataset_alignment_transform(
+                    dataset_alignment, current_start_pose_i, dataset_start_pose_contract
+                )
                 start_alignment_stats = summarize_live_start_alignment_to_dataset_starts(
                     alignment_dataset_root,
                     T_B_Ws,
