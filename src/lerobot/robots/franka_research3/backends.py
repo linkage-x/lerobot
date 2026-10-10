@@ -594,6 +594,8 @@ class CoreneticGripperHardwareDriver:
         self._last_command_distance_m: float | None = None
         self._last_command_time_s: float | None = None
         self._pending_command_distance_m: float | None = None
+        self._last_device_timestamp_us: int | None = None
+        self.reboot_count = 0
 
     def connect(self) -> None:
         cfg = self._box_client_module.BoxClientConfig(
@@ -666,6 +668,7 @@ class CoreneticGripperHardwareDriver:
         self._last_command_distance_m = None
         self._last_command_time_s = None
         self._pending_command_distance_m = None
+        self._last_device_timestamp_us = None
 
     def _latest_distance_m(self) -> float | None:
         if self._client is None:
@@ -674,6 +677,7 @@ class CoreneticGripperHardwareDriver:
         gripper = sample.get("sensors", {}).get("box_gripper")
         if not isinstance(gripper, dict):
             return None
+        self._recover_if_rebooted(gripper)
         distance_m = gripper.get("distance_m")
         if distance_m is None:
             return None
@@ -681,6 +685,43 @@ class CoreneticGripperHardwareDriver:
         if not np.isfinite(distance_m):
             return None
         return max(0.0, distance_m)
+
+    def _recover_if_rebooted(self, gripper: dict) -> None:
+        """Re-take control after the BOX restarts; it comes back in collection mode.
+
+        A restarted BOX (10-10: power lost twice as the wrist swung to the replay start)
+        boots in mode 0, where it logs clamp commands but does not drive the jaw, so the
+        replay ran with the gripper parked open. Its sample clock (us since boot) running
+        backwards is the tell.
+        """
+        try:
+            timestamp_us = int(gripper.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return
+        if timestamp_us <= 0:
+            return
+        previous = self._last_device_timestamp_us
+        self._last_device_timestamp_us = timestamp_us
+        if previous is None or timestamp_us >= previous - 1_000_000:
+            return
+        self.reboot_count += 1
+        logger.warning(
+            "Corenetic BOX restarted (device clock %.1fs -> %.1fs, restart #%d): it lost control mode; "
+            "re-entering mode 1. Check the BOX power/cable on the wrist.",
+            previous / 1e6,
+            timestamp_us / 1e6,
+            self.reboot_count,
+        )
+        mode_rc = self._client.set_mode(1)
+        if mode_rc != 0:
+            raise RuntimeError(f"Corenetic BOX restarted and set_mode(1) failed with rc={mode_rc}.")
+        target_m = self._last_command_distance_m
+        if target_m is None:
+            target_m = max(0.0, float(gripper.get("distance_m") or 0.0))
+        rc = self._client.set_clamp_pos(target_m)
+        if rc != 0:
+            raise RuntimeError(f"Corenetic BOX restarted and re-sending {target_m:.4f}m failed with rc={rc}.")
+        self._last_command_time_s = time.perf_counter()
 
     def get_position(self) -> float:
         if self._client is None:
@@ -693,6 +734,7 @@ class CoreneticGripperHardwareDriver:
     def set_position(self, normalized_position: float) -> None:
         if self._client is None:
             raise RuntimeError("Corenetic gripper backend is not connected.")
+        self._latest_distance_m()  # notices a BOX restart even while the target holds still
         target_distance_m = float(np.clip(normalized_position, 0.0, 1.0) * self.max_width_m)
         if (
             self._last_command_distance_m is not None
