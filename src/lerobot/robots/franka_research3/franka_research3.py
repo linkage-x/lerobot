@@ -37,6 +37,8 @@ from .backends import (
     HirolGaussianNewtonKinematicsDriver,
     HirolLMKinematicsDriver,
     MockGripperDriver,
+    PANDA_PY_JOINT_LIMITS_LOWER,
+    PANDA_PY_JOINT_LIMITS_UPPER,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
     PlacoKinematicsDriver,
@@ -302,18 +304,17 @@ class FrankaResearch3(Robot):
         }
         if self.kinematics_driver_cls is not PlacoKinematicsDriver:
             return self.kinematics_driver_cls(**kwargs)
+        hirol_kwargs = {
+            "tolerance": self.config.ik_tolerance,
+            "max_iterations": self.config.ik_max_iterations,
+        }
+        if self.config.ik_respect_controller_joint_limits:
+            hirol_kwargs["position_limits_lower"] = PANDA_PY_JOINT_LIMITS_LOWER
+            hirol_kwargs["position_limits_upper"] = PANDA_PY_JOINT_LIMITS_UPPER
         if self.config.ik_solver == "hirol_lm":
-            return HirolLMKinematicsDriver(
-                **kwargs,
-                tolerance=self.config.ik_tolerance,
-                max_iterations=self.config.ik_max_iterations,
-            )
+            return HirolLMKinematicsDriver(**kwargs, **hirol_kwargs)
         if self.config.ik_solver == "hirol_gaussian_newton":
-            return HirolGaussianNewtonKinematicsDriver(
-                **kwargs,
-                tolerance=self.config.ik_tolerance,
-                max_iterations=self.config.ik_max_iterations,
-            )
+            return HirolGaussianNewtonKinematicsDriver(**kwargs, **hirol_kwargs)
         return self.kinematics_driver_cls(**kwargs)
 
     @check_if_already_connected

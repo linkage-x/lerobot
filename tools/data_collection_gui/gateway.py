@@ -86,9 +86,11 @@ DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP = 1.0
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
-# Seed of the Thor MuJoCo preview: where move_to_start() (initial_pose_mode=robot_start)
-# leaves the real arm. Validations recorded with any other seed are stale.
-MUJOCO_PREVIEW_INITIAL_JOINTS = "fr3_start"
+# Seed of the Thor MuJoCo preview: frame-0 joints planned so IK tracks the whole episode
+# inside the joint limits panda_py enforces. The preview writes them to its report and the real
+# replay moves there in joint space (initial_pose_mode=joint_start), so both run one branch.
+# Validations recorded with any other seed are stale.
+MUJOCO_PREVIEW_INITIAL_JOINTS = "trajectory_start"
 # EE trajectory generation now tracks gmsl2 (Thor) datasets with AprilTag cubes
 # instead of the legacy Hikon-camera route. The gateway runs on Thor, so it
 # invokes the local runner directly (no SSH / copy-back) -- the runner picks the
@@ -15253,13 +15255,11 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         "hardware",
         "--robot-spacing-m",
         str(DEFAULT_MUJOCO_ROBOT_SPACING_M),
-        # Start where the real replay starts (move_to_start) and walk to frame 0 under the
-        # same joint-jump guard: the arm is redundant, so a preview seeded anywhere else
-        # can show a joint path the arm will not take.
+        # The arm is redundant: from move_to_start() IK can take a branch that hits panda_py's
+        # j6 wall mid-episode (10-09). Plan the start for the whole episode; the real replay is
+        # handed the same joints, so the preview shows the joint path the arm will take.
         "--initial-joints",
         MUJOCO_PREVIEW_INITIAL_JOINTS,
-        "--initial-approach",
-        "guarded",
         "--report-json",
         str(report_path),
         "--render-video",
@@ -15267,6 +15267,25 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         "--no-viewer",
     ]
     return command
+
+
+def _mujoco_trajectory_start_joints(dataset_root: Path, episode: int, cube: str) -> list[float]:
+    """The frame-0 joints the MuJoCo preview of ``cube`` planned and validated for ``episode``."""
+    report = _load_json_file(_mujoco_preview_report_path(dataset_root, episode, cube))
+    if str(report.get("initial_joints") or "") != MUJOCO_PREVIEW_INITIAL_JOINTS:
+        raise RuntimeError(
+            f"Run MuJoCo {cube} again: its report has no planned trajectory start, and without one the "
+            "arm starts on whatever IK branch move_to_start() leads to."
+        )
+    robot = (report.get("robots") or {}).get(cube) or {}
+    plan = robot.get("trajectory_start") or {}
+    joints = plan.get("joints_rad")
+    if not plan.get("feasible") or not isinstance(joints, list) or len(joints) != 7:
+        raise RuntimeError(
+            f"MuJoCo {cube} found no start joints that keep episode {episode} inside the joint limits; "
+            f"{plan.get('reason') or 'no plan in its report'}."
+        )
+    return [float(v) for v in joints]
 
 
 def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
@@ -15298,7 +15317,7 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         raise RuntimeError("MuJoCo report belongs to a different cube selection.")
     if state.profile != "workstation" and str(report.get("initial_joints") or "") != MUJOCO_PREVIEW_INITIAL_JOINTS:
         raise RuntimeError(
-            "MuJoCo report was not seeded at the FR3 start pose the real replay starts from; run MuJoCo again."
+            "MuJoCo report was not seeded at the planned trajectory start the real replay moves to; run MuJoCo again."
         )
     if int(report.get("fps", 0)) != int(state.replay.fps or 30):
         raise RuntimeError("MuJoCo report FPS does not match the selected episode.")
@@ -15435,9 +15454,12 @@ def _real_replay_command(
         f"--input.dataset_pose_name={cube_mode}",
         f"--robot.robot_ip={robot_ip}",
         f"--replay.episode_index={int(state.replay.episode)}",
-        # From the arm's start pose, not wherever it was left: that is the seed the MuJoCo
-        # preview validated, so the joint path executed is the one that was checked.
-        "--replay.initial_pose_mode=robot_start",
+        # move_to_start(), then a joint move to the start joints the MuJoCo preview planned and
+        # validated, so the joint path executed is the one that was checked.
+        "--replay.initial_pose_mode=joint_start",
+        "--replay.initial_joint_positions=["
+        + ",".join(repr(float(v)) for v in _mujoco_trajectory_start_joints(dataset_root, state.replay.episode, cube_mode))
+        + "]",
         "--replay.fail_on_unreached_initial_pose=true",
         # Two steps: stop at frame 0 and stream only on "go" (Execute) over stdin.
         "--replay.hold_at_trajectory_start=true",

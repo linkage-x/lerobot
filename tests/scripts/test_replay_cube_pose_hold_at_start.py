@@ -128,3 +128,68 @@ def test_external_torques_are_nan_when_the_robot_cannot_report_them():
 
     assert all(v != v for v in replay._external_joint_torques(_Robot()))
     assert replay._external_joint_torques(_Fr3())[5] == 9.0
+
+
+class _JointRobot:
+    """Tracks every joint command at once and records what it was sent."""
+
+    def __init__(self, joints):
+        self.joints = list(joints)
+        self.sent = []
+        self.homed = 0
+
+    def move_to_start(self):
+        self.homed += 1
+
+    def send_joint_positions(self, target):
+        self.sent.append([float(v) for v in target])
+        self.joints = list(self.sent[-1])
+
+    def get_observation(self, include_cameras=False):
+        return dict(zip(replay.JOINT_VECTOR_NAMES, self.joints, strict=True))
+
+
+def test_joint_start_homes_then_ramps_to_the_planned_start_joints():
+    planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
+    cfg = replay.ReplayRuntimeConfig(
+        initial_pose_mode="joint_start",
+        initial_joint_positions=planned,
+        initial_joint_max_velocity_rad_s=20.0,
+        command_interval_s=0.005,
+        home_settle_time_s=0.0,
+    )
+    robot = _JointRobot([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+
+    result = replay._prepare_initial_robot_pose(robot, cfg)
+
+    assert robot.homed == 1
+    assert result["reached"] is True and result["mode"] == "joint_start"
+    # Ramped: the first command is a step off the start, not the far target handed over at once.
+    first_step = max(abs(a - b) for a, b in zip(robot.sent[0], [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785], strict=True))
+    assert first_step < 1.0
+    assert robot.sent[-1] == pytest.approx(planned)
+    assert result["ramp_s"] == pytest.approx(1.99 / 20.0, rel=1e-3)
+
+
+def test_joint_start_needs_seven_start_joints():
+    with pytest.raises(ValueError, match="needs replay.initial_joint_positions"):
+        replay.ReplayRuntimeConfig(initial_pose_mode="joint_start")
+    with pytest.raises(ValueError, match="7 finite"):
+        replay.ReplayRuntimeConfig(initial_pose_mode="joint_start", initial_joint_positions=[0.0] * 6)
+
+
+def test_gateway_style_cli_hands_the_start_joints_to_the_replay():
+    import draccus
+
+    cfg = draccus.parse(
+        replay.ReplayCubePoseConfig,
+        config_path=str(_SCRIPT.with_name("replay_cube_pose_in_robot_base.thor.yaml")),
+        args=[
+            "--input.csv_path=/x.csv",
+            "--replay.initial_pose_mode=joint_start",
+            "--replay.initial_joint_positions=[1.22,-1.05,-1.62,-2.26,-1.99,2.89,1.65]",
+        ],
+    )
+    assert cfg.replay.initial_joint_positions == pytest.approx([1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65])
+    # The streamed IK stays inside panda_py's wall too.
+    assert cfg.robot.ik_respect_controller_joint_limits is True

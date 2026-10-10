@@ -1637,9 +1637,8 @@ def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     video_path = Path(command[command.index("--render-video") + 1])
     assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
 
-    # Seeded and approached the way the real replay starts, or the preview shows another joint branch.
-    assert command[command.index("--initial-joints") + 1] == "fr3_start"
-    assert command[command.index("--initial-approach") + 1] == "guarded"
+    # Seeded at the start planned for the whole episode -- the joints the real replay moves to.
+    assert command[command.index("--initial-joints") + 1] == "trajectory_start"
 
     both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
     assert both_command[both_command.index("--cube") + 1] == "both"
@@ -1678,6 +1677,19 @@ def _stamped_replay_dataset(tmp_path: Path, *, edges: list[dict]) -> tuple[gatew
     return state, dataset_root
 
 
+def _write_planned_mujoco_start(dataset_root, cube, episode=0):
+    """A MuJoCo preview report carrying the start joints the real replay is handed."""
+    report_path = gateway._mujoco_preview_report_path(dataset_root, episode, cube)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {cube: {"trajectory_start": {"feasible": True, "joints_rad": [0.1] * 7}}},
+        }),
+        encoding="utf-8",
+    )
+
+
 def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
     # 90 deg about z, then (1, 2, 3): T_fr3_base_world_a.
     edge_matrix = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
@@ -1688,6 +1700,7 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
     fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
 
     mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
+    _write_planned_mujoco_start(dataset_root, "right")
     real = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
 
     # The camera-world sidecar is never what the arm (simulated or real) is given.
@@ -1875,6 +1888,7 @@ def test_thor_real_replay_holds_at_the_trajectory_start_and_reports_into_a_run_d
         edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]}],
     )
     run_dir = gateway._real_replay_run_dir(dataset_root, 0, "right")
+    _write_planned_mujoco_start(dataset_root, "right")
     command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102", run_dir=run_dir)
     assert "--replay.hold_at_trajectory_start=true" in command
     assert f"--replay.report_json_path={run_dir / 'real_replay_report.json'}" in command
@@ -2498,6 +2512,16 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     gateway._finish_mujoco_validation(state, 0)
     gateway._preflight_replay(state)
+    planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {"left": {"trajectory_start": {"feasible": True, "joints_rad": planned}}},
+        }),
+        encoding="utf-8",
+    )
     command = gateway._real_replay_command(
         state,
         dataset_root,
@@ -2516,8 +2540,9 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--input.dataset_pose_name=left" in command
     assert "--robot.robot_ip=192.168.1.99" in command
     assert "--replay.episode_index=0" in command
-    # Starts from move_to_start(), the seed the MuJoCo preview used.
-    assert "--replay.initial_pose_mode=robot_start" in command
+    # move_to_start(), then a joint move to the start the MuJoCo preview planned and checked.
+    assert "--replay.initial_pose_mode=joint_start" in command
+    assert f"--replay.initial_joint_positions=[{','.join(repr(v) for v in planned)}]" in command
     assert "--replay.fail_on_unreached_initial_pose=true" in command
     assert "--end_effector.mode=robot_config" in command
 
@@ -2553,6 +2578,27 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--skip-gripper" in preflight_command
 
 
+def test_real_replay_refuses_a_mujoco_report_without_a_feasible_trajectory_start(tmp_path):
+    dataset_root = tmp_path / "ds"
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 3, "right")
+    report_path.parent.mkdir(parents=True)
+
+    report_path.write_text(json.dumps({"initial_joints": "fr3_start", "robots": {"right": {}}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Run MuJoCo right again"):
+        gateway._mujoco_trajectory_start_joints(dataset_root, 3, "right")
+
+    report_path.write_text(
+        json.dumps({
+            "initial_joints": "trajectory_start",
+            "robots": {"right": {"trajectory_start": {"feasible": False, "joints_rad": [0.0] * 7,
+                                                      "reason": "j6 within 0.020 rad of its limit"}}},
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="j6 within"):
+        gateway._mujoco_trajectory_start_joints(dataset_root, 3, "right")
+
+
 def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
@@ -2573,7 +2619,7 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
             "cube_mode": "left",
             "episode_index": 0,
             "fps": 30,
-            "initial_joints": "fr3_start",
+            "initial_joints": "trajectory_start",
             "robots": {
                 "left": {
                     "frames": [{"frame_index": 0}, {"frame_index": 1}],
@@ -2604,7 +2650,7 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
     # A preview seeded anywhere but the real replay's start pose cannot be approved.
     stale = json.loads(report_path.read_text(encoding="utf-8"))
     report_path.write_text(json.dumps({**stale, "initial_joints": "das_start"}), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="FR3 start pose"):
+    with pytest.raises(RuntimeError, match="planned trajectory start"):
         gateway._approve_mujoco_report(state, "left")
     report_path.write_text(json.dumps(stale), encoding="utf-8")
     video_path.write_bytes(b"rendered")

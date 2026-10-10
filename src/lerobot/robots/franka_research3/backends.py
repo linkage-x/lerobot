@@ -148,6 +148,33 @@ def _resolve_das_databus_cls(gen_con_sdk_path: str | None):
     )
 
 
+# panda_py (0.8.1, the Thor and workstation build) compiles in the *Panda's* joint limits and
+# runs a virtual-wall controller at them, so the FR3 it drives stops there even where the FR3
+# itself goes further -- most of all j6, walled at 3.7525 rad against the FR3's 4.5169. IK that
+# plans past these drives the arm into the wall (2026-10-09: j6 pinned at 3.757, replay abort).
+PANDA_PY_JOINT_LIMITS_LOWER = (-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973)
+PANDA_PY_JOINT_LIMITS_UPPER = (2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973)
+# panda_py JOINT_POSITION_START: where move_to_start() leaves the arm.
+PANDA_PY_JOINT_POSITION_START = (0.0, -np.pi / 4.0, 0.0, -3.0 * np.pi / 4.0, 0.0, np.pi / 2.0, np.pi / 4.0)
+
+
+def _intersect_joint_limits(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    extra_lower: Any | None,
+    extra_upper: Any | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower = np.asarray(lower, dtype=np.float64).copy()
+    upper = np.asarray(upper, dtype=np.float64).copy()
+    if extra_lower is not None:
+        lower = np.maximum(lower, np.asarray(extra_lower, dtype=np.float64).reshape(lower.shape))
+    if extra_upper is not None:
+        upper = np.minimum(upper, np.asarray(extra_upper, dtype=np.float64).reshape(upper.shape))
+    if np.any(lower > upper):
+        raise ValueError(f"Joint limits do not overlap: lower={lower.tolist()} upper={upper.tolist()}")
+    return lower, upper
+
+
 @dataclass
 class PandaPyArmDriver:
     robot_ip: str
@@ -1457,6 +1484,9 @@ class HirolLMKinematicsDriver:
     joint_names: list[str]
     tolerance: float = 1e-6
     max_iterations: int = 200
+    # Narrower than the URDF where the arm's controller walls it off (PANDA_PY_JOINT_LIMITS_*).
+    position_limits_lower: Any | None = None
+    position_limits_upper: Any | None = None
 
     def __post_init__(self):
         try:
@@ -1479,14 +1509,22 @@ class HirolLMKinematicsDriver:
         if not self._model.existFrame(self.target_frame_name):
             raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
         self._frame_id = self._model.getFrameId(self.target_frame_name)
-        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
-        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+        self._lower_limits, self._upper_limits = _intersect_joint_limits(
+            self._model.lowerPositionLimit,
+            self._model.upperPositionLimit,
+            self.position_limits_lower,
+            self.position_limits_upper,
+        )
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         self._pin.forwardKinematics(self._model, self._data, q)
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._lower_limits.copy(), self._upper_limits.copy()
 
     def inverse_kinematics(
         self,
@@ -1553,6 +1591,9 @@ class HirolGaussianNewtonKinematicsDriver:
     tolerance: float = 1e-6
     max_iterations: int = 200
     damping: float = 1e-3
+    # Narrower than the URDF where the arm's controller walls it off (PANDA_PY_JOINT_LIMITS_*).
+    position_limits_lower: Any | None = None
+    position_limits_upper: Any | None = None
 
     def __post_init__(self):
         try:
@@ -1576,14 +1617,22 @@ class HirolGaussianNewtonKinematicsDriver:
         if not self._model.existFrame(self.target_frame_name):
             raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
         self._frame_id = self._model.getFrameId(self.target_frame_name)
-        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
-        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+        self._lower_limits, self._upper_limits = _intersect_joint_limits(
+            self._model.lowerPositionLimit,
+            self._model.upperPositionLimit,
+            self.position_limits_lower,
+            self.position_limits_upper,
+        )
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         self._pin.forwardKinematics(self._model, self._data, q)
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._lower_limits.copy(), self._upper_limits.copy()
 
     def inverse_kinematics(
         self,
