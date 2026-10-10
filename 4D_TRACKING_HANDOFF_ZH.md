@@ -6,6 +6,7 @@
 
 - 主仓库分支：`ntl/4d_track`。
 - 一键入口：[run_thor_sam3_recovery.py](third_party/Track4World/scripts/run_thor_sam3_recovery.py)。日常使用只需要指定 `--dataset-root`。
+- 深度后端实验入口：[run_thor_depth_experiment.py](tools/track4world/run_thor_depth_experiment.py)。`--depth-backend ffs` 用原双目模型求深度，`--depth-backend lingbot-depth` 默认以 FFS 深度为输入，对 `cam_03` 和 `cam_13` 分别细化深度；两个选项的物体轨迹都分别输出，不做双相机轨迹融合。安装、命令及实验限制见 [LINGBOT_DEPTH_EXPERIMENT.md](tools/track4world/LINGBOT_DEPTH_EXPERIMENT.md)。
 - 更完整的英文操作说明：[THOR_SAM3_RECOVERY_TUTORIAL.md](third_party/Track4World/THOR_SAM3_RECOVERY_TUTORIAL.md)；掩码校正和结果格式见 [SAM3_INTERACTIVE_RECOVERY.md](third_party/Track4World/SAM3_INTERACTIVE_RECOVERY.md)。
 - 代码依赖位于 `third_party/Track4World`、`third_party/sam3` 和 `third_party/Fast-FoundationStereo` Git 子模块。切换分支后执行 `git submodule update --init --recursive`，并确认 Track4World 子模块包含 `scripts/run_thor_sam3_recovery.py`。接手新机器时，先确保主仓库提交和对应子模块提交都已推送到远端。
 

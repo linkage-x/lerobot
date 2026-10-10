@@ -17,3 +17,6 @@
 [submodule "third_party/box-sdk"]
 	path = third_party/box-sdk
 	url = git@github.com:linkage-x/box-sdk.git
+[submodule "third_party/lingbot-depth"]
+	path = third_party/lingbot-depth
+	url = https://github.com/Robbyant/lingbot-depth.git
