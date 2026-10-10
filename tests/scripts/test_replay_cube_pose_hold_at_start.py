@@ -79,11 +79,43 @@ def test_csv_trajectory_carries_the_recorded_gripper_opening(tmp_path):
     assert replay._get_target_gripper_command(episodes[0].targets[2], runtime, 1.0) == 1.0
 
 
+def test_trigger_pressed_home_replays_the_gripper_shut_not_at_the_tube_width(tmp_path):
+    csv_path = tmp_path / "state_action.right.csv"
+    # 09 Oct ep0: the jaw follows the trigger, then stops on the tube at 32.3 mm while the
+    # trigger keeps going to 100 %.
+    csv_path.write_text(
+        "episode_index,frame_index,gripper_width_m,gripper_trigger_pct,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.0887,0.0,0.5,0,0.3,0,0,0,1\n"
+        "0,1,0.0386,75.8,0.5,0,0.3,0,0,0,1\n"
+        "0,2,0.0336,92.8,0.5,0,0.3,0,0,0,1\n"
+        "0,3,0.0323,100.0,0.5,0,0.3,0,0,0,1\n"
+        "0,4,0.0372,nan,0.5,0,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    cfg = replay.TrajectoryInputConfig(
+        source="csv", csv_path=str(csv_path), pose_prefix="state", grasp_trigger_close_pct=90.0
+    )
+    episodes, summary = replay._load_csv_episode_trajectories(cfg)
+    assert [t.gripper_pos for t in episodes[0].targets] == pytest.approx(
+        [0.0887 / 0.09, 0.0386 / 0.09, 0.0, 0.0, 0.0372 / 0.09]
+    )
+    assert summary["grasp_rows"] == 2
+    # Off by default: the recorded width throughout.
+    plain, _ = replay._load_csv_episode_trajectories(
+        replay.TrajectoryInputConfig(source="csv", csv_path=str(csv_path), pose_prefix="state")
+    )
+    assert plain[0].targets[3].gripper_pos == pytest.approx(0.0323 / 0.09)
+    with pytest.raises(ValueError, match="grasp_closed_width_m"):
+        replay.TrajectoryInputConfig(source="csv", csv_path=str(csv_path), grasp_closed_width_m=0.2)
+
+
 def test_thor_profile_replays_the_dataset_gripper():
     import yaml
 
     profile = yaml.safe_load(_SCRIPT.with_name("replay_cube_pose_in_robot_base.thor.yaml").read_text())
     assert profile["replay"]["use_dataset_gripper_for_replay"] is True
+    assert profile["input"]["grasp_trigger_close_pct"] == 90
+    assert profile["input"]["grasp_closed_width_m"] == 0.0
 
 
 def test_external_torques_are_nan_when_the_robot_cannot_report_them():

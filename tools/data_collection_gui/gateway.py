@@ -9237,6 +9237,14 @@ def _fr3_base_trajectory_dir_path(dataset_root: Path) -> Path:
 
 
 DATASET_GRIPPER_WIDTH_NAME = "box_gripper.distance_m"
+DATASET_TRIGGER_NAME = "box_trigger.travel_pct"
+# Sidecar column <- observation.state entry the FR3 replay reads from the episode parquet.
+# The trigger is the operator's intent: pressed home on a tube, the handheld jaw stops at the
+# tube's width while the trigger reads 100 %, and the replay closes on that, not on the width.
+FR3_REPLAY_STATE_COLUMNS = {
+    "gripper_width_m": DATASET_GRIPPER_WIDTH_NAME,
+    "gripper_trigger_pct": DATASET_TRIGGER_NAME,
+}
 
 
 def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | None:
@@ -9283,11 +9291,12 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
     out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
     written = []
-    widths = _dataset_gripper_widths(dataset_root)
-    gripper_rows: dict[str, int] = {}
+    recorded = _dataset_state_values(dataset_root, list(FR3_REPLAY_STATE_COLUMNS.values()))
+    carried: dict[str, dict[str, int]] = {column: {} for column in FR3_REPLAY_STATE_COLUMNS}
     for src in sorted(sidecar.glob("state_action.*.csv")):
         wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
-        gripper_rows[src.name] = _fill_gripper_width_column(out_dir / src.name, widths)
+        for column, name in FR3_REPLAY_STATE_COLUMNS.items():
+            carried[column][src.name] = _fill_state_column(out_dir / src.name, column, recorded.get(name, {}))
         written.append(src.name)
     (out_dir / "frame.json").write_text(
         json.dumps(
@@ -9295,7 +9304,14 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
                 "world_frame_id": wp.FR3_BASE_WORLD_ID,
                 "from": routes,
                 "files": written,
-                "gripper_width": {"source": f"observation.state[{DATASET_GRIPPER_WIDTH_NAME}]", "rows": gripper_rows},
+                "gripper_width": {
+                    "source": f"observation.state[{DATASET_GRIPPER_WIDTH_NAME}]",
+                    "rows": carried["gripper_width_m"],
+                },
+                "gripper_trigger": {
+                    "source": f"observation.state[{DATASET_TRIGGER_NAME}]",
+                    "rows": carried["gripper_trigger_pct"],
+                },
             },
             indent=2,
         ),
@@ -9304,24 +9320,26 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
     return out_dir
 
 
-def _dataset_gripper_widths(dataset_root: Path) -> dict[tuple[int, int], float]:
-    """The BOX jaw opening (m) per ``(episode_index, frame_index)``, or {} when not recorded.
+def _dataset_state_values(dataset_root: Path, names: list[str]) -> dict[str, dict[tuple[int, int], float]]:
+    """``observation.state[name]`` per ``(episode_index, frame_index)`` for each recorded name.
 
-    The tracker writes poses only and leaves the sidecar's ``gripper_width_m`` NaN; the
-    opening lives in the episode parquet. The corenetic gripper on the FR3 is commanded
-    in the same metres, so this is what the arm's gripper replays.
+    The tracker writes poses only and leaves the sidecar's gripper columns NaN; the BOX jaw
+    opening (m) and trigger travel (%) live in the episode parquet. The corenetic gripper on
+    the FR3 is commanded in the same metres. Names the dataset did not record are left out.
     """
     info = _load_json_file(dataset_root / "meta" / "info.json")
     features = info.get("features") if isinstance(info.get("features"), dict) else {}
-    names = (features.get("observation.state") or {}).get("names")
-    if isinstance(names, dict):
-        names = next(iter(names.values()), [])
-    if not isinstance(names, list) or DATASET_GRIPPER_WIDTH_NAME not in names:
+    state_names = (features.get("observation.state") or {}).get("names")
+    if isinstance(state_names, dict):
+        state_names = next(iter(state_names.values()), [])
+    if not isinstance(state_names, list):
         return {}
-    column = names.index(DATASET_GRIPPER_WIDTH_NAME)
+    columns = {name: state_names.index(name) for name in names if name in state_names}
+    if not columns:
+        return {}
     import pyarrow.parquet as pq
 
-    widths: dict[tuple[int, int], float] = {}
+    values: dict[str, dict[tuple[int, int], float]] = {name: {} for name in columns}
     for data_file in sorted((dataset_root / "data").glob("chunk-*/file-*.parquet")):
         table = pq.read_table(data_file, columns=["episode_index", "frame_index", "observation.state"])
         for episode, frame, state_vec in zip(
@@ -9330,26 +9348,27 @@ def _dataset_gripper_widths(dataset_root: Path) -> dict[tuple[int, int], float]:
             table.column("observation.state").to_pylist(),
             strict=True,
         ):
-            if not state_vec or len(state_vec) <= column or state_vec[column] is None:
-                continue
-            width = float(state_vec[column])
-            if math.isfinite(width):
-                widths[(int(episode), int(frame))] = width
-    return widths
+            for name, column in columns.items():
+                if not state_vec or len(state_vec) <= column or state_vec[column] is None:
+                    continue
+                value = float(state_vec[column])
+                if math.isfinite(value):
+                    values[name][(int(episode), int(frame))] = value
+    return values
 
 
-def _fill_gripper_width_column(csv_path: Path, widths: dict[tuple[int, int], float]) -> int:
-    """Fill the NaN ``gripper_width_m`` cells of ``csv_path`` from ``widths``; return rows that carry one."""
+def _fill_state_column(csv_path: Path, column: str, values: dict[tuple[int, int], float]) -> int:
+    """Fill the NaN ``column`` cells of ``csv_path`` from ``values``; return rows that carry one."""
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
         rows = list(reader)
-    if "gripper_width_m" not in fieldnames:
-        fieldnames.append("gripper_width_m")
+    if column not in fieldnames:
+        fieldnames.append(column)
     carried = 0
     for row in rows:
         try:
-            recorded = float(row.get("gripper_width_m") or "nan")
+            recorded = float(row.get(column) or "nan")
         except ValueError:
             recorded = math.nan
         if not math.isfinite(recorded):
@@ -9357,9 +9376,10 @@ def _fill_gripper_width_column(csv_path: Path, widths: dict[tuple[int, int], flo
                 key = (int(float(row.get("episode_index") or 0)), int(float(row["frame_index"])))
             except (KeyError, TypeError, ValueError):
                 continue
-            if key not in widths:
+            if key not in values:
+                row[column] = "nan"
                 continue
-            row["gripper_width_m"] = repr(widths[key])
+            row[column] = repr(values[key])
         carried += 1
     tmp = csv_path.with_name(csv_path.name + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="") as f:

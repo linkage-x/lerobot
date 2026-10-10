@@ -1737,7 +1737,11 @@ def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
     rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(r["gripper_width_m"]) for r in rows[:2]] == pytest.approx([0.0887, 0.0323])
     assert rows[2]["gripper_width_m"] == "nan"  # no opening recorded: the replay falls back, not 0
-    assert json.loads((fr3_dir / "frame.json").read_text())["gripper_width"]["rows"] == {"state_action.right.csv": 2}
+    # The trigger rides along: it tells a jaw stopped by the tube from one opened to that width.
+    assert [float(r["gripper_trigger_pct"]) for r in rows] == [0.0, 100.0, 100.0]
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["gripper_width"]["rows"] == {"state_action.right.csv": 2}
+    assert frame["gripper_trigger"]["rows"] == {"state_action.right.csv": 3}
 
 
 def test_thor_preflight_checks_the_replay_arm_not_the_workstation_arm(tmp_path):
