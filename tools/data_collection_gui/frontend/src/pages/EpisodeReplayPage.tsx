@@ -3,6 +3,7 @@ import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus, RealSensePreviewCameraStatus, ReplayTimeline } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
+import { LaserReplayAnalysisPanel } from "../LaserReplayAnalysisPanel";
 import { api } from "../apiClient";
 
 const REAL_REPLAY_TARGET_FRAMES: Record<RealEndEffectorMode, string> = {
@@ -987,6 +988,7 @@ export function EpisodeReplayPage({
   onApproveMujoco,
   onRealReplay,
   onExecuteRealReplay,
+  onAnalyzeLaser,
   onAbort,
   onSelectDataset,
   onSelectEpisode,
@@ -1008,6 +1010,7 @@ export function EpisodeReplayPage({
     recordTracker: boolean
   ) => void;
   onExecuteRealReplay: () => void;
+  onAnalyzeLaser: (cube: RealCubeMode) => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
@@ -1066,6 +1069,9 @@ export function EpisodeReplayPage({
         cubeSelection={cubeSelection}
       />
       <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} onExecute={onExecuteRealReplay} />
+      {cubeSelection ? (
+        <LaserReplayAnalysisPanel status={snapshot.replay} busy={busy} onAnalyze={onAnalyzeLaser} />
+      ) : null}
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}

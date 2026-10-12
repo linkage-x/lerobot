@@ -252,6 +252,9 @@ class ReplayStatus:
     realTrackerState: str = ""  # "", warming, ready, waiting, recording, landing, landed, error
     realTrackerDetail: str = ""
     realRunDir: str = ""
+    # Laser vs FR3 error analysis of the real replays of one (dataset, episode, cube), see
+    # _start_laser_replay_analysis. Status only; the report is fetched by /api/replay/laser-analysis.
+    laserAnalysis: dict[str, Any] = field(default_factory=dict)
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
     # selection on the same slot but swaps in different frames/videos. The UI
@@ -16127,6 +16130,119 @@ def _finish_replay_tracker(state: GatewayState) -> None:
     ).start()
 
 
+
+# --------------------------------------------------------------------------- #
+# Laser vs FR3 error of real replays (metrology.fr3_replay_laser_error)
+# --------------------------------------------------------------------------- #
+
+LASER_REPLAY_ERROR_MODULE = "metrology.fr3_replay_laser_error"
+LASER_REPLAY_ERROR_TIMEOUT_S = 600
+
+
+def _real_replay_root(dataset_root: Path) -> Path:
+    return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / "real_replay"
+
+
+def _laser_replay_runs(dataset_root: Path, episode: int, cube_mode: str) -> list[Path]:
+    """Real replay runs of this episode and cube that carry both a trace and a landed tracker session."""
+    root = _real_replay_root(dataset_root)
+    if not root.is_dir():
+        return []
+    runs = []
+    for run in sorted(root.glob(f"*_episode_{int(episode):06d}_{cube_mode}")):
+        if not run.is_dir():
+            continue
+        if any((run / "laser_tracker").glob("lt_*/*.rt.csv")) and any((run / "replay_pose_traces").glob("*.csv")):
+            runs.append(run)
+    return runs
+
+
+def _laser_replay_report_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
+    return _real_replay_root(dataset_root) / f"laser_replay_error_episode_{int(episode):06d}_{cube_mode}.json"
+
+
+def _laser_analysis_cube(cube_mode: str) -> str:
+    cube_mode = str(cube_mode or "").strip().lower()
+    if cube_mode not in ("left", "right"):
+        raise ValueError(f"Laser analysis cube must be left or right, got {cube_mode!r}")
+    return cube_mode
+
+
+def _start_laser_replay_analysis(state: GatewayState, cube_mode: str) -> None:
+    """Analyse every laser-recorded real replay of the selected episode (called under state.lock)."""
+    if state.replay.laserAnalysis.get("status") == "running":
+        raise RuntimeError("A laser analysis is already running.")
+    cube_mode = _laser_analysis_cube(cube_mode)
+    dataset_root = state.selected_replay_root
+    if dataset_root is None:
+        raise RuntimeError("Select a dataset first.")
+    episode = int(state.replay.episode)
+    runs = _laser_replay_runs(dataset_root, episode, cube_mode)
+    if not runs:
+        raise RuntimeError(
+            f"No real replay of episode {episode} ({cube_mode}) recorded the laser tracker under "
+            f"{_real_replay_root(dataset_root)}."
+        )
+    out = _laser_replay_report_path(dataset_root, episode, cube_mode)
+    state.replay.laserAnalysis = {
+        "status": "running",
+        "datasetRoot": str(dataset_root),
+        "episode": episode,
+        "cube": cube_mode,
+        "runs": len(runs),
+        "reportPath": str(out),
+        "message": f"Analysing {len(runs)} run(s) with the laser tracker",
+        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    state.log("info", f"Laser vs FR3 analysis started: {len(runs)} run(s) of episode {episode} {cube_mode}")
+    Thread(
+        target=_run_laser_replay_analysis,
+        args=(state, runs, out),
+        daemon=True,
+        name=f"laser-replay-analysis-{episode}-{cube_mode}",
+    ).start()
+
+
+def _run_laser_replay_analysis(state: GatewayState, runs: list[Path], out: Path) -> None:
+    env = _tool_env(state.repo_root)
+    env["PYTHONPATH"] = os.pathsep.join([str(state.repo_root / "third_party" / "opencv_kalibr"), env["PYTHONPATH"]])
+    command = [sys.executable, "-m", LASER_REPLAY_ERROR_MODULE, *map(str, runs), "--out", str(out)]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(state.repo_root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=LASER_REPLAY_ERROR_TIMEOUT_S,
+            check=False,
+        )
+        output, ok = proc.stdout or "", proc.returncode == 0 and out.is_file()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        output, ok = f"{type(exc).__name__}: {exc}", False
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    with state.lock:
+        analysis = state.replay.laserAnalysis
+        analysis["status"] = "done" if ok else "failed"
+        analysis["message"] = (
+            f"Analysed {len(runs)} run(s)" if ok else ("analysis failed: " + (lines[-1] if lines else "no output"))
+        )
+        analysis["output"] = lines[-12:]
+        analysis["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        state.log("info" if ok else "warn", f"Laser vs FR3 analysis {analysis['status']}: {analysis['message']}")
+
+
+def _laser_replay_report(dataset_root: Path, episode: int, cube_mode: str) -> dict[str, Any] | None:
+    path = _laser_replay_report_path(dataset_root, episode, _laser_analysis_cube(cube_mode))
+    if not path.is_file():
+        return None
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["reportPath"] = str(path)
+    report["modifiedAt"] = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    report["availableRuns"] = [run.name for run in _laser_replay_runs(dataset_root, episode, cube_mode)]
+    return report
+
 # The tracker's home nest sits ~158 mm from the head: lt_20261009_092828 was "ready"
 # (homed, locked) and recorded 157.7 mm for a whole Execute while the arm moved. Any
 # beam closer than this is on the nest, not on the SMR the arm carries.
@@ -16612,6 +16728,35 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 _json_response(self, HTTPStatus.OK, report)
                 return
+            if path == "/api/replay/laser-analysis":
+                requested = query.get("path", [""])[0]
+                dataset_root = _resolve_known_dataset(self.server.state, requested) or self.server.state.selected_replay_root
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not found"})
+                    return
+                try:
+                    episode = int(query.get("episode", ["0"])[0])
+                    cube_mode = _laser_analysis_cube(query.get("cube", ["right"])[0])
+                    report = _laser_replay_report(dataset_root, episode, cube_mode)
+                except ValueError as exc:
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except OSError as exc:
+                    _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                    return
+                if report is None:
+                    runs = _laser_replay_runs(dataset_root, episode, cube_mode)
+                    _json_response(
+                        self,
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": "no laser analysis for this episode yet",
+                            "availableRuns": [run.name for run in runs],
+                        },
+                    )
+                    return
+                _json_response(self, HTTPStatus.OK, report)
+                return
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
 
     def do_POST(self) -> None:
@@ -16869,6 +17014,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/replay/execute-real":
                     _execute_real_replay(self.server.state)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/analyze-laser":
+                    _start_laser_replay_analysis(
+                        self.server.state, query.get("cube", [self.server.state.replay.realCubeMode])[0]
+                    )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/teleop/start-sim":

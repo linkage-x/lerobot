@@ -30,6 +30,7 @@ import type {
   RealCubeMode,
   RealEndEffectorMode,
   MujocoPreview,
+  LaserReplayReport,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -473,6 +474,32 @@ export class DataCollectionGuiApi {
     const remote = await this.postRemoteSnapshot("/api/replay/execute-real");
     if (remote) return remote;
     throw new Error("Gateway unavailable; the trajectory cannot be executed.");
+  }
+
+  async analyzeRealReplayLaser(cubeMode: RealCubeMode): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/analyze-laser?cube=${encodeURIComponent(cubeMode)}`);
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; the laser analysis runs on the gateway.");
+  }
+
+  // null when there is no report yet; availableRuns then says whether there is anything to analyse.
+  async fetchLaserReplayReport(
+    datasetPath: string,
+    episode: number,
+    cubeMode: RealCubeMode
+  ): Promise<{ report: LaserReplayReport | null; availableRuns: string[] }> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/laser-analysis?path=${encodeURIComponent(datasetPath)}&episode=${episode}&cube=${encodeURIComponent(cubeMode)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      const body = await response.json();
+      if (!response.ok) return { report: null, availableRuns: body.availableRuns ?? [] };
+      const report = body as LaserReplayReport;
+      return { report, availableRuns: report.availableRuns ?? [] };
+    } catch {
+      return { report: null, availableRuns: [] };
+    }
   }
 
   async fetchMujocoPreview(

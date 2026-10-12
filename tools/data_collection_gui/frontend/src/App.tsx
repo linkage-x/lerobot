@@ -283,6 +283,7 @@ function App() {
           run(() => api.startRealCubeReplay(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker))
         }
         onExecuteRealReplay={() => run(() => api.executeRealCubeReplay())}
+        onAnalyzeLaser={(cube) => run(() => api.analyzeRealReplayLaser(cube))}
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}

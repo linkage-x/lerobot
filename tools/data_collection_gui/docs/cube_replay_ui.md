@@ -77,3 +77,51 @@ With a real dataset available, validate in this order:
 5. Verify FR3 connectivity and preflight independently before permitting motion.
 6. Start hardware replay at a conservative workspace setup and stop immediately
    if the initial pose or cube-to-EE transform is unexpected.
+
+## Laser vs FR3 replay error (one click)
+
+When a real replay ran with *Record the laser tracker* on, its run directory
+holds both halves of a ground-truth comparison:
+
+```text
+derived/april_cube_tracking_in_robot_base/real_replay/<UTC stamp>_episode_XXXXXX_<cube>/
+  replay_pose_traces/*.csv        desired TCP pose + the FR3's own (FK) pose, per frame
+  laser_tracker/lt_*/             landed tracker session (rt.csv, meta.json, sync.csv)
+```
+
+The **Laser vs FR3 Replay Error** panel under Real Robot Replay (Thor only)
+analyses every such run of the selected episode and cube:
+
+1. Select the dataset and episode, pick the cube, click `Analyse laser runs`.
+   The button is disabled while a replay is running (its tracker session has not
+   landed yet) and when no run of this episode recorded the tracker.
+2. The gateway runs `python -m metrology.fr3_replay_laser_error <runs...>` in a
+   subprocess (pure numpy; a few seconds) and writes
+   `real_replay/laser_replay_error_episode_XXXXXX_<cube>.json`, plus
+   `laser_replay_error.json` in each run directory. The panel reloads the report
+   by itself; it is also shown again after a gateway restart.
+
+What the numbers are (all in mm, at the SMR point, on the frames the beam saw,
+minus 10 frames before each loss):
+
+| Column | Meaning |
+|---|---|
+| Laser vs desired | the replay error that really happened |
+| FK vs desired | what the trace alone says (`target_position_error`) |
+| Laser vs FK | how far the FR3's own readback is off; a lower bound, because the tracker-to-base registration is fitted to the FK |
+| Offset / Lag / Rest | laser vs desired split into a constant offset, the follow lag (frames the arm trails the target), and what is left |
+
+The registration fits the tracker-to-base transform and the SMR position in the
+TCP frame together (Gauss–Newton, 9 parameters). The SMR offset is reported with
+its formal σ and must agree across runs if the SMR was not reseated. Run-to-run
+repeatability compares the laser points of all analysed runs frame by frame.
+
+The beam-loss line reads the line of sight in the gripper frame. A loss at the
+edge of a small swing points at the SMR (aperture turned away from the tracker,
+or something on the gripper clipping the beam): face the SMR at the tracker at
+the trajectory start. A loss well inside the directions already seen points at
+something in the scene crossing the beam.
+
+Reference (2026-10-10, 1009 ep0 right, three runs): laser vs FK 0.27 mm RMS;
+laser vs desired 7.8 mm RMS = 5.5 mm downward sag + 150 ms follow lag + 2.5–3 mm.
+See W3f in `docs/box_umi_laser_tracker_gt_roadmap.html`.

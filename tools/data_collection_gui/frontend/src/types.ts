@@ -247,6 +247,9 @@ export type ReplayStatus = {
   realTrackerState?: RealTrackerState;
   realTrackerDetail?: string;
   realRunDir?: string;
+  // Laser vs FR3 error analysis of the selected episode's real replays (status only; the
+  // report itself comes from /api/replay/laser-analysis).
+  laserAnalysis?: LaserAnalysisStatus;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -294,6 +297,71 @@ export type RealTrackerState =
   | "landed"
   | "cancelled"
   | "error";
+
+export type LaserAnalysisStatus = {
+  status?: "running" | "done" | "failed";
+  datasetRoot?: string;
+  episode?: number;
+  cube?: RealCubeMode;
+  runs?: number;
+  reportPath?: string;
+  message?: string;
+  output?: string[];
+  updatedAt?: string;
+};
+
+export type LaserErrorStats = { n: number; rms_mm?: number; p50_mm?: number; p95_mm?: number; max_mm?: number };
+
+// One run of metrology.fr3_replay_laser_error, at the SMR point. A run that could not be
+// analysed carries only run/run_dir/error (plus the beam counts when it got that far).
+export type LaserReplayRun = {
+  run: string;
+  run_dir: string;
+  error?: string;
+  frames?: number;
+  beam_frames?: number;
+  used_frames?: number;
+  first_loss_frame?: number;
+  trace_to_tracker_lag_ms?: number;
+  smr_in_tcp_mm?: number[];
+  smr_in_tcp_sigma_mm?: number[];
+  smr_lever_arm_mm?: number;
+  orientation_span_deg?: number;
+  laser_vs_desired?: LaserErrorStats;
+  fk_vs_desired?: LaserErrorStats;
+  laser_vs_fk?: LaserErrorStats;
+  laser_vs_desired_bias_mm?: number[];
+  decomposition?: {
+    follow_lag_frames: number;
+    follow_lag_ms: number;
+    laser_vs_desired_rms_mm: number;
+    without_bias_rms_mm: number;
+    without_bias_and_lag_rms_mm: number;
+    fk_without_bias_and_lag_rms_mm: number;
+  };
+  by_speed?: { from_mm_s: number; to_mm_s: number | null; frames: number; laser_vs_desired_rms_mm: number; laser_vs_fk_rms_mm: number }[];
+  line_of_sight?: {
+    seen_max_deg: number;
+    trajectory_max_deg: number;
+    at_first_loss_deg?: number;
+    first_loss_new_direction_deg?: number;
+  };
+  per_frame?: {
+    frame_index: number[];
+    laser_vs_desired_mm: (number | null)[];
+    laser_vs_fk_mm: (number | null)[];
+    fk_vs_desired_mm: (number | null)[];
+  };
+};
+
+export type LaserReplayReport = {
+  schema: string;
+  runs: LaserReplayRun[];
+  repeatability: { runs: number; frames?: number; pairwise_max?: LaserErrorStats; smr_in_tcp_spread_mm?: number; note?: string };
+  reportPath?: string;
+  modifiedAt?: string;
+  availableRuns?: string[];
+};
 
 export type RealSensePreviewCameraStatus = {
   cameraKey: string;

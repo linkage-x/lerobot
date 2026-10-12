@@ -7882,3 +7882,83 @@ def test_an_unreadable_run_summary_enforces_the_whole_table(tmp_path, monkeypatc
     state = _solve_state(tmp_path)
     monkeypatch.setattr(gateway, "_production_calibration_runs", lambda _s: {"extrinsicsRun": "run_p_extrinsics"})
     assert gateway._load_camera_identity_expected(state)["ports"] == {"cam_04": "SN-57", "cam_07": "SN-B"}
+
+
+def _laser_replay_state(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path.cwd() / "third_party" / "opencv_kalibr"))
+    from metrology.tests.replay_laser_fixture import write_synthetic_run
+
+    dataset_root = tmp_path / "datasets" / "thor_gmsl2_10ch_v1_20261009_102307"
+    real_replay = gateway._real_replay_root(dataset_root)
+    for stamp in ("20261010T031819Z", "20261010T032019Z"):
+        write_synthetic_run(real_replay / f"{stamp}_episode_000000_right")
+    no_tracker = write_synthetic_run(real_replay / "20261010T030806Z_episode_000000_right")
+    shutil.rmtree(no_tracker / "laser_tracker")  # replayed without the tracker: not a laser run
+    write_synthetic_run(real_replay / "20261010T040000Z_episode_000001_right")
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(episode=0),
+    )
+    state.selected_replay_root = dataset_root
+    return state, dataset_root
+
+
+def test_laser_runs_are_this_episode_and_cube_with_a_landed_tracker_session(tmp_path, monkeypatch):
+    _, dataset_root = _laser_replay_state(tmp_path, monkeypatch)
+    runs = gateway._laser_replay_runs(dataset_root, 0, "right")
+    assert [run.name[:16] for run in runs] == ["20261010T031819Z", "20261010T032019Z"]
+    assert gateway._laser_replay_runs(dataset_root, 0, "left") == []
+    with pytest.raises(ValueError, match="left or right"):
+        gateway._laser_analysis_cube("both")
+
+
+def test_laser_analysis_runs_in_one_click_and_serves_its_report(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    state, dataset_root = _laser_replay_state(tmp_path, monkeypatch)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(f"{base}/api/replay/laser-analysis?episode=0&cube=right", timeout=5)
+        assert missing.value.code == 404
+        assert len(json.loads(missing.value.read())["availableRuns"]) == 2
+
+        request = urllib.request.Request(f"{base}/api/replay/analyze-laser?cube=right", data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            snapshot = json.loads(response.read())
+        assert snapshot["replay"]["laserAnalysis"]["status"] == "running"
+        assert snapshot["replay"]["laserAnalysis"]["runs"] == 2
+
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            with state.lock:
+                status = state.replay.laserAnalysis["status"]
+            if status != "running":
+                break
+            time.sleep(0.1)
+        assert status == "done", state.replay.laserAnalysis
+
+        with urllib.request.urlopen(f"{base}/api/replay/laser-analysis?episode=0&cube=right", timeout=5) as response:
+            report = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [run["first_loss_frame"] for run in report["runs"]] == [200, 200]
+    assert report["repeatability"]["runs"] == 2
+    assert report["reportPath"] == str(gateway._laser_replay_report_path(dataset_root, 0, "right"))
+    assert all((Path(run["run_dir"]) / "laser_replay_error.json").is_file() for run in report["runs"])
+
+
+def test_laser_analysis_says_why_when_no_replay_recorded_the_tracker(tmp_path, monkeypatch):
+    state, _ = _laser_replay_state(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match=r"No real replay of episode 0 \(left\) recorded the laser tracker"):
+        gateway._start_laser_replay_analysis(state, "left")
+    assert state.replay.laserAnalysis == {}
