@@ -4941,6 +4941,13 @@ def _apply_training_output(state: GatewayState, line: str) -> None:
     # they arrive about thirteen times a second, and keeping them would push every real log
     # line out of the window before an operator could read it.
     found = training_backend.parse_progress_line(line)
+    if "totalSteps" in found:
+        # A resumed trainer's tqdm bar counts only the remaining updates. Keep the
+        # configured run total and include the checkpoint's completed steps.
+        remaining_steps = found["totalSteps"]
+        total_steps = max(status.totalSteps, remaining_steps)
+        found["step"] += total_steps - remaining_steps
+        found["totalSteps"] = total_steps
     if "step" in found:
         status.step = found["step"]
         # Only out of "starting". A stopped run keeps writing for as long as it takes to die,

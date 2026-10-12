@@ -307,10 +307,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     if cfg.peft is not None:
-        logging.info("Using PEFT! Wrapping model.")
-        # Convert CLI peft config to dict for overrides
-        peft_cli_overrides = dataclasses.asdict(cfg.peft)
-        policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+        if cfg.resume and cfg.policy.use_peft:
+            # make_policy already loaded the checkpoint adapter for inference.
+            # Re-wrapping would initialize it again and discard the learned weights.
+            policy.set_adapter(policy.active_adapter)
+            policy.peft_config[policy.active_adapter].inference_mode = False
+            logging.info("Resuming PEFT: keeping the loaded adapter and enabling its gradients.")
+        else:
+            logging.info("Using PEFT! Wrapping model.")
+            # Convert CLI peft config to dict for overrides
+            peft_cli_overrides = dataclasses.asdict(cfg.peft)
+            policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()

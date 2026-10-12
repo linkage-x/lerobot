@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import logging
 import os
 import re
@@ -66,9 +67,15 @@ def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
     return wandb_run_id
 
 
-def get_safe_wandb_artifact_name(name: str):
-    """WandB artifacts don't accept ":" or "/" in their name."""
-    return name.replace(":", "_").replace("/", "_")
+def get_safe_wandb_artifact_name(name: str) -> str:
+    """Replace separators and keep artifact names within W&B's 128-character limit."""
+    safe_name = name.replace(":", "_").replace("/", "_")
+    if len(safe_name) <= 128:
+        return safe_name
+    # Hash the full name so datasets and checkpoint steps beyond the retained prefix
+    # still produce distinct, deterministic artifact names.
+    suffix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    return f"{safe_name[:111]}-{suffix}"
 
 
 def _flatten_loggable_metric(key: str, value) -> list[tuple[str, int | float | str]]:

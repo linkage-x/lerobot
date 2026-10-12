@@ -4085,6 +4085,30 @@ def test_the_visible_log_keeps_real_lines_and_drops_bare_progress_bars(tmp_path)
     ]
 
 
+@pytest.mark.parametrize("remaining_steps", [30000, 25000, 20000])
+def test_training_progress_includes_checkpoint_steps(tmp_path, remaining_steps):
+    state = _training_run_state(tmp_path, state="running", totalSteps=30000)
+    offset = 30000 - remaining_steps
+
+    gateway._apply_training_output(
+        state, f"Training: 0%| | 63/{remaining_steps} [01:04<6:58:48, 1.01s/step]"
+    )
+    assert state.training.step == offset + 63
+    assert state.training.totalSteps == 30000
+
+    gateway._apply_training_output(
+        state, f"Training: 0%| | 100/{remaining_steps} [01:41<6:58:00, 1.01s/step]INFO loss:0.217"
+    )
+    assert state.training.step == offset + 100
+    assert state.training.totalSteps == 30000
+    assert state.training.loss == pytest.approx(0.217)
+
+    gateway._apply_training_output(
+        state, f"Training: 100%| | {remaining_steps}/{remaining_steps} [7:00:00<00:00, 1.01s/step]"
+    )
+    assert state.training.step == state.training.totalSteps == 30000
+
+
 def test_the_run_is_followed_through_its_log_file_not_a_pipe(tmp_path, monkeypatch):
     """A pipe would make the gateway's lifetime the run's lifetime.
 
