@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { beamLossSummary, errorBudgetSummary, niceCeiling, polylineSegments, runLabel } from "./laserReplayAnalysis";
+import { beamLossSummary, errorBudgetSummary, leadLabel, niceCeiling, polylineSegments, runLabel } from "./laserReplayAnalysis";
 import type { LaserReplayRun } from "./types";
 
 // 2026-10-10 20261010T032019Z, ep0 right of thor_gmsl2_10ch_v1_20261009_102307.
@@ -55,5 +55,14 @@ describe("chart helpers", () => {
     expect(niceCeiling(15.06)).toBe(20);
     expect(niceCeiling(0.7)).toBe(1);
     expect(niceCeiling(0)).toBe(1);
+  });
+});
+
+describe("leadLabel", () => {
+  it("tells an unknown lead (old trace) from an explicit 0", () => {
+    expect(leadLabel(undefined)).toBe("—");
+    expect(leadLabel(null)).toBe("—");
+    expect(leadLabel(0)).toBe("0");
+    expect(leadLabel(3)).toBe("3 fr");
   });
 });

@@ -279,8 +279,10 @@ function App() {
         onPreflight={() => run(() => api.preflightReplay())}
         onMujocoReplay={(mode) => run(() => api.startMujocoReplay(mode))}
         onApproveMujoco={(mode) => run(() => api.approveMujocoReplay(mode))}
-        onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker) =>
-          run(() => api.startRealCubeReplay(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker))
+        onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker, commandLeadFrames) =>
+          run(() =>
+            api.startRealCubeReplay(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker, commandLeadFrames)
+          )
         }
         onExecuteRealReplay={() => run(() => api.executeRealCubeReplay())}
         onAnalyzeLaser={(cube) => run(() => api.analyzeRealReplayLaser(cube))}

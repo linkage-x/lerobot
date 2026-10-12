@@ -77,6 +77,14 @@ TCP by 5.7 mm. Use **Corenetic v2.0 BOX + cam + SMR** (1.1108 kg) while the
 SMR sits on the gripper, and **Corenetic v2.0 BOX + cam** (0.9755 kg) otherwise
 (see `gripper_w_v2_franka_description/README.md`).
 
+*Command lead (frames)* sends each pose that many frames early along the same
+path (`replay.pose_command_lead_frames`; default 3 since 2026-10-12, 0 = off, at
+most 10; one frame is 50 ms at the Thor config's 20 fps). The YAML still says 0,
+so a command-line replay on Thor runs without lead unless it passes the flag. The gateway always passes it explicitly,
+so a value left in the YAML on Thor never applies silently. The trace keeps
+`desired_*` on the dataset timeline and logs the lead per frame, so the laser
+analysis still scores against the trajectory and lists each run's lead.
+
 The gateway re-runs hardware preflight against the exact IP entered in the
 panel, launches the noninteractive selected episode from
 `replay_cube_pose_in_robot_base.py`, and starts the RealSense monitor. Exported
@@ -159,6 +167,25 @@ References (1009 ep0 right; W3f in `docs/box_umi_laser_tracker_gt_roadmap.html`)
 |---|---|---|---|---|---|
 | 2026-10-10, three runs, Desk load 0.7496 kg | first half | 7.7–7.9 | (0.1, −1.6 ~ −2.1, −5.5) | 0.27 | 2.5–3.0 |
 | 2026-10-12, Desk load 1.1108 kg, v2 URDF | 920 / 920 | 5.31 (p95 8.9) | (0.0, 0.2, 0.7) | 0.51 (first half 0.25) | 2.6 |
+| 2026-10-12, same, repeat | 920 / 920 | 5.40 (p95 8.8) | (0.0, 0.1, 0.7) | 0.51 | 2.8 |
+| 2026-10-12, same, **command lead 3**, two runs | 920 / 920 | 2.68–2.80 (p95 4.2–4.8) | (0.0, −0.1, 0.4–0.5) | 0.51–0.52 | 2.6–2.8 |
 
 The 10-10 sag was the Desk load, not the controller. What is left is mostly the
 150 ms lag: by speed, 3.1 mm below 10 mm/s and 7.3 mm above 40 mm/s.
+The lag comes from the controller sending positions only: panda_py's
+`JointPosition` is τ = K(q_d − q) + D(dq_d − dq) with dq_d = 0, which trails by
+D/K = 83 ms (the same for the Thor gains and the panda_py defaults, so stiffer
+gains do not shorten it). The 20 Hz step targets, each braked to zero velocity by
+Ruckig, add the rest. An offline model of the 10-12 run predicts that a 3-frame
+lead brings laser vs desired to about 2.6 mm while the rest stays at about 2.4 mm. The two
+lead-3 runs measured 2.80 and 2.68 mm with no lag left, and the error no longer
+grows with speed (2.3–2.9 mm above 10 mm/s). What is left repeats run to run
+(two lead-3 runs differ by 0.62 mm RMS) and is not the Desk payload. The report's
+"repeatability over N runs" mixes every run of the episode: compare runs with the
+same lead (the Lead column) and the same robot model only.
+
+Correcting each command by the error a previous run of the same trajectory measured
+(iterative learning) would take this to about 1 mm RMS, but it is not implemented:
+none of the current uses need the arm's path that close to the recording, and it
+costs a second run per trajectory. See W3f in `docs/box_umi_laser_tracker_gt_roadmap.html`
+for the trade-off and when to build it.

@@ -124,20 +124,28 @@ function validIpv4(value: string): boolean {
   return parts.length === 4 && parts.every((part) => /^\d+$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
 }
 
+// Gateway: REAL_REPLAY_MAX_COMMAND_LEAD_FRAMES / DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES.
+const MAX_COMMAND_LEAD_FRAMES = 10;
+const DEFAULT_COMMAND_LEAD_FRAMES = 3;
+
 export function RealRobotReplayPanel({
   status,
   busy,
+  commandLeadAvailable = true,
   onStart,
   onExecute
 }: {
   status: ReplayStatus;
   busy: boolean;
+  // Thor cube replay only; the workstation replay has no such setting.
+  commandLeadAvailable?: boolean;
   onStart: (
     mode: RealCubeMode,
     robotIp: string,
     endEffectorMode: RealEndEffectorMode,
     overrideMujocoFailure: boolean,
-    recordTracker: boolean
+    recordTracker: boolean,
+    commandLeadFrames: number
   ) => void;
   onExecute: () => void;
 }) {
@@ -152,6 +160,7 @@ export function RealRobotReplayPanel({
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [recordTracker, setRecordTracker] = useState(false);
+  const [commandLeadFrames, setCommandLeadFrames] = useState(status.realCommandLeadFrames ?? DEFAULT_COMMAND_LEAD_FRAMES);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
@@ -236,7 +245,14 @@ export function RealRobotReplayPanel({
     setOverridePromptOpen(false);
     setMonitorRequested(true);
     setCameraStatus({ available: null, running: true, error: "Connecting to RealSense…" });
-    onStart(mode, robotIp.trim(), endEffectorMode, overrideMujocoFailure, recordTracker);
+    onStart(
+      mode,
+      robotIp.trim(),
+      endEffectorMode,
+      overrideMujocoFailure,
+      recordTracker,
+      commandLeadAvailable ? commandLeadFrames : 0
+    );
   };
 
   return (
@@ -264,6 +280,28 @@ export function RealRobotReplayPanel({
             />
             <span>Record the laser tracker while the trajectory executes (real-robot GT)</span>
           </label>
+          {commandLeadAvailable ? (
+            <label className="real-robot-ip-field">
+              <span>Command lead (frames)</span>
+              <select
+                disabled={disabled}
+                onChange={(event) => setCommandLeadFrames(Number(event.target.value))}
+                value={commandLeadFrames}
+              >
+                {Array.from({ length: MAX_COMMAND_LEAD_FRAMES + 1 }, (_, frames) => (
+                  <option key={frames} value={frames}>
+                    {frames === 0 ? "0 · off" : `${frames} · ${frames * 50} ms at 20 fps`}
+                    {frames === DEFAULT_COMMAND_LEAD_FRAMES ? " (default)" : ""}
+                  </option>
+                ))}
+              </select>
+              <small className="panel-note">
+                Sends each pose this many frames early, on the same path. The arm trails the target by about
+                155 ms; on 2026-10-12 a lead of 3 took laser vs desired from 5.3 to 2.7 mm with no lag left.
+                The laser analysis lists each run&apos;s lead.
+              </small>
+            </label>
+          ) : null}
           <button className="danger real-robot-run" disabled={disabled} onClick={() => setOverridePromptOpen(true)} type="button">
             {phase === "moving_to_start"
               ? "1 · Moving to trajectory start…"
@@ -273,6 +311,9 @@ export function RealRobotReplayPanel({
           </button>
           <div className="teleop-config-grid real-robot-phase">
             <div><span>Phase</span><strong>{REAL_REPLAY_PHASE_LABELS[phase] ?? phase}</strong></div>
+            {active && commandLeadAvailable ? (
+              <div><span>Command lead</span><strong>{status.realCommandLeadFrames ?? DEFAULT_COMMAND_LEAD_FRAMES} frames</strong></div>
+            ) : null}
             {status.realRecordTracker ? (
               <div>
                 <span>Laser tracker</span>
@@ -1007,7 +1048,8 @@ export function EpisodeReplayPage({
     robotIp: string,
     endEffectorMode: RealEndEffectorMode,
     overrideMujocoFailure: boolean,
-    recordTracker: boolean
+    recordTracker: boolean,
+    commandLeadFrames: number
   ) => void;
   onExecuteRealReplay: () => void;
   onAnalyzeLaser: (cube: RealCubeMode) => void;
@@ -1073,7 +1115,13 @@ export function EpisodeReplayPage({
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}
         cubeSelection={cubeSelection}
       />
-      <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} onExecute={onExecuteRealReplay} />
+      <RealRobotReplayPanel
+        status={snapshot.replay}
+        busy={busy}
+        commandLeadAvailable={cubeSelection}
+        onStart={onRealReplay}
+        onExecute={onExecuteRealReplay}
+      />
       {cubeSelection ? (
         <LaserReplayAnalysisPanel status={snapshot.replay} busy={busy} onAnalyze={onAnalyzeLaser} />
       ) : null}

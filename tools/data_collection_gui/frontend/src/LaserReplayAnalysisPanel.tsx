@@ -3,6 +3,7 @@ import { api } from "./apiClient";
 import {
   beamLossSummary,
   errorBudgetSummary,
+  leadLabel,
   mm,
   niceCeiling,
   polylineSegments,
@@ -154,6 +155,7 @@ export function LaserReplayAnalysisPanel({
               <thead>
                 <tr>
                   <th>Run</th>
+                  <th>Lead</th>
                   <th>Beam frames used</th>
                   <th>Lost at</th>
                   <th>Laser vs desired RMS / p95 / max</th>
@@ -174,6 +176,7 @@ export function LaserReplayAnalysisPanel({
                       title={run.run}
                     >
                       <td>{runLabel(run.run)}</td>
+                      <td>{leadLabel(run.command_lead_frames)}</td>
                       <td>{run.used_frames} / {run.frames}</td>
                       <td>{run.first_loss_frame != null && run.first_loss_frame >= 0 ? run.first_loss_frame : "—"}</td>
                       <td>
@@ -188,6 +191,7 @@ export function LaserReplayAnalysisPanel({
                   ) : (
                     <tr key={run.run} title={run.run}>
                       <td>{runLabel(run.run)}</td>
+                      <td>{leadLabel(run.command_lead_frames)}</td>
                       <td colSpan={8} className="laser-analysis-error">{run.error}</td>
                     </tr>
                   )

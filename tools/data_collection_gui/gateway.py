@@ -242,6 +242,9 @@ class ReplayStatus:
     realCubeMode: str = "right"
     realRobotIp: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
+    # Frames each pose command runs ahead of the trajectory (replay.pose_command_lead_frames) in
+    # the last real replay started; the panel starts from it.
+    realCommandLeadFrames: int = 3  # DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES (defined further down)
     mujocoOverrideAccepted: bool = False
     realReplayLog: list[str] = field(default_factory=list)
     # Two-step real replay (Thor): "moving_to_start" -> "at_start" (arm held at frame 0,
@@ -10975,6 +10978,28 @@ def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
 
 # The robot frame each real-replay end-effector mode drives (corenetic goes through the
 # replay yaml's robot config, whose target_frame_name is corenetic_gripper_ee).
+# Upper bound for replay.pose_command_lead_frames from the panel. The 10-12 trace lags the
+# target by ~155 ms = 3 frames at the Thor config's 20 fps; 10 frames leaves room to over-shoot
+# while bounding how far ahead of the validated path a command can run.
+REAL_REPLAY_MAX_COMMAND_LEAD_FRAMES = 10
+# Thor default: 2026-10-12 two runs at lead 3 measured 2.80 / 2.68 mm laser vs desired against
+# 5.31 / 5.40 at lead 0, no lag left (continuous best shift +5 ms), offset and FK accuracy unchanged.
+# In frames, so it assumes the Thor config's 20 fps replay.
+DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES = 3
+
+
+def _real_replay_command_lead_frames(value: Any) -> int:
+    try:
+        frames = int(str(value).strip())
+    except ValueError:
+        raise ValueError(f"Command lead must be a whole number of frames, got {value!r}") from None
+    if not 0 <= frames <= REAL_REPLAY_MAX_COMMAND_LEAD_FRAMES:
+        raise ValueError(
+            f"Command lead must be 0-{REAL_REPLAY_MAX_COMMAND_LEAD_FRAMES} frames, got {frames}"
+        )
+    return frames
+
+
 REAL_REPLAY_TARGET_FRAMES = {
     "corenetic_gripper_ee": "corenetic_gripper_ee",
     "pika_gripper_ee": "pika_task_tcp",
@@ -15461,6 +15486,7 @@ def _real_replay_command(
     robot_ip: str,
     end_effector_mode: str = "corenetic_gripper_ee",
     run_dir: Path | None = None,
+    command_lead_frames: int = DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES,
 ) -> list[str]:
     if state.profile == "workstation":
         return _fr3_real_replay_command(state, dataset_root, robot_ip)
@@ -15502,6 +15528,10 @@ def _real_replay_command(
         "--replay.fail_on_unreached_initial_pose=true",
         # Two steps: stop at frame 0 and stream only on "go" (Execute) over stdin.
         "--replay.hold_at_trajectory_start=true",
+        # Always explicit, so the run does not silently take whatever the YAML on this host says.
+        # The trace logs it per frame (pose_command_lead_frames) and keeps desired_* on the dataset
+        # timeline, so the laser analysis still scores against the trajectory, not the led command.
+        f"--replay.pose_command_lead_frames={_real_replay_command_lead_frames(command_lead_frames)}",
         f"--end_effector.mode={'fr3_ee' if end_effector_mode == 'fr3_ee' else 'robot_config'}",
     ]
     if run_dir is not None:
@@ -15933,11 +15963,14 @@ def _start_real_replay(
     end_effector_mode: str = "corenetic_gripper_ee",
     override_mujoco_failure: bool = False,
     record_tracker: bool = False,
+    command_lead_frames: Any = None,
 ) -> None:
     """Thor: step 1 of a real replay -- move the arm to the trajectory start and hold there.
 
     Streaming waits for ``_execute_real_replay``. With ``record_tracker`` the laser tracker
     connects now, so its ~16 s handshake overlaps the move instead of delaying Execute.
+    ``command_lead_frames`` sends each pose that many frames early, to cancel the follow lag;
+    None takes the profile default (Thor 3, workstation 0).
     """
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
@@ -15950,12 +15983,18 @@ def _start_real_replay(
     if end_effector_mode not in ("pika_gripper_ee", "corenetic_gripper_ee", "fr3_ee"):
         raise ValueError("Real replay end effector must be pika_gripper_ee, corenetic_gripper_ee, or fr3_ee")
     workstation = state.profile == "workstation"
+    if command_lead_frames is None or not str(command_lead_frames).strip():
+        command_lead_frames = 0 if workstation else DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES
+    command_lead_frames = _real_replay_command_lead_frames(command_lead_frames)
+    if workstation and command_lead_frames:
+        raise ValueError("Command lead is a Thor cube replay setting; the workstation replay has none.")
     state.replay.realReplayLog = []
     _append_real_replay_log(
         state,
         "request",
         f"{'source=recorded EE actions' if workstation else f'cube={cube_mode}'} "
-        f"episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
+        f"episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}"
+        + ("" if workstation else f" command_lead={command_lead_frames} frames"),
     )
     dataset_root = _require_mujoco_validation(
         state,
@@ -16004,6 +16043,7 @@ def _start_real_replay(
     state.replay.realCubeMode = cube_mode
     state.replay.realRobotIp = selected_ip
     state.replay.realEndEffectorMode = end_effector_mode
+    state.replay.realCommandLeadFrames = command_lead_frames
     state.replay.mujocoOverrideAccepted = bool(
         override_mujoco_failure and (state.replay.mujocoValidation or {}).get("status") == "failed"
     )
@@ -16020,7 +16060,9 @@ def _start_real_replay(
         raise RuntimeError("Laser tracker recording during real replay is a Thor feature.")
     if record_tracker:
         _check_replay_tracker_available(state)
-    command = _real_replay_command(state, dataset_root, cube_mode, selected_ip, end_effector_mode, run_dir)
+    command = _real_replay_command(
+        state, dataset_root, cube_mode, selected_ip, end_effector_mode, run_dir, command_lead_frames
+    )
     _append_real_replay_log(state, "launch", "preflight passed; moving to the trajectory start")
     try:
         process = subprocess.Popen(
@@ -16277,7 +16319,25 @@ def _laser_replay_report(dataset_root: Path, episode: int, cube_mode: str) -> di
     report["reportPath"] = str(path)
     report["modifiedAt"] = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     report["availableRuns"] = [run.name for run in _laser_replay_runs(dataset_root, episode, cube_mode)]
+    for run in report.get("runs") or []:
+        if isinstance(run, dict) and run.get("run_dir"):
+            run["command_lead_frames"] = _replay_trace_command_lead_frames(Path(run["run_dir"]))
     return report
+
+
+def _replay_trace_command_lead_frames(run_dir: Path) -> int | None:
+    """The run's replay.pose_command_lead_frames, read off its trace; None when the trace does not say."""
+    for trace in sorted((run_dir / "replay_pose_traces").glob("*.csv")):
+        try:
+            with trace.open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle), None)
+        except (OSError, csv.Error):
+            continue
+        try:
+            return int(row["pose_command_lead_frames"]) if row else None
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
 
 # The tracker's home nest sits ~158 mm from the head: lt_20261009_092828 was "ready"
 # (homed, locked) and recorded 157.7 mm for a whole Execute while the arm moved. Any
@@ -17045,6 +17105,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         in ("1", "true", "yes", "on"),
                         record_tracker=str(query.get("record_tracker", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
+                        command_lead_frames=query.get("lead_frames", [None])[0],
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return

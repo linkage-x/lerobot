@@ -12,6 +12,10 @@ export function runLabel(run: string): string {
   return match ? `${match[1]}:${match[2]}:${match[3]}Z` : run;
 }
 
+// replay.pose_command_lead_frames of a run; "—" for traces that predate the column.
+export const leadLabel = (frames: number | null | undefined) =>
+  frames == null ? "—" : frames === 0 ? "0" : `${frames} fr`;
+
 export function beamLossSummary(run: LaserReplayRun): string {
   if (run.first_loss_frame == null) return "";
   if (run.first_loss_frame < 0) return `Beam held for all ${run.frames} frames.`;

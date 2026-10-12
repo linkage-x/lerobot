@@ -1958,6 +1958,10 @@ button.danger {
   width: 100%;
 }
 
+.real-robot-ip-field select {
+  width: 100%;
+}
+
 .real-robot-run {
   min-height: 42px;
   width: 100%;

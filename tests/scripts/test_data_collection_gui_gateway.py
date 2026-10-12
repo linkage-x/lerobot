@@ -1895,6 +1895,65 @@ def test_thor_real_replay_holds_at_the_trajectory_start_and_reports_into_a_run_d
     assert run_dir.parent == dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME / "real_replay"
 
 
+def test_real_replay_passes_the_panel_command_lead_explicitly(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]}],
+    )
+    _write_planned_mujoco_start(dataset_root, "right")
+    # Explicit always, so the run never inherits a lead someone left in the YAML on Thor.
+    assert gateway.DEFAULT_REAL_REPLAY_COMMAND_LEAD_FRAMES == 3
+    assert gateway.ReplayStatus().realCommandLeadFrames == 3
+    assert "--replay.pose_command_lead_frames=3" in gateway._real_replay_command(
+        state, dataset_root, "right", "192.168.11.102"
+    )
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102", command_lead_frames=0)
+    assert "--replay.pose_command_lead_frames=0" in command
+    for bad in (-1, gateway.REAL_REPLAY_MAX_COMMAND_LEAD_FRAMES + 1, "1.5", "three", ""):
+        with pytest.raises(ValueError, match="Command lead"):
+            gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102", command_lead_frames=bad)
+
+
+def test_real_replay_rejects_a_bad_command_lead_before_anything_moves(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    with pytest.raises(ValueError, match="Command lead must be 0-10"):
+        gateway._start_real_replay(state, "right", "192.168.1.99", command_lead_frames="11")
+    assert state.replay.realReplayLog == []
+    state.profile = "workstation"
+    with pytest.raises(ValueError, match="Thor cube replay setting"):
+        gateway._start_real_replay(state, "right", "192.168.1.99", command_lead_frames=3)
+    # No lead given: the workstation takes 0, so its replay is not refused by the Thor default.
+    with pytest.raises(Exception) as excinfo:
+        gateway._start_real_replay(state, "right", "192.168.1.99")
+    assert "Command lead" not in str(excinfo.value) and "Thor cube replay setting" not in str(excinfo.value)
+
+
+def test_laser_report_shows_each_runs_command_lead_from_its_trace(tmp_path):
+    dataset_root = tmp_path / "ds"
+    runs = []
+    for name, header, row in (
+        ("20261013T010000Z_episode_000000_right", "frame_order,pose_command_lead_frames", "0,3"),
+        ("20261012T081922Z_episode_000000_right", "frame_order,pose_command_lead_frames", "0,0"),
+        ("20261001T000000Z_episode_000000_right", "frame_order", "0"),
+    ):
+        run = gateway._real_replay_root(dataset_root) / name
+        (run / "replay_pose_traces").mkdir(parents=True)
+        (run / "replay_pose_traces" / "session_000.csv").write_text(f"{header}\n{row}\n", encoding="utf-8")
+        runs.append({"run": name, "run_dir": str(run)})
+    report_path = gateway._laser_replay_report_path(dataset_root, 0, "right")
+    report_path.write_text(json.dumps({"runs": runs}), encoding="utf-8")
+
+    report = gateway._laser_replay_report(dataset_root, 0, "right")
+
+    assert [run["command_lead_frames"] for run in report["runs"]] == [3, 0, None]
+
+
 def test_real_replay_executes_only_from_the_trajectory_start(tmp_path):
     state = _held_real_replay_state(tmp_path)
     with pytest.raises(RuntimeError, match="not reached the trajectory start"):

@@ -456,14 +456,16 @@ export class DataCollectionGuiApi {
     robotIp: string,
     endEffectorMode: RealEndEffectorMode,
     overrideMujocoFailure = false,
-    recordTracker = false
+    recordTracker = false,
+    commandLeadFrames = 0
   ): Promise<GuiSnapshot> {
     const params = new URLSearchParams({
       cube: cubeMode,
       robot_ip: robotIp,
       end_effector: endEffectorMode,
       override_mujoco_failure: String(overrideMujocoFailure),
-      record_tracker: String(recordTracker)
+      record_tracker: String(recordTracker),
+      lead_frames: String(commandLeadFrames)
     });
     const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
     if (remote) return remote;

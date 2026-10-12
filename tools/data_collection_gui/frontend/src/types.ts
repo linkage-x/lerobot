@@ -239,6 +239,8 @@ export type ReplayStatus = {
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;
   realEndEffectorMode?: RealEndEffectorMode;
+  // replay.pose_command_lead_frames of the last real replay started (Thor).
+  realCommandLeadFrames?: number;
   mujocoOverrideAccepted?: boolean;
   realReplayLog?: string[];
   // Thor two-step real replay: move to the trajectory start, then Execute.
@@ -317,6 +319,8 @@ export type LaserErrorStats = { n: number; rms_mm?: number; p50_mm?: number; p95
 export type LaserReplayRun = {
   run: string;
   run_dir: string;
+  // Added by the gateway from the run's trace; null for traces that predate the column.
+  command_lead_frames?: number | null;
   error?: string;
   frames?: number;
   beam_frames?: number;
