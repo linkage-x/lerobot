@@ -49,18 +49,24 @@
     <mesh name="link7_1" content_type="model/obj" file="link7_1.obj" />
     <mesh name="link7_2" content_type="model/obj" file="link7_2.obj" />
     <mesh name="link7_3" content_type="model/obj" file="link7_3.obj" />
-    <mesh name="corenetic_base_link" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/base_link.STL" />
-    <mesh name="corenetic_link_franka_corenetic_gripper_1" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_1.STL" />
-    <mesh name="corenetic_link_franka_corenetic_gripper_2" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_2.STL" />
-    <mesh name="corenetic_link_franka_corenetic_gripper_3" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_3.STL" />
-    <mesh name="corenetic_link_lt_gripper_base" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_base.STL" />
-    <mesh name="corenetic_link_lt_gripper_drive" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_drive.STL" />
-    <mesh name="corenetic_link_lt_gripper_knuckle_left_outer" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_outer.STL" />
-    <mesh name="corenetic_link_lt_gripper_finger_left" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_left.STL" />
-    <mesh name="corenetic_link_lt_gripper_knuckle_left_inner" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_inner.STL" />
-    <mesh name="corenetic_link_lt_gripper_knuckle_right_outer" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_outer.STL" />
-    <mesh name="corenetic_link_lt_gripper_finger_right" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_right.STL" />
-    <mesh name="corenetic_link_lt_gripper_knuckle_right_inner" content_type="model/stl" file="../URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_inner.STL" />
+    <mesh name="corenetic_mount" content_type="model/stl" file="../corenetic_smr_cam/meshes/mount.STL" />
+    <mesh name="corenetic_smr_cam_base" content_type="model/stl" file="../corenetic_smr_cam/meshes/smr_cam_base.STL" />
+    <mesh name="corenetic_smr_cam_case" content_type="model/stl" file="../corenetic_smr_cam/meshes/smr_cam_case.STL" />
+    <mesh name="corenetic_smr_cam_steel_plate" content_type="model/stl" file="../corenetic_smr_cam/meshes/smr_cam_steel_plate.STL" />
+    <mesh name="corenetic_smr_cam_smr_nest" content_type="model/stl" file="../corenetic_smr_cam/meshes/smr_cam_smr_nest.STL" />
+    <mesh name="corenetic_smr_cam_camera" content_type="model/stl" file="../corenetic_smr_cam/meshes/smr_cam_camera.STL" />
+    <mesh name="corenetic_v2_base_link" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/base_link.STL" />
+    <mesh name="corenetic_v2_link_franka_corenetic_gripper_1" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_franka_corenetic_gripper_1.STL" />
+    <mesh name="corenetic_v2_link_sensor_ft" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_sensor_ft.STL" />
+    <mesh name="corenetic_v2_link_gripper_base" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_base.STL" />
+    <mesh name="corenetic_v2_link_gripper_knuckle_left_outer" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_knuckle_left_outer.STL" />
+    <mesh name="corenetic_v2_link_gripper_finger_left" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_finger_left.STL" />
+    <mesh name="corenetic_v2_link_gripper_tip_left" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_tip_left.STL" />
+    <mesh name="corenetic_v2_link_gripper_knuckle_left_inner" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_knuckle_left_inner.STL" />
+    <mesh name="corenetic_v2_link_gripper_knuckle_right_outer" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_knuckle_right_outer.STL" />
+    <mesh name="corenetic_v2_link_gripper_finger_right" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_finger_right.STL" />
+    <mesh name="corenetic_v2_link_gripper_tip_right" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_tip_right.STL" />
+    <mesh name="corenetic_v2_link_gripper_knuckle_right_inner" content_type="model/stl" file="../gripper_w_v2_franka_description/meshes/link_gripper_knuckle_right_inner.STL" />
   </asset>
   <worldbody>
     <body name="base" childclass="fr3">
@@ -118,76 +124,109 @@
                       <geom type="mesh" material="black" class="visual" mesh="link7_3" />
                       <body name="fr3_link8" pos="0 0 0.107">
                         <body name="base_link" quat="0.923879532511287 0 0 -0.38268343236509">
-                          <inertial pos="-0.00016355520799417 8.86199750735339E-17 0.00499219128724902" mass="0.0280919165597075" diaginertia="7.71480419171194E-06 7.59918824294922E-06 1.48469947210806E-05" />
-                          <geom name="base_link_visual" type="mesh" mesh="corenetic_base_link" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
-                          <geom name="base_link_collision" type="mesh" mesh="corenetic_base_link" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                          <inertial pos="8.791992e-05 0 0.00499219129" mass="0.07584817471" fullinertia="2.082997132e-05 2.051780826e-05 4.008688575e-05 0 -2.161251706e-08 0" />
+                          <geom name="base_link_visual" type="mesh" mesh="corenetic_v2_base_link" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
+                          <geom name="base_link_collision" type="mesh" mesh="corenetic_v2_base_link" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
                           <body name="link_franka_corenetic_gripper_1" pos="0 0 0">
-                            <inertial pos="0.0161338715170421 0.0125880277735246 0.0194975860884886" mass="0.0703171182690708" diaginertia="4.59868816471546E-05 2.23221112183621E-05 4.71431067802039E-05" />
-                            <geom name="link_franka_corenetic_gripper_1_visual" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_1" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
-                            <geom name="link_franka_corenetic_gripper_1_collision" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_1" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                            <inertial pos="0.01613387152 0.01258802777 0.01949758609" mass="0.07031711827" fullinertia="4.598688165e-05 2.232211122e-05 4.714310678e-05 5.552927581e-08 1.26619747e-07 1.801346059e-06" />
+                            <geom name="link_franka_corenetic_gripper_1_visual" type="mesh" mesh="corenetic_v2_link_franka_corenetic_gripper_1" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
+                            <geom name="link_franka_corenetic_gripper_1_collision" type="mesh" mesh="corenetic_v2_link_franka_corenetic_gripper_1" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
                           </body>
-                          <body name="link_franka_corenetic_gripper_2" pos="0 0 0.02225" quat="0.707106781186539 0 0 -0.707106781186556">
-                            <inertial pos="-2.22998821206779E-07 0.000242859796049694 -0.00179806963458283" mass="0.0525656216796275" diaginertia="6.19283398828473E-06 5.88633887296662E-06 8.28323273216034E-06" />
-                            <geom name="link_franka_corenetic_gripper_2_visual" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_2" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                            <geom name="link_franka_corenetic_gripper_2_collision" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_2" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                          </body>
-                          <body name="link_franka_corenetic_gripper_3" pos="0.0424995051043118 0 0.123603823164162" quat="0.696395976460645 0.122794019231228 -0.122782789693918 -0.69633229091106">
-                            <inertial pos="5.77614836709886E-06 -0.0149927548599076 -0.0628131545384932" mass="0.164242231833142" diaginertia="6.30244354225942E-05 6.19665148020467E-05 7.18689033492371E-05" />
-                            <geom name="link_franka_corenetic_gripper_3_visual" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_3" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
-                            <geom name="link_franka_corenetic_gripper_3_collision" type="mesh" mesh="corenetic_link_franka_corenetic_gripper_3" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                          </body>
-                          <body name="link_lt_gripper_base" pos="0 0 0.036" quat="1.61554457274806e-15 -0.999999998957299 -4.56662058985911e-05 7.37757911743903e-20">
-                            <inertial pos="-0.000980332060006024 -0.000165460803064683 -0.0380637297528955" mass="0.148362683973387" diaginertia="0.000108524117304559 8.91872435110639E-05 7.54521906672916E-05" />
-                            <geom name="link_lt_gripper_base_visual" type="mesh" mesh="corenetic_link_lt_gripper_base" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                            <geom name="link_lt_gripper_base_collision" type="mesh" mesh="corenetic_link_lt_gripper_base" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                            <body name="link_lt_gripper_drive" pos="-0.00079195 0 -0.031">
-                              <inertial pos="0 0 0" mass="0.02" diaginertia="1e-5 1e-5 1e-5" />
-                              <geom name="link_lt_gripper_drive_visual" type="mesh" mesh="corenetic_link_lt_gripper_drive" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                              <geom name="link_lt_gripper_drive_collision" type="mesh" mesh="corenetic_link_lt_gripper_drive" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                              <joint name="joint_lt_gripper_drive" type="hinge" axis="0 0 -1" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                            </body>
-                            <body name="link_lt_gripper_knuckle_left_outer" pos="-0.00079195 0.018992 -0.05">
-                              <inertial pos="2.86107331813327E-05 -0.0235652743366583 -0.037949799327442" mass="0.0542841793588412" diaginertia="2.49252404499279E-05 2.61457716782546E-05 3.63669814336204E-06" />
-                              <geom name="link_lt_gripper_knuckle_left_outer_visual" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_left_outer" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                              <geom name="link_lt_gripper_knuckle_left_outer_collision" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_left_outer" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                              <joint name="joint_lt_gripper_knuckle_left_outer" type="hinge" axis="1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                              <body name="link_lt_gripper_finger_left" pos="0 0.0043547 -0.04981">
-                                <inertial pos="2.56595310106296E-05 -0.0254574097735164 -0.0218146948643816" mass="0.0864607010067869" diaginertia="3.23998364747912E-05 3.47600641615956E-05 5.51801591712787E-06" />
-                                <geom name="link_lt_gripper_finger_left_visual" type="mesh" mesh="corenetic_link_lt_gripper_finger_left" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                                <geom name="link_lt_gripper_finger_left_collision" type="mesh" mesh="corenetic_link_lt_gripper_finger_left" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                                <joint name="joint_lt_gripper_finger_left" type="hinge" axis="-1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
+                          <body name="link_sensor_ft" pos="0 0 0.02225" quat="0.707106781186539 0 0 -0.707106781186556">
+                            <inertial pos="-2.229988212e-07 0.000242859796 -0.001798069635" mass="0.05256562168" fullinertia="6.192833988e-06 5.886338873e-06 8.283232732e-06 2.424850363e-11 4.857936949e-11 6.97047698e-08" />
+                            <geom name="link_sensor_ft_visual" type="mesh" mesh="corenetic_v2_link_sensor_ft" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+                            <geom name="link_sensor_ft_collision" type="mesh" mesh="corenetic_v2_link_sensor_ft" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                            <body name="link_gripper_base" pos="0 0 0.01375" quat="1.14236252389042e-15 0.707106781186546 0.707106781186549 1.14236252389042e-15">
+                              <inertial pos="1.164266e-05 4.68227e-06 -0.05046841752" mass="0.4343705289" fullinertia="0.0005913821083 0.000471780368 0.0002144347157 6.637465459e-08 -4.697549012e-07 1.302441364e-08" />
+                              <geom name="link_gripper_base_visual" type="mesh" mesh="corenetic_v2_link_gripper_base" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
+                              <geom name="link_gripper_base_collision" type="mesh" mesh="corenetic_v2_link_gripper_base" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <body name="link_gripper_drive" pos="0 0 0">
+                                <inertial pos="0 0 0" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                <joint name="joint_gripper_drive" type="hinge" axis="0 0 1" range="0 1.5708" limited="true" damping="0.05" frictionloss="0.01" />
+                              </body>
+                              <body name="link_gripper_knuckle_left_outer" pos="0 0.019 -0.0525">
+                                <inertial pos="6.08448e-05 -0.0286653 -0.0405486" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                <geom name="link_gripper_knuckle_left_outer_visual" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_left_outer" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                <geom name="link_gripper_knuckle_left_outer_collision" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_left_outer" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                <joint name="joint_gripper_knuckle_left_outer" type="hinge" axis="1 0 0" range="0 1.4434" limited="true" damping="0.05" frictionloss="0.01" />
+                                <body name="link_gripper_finger_left" pos="0 0.005475 -0.049699">
+                                  <inertial pos="1.21423e-05 -0.0339877 -3.05901e-05" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                  <geom name="link_gripper_finger_left_visual" type="mesh" mesh="corenetic_v2_link_gripper_finger_left" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                  <geom name="link_gripper_finger_left_collision" type="mesh" mesh="corenetic_v2_link_gripper_finger_left" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                  <joint name="joint_gripper_finger_left" type="hinge" axis="-1 0 0" range="0 1.44339" limited="true" damping="0.05" frictionloss="0.01" />
+                                  <body name="link_gripper_tip_left" pos="0 -0.012975 -0.028789">
+                                    <geom name="link_gripper_tip_left_visual" type="mesh" mesh="corenetic_v2_link_gripper_tip_left" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
+                                    <geom name="link_gripper_tip_left_collision" type="mesh" mesh="corenetic_v2_link_gripper_tip_left" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                    <body name="link_gripper_contact_left" pos="0 -0.0115 -0.005">
+                                      <site name="link_gripper_contact_left_site" type="sphere" size="0.002" rgba="1 0.5 0 1" />
+                                    </body>
+                                  </body>
+                                </body>
+                              </body>
+                              <body name="link_gripper_knuckle_left_inner" pos="0 0.0074298 -0.066289">
+                                <inertial pos="5.81328e-05 0.00345489 -0.019586" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                <geom name="link_gripper_knuckle_left_inner_visual" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_left_inner" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                <geom name="link_gripper_knuckle_left_inner_collision" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_left_inner" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                <joint name="joint_gripper_knuckle_left_inner" type="hinge" axis="1 0 0" range="0 1.4434" limited="true" damping="0.05" frictionloss="0.01" />
+                              </body>
+                              <body name="link_gripper_knuckle_right_outer" pos="0 -0.019 -0.0525">
+                                <inertial pos="6.09154e-05 0.0286653 -0.0405486" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                <geom name="link_gripper_knuckle_right_outer_visual" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_right_outer" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                <geom name="link_gripper_knuckle_right_outer_collision" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_right_outer" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                <joint name="joint_gripper_knuckle_right_outer" type="hinge" axis="-1 0 0" range="0 1.44339" limited="true" damping="0.05" frictionloss="0.01" />
+                                <body name="link_gripper_finger_right" pos="0 -0.005475 -0.049699">
+                                  <inertial pos="1.21718e-05 0.0339877 -3.05901e-05" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                  <geom name="link_gripper_finger_right_visual" type="mesh" mesh="corenetic_v2_link_gripper_finger_right" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                  <geom name="link_gripper_finger_right_collision" type="mesh" mesh="corenetic_v2_link_gripper_finger_right" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                  <joint name="joint_gripper_finger_right" type="hinge" axis="1 0 0" range="0 1.44339" limited="true" damping="0.05" frictionloss="0.01" />
+                                  <body name="link_gripper_tip_right" pos="0 0.012975 -0.028789">
+                                    <geom name="link_gripper_tip_right_visual" type="mesh" mesh="corenetic_v2_link_gripper_tip_right" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" />
+                                    <geom name="link_gripper_tip_right_collision" type="mesh" mesh="corenetic_v2_link_gripper_tip_right" rgba="1 1 1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                    <body name="link_gripper_contact_right" pos="0 0.0115 -0.005">
+                                      <site name="link_gripper_contact_right_site" type="sphere" size="0.002" rgba="1 0.5 0 1" />
+                                    </body>
+                                  </body>
+                                </body>
+                              </body>
+                              <body name="link_gripper_knuckle_right_inner" pos="0 -0.0074298 -0.066289">
+                                <inertial pos="5.81715e-05 -0.00345489 -0.019586" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
+                                <geom name="link_gripper_knuckle_right_inner_visual" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_right_inner" contype="0" conaffinity="0" group="1" density="0" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+                                <geom name="link_gripper_knuckle_right_inner_collision" type="mesh" mesh="corenetic_v2_link_gripper_knuckle_right_inner" rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                <joint name="joint_gripper_knuckle_right_inner" type="hinge" axis="-1 0 0" range="0 1.4434" limited="true" damping="0.05" frictionloss="0.01" />
+                              </body>
+                              <body name="link_gripper_tcp" pos="0 0 -0.13599" quat="-3.67320510334657e-06 0.999999999993254 0 -0">
+                                <body name="corenetic_gripper_ee" pos="0 0 0">
+                                  <site name="corenetic_gripper_ee_site" type="sphere" size="0.004" rgba="1 1 0 1" />
+                                  <geom type="capsule" fromto="0 0 0 0.03 0 0" size="0.002" rgba="1 0 0 1" contype="0" conaffinity="0" />
+                                  <geom type="capsule" fromto="0 0 0 0 0.03 0" size="0.002" rgba="0 1 0 1" contype="0" conaffinity="0" />
+                                  <geom type="capsule" fromto="0 0 0 0 0 0.03" size="0.002" rgba="0 0 1 1" contype="0" conaffinity="0" />
+                                </body>
                               </body>
                             </body>
-                            <body name="link_lt_gripper_knuckle_left_inner" pos="-0.00079195 0.0074222 -0.06378">
-                              <inertial pos="4.40656810463356E-05 0.00379719277771037 -0.0284917519280255" mass="0.0231471998062083" diaginertia="4.33507368102839E-06 8.89789850261164E-06 4.92665747896934E-06" />
-                              <geom name="link_lt_gripper_knuckle_left_inner_visual" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_left_inner" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                              <geom name="link_lt_gripper_knuckle_left_inner_collision" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_left_inner" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                              <joint name="joint_lt_gripper_knuckle_left_inner" type="hinge" axis="1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                            </body>
-                            <body name="link_lt_gripper_knuckle_right_outer" pos="-0.00079195 -0.019008 -0.05">
-                              <inertial pos="2.81848398361E-05 0.0235652741269535 -0.0379497987923611" mass="0.0542841781980837" diaginertia="2.49252400290207E-05 2.61457712806372E-05 3.63669809325367E-06" />
-                              <geom name="link_lt_gripper_knuckle_right_outer_visual" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_right_outer" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                              <geom name="link_lt_gripper_knuckle_right_outer_collision" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_right_outer" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                              <joint name="joint_lt_gripper_knuckle_right_outer" type="hinge" axis="-1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                              <body name="link_lt_gripper_finger_right" pos="0 -0.0043547 -0.04981">
-                                <inertial pos="1.17830297459924E-05 0.0254574075050252 -0.0218146965213329" mass="0.0864606849680532" diaginertia="3.23998306352358E-05 3.47600582303323E-05 5.51801482447027E-06" />
-                                <geom name="link_lt_gripper_finger_right_visual" type="mesh" mesh="corenetic_link_lt_gripper_finger_right" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                                <geom name="link_lt_gripper_finger_right_collision" type="mesh" mesh="corenetic_link_lt_gripper_finger_right" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                                <joint name="joint_lt_gripper_finger_right" type="hinge" axis="1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                              </body>
-                            </body>
-                            <body name="link_lt_gripper_knuckle_right_inner" pos="-0.00079195 -0.0074378 -0.06378">
-                              <inertial pos="4.43116565245756E-05 -0.00379719277771036 -0.0284917519280255" mass="0.0231471998062083" diaginertia="4.33507368102844E-06 8.89789850261162E-06 4.92665747896941E-06" />
-                              <geom name="link_lt_gripper_knuckle_right_inner_visual" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_right_inner" contype="0" conaffinity="0" group="1" density="0" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
-                              <geom name="link_lt_gripper_knuckle_right_inner_collision" type="mesh" mesh="corenetic_link_lt_gripper_knuckle_right_inner" rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
-                              <joint name="joint_lt_gripper_knuckle_right_inner" type="hinge" axis="-1 0 0" range="0 1.44862" limited="true" damping="0.05" frictionloss="0.01" />
-                            </body>
-                            <body name="link_lt_gripper_tcp" pos="0 0 -0.155">
-                              <body name="corenetic_gripper_ee" pos="0 0 0" quat="6.12323399573677e-17 1 0 0">
-                                <site name="corenetic_gripper_ee_site" type="sphere" size="0.004" rgba="1 1 0 1" />
-                                <geom type="capsule" fromto="0 0 0 0.03 0 0" size="0.002" rgba="1 0 0 1" contype="0" conaffinity="0" />
-                                <geom type="capsule" fromto="0 0 0 0 0.03 0" size="0.002" rgba="0 1 0 1" contype="0" conaffinity="0" />
-                                <geom type="capsule" fromto="0 0 0 0 0 0.03" size="0.002" rgba="0 0 1 1" contype="0" conaffinity="0" />
+                          </body>
+                          <!-- SMR/camera adaptor; replaces the old link_franka_corenetic_gripper_3 mount (see the URDF) -->
+                          <body name="link_corenetic_mount" pos="0 0 0">
+                            <inertial pos="0.02889 -1e-06 0.034398" mass="0.046529" fullinertia="1.00699e-05 4.01478e-05 4.98084e-05 4.66939e-10 -1.247e-06 8.73376e-11" />
+                            <geom name="mount_visual" type="mesh" mesh="corenetic_mount" contype="0" conaffinity="0" group="1" density="0" rgba="0.15 0.15 0.15 1" />
+                            <geom name="mount_collision" type="mesh" mesh="corenetic_mount" rgba="0.15 0.15 0.15 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                            <body name="link_corenetic_smr_cam" pos="0 0 0">
+                              <inertial pos="0.096006 -0.000614 0.064792" mass="0.1871" fullinertia="8.84127e-05 0.000331754 0.000295959 3.42549e-06 9.19606e-05 -1.32722e-06" />
+                              <geom name="smr_cam_base_visual" type="mesh" mesh="corenetic_smr_cam_base" contype="0" conaffinity="0" group="1" density="0" rgba="0.95 0.95 0.9 1" />
+                              <geom name="smr_cam_base_collision" type="mesh" mesh="corenetic_smr_cam_base" rgba="0.95 0.95 0.9 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <geom name="smr_cam_case_visual" type="mesh" mesh="corenetic_smr_cam_case" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" />
+                              <geom name="smr_cam_case_collision" type="mesh" mesh="corenetic_smr_cam_case" rgba="0.1 0.1 0.1 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <geom name="smr_cam_steel_plate_visual" type="mesh" mesh="corenetic_smr_cam_steel_plate" contype="0" conaffinity="0" group="1" density="0" rgba="0.6 0.6 0.65 1" />
+                              <geom name="smr_cam_steel_plate_collision" type="mesh" mesh="corenetic_smr_cam_steel_plate" rgba="0.6 0.6 0.65 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <geom name="smr_cam_smr_nest_visual" type="mesh" mesh="corenetic_smr_cam_smr_nest" contype="0" conaffinity="0" group="1" density="0" rgba="0.3 0.3 0.3 1" />
+                              <geom name="smr_cam_smr_nest_collision" type="mesh" mesh="corenetic_smr_cam_smr_nest" rgba="0.3 0.3 0.3 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <geom name="smr_cam_camera_visual" type="mesh" mesh="corenetic_smr_cam_camera" contype="0" conaffinity="0" group="1" density="0" rgba="0.15 0.15 0.2 1" />
+                              <geom name="smr_cam_camera_collision" type="mesh" mesh="corenetic_smr_cam_camera" rgba="0.15 0.15 0.2 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                              <!-- 1.5" SMR at the CAD ball centre (nominal: a laser-tracker fit differs by 4.15 mm) -->
+                              <body name="link_corenetic_smr" pos="0.070201 -0.000249 0.103891">
+                                <inertial pos="0 0 0" mass="0.14" fullinertia="2.03225e-05 2.03225e-05 2.03225e-05 0 0 0" />
+                                <geom name="smr_visual" type="sphere" size="0.01905" contype="0" conaffinity="0" group="1" density="0" rgba="0.8 0.8 0.82 1" />
+                                <geom name="smr_collision" type="sphere" size="0.01905" rgba="0.8 0.8 0.82 1" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001" />
+                                <site name="corenetic_smr_site" type="sphere" size="0.003" rgba="1 0 1 1" />
                               </body>
                             </body>
                           </body>
@@ -204,13 +243,44 @@
     </body>
   </worldbody>
   <equality>
-    <joint name="corenetic_mimic_knuckle_left_outer" joint1="joint_lt_gripper_knuckle_left_outer" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
-    <joint name="corenetic_mimic_finger_left" joint1="joint_lt_gripper_finger_left" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
-    <joint name="corenetic_mimic_knuckle_left_inner" joint1="joint_lt_gripper_knuckle_left_inner" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
-    <joint name="corenetic_mimic_knuckle_right_outer" joint1="joint_lt_gripper_knuckle_right_outer" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
-    <joint name="corenetic_mimic_finger_right" joint1="joint_lt_gripper_finger_right" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
-    <joint name="corenetic_mimic_knuckle_right_inner" joint1="joint_lt_gripper_knuckle_right_inner" joint2="joint_lt_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_knuckle_left_outer" joint1="joint_gripper_knuckle_left_outer" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_finger_left" joint1="joint_gripper_finger_left" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_knuckle_left_inner" joint1="joint_gripper_knuckle_left_inner" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_knuckle_right_outer" joint1="joint_gripper_knuckle_right_outer" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_finger_right" joint1="joint_gripper_finger_right" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
+    <joint name="corenetic_mimic_knuckle_right_inner" joint1="joint_gripper_knuckle_right_inner" joint2="joint_gripper_drive" polycoef="0 1 0 0 0" solref="0.004 1" solimp="0.95 0.99 0.001" />
   </equality>
+  <contact>
+    <exclude body1="link_gripper_base" body2="link_gripper_drive" />
+    <exclude body1="link_gripper_base" body2="link_gripper_knuckle_left_outer" />
+    <exclude body1="link_gripper_base" body2="link_gripper_knuckle_left_inner" />
+    <exclude body1="link_gripper_base" body2="link_gripper_finger_left" />
+    <exclude body1="link_gripper_base" body2="link_gripper_tip_left" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_knuckle_left_outer" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_knuckle_left_inner" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_finger_left" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_tip_left" />
+    <exclude body1="link_gripper_knuckle_left_outer" body2="link_gripper_knuckle_left_inner" />
+    <exclude body1="link_gripper_knuckle_left_outer" body2="link_gripper_finger_left" />
+    <exclude body1="link_gripper_knuckle_left_outer" body2="link_gripper_tip_left" />
+    <exclude body1="link_gripper_knuckle_left_inner" body2="link_gripper_finger_left" />
+    <exclude body1="link_gripper_knuckle_left_inner" body2="link_gripper_tip_left" />
+    <exclude body1="link_gripper_finger_left" body2="link_gripper_tip_left" />
+    <exclude body1="link_gripper_base" body2="link_gripper_knuckle_right_outer" />
+    <exclude body1="link_gripper_base" body2="link_gripper_knuckle_right_inner" />
+    <exclude body1="link_gripper_base" body2="link_gripper_finger_right" />
+    <exclude body1="link_gripper_base" body2="link_gripper_tip_right" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_knuckle_right_outer" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_knuckle_right_inner" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_finger_right" />
+    <exclude body1="link_gripper_drive" body2="link_gripper_tip_right" />
+    <exclude body1="link_gripper_knuckle_right_outer" body2="link_gripper_knuckle_right_inner" />
+    <exclude body1="link_gripper_knuckle_right_outer" body2="link_gripper_finger_right" />
+    <exclude body1="link_gripper_knuckle_right_outer" body2="link_gripper_tip_right" />
+    <exclude body1="link_gripper_knuckle_right_inner" body2="link_gripper_finger_right" />
+    <exclude body1="link_gripper_knuckle_right_inner" body2="link_gripper_tip_right" />
+    <exclude body1="link_gripper_finger_right" body2="link_gripper_tip_right" />
+  </contact>
   <actuator>
     <position class="fr3" name="fr3_actuator1" joint="fr3_joint1" kp="5000" dampratio="1" />
     <position class="fr3" name="fr3_actuator2" joint="fr3_joint2" kp="5000" dampratio="1" />
@@ -219,7 +289,7 @@
     <position class="fr3" name="fr3_actuator5" joint="fr3_joint5" kp="5000" dampratio="1" />
     <position class="fr3" name="fr3_actuator6" joint="fr3_joint6" kp="5000" dampratio="1" />
     <position class="fr3" name="fr3_actuator7" joint="fr3_joint7" kp="5000" dampratio="1" />
-    <general name="corenetic_gripper" joint="joint_lt_gripper_drive" ctrllimited="true" ctrlrange="0 1" forcelimited="true" forcerange="-250 250" gainprm="1448.62 0 0" biastype="affine" biasprm="0 -1000 -30" />
+    <general name="corenetic_gripper" joint="joint_gripper_drive" ctrllimited="true" ctrlrange="0 1" forcelimited="true" forcerange="-250 250" gainprm="1443.39 0 0" biastype="affine" biasprm="0 -1000 -30" />
   </actuator>
   <keyframe>
     <key name="home" qpos="0 -0.785 0 -2.355 0 1.57079 0.785 0 0 0 0 0 0 0" ctrl="0 -0.785 0 -2.355 0 1.57079 0.785 0" />
