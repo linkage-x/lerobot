@@ -45,16 +45,37 @@ The validation record contains the selected cube mode. A pass for `left` cannot
 unlock real replay of `right`, and a `both` result cannot unlock either
 single-arm hardware action.
 
+Validations are stored in `meta/gui_replay_validations.json`. Selecting a
+dataset or episode restores the newest one for it. One for the current cube mode
+wins; if there is none, the gateway switches to the stored run's cube. A
+restarted gateway is back at `left`, and before this rule it silently dropped a
+passed `right` run, which left Move to trajectory start greyed out.
+
+A stored validation is only restored for the robot model it ran on: it records a
+digest of `fr3_corenetic_gripper.urdf` and `.xml`. MuJoCo plans the start joints
+for the model's TCP, so after any model change (2026-10-12: the TCP moved from
+191 to 172 mm below the flange) run MuJoCo again.
+
 ## Single-cube hardware replay
 
 The Real Robot Replay panel only permits `left` or `right`:
 
-1. Run and pass MuJoCo for the same dataset, episode, FPS, thresholds, and cube.
+1. Run and pass MuJoCo for the same dataset, episode, FPS, thresholds, cube, and
+   robot model.
 2. Select that cube in the hardware panel.
 3. Enter the FR3 IPv4 address.
 4. Keep the workspace clear and an operator at the robot.
 5. Click `Run real-robot replay`, verify the dataset/episode/cube/IP confirmation,
    and continue only after reviewing the selected trajectory.
+
+Check the end-effector load in Franka Desk before replaying. The robot
+compensates gravity with the Desk load, and the replay controller is a soft joint
+impedance (`replay_cube_pose_in_robot_base.thor.yaml`: stiffness
+[300, 300, 300, 300, 120, 80, 30], half the panda_py default). A wrong load
+shows up as a constant offset: on 2026-10-10 a load 0.36 kg too light dropped the
+TCP by 5.7 mm. Use **Corenetic v2.0 BOX + cam + SMR** (1.1108 kg) while the
+SMR sits on the gripper, and **Corenetic v2.0 BOX + cam** (0.9755 kg) otherwise
+(see `gripper_w_v2_franka_description/README.md`).
 
 The gateway re-runs hardware preflight against the exact IP entered in the
 panel, launches the noninteractive selected episode from
@@ -116,12 +137,28 @@ TCP frame together (Gauss–Newton, 9 parameters). The SMR offset is reported wi
 its formal σ and must agree across runs if the SMR was not reseated. Run-to-run
 repeatability compares the laser points of all analysed runs frame by frame.
 
+Only compare runs made with the same robot model. The SMR offset is expressed in
+`corenetic_gripper_ee`, and the desired path drives that frame, so a TCP change
+moves both. After the 2026-10-12 URDF change the SMR z moved by 19.2 mm. Mixing
+those runs with the 10-10 ones gave a meaningless "repeatability" of 18 mm.
+
+Laser vs FK grows with the orientation range the fit has to cover: one rigid
+registration cannot absorb the FR3's nominal kinematic error over a wider range.
+On the same run, the full trajectory (27°) gave 0.51 mm and its first half (18°)
+gave 0.25 mm.
+
 The beam-loss line reads the line of sight in the gripper frame. A loss at the
 edge of a small swing points at the SMR (aperture turned away from the tracker,
 or something on the gripper clipping the beam): face the SMR at the tracker at
 the trajectory start. A loss well inside the directions already seen points at
 something in the scene crossing the beam.
 
-Reference (2026-10-10, 1009 ep0 right, three runs): laser vs FK 0.27 mm RMS;
-laser vs desired 7.8 mm RMS = 5.5 mm downward sag + 150 ms follow lag + 2.5–3 mm.
-See W3f in `docs/box_umi_laser_tracker_gt_roadmap.html`.
+References (1009 ep0 right; W3f in `docs/box_umi_laser_tracker_gt_roadmap.html`):
+
+| Run | Beam | Laser vs desired | Offset (x, y, z) | Laser vs FK | Rest after offset + 150 ms lag |
+|---|---|---|---|---|---|
+| 2026-10-10, three runs, Desk load 0.7496 kg | first half | 7.7–7.9 | (0.1, −1.6 ~ −2.1, −5.5) | 0.27 | 2.5–3.0 |
+| 2026-10-12, Desk load 1.1108 kg, v2 URDF | 920 / 920 | 5.31 (p95 8.9) | (0.0, 0.2, 0.7) | 0.51 (first half 0.25) | 2.6 |
+
+The 10-10 sag was the Desk load, not the controller. What is left is mostly the
+150 ms lag: by speed, 3.1 mm below 10 mm/s and 7.3 mm above 40 mm/s.

@@ -703,7 +703,28 @@ def _new_mujoco_validation(
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cubeMode": str(state.replay.mujocoCubeMode),
         "initialJoints": "" if state.profile == "workstation" else MUJOCO_PREVIEW_INITIAL_JOINTS,
+        "robotModel": _replay_robot_model_fingerprint(state),
     }
+
+
+def _replay_robot_model_fingerprint(state: GatewayState) -> str:
+    """Digest of the robot model files MuJoCo validation and real replay both load.
+
+    A stored validation from another model planned its start joints for a different TCP (10-12: the
+    gripper v2 URDF moved corenetic_gripper_ee from 191 to 172 mm below the flange), so it must not
+    unlock real replay. Empty when the files are missing.
+    """
+    paths = _fr3_pika_asset_paths(state.repo_root)
+    if state.profile != "workstation":
+        asset_root = paths[0].parent
+        paths = (asset_root / "fr3_corenetic_gripper.urdf", asset_root / "fr3_corenetic_gripper.xml")
+    digest = hashlib.sha1()
+    try:
+        for path in paths:
+            digest.update(path.read_bytes())
+    except OSError:
+        return ""
+    return digest.hexdigest()[:12]
 
 
 def _invalidate_mujoco_validation(state: GatewayState, message: str) -> None:
@@ -764,7 +785,14 @@ def _write_validation_store(dataset_root: Path, validation: dict[str, Any]) -> N
 
 
 def _load_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """Newest stored validation of this episode, preferring the current cube mode over the others.
+
+    The cube mode lives only in memory and a restarted gateway is back at the default, so matching it
+    strictly lost every validation of the other cube (10-12: a passed `right` run locked real replay).
+    """
     max_pos_mm, max_rot_deg = _mujoco_validation_thresholds(state.config)
+    robot_model = _replay_robot_model_fingerprint(state)
+    other_mode: dict[str, Any] | None = None
     for item in _read_validation_store(dataset_root).get("validations", []):
         if not isinstance(item, dict):
             continue
@@ -775,19 +803,36 @@ def _load_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, e
                 and int(item.get("fps")) == int(state.replay.fps or 30)
                 and float(item.get("maxPositionThresholdMm")) == max_pos_mm
                 and float(item.get("maxRotationThresholdDeg")) == max_rot_deg
-                and str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) == str(state.replay.mujocoCubeMode)
+                and str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) in MUJOCO_CUBE_MODES
                 # Thor: only a preview seeded where the real replay starts says anything about
                 # the joint path the arm will take; older ones (DAS seed) must be re-run.
                 and (
                     state.profile == "workstation"
                     or str(item.get("initialJoints") or "") == MUJOCO_PREVIEW_INITIAL_JOINTS
                 )
+                # validated on these model files; older entries never recorded one and must be re-run
+                and str(item.get("robotModel") or "") == robot_model
             )
         except (TypeError, ValueError, OSError):
             matches = False
-        if matches:
+        if not matches:
+            continue
+        if str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) == str(state.replay.mujocoCubeMode):
             return dict(item)
-    return None
+        if other_mode is None:
+            other_mode = dict(item)
+    return other_mode
+
+
+def _restore_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, episode: int) -> bool:
+    """Make the stored validation of this episode the active one, switching to its cube mode."""
+    persisted = _load_persisted_mujoco_validation(state, dataset_root, episode)
+    if persisted is None:
+        return False
+    state.replay.mujocoCubeMode = str(persisted.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE)
+    state.replay.mujocoValidation = persisted
+    _refresh_mujoco_validation_current(state)
+    return True
 
 
 def _refresh_mujoco_validation_current(state: GatewayState) -> None:
@@ -1588,10 +1633,7 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     state.replay.dataset = str(matched)
     state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}"
     _invalidate_mujoco_validation(state, "Dataset changed; run MuJoCo replay again before real-robot replay.")
-    persisted_validation = _load_persisted_mujoco_validation(state, matched, state.replay.episode)
-    if persisted_validation is not None:
-        state.replay.mujocoValidation = persisted_validation
-        _refresh_mujoco_validation_current(state)
+    if _restore_persisted_mujoco_validation(state, matched, state.replay.episode):
         state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}; MuJoCo validation restored"
     state.cached_recorded_datasets = _recorded_dataset_items(state)
     state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
@@ -1622,10 +1664,7 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
     state.replay.datasetKind = _dataset_kind(state, dataset_root)
     state.replay.message = f"Selected episode {episode} from {dataset_root.name}"
     _invalidate_mujoco_validation(state, "Episode changed; run MuJoCo replay again before real-robot replay.")
-    persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, episode)
-    if persisted_validation is not None:
-        state.replay.mujocoValidation = persisted_validation
-        _refresh_mujoco_validation_current(state)
+    if _restore_persisted_mujoco_validation(state, dataset_root, episode):
         state.replay.message = f"Selected episode {episode} from {dataset_root.name}; MuJoCo validation restored"
     state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
     state.dataset_cache_ready = True
@@ -1714,10 +1753,7 @@ def _delete_replay_episode(state: GatewayState, raw_episode: str) -> None:
     _invalidate_mujoco_validation(
         state, "Episode deleted; run MuJoCo replay again before real-robot replay."
     )
-    persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, next_episode)
-    if persisted_validation is not None:
-        state.replay.mujocoValidation = persisted_validation
-        _refresh_mujoco_validation_current(state)
+    _restore_persisted_mujoco_validation(state, dataset_root, next_episode)
     state.log("warn", f"Deleted replay episode {episode} from {dataset_root}")
 
 

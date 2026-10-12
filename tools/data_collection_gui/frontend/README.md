@@ -92,6 +92,12 @@ MuJoCo validation is persisted under:
 <dataset>/meta/gui_replay_validations.json
 ```
 
+Selecting a dataset or episode restores its newest stored validation. One for the current cube mode
+wins; otherwise the gateway switches to the cube mode of the stored one. A restarted gateway is back at
+`left`, and without that switch a passed `right` run would be lost. A stored validation is only restored
+for the robot model files it ran on (`fr3_corenetic_gripper.urdf/.xml`, or the pika pair on a workstation):
+after a model change, run MuJoCo again.
+
 Episode annotations are persisted under:
 
 ```text

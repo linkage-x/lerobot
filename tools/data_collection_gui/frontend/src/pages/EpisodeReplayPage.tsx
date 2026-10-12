@@ -1020,6 +1020,11 @@ export function EpisodeReplayPage({
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
 }) {
   const [mujocoMode, setMujocoMode] = useState<MujocoCubeMode>(snapshot.replay.mujocoCubeMode ?? "left");
+  // Follow the gateway when it switches mode itself (restoring a stored validation of the other cube).
+  const gatewayCubeMode = snapshot.replay.mujocoCubeMode;
+  useEffect(() => {
+    if (gatewayCubeMode) setMujocoMode(gatewayCubeMode);
+  }, [gatewayCubeMode]);
   // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
   // pick between, and the gateway ignores the cube mode on that profile entirely.
   const cubeSelection = (snapshot.deployment?.profile ?? "thor") !== "workstation";

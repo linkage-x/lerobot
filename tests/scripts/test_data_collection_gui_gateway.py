@@ -2465,6 +2465,66 @@ def test_replay_realsense_status_reports_all_matched_dataset_cameras(tmp_path):
     ]
 
 
+def test_restarted_gateway_restores_a_stored_validation_of_the_other_cube(tmp_path):
+    # 10-12 on Thor: the cube mode lives in memory, so after a restart it was back at the default
+    # (left) and a passed `right` validation was never restored, which locked real replay.
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+
+    def new_state() -> gateway.GatewayState:
+        return gateway.GatewayState(
+            repo_root=repo_root,
+            config_path=repo_root / "config.yaml",
+            config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+            recording=gateway.RecordingStatus(repoId="local/test"),
+            replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+            datasets_root=dataset_root.parent,
+        )
+
+    state = new_state()
+    state.replay.mujocoCubeMode = "right"
+    stored = gateway._new_mujoco_validation(state, status="passed", dataset_root=dataset_root, episode=0)
+    gateway._write_validation_store(dataset_root, stored)
+
+    state = new_state()
+    assert state.replay.mujocoCubeMode == "left"
+    gateway._select_replay_dataset(state, str(dataset_root))
+    assert state.replay.mujocoCubeMode == "right"
+    assert state.replay.mujocoValidation["status"] == "passed"
+    assert state.replay.mujocoValidation["isCurrentForSelection"] is True
+
+    # the current mode still wins when both cubes have one
+    state.replay.mujocoCubeMode = "left"
+    gateway._write_validation_store(
+        dataset_root,
+        gateway._new_mujoco_validation(state, status="failed", dataset_root=dataset_root, episode=0),
+    )
+    gateway._write_validation_store(dataset_root, stored)  # right is now the newest
+    gateway._select_replay_episode(state, "0")
+    assert state.replay.mujocoCubeMode == "left"
+    assert state.replay.mujocoValidation["status"] == "failed"
+
+    # nothing stored for this episode: stays locked
+    gateway._select_replay_episode(state, "1")
+    assert state.replay.mujocoValidation["status"] == "not_run"
+
+    # a changed robot model (10-12: gripper v2 moved the TCP 19 mm) invalidates every stored run
+    assets = repo_root / "src" / "lerobot" / "robots" / "franka_research3" / "assets" / "franka_fr3"
+    assets.mkdir(parents=True)
+    (assets / "fr3_corenetic_gripper.urdf").write_text("<robot/>", encoding="utf-8")
+    (assets / "fr3_corenetic_gripper.xml").write_text("<mujoco/>", encoding="utf-8")
+    gateway._select_replay_episode(state, "0")
+    assert state.replay.mujocoValidation["status"] == "not_run"
+    state.replay.mujocoCubeMode = "right"
+    gateway._write_validation_store(
+        dataset_root,
+        gateway._new_mujoco_validation(state, status="passed", dataset_root=dataset_root, episode=0),
+    )
+    gateway._select_replay_episode(state, "0")
+    assert state.replay.mujocoValidation["status"] == "passed"
+
+
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
