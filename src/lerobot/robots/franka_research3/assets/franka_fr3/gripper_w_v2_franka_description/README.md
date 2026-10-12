@@ -29,3 +29,13 @@ Inertial caveats (vendor numbers, not measured):
 - `base_link` is now 75.8 g (old: 28.1 g).
 
 The real end-effector load is identified on the robot instead (`tools/fr3/fr3_payload_identification_runtime.py`).
+Franka Desk configs from it (10-12; flange frame, TCP z 0.17199 / yaw −45° as the vendor's):
+
+| Desk name | mass | CoM (mm) | closed loop |
+|---|---|---|---|
+| Corenetic v2.0 BOX + cam | 0.9755 kg | (12.8, −19.0, 56.9) | Fz −0.17 N |
+| Corenetic v2.0 BOX + cam + SMR | 1.1108 kg | (16.8, −22.2, 60.9) | Fz −0.11 N |
+
+The URDF/MJCF masses stay CAD (0.867 / 1.007 kg). The Desk mass is the load that best explains the
+torques with libfranka's arm model and no sensor offsets. That is what the robot needs, but it is not
+a weighing: the physical load is only known to ~±60 g.

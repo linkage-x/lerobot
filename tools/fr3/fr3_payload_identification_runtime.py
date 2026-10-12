@@ -21,13 +21,22 @@ Subcommands (math in lerobot.robots.franka_research3.payload_identification):
   check-poses  MuJoCo: clearance between the tool and the arm along the pose sequence, lowest tool point
   sim          MuJoCo: synthetic run (optional sensor noise/offsets, bare-arm model error, SMR removed)
   collect      real robot: visit the poses, average tau_J at rest, store with libfranka's bare-arm gravity
-  fit          one run -> total load (what Desk takes); optionally minus parts already weighed
+  fit          one run -> total load with sensor offsets (physical estimate); optionally minus weighed parts
   diff         two runs over the same poses -> the part that differs (e.g. SMR in vs out)
-  desk-config  one run -> Franka Desk end-effector JSON (identified mass/CoM, CAD inertia scaled)
+  desk-config  runs (SMR in/out) -> Franka Desk end-effector JSONs (fit without offsets, see below)
 
-Accuracy check on the real robot: collect with the SMR in its nest, collect again without it, then
-`diff` must return ~140 g at the SMR centre. The difference cancels sensor offsets and the bare-arm
-model error, which a single `fit` cannot.
+Desk wants the fit *without* joint offsets, not `fit`'s: the robot subtracts no offsets before its gravity
+compensation and its O_F_ext_hat_K. 10-12, the with-offset fit (1.056 kg) loaded into Desk gave
+Fz -0.94 N; the no-offset one (0.976 kg) gave -0.17 N. The physical load is less certain than either:
+with/without offsets and per reach spread over ~110 g.
+
+Two checks on the real robot:
+- SMR difference: collect with the SMR in its nest and without it, `diff` must return ~140 g at the SMR
+  centre. The difference cancels sensor offsets and the bare-arm model error, so it checks the sensors'
+  linearity and noise, not the absolute load.
+- Desk closed loop: load the desk-config JSON into Desk and collect again (`collect` records the load Desk
+  had, `desk-config` prints the robot's O_F_ext_hat_K next to its reproduction). Mean Fz should be within
+  ~0.2 N of 0. What stays (10-12: Fx -0.8, Fy -0.36 N in every run) is sensor offsets; no load removes it.
 
 On Thor: PYTHONPATH=src with the .venv-fr3 interpreter (see the FR3 control notes); `collect` moves
 the arm -- someone must be at the robot with the user stop in reach.
@@ -57,6 +66,8 @@ from lerobot.robots.franka_research3.payload_identification import (
     default_poses,
     fit_difference,
     fit_load,
+    franka_external_wrench,
+    load_regressor,
     reach_groups,
     subtract_known,
     urdf_link_load,
@@ -536,16 +547,18 @@ def fit(args) -> int:
             )
         )
     est = fits[use]
-    report["desk_load"] = {
+    report["load"] = {
         "fit": use,
         "mass_kg": round(est.mass_kg, 4),
         "com_flange_m": np.round(est.com_flange_m, 4).tolist(),
     }
     print(
-        f"[{use}] Desk end-effector load (SMR {'in' if run.get('smr_present', True) else 'out'}): "
+        f"[{use}] end-effector load (SMR {'in' if run.get('smr_present', True) else 'out'}): "
         f"mass {est.mass_kg:.3f} kg, CoM {np.round(est.com_flange_m, 4).tolist()} m in the flange frame "
         "(inertia is not identifiable from statics)"
     )
+    if not args.no_bias:
+        print("  not the load for Desk (the robot subtracts no offsets): use desk-config, or fit --no-bias")
     if args.subtract_weighed:
         links = [k for k in WEIGHED_LINKS if k != SMR_BODY or run.get("smr_present", True)]
     else:
@@ -587,50 +600,91 @@ def diff(args) -> int:
     return 0
 
 
-def _chosen_fit(run: dict, qs, tau, g_arm) -> tuple[str, object]:
-    """The fit `fit` would report as the Desk load: global, unless the per-reach one disagrees."""
-    glob = fit_load(qs, tau, g_arm, run["gravity"])
-    reach = fit_load(qs, tau, g_arm, run["gravity"], groups=reach_groups(qs))
-    agree = abs(glob.mass_kg - reach.mass_kg) <= 2 * reach.mass_std_kg and np.all(
-        np.abs(glob.com_flange_m - reach.com_flange_m) <= 2 * np.maximum(reach.com_std_m, 1e-3)
+def _wrench_with_load(qs, tau, g_arm, mass: float, com: np.ndarray, gravity) -> np.ndarray:
+    """What the robot would report as O_F_ext_hat_K at each pose with this load configured in Desk."""
+    theta = np.r_[mass, mass * np.asarray(com)]
+    return np.array(
+        [
+            franka_external_wrench(q, t - g - load_regressor(q, gravity) @ theta)
+            for q, t, g in zip(qs, tau, g_arm, strict=True)
+        ]
     )
-    return ("global", glob) if agree else ("per_reach", reach)
+
+
+def _fmt_force(w: np.ndarray) -> str:
+    f = w[:, :3]
+    return f"mean F {np.round(f.mean(0), 2).tolist()} N, max |F| {np.linalg.norm(f, axis=1).max():.2f} N"
 
 
 def desk_config(args) -> int:
-    """Franka Desk end-effector config: identified mass + CoM, CAD inertia scaled to that mass."""
-    run, qs, tau, g_arm = _read_run(args.run)
-    if run.get("source") == "fr3" and "tau_J_up" not in run["poses"][0]:
-        raise SystemExit(
-            "one measurement per pose: friction hysteresis is in this run (10-12); collect it again"
-        )
-    if not run.get("complete", True):
-        raise SystemExit("incomplete run")
-    which, est = _chosen_fit(run, qs, tau, g_arm)
-    smr = run.get("smr_present", True)
-    m_cad, c_cad, inertia_cad = urdf_subtree_inertial(args.urdf, exclude=() if smr else (SMR_BODY,))
-    inertia = inertia_cad * (est.mass_kg / m_cad)  # shape from CAD; statics cannot see inertia
+    """Franka Desk end-effector configs, one per SMR state: identified mass + CoM, CAD inertia scaled to that mass.
+
+    The load is fitted *without* joint offsets: the robot subtracts none before its gravity compensation and
+    its external wrench estimate (O_F_ext_hat_K, reproduced by ``franka_external_wrench``), so this is the
+    load that leaves the least torque unexplained there. Fits with offsets (global, per reach) are printed
+    alongside; the spread of the three is the uncertainty of the *physical* load, not a Desk error. Runs of
+    the same SMR state are pooled.
+    """
+    by_state: dict[bool, list] = {}
+    for path in args.runs:
+        run, qs, tau, g_arm = _read_run(path)
+        if run.get("source") == "fr3" and "tau_J_up" not in run["poses"][0]:
+            raise SystemExit(
+                f"{path}: one measurement per pose, friction hysteresis is in it (10-12); collect again"
+            )
+        if not run.get("complete", True):
+            raise SystemExit(f"{path}: incomplete run")
+        by_state.setdefault(run.get("smr_present", True), []).append((path, run, qs, tau, g_arm))
     template = json.loads(Path(args.template).read_text())
-    cfg = dict(template)
-    cfg["id"] = str(uuid.uuid4())  # a new Desk entry, not an overwrite of the template's
-    cfg["name"] = args.name
-    cfg["inertial"] = {
-        "mass": round(est.mass_kg, 4),
-        "centerOfMass": dict(zip("xyz", (round(float(v), 5) for v in est.com_flange_m), strict=True)),
-        "inertia": {f"x{i + 1}{j + 1}": float(f"{inertia[i, j]:.6g}") for i in range(3) for j in range(i, 3)},
-    }
-    Path(args.out).write_text(json.dumps(cfg, ensure_ascii=False, separators=(",", ":")))
-    old = template.get("inertial", {})
-    print(
-        f"[{which}] SMR {'in' if smr else 'out'}: mass {est.mass_kg:.4f} kg (+-{est.mass_std_kg * 1000:.1f} g fit), "
-        f"CoM {np.round(est.com_flange_m * 1000, 1).tolist()} mm"
-    )
-    print(
-        f"  CAD for comparison: {m_cad:.4f} kg, CoM {np.round(c_cad * 1000, 1).tolist()} mm; "
-        f"template ({template.get('name')}): {old.get('mass')} kg, CoM {old.get('centerOfMass')}"
-    )
-    print(f"  tcp / deviceId kept from the template: {cfg.get('tcp')} / {cfg.get('deviceId')}")
-    print(f"written: {args.out}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    masses = {}
+    for smr, runs in sorted(by_state.items(), reverse=True):
+        gravity = runs[0][1]["gravity"]
+        qs, tau, g_arm = (np.concatenate([r[i] for r in runs]) for i in (2, 3, 4))
+        est = fit_load(qs, tau, g_arm, gravity, with_bias=False)
+        ref = {
+            "with offsets, global": fit_load(qs, tau, g_arm, gravity),
+            "with offsets, per reach": fit_load(qs, tau, g_arm, gravity, groups=reach_groups(qs)),
+        }
+        m_cad, c_cad, inertia_cad = urdf_subtree_inertial(args.urdf, exclude=() if smr else (SMR_BODY,))
+        inertia = inertia_cad * (est.mass_kg / m_cad)  # shape from CAD; statics cannot see inertia
+        cfg = dict(template)
+        cfg["id"] = str(uuid.uuid4())  # a new Desk entry, not an overwrite of the template's
+        cfg["name"] = args.name_smr if smr else args.name_no_smr
+        cfg["inertial"] = {
+            "mass": round(est.mass_kg, 4),
+            "centerOfMass": dict(zip("xyz", (round(float(v), 5) for v in est.com_flange_m), strict=True)),
+            "inertia": {
+                f"x{i + 1}{j + 1}": float(f"{inertia[i, j]:.6g}") for i in range(3) for j in range(i, 3)
+            },
+        }
+        out = args.out_dir / f"{args.stem}_{'smr' if smr else 'no_smr'}.json"
+        out.write_text(json.dumps(cfg, ensure_ascii=False, separators=(",", ":")))
+        masses[smr] = est.mass_kg
+        print(f"{cfg['name']} <- {', '.join(r[0].name for r in runs)}")
+        print(
+            f"  Desk load (no joint offsets): {_fmt(est.mass_kg, est.com_flange_m)}  "
+            f"(fit noise +-{est.mass_std_kg * 1000:.1f} g)"
+        )
+        w = _wrench_with_load(qs, tau, g_arm, est.mass_kg, est.com_flange_m, gravity)
+        print(f"    robot's O_F_ext_hat_K with it (predicted): {_fmt_force(w)}")
+        for path, run, q1, t1, g1 in runs:
+            loaded = run.get("desk_load_at_start")
+            if loaded and "O_F_ext_hat_K" in run["poses"][0]:
+                # what the robot reported with the load configured then, and our reproduction of it
+                w = np.array([p["O_F_ext_hat_K"] for p in run["poses"]])
+                e = w - _wrench_with_load(q1, t1, g1, loaded["m_ee"], loaded["F_x_Cee"], gravity)
+                print(
+                    f"    {path.name}, Desk {loaded['m_ee']:.4f} kg: measured {_fmt_force(w)}; "
+                    f"reproduced to rms {np.sqrt((e**2).mean()):.3f}"
+                )
+        for name, r in ref.items():
+            print(f"  {name}: {_fmt(r.mass_kg, r.com_flange_m)}")
+        print(f"  CAD: {_fmt(m_cad, c_cad)}")
+        print(f"  tcp / deviceId from the template: {cfg.get('tcp')} / {cfg.get('deviceId')}")
+        print(f"  written: {out}")
+    if len(masses) == 2:
+        print(f"difference between the two loads: {(masses[True] - masses[False]) * 1000:.1f} g")
     return 0
 
 
@@ -712,15 +766,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="subtract the parts weighed on a scale (adaptor, and the SMR if the run had it): "
         "what is left is the gripper + Part 1 + anything the URDF does not model",
     )
-    p.add_argument("--no-bias", action="store_true", help="do not estimate per-joint sensor offsets")
+    p.add_argument(
+        "--no-bias",
+        action="store_true",
+        help="do not estimate per-joint sensor offsets (the load Desk needs)",
+    )
     p.add_argument("--json", type=Path, help="also write the report here")
     p.set_defaults(func=fit)
 
-    p = sub.add_parser("desk-config", help="Franka Desk end-effector JSON from one run")
-    p.add_argument("run", type=Path)
+    p = sub.add_parser("desk-config", help="Franka Desk end-effector JSONs, one per SMR state")
+    p.add_argument("runs", type=Path, nargs="+", help="runs, SMR in and/or out; runs of one state are pooled")
     p.add_argument("--template", type=Path, required=True, help="an exported Desk end-effector JSON")
-    p.add_argument("--name", required=True)
-    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--name-smr", required=True, help="Desk name for the run with the SMR in its nest")
+    p.add_argument("--name-no-smr", required=True, help="Desk name for the run without the SMR")
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--stem", default="fr3_corenetic_desk_load")
     p.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     p.set_defaults(func=desk_config)
 

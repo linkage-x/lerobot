@@ -22,7 +22,11 @@ squares problem in ``theta`` and ``b``.
 
 What it cannot see: inertia (statics only), and errors of ``g_arm`` itself -- those land in the result.
 Two runs over the same poses that differ by one known part (``fit_difference``) cancel both ``b`` and
-the arm-model error; that difference is how the method's accuracy is checked on the real robot.
+the arm-model error, so it checks the sensors, not the absolute load.
+
+Franka Desk needs the fit *without* ``b``: the robot subtracts no offsets before its gravity compensation
+and its external wrench estimate (``franka_external_wrench`` reproduces ``O_F_ext_hat_K`` to a few mN).
+On the FR3 (10-12) that load left Fz -0.17 N; the fit with ``b`` was 80 g heavier and left -0.94 N.
 
 Pure numpy, no robot or simulator imports: the same code fits MuJoCo data and real data.
 """
@@ -176,6 +180,18 @@ def fit_load(qs, tau_j, g_arm, gravity=GRAVITY_EARTH, with_bias: bool = True, gr
 def fit_difference(qs, tau_j_a, tau_j_b, gravity=GRAVITY_EARTH) -> LoadEstimate:
     """Load present in run A but not in run B, over the same poses (bias and arm-model error cancel)."""
     return _solve(qs, np.asarray(tau_j_a) - np.asarray(tau_j_b), gravity, with_bias=False)
+
+
+def franka_external_wrench(q, tau_residual) -> np.ndarray:
+    """The wrench Franka reports as ``O_F_ext_hat_K`` for a joint torque residual (tau_J - model gravity).
+
+    Force and moment about the *base origin*, base axes: ``pinv(J0^T) @ tau`` with ``J0`` the geometric
+    Jacobian taken at the base origin. The robot subtracts no joint offsets first, so a sensor offset shows
+    up here as a constant wrench. Matches the robot to a few mN / mNm (10-12 runs).
+    """
+    T, J = flange_kinematics(q)
+    w = np.linalg.pinv(J.T) @ np.asarray(tau_residual, dtype=np.float64)
+    return np.r_[w[:3], w[3:] + np.cross(T[:3, 3], w[:3])]
 
 
 def _wrist_poses(j2: float, j4: float, tilts, spins) -> list[np.ndarray]:

@@ -14,6 +14,8 @@ from lerobot.robots.franka_research3.payload_identification import (
     fit_difference,
     fit_load,
     flange_kinematics,
+    franka_external_wrench,
+    load_regressor,
     reach_groups,
     urdf_link_load,
     visit_sequence,
@@ -186,11 +188,13 @@ def test_move_retries_only_the_communication_reflex(monkeypatch):
     assert not _move(arm) and arm.recovered == 3
 
 
-def test_desk_config_keeps_the_template_tcp_and_writes_the_identified_load(tmp_path):
+def test_desk_config_writes_one_config_per_smr_state_with_the_template_tcp(tmp_path):
     pytest.importorskip("mujoco")
     from tools.fr3 import fr3_payload_identification_runtime as runtime
 
-    run, *_ = _sim_run(tmp_path, "no_smr", without_smr=True, hysteresis_nm=0.25)
+    # no sensor offsets: then the load the robot's model needs is the physical one
+    run_in, *_ = _sim_run(tmp_path, "smr_in", hysteresis_nm=0.25)
+    run_out, *_ = _sim_run(tmp_path, "smr_out", without_smr=True, hysteresis_nm=0.25)
     template = {
         "id": "old",
         "name": "old",
@@ -203,18 +207,36 @@ def test_desk_config_keeps_the_template_tcp_and_writes_the_identified_load(tmp_p
     }
     (tmp_path / "template.json").write_text(json.dumps(template))
     args = argparse.Namespace(
-        run=tmp_path / "no_smr.json",
+        runs=[tmp_path / "smr_in.json", tmp_path / "smr_out.json"],
         template=tmp_path / "template.json",
-        name="gripper + cam",
-        out=tmp_path / "desk.json",
+        name_smr="gripper + cam + smr",
+        name_no_smr="gripper + cam",
+        out_dir=tmp_path / "desk",
+        stem="load",
         urdf=_URDF,
     )
     runtime.desk_config(args)
-    cfg = json.loads(args.out.read_text())
-    assert cfg["id"] != "old" and cfg["name"] == "gripper + cam"
-    assert cfg["tcp"] == template["tcp"] and cfg["deviceId"] == "ee-gripper"
-    truth = run["sim"]["truth"]
-    assert cfg["inertial"]["mass"] == pytest.approx(truth["mass_kg"], abs=1e-3)
-    com = [cfg["inertial"]["centerOfMass"][k] * 1000 for k in "xyz"]
-    np.testing.assert_allclose(com, truth["com_flange_mm"], atol=0.5)
-    assert set(cfg["inertial"]["inertia"]) == {"x11", "x12", "x13", "x22", "x23", "x33"}
+    for stem, run, name in (
+        ("load_smr", run_in, "gripper + cam + smr"),
+        ("load_no_smr", run_out, "gripper + cam"),
+    ):
+        cfg = json.loads((tmp_path / "desk" / f"{stem}.json").read_text())
+        assert cfg["id"] != "old" and cfg["name"] == name
+        assert cfg["tcp"] == template["tcp"] and cfg["deviceId"] == "ee-gripper"
+        truth = run["sim"]["truth"]
+        assert cfg["inertial"]["mass"] == pytest.approx(truth["mass_kg"], abs=1e-3)
+        com = [cfg["inertial"]["centerOfMass"][k] * 1000 for k in "xyz"]
+        np.testing.assert_allclose(com, truth["com_flange_mm"], atol=0.5)
+        assert set(cfg["inertial"]["inertia"]) == {"x11", "x12", "x13", "x22", "x23", "x33"}
+
+
+def test_franka_external_wrench_of_an_unconfigured_mass_is_its_weight():
+    # 0.3 kg more than configured, 50 mm off the flange axis: the robot reports +m*g up (the force it holds
+    # the extra mass with) and the matching moment about the base origin.
+    m, c = 0.3, np.array([0.05, -0.02, 0.06])
+    for q in default_poses()[::7]:
+        T, _ = flange_kinematics(q)
+        w = franka_external_wrench(q, load_regressor(q) @ np.r_[m, m * c])
+        f = np.array([0.0, 0.0, m * 9.81])
+        np.testing.assert_allclose(w[:3], f, atol=1e-9)
+        np.testing.assert_allclose(w[3:], np.cross(T[:3, :3] @ c + T[:3, 3], f), atol=1e-9)
