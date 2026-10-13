@@ -4,6 +4,11 @@ Gripper part of `fr3_corenetic_gripper.urdf` / `.xml` since 2026-10-12. It repla
 `URDF_franka_corenetic_gripper` package, whose fingers were wrong: its TCP sat 191 mm below the flange.
 This one puts `link_gripper_tcp` (= `corenetic_gripper_ee`) 171.99 mm below the flange, at the contact point
 of the closed fingers. That agrees with the vendor's Franka Desk config (0.17199) and a tape measure (~170 mm).
+The finger meshes do not match the real gripper along the tool axis. With the sensor fingertips and the
+gripper closed, the meshes put the nose 184 mm below the flange (EE z +12). On 2026-10-13 a tape measured
+about 175 mm. On the real gripper the EE therefore sits about 3 mm inside the nose, not at the pad centre.
+Do not use the meshes to locate points on the fingertip, such as the pivot insert's socket. The laser measures
+that socket at EE z −10.3 mm in the TCP frame while the insert is gripped, with a 35 mm gap between the pads.
 The repo URDF matches Thor's replay model (`box_api/replay_p0_arm_only_20260908/model.urdf`) frame for frame.
 
 - `urdf/gripper_w_v2_franka_description.urdf`: the vendor file, verbatim, for reference only. It does not

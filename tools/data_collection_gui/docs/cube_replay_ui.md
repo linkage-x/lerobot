@@ -54,7 +54,18 @@ passed `right` run, which left Move to trajectory start greyed out.
 A stored validation is only restored for the robot model it ran on: it records a
 digest of `fr3_corenetic_gripper.urdf` and `.xml`. MuJoCo plans the start joints
 for the model's TCP, so after any model change (2026-10-12: the TCP moved from
-191 to 172 mm below the flange) run MuJoCo again.
+191 to 172 mm below the flange; 2026-10-13: `corenetic_socket_ee` added) run MuJoCo again.
+
+The trajectory is driven by the frame named in `robot.target_frame_name` of
+`replay_cube_pose_in_robot_base.thor.yaml`. The gateway passes the same frame to
+MuJoCo (`--target-frame-name`), and the IK QC config uses it too. Since 2026-10-13 it is
+`corenetic_socket_ee`: the pivot insert's socket centre, 10.3 mm up the tool axis
+from `corenetic_gripper_ee`, with the same axes. The camera trajectories put their
+TCP at that socket, while `corenetic_gripper_ee` sits at the fingertip: with the gripper closed,
+a tape measured about 175 mm from the flange to the nose. Driving the EE frame put every
+replayed pose about 10 mm out along the tool, which was 15.7 mm p95 end to end; on the socket
+frame it is 7.7 mm. The replay refuses a socket frame that is not a pure translation of
+the EE frame.
 
 ## Single-cube hardware replay
 
@@ -145,9 +156,10 @@ TCP frame together (Gauss–Newton, 9 parameters). The SMR offset is reported wi
 its formal σ and must agree across runs if the SMR was not reseated. Run-to-run
 repeatability compares the laser points of all analysed runs frame by frame.
 
-Only compare runs made with the same robot model. The SMR offset is expressed in
-`corenetic_gripper_ee`, and the desired path drives that frame, so a TCP change
-moves both. After the 2026-10-12 URDF change the SMR z moved by 19.2 mm. Mixing
+Only compare runs made with the same robot model and target frame. The SMR offset
+is expressed in the frame the desired path drives (`corenetic_socket_ee` since
+2026-10-13; `corenetic_gripper_ee` before), so changing that frame moves both: the
+SMR z moved by 10.5 mm on 2026-10-13 (-65.8 to -55.3). After the 2026-10-12 URDF change the SMR z moved by 19.2 mm. Mixing
 those runs with the 10-10 ones gave a meaningless "repeatability" of 18 mm.
 
 Laser vs FK grows with the orientation range the fit has to cover: one rigid
