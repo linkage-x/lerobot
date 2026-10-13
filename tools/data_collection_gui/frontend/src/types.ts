@@ -1248,6 +1248,78 @@ export type WorldFrameResponse = {
   extrinsicsRun?: string;
 };
 
+// The world -> fr3_base registration edge (register_fr3_base.py): the live edge,
+// the P0 single-tag runs it can be solved from, and the solved candidates.
+export type Fr3BaseEdgeQuality = {
+  captures?: number | null;
+  outOfSampleP95Mm?: number | null;
+  tagScale?: number | null;
+  rmsePx?: number | null;
+  observationsKept?: number | null;
+  observationsIn?: number | null;
+  folds: {
+    name: string;
+    heldOutCaptures?: number | null;
+    tagCentreP50Mm?: number | null;
+    tagCentreP95Mm?: number | null;
+    edgeShiftMm?: number | null;
+    edgeShiftDeg?: number | null;
+  }[];
+};
+
+export type Fr3BaseEdgeMove = {
+  points: number;
+  meanMm: [number, number, number];
+  meanNormMm: number;
+  maxMm: number;
+  rotationDeg: number;
+};
+
+export type Fr3BaseEdgeResponse = {
+  ok: boolean;
+  error?: string;
+  output?: string;
+  solved?: string;
+  applied?: string;
+  referenceWorld: string;
+  current: {
+    world: string;
+    createdUtc: string;
+    method: string;
+    p0Run: string;
+    intrinsicsRun: string;
+    fromReferenceWorld: boolean;
+    referenceUnchanged: boolean;
+    supersedes: number;
+    edgeCount: number;
+    quality: Fr3BaseEdgeQuality;
+  } | null;
+  runs: {
+    name: string;
+    captures: number;
+    live: number;
+    imported: number;
+    p0Status: string;
+    solvable: boolean;
+    isLiveEdgeSource: boolean;
+  }[];
+  candidates: {
+    name: string;
+    generatedUtc: string;
+    p0Run: string;
+    verdict: string;
+    reasons: string[];
+    intrinsicsRun: string;
+    quality: Fr3BaseEdgeQuality;
+    moveVsLive: Fr3BaseEdgeMove | null;
+    sameAsLive: boolean;
+    applyBlockers: string[];
+  }[];
+  runsRoot?: string;
+  reportsRoot?: string;
+  captureCommand?: string;
+};
+
 // Guided calibration: per-camera intrinsics sweeps, then one shared extrinsics
 // sweep. They cannot be merged -- intrinsics are constrained by how much of one
 // camera's frame the board reaches, extrinsics by how often several cameras see

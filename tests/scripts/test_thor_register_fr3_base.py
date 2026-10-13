@@ -166,3 +166,67 @@ def test_solve_refuses_intrinsics_from_another_calibration(tmp_path: Path) -> No
     (intr / "summary.json").write_text(json.dumps({"cameras": []}))
     with pytest.raises(SystemExit, match="not the run the world's cameras were solved with"):
         reg.main(["--world-dir", str(world_dir), "solve", "--run", str(tmp_path), "--intrinsics", str(intr / "summary.json"), "--out", str(tmp_path / "r.json")])
+
+
+def _shifted(x: float, **source) -> dict:
+    report = _report()
+    report["edge"] = {**report["edge"], "T_to_from": [[1.0, 0.0, 0.0, x], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]}
+    report["edge"]["source"] = source
+    return report
+
+
+def test_replace_swaps_the_direct_edge_and_keeps_the_old_one_inside_the_new() -> None:
+    graph = reg.apply_report(_shifted(0.5, p0_run="old"), {"nodes": [{"world_frame_id": "world_a"}], "edges": []})
+    updated = reg.apply_report(_shifted(0.7, p0_run="new"), graph, replace=True)
+
+    assert len(updated["edges"]) == 1
+    T, _ = wp.world_transform(updated, "world_a", "fr3_base")
+    assert T[0][3] == pytest.approx(0.7)
+    (old,) = updated["edges"][0]["supersedes"]
+    assert old["source"] == {"p0_run": "old"} and old["T_to_from"][0][3] == 0.5 and old["superseded_utc"]
+    # metrology.world_frame.WorldGraph rewrites the file with nodes and edges only:
+    # the history has to live inside an edge to survive that.
+    assert set(updated) == {"version", "nodes", "edges"}
+    assert [n["world_frame_id"] for n in updated["nodes"]] == ["world_a", "fr3_base"]
+
+
+def test_replace_still_refuses_worlds_joined_through_other_edges() -> None:
+    graph = {
+        "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "world_b"}, {"world_frame_id": "fr3_base"}],
+        "edges": [
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "world_b", "T_to_from": _report()["edge"]["T_to_from"]},
+            {"from_world_frame_id": "world_b", "to_world_frame_id": "fr3_base", "T_to_from": _report()["edge"]["T_to_from"]},
+        ],
+    }
+    with pytest.raises(ValueError, match="through other edges"):
+        reg.apply_report(_report(), graph, replace=True)
+
+
+def test_check_reference_refuses_a_report_solved_against_another_reference(tmp_path: Path) -> None:
+    reference = tmp_path / wp.WORLD_REFERENCE_FILE
+    reference.write_text(json.dumps({"world_frame_id": "world_a"}))
+    sha = reg._sha256(reference)
+
+    reg.check_reference(_shifted(0.5, world_reference_sha256=sha), tmp_path)
+    with pytest.raises(ValueError, match="changed since this report was solved"):
+        reg.check_reference(_shifted(0.5, world_reference_sha256="0" * 64), tmp_path)
+    reference.write_text(json.dumps({"world_frame_id": "world_b"}))
+    with pytest.raises(ValueError, match="the reference world is world_b"):
+        reg.check_reference(_shifted(0.5, world_reference_sha256=reg._sha256(reference)), tmp_path)
+
+
+def test_cli_apply_replace_writes_the_graph(tmp_path: Path) -> None:
+    reference = tmp_path / wp.WORLD_REFERENCE_FILE
+    reference.write_text(json.dumps({"world_frame_id": "world_a"}))
+    sha = reg._sha256(reference)
+    (tmp_path / wp.WORLD_GRAPH_FILE).write_text(
+        json.dumps(reg.apply_report(_shifted(0.5, world_reference_sha256=sha), {"nodes": [{"world_frame_id": "world_a"}]}))
+    )
+    report = tmp_path / "r.json"
+    report.write_text(json.dumps(_shifted(0.7, world_reference_sha256=sha)))
+
+    assert reg.main(["--world-dir", str(tmp_path), "apply", str(report)]) == 1  # already connected
+    assert reg.main(["--world-dir", str(tmp_path), "apply", str(report), "--replace"]) == 0
+    graph = json.loads((tmp_path / wp.WORLD_GRAPH_FILE).read_text())
+    assert graph["edges"][0]["T_to_from"][0][3] == 0.7
+    assert not (tmp_path / (wp.WORLD_GRAPH_FILE + ".tmp")).exists()

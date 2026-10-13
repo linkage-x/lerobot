@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -8081,3 +8082,162 @@ def test_laser_analysis_says_why_when_no_replay_recorded_the_tracker(tmp_path, m
     with pytest.raises(RuntimeError, match=r"No real replay of episode 0 \(left\) recorded the laser tracker"):
         gateway._start_laser_replay_analysis(state, "left")
     assert state.replay.laserAnalysis == {}
+
+
+def _fr3_base_edge_repo(tmp_path: Path) -> tuple[gateway.GatewayState, list[list[float]]]:
+    """A live world -> fr3_base edge from run_a, plus run_a's captures, laid out as on Thor."""
+    world = tmp_path / "tools" / "thor" / "gmsl2" / "world"
+    world.mkdir(parents=True)
+    reference = world / "world_reference.json"
+    reference.write_text(json.dumps({"world_frame_id": "world_a", "calibration_id": "calib_x_extrinsics", "cameras": {}}))
+    sha = hashlib.sha256(reference.read_bytes()).hexdigest()
+    T_live = [[0.0, 0.0, -1.0, 1.2], [1.0, 0.0, 0.0, 0.01], [0.0, -1.0, 0.0, 0.74], [0.0, 0.0, 0.0, 1.0]]
+    edge = {
+        "from_world_frame_id": "world_a",
+        "to_world_frame_id": "fr3_base",
+        "T_to_from": T_live,
+        "method": "fr3_single_tag_hand_eye",
+        "source": {"p0_run": "outputs/calibration/p0_single_tag_camera_calibration/run_a", "captures_sha256": "aaa", "world_reference_sha256": sha},
+        "quality": {"captures": 40, "out_of_sample_tag_centre_p95_mm": 4.1, "tag_scale": 0.991},
+        "created_utc": "2026-10-09T06:55:38Z",
+    }
+    (world / "world_graph.json").write_text(
+        json.dumps({"version": 1, "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}], "edges": [edge]})
+    )
+    runs = tmp_path / "outputs" / "calibration" / "p0_single_tag_camera_calibration"
+    for name, n in (("run_a", 3), ("run_b", 2)):
+        (runs / name / "camera_calibration").mkdir(parents=True)
+        records = [
+            {"capture_index": i, "T_base_tcp": [[1, 0, 0, 0.4 + 0.1 * i], [0, 1, 0, 0.0], [0, 0, 1, 0.3], [0, 0, 0, 1]]}
+            for i in range(n)
+        ]
+        records[0]["source"] = {"dataset_root": "/x/outputs/datasets/imported"}
+        (runs / name / "captures.json").write_text(json.dumps({"records": records}))
+        (runs / name / "camera_calibration" / "summary.json").write_text(json.dumps({"status": "passed"}))
+    (runs / "run_empty").mkdir()
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path / "ds"), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path / "ds")),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "ds",
+    )
+    return state, T_live
+
+
+def _write_edge_candidate(state, name: str, T: list[list[float]], *, run: str = "run_b", sha: str | None = None, verdict: str = "ok") -> None:
+    reference = state.repo_root / "tools" / "thor" / "gmsl2" / "world" / "world_reference.json"
+    root = state.repo_root / "outputs" / "calibration" / "fr3_base_registration"
+    root.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema": "fr3_base_registration_report/v1",
+        "generated_utc": "2026-10-13T08:00:00Z",
+        "verdict": verdict,
+        "reasons": [] if verdict == "ok" else ["only 2 captures (< 20)"],
+        "edge": {
+            "from_world_frame_id": "world_a",
+            "to_world_frame_id": "fr3_base",
+            "T_to_from": T,
+            "method": "fr3_single_tag_hand_eye",
+            "source": {
+                "p0_run": f"outputs/calibration/p0_single_tag_camera_calibration/{run}",
+                "captures_sha256": "bbb",
+                "world_reference_sha256": sha or hashlib.sha256(reference.read_bytes()).hexdigest(),
+            },
+            "quality": {
+                "captures": 2,
+                "out_of_sample_tag_centre_p95_mm": 5.2,
+                "tag_scale": 0.99,
+                "fit": {"rmse_px": 2.3},
+                "folds": {"first_half": {"held_out_captures": 1, "held_out_tag_check": {"tag_centre_p95_mm": 5.2}, "T_world_base_vs_all": {"translation_mm_at_base_origin": 3.1, "rotation_deg": 0.2}}},
+            },
+        },
+        "target_node": {"world_frame_id": "fr3_base", "reason": "robot_base"},
+    }
+    (root / name).write_text(json.dumps(report))
+
+
+def _shift_x(T: list[list[float]], dx: float) -> list[list[float]]:
+    return [[*row[:3], row[3] + (dx if r == 0 else 0.0)] for r, row in enumerate(T)]
+
+
+def test_fr3_base_edge_payload_puts_each_candidate_next_to_how_far_it_moves_the_live_edge(tmp_path):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _write_edge_candidate(state, "run_b__1.json", _shift_x(T_live, 0.003))
+    _write_edge_candidate(state, "run_b__0.json", T_live, sha="0" * 64, verdict="rejected")
+
+    payload = gateway._fr3_base_edge_payload(state)
+
+    assert payload["ok"] and payload["referenceWorld"] == "world_a"
+    current = payload["current"]
+    assert current["world"] == "world_a" and current["fromReferenceWorld"] and current["referenceUnchanged"]
+    assert current["quality"]["outOfSampleP95Mm"] == 4.1
+    runs = {run["name"]: run for run in payload["runs"]}
+    assert runs["run_a"]["isLiveEdgeSource"] and not runs["run_b"]["isLiveEdgeSource"]
+    assert (runs["run_a"]["captures"], runs["run_a"]["live"], runs["run_a"]["imported"]) == (3, 2, 1)
+    assert runs["run_empty"]["solvable"] is False
+    candidates = {c["name"]: c for c in payload["candidates"]}
+    move = candidates["run_b__1.json"]["moveVsLive"]
+    # evaluated at run_b's own tool positions, in the FR3 base
+    assert move["points"] == 2
+    assert move["meanMm"] == pytest.approx([3.0, 0.0, 0.0], abs=1e-6)
+    assert move["maxMm"] == pytest.approx(3.0, abs=1e-6) and move["rotationDeg"] == pytest.approx(0.0, abs=1e-6)
+    assert candidates["run_b__1.json"]["applyBlockers"] == []
+    stale = candidates["run_b__0.json"]["applyBlockers"]
+    assert any("判定未通过" in b for b in stale) and any("world_reference.json" in b for b in stale)
+
+
+def test_fr3_base_edge_apply_over_http_swaps_the_live_edge_and_keeps_the_old(tmp_path):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _write_edge_candidate(state, "run_b__1.json", _shift_x(T_live, 0.003))
+    import urllib.request
+
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/fr3-base-edge/apply",
+            data=json.dumps({"report": "run_b__1.json"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # it logs under state.lock, so routing it inside the locked block would hang here
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/calibration/fr3-base-edge", timeout=10) as response:
+            after = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["ok"] and result["applied"] == "run_b__1.json"
+    graph = json.loads((tmp_path / "tools" / "thor" / "gmsl2" / "world" / "world_graph.json").read_text())
+    (edge,) = graph["edges"]
+    assert edge["T_to_from"][0][3] == pytest.approx(T_live[0][3] + 0.003)
+    assert edge["supersedes"][0]["source"]["p0_run"].endswith("run_a")
+    assert after["current"]["supersedes"] == 1
+    assert {r["name"]: r["isLiveEdgeSource"] for r in after["runs"]}["run_b"] is True
+    assert "commit" in state.events[0].message
+
+
+def test_fr3_base_edge_refuses_to_apply_a_stale_or_rejected_report(tmp_path):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _write_edge_candidate(state, "stale.json", _shift_x(T_live, 0.003), sha="0" * 64)
+    _write_edge_candidate(state, "rejected.json", _shift_x(T_live, 0.003), verdict="rejected")
+    graph_before = (tmp_path / "tools" / "thor" / "gmsl2" / "world" / "world_graph.json").read_text()
+
+    assert "changed since" in gateway._apply_fr3_base_edge(state, {"report": "stale.json"})["error"]
+    assert "rejected" in gateway._apply_fr3_base_edge(state, {"report": "rejected.json"})["error"]
+    assert gateway._apply_fr3_base_edge(state, {"report": "../world_graph.json"})["ok"] is False
+    assert (tmp_path / "tools" / "thor" / "gmsl2" / "world" / "world_graph.json").read_text() == graph_before
+
+
+def test_fr3_base_edge_solve_refuses_a_run_it_cannot_solve(tmp_path):
+    state, _ = _fr3_base_edge_repo(tmp_path)
+    assert "不能解算" in gateway._solve_fr3_base_edge(state, {"run": "run_empty"})["error"]
+    assert "不是一个 P0 run 名" in gateway._solve_fr3_base_edge(state, {"run": "../run_a"})["error"]
+    # the world's own intrinsics are required, not whatever the P0 run used
+    assert "内参" in gateway._solve_fr3_base_edge(state, {"run": "run_a"})["error"]

@@ -26,6 +26,7 @@ import type {
   RigCheckResponse,
   CrossCameraResponse,
   WorldFrameResponse,
+  Fr3BaseEdgeResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -1325,6 +1326,42 @@ export class DataCollectionGuiApi {
         return null;
       }
       return (await response.json()) as TrackerAlignment;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchFr3BaseEdge(): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-base-edge`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as Fr3BaseEdgeResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Solving writes a candidate report and nothing else; applying swaps the live
+  // edge. Both answer with the whole panel payload, failure included.
+  async solveFr3BaseEdge(run: string): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/solve", { run });
+  }
+
+  async applyFr3BaseEdge(report: string): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/apply", { report });
+  }
+
+  private async fr3BaseEdgePost(path: string, body: Record<string, string>): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<Fr3BaseEdgeResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as Fr3BaseEdgeResponse;
     } catch {
       return null;
     }

@@ -118,3 +118,44 @@ decision: dry run by default (`--apply` to write), the target must be a node of
 `world_graph.json`, only episodes carrying `--expect-from` are touched, and the
 original block is kept under `world_frame.restamp.original`. The real fix is to
 commit a new island here *before* recording in it.
+
+### Re-solving and replacing the edge (calibration page, 2026-10-13)
+
+The calibration page's 「FR3 基座注册边」 panel handles the edge from start to end
+except for the capture:
+
+- It lists the P0 runs under `outputs/calibration/p0_single_tag_camera_calibration/`.
+- It solves any run with `register_fr3_base.py solve`, against the reference's
+  own intrinsics. Candidate reports go to `outputs/calibration/fr3_base_registration/`.
+- It shows each candidate's out-of-sample verdict. Next to it is how far the
+  candidate would move the live edge, measured at that run's own tool positions.
+- Swapping in a candidate is a separate, confirmed step: `apply --replace`.
+
+The capture stays at the robot, with `run_p0_two_marker_calibration_local.sh guided`,
+because the arm is hand-guided in zero-stiffness mode and the tool opens its own
+recorder.
+
+`apply` checks two things before it changes anything:
+
+- It refuses a report solved against a different `world_reference.json`, by sha.
+- With `--replace`, it moves the old direct edge into the new edge's `supersedes`.
+  It does not go to a top-level key, because `metrology.world_frame.WorldGraph`
+  rewrites this file with nodes and edges only.
+
+The swap happens only on the machine the GUI runs on. Copy `world_graph.json` back
+here and commit it. `run/sync_to_target.sh` keeps a target graph that has a newer
+stamp than this tree's, and says so, rather than silently putting the old edge back.
+
+A passing verdict alone does not show that a candidate is better. Each solve
+checks itself only against its own run's captures. On 2026-10-13 all three runs
+captured at this mount were re-solved:
+
+- 10-02: reproduces the live edge exactly.
+- 10-10 a: held-out p95 5.6 mm.
+- 10-10 b: held-out p95 5.2 mm.
+
+The two 10-10 runs each move the live edge by a mean of 2.6 mm at their own tool
+positions (0.4°), in different directions. At the 10-13 replay trajectory that is
+about 4 mm. Neither removes the 4.6 mm constant the laser measured there. The
+method's run-to-run repeatability is therefore about 4 mm. An edge that is to beat
+it needs an independent check, such as a laser replay, before it goes live.

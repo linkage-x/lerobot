@@ -23,8 +23,13 @@ Two subcommands, because the inputs live on Thor and the graph lives in git:
   writes a report holding the proposed edge, its residuals and a verdict.
 * ``apply`` (stdlib) appends that edge, and the target node, to the tracked
   ``world_graph.json``.  It refuses a report whose verdict is not ``ok``, an
-  edge between two worlds that are already connected, and a source world that is
-  not a node of the graph.
+  edge between two worlds that are already connected, a source world that is
+  not a node of the graph, and a report solved against another
+  ``world_reference.json`` than the one on disk.  ``--replace`` swaps out a
+  direct edge between the same two worlds; the old one is kept inside the new
+  edge's ``supersedes`` (not a top-level key: ``metrology.world_frame.WorldGraph``
+  rewrites the file with nodes and edges only), so the record of what earlier
+  exports used survives.
 
 The verdict is out-of-sample: captures are split into folds (by source -- an
 imported dataset vs a live session -- or in halves when there is one source),
@@ -373,8 +378,17 @@ def _solve(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------- apply ---
 
 
-def apply_report(report: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
-    """Return ``graph`` with the report's edge and target node added (stdlib)."""
+def _is_direct(edge: dict[str, Any], a: str, b: str) -> bool:
+    return {str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id"))} == {a, b}
+
+
+def apply_report(report: dict[str, Any], graph: dict[str, Any], *, replace: bool = False) -> dict[str, Any]:
+    """Return ``graph`` with the report's edge and target node added (stdlib).
+
+    With ``replace``, a direct edge between the same two worlds moves into the
+    new edge's ``supersedes``. Worlds joined only through other edges are still
+    refused: which hop to drop is not this tool's call.
+    """
     if report.get("schema") != REPORT_SCHEMA:
         raise ValueError(f"not a {REPORT_SCHEMA} report")
     if report.get("verdict") != "ok":
@@ -384,18 +398,56 @@ def apply_report(report: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any
     target = str(edge["to_world_frame_id"])
     nodes = list(graph.get("nodes") or [])
     edges = list(graph.get("edges") or [])
+    superseded: list[dict[str, Any]] = []
     known = {str(node.get("world_frame_id")) for node in nodes}
     if source not in known:
         raise ValueError(f"{source} is not a node of the world graph")
+    now = _now_iso()
+    if replace:
+        superseded = [{**old, "superseded_utc": now} for old in edges if _is_direct(old, source, target)]
+        edges = [old for old in edges if not _is_direct(old, source, target)]
     if wp.world_transform({"edges": edges}, source, target) is not None:
-        raise ValueError(f"{source} and {target} are already connected; remove the old edge first")
+        how = "through other edges" if replace else "already"
+        raise ValueError(f"{source} and {target} are {how} connected; remove the old edge first")
     if target not in known:
         node = dict(report["target_node"])
-        node.setdefault("created_utc", _now_iso())
+        node.setdefault("created_utc", now)
         nodes.append(node)
-    edge["created_utc"] = _now_iso()
+    edge["created_utc"] = now
+    if superseded:
+        edge["supersedes"] = superseded
     edges.append(edge)
     return {**graph, "version": graph.get("version", 1), "nodes": nodes, "edges": edges}
+
+
+def check_reference(report: dict[str, Any], world_dir: Path) -> None:
+    """Refuse a report solved against another ``world_reference.json`` than ``world_dir``'s.
+
+    The edge is only valid with the camera poses it was solved against; after a
+    re-freeze or a revision those are not the ones on disk any more.
+    """
+    reference_path = world_dir / wp.WORLD_REFERENCE_FILE
+    if not reference_path.is_file():
+        raise ValueError(f"{reference_path} does not exist")
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    edge = report.get("edge") or {}
+    if str(edge.get("from_world_frame_id")) != str(reference.get("world_frame_id")):
+        raise ValueError(
+            f"the report leaves {edge.get('from_world_frame_id')}, but the reference world is "
+            f"{reference.get('world_frame_id')}; solve again against the current reference"
+        )
+    solved_against = str((edge.get("source") or {}).get("world_reference_sha256") or "")
+    if solved_against != _sha256(reference_path):
+        raise ValueError(
+            "world_reference.json changed since this report was solved; solve again against the current reference"
+        )
+
+
+def write_graph(graph_path: Path, graph: dict[str, Any]) -> None:
+    """Atomically: replay and export read this file while it is being swapped."""
+    temporary = graph_path.with_name(graph_path.name + ".tmp")
+    temporary.write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(graph_path)
 
 
 def _apply(args: argparse.Namespace) -> int:
@@ -404,11 +456,12 @@ def _apply(args: argparse.Namespace) -> int:
     report = json.loads(args.report.read_text(encoding="utf-8"))
     graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.is_file() else {"version": 1}
     try:
-        updated = apply_report(report, graph)
+        check_reference(report, world_dir)
+        updated = apply_report(report, graph, replace=args.replace)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    graph_path.write_text(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_graph(graph_path, updated)
     edge = report["edge"]
     print(f"edge {edge['from_world_frame_id']} -> {edge['to_world_frame_id']} written to {graph_path}")
     return 0
@@ -430,6 +483,11 @@ def main(argv: list[str] | None = None) -> int:
     solve.add_argument("--out", required=True, type=Path, help="report json to write")
     apply = sub.add_parser("apply", help="append a solved edge to world_graph.json")
     apply.add_argument("report", type=Path)
+    apply.add_argument(
+        "--replace",
+        action="store_true",
+        help="swap out an existing direct edge between the same worlds (kept in the new edge's supersedes)",
+    )
     args = parser.parse_args(argv)
     return _solve(args) if args.command == "solve" else _apply(args)
 

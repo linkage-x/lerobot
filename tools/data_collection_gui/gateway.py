@@ -34,6 +34,7 @@ from urllib.request import urlopen
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
+from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 from tools.thor.gmsl2 import world_provenance as wp
 
@@ -3552,6 +3553,367 @@ def _world_registration_for_export(state: GatewayState, bundle: Path) -> dict[st
     if not result.get("ok"):
         return None
     return result.get("registration")
+
+
+# --- FR3 base registration edge (world -> fr3_base) ----------------------------
+#
+# Every fr3_base trajectory -- MuJoCo preview, IK QC, real replay, export with
+# --target-world auto -- goes through this one edge of world_graph.json. It is
+# measured by tools/thor/gmsl2/register_fr3_base.py from a P0 single-tag run:
+# tag36h11 id6 on the FR3 tool, seen at many arm poses by the world's cameras
+# held at their reference poses.
+#
+# Capturing a run stays at the robot (tools/thor/run_p0_two_marker_calibration_local.sh
+# guided): the arm is hand-guided in zero-stiffness mode, and the tool opens its
+# own recorder on the cameras. What the panel does is the rest -- solve a run,
+# put its out-of-sample verdict next to how far it would move the live edge in
+# the workspace, and swap the edge in as a separate, confirmed action. The
+# second number matters as much as the first: on 2026-10-13 two 10-10 runs that
+# each passed (held-out p95 5.2 / 5.6 mm) moved the live edge by 2.6 mm on average
+# where they were captured (0.4 deg; about 4 mm at the 10-13 replay trajectory),
+# in different directions, and neither removed the 4.6 mm the laser saw there.
+
+_P0_RUNS_SUBDIR = Path("outputs") / "calibration" / "p0_single_tag_camera_calibration"
+_FR3_BASE_EDGE_REPORTS_SUBDIR = Path("outputs") / "calibration" / "fr3_base_registration"
+_REGISTER_FR3_BASE = Path("tools") / "thor" / "gmsl2" / "register_fr3_base.py"
+_FR3_BASE_EDGE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_FR3_BASE_EDGE_SOLVE_LOCK = Lock()
+_FR3_BASE_EDGE_REPORT_LIMIT = 12
+_P0_GUIDED_CAPTURE_COMMAND = (
+    "bash tools/thor/run_p0_two_marker_calibration_local.sh guided "
+    "--execute --confirmation P0_TWO_MARKER_TEACHING"
+)
+
+
+def _fr3_base_edge_reports_root(state: GatewayState) -> Path:
+    return state.repo_root / _FR3_BASE_EDGE_REPORTS_SUBDIR
+
+
+def _rotation_angle_deg(R: list[list[float]]) -> float:
+    cosine = (R[0][0] + R[1][1] + R[2][2] - 1.0) / 2.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def _edge_T_fr3_base_world(edge: dict[str, Any]) -> list[list[float]] | None:
+    """``T_fr3_base_world`` of a direct edge, whichever way it was written."""
+    try:
+        T = [[float(v) for v in row] for row in edge["T_to_from"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if str(edge.get("to_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
+        return T
+    if str(edge.get("from_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
+        return wp._rigid_inverse(T)
+    return None
+
+
+def _edge_quality_summary(edge: dict[str, Any]) -> dict[str, Any]:
+    quality = edge.get("quality") or {}
+    fit = quality.get("fit") or {}
+    folds = []
+    for name, fold in (quality.get("folds") or {}).items():
+        check = fold.get("held_out_tag_check") or {}
+        shift = fold.get("T_world_base_vs_all") or {}
+        folds.append(
+            {
+                "name": name,
+                "heldOutCaptures": fold.get("held_out_captures"),
+                "tagCentreP50Mm": check.get("tag_centre_p50_mm"),
+                "tagCentreP95Mm": check.get("tag_centre_p95_mm"),
+                "edgeShiftMm": shift.get("translation_mm_at_base_origin"),
+                "edgeShiftDeg": shift.get("rotation_deg"),
+            }
+        )
+    return {
+        "captures": quality.get("captures"),
+        "outOfSampleP95Mm": quality.get("out_of_sample_tag_centre_p95_mm"),
+        "tagScale": quality.get("tag_scale"),
+        "rmsePx": fit.get("rmse_px"),
+        "observationsKept": fit.get("observations_kept"),
+        "observationsIn": fit.get("observations_in"),
+        "folds": folds,
+    }
+
+
+def _p0_run_tool_positions(run_dir: Path) -> list[list[float]]:
+    """Where the arm held the tag in this run, in the FR3 base -- the workspace the edge was measured in."""
+    captures = _read_json_file(run_dir / "captures.json") or {}
+    points = []
+    for record in captures.get("records") or []:
+        try:
+            T = record["T_base_tcp"]
+            points.append([float(T[0][3]), float(T[1][3]), float(T[2][3])])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    return points
+
+
+def _edge_move_in_workspace(
+    T_new: list[list[float]], T_old: list[list[float]], points: list[list[float]]
+) -> dict[str, Any] | None:
+    """How far swapping ``T_old`` for ``T_new`` moves a pose, at the given base points.
+
+    A label re-expressed with the new edge lands at ``T_new T_old^-1`` applied to
+    where the old edge put it. The displacement at the origin of the base says
+    little -- the workspace is half a metre away -- so it is evaluated where the
+    arm actually was.
+    """
+    if not points:
+        return None
+    A = wp._matmul4(T_new, wp._rigid_inverse(T_old))
+    moves = [
+        [sum(A[r][k] * p[k] for k in range(3)) + A[r][3] - p[r] for r in range(3)]
+        for p in points
+    ]
+    norms = [math.sqrt(sum(c * c for c in m)) for m in moves]
+    mean = [sum(m[r] for m in moves) / len(moves) * 1e3 for r in range(3)]
+    return {
+        "points": len(points),
+        "meanMm": mean,
+        "meanNormMm": sum(norms) / len(norms) * 1e3,
+        "maxMm": max(norms) * 1e3,
+        "rotationDeg": _rotation_angle_deg([row[:3] for row in A[:3]]),
+    }
+
+
+def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
+    """Everything the FR3-base edge panel shows: the live edge, the runs, the solved candidates."""
+    repo = state.repo_root
+    world_dir = _world_root(state)
+    reference_path = world_dir / _WORLD_REFERENCE_FILE
+    reference = _read_json_file(reference_path) or {}
+    reference_id = str(reference.get("world_frame_id") or "")
+    reference_sha = hashlib.sha256(reference_path.read_bytes()).hexdigest() if reference_path.is_file() else ""
+
+    error = ""
+    try:
+        graph = wp.read_world_graph(repo)
+    except RuntimeError as exc:
+        graph, error = {}, str(exc)
+    direct = [
+        edge
+        for edge in graph.get("edges") or []
+        if wp.FR3_BASE_WORLD_ID in (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
+    ]
+    current: dict[str, Any] | None = None
+    T_current: list[list[float]] | None = None
+    if direct:
+        edge = direct[-1]
+        T_current = _edge_T_fr3_base_world(edge)
+        source = edge.get("source") or {}
+        world = (
+            str(edge.get("from_world_frame_id"))
+            if str(edge.get("to_world_frame_id")) == wp.FR3_BASE_WORLD_ID
+            else str(edge.get("to_world_frame_id"))
+        )
+        current = {
+            "world": world,
+            "createdUtc": edge.get("created_utc", ""),
+            "method": edge.get("method", ""),
+            "p0Run": source.get("p0_run", ""),
+            "intrinsicsRun": source.get("intrinsics_run", ""),
+            "fromReferenceWorld": world == reference_id,
+            "referenceUnchanged": bool(reference_sha) and source.get("world_reference_sha256") == reference_sha,
+            "supersedes": len(edge.get("supersedes") or []),
+            "edgeCount": len(direct),
+            "quality": _edge_quality_summary(edge),
+        }
+
+    runs_root = repo / _P0_RUNS_SUBDIR
+    runs = []
+    positions: dict[str, list[list[float]]] = {}
+    for run_dir in sorted((p for p in runs_root.glob("*") if p.is_dir()), key=lambda p: p.name, reverse=True):
+        captures = _read_json_file(run_dir / "captures.json")
+        summary = _read_json_file(run_dir / "camera_calibration" / "summary.json")
+        records = (captures or {}).get("records") or []
+        imported = sum(1 for record in records if (record.get("source") or {}).get("dataset_root"))
+        runs.append(
+            {
+                "name": run_dir.name,
+                "captures": len(records),
+                "live": len(records) - imported,
+                "imported": imported,
+                "p0Status": (summary or {}).get("status", ""),
+                "solvable": bool(records) and summary is not None,
+                "isLiveEdgeSource": bool(current) and str(current["p0Run"]).rstrip("/").endswith(run_dir.name),
+            }
+        )
+
+    reports_root = _fr3_base_edge_reports_root(state)
+    candidates = []
+    report_paths = sorted(reports_root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if reports_root.is_dir() else []
+    for path in report_paths[:_FR3_BASE_EDGE_REPORT_LIMIT]:
+        report = _read_json_file(path)
+        if not report or report.get("schema") != "fr3_base_registration_report/v1":
+            continue
+        edge = report.get("edge") or {}
+        source = edge.get("source") or {}
+        run_name = Path(str(source.get("p0_run") or "")).name
+        T_new = _edge_T_fr3_base_world(edge)
+        move = None
+        if T_new is not None and T_current is not None:
+            if run_name not in positions:
+                positions[run_name] = _p0_run_tool_positions(runs_root / run_name)
+            move = _edge_move_in_workspace(T_new, T_current, positions[run_name])
+        same_as_live = (
+            current is not None
+            and source.get("captures_sha256") == ((direct[-1].get("source") or {}).get("captures_sha256"))
+            and move is not None
+            and move["maxMm"] < 0.01
+        )
+        world = str(edge.get("from_world_frame_id") or "")
+        blockers = []
+        if report.get("verdict") != "ok":
+            blockers.append("判定未通过")
+        if world != reference_id:
+            blockers.append(f"解算时的世界系是 {world}，当前基准是 {reference_id or '—'}")
+        elif source.get("world_reference_sha256") != reference_sha:
+            blockers.append("world_reference.json 在解算之后改过，需要重新解算")
+        if same_as_live:
+            blockers.append("与现役边相同")
+        candidates.append(
+            {
+                "name": path.name,
+                "generatedUtc": report.get("generated_utc", ""),
+                "p0Run": run_name,
+                "verdict": report.get("verdict", ""),
+                "reasons": report.get("reasons") or [],
+                "intrinsicsRun": source.get("intrinsics_run", ""),
+                "quality": _edge_quality_summary(edge),
+                "moveVsLive": move,
+                "sameAsLive": same_as_live,
+                "applyBlockers": blockers,
+            }
+        )
+
+    return {
+        "ok": not error,
+        "error": error,
+        "referenceWorld": reference_id,
+        "current": current,
+        "runs": runs,
+        "candidates": candidates,
+        "runsRoot": str(_P0_RUNS_SUBDIR),
+        "reportsRoot": str(_FR3_BASE_EDGE_REPORTS_SUBDIR),
+        "captureCommand": _P0_GUIDED_CAPTURE_COMMAND,
+    }
+
+
+def _fr3_base_edge_run_dir(state: GatewayState, name: Any) -> Path:
+    name = str(name or "").strip()
+    if not _FR3_BASE_EDGE_NAME_RE.match(name):
+        raise ValueError(f"不是一个 P0 run 名：{name!r}")
+    run_dir = state.repo_root / _P0_RUNS_SUBDIR / name
+    if not (run_dir / "captures.json").is_file() or not (run_dir / "camera_calibration" / "summary.json").is_file():
+        raise ValueError(f"{name} 缺 captures.json 或 camera_calibration/summary.json，不能解算")
+    return run_dir
+
+
+def _solve_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Solve one P0 run into a candidate edge report. Never touches world_graph.json."""
+    try:
+        run_dir = _fr3_base_edge_run_dir(state, body.get("run"))
+    except ValueError as exc:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    reference = _read_json_file(_world_root(state) / _WORLD_REFERENCE_FILE) or {}
+    calibration_id = str(reference.get("calibration_id") or "")
+    if not calibration_id:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": "world_reference.json 没有 calibration_id，找不到它的内参"}
+    # The world's cameras are only valid with the intrinsics they were solved with.
+    intrinsics = (
+        state.repo_root
+        / "outputs"
+        / "calibration"
+        / f"{calibration_id.removesuffix('_extrinsics')}_intrinsics"
+        / "summary.json"
+    )
+    if not intrinsics.is_file():
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": f"找不到基准世界系的内参 {intrinsics}"}
+    try:
+        python = _marker_tcp_python(state)
+    except RuntimeError as exc:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    if not _FR3_BASE_EDGE_SOLVE_LOCK.acquire(blocking=False):
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": "已有一次注册边解算在运行"}
+    try:
+        out = _fr3_base_edge_reports_root(state) / f"{run_dir.name}__{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(python),
+            str(state.repo_root / _REGISTER_FR3_BASE),
+            "--world-dir",
+            str(_world_root(state)),
+            "solve",
+            "--run",
+            str(run_dir),
+            "--intrinsics",
+            str(intrinsics),
+            "--out",
+            str(out),
+        ]
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(state.repo_root),
+                env=_marker_tcp_tool_env(state),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    finally:
+        _FR3_BASE_EDGE_SOLVE_LOCK.release()
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    # exit 2 is a rejected verdict, written out like a passing one
+    if proc.returncode not in (0, 2) or not out.is_file():
+        tail = output.splitlines()
+        with state.lock:
+            state.log("warn", f"FR3 base edge solve of {run_dir.name} failed: {tail[-1] if tail else proc.returncode}")
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": output or f"exit {proc.returncode}"}
+    with state.lock:
+        state.log(
+            "info" if proc.returncode == 0 else "warn",
+            f"FR3 base edge solved from {run_dir.name}: {output.splitlines()[-2] if len(output.splitlines()) > 1 else output}",
+        )
+    return {**_fr3_base_edge_payload(state), "ok": True, "solved": out.name, "output": output}
+
+
+def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Swap the live world -> fr3_base edge for a solved candidate. The old edge is kept inside the new one."""
+    name = str(body.get("report") or "").strip()
+    path = _fr3_base_edge_reports_root(state) / name
+    if not _FR3_BASE_EDGE_NAME_RE.match(name) or not path.is_file():
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": f"找不到候选报告 {name!r}"}
+    report = _read_json_file(path)
+    if not report:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": f"{name} 读不出来"}
+    world_dir = _world_root(state)
+    graph_path = world_dir / _WORLD_GRAPH_FILE
+    try:
+        register_fr3_base.check_reference(report, world_dir)
+        graph = wp.read_world_graph(state.repo_root)
+        updated = register_fr3_base.apply_report(report, graph, replace=True)
+        register_fr3_base.write_graph(graph_path, updated)
+    except (ValueError, RuntimeError, OSError) as exc:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    run = Path(str(((report.get("edge") or {}).get("source") or {}).get("p0_run") or "")).name
+    with state.lock:
+        state.log(
+            "warn",
+            f"world -> fr3_base edge replaced by {run} ({name}); every fr3_base replay and export from now on uses it. "
+            f"{_WORLD_SUBDIR / _WORLD_GRAPH_FILE} changed on this machine only -- copy it back into the repo and commit.",
+        )
+    return {**_fr3_base_edge_payload(state), "ok": True, "applied": name}
+
+
+# Outside the state lock (see the POST handler): the solve runs for minutes.
+_FR3_BASE_EDGE_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/fr3-base-edge/solve": _solve_fr3_base_edge,
+    "/api/calibration/fr3-base-edge/apply": _apply_fr3_base_edge,
+}
 
 
 # --- Extrinsics calibration --------------------------------------------------
@@ -10976,8 +11338,9 @@ def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
     return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}{DEFAULT_TRACKING_RUN_SUFFIX}"
 
 
-# The robot frame each real-replay end-effector mode drives (corenetic goes through the
-# replay yaml's robot config, whose target_frame_name is corenetic_gripper_ee).
+# The URDF link a trajectory must be labelled on for each real-replay end-effector mode. Corenetic
+# trajectories are labelled corenetic_gripper_ee (the tracker hops onto its axes) and are the socket
+# centre; the replay yaml's target_frame_name, corenetic_socket_ee, is the frame that point is driven by.
 # Upper bound for replay.pose_command_lead_frames from the panel. The 10-12 trace lags the
 # target by ~155 ms = 3 frames at the Thor config's 20 fps; 10 frames leaves room to over-shoot
 # while bounding how far ahead of the validated path a command can run.
@@ -16559,6 +16922,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/world-frame":
             _json_response(self, HTTPStatus.OK, _world_frame_payload(self.server.state))
             return
+        if path == "/api/calibration/fr3-base-edge":
+            _json_response(self, HTTPStatus.OK, _fr3_base_edge_payload(self.server.state))
+            return
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
             return
@@ -17002,7 +17368,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
-        tracker_fit = _TRACKER_MOUNT_FIT_ROUTES.get(path) or _CROSS_CAMERA_ROUTES.get(path)
+        tracker_fit = (
+            _TRACKER_MOUNT_FIT_ROUTES.get(path) or _CROSS_CAMERA_ROUTES.get(path) or _FR3_BASE_EDGE_ROUTES.get(path)
+        )
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the
             # capture's EE trajectory, which queues a job and waits on it -- both
