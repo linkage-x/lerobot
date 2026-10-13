@@ -1810,6 +1810,79 @@ def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
     assert frame["gripper_trigger"]["rows"] == {"state_action.right.csv": 3}
 
 
+def test_fr3_base_trajectory_reads_the_handheld_box_when_the_arm_box_was_recorded_too(tmp_path):
+    # 10-13: both BOXes were up while recording, so the parquet names carry box<id>. prefixes;
+    # the bare-name lookup found nothing and the replay ran with the gripper never commanded.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
+    )
+    replay_yaml = state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG
+    replay_yaml.parent.mkdir(parents=True, exist_ok=True)
+    replay_yaml.write_text("robot:\n  corenetic_device_id: 596523097\n", encoding="utf-8")
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    (sidecar / "state_action.right.csv").write_text(
+        "episode_index,frame_index,gripper_width_m,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,nan,0.1,0.2,0.3,0,0,0,1\n"
+        "0,1,nan,0.1,0.2,0.3,0,0,0,1\n",
+        encoding="utf-8",
+    )
+    names = [
+        f"box{device}.{name}"
+        for device in ("1819152274", "596523097")
+        for name in ("box_gripper.distance_m", "box_trigger.travel_pct")
+    ]
+    (dataset_root / "meta").mkdir()
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"features": {"observation.state": {"names": names}}}), encoding="utf-8"
+    )
+    data_dir = dataset_root / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({
+            "episode_index": [0, 0],
+            "frame_index": [0, 1],
+            # handheld closes on the tube; the arm's BOX sits open and idle
+            "observation.state": [[0.0887, 0.0, 0.0887, 0.0], [0.0326, 100.0, 0.0887, 0.0]],
+        }),
+        data_dir / "file-000.parquet",
+    )
+
+    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+
+    rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(r["gripper_width_m"]) for r in rows] == pytest.approx([0.0887, 0.0326])
+    assert [float(r["gripper_trigger_pct"]) for r in rows] == [0.0, 100.0]
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["gripper_width"]["source"] == "observation.state[box1819152274.box_gripper.distance_m]"
+    assert frame["gripper_width"]["rows"] == {"state_action.right.csv": 2}
+
+    # Without knowing which BOX is on the arm there are two candidates: nothing is guessed.
+    replay_yaml.write_text("robot: {}\n", encoding="utf-8")
+    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    assert json.loads((fr3_dir / "frame.json").read_text())["gripper_width"]["rows"] == {"state_action.right.csv": 0}
+
+
+def test_mujoco_preview_plans_for_the_frame_the_real_replay_drives(tmp_path):
+    state, dataset_root = _stamped_replay_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]}],
+    )
+    replay_yaml = state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG
+    replay_yaml.parent.mkdir(parents=True, exist_ok=True)
+    replay_yaml.write_text("robot:\n  target_frame_name: corenetic_socket_ee\n", encoding="utf-8")
+
+    command = gateway._mujoco_replay_command(state, dataset_root, "right")
+
+    assert command[command.index("--target-frame-name") + 1] == "corenetic_socket_ee"
+    # The checked-in Thor config is what both read in production.
+    assert gateway._fr3_replay_target_frame(Path(__file__).resolve().parents[2]) == "corenetic_socket_ee"
+
+
 def test_thor_preflight_checks_the_replay_arm_not_the_workstation_arm(tmp_path):
     state = gateway.GatewayState(
         repo_root=tmp_path,

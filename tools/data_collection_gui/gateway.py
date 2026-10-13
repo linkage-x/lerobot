@@ -9701,7 +9701,13 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
     out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
     written = []
-    recorded = _dataset_state_values(dataset_root, list(FR3_REPLAY_STATE_COLUMNS.values()))
+    sources: dict[str, str] = {}
+    recorded = _dataset_state_values(
+        dataset_root,
+        list(FR3_REPLAY_STATE_COLUMNS.values()),
+        exclude_box_ids=_fr3_arm_box_ids(repo_root),
+        sources=sources,
+    )
     carried: dict[str, dict[str, int]] = {column: {} for column in FR3_REPLAY_STATE_COLUMNS}
     for src in sorted(sidecar.glob("state_action.*.csv")):
         wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
@@ -9715,11 +9721,11 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
                 "from": routes,
                 "files": written,
                 "gripper_width": {
-                    "source": f"observation.state[{DATASET_GRIPPER_WIDTH_NAME}]",
+                    "source": f"observation.state[{sources.get(DATASET_GRIPPER_WIDTH_NAME, DATASET_GRIPPER_WIDTH_NAME)}]",
                     "rows": carried["gripper_width_m"],
                 },
                 "gripper_trigger": {
-                    "source": f"observation.state[{DATASET_TRIGGER_NAME}]",
+                    "source": f"observation.state[{sources.get(DATASET_TRIGGER_NAME, DATASET_TRIGGER_NAME)}]",
                     "rows": carried["gripper_trigger_pct"],
                 },
             },
@@ -9730,12 +9736,71 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
     return out_dir
 
 
-def _dataset_state_values(dataset_root: Path, names: list[str]) -> dict[str, dict[tuple[int, int], float]]:
+FR3_REPLAY_THOR_CONFIG = Path(
+    "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"
+)
+
+
+def _fr3_replay_robot_config(repo_root: Path) -> dict[str, Any]:
+    """``robot`` block of the Thor real replay YAML ({} when unreadable)."""
+    try:
+        robot = _load_yaml(repo_root / FR3_REPLAY_THOR_CONFIG).get("robot") or {}
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    return robot if isinstance(robot, dict) else {}
+
+
+def _fr3_arm_box_ids(repo_root: Path) -> set[str]:
+    """Column prefixes (``box<device id>``) of the BOX mounted on the FR3, per the real replay YAML.
+
+    The recorder discovers every BOX on the network, so a session recorded with the arm's BOX
+    powered also carries that BOX's (idle) jaw and trigger; it is never the operator's.
+    """
+    device_id = _fr3_replay_robot_config(repo_root).get("corenetic_device_id")
+    return {f"box{device_id}"} if device_id not in (None, "") else set()
+
+
+def _fr3_replay_target_frame(repo_root: Path) -> str:
+    """The frame real replay drives onto the trajectory (its YAML's robot.target_frame_name).
+
+    The MuJoCo preview is handed the same one: 10-13 it became corenetic_socket_ee, 10.3 mm up the
+    tool axis from corenetic_gripper_ee, and a preview on the old frame plans a different arm pose.
+    """
+    return str(_fr3_replay_robot_config(repo_root).get("target_frame_name") or "corenetic_gripper_ee")
+
+
+def _resolve_box_state_name(state_names: list[str], name: str, exclude_box_ids: set[str]) -> str | None:
+    """The ``observation.state`` entry recording ``name`` of the handheld BOX, or None.
+
+    One BOX records ``name`` bare; several record ``box<id>.name`` each. The arm's own BOX is
+    dropped, and if more than one remains the operator's is unknown, so nothing is guessed.
+    """
+    if name in state_names:
+        return name
+    handheld = [
+        entry
+        for entry in state_names
+        if entry.startswith("box")
+        and entry.partition(".")[2] == name
+        and entry.partition(".")[0] not in exclude_box_ids
+    ]
+    return handheld[0] if len(handheld) == 1 else None
+
+
+def _dataset_state_values(
+    dataset_root: Path,
+    names: list[str],
+    *,
+    exclude_box_ids: set[str] | None = None,
+    sources: dict[str, str] | None = None,
+) -> dict[str, dict[tuple[int, int], float]]:
     """``observation.state[name]`` per ``(episode_index, frame_index)`` for each recorded name.
 
     The tracker writes poses only and leaves the sidecar's gripper columns NaN; the BOX jaw
     opening (m) and trigger travel (%) live in the episode parquet. The corenetic gripper on
     the FR3 is commanded in the same metres. Names the dataset did not record are left out.
+    With several BOXes connected the names carry a ``box<id>.`` prefix; ``exclude_box_ids``
+    drops the arm's own BOX and ``sources`` receives the entry each name was read from.
     """
     info = _load_json_file(dataset_root / "meta" / "info.json")
     features = info.get("features") if isinstance(info.get("features"), dict) else {}
@@ -9744,7 +9809,10 @@ def _dataset_state_values(dataset_root: Path, names: list[str]) -> dict[str, dic
         state_names = next(iter(state_names.values()), [])
     if not isinstance(state_names, list):
         return {}
-    columns = {name: state_names.index(name) for name in names if name in state_names}
+    resolved = {name: _resolve_box_state_name(state_names, name, exclude_box_ids or set()) for name in names}
+    if sources is not None:
+        sources.update({name: entry for name, entry in resolved.items() if entry})
+    columns = {name: state_names.index(entry) for name, entry in resolved.items() if entry}
     if not columns:
         return {}
     import pyarrow.parquet as pq
@@ -15704,6 +15772,8 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         "state",
         "--ik-solver",
         "hardware",
+        "--target-frame-name",
+        _fr3_replay_target_frame(state.repo_root),
         "--robot-spacing-m",
         str(DEFAULT_MUJOCO_ROBOT_SPACING_M),
         # The arm is redundant: from move_to_start() IK can take a branch that hits panda_py's
@@ -15883,6 +15953,14 @@ def _real_replay_command(
     # replay runtime locally with the exact selected sidecar and episode.
     # Same FR3-frame copy the MuJoCo validation ran on, so the arm executes what was checked.
     csv_path = _fr3_trajectory_csv(dataset_root, state.repo_root, cube_mode)
+    frame = _load_json_file(csv_path.parent / "frame.json") if csv_path.parent.name == FR3_BASE_TRAJECTORY_SUBDIR else {}
+    if (frame.get("gripper_width") or {}).get("rows", {}).get(csv_path.name) == 0:
+        # 10-13: the replay ran start to end with the gripper never commanded and nothing said so.
+        state.log(
+            "warn",
+            f"{csv_path.name} carries no recorded BOX opening "
+            f"({frame['gripper_width'].get('source')}): the FR3 gripper will not move during this replay",
+        )
     command = [
         str(_mujoco_replay_python(state)),
         str(
@@ -16407,11 +16485,11 @@ def _start_real_replay(
         # Absolute poses put the labelled point on whatever frame the arm drives; another
         # tool's TCP there is a different physical point, so refuse instead of approximating.
         trajectory_link = _trajectory_tcp_link(state, dataset_root)
-        driven_frame = REAL_REPLAY_TARGET_FRAMES[end_effector_mode]
-        if trajectory_link and trajectory_link != driven_frame:
+        expected_link = REAL_REPLAY_TARGET_FRAMES[end_effector_mode]
+        if trajectory_link and trajectory_link != expected_link:
             raise RuntimeError(
-                f"The EE trajectory is on {trajectory_link}, but end effector {end_effector_mode} drives "
-                f"{driven_frame}; select the end effector that matches the tracked gripper."
+                f"The EE trajectory is on {trajectory_link}, but end effector {end_effector_mode} expects "
+                f"{expected_link}; select the end effector that matches the tracked gripper."
             )
 
     selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")

@@ -99,6 +99,15 @@ analysis still scores against the trajectory and lists each run's lead.
 The gateway re-runs hardware preflight against the exact IP entered in the
 panel, launches the noninteractive selected episode from
 `replay_cube_pose_in_robot_base.py`, and starts the RealSense monitor. Exported
+
+The gripper follows the recorded BOX opening and trigger, which the gateway copies
+from the episode parquet into `fr3_base/state_action.<cube>.csv` (see `frame.json`:
+`gripper_width.source` / `rows`). If several BOXes were online while recording, the
+names carry a `box<device id>.` prefix. The arm's own BOX (`robot.corenetic_device_id`
+in the replay YAML) is left out, and the one remaining BOX is used. If more than one
+remains, nothing is guessed. When a trajectory carries no opening, the gateway logs a
+warning that the gripper will not move. Before 2026-10-13 such a replay ran with the
+gripper never commanded and nothing said so.
 datasets remain blocked because their derived action semantics are not approved
 as a verified robot command stream.
 
