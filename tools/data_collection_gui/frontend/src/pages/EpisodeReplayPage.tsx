@@ -6,6 +6,9 @@ import { ReplayInspector } from "../ReplayInspector";
 import { LaserReplayAnalysisPanel } from "../LaserReplayAnalysisPanel";
 import { api } from "../apiClient";
 
+// The replay FR3 on Thor; the IP field overrides it.
+const DEFAULT_HOME_ROBOT_IP = "192.168.11.102";
+
 const REAL_REPLAY_TARGET_FRAMES: Record<RealEndEffectorMode, string> = {
   corenetic_gripper_ee: "corenetic_gripper_ee",
   pika_gripper_ee: "pika_task_tcp",
@@ -159,6 +162,9 @@ export function RealRobotReplayPanel({
   const [robotIp, setRobotIp] = useState(status.realRobotIp || "");
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
+  const [homePromptOpen, setHomePromptOpen] = useState(false);
+  const [homing, setHoming] = useState(false);
+  const [homeResult, setHomeResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [recordTracker, setRecordTracker] = useState(false);
   const [commandLeadFrames, setCommandLeadFrames] = useState(status.realCommandLeadFrames ?? DEFAULT_COMMAND_LEAD_FRAMES);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
@@ -241,6 +247,23 @@ export function RealRobotReplayPanel({
     });
   }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
 
+  const homeIp = robotIp.trim() || DEFAULT_HOME_ROBOT_IP;
+  const homeDisabled = busy || active || homing || !validIpv4(homeIp);
+  const homeConfirmed = async () => {
+    setHomePromptOpen(false);
+    setHoming(true);
+    setHomeResult(null);
+    const result = await api.moveFr3ToStart(homeIp);
+    setHoming(false);
+    setHomeResult(
+      result === null
+        ? { ok: false, message: "Gateway unreachable; the arm was not moved." }
+        : result.ok
+          ? { ok: true, message: `${result.robotIp} is at its start pose.` }
+          : { ok: false, message: result.error || "move_to_start failed" }
+    );
+  };
+
   const startConfirmed = (overrideMujocoFailure: boolean) => {
     setOverridePromptOpen(false);
     setMonitorRequested(true);
@@ -269,8 +292,14 @@ export function RealRobotReplayPanel({
           </div>
           <label className="real-robot-ip-field">
             <span>Robot IP</span>
-            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.11.102" />
+            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder={DEFAULT_HOME_ROBOT_IP} />
           </label>
+          <button className="real-robot-home" disabled={homeDisabled} onClick={() => setHomePromptOpen(true)} type="button">
+            {homing ? `Moving ${homeIp} to start…` : "Move to start (home)"}
+          </button>
+          {homeResult ? (
+            <p className={`panel-note ${homeResult.ok ? "" : "real-robot-home-error"}`}>{homeResult.message}</p>
+          ) : null}
           <label className="real-robot-tracker-toggle">
             <input
               checked={recordTracker}
@@ -427,6 +456,21 @@ export function RealRobotReplayPanel({
             : "Waiting for a replay request. Preflight, camera, initial-pose, and trajectory output will appear here."}
         </pre>
       </div>
+      {homePromptOpen ? (
+        <div className="danger-modal-backdrop" role="presentation">
+          <div aria-labelledby="fr3-home-title" aria-modal="true" className="danger-modal" role="dialog">
+            <h3 id="fr3-home-title">Move FR3 to start</h3>
+            <p>
+              The arm at <strong>{homeIp}</strong> moves in joint space to the SDK start pose (panda_py
+              move_to_start). Clear the workspace and keep a hand on the user stop. Proceed?
+            </p>
+            <div className="danger-modal-actions">
+              <button autoFocus onClick={() => setHomePromptOpen(false)} type="button">No, cancel</button>
+              <button className="danger" onClick={() => void homeConfirmed()} type="button">Yes, move</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {overridePromptOpen ? (
         <div className="danger-modal-backdrop" role="presentation">
           <div aria-labelledby="mujoco-override-title" aria-modal="true" className="danger-modal" role="dialog">

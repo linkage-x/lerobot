@@ -8366,3 +8366,56 @@ def test_fr3_base_edge_solve_refuses_a_run_it_cannot_solve(tmp_path):
     assert "不是一个 P0 run 名" in gateway._solve_fr3_base_edge(state, {"run": "../run_a"})["error"]
     # the world's own intrinsics are required, not whatever the P0 run used
     assert "内参" in gateway._solve_fr3_base_edge(state, {"run": "run_a"})["error"]
+
+
+# --- FR3 move to start ------------------------------------------------------------
+
+_FAKE_MOVE_TO_START_TOOL = '''
+import sys
+ip = sys.argv[1].split("=", 1)[1]
+if ip == "192.168.11.9":
+    print(f"fr3_move_to_start=FAIL details=Failed to connect to FR3 at {ip}.", file=sys.stderr)
+    raise SystemExit(1)
+print(f"fr3_move_to_start=CONNECT robot_ip={ip}")
+print("fr3_move_to_start=PASS")
+'''
+
+
+def _fr3_move_to_start_state(tmp_path, monkeypatch):
+    state, _ = _fr3_base_edge_repo(tmp_path)
+    tool = tmp_path / "tools" / "fr3" / "fr3_move_to_start_runtime.py"
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text(_FAKE_MOVE_TO_START_TOOL)
+    monkeypatch.setattr(gateway, "_mujoco_replay_python", lambda _state: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_real_preflight_env", lambda _state: dict(os.environ))
+    return state
+
+
+def test_fr3_move_to_start_runs_the_runtime_and_reports_its_failure(tmp_path, monkeypatch):
+    state = _fr3_move_to_start_state(tmp_path, monkeypatch)
+    move = gateway._FR3_MOVE_TO_START_ROUTES["/api/robot/move-to-start"]
+
+    done = move(state, {})
+    assert done["ok"], done["error"]
+    assert done["robotIp"] == "192.168.11.102" and "robot_ip=192.168.11.102" in done["output"]
+
+    failed = move(state, {"robotIp": "192.168.11.9"})
+    assert not failed["ok"] and "Failed to connect to FR3 at 192.168.11.9" in failed["error"]
+    assert "IP" in move(state, {"robotIp": "not-an-ip"})["error"]
+
+
+def test_fr3_move_to_start_refuses_while_the_fci_is_taken(tmp_path, monkeypatch):
+    state = _fr3_move_to_start_state(tmp_path, monkeypatch)
+    move = gateway._fr3_move_to_start
+
+    class Alive:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    state.replay_process, state.replay_process_kind = Alive(), "real"
+    assert "真机 replay" in move(state, {})["error"]
+    state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
+    state.teleop_process = Alive()
+    assert "遥操作" in move(state, {})["error"]

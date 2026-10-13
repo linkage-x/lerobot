@@ -3920,6 +3920,88 @@ _FR3_BASE_EDGE_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[s
 }
 
 
+# --- FR3 move to start --------------------------------------------------------
+#
+# panda_py's move_to_start(): the SDK home pose, joint-space, at its own slow speed.
+# The replay panel's button homes the arm between runs without a terminal. It takes
+# the FCI for the move, so it is refused while anything else holds it.
+
+_FR3_MOVE_TO_START_SCRIPT = Path("tools") / "fr3" / "fr3_move_to_start_runtime.py"
+_FR3_MOVE_TO_START_TIMEOUT_S = 120.0
+_FR3_MOVE_TO_START_LOCK = Lock()
+
+
+def _fr3_fci_holder(state: GatewayState) -> str:
+    """Who else holds the FR3's FCI right now (one client at a time), or ""."""
+    with state.lock:
+        replay = state.replay_process
+        if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+            return "真机 replay 正在运行"
+        teleop = state.teleop_process
+        if teleop is not None and teleop.poll() is None:
+            return "FR3 遥操作正在运行"
+        recorder = state.process
+        if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
+            return "FR3 录制器已连接"
+    return ""
+
+
+def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "robotIp": "", "output": ""}
+    refusal = {"ok": False, "robotIp": robot_ip, "output": ""}
+    holder = _fr3_fci_holder(state)
+    if holder:
+        return {**refusal, "error": f"{holder}，它占着 FR3 的 FCI；先停掉再归位"}
+    if not _FR3_MOVE_TO_START_LOCK.acquire(blocking=False):
+        return {**refusal, "error": "已有一次 move to start 在进行"}
+    try:
+        with state.lock:
+            state.log("warn", f"FR3 move_to_start on {robot_ip}")
+        command = [
+            str(_mujoco_replay_python(state)),
+            str(state.repo_root / _FR3_MOVE_TO_START_SCRIPT),
+            f"--robot-ip={robot_ip}",
+        ]
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(state.repo_root),
+                env=_real_preflight_env(state),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=_FR3_MOVE_TO_START_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            error = f"move_to_start timed out after {_FR3_MOVE_TO_START_TIMEOUT_S:g} s"
+            with state.lock:
+                state.log("warn", f"FR3 move_to_start on {robot_ip}: {error}")
+            return {**refusal, "error": error}
+        except OSError as exc:
+            return {**refusal, "error": str(exc)}
+    finally:
+        _FR3_MOVE_TO_START_LOCK.release()
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    ok = proc.returncode == 0
+    error = "" if ok else next(
+        (line for line in reversed(output.splitlines()) if "fr3_move_to_start=FAIL" in line),
+        output.splitlines()[-1] if output else f"exit {proc.returncode}",
+    )
+    with state.lock:
+        state.log("info" if ok else "warn", f"FR3 move_to_start on {robot_ip}: {'done' if ok else error}")
+    return {"ok": ok, "error": error, "robotIp": robot_ip, "output": output}
+
+
+# Outside the state lock: the move blocks its request for as long as the arm moves.
+_FR3_MOVE_TO_START_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/robot/move-to-start": _fr3_move_to_start,
+}
+
+
 # --- Extrinsics calibration --------------------------------------------------
 #
 # Runs the same three steps the 0804 calibration ran by hand, on an already
@@ -17471,7 +17553,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         tracker_fit = (
-            _TRACKER_MOUNT_FIT_ROUTES.get(path) or _CROSS_CAMERA_ROUTES.get(path) or _FR3_BASE_EDGE_ROUTES.get(path)
+            _TRACKER_MOUNT_FIT_ROUTES.get(path)
+            or _CROSS_CAMERA_ROUTES.get(path)
+            or _FR3_BASE_EDGE_ROUTES.get(path)
+            or _FR3_MOVE_TO_START_ROUTES.get(path)
         )
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the

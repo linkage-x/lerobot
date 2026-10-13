@@ -1967,6 +1967,14 @@ button.danger {
   width: 100%;
 }
 
+.real-robot-home {
+  width: 100%;
+}
+
+.real-robot-home-error {
+  color: #b42318;
+}
+
 .real-replay-log-block {
   background: #11181c;
   border: 1px solid #34424a;

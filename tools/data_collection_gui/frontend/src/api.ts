@@ -27,6 +27,7 @@ import type {
   CrossCameraResponse,
   WorldFrameResponse,
   Fr3BaseEdgeResponse,
+  Fr3MoveToStartResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -1362,6 +1363,26 @@ export class DataCollectionGuiApi {
       const payload = (await response.json()) as Partial<Fr3BaseEdgeResponse>;
       if (!response.ok && !payload.runs) return null;
       return payload as Fr3BaseEdgeResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  // Homes the real FR3; the request lasts as long as the move. null: gateway unreachable.
+  async moveFr3ToStart(robotIp: string): Promise<Fr3MoveToStartResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/move-to-start`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ robotIp })
+      });
+      const payload = (await response.json()) as Partial<Fr3MoveToStartResponse>;
+      return {
+        ok: response.ok && Boolean(payload.ok),
+        error: String(payload.error ?? (response.ok ? "" : `HTTP ${response.status}`)),
+        robotIp: String(payload.robotIp ?? robotIp),
+        output: String(payload.output ?? "")
+      };
     } catch {
       return null;
     }

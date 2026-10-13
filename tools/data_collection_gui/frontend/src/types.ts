@@ -1338,6 +1338,14 @@ export type Fr3BaseEdgeResponse = {
   captureCommand?: string;
 };
 
+/** POST /api/robot/move-to-start: panda_py move_to_start() on one FR3, run to completion. */
+export type Fr3MoveToStartResponse = {
+  ok: boolean;
+  error: string;
+  robotIp: string;
+  output: string;
+};
+
 // Guided calibration: per-camera intrinsics sweeps, then one shared extrinsics
 // sweep. They cannot be merged -- intrinsics are constrained by how much of one
 // camera's frame the board reaches, extrinsics by how often several cameras see
