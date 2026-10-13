@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>激光跟踪仪独立 GT：3 mm TCP 轨迹精度验证 · 阶段性总结（截至 2026-10-13）</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 20px 60px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:20px;padding:28px 32px;box-shadow:var(--shadow);margin-bottom:20px}
+  .hero h1{margin:0 0 8px;font-size:26px}
+  .hero p{margin:4px 0;color:#d1d5db}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:20px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:12px 16px;border-radius:10px;margin:10px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .done{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:1px 5px;font-size:.92em}
+  ul{margin:6px 0;padding-left:22px} li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>激光跟踪仪独立 GT：3 mm TCP 轨迹精度验证 · 阶段性总结</h1>
+  <p>阶段性总结 · 结论截至 <b>2026-10-13</b>，有新数据会更新 · 覆盖 2026-09-21 起的整条线</p>
+  <p class="small" style="color:#9ca3af">口径：TCP 位置，按 p95，不含姿态（09-22 定）。详细数据与推导见 <code>docs/box_umi_laser_tracker_gt_roadmap.html</code>。</p>
+</div>
+
+<div class="card">
+  <h2>结论（截至 10-13）</h2>
+  <div class="callout ok"><b>这把「尺子」已经立住。</b>跟踪仪 → 相机 world 的站位认证 rms 0.74 mm。跟踪仪流 1 kHz 零缺口，相机时间偏置在三段独立录制上样本外复现。GT 链自身的误差远小于 3 mm，可以用来裁决 3 mm。</div>
+  <div class="callout"><b>相机 TCP 轨迹：只在相机覆盖充足时满足 3 mm。</b>
+    <ul>
+      <li>09-28 的 9 路自由运动，扣掉 −5 ms 时间偏置后 p50 0.84、p95 2.02 mm。</li>
+      <li>10-08 的直线往返，≥ 4 台相机融合时 p50 1.8–2.4 mm。</li>
+      <li>只剩 3 台相机时升到 6–9 mm，整段 p95 9–11 mm。</li>
+    </ul>
+    误差的主变量是「哪几台相机看见 cube」，不是运动方向，也不是跟踪仪。</div>
+  <div class="callout warn"><b>所以「用激光建 GT、量出第一轮数」可以告一段落。</b>剩下的不达标项都落在相机侧（覆盖、外参一致性）、生产配置（时间偏置未上线），以及下面这个回放端到端的恒定偏差上，不再是 GT 侧的问题。注意这是诊断结论，还不是认证：pivot 球窝 σ 0.31 mm，没过 0.10 mm 的认证门槛；left 侧没测。</div>
+  <div class="callout ok"><b>10-13 更新：恒定偏差查明是 TCP 定义差，消掉后回放端到端 p95 15.7 → 7.7 mm。</b>URDF 的 TCP 在实物上基本就在指尖端：闭合时法兰到鼻尖尺量约 175 mm，而 URDF 网格给 184 mm。相机轨迹的 TCP 是球窝中心，在鼻尖后 12.2 mm。激光量得两者沿工具轴差 10.3 mm，已加成 <code>corenetic_socket_ee</code>，回放改驱动它。剩下的：
+    <ul>
+      <li>约 4.6 mm 恒定偏差，来自 world → FR3 基座的注册边（10-09 单 tag 手眼）；</li>
+      <li>FR3 执行误差，p95 3.8 mm；</li>
+      <li>UMI 标签扣掉恒定后，p95 2.35 mm。</li>
+    </ul>
+    <b>7.7 mm 不是「UMI 轨迹精度」</b>：它含 FR3 执行误差，只有一条 18 s 的慢速轨迹，常量的 z 也有一部分是用这条录制拟合的。下面这段 10-12 的原文保留，其中两种解释已由 10-13 定案为第一种。</div>
+  <div class="callout warn"><b>回放端到端第一个数：p95 约 12 mm，几乎全是一个约 10.5 mm 的恒定偏差。</b>拿 10-09 录制时人手的实际运动（激光）和 10-12 FR3 回放出来的实际运动（激光）直接比。这个偏差基本沿工具轴，扣掉后只剩 p95 2.6–3.1 mm。它最可能来自两处之一：
+    <ul>
+      <li>TCP 定义不一致：相机轨迹的 TCP 是 pivot 插件的球窝中心，FR3 驱动的是 URDF 里的闭合指尖点，两点之间的偏距一直没量（roadmap U1）。</li>
+      <li>相机 world 和 FR3 基座之间的注册误差：两种换算在轨迹处差约 7 mm。</li>
+    </ul>
+    这段录制可用的帧太少（13%，姿态只摆了 8°），分不开这两种。</div>
+</div>
+
+<div class="card">
+  <h2>关键数字</h2>
+  <table>
+    <tr><th>量</th><th>结果</th><th>出处</th><th>状态</th></tr>
+    <tr><td>站位（跟踪仪 ↔ 相机 world）</td><td class="num">rms 0.74 mm，留一最大 0.43 mm</td><td>09-28 W3c</td><td><span class="badge done">认证通过</span></td></tr>
+    <tr><td>相机 TCP 轨迹，9 路自由运动</td><td class="num">p50 0.84 / p95 2.02 mm（Δt −5 ms）<br/>p95 3.12 mm（Δt 0，即生产现状）</td><td>09-28 W3c</td><td><span class="badge done">&lt; 3 mm</span></td></tr>
+    <tr><td>相机 TCP 轨迹，直线往返</td><td class="num">≥ 4 台：p50 1.8–2.4 mm<br/>仅 [08,09,14]：6–9 mm；整段 p95 9.3 / 11.5 mm</td><td>10-08 W3e</td><td><span class="badge warn">取决于覆盖</span></td></tr>
+    <tr><td>相机时间偏置</td><td class="num">−5 ms（三段样本外最优 −4.4 ms）</td><td>09-28 / 09-30 / 10-08</td><td><span class="badge warn">只进了 metrology，生产仍 0</span></td></tr>
+    <tr><td>FR3 读回位姿 vs 激光</td><td class="num">0.51 mm RMS（全程）</td><td>10-12 W3f</td><td><span class="badge done">可当 0.5 mm 参考</span></td></tr>
+    <tr><td>FR3 回放执行误差（激光 vs 指令）</td><td class="num">7.8 → 5.3 → <b>2.7 mm</b> RMS，p95 4.2–4.8 mm</td><td>10-10 → 10-12 W3f</td><td><span class="badge done">10-12 压下来</span></td></tr>
+    <tr><td>FR3 回放 vs 原始录制（激光 vs 未平滑的相机轨迹）</td><td class="num">RMS 2.8–2.9，p95 4.3–4.8，max 8.1 mm（lead 3）</td><td>10-12 W3f</td><td><span class="badge done">≈ 执行误差</span></td></tr>
+    <tr><td>端到端：人手原始运动 vs FR3 回放（激光对激光）</td><td class="num">p95 12.2–12.5 mm，其中恒定偏差约 10.5 mm；扣掉后 p95 2.6–3.1 mm<br/><span class="small">只有 120 帧（13%），全是静止或慢速</span></td><td>10-09 录制 × 10-12 回放 W3f</td><td><span class="badge done">10-13 查明</span></td></tr>
+    <tr><td>端到端，回放驱动 EE（10-13 录制，换坐标系前）</td><td class="num">RMS 12.6，p95 15.7 mm；TCP 系恒定 (1.6, 0.8, −10.3) mm<br/><span class="small">1060 帧全程有光，姿态跨度 11.6°</span></td><td>10-13 <code>031102Z</code> W3f</td><td><span class="badge done">TCP 定义差</span></td></tr>
+    <tr><td>端到端，回放驱动球窝坐标系 <code>corenetic_socket_ee</code></td><td class="num">RMS 5.35，p95 7.74 mm（预测 5.5 / 8.4）<br/><span class="small">执行 p95 3.76；激光 vs FK 0.47</span></td><td>10-13 <code>034118Z</code> W3f</td><td><span class="badge warn">注册边约 4.6 mm 待处理</span></td></tr>
+    <tr><td>UMI 标签 vs 真值，在 FR3 基座系（不含执行，不用站位）</td><td class="num">RMS 4.79，p95 6.50 mm；恒定约 4.6，扣掉后 p95 2.35</td><td>10-13 W3f</td><td><span class="badge warn">单条轨迹，诊断</span></td></tr>
+  </table>
+  <p class="small">TCP 轨迹的数都是 right cube、单次站位下的诊断值。TCP 定义为 pivot 插件 v2 的球窝中心，偏距 d = 0 按定义成立。「原始录制」那一行在 FR3 基座系里比，量的是机械臂复现录制轨迹有多准，不含相机录制误差。回放执行的是离线平滑后的轨迹，它和原始轨迹差 RMS 0.81、p95 1.41 mm。</p>
+</div>
+
+<div class="card">
+  <h2>最近的进展（10-08 – 10-13）</h2>
+  <ul>
+    <li><b>10-08 光轴对照</b>：沿激光光束、垂直于光束各录一段直线往返。结论：
+      <ul>
+        <li>误差由相机组合决定，与运动方向无关。同一组 [08,09,14] 在两个方向上的偏置几乎相同。</li>
+        <li>沿光束方向的分量最小，610–1141 mm 量程内看不到跟踪仪测距的尺度误差。</li>
+      </ul></li>
+    <li><b>10-10 FR3 真机回放第一次带激光</b>：FR3 自己报的位姿和激光只差 0.27 mm。回放误差 7.8 mm 拆开是两部分：5.5 mm 向下的固定下沉，以及 150 ms 的跟随滞后。分析做成了 Episode Replay 页上的一键按钮。</li>
+    <li><b>10-12 末端负载辨识</b>：根因是 Desk 里的负载设轻了，设的是 0.7496 kg，实际 1.1108 kg。辨识后给 Desk 做了带 SMR / 不带 SMR 两份配置，闭环验证通过。重采回放后下沉消失，误差 7.8 → 5.3 mm。详见单独的实验报告。</li>
+    <li><b>10-12 夹爪模型换成厂商 v2 包</b>：TCP 从法兰下 191 mm 改为 171.99 mm。同时加了旧链接名的兼容帧，修好了回放和 EE 轨迹生成在新模型下的崩溃。MuJoCo 校验现在和模型文件绑定，模型变了就必须重跑。</li>
+    <li><b>10-12 消掉 150 ms 滞后</b>：
+      <ul>
+        <li>原因：控制器只收位置，阻尼项把机械臂拖慢了 D/K = 83 ms；20 Hz 的阶梯目标让轨迹生成器每一步都刹停，又多一截。</li>
+        <li>做法：指令提前 3 帧发。离线模型在实测前就预测了 2.6–2.7 mm，两次实测 2.80 / 2.68 mm，滞后归零。</li>
+        <li>GUI 新增 Command lead 选项，默认值改为 3。</li>
+      </ul></li>
+    <li><b>10-12 端到端首测</b>：10-09 录制时跟踪仪也开着，但两个问题让只有 120 帧（13%）可用。
+      <ul>
+        <li>跟踪仪数据流每 5 s 只有约 1 s，是 RadianCAL 挤占的老问题。</li>
+        <li>光束大部分时间停在跟踪仪的回位窝上，没有对着夹爪上的 SMR。</li>
+      </ul>
+      在这 120 帧上做了上面那张表里的比较。</li>
+    <li><b>10-13 端到端第二测，恒定偏差查明并消掉</b>：
+      <ul>
+        <li>录制时关掉了 RadianCAL，光束全程在 SMR 上，1060 帧都可用。</li>
+        <li>偏差在 TCP 系里固定（−10.3 mm 沿工具轴），所以是 TCP 定义差，不是注册。尺量证实 URDF 的 TCP 在指尖端、球窝在鼻尖后 12.2 mm；10-12 晚按 URDF 网格做的 CAD 推算作废（网格沿工具轴长约 9 mm）。</li>
+        <li>加了 <code>corenetic_socket_ee</code>（EE −10.3 mm），真机回放、MuJoCo 预览、IK QC 都驱动它。重放同一条：端到端 p95 15.7 → 7.74 mm，和预测一致。</li>
+        <li>同场修了回放夹爪不动：录制时两台 BOX 都在线，列名带设备号前缀，网关找不到开度。现在按「排除臂上那台」取手持的那台；修后夹爪按录制闭合。</li>
+      </ul></li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>截至 10-13 没结案的，以及归谁</h2>
+  <table>
+    <tr><th>事项</th><th>现状</th><th>归属 / 下一步</th></tr>
+    <tr><td>覆盖不足的区域超 3 mm</td><td>只剩 3 台相机时 6–9 mm，单台相机之间相差 ±10 mm</td><td>相机侧：补视角，保证任一点 ≥ 4 台；用盘上的 1001 外参重跑对比</td></tr>
+    <tr><td>生产时间偏置</td><td>−5 ms 已证实，生产录制器仍是 0（单改相机会让 BOX 配帧变差）</td><td>相机时刻 −E/2 和逐 BOX 的延迟要一起改；BOX 延迟需要重测</td></tr>
+    <tr><td>认证条件</td><td>right 侧 pivot σ 0.31 mm（门槛 0.10）；新插件重夹重复性未测；left 仍用 0825 常量</td><td>补 left 侧 pivot，以及新插件重夹 3 次</td></tr>
+    <tr><td>TCP 姿态</td><td>未测（3 mm 只认位置）</td><td>需要时再上三窝或 STS</td></tr>
+    <tr><td>world → FR3 基座注册边</td><td>10-13 回放端到端剩约 4.6 mm 恒定偏差，是这条边在这块工作区的误差（10-12 的约 10.5 mm 已查明是 TCP 定义差、已消掉）</td><td>当天采一次驻点集重认站位，结合回放 FK 拟合用激光求边，再在另一条轨迹上 held-out 验收</td></tr>
+    <tr><td>回放端到端约 10.5 mm 的恒定偏差 <span class="badge done">10-13 结案</span></td><td>沿工具轴；分不开是 TCP 定义不一致（球窝中心 vs URDF 指尖点）还是 world ↔ 基座注册误差</td><td>先从 CAD 量出球窝中心到 URDF 指尖点的偏距（U1），对得上就把它写进标定或回放的目标帧；再录一段带激光、姿态摆幅 ≥ 30° 的轨迹做验证。录制时关掉 RadianCAL，光束要在 SMR 上</td></tr>
+    <tr><td>FR3 回放剩下的 2.5 mm</td><td>每次几乎一样（两次只差 0.62 mm），主要随运动方向变化（摩擦或线缆拖拽）</td><td>按上一次实测修正指令预计能到约 1 mm，暂不做；某个任务因 2–3 mm 回放失败，或要报 ≤ 2 mm 回放精度时再做</td></tr>
+  </table>
+</div>
+
+</div>
+</body>
+</html>
