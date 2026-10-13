@@ -4387,6 +4387,34 @@ button.danger {
   padding: 8px 10px;
 }
 
+/* The last episode's laser verdict. A discarded take is red: its files are
+   already gone and the operator records it again now. */
+.laser-episode-banner {
+  border-left: 3px solid #d79b00;
+  border-radius: 4px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+}
+
+.laser-episode-error {
+  background: #fde8e7;
+  border-left-color: #b42318;
+  color: #7a1a12;
+  font-weight: 600;
+}
+
+.laser-episode-warning {
+  background: #fff4d6;
+  color: #6b4e00;
+}
+
+.laser-episode-ok {
+  background: transparent;
+  border-left-color: #2e7d32;
+  color: #2e5e31;
+  font-size: 13px;
+}
+
 /* Homed is its own line: "not homed" and "beam off the SMR" need different
    actions, and W2 looked green while never having homed. */
 .tracker-home-state {

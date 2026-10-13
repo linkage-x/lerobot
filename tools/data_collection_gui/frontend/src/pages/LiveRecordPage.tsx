@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession } from "../types";
+import { laserEpisodeBanner } from "../laserEpisodeVerdict";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
@@ -229,6 +230,7 @@ export function RecordingPanel({
     : "";
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
+  const laserBanner = status.laserTracker ? laserEpisodeBanner(status.laserTrackerEpisode) : null;
   const isGmsl = config.rigType === "gmsl2";
   const panelTitle = backendPicker ? "FR3 Record" : isGmsl ? "GMSL2 Record" : "Handheld Record";
 
@@ -302,6 +304,12 @@ export function RecordingPanel({
         <Metric label="PID" value={status.pid ?? "none"} />
       </div>
       <p className="panel-note">{status.message}</p>
+      {laserBanner && (
+        <p className={`laser-episode-banner laser-episode-${laserBanner.tone}`}>
+          {laserBanner.tone === "error" ? "⛔ " : laserBanner.tone === "warning" ? "⚠️ " : "✅ "}
+          {laserBanner.text}
+        </p>
+      )}
       <SyncAuditPanel status={status} />
       {logLines && logLines.length > 0
         ? <RecorderLogStream lines={logLines} />

@@ -205,6 +205,10 @@ class RecordingStatus:
     laserTrackerHomed: bool = False
     # Homed, but the beam broke since: the current lock's range is not absolute.
     laserTrackerBeamBroken: bool = False
+    # The laser verdict on the last episode stopped (recorder's LT_EPISODE line):
+    # usable / coverage / max_gap_ms / nest fractions, error, and whether the
+    # recorder discarded the episode for it. Empty until one has been stopped.
+    laserTrackerEpisode: dict[str, Any] = field(default_factory=dict)
     # Which physical camera is on each port, read by the recorder off each
     # module's EEPROM at Connect ({cam_NN: {serial, answered}}). cam_NN is the
     # cable's port, not the camera: a swapped cable silently hands one camera
@@ -14284,6 +14288,7 @@ def _connect_recorder(
     state.recording.laserTrackerReady = False
     state.recording.laserTrackerHomed = False
     state.recording.laserTrackerBeamBroken = False
+    state.recording.laserTrackerEpisode = {}
     state.recording.cameraIdentity = {}
     state.recording.cameraIdentityMismatches = []
     state.recording.cameraIdentityExpectedFrom = ""
@@ -15278,6 +15283,19 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         if isinstance(identity, dict):
             _apply_camera_identity(state, identity)
         return
+    if output.startswith("LT_EPISODE "):
+        try:
+            verdict = json.loads(output.removeprefix("LT_EPISODE "))
+        except ValueError:
+            return
+        if isinstance(verdict, dict):
+            state.recording.laserTrackerEpisode = verdict
+            if verdict.get("rejected"):
+                state.log(
+                    "error",
+                    f"Episode {verdict.get('episode')} discarded: laser data incomplete -- {verdict.get('error')}",
+                )
+        return
     if output.startswith("LT_SEGMENT "):
         try:
             seg = json.loads(output.removeprefix("LT_SEGMENT "))
@@ -15313,7 +15331,13 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         # The identity line is reported once, at Connect, and must survive every
         # status line that follows -- which instrument took the data is a
         # property of the session, not its latest event.
-        if output.startswith("Laser tracker: ") and "session" not in low and not low.startswith("warning"):
+        if low.removeprefix("warning: ").startswith("laser tracker episode "):
+            # A note on the episode just stopped (LT_EPISODE carries its verdict),
+            # never the session's state. Read as "unavailable" it refused the next
+            # StartEpisode after every dwell -- "the target did not move" is what
+            # a station capture is meant to look like (2026-10-13).
+            pass
+        elif output.startswith("Laser tracker: ") and "session" not in low and not low.startswith("warning"):
             state.recording.laserTrackerDevice = output[len("Laser tracker: "):].strip()[:200]
         elif low.startswith("warning:"):
             state.recording.laserTrackerState = "error"

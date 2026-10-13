@@ -132,6 +132,24 @@ export type RecordingStatus = {
   laserTrackerHomed?: boolean;
   /** Homed, but the beam broke since: the current lock has no absolute range. */
   laserTrackerBeamBroken?: boolean;
+  // The laser verdict on the last episode stopped; see LaserEpisodeVerdict.
+  laserTrackerEpisode?: LaserEpisodeVerdict;
+};
+
+/** Recorder's LT_EPISODE line: how much of the episode has a usable laser point. Fractions are -1 when unread. */
+export type LaserEpisodeVerdict = {
+  episode?: number;
+  // The recorder discarded the episode for it (its files are already deleted).
+  rejected?: boolean;
+  // Saved at all: an operator Discard (or another gate) leaves it false without `rejected`.
+  kept?: boolean;
+  incomplete?: boolean;
+  window_s?: number;
+  usable?: number;
+  coverage?: number;
+  max_gap_ms?: number;
+  nest?: number;
+  error?: string;
 };
 
 export type MarkerTcpSample = {

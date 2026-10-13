@@ -71,6 +71,153 @@ _SSH_BASE = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHost
 _PROGRESS_RE = re.compile(r"^\s*rows \d+\s+dropped \d+\s*$")
 _OP_MODES = ("Idle", "Tracking", "Position", "TrackIdle", "Searching", "Internal")
 
+# Shared head of the snippets that run on the capture PC: argv = rt.csv, tail
+# bytes, seconds-ago of the window's start and end, <snippet's own>, [QPC
+# frequency, QPC now -- tests only]. Leaves ``rs``: the rows whose QPC stamp falls
+# in the window on the PC's own clock, so a stream in gaps cannot stretch the
+# window back into whatever came before it (as "the last N rows" does).
+# Columns: 1 ctrl_ts_ms, 2 qpc, 5 dist_mm, 6-8 x/y/z, 9 valid, 10 tracking,
+# 12 op_mode, 18 ranged (absent on v1 streams, which ranged nothing separately).
+# No double quotes and no percent signs: these travel inside cmd's "...".
+_QPC_WINDOW_PRELUDE = (
+    "import sys,collections,ctypes;"
+    "A=sys.argv;"
+    "fq,now=(int(A[6]),int(A[7])) if len(A)>7 else (lambda k,f,c:(k.QueryPerformanceFrequency("
+    "ctypes.byref(f)),k.QueryPerformanceCounter(ctypes.byref(c)),f.value,c.value)[2:])("
+    "ctypes.windll.kernel32,ctypes.c_int64(),ctypes.c_int64());"
+    "fh=open(A[1],'rb');fh.seek(0,2);n=fh.tell();fh.seek(max(0,n-int(A[2])));"
+    "ls=fh.read().decode('ascii','replace').splitlines()[1:];"
+    "a=now-int(float(A[3])*fq);b=now-int(float(A[4])*fq);"
+    "T=lambda v:v.strip() in ('1','true');"
+    "rs=[r for r in (l.split(',') for l in ls if l.count(',')>=16)"
+    " if r[2].strip().isdigit() and a<=int(r[2])<=b];"
+)
+
+# argv[5] = nest distance (mm). One line out: rows, distinct controller ms,
+# valid, tracking, modal op_mode, min/max distance of the ranged valid points,
+# how many of those sit on the nest and off it, the longest gap (ms, window
+# edges included), window length (s).
+_EPISODE_STATS_CODE = _QPC_WINDOW_PRELUDE + (
+    "N=float(A[5]);"
+    "vr=[r for r in rs if T(r[9])];"
+    "d=[float(r[5]) for r in vr if len(r)<19 or T(r[18])];"
+    "q=[a]+[int(r[2]) for r in rs]+[b];"
+    "g=max(y-x for x,y in zip(q,q[1:]))*1000.0/fq;"
+    "m=collections.Counter(r[12].strip() for r in rs).most_common(1);"
+    "print(len(rs),len(set(r[1] for r in rs)),len(vr),sum(1 for r in rs if T(r[10])),"
+    "m[0][0] if m else -1,min(d) if d else -1,max(d) if d else -1,"
+    "sum(1 for x in d if x<N),sum(1 for x in d if x>=N),round(g,1),round((b-a)/fq,3))"
+)
+
+# argv[5] = at most this many points. One line out: "x y z;x y z;..." (mm) of the
+# ranged valid rows, thinned evenly.
+_SEGMENT_POINTS_CODE = _QPC_WINDOW_PRELUDE + (
+    "vr=[r for r in rs if T(r[9]) and (len(r)<19 or T(r[18]))];"
+    "k=max(1,len(vr)//int(A[5]));"
+    "print(';'.join(r[6]+' '+r[7]+' '+r[8] for r in vr[::k]))"
+)
+
+
+def parse_segment_points(stdout: str) -> list[tuple[float, float, float]]:
+    """``_SEGMENT_POINTS_CODE``'s line as points; malformed items are skipped."""
+    out: list[tuple[float, float, float]] = []
+    lines = stdout.strip().splitlines()
+    for item in lines[-1].split(";") if lines else []:
+        try:
+            x, y, z = (float(v) for v in item.split())
+        except ValueError:
+            continue
+        out.append((x, y, z))
+    return out
+
+
+def parse_episode_stats(stdout: str) -> dict[str, Any]:
+    """Fractions of one episode's window from ``_EPISODE_STATS_CODE``'s line; rows -1 if unreadable."""
+    out: dict[str, Any] = {
+        "rows": -1, "valid": -1.0, "tracking": -1.0, "mode": -1,
+        "dist_min_mm": -1.0, "dist_max_mm": -1.0, "window_s": -1.0, "coverage": -1.0,
+        "max_gap_ms": -1.0, "nest_fraction": -1.0, "usable_fraction": -1.0,
+    }
+    try:
+        f = stdout.strip().splitlines()[-1].split()
+        rows, distinct, valid, tracking, mode = (int(x) for x in f[:5])
+        dmin, dmax = float(f[5]), float(f[6])
+        nest, usable = int(f[7]), int(f[8])
+        gap_ms, window_s = float(f[9]), float(f[10])
+    except (ValueError, IndexError):
+        return out
+    if window_s <= 0.0:
+        return out
+    expected = window_s * 1000.0  # one row per controller millisecond
+    per_row = 1.0 / rows if rows > 0 else 0.0
+    out.update(
+        rows=rows,
+        valid=valid * per_row,
+        tracking=tracking * per_row,
+        mode=mode,
+        dist_min_mm=dmin,
+        dist_max_mm=dmax,
+        window_s=window_s,
+        coverage=min(1.0, distinct / expected),
+        max_gap_ms=gap_ms,
+        nest_fraction=min(1.0, nest / expected),
+        usable_fraction=min(1.0, usable / expected),
+    )
+    return out
+
+
+def episode_verdict(
+    st: dict[str, Any], *, min_usable_fraction: float, nest_max_mm: float, gimbal_mode: str = ""
+) -> tuple[str, bool]:
+    """``(error, incomplete)`` for one episode's window stats.
+
+    ``incomplete`` is the gate: too little of the episode has a ranged point off the
+    nest for it to be laser GT. The error names the cause the operator can fix.
+    A window that could not be read is reported but is not called incomplete --
+    unknown is not the same as bad, and the episode is not thrown away for it.
+    """
+    if st["rows"] < 0:
+        return ("could not read this episode's tracker rows from the capture PC: "
+                "check it after Disconnect, before using it as GT", False)
+    valid, tracking, usable = st["valid"], st["tracking"], st["usable_fraction"]
+    if st["rows"] > 0 and tracking < 0.5:
+        # The failure that looks like success: a full-rate stream of nothing at all.
+        return (f"tracker not measuring during this episode: gimbal in "
+                f"{gimbal_mode or 'unknown mode'} "
+                f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%)", True)
+    if tracking >= 0.5 > valid and usable < 0.05:
+        # Tracking without measuring. The gimbal follows the SMR and az/el/dist keep
+        # updating while x/y/z are zeroed, so every liveness check passes and the
+        # episode has no usable point in it. 2026-09-20 recorded two episodes this
+        # way: the distance reference Home left behind does not survive a beam
+        # break, and only a running measurement routine restores it.
+        return (f"tracker tracked but did not measure: valid {valid * 100:.0f}% "
+                f"of {st['rows']} rows against tracking {tracking * 100:.0f}% "
+                "-- is the measurement routine running (--measure-ms)?", True)
+    if usable < min_usable_fraction:
+        head = (f"only {usable * 100:.0f}% of this {st['window_s']:.1f} s episode has a "
+                f"ranged laser point off the home nest (need {min_usable_fraction * 100:.0f}%)")
+        if st["coverage"] < min_usable_fraction:
+            return (f"{head}: the stream covered {st['coverage'] * 100:.0f}% of it, longest gap "
+                    f"{st['max_gap_ms'] / 1000:.1f} s -- is RadianCAL-Pro or another tracker "
+                    "client running on the capture PC?", True)
+        if st["nest_fraction"] > 1.0 - min_usable_fraction:
+            return (f"{head}: the beam was on the home nest (< {nest_max_mm:.0f} mm from the "
+                    f"head) for {st['nest_fraction'] * 100:.0f}% of it -- carry the SMR to the "
+                    "target with the beam locked before StartEpisode", True)
+        return (f"{head}: the beam was off the SMR for most of it (valid {valid * 100:.0f}% of rows, "
+                f"tracking {tracking * 100:.0f}%) -- keep the line of sight clear and move slower; "
+                "after a break the tracker re-homes to the nest", True)
+    span = st["dist_max_mm"] - st["dist_min_mm"] if st["dist_min_mm"] >= 0.0 else -1.0
+    if 0.0 <= span < 5.0:
+        # Valid, dense, and all at one distance. Not an error -- a dwell recording
+        # for fit_tracker_mount looks exactly like this -- but it must not pass for
+        # a trajectory.
+        return (f"every valid sample is at {st['dist_min_mm']:.0f} mm "
+                f"(span {span:.1f} mm): the target did not move -- correct "
+                "for a dwell, useless as a trajectory", False)
+    return ("", False)
+
 # What a failure means right after the controller has been power-cycled, which
 # is exactly when these codes stop meaning what they usually mean.  2026-09-21,
 # after an unplanned power cut, four Connects in a row walked through the whole
@@ -170,6 +317,17 @@ class LaserTrackerConfig:
     # 2026-09-20 behaviour and is kept only so the two can be compared without
     # rebuilding the capture PC's binary.
     measure_ms: int = 1
+    # Episode gate. An episode is laser GT only where the stream has a ranged
+    # point off the home nest; below this fraction of its duration the recorder
+    # discards it instead of saving it (2026-10-09 ep0: 13% -- RadianCAL-Pro left
+    # the stream ~1 s in every 5 -- saved, and found three days later). 0.8 is
+    # what validate_against_tracker asks of the paired camera frames anyway.
+    # Calibration captures are never discarded by it: their own checks decide.
+    min_usable_fraction: float = 0.8
+    discard_incomplete: bool = True
+    # Home leaves the beam on the nest ~158 mm from the head; nothing measured
+    # that close is the target.
+    nest_max_mm: float = 300.0
     land: bool = True
     note: str = ""
 
@@ -228,6 +386,20 @@ class EpisodeRecord:
     beam_window_rows: int = 0
     beam_dist_min_mm: float = -1.0
     beam_dist_max_mm: float = -1.0
+    # The episode's window is cut on the capture PC's own clock (QPC), not as
+    # "the last N rows": with the stream in gaps the last 15341 rows of
+    # 2026-10-09 ep0 reached 104 s back, read 100% valid, and passed an episode
+    # whose own 15.3 s held 13% of a stream.
+    beam_window_s: float = -1.0
+    stream_coverage: float = -1.0  # distinct controller ms / window ms
+    max_gap_ms: float = -1.0  # longest stretch without a row, window edges included
+    nest_fraction: float = -1.0  # ranged points on the home nest / window ms
+    usable_fraction: float = -1.0  # ranged points off the nest / window ms
+    # Below min_usable_fraction: not laser GT. The recorder discards such an
+    # episode unless it is a calibration capture.
+    incomplete: bool = False
+    discarded: bool = False
+    discard_reason: str = ""
     error: str = ""
 
 
@@ -323,8 +495,15 @@ class LaserTrackerSession:
 
     def _run(self, remote_cmd: str, *, timeout_s: float = 30.0) -> subprocess.CompletedProcess[str]:
         # Captured as bytes and decoded here rather than text=True: see _decode.
+        # stdin=DEVNULL is load-bearing: this runs inside the recorder, whose stdin
+        # is the GUI's command channel, and ssh switches the stdin it inherits to
+        # non-blocking. A Save/Discard arriving during the call then leaves the
+        # recorder's next readline() an EAGAIN that reads as "" -- the GUI closed
+        # stdin -- and the whole session quits (2026-10-13 10:41, right after a
+        # Discard pressed during the episode-stop tracker check).
         raw = subprocess.run(
             [*self._ssh_argv(), remote_cmd],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=timeout_s,
         )
@@ -401,7 +580,10 @@ class LaserTrackerSession:
         script = self.repo_root / self.cfg.responder_script
         if not script.exists():
             raise RuntimeError(f"responder script not found: {script}")
-        subprocess.run([str(script), "start"], capture_output=True, text=True, errors="replace", timeout=30)
+        subprocess.run(
+            [str(script), "start"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", timeout=30,
+        )
 
     def _spawn_probe(self) -> bool:
         out = f"{self.win_dir}\\{self.session_id}.sync.csv"
@@ -676,42 +858,49 @@ class LaserTrackerSession:
             "dist_max_mm": dmax,
         }
 
-    def segment_points(self, *, last_rows: int, max_points: int = 3000) -> list[tuple[float, float, float]]:
-        """x/y/z (mm) of the valid samples among the last ``last_rows``, thinned
-        on the capture PC to at most ``max_points`` so the reply stays small.
+    def episode_window_stats(self, *, ago_start_s: float, ago_end_s: float) -> dict[str, Any]:
+        """The stream between ``ago_start_s`` and ``ago_end_s`` seconds before now, on the PC's clock.
+
+        Rows are picked by their QPC stamp against the capture PC's QueryPerformanceCounter
+        at the moment of the call, so a stream in gaps cannot stretch the window back into
+        whatever came before the episode. The ssh round trip shifts it earlier by its own
+        latency (well under a second). ``rows`` is -1 when the read failed.
+        """
+        budget = int((max(ago_start_s, 0.0) * 1000.0 + 3000.0) * self._BYTES_PER_ROW)
+        res = self._run(
+            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{_EPISODE_STATS_CODE}" '
+            f"{self.session_id}.rt.csv {budget} {ago_start_s:.3f} {ago_end_s:.3f} {self.cfg.nest_max_mm:g}",
+            timeout_s=45,
+        )
+        st = parse_episode_stats(res.stdout or "")
+        mode = st.pop("mode")
+        if 0 <= mode < len(_OP_MODES):
+            self.gimbal_mode = _OP_MODES[mode]
+        return st
+
+    def segment_points(
+        self, *, ago_start_s: float, ago_end_s: float, max_points: int = 3000
+    ) -> list[tuple[float, float, float]]:
+        """x/y/z (mm) of the valid samples between ``ago_start_s`` and ``ago_end_s``
+        seconds before now on the capture PC's clock, thinned there to at most
+        ``max_points`` so the reply stays small.
 
         Only for the capture-time geometry preview (``tracker_live_geometry``);
         the solves read the landed stream. A v2 row whose lock is not yet ranged
-        (``ranged`` column 0) is left out, as the solves leave it out.
+        (``ranged`` column 0) is left out, as the solves leave it out. Cut by
+        time, not as the last N rows: with the stream in gaps those reach back to
+        the previous pose and blend it into this one's dwell point or pivot gain.
         """
-        if last_rows <= 0:
+        if ago_start_s <= ago_end_s:
             return []
-        budget = (last_rows + 2) * self._BYTES_PER_ROW
-        code = (
-            "import sys;"
-            "f=open(sys.argv[1],'rb');"
-            "f.seek(0,2);n=f.tell();f.seek(max(0,n-int(sys.argv[2])));"
-            "ls=f.read().decode('ascii','replace').splitlines()[1:];"
-            "rs=[l.split(',') for l in ls if l.count(',')>=16][-int(sys.argv[3]):];"
-            "vr=[r for r in rs if r[9].strip() in ('1','true')"
-            " and (len(r)<19 or r[18].strip() in ('1','true'))];"
-            "k=max(1,len(vr)//int(sys.argv[4]));"
-            "print(';'.join(r[6]+' '+r[7]+' '+r[8] for r in vr[::k]))"
-        )
+        budget = int((max(ago_start_s, 0.0) * 1000.0 + 3000.0) * self._BYTES_PER_ROW)
         res = self._run(
-            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{code}" '
-            f'{self.session_id}.rt.csv {budget} {last_rows} {max(1, int(max_points))}',
+            f'cd /d "{self.win_dir}" && {self.cfg.python} -c "{_SEGMENT_POINTS_CODE}" '
+            f"{self.session_id}.rt.csv {budget} {ago_start_s:.3f} {ago_end_s:.3f} {max(1, int(max_points))}",
             timeout_s=45,
         )
-        out: list[tuple[float, float, float]] = []
-        lines = (res.stdout or "").strip().splitlines()
-        for item in (lines[-1].split(";") if lines else []):
-            try:
-                x, y, z = (float(v) for v in item.split())
-            except ValueError:
-                continue
-            out.append((x, y, z))
-        return out
+        return parse_segment_points(res.stdout or "")
+
 
     def beam_quality(self, sample_bytes: int = 200_000) -> tuple[float, float]:  # noqa: D401
         """Fraction of recent samples that are ``valid`` and ``tracking``."""
@@ -762,57 +951,36 @@ class LaserTrackerSession:
             # stalled or lost the beam -- the one failure this can catch now,
             # while the rig is still set up.
             rec.stream_advanced = total > self._rows_mark
-            # One row per controller millisecond, so the episode's own rows are
-            # the last (duration in ms) of them. Asking about the file's tail
-            # instead answers a question about the instant Stop was pressed.
-            window = int(round(max(0.0, rec.t_end_wall_s - rec.t_start_wall_s) * 1000.0))
-            st = self.beam_stats(last_rows=window)
-            valid, tracking = st["valid"], st["tracking"]
-            rec.beam_valid_fraction = valid
-            rec.beam_tracking_fraction = tracking
-            rec.beam_window_rows = st["rows"]
+            # The episode's own window, on the capture PC's clock. Asking about
+            # the file's tail answers a question about the instant Stop was
+            # pressed; asking for the last (duration in ms) rows answers one
+            # about however far back the stream's gaps reach.
+            now = time.time()
+            st = self.episode_window_stats(
+                ago_start_s=max(0.0, now - rec.t_start_wall_s),
+                ago_end_s=max(0.0, now - rec.t_end_wall_s),
+            )
+            rec.beam_valid_fraction = st["valid"]
+            rec.beam_tracking_fraction = st["tracking"]
+            rec.beam_window_rows = max(0, st["rows"])
             rec.beam_dist_min_mm = st["dist_min_mm"]
             rec.beam_dist_max_mm = st["dist_max_mm"]
-            span = (
-                st["dist_max_mm"] - st["dist_min_mm"]
-                if st["dist_min_mm"] >= 0.0
-                else -1.0
-            )
+            rec.beam_window_s = st["window_s"]
+            rec.stream_coverage = st["coverage"]
+            rec.max_gap_ms = st["max_gap_ms"]
+            rec.nest_fraction = st["nest_fraction"]
+            rec.usable_fraction = st["usable_fraction"]
             if not rec.stream_advanced:
                 rec.error = "tracker stream did not advance during this episode"
-                self.last_error = rec.error
-            elif 0.0 <= tracking < 0.5:
-                # The failure that looks like success: a full-rate stream of
-                # nothing at all.
-                rec.error = (
-                    f"tracker not measuring during this episode: gimbal in "
-                    f"{self.gimbal_mode or 'unknown mode'} "
-                    f"(valid {valid * 100:.0f}%, tracking {tracking * 100:.0f}%)"
+                rec.incomplete = True
+            else:
+                rec.error, rec.incomplete = episode_verdict(
+                    st,
+                    min_usable_fraction=self.cfg.min_usable_fraction,
+                    nest_max_mm=self.cfg.nest_max_mm,
+                    gimbal_mode=self.gimbal_mode,
                 )
-                self.last_error = rec.error
-            elif tracking >= 0.5 > valid:
-                # Tracking without measuring. The gimbal follows the SMR and
-                # az/el/dist keep updating while x/y/z are zeroed, so every
-                # liveness check passes and the episode has no usable point in
-                # it. 2026-09-20 recorded two episodes this way: the distance
-                # reference Home left behind does not survive a beam break, and
-                # only a running measurement routine restores it.
-                rec.error = (
-                    f"tracker tracked but did not measure: valid {valid * 100:.0f}% "
-                    f"of {st['rows']} rows against tracking {tracking * 100:.0f}% "
-                    "-- is the measurement routine running (--measure-ms)?"
-                )
-                self.last_error = rec.error
-            elif valid > 0.0 and 0.0 <= span < 5.0:
-                # Valid, dense, and all at one distance: the SMR sat in the home
-                # nest for the whole episode. Not an error -- a dwell recording
-                # for fit_tracker_mount looks exactly like this -- but it must
-                # not pass for a trajectory.
-                rec.error = (
-                    f"every valid sample is at {st['dist_min_mm']:.0f} mm "
-                    f"(span {span:.1f} mm): the target did not move -- correct "
-                    "for a dwell, useless as a trajectory"
-                )
+            if rec.error:
                 self.last_error = rec.error
             self._rows_mark = max(total, self._rows_mark)
         except Exception as exc:
@@ -820,6 +988,17 @@ class LaserTrackerSession:
             self.last_error = rec.error
         self._episodes.append(rec)
         return asdict(rec)
+
+    def mark_discarded(self, reason: str) -> None:
+        """The recorder threw the last episode away; say so in the episode index.
+
+        Its rows stay in the session's one stream (they cannot be cut out of a file
+        still being written), and the next take reuses its episode index, so without
+        this mark the index would carry two different takes under one number.
+        """
+        if self._episodes:
+            self._episodes[-1].discarded = True
+            self._episodes[-1].discard_reason = str(reason)
 
     # --------------------------------------------------------- disconnect --
 
@@ -880,7 +1059,7 @@ class LaserTrackerSession:
         key = str(Path(self.cfg.ssh_key).expanduser())
         dest = f"{self.cfg.win_host}:{self.win_dir.replace(chr(92), '/')}/{self.session_id}.episodes.json"
         subprocess.run(["scp", "-i", key, *_SSH_BASE, str(local), dest],
-                       capture_output=True, timeout=120)
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
         local.unlink(missing_ok=True)
 
     def _teardown_logger(self, *, wait_s: float = 60.0) -> None:
@@ -934,7 +1113,7 @@ class LaserTrackerSession:
         # is an unhelpful "connection unexpectedly closed".
         res = subprocess.run(
             ["scp", "-i", key, *_SSH_BASE, "-r", src, str(dest_root)],
-            capture_output=True, timeout=1800,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=1800,
         )
         if res.returncode != 0:
             detail = (_decode(res.stderr or b"") or _decode(res.stdout or b"")).strip()
@@ -947,7 +1126,7 @@ class LaserTrackerSession:
         if verifier.exists():
             check = subprocess.run(
                 ["python3", str(verifier), "verify", str(landed)],
-                capture_output=True, text=True, errors="replace", timeout=600,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=600,
             )
             if check.returncode != 0:
                 # A truncated copy fails verify rather than being analysed --

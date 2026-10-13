@@ -141,6 +141,42 @@ _TRACKER_GEOMETRY_PROTOCOLS = {
 }
 
 
+def _tracker_reject_reason(tracker_record: dict[str, Any], lt_cfg: Any, capture_intent: Any) -> str:
+    """Why this episode is not laser GT and is to be discarded, or "" to keep it.
+
+    Calibration captures are kept whatever the tracker says: a dwell is meant to
+    sit still, and their own checks (LT_SEGMENT, the solves) judge them.
+    """
+    if not tracker_record.get("incomplete") or not getattr(lt_cfg, "discard_incomplete", True):
+        return ""
+    purpose = str(capture_intent.get("purpose") or "") if isinstance(capture_intent, dict) else ""
+    if purpose.startswith("calibration_"):
+        return ""
+    return str(tracker_record.get("error") or "too little of the episode has a laser point")
+
+
+def _tracker_episode_summary(
+    ep_idx: int, rec: dict[str, Any], *, rejected: bool, kept: bool
+) -> dict[str, Any]:
+    """``LT_EPISODE <json>``: the laser verdict on the episode just stopped, for the GUI.
+
+    ``rejected``: discarded for its laser data; ``kept``: saved at all (an operator
+    Discard or another gate leaves it False without ``rejected``).
+    """
+    return {
+        "episode": int(ep_idx),
+        "rejected": bool(rejected),
+        "kept": bool(kept),
+        "incomplete": bool(rec.get("incomplete")),
+        "window_s": rec.get("beam_window_s", -1.0),
+        "usable": rec.get("usable_fraction", -1.0),
+        "coverage": rec.get("stream_coverage", -1.0),
+        "max_gap_ms": rec.get("max_gap_ms", -1.0),
+        "nest": rec.get("nest_fraction", -1.0),
+        "error": str(rec.get("error") or ""),
+    }
+
+
 def _emit_tracker_segment_geometry(
     tracker: Any, tracker_record: dict[str, Any], capture_intent: Any, ep_idx: int
 ) -> None:
@@ -157,9 +193,11 @@ def _emit_tracker_segment_geometry(
     if kind is None:
         return
     try:
-        window = int(round(max(0.0, float(tracker_record.get("t_end_wall_s") or 0.0)
-                               - float(tracker_record.get("t_start_wall_s") or 0.0)) * 1000.0))
-        pts = tracker.segment_points(last_rows=window)
+        now = time.time()
+        pts = tracker.segment_points(
+            ago_start_s=max(0.0, now - float(tracker_record.get("t_start_wall_s") or now)),
+            ago_end_s=max(0.0, now - float(tracker_record.get("t_end_wall_s") or now)),
+        )
         out: dict[str, Any] = {"episode": int(ep_idx), "kind": kind, "n": len(pts)}
         if kind == "dwell" and pts:
             med = tlg.median_point(pts)
@@ -408,6 +446,18 @@ def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
         _CALI_LOCK.release()
 
 
+def _stdin_was_made_nonblocking() -> bool:
+    """Restore a blocking stdin and say whether it had been made non-blocking."""
+    try:
+        fd = sys.stdin.fileno()
+        if os.get_blocking(fd):
+            return False
+        os.set_blocking(fd, True)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _read_stdin_loop(
     queue: list[StdinCommand],
     stop: threading.Event,
@@ -421,6 +471,13 @@ def _read_stdin_loop(
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
+        if line == "" and _stdin_was_made_nonblocking():
+            # Not EOF: a child that inherited this stdin (ssh does this) switched
+            # it to non-blocking, and readline() turned an empty pipe's EAGAIN into
+            # "". Treating that as "the GUI closed stdin" quit a whole session on
+            # 2026-10-13. Put the pipe back and keep listening.
+            logger.warning("stdin was switched to non-blocking by a child process; restored")
+            continue
         if line == "":  # parent closed our stdin
             queue.append(StdinCommand(kind="quit", raw=""))
             return
@@ -1306,7 +1363,8 @@ def _run_recover_argus(
     cmd = ["bash", str(script), "--sdk", str(sdk_dir), "--skip-kill"]
     runner = _runner or subprocess.run
     try:
-        r = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
+        # Not our stdin: it is the GUI's command channel (see _read_stdin_loop).
+        r = runner(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return False, f"recover_argus.sh timed out after {timeout_s:.0f}s"
     except Exception as exc:
@@ -2155,10 +2213,18 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 recorded_samples = {}
             tracker_record: dict[str, Any] = {}
+            tracker_reject = ""
             if tracker_started:
                 tracker_record = tracker.stop_recording()
-                if tracker_record.get("error"):
-                    _emit(f"WARNING: laser tracker episode {ep_idx}: {tracker_record['error']}")
+                # A rejected episode's reason is said once, below, as the reason it
+                # is discarded -- not as a WARNING, which the GUI reads as the
+                # tracker being unavailable and refuses the retake for.
+                tracker_reject = _tracker_reject_reason(tracker_record, lt_cfg, capture_intent)
+                if tracker_record.get("error") and not tracker_reject:
+                    # Not every note is a warning: "the target did not move" is
+                    # what a dwell is meant to look like.
+                    level = "WARNING: laser" if tracker_record.get("incomplete") else "Laser"
+                    _emit(f"{level} tracker episode {ep_idx}: {tracker_record['error']}")
                 elif tracker_record.get("stream_advanced"):
                     # The session total, not this episode's -- the per-episode
                     # slice is taken offline by timestamp. Worded to match.
@@ -2183,6 +2249,14 @@ def main(argv: list[str] | None = None) -> int:
                     deadline_s=0.2,
                 )
                 decision = (decision_cmd.kind if decision_cmd else "save")
+
+            # Laser GT gate: an episode recorded for its laser trajectory that has
+            # too little of one is deleted now, while the rig is still set up to
+            # record it again, instead of being found days later (2026-10-09 ep0).
+            tracker_rejected = bool(tracker_reject) and decision in ("save", "operator_save", "stream_exit")
+            if tracker_rejected:
+                _emit(f"ERROR: tracker data incomplete; episode will be discarded. {tracker_reject}")
+                decision = "laser_tracker_incomplete"
 
             frame_sync_payload: dict[str, Any] | None = None
             online_sync_payload: dict[str, Any] | None = None
@@ -2220,6 +2294,16 @@ def main(argv: list[str] | None = None) -> int:
                         f"{details or online_sync_failure}"
                     )
                     decision = online_sync_failure
+
+            if tracker_started and tracker_record:
+                # After every gate, so the GUI says what actually became of the take.
+                _emit("LT_EPISODE " + json.dumps(
+                    _tracker_episode_summary(
+                        ep_idx, tracker_record, rejected=tracker_rejected,
+                        kept=decision in ("save", "operator_save", "stream_exit"),
+                    ),
+                    separators=(",", ":"),
+                ))
 
             if decision in ("save", "operator_save", "stream_exit"):
                 meta_path = _write_episode_meta(
@@ -2350,6 +2434,8 @@ def main(argv: list[str] | None = None) -> int:
                 # splitmuxsink just closed, then drop the (now-empty)
                 # episode directory so it doesn't show up in dataset scans.
                 pcs.discard_episode(handle)
+                if tracker_started and tracker_record:
+                    tracker.mark_discarded(decision)
                 try:
                     if ep_dir.is_dir():
                         # Remove ep_dir only if nothing else slipped in.

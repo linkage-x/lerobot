@@ -285,6 +285,58 @@ def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
     assert written
 
 
+def test_a_take_discarded_for_missing_laser_data_is_shown_and_does_not_block_the_retake(tmp_path, monkeypatch):
+    """The recorder discards an episode with too little laser data; the operator retakes at once."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+
+    verdict = {"episode": 3, "rejected": True, "incomplete": True, "window_s": 15.3, "usable": 0.13,
+               "coverage": 0.13, "max_gap_ms": 4442.0, "nest": 0.0,
+               "error": "the stream covered 13% of it -- is RadianCAL-Pro running?"}
+    gateway._apply_recorder_output(
+        state, "ERROR: tracker data incomplete; episode will be discarded. the stream covered 13% of it"
+    )
+    gateway._apply_recorder_output(state, "LT_EPISODE " + json.dumps(verdict))
+    gateway._apply_recorder_output(state, "Episode discarded")
+    assert state.recording.laserTrackerEpisode == verdict
+    assert any("RadianCAL" in e.message and e.level == "error" for e in state.events)
+    # Still ready: the tracker is fine, the take was not.
+    assert state.recording.laserTrackerReady is True
+    assert state.recording.laserTrackerState != "error"
+    gateway._apply_recorder_output(state, "Episode 3 ready")
+    gateway._start_episode(state)
+    assert written
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        # what the recorder said after every station dwell until 2026-10-13
+        "WARNING: laser tracker episode 2: every valid sample is at 1260 mm (span 0.0 mm): "
+        "the target did not move -- correct for a dwell, useless as a trajectory",
+        "Laser tracker episode 2: every valid sample is at 1260 mm (span 0.0 mm): "
+        "the target did not move -- correct for a dwell, useless as a trajectory",
+        "WARNING: laser tracker episode 4: could not read this episode's tracker rows from the capture PC",
+    ],
+)
+def test_a_note_on_the_last_episode_does_not_block_the_next(tmp_path, monkeypatch, note):
+    state = _marker_tcp_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.laserTracker = True
+    gateway._apply_recorder_output(state, "LT_HOMED 1")
+    gateway._apply_recorder_output(state, "LT_BEAM ready|homed, locked on the SMR")
+
+    gateway._apply_recorder_output(state, note)
+
+    assert state.recording.laserTrackerState != "error"
+    assert state.recording.laserTrackerReady is True
+    gateway._start_episode(state)
+    assert written
+
+
 def test_start_episode_refuses_a_tracker_session_that_never_homed(tmp_path, monkeypatch):
     """Locked-on and green is not enough: W2 (2026-09-21) never homed.
 

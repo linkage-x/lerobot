@@ -69,8 +69,8 @@ def test_the_recorder_emits_a_segment_line_only_for_tracker_mount_captures(capsy
         def __init__(self):
             self.asked = []
 
-        def segment_points(self, *, last_rows):
-            self.asked.append(last_rows)
+        def segment_points(self, *, ago_start_s, ago_end_s):
+            self.asked.append(round(ago_start_s - ago_end_s, 3))
             return [(100.0, 200.0, 300.0), (100.2, 200.0, 300.0), (99.8, 200.0, 300.0)]
 
     tr = FakeTracker()
@@ -79,7 +79,7 @@ def test_the_recorder_emits_a_segment_line_only_for_tracker_mount_captures(capsy
     thor_record._emit_tracker_segment_geometry(tr, rec, {"protocol": "task"}, 8)
     thor_record._emit_tracker_segment_geometry(tr, rec, None, 9)
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("LT_SEGMENT ")]
-    assert tr.asked == [4000]
+    assert tr.asked == [4.0]  # the episode's own 4 s, cut by time
     assert len(lines) == 1
     import json
 
