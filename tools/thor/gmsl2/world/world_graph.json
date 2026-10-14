@@ -38,22 +38,22 @@
       "to_world_frame_id": "fr3_base",
       "T_to_from": [
         [
-          0.0024623088592682363,
-          0.026626024870890053,
-          -0.9996424319898873,
-          1.222626178306823
+          -0.003257043642324061,
+          0.010086360013710898,
+          -0.9999438269264859,
+          1.2246072821874077
         ],
         [
-          0.999826402173275,
-          -0.01852802040418311,
-          0.0019692580193828024,
-          0.010204420764186237
+          0.9999545919701811,
+          -0.008922502880404507,
+          -0.003347079338398318,
+          0.012636977322111508
         ],
         [
-          -0.018468961863794542,
-          -0.999473745157659,
-          -0.026667024359624147,
-          0.7373806019285256
+          -0.008955761523195733,
+          -0.9999093230308552,
+          -0.010056841030694154,
+          0.7174790026973155
         ],
         [
           0.0,
@@ -63,111 +63,230 @@
         ]
       ],
       "covariance_6x6": null,
-      "method": "fr3_single_tag_hand_eye: FR3 T_base_tcp + tag36h11 id6 on the tool, seen by the world's cameras held at their world_20260928_063531 poses; tag corners reprojected (fisheye), T_world_base / T_tcp_tag / tag scale free",
+      "method": "fr3_ball_pivot_check: a ball fixed to the table, pivoted about by the FR3 (FK; centre in fr3_base) and by the handheld UMI (production labels, cameras at their world_20260928_063531 poses; centre in the world, handheld s shared) at 5 positions; rigid Kabsch, no scale",
       "source": {
-        "p0_run": "outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z",
-        "captures_sha256": "602340f6626cb045aa80b1e11bce845c5c4cadc05331cddb243ce34764b216b1",
-        "intrinsics_run": "calib_20260928_143107_intrinsics",
+        "ball_check": "outputs/calibration/fr3_base_ball_check/check_20261014T090257Z.json",
+        "positions": [
+          {
+            "fr3_pivot": "20261014_144818_joint.json",
+            "fr3_runs": [
+              "20261014_113021_pivot.json",
+              "20261014_113121_pivot.json",
+              "20261014_113337_pivot.json",
+              "20261014_113639_pivot.json",
+              "20261014_114709_pivot.json",
+              "20261014_140351_pivot.json",
+              "20261014_141437_pivot.json",
+              "20261014_141601_pivot.aborted.json",
+              "20261014_141856_pivot.json"
+            ],
+            "dataset": "thor_gmsl2_10ch_v1_20261014_145631",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261014_152156_pivot.fit.json",
+            "fr3_runs": null,
+            "dataset": "thor_gmsl2_10ch_v1_20261014_150515",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261014_153217_pivot.fit.json",
+            "fr3_runs": null,
+            "dataset": "thor_gmsl2_10ch_v1_20261014_153329",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261014_162528_joint.json",
+            "fr3_runs": [
+              "20261014_160014_pivot.json",
+              "20261014_160158_pivot.json"
+            ],
+            "dataset": "thor_gmsl2_10ch_v1_20261014_160455",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261014_162127_pivot.fit.json",
+            "fr3_runs": null,
+            "dataset": "thor_gmsl2_10ch_v1_20261014_164021",
+            "episode": 0
+          }
+        ],
         "world_reference_sha256": "5124b5a80599f02078d9b704e9097895dd6cbea7b9d64a723998731f5b4fbb03"
       },
       "quality": {
-        "captures": 137,
-        "fit": {
-          "observations_in": 545,
-          "observations_kept": 486,
-          "rmse_px": 1.980953695233105,
-          "p95_px": 3.3911712809561343,
-          "per_camera_rmse_px": {
-            "cam_03": 1.892280152970349,
-            "cam_06": 1.983220794459294,
-            "cam_07": 1.734636747102968,
-            "cam_08": 1.9865468013579959,
-            "cam_09": 2.3412915444536933,
-            "cam_12": 2.4103180403877484,
-            "cam_13": 1.4951842460724185,
-            "cam_14": 2.130617309750646
-          }
-        },
-        "tag_scale": 0.9912098685629683,
-        "in_sample_tag_check": {
-          "captures": 115,
-          "tag_centre_p50_mm": 1.4745265398968261,
-          "tag_centre_p95_mm": 2.8687959369650136,
-          "tag_centre_max_mm": 4.39583481014351,
-          "rotation_p50_deg": 0.37692737626610223
-        },
-        "folds": {
-          "outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged": {
-            "held_out_captures": 87,
-            "fit_on_the_rest": {
-              "observations_in": 166,
-              "observations_kept": 121,
-              "rmse_px": 2.0418039695165824,
-              "p95_px": 3.4273489305488276,
+        "positions": 5,
+        "extent_mm": [
+          630.8,
+          239.7,
+          190.9
+        ],
+        "residual_mm": [
+          0.69,
+          2.6,
+          0.98,
+          4.07,
+          1.58
+        ],
+        "residual_rms_mm": 2.34,
+        "leave_one_out_mm": [
+          1.08,
+          5.03,
+          2.59,
+          5.3,
+          2.15
+        ],
+        "leave_one_out_rms_mm": 3.63,
+        "leave_one_out_max_mm": 5.3,
+        "rotation_spread_deg": 0.4,
+        "scale_pct": -0.343,
+        "handheld_s": "shared",
+        "handheld_shared_s_mm": [
+          2.373,
+          -2.527,
+          2.099
+        ]
+      },
+      "valid_while": "the rig cameras stay at their world_20260928_063531 poses and the FR3 is not re-mounted; either change, or a fix of the camera world's scale, needs the ball check run again and the edge refitted",
+      "created_utc": "2026-10-14T09:17:42Z",
+      "supersedes": [
+        {
+          "from_world_frame_id": "world_20260928_063531",
+          "to_world_frame_id": "fr3_base",
+          "T_to_from": [
+            [
+              0.0024623088592682363,
+              0.026626024870890053,
+              -0.9996424319898873,
+              1.222626178306823
+            ],
+            [
+              0.999826402173275,
+              -0.01852802040418311,
+              0.0019692580193828024,
+              0.010204420764186237
+            ],
+            [
+              -0.018468961863794542,
+              -0.999473745157659,
+              -0.026667024359624147,
+              0.7373806019285256
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
+          ],
+          "covariance_6x6": null,
+          "method": "fr3_single_tag_hand_eye: FR3 T_base_tcp + tag36h11 id6 on the tool, seen by the world's cameras held at their world_20260928_063531 poses; tag corners reprojected (fisheye), T_world_base / T_tcp_tag / tag scale free",
+          "source": {
+            "p0_run": "outputs/calibration/p0_single_tag_camera_calibration/manual_run_20261002T014903Z",
+            "captures_sha256": "602340f6626cb045aa80b1e11bce845c5c4cadc05331cddb243ce34764b216b1",
+            "intrinsics_run": "calib_20260928_143107_intrinsics",
+            "world_reference_sha256": "5124b5a80599f02078d9b704e9097895dd6cbea7b9d64a723998731f5b4fbb03"
+          },
+          "quality": {
+            "captures": 137,
+            "fit": {
+              "observations_in": 545,
+              "observations_kept": 486,
+              "rmse_px": 1.980953695233105,
+              "p95_px": 3.3911712809561343,
               "per_camera_rmse_px": {
-                "cam_03": 2.2483114386625673,
-                "cam_06": 1.8304278896601434,
-                "cam_07": 2.296815594781263,
-                "cam_08": 1.7895028429766608,
-                "cam_09": 2.2275282113476442,
-                "cam_12": 2.5134894103387406,
-                "cam_13": 1.6165940671121435,
-                "cam_14": 1.814063005648814
+                "cam_03": 1.892280152970349,
+                "cam_06": 1.983220794459294,
+                "cam_07": 1.734636747102968,
+                "cam_08": 1.9865468013579959,
+                "cam_09": 2.3412915444536933,
+                "cam_12": 2.4103180403877484,
+                "cam_13": 1.4951842460724185,
+                "cam_14": 2.130617309750646
               }
             },
-            "tag_scale": 0.9901596862548565,
-            "T_world_base_vs_all": {
-              "translation_mm_at_base_origin": 0.6661616902650855,
-              "rotation_deg": 0.3072808850373241
+            "tag_scale": 0.9912098685629683,
+            "in_sample_tag_check": {
+              "captures": 115,
+              "tag_centre_p50_mm": 1.4745265398968261,
+              "tag_centre_p95_mm": 2.8687959369650136,
+              "tag_centre_max_mm": 4.39583481014351,
+              "rotation_p50_deg": 0.37692737626610223
             },
-            "held_out_tag_check": {
-              "captures": 79,
-              "tag_centre_p50_mm": 1.9707313629655994,
-              "tag_centre_p95_mm": 4.061845240877674,
-              "tag_centre_max_mm": 4.903951145975607,
-              "rotation_p50_deg": 0.39928710829988806
+            "folds": {
+              "outputs/datasets/fr3_execute_pose_thor_gmsl2_apriltag_p0_tag6_replay_20260921_merged": {
+                "held_out_captures": 87,
+                "fit_on_the_rest": {
+                  "observations_in": 166,
+                  "observations_kept": 121,
+                  "rmse_px": 2.0418039695165824,
+                  "p95_px": 3.4273489305488276,
+                  "per_camera_rmse_px": {
+                    "cam_03": 2.2483114386625673,
+                    "cam_06": 1.8304278896601434,
+                    "cam_07": 2.296815594781263,
+                    "cam_08": 1.7895028429766608,
+                    "cam_09": 2.2275282113476442,
+                    "cam_12": 2.5134894103387406,
+                    "cam_13": 1.6165940671121435,
+                    "cam_14": 1.814063005648814
+                  }
+                },
+                "tag_scale": 0.9901596862548565,
+                "T_world_base_vs_all": {
+                  "translation_mm_at_base_origin": 0.6661616902650855,
+                  "rotation_deg": 0.3072808850373241
+                },
+                "held_out_tag_check": {
+                  "captures": 79,
+                  "tag_centre_p50_mm": 1.9707313629655994,
+                  "tag_centre_p95_mm": 4.061845240877674,
+                  "tag_centre_max_mm": 4.903951145975607,
+                  "rotation_p50_deg": 0.39928710829988806
+                }
+              },
+              "live": {
+                "held_out_captures": 50,
+                "fit_on_the_rest": {
+                  "observations_in": 379,
+                  "observations_kept": 364,
+                  "rmse_px": 1.88106493379066,
+                  "p95_px": 3.3598788717402344,
+                  "per_camera_rmse_px": {
+                    "cam_03": 1.7316568648030644,
+                    "cam_06": 2.093550650572955,
+                    "cam_07": 1.5210685429055373,
+                    "cam_08": 2.0613464626223412,
+                    "cam_09": 2.3594851216481363,
+                    "cam_12": 2.2319032241745007,
+                    "cam_13": 1.3876936661620833,
+                    "cam_14": 3.3509919006574855
+                  }
+                },
+                "tag_scale": 0.9913045592362494,
+                "T_world_base_vs_all": {
+                  "translation_mm_at_base_origin": 1.3020837926570457,
+                  "rotation_deg": 0.16419393041702385
+                },
+                "held_out_tag_check": {
+                  "captures": 36,
+                  "tag_centre_p50_mm": 1.9075858174652796,
+                  "tag_centre_p95_mm": 4.171500045235451,
+                  "tag_centre_max_mm": 5.645889825399104,
+                  "rotation_p50_deg": 0.4490940824566644
+                }
+              }
+            },
+            "out_of_sample_tag_centre_p95_mm": 4.171500045235451,
+            "vs_p0_camera_alignment": {
+              "translation_mm_at_base_origin": 7.398302311573967,
+              "rotation_deg": 0.25830394389102795
             }
           },
-          "live": {
-            "held_out_captures": 50,
-            "fit_on_the_rest": {
-              "observations_in": 379,
-              "observations_kept": 364,
-              "rmse_px": 1.88106493379066,
-              "p95_px": 3.3598788717402344,
-              "per_camera_rmse_px": {
-                "cam_03": 1.7316568648030644,
-                "cam_06": 2.093550650572955,
-                "cam_07": 1.5210685429055373,
-                "cam_08": 2.0613464626223412,
-                "cam_09": 2.3594851216481363,
-                "cam_12": 2.2319032241745007,
-                "cam_13": 1.3876936661620833,
-                "cam_14": 3.3509919006574855
-              }
-            },
-            "tag_scale": 0.9913045592362494,
-            "T_world_base_vs_all": {
-              "translation_mm_at_base_origin": 1.3020837926570457,
-              "rotation_deg": 0.16419393041702385
-            },
-            "held_out_tag_check": {
-              "captures": 36,
-              "tag_centre_p50_mm": 1.9075858174652796,
-              "tag_centre_p95_mm": 4.171500045235451,
-              "tag_centre_max_mm": 5.645889825399104,
-              "rotation_p50_deg": 0.4490940824566644
-            }
-          }
-        },
-        "out_of_sample_tag_centre_p95_mm": 4.171500045235451,
-        "vs_p0_camera_alignment": {
-          "translation_mm_at_base_origin": 7.398302311573967,
-          "rotation_deg": 0.25830394389102795
+          "valid_while": "the rig cameras stay at their world_20260928_063531 poses and the FR3 is not re-mounted; either change needs a new edge",
+          "created_utc": "2026-10-09T06:55:38Z",
+          "superseded_utc": "2026-10-14T09:17:42Z"
         }
-      },
-      "valid_while": "the rig cameras stay at their world_20260928_063531 poses and the FR3 is not re-mounted; either change needs a new edge",
-      "created_utc": "2026-10-09T06:55:38Z"
+      ]
     }
   ]
 }
