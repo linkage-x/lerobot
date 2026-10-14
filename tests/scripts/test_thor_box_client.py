@@ -953,6 +953,31 @@ def test_box_pool_two_boxes_namespace_sensors(fake_box_module):
     pool.stop()
 
 
+def test_box_pool_leaves_the_mode_of_a_kept_box_alone(fake_box_module):
+    # The FR3's gripper BOX: mode 0 hands its jaw to its own trigger and drops what it holds,
+    # so neither the recorder's Connect nor its rearm may set_mode() it.
+    fake_box_module.Box = _MultiDeviceBox
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=7, ip="192.168.2.61", capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=9, ip="192.168.2.62", capabilities=box_client.CAP_GRIPPER),
+    ]
+    fleet = box_client.fleet_from_yaml_dict(
+        {"enabled": True, "keep_mode_device_ids": [9], "rearm_interval_s": 0.01, "poll_interval_s": 0.005}
+    )
+    assert fleet.keep_mode_device_ids == [9]
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.08)
+    box = pool._shared_box
+    assert box.mode.get(7) == 0
+    assert 9 not in box.mode
+    assert pool.client_for_device(9) is not None and pool.client_for_device(3) is None
+    assert pool.client_for_device(9).set_clamp_pos(0.03) == 0  # still commandable
+    assert box.clamp_cmds[-1] == (0.03, 9)
+    pool.stop()
+
+
 class _TwoBoxSharedSocket(_FakeBox):
     """Two BOXes streaming on one socket while broadcast discovery answers nothing.
 

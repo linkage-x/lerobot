@@ -183,6 +183,10 @@ box_collection:
   sdk_setup_script: setup_env.sh
   urdf_relpath: share/monte_gripper.urdf
   startup_mode: 0          # 0 = collection (trigger-controlled), 1 = control
+  # Recorded but never set_mode()d: the FR3's gripper BOX (robot.corenetic_device_id in
+  # replay_cube_pose_in_robot_base.thor.yaml). startup_mode 0 would hand its jaw back to
+  # its own trigger and drop whatever the arm holds (the pivot insert) on every Connect.
+  keep_mode_device_ids: [596523097]
   poll_interval_s: 0.001   # 1 kHz idle/Connect poll; exposes 480 Hz six_d_force in rate reports
   record_poll_interval_s: 0.0005  # 2 kHz recording wait; absorbs Python sleep jitter for 480 Hz six_d_force
   stale_threshold_s: 1.0   # consider a sensor offline after this gap
