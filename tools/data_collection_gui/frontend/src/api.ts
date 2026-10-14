@@ -28,6 +28,8 @@ import type {
   WorldFrameResponse,
   Fr3BaseEdgeResponse,
   Fr3MoveToStartResponse,
+  Fr3PivotResponse,
+  GripperTeleopResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -1353,7 +1355,11 @@ export class DataCollectionGuiApi {
     return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/apply", { report });
   }
 
-  private async fr3BaseEdgePost(path: string, body: Record<string, string>): Promise<Fr3BaseEdgeResponse | null> {
+  async solveFr3BaseLaserEdge(station: string, replays: string[]): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/solve-laser", { station, replays });
+  }
+
+  private async fr3BaseEdgePost(path: string, body: Record<string, string | string[]>): Promise<Fr3BaseEdgeResponse | null> {
     try {
       const response = await fetch(`${this.apiBase}${path}`, {
         method: "POST",
@@ -1363,6 +1369,127 @@ export class DataCollectionGuiApi {
       const payload = (await response.json()) as Partial<Fr3BaseEdgeResponse>;
       if (!response.ok && !payload.runs) return null;
       return payload as Fr3BaseEdgeResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-pivot`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as Fr3PivotResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Collecting puts the real FR3 in teaching mode: the panel confirms first.
+  async startFr3Pivot(robotIp: string, durationS: number, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/collect", { robotIp, durationS, note });
+  }
+
+  // Read only: FK of the seated socket becomes the centre to plan about.
+  async captureFr3PivotCentre(robotIp: string, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/capture-centre", { robotIp, note });
+  }
+
+  async planFr3Pivot(centre: string, biasMm: number[]): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm });
+  }
+
+  // Moves the real FR3 along a plan that passed: the panel confirms first.
+  async executeFr3Pivot(plan: string, robotIp: string, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/execute", { plan, robotIp, note });
+  }
+
+  // A virtual ball joint on the real FR3: the socket is held on the ball, the operator turns it.
+  async guideFr3Pivot(
+    centre: string,
+    biasMm: number[],
+    durationS: number,
+    robotIp: string,
+    note: string,
+    anchorFromFit = false
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/guide", { centre, biasMm, durationS, robotIp, note, anchorFromFit });
+  }
+
+  // Ends a guided pivot early and keeps it (Stop discards).
+  async finishFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/finish", {});
+  }
+
+  async stopFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/stop", {});
+  }
+
+  async refitFr3Pivot(run: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/fit", { run });
+  }
+
+  // One socket centre from several runs; perRunCentre when the ball may have moved between them.
+  async fitJointFr3Pivot(runs: string[], perRunCentre: boolean): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/fit-joint", { runs, perRunCentre });
+  }
+
+  async runFr3BallCheck(
+    positions: { pivot: string; dataset: string; episode: number }[]
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/check", { positions });
+  }
+
+  /** Write a check's ball edge as a candidate report; swapping it in is the FR3-base edge panel's. */
+  async saveFr3BallEdge(check: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/ball-edge", { check });
+  }
+
+  async fetchGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as GripperTeleopResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The FR3's gripper follows the handheld BOX; exit leaves it holding (no release).
+  async startGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start");
+  }
+
+  async stopGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop");
+  }
+
+  private async gripperTeleopPost(path: string): Promise<GripperTeleopResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      });
+      const payload = (await response.json()) as Partial<GripperTeleopResponse>;
+      if (!response.ok && !payload.job) return null;
+      return payload as GripperTeleopResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fr3PivotPost(path: string, body: Record<string, unknown>): Promise<Fr3PivotResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<Fr3PivotResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as Fr3PivotResponse;
     } catch {
       return null;
     }

@@ -510,6 +510,15 @@ class GatewayState:
     calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
     tracker_mount_session: TrackerMountSession = field(default_factory=TrackerMountSession)
+    # FR3 FK pivot (tools/fr3/fr3_tcp_pivot.py collect, then fit). Its own lock: the
+    # output reader and the panel's poll run on different threads, never under state.lock.
+    fr3_pivot_process: subprocess.Popen[str] | None = None
+    fr3_pivot_job: dict[str, Any] = field(default_factory=dict)
+    fr3_pivot_lock: Lock = field(default_factory=Lock)
+    # FR3 gripper teleop from the handheld BOX (tools/fr3/fr3_gripper_teleop.py); same pattern.
+    gripper_teleop_process: subprocess.Popen[str] | None = None
+    gripper_teleop_job: dict[str, Any] = field(default_factory=dict)
+    gripper_teleop_lock: Lock = field(default_factory=Lock)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -3576,6 +3585,13 @@ def _world_registration_for_export(state: GatewayState, bundle: Path) -> dict[st
 # each passed (held-out p95 5.2 / 5.6 mm) moved the live edge by 2.6 mm on average
 # where they were captured (0.4 deg; about 4 mm at the 10-13 replay trajectory),
 # in different directions, and neither removed the 4.6 mm the laser saw there.
+#
+# The other way in is the laser (register_fr3_base.py laser): a tracker station
+# (world <- tracker, the tracker-mount panel) times the FR3's FK fitted to the
+# laser on real replays (tracker <- fr3_base), no tag involved. It is one edge
+# only if the tracker stayed put between the two, so the panel lists the
+# stations and the replays that carried the laser side by side with their
+# times, and the solve checks replays on either side of the station agree.
 
 _P0_RUNS_SUBDIR = Path("outputs") / "calibration" / "p0_single_tag_camera_calibration"
 _FR3_BASE_EDGE_REPORTS_SUBDIR = Path("outputs") / "calibration" / "fr3_base_registration"
@@ -3583,6 +3599,11 @@ _REGISTER_FR3_BASE = Path("tools") / "thor" / "gmsl2" / "register_fr3_base.py"
 _FR3_BASE_EDGE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _FR3_BASE_EDGE_SOLVE_LOCK = Lock()
 _FR3_BASE_EDGE_REPORT_LIMIT = 12
+# The laser edge: a station fit (outputs/laser_tracker, the tracker-mount panel)
+# times the FR3's FK fitted to the laser on real replays.
+_LASER_STATIONS_SUBDIR = Path("outputs") / "laser_tracker"
+_LASER_REPLAY_GLOB = "*/derived/*/real_replay/*"
+_LASER_REPLAY_LIMIT = 30
 _P0_GUIDED_CAPTURE_COMMAND = (
     "bash tools/thor/run_p0_two_marker_calibration_local.sh guided "
     "--execute --confirmation P0_TWO_MARKER_TEACHING"
@@ -3611,6 +3632,29 @@ def _edge_T_fr3_base_world(edge: dict[str, Any]) -> list[list[float]] | None:
     return None
 
 
+def _edge_is_laser(edge: dict[str, Any]) -> bool:
+    return str(edge.get("method") or "").startswith(register_fr3_base.LASER_METHOD)
+
+
+# fr3_base_ball_check.BALL_EDGE_METHOD (that module needs numpy; this one stays stdlib)
+_BALL_EDGE_METHOD = "fr3_ball_pivot_check"
+
+
+def _edge_is_ball(edge: dict[str, Any]) -> bool:
+    return str(edge.get("method") or "").startswith(_BALL_EDGE_METHOD)
+
+
+def _edge_label(edge: dict[str, Any]) -> str:
+    """What the edge was measured from, in a few words: the P0 run, the station and the replays, or the balls."""
+    source = edge.get("source") or {}
+    if _edge_is_ball(edge):
+        return f"{len(source.get('positions') or [])} 个球位 · {Path(str(source.get('ball_check') or '')).stem}"
+    if _edge_is_laser(edge):
+        replays = source.get("replays") or []
+        return f"{Path(str(source.get('station') or '')).stem} × {len(replays)} 次回放"
+    return Path(str(source.get("p0_run") or "")).name
+
+
 def _edge_quality_summary(edge: dict[str, Any]) -> dict[str, Any]:
     quality = edge.get("quality") or {}
     fit = quality.get("fit") or {}
@@ -3628,7 +3672,38 @@ def _edge_quality_summary(edge: dict[str, Any]) -> dict[str, Any]:
                 "edgeShiftDeg": shift.get("rotation_deg"),
             }
         )
+    if _edge_is_ball(edge):
+        return {
+            "method": "ball",
+            "positions": quality.get("positions"),
+            "residualRmsMm": quality.get("residual_rms_mm"),
+            "leaveOneOutRmsMm": quality.get("leave_one_out_rms_mm"),
+            "leaveOneOutMaxMm": quality.get("leave_one_out_max_mm"),
+            "rotationSpreadDeg": quality.get("rotation_spread_deg"),
+            "scalePct": quality.get("scale_pct"),
+            "handheldS": quality.get("handheld_s"),
+            "extentMm": quality.get("extent_mm"),
+            "folds": [],
+        }
+    if _edge_is_laser(edge):
+        station = quality.get("station") or {}
+        replays = [r for r in quality.get("replays") or [] if "error" not in r]
+        p95 = [r["laser_vs_fk_p95_mm"] for r in replays if r.get("laser_vs_fk_p95_mm") is not None]
+        span = [r["orientation_span_deg"] for r in replays if r.get("orientation_span_deg") is not None]
+        return {
+            "method": "laser",
+            "stationPoses": station.get("poses"),
+            "stationRmsMm": station.get("rms_mm"),
+            "stationCertifies": station.get("certifies"),
+            "stationExtentM": station.get("extent_m"),
+            "replays": len(replays),
+            "laserVsFkP95Mm": max(p95) if p95 else None,
+            "orientationSpanDeg": min(span) if span else None,
+            "replaySpreadMm": (quality.get("replay_spread") or {}).get("mean_mm"),
+            "folds": [],
+        }
     return {
+        "method": "singleTag",
         "captures": quality.get("captures"),
         "outOfSampleP95Mm": quality.get("out_of_sample_tag_centre_p95_mm"),
         "tagScale": quality.get("tag_scale"),
@@ -3680,6 +3755,62 @@ def _edge_move_in_workspace(
     }
 
 
+def _session_utc(session_id: str) -> str:
+    """``lt_YYYYMMDD_HHMMSS`` (the tracker logger names sessions in UTC) as ISO, or ""."""
+    try:
+        stamp = datetime.strptime(session_id, "lt_%Y%m%d_%H%M%S")
+    except ValueError:
+        return ""
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _laser_edge_stations(state: GatewayState, reference_id: str) -> list[dict[str, Any]]:
+    """Station fits (world <- tracker), newest first: the first half of a laser edge."""
+    root = state.repo_root / _LASER_STATIONS_SUBDIR
+    out = []
+    paths = sorted(root.glob("station_*.json"), key=lambda p: p.name, reverse=True) if root.is_dir() else []
+    for path in paths[:_FR3_BASE_EDGE_REPORT_LIMIT]:
+        station = _read_json_file(path)
+        if not station or "T_world_tracker" not in station:
+            continue
+        sessions = [str(s.get("session_id") or "") for s in station.get("sessions") or []]
+        world = str(station.get("world_frame_id") or "")
+        out.append(
+            {
+                "name": path.name,
+                "world": world,
+                "matchesReference": world == reference_id,
+                "poses": station.get("n_poses_total"),
+                "rmsMm": station.get("rms_mm"),
+                "certifies": bool(station.get("certifies")),
+                "extentM": (station.get("observability") or {}).get("extent_m"),
+                "sessions": sessions,
+                "sessionUtc": next((u for u in map(_session_utc, sessions) if u), ""),
+            }
+        )
+    return out
+
+
+def _laser_edge_replays(state: GatewayState) -> list[dict[str, Any]]:
+    """FR3 real replays that carried the laser: the second half of a laser edge, newest first."""
+    runs = []
+    for run in state.datasets_root.glob(_LASER_REPLAY_GLOB):
+        sessions = sorted(p.name for p in (run / "laser_tracker").glob("lt_*") if p.is_dir())
+        if len(sessions) != 1 or not any((run / "replay_pose_traces").glob("*.csv")):
+            continue
+        runs.append(
+            {
+                "path": str(run.relative_to(state.datasets_root)),
+                "name": run.name,
+                "dataset": run.parents[3].name,
+                "sessionId": sessions[0],
+                "sessionUtc": _session_utc(sessions[0]),
+            }
+        )
+    runs.sort(key=lambda r: r["sessionUtc"] or r["name"], reverse=True)
+    return runs[:_LASER_REPLAY_LIMIT]
+
+
 def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
     """Everything the FR3-base edge panel shows: the live edge, the runs, the solved candidates."""
     repo = state.repo_root
@@ -3714,6 +3845,7 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
             "world": world,
             "createdUtc": edge.get("created_utc", ""),
             "method": edge.get("method", ""),
+            "label": _edge_label(edge),
             "p0Run": source.get("p0_run", ""),
             "intrinsicsRun": source.get("intrinsics_run", ""),
             "fromReferenceWorld": world == reference_id,
@@ -3756,12 +3888,17 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         T_new = _edge_T_fr3_base_world(edge)
         move = None
         if T_new is not None and T_current is not None:
-            if run_name not in positions:
-                positions[run_name] = _p0_run_tool_positions(runs_root / run_name)
-            move = _edge_move_in_workspace(T_new, T_current, positions[run_name])
+            if "workspace_points_base_m" in report:
+                # where the replays put the TCP, or where the balls were: the workspace this edge was measured in
+                points = report.get("workspace_points_base_m") or []
+            else:
+                if run_name not in positions:
+                    positions[run_name] = _p0_run_tool_positions(runs_root / run_name)
+                points = positions[run_name]
+            move = _edge_move_in_workspace(T_new, T_current, points)
         same_as_live = (
             current is not None
-            and source.get("captures_sha256") == ((direct[-1].get("source") or {}).get("captures_sha256"))
+            and source == (direct[-1].get("source") or {})
             and move is not None
             and move["maxMm"] < 0.01
         )
@@ -3779,9 +3916,11 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
             {
                 "name": path.name,
                 "generatedUtc": report.get("generated_utc", ""),
+                "label": _edge_label(edge),
                 "p0Run": run_name,
                 "verdict": report.get("verdict", ""),
                 "reasons": report.get("reasons") or [],
+                "warnings": report.get("warnings") or [],
                 "intrinsicsRun": source.get("intrinsics_run", ""),
                 "quality": _edge_quality_summary(edge),
                 "moveVsLive": move,
@@ -3800,6 +3939,9 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         "runsRoot": str(_P0_RUNS_SUBDIR),
         "reportsRoot": str(_FR3_BASE_EDGE_REPORTS_SUBDIR),
         "captureCommand": _P0_GUIDED_CAPTURE_COMMAND,
+        "stations": _laser_edge_stations(state, reference_id),
+        "laserReplays": _laser_edge_replays(state),
+        "stationsRoot": str(_LASER_STATIONS_SUBDIR),
     }
 
 
@@ -3833,6 +3975,12 @@ def _solve_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     )
     if not intrinsics.is_file():
         return {**_fr3_base_edge_payload(state), "ok": False, "error": f"找不到基准世界系的内参 {intrinsics}"}
+    out = _fr3_base_edge_reports_root(state) / f"{run_dir.name}__{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    return _run_register_fr3_base(state, ["solve", "--run", str(run_dir), "--intrinsics", str(intrinsics)], out)
+
+
+def _run_register_fr3_base(state: GatewayState, args: list[str], out: Path) -> dict[str, Any]:
+    """One ``register_fr3_base.py`` solve into ``out``, serialised; exit 2 (rejected) is a result too."""
     try:
         python = _marker_tcp_python(state)
     except RuntimeError as exc:
@@ -3840,18 +3988,13 @@ def _solve_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     if not _FR3_BASE_EDGE_SOLVE_LOCK.acquire(blocking=False):
         return {**_fr3_base_edge_payload(state), "ok": False, "error": "已有一次注册边解算在运行"}
     try:
-        out = _fr3_base_edge_reports_root(state) / f"{run_dir.name}__{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         command = [
             str(python),
             str(state.repo_root / _REGISTER_FR3_BASE),
             "--world-dir",
             str(_world_root(state)),
-            "solve",
-            "--run",
-            str(run_dir),
-            "--intrinsics",
-            str(intrinsics),
+            *args,
             "--out",
             str(out),
         ]
@@ -3871,18 +4014,38 @@ def _solve_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     finally:
         _FR3_BASE_EDGE_SOLVE_LOCK.release()
     output = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    # exit 2 is a rejected verdict, written out like a passing one
+    lines = output.splitlines()
     if proc.returncode not in (0, 2) or not out.is_file():
-        tail = output.splitlines()
         with state.lock:
-            state.log("warn", f"FR3 base edge solve of {run_dir.name} failed: {tail[-1] if tail else proc.returncode}")
+            state.log("warn", f"FR3 base edge solve ({out.name}) failed: {lines[-1] if lines else proc.returncode}")
         return {**_fr3_base_edge_payload(state), "ok": False, "error": output or f"exit {proc.returncode}"}
+    verdict = next((line for line in reversed(lines) if line.startswith("verdict:")), output)
     with state.lock:
-        state.log(
-            "info" if proc.returncode == 0 else "warn",
-            f"FR3 base edge solved from {run_dir.name}: {output.splitlines()[-2] if len(output.splitlines()) > 1 else output}",
-        )
+        state.log("info" if proc.returncode == 0 else "warn", f"FR3 base edge solved ({out.name}): {verdict}")
     return {**_fr3_base_edge_payload(state), "ok": True, "solved": out.name, "output": output}
+
+
+def _solve_fr3_base_laser_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Compose a candidate edge from a station fit and replays with the laser. Never touches world_graph.json."""
+    station_name = str(body.get("station") or "").strip()
+    station = state.repo_root / _LASER_STATIONS_SUBDIR / station_name
+    if not (_FR3_BASE_EDGE_NAME_RE.match(station_name) and station_name.startswith("station_") and station.is_file()):
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": f"找不到站位拟合 {station_name!r}"}
+    raw = body.get("replays")
+    if not isinstance(raw, list) or not raw:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": "至少选一次带激光的 FR3 回放"}
+    known = {r["path"] for r in _laser_edge_replays(state)}
+    replays = []
+    for item in raw:
+        path = str(item or "").strip()
+        if path not in known:
+            return {**_fr3_base_edge_payload(state), "ok": False, "error": f"不是一次带激光的回放：{path!r}"}
+        replays.append(state.datasets_root / path)
+    args = ["laser", "--station", str(station)]
+    for run in replays:
+        args += ["--replay", str(run)]
+    stamp = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    return _run_register_fr3_base(state, args, _fr3_base_edge_reports_root(state) / f"laser__{station.stem}__{stamp}.json")
 
 
 def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
@@ -3903,7 +4066,7 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
         register_fr3_base.write_graph(graph_path, updated)
     except (ValueError, RuntimeError, OSError) as exc:
         return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
-    run = Path(str(((report.get("edge") or {}).get("source") or {}).get("p0_run") or "")).name
+    run = _edge_label(report.get("edge") or {})
     with state.lock:
         state.log(
             "warn",
@@ -3916,22 +4079,246 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
 # Outside the state lock (see the POST handler): the solve runs for minutes.
 _FR3_BASE_EDGE_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
     "/api/calibration/fr3-base-edge/solve": _solve_fr3_base_edge,
+    "/api/calibration/fr3-base-edge/solve-laser": _solve_fr3_base_laser_edge,
     "/api/calibration/fr3-base-edge/apply": _apply_fr3_base_edge,
 }
 
 
-# --- FR3 move to start --------------------------------------------------------
+# --- FR3 FK pivot, and the ball check of the world -> fr3_base edge ---------------
 #
-# panda_py's move_to_start(): the SDK home pose, joint-space, at its own slow speed.
-# The replay panel's button homes the arm between runs without a terminal. It takes
-# the FCI for the move, so it is refused while anything else holds it.
+# A ball fixed to the table, pivoted about twice: by the FR3 in teaching mode
+# (tools/fr3/fr3_tcp_pivot.py: the arm is moved by hand, its joint angles give
+# the socket centre in the EE frame and the ball in fr3_base) and by the handheld
+# UMI in an ordinary recording (production's labels give the ball in the world).
+# The FR3 half settles the socket frame the replay drives without any edge; the
+# two together referee every edge -- live, single-tag, laser -- at the ball
+# (tools/thor/gmsl2/fr3_base_ball_check.py). No laser, no TCP definition.
+#
+# Collecting moves the real arm only as the operator pushes it, but it does take
+# the FCI: refused while a real replay or teleop holds it, and the panel confirms
+# first because the arm goes limp under gravity compensation.
 
-_FR3_MOVE_TO_START_SCRIPT = Path("tools") / "fr3" / "fr3_move_to_start_runtime.py"
-_FR3_MOVE_TO_START_TIMEOUT_S = 120.0
-_FR3_MOVE_TO_START_LOCK = Lock()
+_FR3_PIVOT_SCRIPT = Path("tools") / "fr3" / "fr3_tcp_pivot.py"
+# Planned pivot (capture a centre, plan + MuJoCo-check, execute under soft impedance); see the tool.
+_FR3_PIVOT_AUTO_SCRIPT = Path("tools") / "fr3" / "fr3_pivot_auto.py"
+_FR3_PIVOT_CENTRE_RE = re.compile(r"^\d{8}_\d{6}_centre\.json$")
+_FR3_PIVOT_PLAN_RE = re.compile(r"^\d{8}_\d{6}_plan\.json$")
+_FR3_PIVOT_MAX_BIAS_MM = 5.0
+_FR3_PIVOT_GUIDE_DEFAULT_S = 60.0
+_FR3_PIVOT_GUIDE_RANGE_S = (20.0, 180.0)
+# guide --anchor-mm from the latest guided fit: the spring held on the fitted ball centre instead of
+# corenetic_socket_ee's origin. Only a fit as good as fr3_tcp_pivot.py's own warnings ask, and
+# no anchor further off the frame than the script itself accepts.
+_FR3_PIVOT_ANCHOR_MAX_RMS_MM = 3.0
+_FR3_PIVOT_ANCHOR_MAX_SIGMA_MM = 3.0
+_FR3_PIVOT_ANCHOR_MIN_SPAN_DEG = 20.0
+_FR3_PIVOT_ANCHOR_MIN_WEAK = 0.1
+_FR3_PIVOT_ANCHOR_MAX_MM = 20.0
+# corenetic_socket_ee is a pure translation of corenetic_gripper_ee in this URDF (the one the tool fits
+# with). A fit's socket_frame is relative to the frame as it was when fitted (10-14 it moved from z -10.3
+# to the pivot's own value), so the anchor re-expresses the fit's corenetic_gripper_ee value in today's.
+_FR3_PIVOT_URDF = Path("src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf")
+_FR3_PIVOT_SUBDIR = Path("outputs") / "fr3_tcp_pivot"
+_BALL_CHECK_SCRIPT = Path("tools") / "thor" / "gmsl2" / "fr3_base_ball_check.py"
+_BALL_CHECK_SUBDIR = Path("outputs") / "calibration" / "fr3_base_ball_check"
+_FR3_PIVOT_RUN_RE = re.compile(r"^\d{8}_\d{6}_pivot\.json$")
+# fr3_tcp_pivot.py fit-joint: one socket centre from several runs (outputs/fr3_tcp_pivot/joint/).
+_FR3_PIVOT_JOINT_RE = re.compile(r"^\d{8}_\d{6}_joint\.json$")
+_FR3_PIVOT_JOINT_MAX_RUNS = 12
+_FR3_PIVOT_DEFAULT_DURATION_S = 45.0
+_FR3_PIVOT_DURATION_RANGE_S = (15.0, 180.0)
+_FR3_PIVOT_LOG_LINES = 80
+_FR3_PIVOT_LIST_LIMIT = 20
+_BALL_CHECK_EPISODE_LIMIT = 40
+_BALL_CHECK_LIST_LIMIT = 6
+_BALL_CHECK_LOCK = Lock()
 
 
-def _fr3_fci_holder(state: GatewayState) -> str:
+def _fr3_pivot_root(state: GatewayState) -> Path:
+    return state.repo_root / _FR3_PIVOT_SUBDIR
+
+
+def _fr3_pivot_fit_path(run: Path) -> Path:
+    return run.with_name(run.name.removesuffix(".json") + ".fit.json")
+
+
+def _fr3_pivot_runs(state: GatewayState) -> list[dict[str, Any]]:
+    """Collected runs, newest first, with what their fit says (the run itself is MBs of joint angles)."""
+    root = _fr3_pivot_root(state)
+    paths = sorted((p for p in root.glob("*_pivot.json") if _FR3_PIVOT_RUN_RE.match(p.name)), reverse=True) if root.is_dir() else []
+    runs = []
+    for path in paths[:_FR3_PIVOT_LIST_LIMIT]:
+        fit = _read_json_file(_fr3_pivot_fit_path(path))
+        socket = (fit or {}).get("socket_frame") or {}
+        runs.append(
+            {
+                "name": path.name,
+                "commanded": (fit or {}).get("commanded"),
+                "fitName": _fr3_pivot_fit_path(path).name if fit else "",
+                "note": str((fit or {}).get("note") or ""),
+                "created": str((fit or {}).get("created") or ""),
+                "fk": (fit or {}).get("fk"),
+                "deskOTEE": (fit or {}).get("desk_O_T_EE"),
+                "socketFrame": None if "error" in socket else socket or None,
+            }
+        )
+    return runs
+
+
+def _fr3_pivot_joint_root(state: GatewayState) -> Path:
+    return _fr3_pivot_root(state) / "joint"
+
+
+def _fr3_pivot_joints(state: GatewayState) -> list[dict[str, Any]]:
+    """Joint fits (several runs, one socket centre), newest first."""
+    root = _fr3_pivot_joint_root(state)
+    paths = sorted((p for p in root.glob("*_joint.json") if _FR3_PIVOT_JOINT_RE.match(p.name)), reverse=True) if root.is_dir() else []
+    out = []
+    for path in paths[:_FR3_PIVOT_LIST_LIMIT]:
+        report = _read_json_file(path) or {}
+        socket = report.get("socket_frame") or {}
+        out.append(
+            {
+                "name": path.name,
+                "created": str(report.get("created") or ""),
+                "runs": list(report.get("runs") or []),
+                "sharedCentre": bool(report.get("shared_centre")),
+                "fk": report.get("fk"),
+                "socketFrame": socket or None,
+                "warnings": list(report.get("warnings") or []),
+            }
+        )
+    return out
+
+
+def _fr3_pivot_job_view(state: GatewayState) -> dict[str, Any]:
+    with state.fr3_pivot_lock:
+        job = dict(state.fr3_pivot_job)
+        job["log"] = list(job.get("log") or [])
+    if job.get("state") == "collecting":
+        job["elapsedS"] = round(time.time() - float(job.get("startedUnixS") or time.time()), 1)
+    return job
+
+
+def _ball_check_episodes(state: GatewayState) -> list[dict[str, Any]]:
+    """Recent recorded episodes a handheld pivot could be, newest first."""
+    rows = []
+    for dataset in _tracker_mount_capture_candidates(state, 12):
+        episodes_dir = dataset / "episodes"
+        if not episodes_dir.is_dir():
+            continue
+        sidecar = dataset / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+        for meta_path in episodes_dir.glob("episode_*/meta.json"):
+            meta = _read_json_file(meta_path) or {}
+            try:
+                episode = int(meta_path.parent.name.split("_")[-1])
+            except ValueError:
+                continue
+            rows.append(
+                {
+                    "dataset": str(dataset),
+                    "datasetName": dataset.name,
+                    "episode": episode,
+                    "world": wp.world_frame_id_of(meta.get("world_frame")),
+                    "recordedUnixS": meta_path.stat().st_mtime,
+                    "hasTrajectory": any(sidecar.glob("state_action.*.csv")),
+                }
+            )
+    rows.sort(key=lambda r: r["recordedUnixS"], reverse=True)
+    return rows[:_BALL_CHECK_EPISODE_LIMIT]
+
+
+def _ball_checks(state: GatewayState) -> list[dict[str, Any]]:
+    root = state.repo_root / _BALL_CHECK_SUBDIR
+    paths = sorted(root.glob("check_*.json"), reverse=True) if root.is_dir() else []
+    out = []
+    for path in paths[:_BALL_CHECK_LIST_LIMIT]:
+        report = _read_json_file(path)
+        if report and report.get("schema") == "fr3_base_ball_check/v1":
+            out.append({"name": path.name, **report})
+    return out
+
+
+def _fr3_pivot_centres(state: GatewayState) -> list[dict[str, Any]]:
+    root = _fr3_pivot_root(state) / "centres"
+    paths = sorted((p for p in root.glob("*_centre.json") if _FR3_PIVOT_CENTRE_RE.match(p.name)), reverse=True) if root.is_dir() else []
+    out = []
+    for path in paths[:_FR3_PIVOT_LIST_LIMIT]:
+        centre = _read_json_file(path) or {}
+        out.append(
+            {
+                "name": path.name,
+                "created": str(centre.get("created") or ""),
+                "note": str(centre.get("note") or ""),
+                "centreMm": [round(float(x) * 1e3, 1) for x in centre.get("centre_m") or []],
+                "toolFromLevelDeg": centre.get("tool_from_level_deg"),
+                "wallProblems": list(centre.get("wall_problems") or []),
+            }
+        )
+    return out
+
+
+def _fr3_pivot_plans(state: GatewayState) -> list[dict[str, Any]]:
+    """Plan summaries (the plan itself carries every sample's joints and is MBs)."""
+    root = _fr3_pivot_root(state) / "plans"
+    paths = sorted(root.glob("*_plan.summary.json"), reverse=True) if root.is_dir() else []
+    out = []
+    for path in paths[:_FR3_PIVOT_LIST_LIMIT]:
+        summary = _read_json_file(path) or {}
+        name = path.name.replace(".summary.json", ".json")
+        if not _FR3_PIVOT_PLAN_RE.match(name) or not (path.parent / name).is_file():
+            continue
+        params = summary.get("params") or {}
+        out.append(
+            {
+                "name": name,
+                "centre": str(summary.get("centre") or ""),
+                "created": str(summary.get("created") or ""),
+                "passed": bool(summary.get("passed")),
+                "problems": list(summary.get("problems") or []),
+                "durationS": summary.get("duration_s"),
+                "biasMm": params.get("bias_mm"),
+                "params": params,
+                "jointTravelDeg": summary.get("joint_travel_deg"),
+                "maxJointSpeedDegS": summary.get("max_joint_speed_deg_s"),
+                "minMarginWallDeg": summary.get("min_margin_wall_deg"),
+                "minMarginFr3Deg": summary.get("min_margin_fr3_deg"),
+                "tableClearanceMm": summary.get("table_clearance_mm"),
+                "tableClearanceBody": summary.get("table_clearance_body"),
+                "tableZMm": summary.get("table_z_mm"),
+                "mujocoChecked": bool(summary.get("mujoco_checked")),
+            }
+        )
+    return out
+
+
+def _fr3_pivot_payload(state: GatewayState) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "error": "",
+        "job": _fr3_pivot_job_view(state),
+        "runs": _fr3_pivot_runs(state),
+        "centres": _fr3_pivot_centres(state),
+        "plans": _fr3_pivot_plans(state),
+        "joints": _fr3_pivot_joints(state),
+        "robotIp": _real_robot_ip(state),
+        "defaultDurationS": _FR3_PIVOT_DEFAULT_DURATION_S,
+        "guideDefaultS": _FR3_PIVOT_GUIDE_DEFAULT_S,
+        "guideRangeS": list(_FR3_PIVOT_GUIDE_RANGE_S),
+        "anchor": _fr3_pivot_anchor(state),
+        "durationRangeS": list(_FR3_PIVOT_DURATION_RANGE_S),
+        "runsRoot": str(_FR3_PIVOT_SUBDIR),
+        "episodes": _ball_check_episodes(state),
+        "checks": _ball_checks(state),
+        "checksRoot": str(_BALL_CHECK_SUBDIR),
+    }
+
+
+def _fr3_pivot_refusal(state: GatewayState, message: str) -> dict[str, Any]:
+    return {**_fr3_pivot_payload(state), "ok": False, "error": message}
+
+
+def _fr3_pivot_fci_holder(state: GatewayState) -> str:
     """Who else holds the FR3's FCI right now (one client at a time), or ""."""
     with state.lock:
         replay = state.replay_process
@@ -3946,13 +4333,833 @@ def _fr3_fci_holder(state: GatewayState) -> str:
     return ""
 
 
+def _fr3_pivot_log(state: GatewayState, line: str) -> None:
+    with state.fr3_pivot_lock:
+        log = state.fr3_pivot_job.setdefault("log", [])
+        log.append(line)
+        del log[:-_FR3_PIVOT_LOG_LINES]
+
+
+def _fr3_pivot_fit_command(state: GatewayState, run: Path) -> list[str]:
+    return [
+        str(_mujoco_replay_python(state)),
+        str(state.repo_root / _FR3_PIVOT_SCRIPT),
+        "fit",
+        str(run),
+        "--json",
+        str(_fr3_pivot_fit_path(run)),
+    ]
+
+
+def _run_fr3_pivot_fit(state: GatewayState, run: Path) -> tuple[bool, str]:
+    """``fit`` (pinocchio, in the FR3 venv) -- seconds; returns (ok, output)."""
+    try:
+        proc = subprocess.run(
+            _fr3_pivot_fit_command(state, run),
+            cwd=str(state.repo_root),
+            env=_real_preflight_env(state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode == 0 and _fr3_pivot_fit_path(run).is_file(), output
+
+
+def _watch_fr3_pivot(state: GatewayState, process: subprocess.Popen[str], run: Path) -> None:
+    """Stream ``collect``'s output into the job, then fit what it wrote."""
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip()
+        if line:
+            _fr3_pivot_log(state, line)
+    code = process.wait()
+    with state.fr3_pivot_lock:
+        stopped = bool(state.fr3_pivot_job.get("stopRequested"))
+        state.fr3_pivot_job["returncode"] = code
+        state.fr3_pivot_job["state"] = "fitting" if code == 0 and run.is_file() else ("stopped" if stopped else "error")
+        if state.fr3_pivot_process is process:
+            state.fr3_pivot_process = None
+    if code != 0 or not run.is_file():
+        with state.lock:
+            state.log("warn", f"FR3 pivot collect {'stopped' if stopped else f'failed (exit {code})'}; nothing written")
+        return
+    ok, output = _run_fr3_pivot_fit(state, run)
+    for line in output.splitlines():
+        _fr3_pivot_log(state, line)
+    with state.fr3_pivot_lock:
+        state.fr3_pivot_job["state"] = "done" if ok else "error"
+        if not ok:
+            state.fr3_pivot_job["error"] = output.splitlines()[-1] if output else "fit failed"
+    with state.lock:
+        state.log("info" if ok else "warn", f"FR3 pivot {run.name}: {'fitted' if ok else 'fit failed'}")
+
+
+def _start_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Teaching mode for ``durationS``, the arm moved about the ball by hand; then fit."""
+    try:
+        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        duration = float(body.get("durationS") or _FR3_PIVOT_DEFAULT_DURATION_S)
+    except (TypeError, ValueError) as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    lo, hi = _FR3_PIVOT_DURATION_RANGE_S
+    if not lo <= duration <= hi:
+        return _fr3_pivot_refusal(state, f"采集时长要在 {lo:.0f}–{hi:.0f} s 之间")
+    note = " ".join(str(body.get("note") or "").split())[:120]
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return _fr3_pivot_refusal(state, f"{holder}，它占着 FR3 的 FCI；先停掉再采集")
+    refusal = ""
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") in ("collecting", "fitting"):
+            refusal = "已有一次 pivot 采集在进行"
+        else:
+            refusal, process, run = _spawn_fr3_pivot(
+                state,
+                lambda run: [
+                    str(_mujoco_replay_python(state)),
+                    str(state.repo_root / _FR3_PIVOT_SCRIPT),
+                    "collect",
+                    "--robot-ip", robot_ip,
+                    "--duration-s", f"{duration:g}",
+                    "--note", note,
+                    "--out", str(run),
+                    "--yes",  # the panel's confirmation replaces the terminal prompt
+                ],
+                {"mode": "teach", "robotIp": robot_ip, "durationS": duration, "note": note},
+            )
+    if refusal:
+        return _fr3_pivot_refusal(state, refusal)
+    with state.lock:
+        state.log("warn", f"FR3 pivot collect started on {robot_ip} for {duration:g} s (teaching mode) -> {run.name}")
+    Thread(target=_watch_fr3_pivot, args=(state, process, run), daemon=True, name=f"fr3-pivot-{process.pid}").start()
+    return _fr3_pivot_payload(state)
+
+
+def _spawn_fr3_pivot(
+    state: GatewayState, command_for: Callable[[Path], list[str]], job: dict[str, Any]
+) -> tuple[str, subprocess.Popen[str] | None, Path]:
+    """Start a run that writes ``<stamp>_pivot.json`` and record the job; the caller holds
+    ``fr3_pivot_lock``. Returns (refusal, process, run)."""
+    root = _fr3_pivot_root(state)
+    root.mkdir(parents=True, exist_ok=True)
+    run = root / f"{datetime.now():%Y%m%d_%H%M%S}_pivot.json"
+    command = command_for(run)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(state.repo_root),
+            env=_real_preflight_env(state),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,  # Stop signals this group, never the gateway
+        )
+    except OSError as exc:
+        return str(exc), None, run
+    state.fr3_pivot_process = process
+    state.fr3_pivot_job = {
+        **job,
+        "state": "collecting",
+        "run": run.name,
+        "startedUnixS": time.time(),
+        "pid": process.pid,
+        "log": [],
+        "error": "",
+    }
+    return "", process, run
+
+
+def _fr3_pivot_auto_command(state: GatewayState, *args: str) -> list[str]:
+    return [str(_mujoco_replay_python(state)), str(state.repo_root / _FR3_PIVOT_AUTO_SCRIPT), *args]
+
+
+def _fr3_pivot_busy(state: GatewayState) -> str:
+    with state.fr3_pivot_lock:
+        return "pivot 采集/执行还在进行，等它结束" if state.fr3_pivot_job.get("state") in ("collecting", "fitting") else ""
+
+
+def _run_fr3_pivot_tool(state: GatewayState, command: list[str], timeout_s: float) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(state.repo_root),
+            env=_real_preflight_env(state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, str(exc)
+    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def _capture_fr3_pivot_centre(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Read only: the socket seated on the ball, its FK is the centre the plan pivots about."""
+    try:
+        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+    except ValueError as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    busy = _fr3_pivot_busy(state) or _fr3_pivot_fci_holder(state)
+    if busy:
+        return _fr3_pivot_refusal(state, busy)
+    out = _fr3_pivot_root(state) / "centres" / f"{datetime.now():%Y%m%d_%H%M%S}_centre.json"
+    note = " ".join(str(body.get("note") or "").split())[:120]
+    code, output = _run_fr3_pivot_tool(
+        state,
+        _fr3_pivot_auto_command(state, "capture", "--robot-ip", robot_ip, "--note", note, "--out", str(out)),
+        60,
+    )
+    if code != 0 or not out.is_file():
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {code}"), "output": output}
+    return {**_fr3_pivot_payload(state), "captured": out.name, "output": output}
+
+
+def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """IK + MuJoCo checks of the pivot about a captured centre. A plan that fails is written too."""
+    name = str(body.get("centre") or "")
+    centre = _fr3_pivot_root(state) / "centres" / name
+    if not _FR3_PIVOT_CENTRE_RE.match(name) or not centre.is_file():
+        return _fr3_pivot_refusal(state, f"找不到球心 {name!r}；先取球心")
+    bias = _fr3_pivot_bias(body)
+    if isinstance(bias, str):
+        return _fr3_pivot_refusal(state, bias)
+    out = _fr3_pivot_root(state) / "plans" / f"{datetime.now():%Y%m%d_%H%M%S}_plan.json"
+    code, output = _run_fr3_pivot_tool(
+        state,
+        _fr3_pivot_auto_command(state, "plan", str(centre), "--bias-mm", *[f"{x:g}" for x in bias], "--out", str(out)),
+        300,
+    )
+    if code not in (0, 3) or not out.is_file():  # 3: written, did not pass
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {code}"), "output": output}
+    return {**_fr3_pivot_payload(state), "planned": out.name, "output": output}
+
+
+def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Real robot: the soft impedance follows a passed plan, then the run is fitted as a collect is."""
+    name = str(body.get("plan") or "")
+    plan = _fr3_pivot_root(state) / "plans" / name
+    if not _FR3_PIVOT_PLAN_RE.match(name) or not plan.is_file():
+        return _fr3_pivot_refusal(state, f"找不到规划 {name!r}")
+    summary = _read_json_file(plan.with_name(name.replace(".json", ".summary.json"))) or {}
+    if not summary.get("passed"):
+        return _fr3_pivot_refusal(state, "这个规划没通过演算，不能执行")
+    try:
+        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+    except ValueError as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return _fr3_pivot_refusal(state, f"{holder}，它占着 FR3 的 FCI；先停掉再执行")
+    note = " ".join(str(body.get("note") or "").split())[:120]
+    refusal = ""
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") in ("collecting", "fitting"):
+            refusal = "已有一次 pivot 采集/执行在进行"
+        else:
+            refusal, process, run = _spawn_fr3_pivot(
+                state,
+                lambda run: _fr3_pivot_auto_command(
+                    state, "execute", str(plan), "--robot-ip", robot_ip, "--note", note, "--out", str(run)
+                ),
+                {
+                    "mode": "auto",
+                    "plan": name,
+                    "biasMm": (summary.get("params") or {}).get("bias_mm"),
+                    "robotIp": robot_ip,
+                    "durationS": summary.get("duration_s"),
+                    "note": note,
+                },
+            )
+    if refusal:
+        return _fr3_pivot_refusal(state, refusal)
+    with state.lock:
+        state.log("warn", f"FR3 planned pivot executing on {robot_ip}: {name} -> {run.name}")
+    Thread(target=_watch_fr3_pivot, args=(state, process, run), daemon=True, name=f"fr3-pivot-{process.pid}").start()
+    return _fr3_pivot_payload(state)
+
+
+def _fr3_pivot_bias(body: dict[str, Any]) -> list[float] | str:
+    try:
+        bias = [float(x) for x in body.get("biasMm") or [0, 0, 0]]
+    except (TypeError, ValueError):
+        return "偏置要是 3 个数"
+    if len(bias) != 3 or any(abs(x) > _FR3_PIVOT_MAX_BIAS_MM for x in bias):
+        return f"偏置要是 3 个数，每个不超过 ±{_FR3_PIVOT_MAX_BIAS_MM:g} mm"
+    return bias
+
+
+def _fr3_socket_offset_mm(state: GatewayState) -> list[float] | None:
+    """corenetic_socket_ee's origin in corenetic_gripper_ee (mm), or None unless a pure translation."""
+    try:
+        text = (state.repo_root / _FR3_PIVOT_URDF).read_text()
+    except OSError:
+        return None
+    m = re.search(r'<joint name="corenetic_socket_joint"[^>]*>\s*<origin rpy="([^"]*)" xyz="([^"]*)"', text)
+    if m is None:
+        return None
+    try:
+        rpy = [float(v) for v in m[1].split()]
+        xyz = [float(v) for v in m[2].split()]
+    except ValueError:
+        return None
+    return [1e3 * v for v in xyz] if len(xyz) == 3 and not any(rpy) else None
+
+
+def _fr3_pivot_anchor(state: GatewayState) -> dict[str, Any]:
+    """The ball centre in corenetic_socket_ee from the latest guided/commanded fit, for ``guide
+    --anchor-mm`` -- or why not. It was fitted on one grip; the gripper teleop having run since that
+    run started (the only way the GUI re-clamps the insert) is said, but does not refuse it: the gripper
+    still drops out on its own, and a re-clamped insert seats again within 0.2 mm (the operator, 10-14)."""
+    root = _fr3_pivot_root(state)
+    paths = sorted((p for p in root.glob("*_pivot.json") if _FR3_PIVOT_RUN_RE.match(p.name)), reverse=True) if root.is_dir() else []
+    single = None
+    for path in paths:
+        fit = _read_json_file(_fr3_pivot_fit_path(path)) or {}
+        socket = fit.get("socket_frame") or {}
+        if (fit.get("commanded") or {}).get("kind") in ("guided", "commanded") and "s_ee_mm" in socket:
+            single = (path.name[:15], path.name, _fr3_pivot_fit_path(path).name, socket, [], path.name[:15], fit.get("fk"))
+            break
+    joint = None
+    joints = _fr3_pivot_joint_root(state)
+    for path in sorted(joints.glob("*_joint.json"), reverse=True) if joints.is_dir() else []:
+        report = _read_json_file(path) or {}
+        socket = report.get("socket_frame") or {}
+        if _FR3_PIVOT_JOINT_RE.match(path.name) and "s_ee_mm" in socket:
+            runs = sorted(str(r) for r in report.get("runs") or [])
+            first = runs[0][:15] if runs else path.name[:15]
+            joint = (path.name[:15], path.name, path.name, socket, list(report.get("warnings") or []), first, report.get("fk"))
+            break
+    # The newer of the two: a joint fit made after the last run, else that run's own fit.
+    picked = max((c for c in (single, joint) if c), default=None, key=lambda c: c[0])
+    if picked is None:
+        return {"available": False, "reason": "还没有拟合过的引导；先跑一轮不挂球心的引导"}
+    _, source, fit_name, socket, fit_warnings, first_run, fk = picked
+    s = [float(x) for x in socket["s_ee_mm"]]
+    offset = _fr3_socket_offset_mm(state)
+    if offset is not None and len((fk or {}).get("s_ee_mm") or []) == 3:
+        s = [float(a) - b for a, b in zip(fk["s_ee_mm"], offset, strict=True)]
+    s = [round(x, 2) + 0.0 for x in s]
+    view = {"available": False, "sMm": s, "run": source, "fitName": fit_name, "joint": picked is joint,
+            "residualRmsMm": socket.get("residual_rms_mm")}
+    problems, warnings = list(fit_warnings), []
+    rms = socket.get("residual_rms_mm")
+    if rms is None or rms > _FR3_PIVOT_ANCHOR_MAX_RMS_MM:
+        problems.append(f"残差 {rms} mm 超过 {_FR3_PIVOT_ANCHOR_MAX_RMS_MM:g} mm")
+    if max(socket.get("s_sigma_mm") or [1e9]) > _FR3_PIVOT_ANCHOR_MAX_SIGMA_MM:
+        problems.append(f"偏移不确定度 {socket.get('s_sigma_mm')} mm 超过 ±{_FR3_PIVOT_ANCHOR_MAX_SIGMA_MM:g} mm")
+    if (socket.get("span_deg") or 0) < _FR3_PIVOT_ANCHOR_MIN_SPAN_DEG or (socket.get("weak_singular") or 0) < _FR3_PIVOT_ANCHOR_MIN_WEAK:
+        problems.append(f"转得不够（总转角 {socket.get('span_deg')}°，弱方向 {socket.get('weak_singular')}）")
+    if math.hypot(*s) > _FR3_PIVOT_ANCHOR_MAX_MM:
+        problems.append(f"偏移 {math.hypot(*s):.1f} mm 超过 {_FR3_PIVOT_ANCHOR_MAX_MM:g} mm，不像球心")
+    started = datetime.strptime(first_run, "%Y%m%d_%H%M%S").timestamp()
+    hold = _gripper_teleop_root(state) / "hold.json"
+    if _gripper_teleop_running(state):
+        warnings.append("夹爪遥控正在运行，夹持可能会变")
+    elif hold.is_file() and hold.stat().st_mtime >= started:
+        when = datetime.fromtimestamp(hold.stat().st_mtime).strftime("%m-%d %H:%M:%S")
+        warnings.append(f"夹爪遥控在 {when} 用过（这次拟合的运行之后），夹持可能变了；先跑一轮不挂球心的引导、重新拟合")
+    if warnings:
+        view["warning"] = f"{source} 的拟合：" + "；".join(warnings) + "（插件重夹定位在 0.2 mm 内，仍可沿用）"
+    if problems:
+        return {**view, "reason": f"{source} 的拟合不能用：" + "；".join(problems)}
+    return {**view, "available": True, "reason": ""}
+
+
+def _guide_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Real robot: a virtual ball joint -- the socket held pressed on the ball, the operator turns it."""
+    name = str(body.get("centre") or "")
+    centre = _fr3_pivot_root(state) / "centres" / name
+    if not _FR3_PIVOT_CENTRE_RE.match(name) or not centre.is_file():
+        return _fr3_pivot_refusal(state, f"找不到球心 {name!r}；先取球心")
+    bias = _fr3_pivot_bias(body)
+    if isinstance(bias, str):
+        return _fr3_pivot_refusal(state, bias)
+    try:
+        duration = float(body.get("durationS") or _FR3_PIVOT_GUIDE_DEFAULT_S)
+        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+    except (TypeError, ValueError) as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    lo, hi = _FR3_PIVOT_GUIDE_RANGE_S
+    if not lo <= duration <= hi:
+        return _fr3_pivot_refusal(state, f"引导时长要在 {lo:.0f}–{hi:.0f} s 之间")
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return _fr3_pivot_refusal(state, f"{holder}，它占着 FR3 的 FCI；先停掉再开始")
+    note = " ".join(str(body.get("note") or "").split())[:120]
+    anchor_args: list[str] = []
+    anchor_mm = [0.0, 0.0, 0.0]
+    if body.get("anchorFromFit"):
+        anchor = _fr3_pivot_anchor(state)
+        if not anchor["available"]:
+            return _fr3_pivot_refusal(state, anchor["reason"])
+        anchor_mm = anchor["sMm"]
+        anchor_args = ["--anchor-mm", *[f"{x:g}" for x in anchor_mm], "--anchor-from", anchor["fitName"]]
+    refusal = ""
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") in ("collecting", "fitting"):
+            refusal = "已有一次 pivot 采集/执行在进行"
+        else:
+            refusal, process, run = _spawn_fr3_pivot(
+                state,
+                lambda run: _fr3_pivot_auto_command(
+                    state,
+                    "guide", str(centre),
+                    "--robot-ip", robot_ip,
+                    "--duration-s", f"{duration:g}",
+                    "--bias-mm", *[f"{x:g}" for x in bias],
+                    *anchor_args,
+                    "--note", note,
+                    "--out", str(run),
+                ),
+                {
+                    "mode": "guided", "centre": name, "biasMm": bias, "anchorMm": anchor_mm,
+                    "robotIp": robot_ip, "durationS": duration, "note": note,
+                },
+            )
+    if refusal:
+        return _fr3_pivot_refusal(state, refusal)
+    with state.lock:
+        state.log("warn", f"FR3 guided pivot on {robot_ip} about {name}, bias {bias} mm, anchor {anchor_mm} mm -> {run.name}")
+    Thread(target=_watch_fr3_pivot, args=(state, process, run), daemon=True, name=f"fr3-pivot-{process.pid}").start()
+    return _fr3_pivot_payload(state)
+
+
+def _finish_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """SIGUSR1 to ``guide``: ease the press off, keep the run, fit it (Stop discards instead)."""
+    del body
+    with state.fr3_pivot_lock:
+        process = state.fr3_pivot_process
+        job = state.fr3_pivot_job
+        ok = process is not None and process.poll() is None and job.get("mode") == "guided"
+        if ok:
+            job["finishRequested"] = True
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGUSR1)
+    if not ok:
+        return _fr3_pivot_refusal(state, "没有正在进行的引导 pivot")
+    return _fr3_pivot_payload(state)
+
+
+def _stop_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """SIGINT to ``collect``: its ``finally`` leaves teaching mode; nothing is written."""
+    del body
+    with state.fr3_pivot_lock:
+        process = state.fr3_pivot_process
+        if process is None or process.poll() is not None:
+            refusal = "没有正在进行的 pivot 采集"
+        else:
+            refusal = ""
+            state.fr3_pivot_job["stopRequested"] = True
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGINT)
+    if refusal:
+        return _fr3_pivot_refusal(state, refusal)
+    return _fr3_pivot_payload(state)
+
+
+def _fr3_pivot_run_path(state: GatewayState, name: Any) -> Path | None:
+    name = str(name or "").strip()
+    path = _fr3_pivot_root(state) / name
+    return path if _FR3_PIVOT_RUN_RE.match(name) and path.is_file() else None
+
+
+def _refit_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    run = _fr3_pivot_run_path(state, body.get("run"))
+    if run is None:
+        return _fr3_pivot_refusal(state, f"找不到 pivot 采集 {body.get('run')!r}")
+    with state.fr3_pivot_lock:
+        busy = state.fr3_pivot_job.get("state") in ("collecting", "fitting")
+    if busy:
+        return _fr3_pivot_refusal(state, "pivot 采集还在进行，等它结束")
+    ok, output = _run_fr3_pivot_fit(state, run)
+    if not ok:
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else "fit failed"), "output": output}
+    return {**_fr3_pivot_payload(state), "output": output}
+
+
+def _fit_joint_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """``fr3_tcp_pivot.py fit-joint``: one socket centre from the chosen runs (each from its own heading)."""
+    names = [str(n) for n in body.get("runs") or []]
+    if len(set(names)) < 2:
+        return _fr3_pivot_refusal(state, "合并拟合至少要选两次采集")
+    if len(set(names)) > _FR3_PIVOT_JOINT_MAX_RUNS:
+        return _fr3_pivot_refusal(state, f"一次最多合并 {_FR3_PIVOT_JOINT_MAX_RUNS} 次采集")
+    runs = []
+    for name in sorted(set(names)):
+        run = _fr3_pivot_run_path(state, name)
+        if run is None:
+            return _fr3_pivot_refusal(state, f"找不到 pivot 采集 {name!r}")
+        runs.append(run)
+    if _fr3_pivot_busy(state):
+        return _fr3_pivot_refusal(state, _fr3_pivot_busy(state))
+    out = _fr3_pivot_joint_root(state) / f"{datetime.now():%Y%m%d_%H%M%S}_joint.json"
+    command = [
+        str(_mujoco_replay_python(state)),
+        str(state.repo_root / _FR3_PIVOT_SCRIPT),
+        "fit-joint",
+        *[str(r) for r in runs],
+        *(["--per-run-centre"] if body.get("perRunCentre") else []),
+        "--json",
+        str(out),
+    ]
+    code, output = _run_fr3_pivot_tool(state, command, 300)
+    if code != 0 or not out.is_file():
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {code}"), "output": output}
+    with state.lock:
+        state.log("info", f"FR3 pivot joint fit of {len(runs)} runs -> {out.name}")
+    return {**_fr3_pivot_payload(state), "jointFitted": out.name, "output": output}
+
+
+def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Every edge -- live and each candidate report -- against the balls both pivots found."""
+    raw = body.get("positions")
+    if not isinstance(raw, list) or not raw:
+        return _fr3_pivot_refusal(state, "至少要一个球位置：一次 FR3 pivot + 同一个球上的手持 episode")
+    known = {(row["dataset"], int(row["episode"])) for row in _ball_check_episodes(state)}
+    args: list[str] = []
+    pairs: list[tuple[Path, int]] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置不是对象")
+        # one run's fit, or a joint fit of several runs on this ball (one shared centre: steadier)
+        pivot = str(item.get("pivot") or "").strip()
+        run = _fr3_pivot_run_path(state, pivot)
+        fit = _fr3_pivot_fit_path(run) if run is not None else _fr3_pivot_joint_root(state) / pivot
+        if not (run is not None or _FR3_PIVOT_JOINT_RE.match(pivot)) or not fit.is_file():
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置：{item.get('pivot')!r} 不是一次已拟合的 FR3 pivot 或合并拟合")
+        if run is None and not (_read_json_file(fit) or {}).get("shared_centre"):
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置：{pivot} 是每次一个球心的合并拟合，不是一个球位置")
+        try:
+            episode = int(item.get("episode"))
+        except (TypeError, ValueError):
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置：episode 不是整数")
+        dataset = str(item.get("dataset") or "")
+        if (dataset, episode) not in known:
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置：{dataset} episode {episode} 不在最近的录制里")
+        args += ["--position", str(fit), dataset, str(episode)]
+        pairs.append((Path(dataset), episode))
+    if not _BALL_CHECK_LOCK.acquire(blocking=False):
+        return _fr3_pivot_refusal(state, "已有一次同球检验在运行")
+    try:
+        try:
+            python = _marker_tcp_python(state)
+            # Production's labels for these episodes, generated if nobody has yet.
+            cube = _ensure_tracker_sidecars(state, pairs)
+        except Exception as exc:  # noqa: BLE001
+            return _fr3_pivot_refusal(state, str(exc))
+        reports = _fr3_base_edge_reports_root(state)
+        candidates = sorted(reports.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if reports.is_dir() else []
+        for path in candidates[:_FR3_BASE_EDGE_REPORT_LIMIT]:
+            args += ["--candidate", str(path)]
+        out = state.repo_root / _BALL_CHECK_SUBDIR / f"check_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+        command = [
+            str(python),
+            str(state.repo_root / _BALL_CHECK_SCRIPT),
+            *args,
+            "--cube", cube,
+            "--world-dir", str(_world_root(state)),
+            "--out", str(out),
+        ]
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(state.repo_root),
+                env=_marker_tcp_tool_env(state),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return _fr3_pivot_refusal(state, str(exc))
+    finally:
+        _BALL_CHECK_LOCK.release()
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if proc.returncode not in (0, 2) or not out.is_file():
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {proc.returncode}"), "output": output}
+    with state.lock:
+        state.log("info", f"FR3 base ball check written: {out.name}")
+    return {**_fr3_pivot_payload(state), "checked": out.name, "output": output}
+
+
+_BALL_CHECK_NAME_RE = re.compile(r"^check_[0-9A-Za-z_]+\.json$")
+
+
+def _save_ball_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """A check's ball edge as a candidate report of the FR3-base edge panel; swapping it in stays there."""
+    name = str(body.get("check") or "").strip()
+    check = state.repo_root / _BALL_CHECK_SUBDIR / name
+    if not _BALL_CHECK_NAME_RE.match(name) or not check.is_file():
+        return _fr3_pivot_refusal(state, f"找不到同球检验 {name!r}")
+    out = _fr3_base_edge_reports_root(state) / f"ball_{check.stem}.json"
+    try:
+        python = _marker_tcp_python(state)
+        proc = subprocess.run(
+            [str(python), str(state.repo_root / _BALL_CHECK_SCRIPT), "edge", "--check", str(check), "--out", str(out)],
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    # exit 2: written, but the verdict is not ok -- listed with its reasons, not swappable
+    if proc.returncode not in (0, 2) or not out.is_file():
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {proc.returncode}"), "output": output}
+    with state.lock:
+        state.log("info", f"ball edge of {name} written as candidate {out.name}")
+    return {**_fr3_pivot_payload(state), "edgeSaved": out.name, "output": output}
+
+
+# Outside the state lock (see the POST handler): fits and checks run for seconds to minutes.
+_FR3_PIVOT_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/fr3-pivot/collect": _start_fr3_pivot,
+    "/api/calibration/fr3-pivot/capture-centre": _capture_fr3_pivot_centre,
+    "/api/calibration/fr3-pivot/plan": _plan_fr3_pivot,
+    "/api/calibration/fr3-pivot/execute": _execute_fr3_pivot,
+    "/api/calibration/fr3-pivot/guide": _guide_fr3_pivot,
+    "/api/calibration/fr3-pivot/finish": _finish_fr3_pivot,
+    "/api/calibration/fr3-pivot/stop": _stop_fr3_pivot,
+    "/api/calibration/fr3-pivot/fit": _refit_fr3_pivot,
+    "/api/calibration/fr3-pivot/fit-joint": _fit_joint_fr3_pivot,
+    "/api/calibration/fr3-pivot/check": _run_ball_check,
+    "/api/calibration/fr3-pivot/ball-edge": _save_ball_edge,
+}
+
+
+# --- FR3 gripper teleop from the handheld BOX --------------------------------
+#
+# The FR3's gripper is a BOX like the handheld one -- UDP on one shared socket
+# (:15000), not part of the FCI. tools/fr3/fr3_gripper_teleop.py makes its jaw
+# follow the handheld's (trigger pressed home -> shut, as in the replay), so the
+# pivot insert can be clamped without a terminal. It needs the BOX port: refused
+# while the recorder or a real replay holds it, and they are refused while it
+# runs. It never takes the FCI, so teaching mode (a pivot collect) may run
+# alongside. Exit leaves the arm's BOX in control mode at the last target, so a
+# grip keeps its force; mode 0 would hand the jaw to its own trigger and open it.
+
+_GRIPPER_TELEOP_SCRIPT = Path("tools") / "fr3" / "fr3_gripper_teleop.py"
+_GRIPPER_TELEOP_SUBDIR = Path("outputs") / "fr3_gripper_teleop"
+_GRIPPER_TELEOP_LOG_LINES = 40
+_GRIPPER_TELEOP_STOP_WAIT_S = 3.0
+# The BOX SDK logs every packet (and its device's own log) to stderr; kept out of the panel's tail,
+# which is for the teleop's own lines (10-13: the tail was nothing but "Set gripper position").
+_BOX_SDK_LOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[(?:DEBUG|INFO|WARN)\s*\]")
+
+
+def _gripper_teleop_root(state: GatewayState) -> Path:
+    return state.repo_root / _GRIPPER_TELEOP_SUBDIR
+
+
+def _gripper_teleop_running(state: GatewayState) -> bool:
+    process = state.gripper_teleop_process
+    return process is not None and process.poll() is None
+
+
+def _gripper_teleop_settings(state: GatewayState) -> dict[str, Any]:
+    """Arm BOX id and the grasp rule, from the real replay YAML (the same gripper, the same rule)."""
+    try:
+        config = _load_yaml(state.repo_root / FR3_REPLAY_THOR_CONFIG)
+    except (OSError, RuntimeError, ValueError):
+        config = {}
+    robot = config.get("robot") if isinstance(config.get("robot"), dict) else {}
+    source = config.get("input") if isinstance(config.get("input"), dict) else {}
+    device_id = robot.get("corenetic_device_id")
+    return {
+        "armDeviceId": int(device_id) if str(device_id or "").strip().isdigit() else None,
+        "graspTriggerClosePct": source.get("grasp_trigger_close_pct"),
+        "graspClosedWidthM": source.get("grasp_closed_width_m"),
+    }
+
+
+def _gripper_teleop_job_view(state: GatewayState) -> dict[str, Any]:
+    with state.gripper_teleop_lock:
+        job = dict(state.gripper_teleop_job)
+        job["log"] = list(job.get("log") or [])
+    return job
+
+
+def _gripper_teleop_payload(state: GatewayState) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "error": "",
+        "job": _gripper_teleop_job_view(state),
+        **_gripper_teleop_settings(state),
+        "hold": _read_json_file(_gripper_teleop_root(state) / "hold.json"),
+    }
+
+
+def _gripper_teleop_refusal(state: GatewayState, message: str) -> dict[str, Any]:
+    return {**_gripper_teleop_payload(state), "ok": False, "error": message}
+
+
+def _gripper_teleop_box_holder(state: GatewayState) -> str:
+    """Who else holds the BOX port (or the arm's gripper) right now, or ""."""
+    with state.lock:
+        recorder = state.process
+        if recorder is not None and recorder.poll() is None:
+            return "录制器已连接，它占着 BOX 端口（:15000）；先 Disconnect"
+        replay = state.replay_process
+        if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+            return "真机 replay 正在运行，它在控制 FR3 夹爪"
+    return ""
+
+
+def _gripper_teleop_conflict() -> str:
+    return "FR3 夹爪遥控正在运行，它占着 BOX 端口（:15000）；先在标定页退出遥控"
+
+
+def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip()
+        if not line:
+            continue
+        with state.gripper_teleop_lock:
+            job = state.gripper_teleop_job
+            if line.startswith("STATUS "):
+                with suppress(ValueError):
+                    job["status"] = json.loads(line[len("STATUS "):])
+                continue
+            if line.startswith("ERROR "):
+                job["error"] = line[len("ERROR "):]
+            if _BOX_SDK_LOG_LINE_RE.match(line):
+                continue
+            log = job.setdefault("log", [])
+            log.append(line)
+            del log[:-_GRIPPER_TELEOP_LOG_LINES]
+    code = process.wait()
+    with state.gripper_teleop_lock:
+        job = state.gripper_teleop_job
+        job["returncode"] = code
+        job["state"] = "exited" if code == 0 else "error"
+        if code != 0 and not job.get("error"):
+            job["error"] = (job.get("log") or [f"exit {code}"])[-1]
+        if state.gripper_teleop_process is process:
+            state.gripper_teleop_process = None
+    with state.lock:
+        state.log("info" if code == 0 else "warn", f"FR3 gripper teleop ended (exit {code})")
+
+
+def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    del body
+    settings = _gripper_teleop_settings(state)
+    if settings["armDeviceId"] is None:
+        return _gripper_teleop_refusal(state, f"{FR3_REPLAY_THOR_CONFIG} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）")
+    holder = _gripper_teleop_box_holder(state)
+    if holder:
+        return _gripper_teleop_refusal(state, holder)
+    command = [
+        str(_mujoco_replay_python(state)),
+        str(state.repo_root / _GRIPPER_TELEOP_SCRIPT),
+        "--arm-device-id", str(settings["armDeviceId"]),
+        "--hold-file", str(_gripper_teleop_root(state) / "hold.json"),
+    ]
+    if settings["graspTriggerClosePct"] is not None:
+        command += ["--grasp-trigger-close-pct", str(settings["graspTriggerClosePct"])]
+    if settings["graspClosedWidthM"] is not None:
+        command += ["--grasp-closed-width-m", str(settings["graspClosedWidthM"])]
+    # The refusals are built after the lock is released: the payload reads the job under it.
+    refusal, process = "", None
+    with state.gripper_teleop_lock:
+        if _gripper_teleop_running(state):
+            refusal = "已经在遥控"
+        else:
+            root = _gripper_teleop_root(state)
+            root.mkdir(parents=True, exist_ok=True)
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(root),  # the BOX SDK drops its CSV dumps in the working directory
+                    env=_real_preflight_env(state),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,  # Exit signals this group, never the gateway
+                )
+            except OSError as exc:
+                refusal = str(exc)
+            else:
+                state.gripper_teleop_process = process
+                state.gripper_teleop_job = {
+                    "state": "running",
+                    "startedUnixS": time.time(),
+                    "pid": process.pid,
+                    "armDeviceId": settings["armDeviceId"],
+                    "log": [],
+                    "error": "",
+                }
+    if refusal or process is None:
+        return _gripper_teleop_refusal(state, refusal)
+    with state.lock:
+        state.log("info", f"FR3 gripper teleop started (arm BOX {settings['armDeviceId']})")
+    Thread(target=_watch_gripper_teleop, args=(state, process), daemon=True, name=f"gripper-teleop-{process.pid}").start()
+    return _gripper_teleop_payload(state)
+
+
+def _stop_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """SIGINT: the script sends the last command, leaves the arm's BOX in control mode, exits."""
+    del body
+    with state.gripper_teleop_lock:
+        process = state.gripper_teleop_process
+        if process is not None and process.poll() is None:
+            state.gripper_teleop_job["stopRequested"] = True
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGINT)
+        else:
+            process = None
+    if process is None:
+        return _gripper_teleop_refusal(state, "没有在遥控")
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_GRIPPER_TELEOP_STOP_WAIT_S)
+    deadline = time.monotonic() + 1.0  # let the reader thread record the exit
+    while time.monotonic() < deadline and _gripper_teleop_job_view(state).get("state") == "running":
+        time.sleep(0.02)
+    return _gripper_teleop_payload(state)
+
+
+_GRIPPER_TELEOP_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/fr3/gripper-teleop/start": _start_gripper_teleop,
+    "/api/fr3/gripper-teleop/stop": _stop_gripper_teleop,
+}
+
+
+# --- FR3 move to start --------------------------------------------------------
+#
+# panda_py's move_to_start(): the SDK home pose, joint-space, at its own slow speed.
+# The replay panel's button homes the arm between runs without a terminal. It takes
+# the FCI for the move, so it is refused while anything else holds it.
+
+_FR3_MOVE_TO_START_SCRIPT = Path("tools") / "fr3" / "fr3_move_to_start_runtime.py"
+_FR3_MOVE_TO_START_TIMEOUT_S = 120.0
+_FR3_MOVE_TO_START_LOCK = Lock()
+
+
 def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     try:
         robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "robotIp": "", "output": ""}
     refusal = {"ok": False, "robotIp": robot_ip, "output": ""}
-    holder = _fr3_fci_holder(state)
+    holder = _fr3_pivot_fci_holder(state)
+    if not holder:
+        with state.fr3_pivot_lock:
+            if state.fr3_pivot_job.get("state") == "collecting":
+                holder = "FR3 pivot 采集正在进行"
     if holder:
         return {**refusal, "error": f"{holder}，它占着 FR3 的 FCI；先停掉再归位"}
     if not _FR3_MOVE_TO_START_LOCK.acquire(blocking=False):
@@ -9845,8 +11052,9 @@ def _fr3_arm_box_ids(repo_root: Path) -> set[str]:
 def _fr3_replay_target_frame(repo_root: Path) -> str:
     """The frame real replay drives onto the trajectory (its YAML's robot.target_frame_name).
 
-    The MuJoCo preview is handed the same one: 10-13 it became corenetic_socket_ee, 10.3 mm up the
-    tool axis from corenetic_gripper_ee, and a preview on the old frame plans a different arm pose.
+    The MuJoCo preview is handed the same one: 10-13 it became corenetic_socket_ee, the pivot insert's
+    socket (10-14: (1.45, -0.78, -5.06) mm in corenetic_gripper_ee, by FR3 pivot), and a preview on
+    the old frame plans a different arm pose.
     """
     return str(_fr3_replay_robot_config(repo_root).get("target_frame_name") or "corenetic_gripper_ee")
 
@@ -14363,6 +15571,8 @@ def _connect_recorder(
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
+    if _gripper_teleop_running(state):
+        raise ValueError(_gripper_teleop_conflict())
 
     is_workstation = state.profile == "workstation"
     if backend is not None:
@@ -16522,6 +17732,8 @@ def _start_real_replay(
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
+    if _gripper_teleop_running(state):
+        raise ValueError(_gripper_teleop_conflict())
 
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
@@ -17109,6 +18321,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/fr3-base-edge":
             _json_response(self, HTTPStatus.OK, _fr3_base_edge_payload(self.server.state))
             return
+        if path == "/api/calibration/fr3-pivot":
+            _json_response(self, HTTPStatus.OK, _fr3_pivot_payload(self.server.state))
+            return
+        if path == "/api/fr3/gripper-teleop":
+            _json_response(self, HTTPStatus.OK, _gripper_teleop_payload(self.server.state))
+            return
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
             return
@@ -17556,6 +18774,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             _TRACKER_MOUNT_FIT_ROUTES.get(path)
             or _CROSS_CAMERA_ROUTES.get(path)
             or _FR3_BASE_EDGE_ROUTES.get(path)
+            or _FR3_PIVOT_ROUTES.get(path)
+            or _GRIPPER_TELEOP_ROUTES.get(path)
             or _FR3_MOVE_TO_START_ROUTES.get(path)
         )
         if tracker_fit is not None:

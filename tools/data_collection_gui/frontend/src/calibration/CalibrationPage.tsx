@@ -32,6 +32,7 @@ import { RigCheckPanel } from "./RigCheckPanel";
 import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
 import { Fr3BaseEdgePanel } from "./Fr3BaseEdgePanel";
+import { Fr3PivotPanel } from "./Fr3PivotPanel";
 import { CrossCameraPanel } from "./CrossCameraPanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
@@ -198,6 +199,10 @@ export function CalibrationPage({
           fr3_base export goes through it, so it sits right after the world it
           starts from. */}
       <Fr3BaseEdgePanel api={api} busy={busy} />
+
+      {/* A referee for that edge that needs no laser and no TCP definition:
+          the FR3 and the handheld pivot about one ball on the table. */}
+      <Fr3PivotPanel api={api} busy={busy} />
 
       {/* Both checks above compare with the past, so an extrinsic that was
           wrong from the day it was solved passes them. This one compares the

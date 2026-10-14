@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import threading
@@ -8368,6 +8369,493 @@ def test_fr3_base_edge_solve_refuses_a_run_it_cannot_solve(tmp_path):
     assert "内参" in gateway._solve_fr3_base_edge(state, {"run": "run_a"})["error"]
 
 
+def _laser_edge_inputs(state, T_live):
+    """A certified station and two replays with the laser, laid out as on Thor, and a laser candidate from them."""
+    np = pytest.importorskip("numpy")
+    from tools.thor.gmsl2 import register_fr3_base
+
+    T_world_base = np.linalg.inv(np.asarray(_shift_x(T_live, 0.002)))
+    T_tracker_base = np.eye(4)
+    T_tracker_base[:3, 3] = [2.0, 0.5, -0.4]
+    station = {
+        "T_world_tracker": (T_world_base @ np.linalg.inv(T_tracker_base)).tolist(),
+        "world_frame_id": "world_a",
+        "sessions": [{"session_id": "lt_20261013_061349"}],
+        "n_poses_total": 15,
+        "rms_mm": 0.8,
+        "certifies": True,
+        "observability": {"extent_m": 0.6},
+    }
+    stations = state.repo_root / "outputs" / "laser_tracker"
+    stations.mkdir(parents=True)
+    (stations / "station_20261013_150000.json").write_text(json.dumps(station))
+    (stations / "pivot_right_20260929_ep2.json").write_text("{}")
+    for stamp in ("034118", "071500"):
+        run = state.datasets_root / "ds_1013" / "derived" / "cube" / "real_replay" / f"20261013T{stamp}Z_episode_000000_right"
+        (run / "laser_tracker" / f"lt_20261013_{stamp}").mkdir(parents=True)
+        (run / "replay_pose_traces").mkdir()
+        (run / "replay_pose_traces" / "t.csv").write_text("")
+    no_laser = state.datasets_root / "ds_1013" / "derived" / "cube" / "real_replay" / "20261013T020000Z_episode_000000_right"
+    (no_laser / "replay_pose_traces").mkdir(parents=True)
+    replay = {
+        "run": "r",
+        "run_dir": "/x/outputs/datasets/ds_1013/r",
+        "session_id": "lt_20261013_034118",
+        "used_frames": 900,
+        "laser_vs_fk": {"rms_mm": 0.3, "p95_mm": 0.47},
+        "orientation_span_deg": 11.6,
+        "T_tracker_base": T_tracker_base.tolist(),
+    }
+    reference = state.repo_root / "tools" / "thor" / "gmsl2" / "world" / "world_reference.json"
+    report = register_fr3_base.laser_report(
+        station,
+        "outputs/laser_tracker/station_20261013_150000.json",
+        [{"report": replay, "points": [[0.5, 0.0, 0.3], [0.6, 0.1, 0.2]]}],
+        reference_world="world_a",
+        reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(),
+    )
+    root = state.repo_root / "outputs" / "calibration" / "fr3_base_registration"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "laser__station_20261013_150000__x.json").write_text(json.dumps(report))
+
+
+def test_fr3_base_edge_payload_offers_the_laser_edge_next_to_the_single_tag_ones(tmp_path):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _laser_edge_inputs(state, T_live)
+
+    payload = gateway._fr3_base_edge_payload(state)
+
+    (station,) = payload["stations"]
+    assert station["name"] == "station_20261013_150000.json" and station["matchesReference"] and station["certifies"]
+    assert station["sessionUtc"] == "2026-10-13T06:13:49Z"
+    # only the runs that carried the laser, newest first
+    assert [r["sessionId"] for r in payload["laserReplays"]] == ["lt_20261013_071500", "lt_20261013_034118"]
+    assert payload["laserReplays"][0]["dataset"] == "ds_1013"
+    (candidate,) = payload["candidates"]
+    assert candidate["label"] == "station_20261013_150000 × 1 次回放"
+    assert candidate["quality"]["method"] == "laser"
+    assert candidate["quality"]["laserVsFkP95Mm"] == 0.47 and candidate["quality"]["stationRmsMm"] == 0.8
+    assert any("one replay" in w for w in candidate["warnings"])
+    # moved where the replays put the TCP
+    move = candidate["moveVsLive"]
+    assert move["points"] == 2 and move["meanMm"] == pytest.approx([2.0, 0.0, 0.0], abs=1e-6)
+    assert candidate["applyBlockers"] == []
+    assert payload["current"]["label"] == "run_a" and payload["current"]["quality"]["method"] == "singleTag"
+
+
+def test_fr3_base_laser_edge_solve_takes_only_a_station_and_replays_it_lists(tmp_path):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _laser_edge_inputs(state, T_live)
+    solve = gateway._solve_fr3_base_laser_edge
+    good = "ds_1013/derived/cube/real_replay/20261013T034118Z_episode_000000_right"
+
+    assert "站位拟合" in solve(state, {"station": "pivot_right_20260929_ep2.json", "replays": [good]})["error"]
+    assert "站位拟合" in solve(state, {"station": "../station_x.json", "replays": [good]})["error"]
+    assert "至少选一次" in solve(state, {"station": "station_20261013_150000.json", "replays": []})["error"]
+    bad = "ds_1013/derived/cube/real_replay/20261013T020000Z_episode_000000_right"
+    assert "不是一次带激光的回放" in solve(state, {"station": "station_20261013_150000.json", "replays": [bad]})["error"]
+
+
+# --- FR3 FK pivot and the ball check of the world -> fr3_base edge ---------------
+
+_FAKE_PIVOT_TOOL = '''
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+args = sys.argv[1:]
+def opt(name):
+    return args[args.index(name) + 1]
+if args[0] == "collect":
+    print("collect: teaching mode", flush=True)
+    if opt("--note") == "slow":
+        time.sleep(30)
+    Path(opt("--out")).write_text(json.dumps({"note": opt("--note"), "created": "2026-10-13T16:00:00", "q": []}))
+    print("wrote", opt("--out"), flush=True)
+elif args[0] == "fit-joint":
+    runs = [a for a in args[1:] if a.endswith("_pivot.json")]
+    shared = "--per-run-centre" not in args
+    out = Path(opt("--json"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "schema": "fr3_pivot_joint/v1", "created": "2026-10-14T12:00:00", "runs": [Path(r).name for r in runs],
+        "shared_centre": shared, "frame": "corenetic_gripper_ee", "fk": {"s_ee_mm": [1.5, -0.5, -4.3]},
+        "socket_frame": {"frame": "corenetic_socket_ee", "s_ee_mm": [1.5, -0.5, 6.0], "s_sigma_mm": [0.4, 0.6, 0.8],
+                         "residual_rms_mm": 0.98, "span_deg": 70.0, "weak_singular": 0.2},
+        "warnings": [] if shared else ["per run"],
+    }))
+    print(f"{len(runs)} runs, {'one ball centre' if shared else 'a ball centre per run'}")
+else:
+    run = json.loads(Path(args[1]).read_text())
+    Path(opt("--json")).write_text(json.dumps({
+        "note": run["note"], "created": run["created"],
+        "fk": {"s_ee_mm": [0.1, -0.2, -10.1], "s_sigma_mm": [0.02] * 3, "c_base_mm": [600.0, 0.0, 50.0],
+               "c_sigma_mm": [0.03] * 3, "residual_rms_mm": 0.1, "residual_p95_mm": 0.2,
+               "n_used": 300, "n_total": 4500, "span_deg": 32.0, "weak_singular": 0.25},
+        "socket_frame": {"frame": "corenetic_socket_ee", "s_ee_mm": [0.1, -0.2, 0.2]},
+    }))
+    print("socket centre in corenetic_gripper_ee: [0.1, -0.2, -10.1] mm")
+'''
+
+
+def _fr3_pivot_state(tmp_path, monkeypatch):
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    tool = tmp_path / "tools" / "fr3" / "fr3_tcp_pivot.py"
+    tool.parent.mkdir(parents=True)
+    tool.write_text(_FAKE_PIVOT_TOOL)
+    monkeypatch.setattr(gateway, "_mujoco_replay_python", lambda _state: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_real_preflight_env", lambda _state: dict(os.environ))
+    return state, T_live
+
+
+def _await_pivot(state, states=("done", "error", "stopped"), timeout_s=10.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        job = gateway._fr3_pivot_job_view(state)
+        if job.get("state") in states:
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"pivot job stuck in {gateway._fr3_pivot_job_view(state)}")
+
+
+def test_fr3_pivot_collect_runs_the_tool_then_fits_what_it_wrote(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+
+    started = gateway._start_fr3_pivot(state, {"robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
+
+    assert started["ok"], started["error"]
+    assert started["job"]["state"] in ("collecting", "fitting", "done")
+    job = _await_pivot(state)
+    assert job["state"] == "done", job
+    assert any("wrote" in line for line in job["log"]) and any("socket centre" in line for line in job["log"])
+    (run,) = gateway._fr3_pivot_payload(state)["runs"]
+    assert run["name"] == job["run"] and run["fitName"] == job["run"].replace(".json", ".fit.json")
+    assert run["note"] == "位置 1" and run["fk"]["c_base_mm"] == [600.0, 0.0, 50.0]
+    assert run["socketFrame"]["s_ee_mm"] == [0.1, -0.2, 0.2]
+
+
+def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    start = gateway._start_fr3_pivot
+    assert "IP" in start(state, {"robotIp": "not-an-ip"})["error"]
+    assert "15–180" in start(state, {"durationS": 5})["error"]
+
+    class Alive:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    state.replay_process, state.replay_process_kind = Alive(), "real"
+    assert "真机 replay" in start(state, {})["error"]
+    state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
+    state.teleop_process = Alive()
+    assert "遥操作" in start(state, {})["error"]
+    assert gateway._fr3_pivot_job_view(state) == {"log": []}
+
+
+def test_fr3_pivot_stop_interrupts_the_collect_and_a_second_start_is_refused(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
+    assert "已有一次" in gateway._start_fr3_pivot(state, {})["error"]
+
+    assert gateway._stop_fr3_pivot(state, {})["ok"]
+
+    job = _await_pivot(state)
+    assert job["state"] == "stopped" and job["returncode"] != 0
+    assert gateway._fr3_pivot_payload(state)["runs"] == []
+    assert "没有正在进行" in gateway._stop_fr3_pivot(state, {})["error"]
+
+
+def _rotations(n: int = 200) -> list[np.ndarray]:
+    def rot(axis: int, angle: float) -> np.ndarray:
+        c, s = math.cos(angle), math.sin(angle)
+        i, j = [(1, 2), (2, 0), (0, 1)][axis]
+        R = np.eye(3)
+        R[i, i], R[i, j], R[j, i], R[j, j] = c, -s, s, c
+        return R
+
+    return [
+        rot(0, 0.5 * math.sin(k / n * 6 * math.pi)) @ rot(1, 0.5 * math.cos(k / n * 4 * math.pi)) @ rot(2, math.sin(k / n * 2 * math.pi))
+        for k in range(n)
+    ]
+
+
+def _quat_xyzw(R: np.ndarray) -> list[float]:
+    w = math.sqrt(max(1e-12, 1 + np.trace(R))) / 2
+    return [(R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w), w]
+
+
+def test_fr3_pivot_ball_check_scores_the_live_edge_and_every_candidate(tmp_path, monkeypatch):
+    state, T_live = _fr3_pivot_state(tmp_path, monkeypatch)
+    real_script = Path(__file__).resolve().parents[2] / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py"
+    (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py").symlink_to(real_script)
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
+    assert gateway._start_fr3_pivot(state, {"note": "位置 1"})["ok"]
+    run = _await_pivot(state)["run"]
+
+    # The handheld episode about the same ball: the live edge maps c_base (600, 0, 50) mm to the world.
+    T = np.asarray(T_live)
+    ball_world = np.linalg.inv(T) @ np.array([0.6, 0.0, 0.05, 1.0])
+    ds = state.datasets_root / "hh"
+    (ds / "meta").mkdir(parents=True)
+    (ds / "meta" / "info.json").write_text("{}")
+    ep = ds / "episodes" / "episode_000000"
+    ep.mkdir(parents=True)
+    (ep / "meta.json").write_text(json.dumps({"world_frame": {"status": "ok", "world_frame_id": "world_a"}}))
+    sidecar = ds / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    with (sidecar / "state_action.right.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["episode_index", "frame_index", "solve_ok", "state_x_m", "state_y_m", "state_z_m", "state_qx", "state_qy", "state_qz", "state_qw"])
+        for i, R in enumerate(_rotations()):
+            w.writerow([0, i, "True", *(ball_world[:3] + [0.002, 0.0, 0.0]), *_quat_xyzw(R)])  # the world is 2 mm off
+    shifted = [row[:] for row in T_live]
+    shifted[0][3] += 0.005
+    _write_edge_candidate(state, "laser__x.json", shifted)
+
+    episodes = gateway._fr3_pivot_payload(state)["episodes"]
+    assert [(e["datasetName"], e["episode"], e["world"]) for e in episodes] == [("hh", 0, "world_a")]
+    check = gateway._run_ball_check
+    assert "已拟合" in check(state, {"positions": [{"pivot": "nope.json", "dataset": str(ds), "episode": 0}]})["error"]
+    assert "不在最近的录制里" in check(state, {"positions": [{"pivot": run, "dataset": "/etc", "episode": 0}]})["error"]
+
+    result = check(state, {"positions": [{"pivot": run, "dataset": episodes[0]["dataset"], "episode": 0}]})
+
+    assert result["ok"], result.get("output") or result["error"]
+    report = result["checks"][0]
+    assert report["name"] == result["checked"]
+    live, cand = report["edges"]
+    assert live["name"] == "live" and live["positions"][0]["error_mm"] == pytest.approx([-2.0, 0.0, 0.0], abs=0.1)
+    assert cand["name"] == "laser__x.json" and cand["positions"][0]["norm_mm"] == pytest.approx(
+        np.linalg.norm(np.array([-2.0, 0, 0]) + np.linalg.inv(T)[:3, :3] @ [-5.0, 0, 0]), abs=0.1
+    )
+
+    # a joint fit of runs on this ball (one shared centre) stands for the position just as well
+    fk = json.loads(gateway._fr3_pivot_fit_path(gateway._fr3_pivot_run_path(state, run)).read_text())["fk"]
+    joints = gateway._fr3_pivot_joint_root(state)
+    joints.mkdir(parents=True, exist_ok=True)
+    joint = {"schema": "fr3_pivot_joint/v1", "runs": [run], "shared_centre": True,
+             "fk": {**fk, "c_base_mm": [fk["c_base_mm"]], "c_sigma_mm": [[0.1, 0.1, 0.1]]}}
+    (joints / "20261014_142837_joint.json").write_text(json.dumps(joint))
+    (joints / "20261014_150000_joint.json").write_text(json.dumps({**joint, "shared_centre": False}))
+    position = {"dataset": episodes[0]["dataset"], "episode": 0}
+    assert "不是一个球位置" in check(state, {"positions": [{**position, "pivot": "20261014_150000_joint.json"}]})["error"]
+    result = check(state, {"positions": [{**position, "pivot": "20261014_142837_joint.json"}]})
+    assert result["ok"], result.get("output") or result["error"]
+    report = next(c for c in result["checks"] if c["name"] == result["checked"])
+    assert report["positions"][0]["fr3_pivot"] == "20261014_142837_joint.json"
+    assert report["edges"][0]["positions"][0]["error_mm"] == pytest.approx([-2.0, 0.0, 0.0], abs=0.1)
+
+
+def test_a_ball_checks_edge_is_saved_as_a_candidate_the_edge_panel_compares_and_can_swap_in(tmp_path, monkeypatch):
+    from tools.thor.gmsl2 import fr3_base_ball_check as bc
+
+    state, T_live = _fr3_pivot_state(tmp_path, monkeypatch)
+    real_script = Path(__file__).resolve().parents[2] / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py"
+    (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py").symlink_to(real_script)
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    # the balls say the base is 3 mm further along its x than the live edge puts it
+    T_true = np.asarray(_shift_x(T_live, 0.003))
+    balls = [[0.6, -0.2, 0.2], [0.6, 0.2, 0.2], [0.4, -0.4, 0.2], [0.6, -0.2, 0.42], [0.45, 0.27, 0.43]]
+    rows = [
+        {
+            "fr3_pivot": f"p{i}.fit.json", "dataset": "hh", "episode": i, "usable": True, "world": "world_a",
+            "reasons": [], "warnings": [], "fr3": {"centre_mm": (np.asarray(c) * 1e3).tolist()},
+            "handheld": {"centre_mm": ((np.linalg.inv(T_true) @ np.r_[c, 1.0])[:3] * 1e3).tolist()},
+        }
+        for i, c in enumerate(balls)
+    ]
+    reference = tmp_path / "tools" / "thor" / "gmsl2" / "world" / "world_reference.json"
+    check = {
+        "schema": bc.SCHEMA, "generated_utc": "2026-10-14T09:00:00Z", "handheld_s": "shared", "handheld_shared": {},
+        "reference_world": "world_a", "world_reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+        "positions": rows, "edges": [], "ball_edges": {"world_a": bc.ball_edge(rows, "world_a")},
+    }
+    checks = tmp_path / "outputs" / "calibration" / "fr3_base_ball_check"
+    checks.mkdir(parents=True)
+    (checks / "check_20261014T090000Z.json").write_text(json.dumps(check))
+    assert "找不到" in gateway._save_ball_edge(state, {"check": "../check_x.json"})["error"]
+
+    saved = gateway._save_ball_edge(state, {"check": "check_20261014T090000Z.json"})
+
+    assert saved["ok"], saved.get("output") or saved["error"]
+    assert saved["edgeSaved"] == "ball_check_20261014T090000Z.json"
+    candidate = next(c for c in gateway._fr3_base_edge_payload(state)["candidates"] if c["name"] == saved["edgeSaved"])
+    assert candidate["verdict"] == "ok" and candidate["applyBlockers"] == []
+    assert candidate["label"] == "5 个球位 · check_20261014T090000Z"
+    quality = candidate["quality"]
+    assert quality["method"] == "ball" and quality["positions"] == 5
+    assert quality["leaveOneOutMaxMm"] == pytest.approx(0.0, abs=1e-3) and quality["scalePct"] == pytest.approx(0.0, abs=1e-6)
+    # moved where the balls were, by what they said
+    move = candidate["moveVsLive"]
+    assert move["points"] == 5 and move["meanMm"] == pytest.approx([3.0, 0.0, 0.0], abs=1e-6)
+
+    applied = gateway._apply_fr3_base_edge(state, {"report": saved["edgeSaved"]})
+    assert applied["ok"], applied["error"]
+    current = applied["current"]
+    assert current["label"] == "5 个球位 · check_20261014T090000Z" and current["supersedes"] == 1
+
+
+def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    import urllib.request
+
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/fr3-pivot/collect",
+            data=json.dumps({"durationS": 20, "note": "http"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # the FCI check and the log take state.lock: routed inside the locked block this would hang
+        with urllib.request.urlopen(request, timeout=10) as response:
+            started = json.loads(response.read())
+        _await_pivot(state)
+        with urllib.request.urlopen(f"{base}/api/calibration/fr3-pivot", timeout=10) as response:
+            after = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert started["ok"], started["error"]
+    assert after["job"]["state"] == "done" and after["runs"][0]["note"] == "http"
+
+
+_FAKE_GRIPPER_TELEOP_TOOL = '''
+import json, signal, sys, time
+args = sys.argv[1:]
+if "--arm-device-id" in args and args[args.index("--arm-device-id") + 1] == "13":
+    print("ERROR 没发现 FR3 夹爪 BOX 13；在线的：[5]", flush=True)
+    raise SystemExit(2)
+stop = []
+signal.signal(signal.SIGINT, lambda *a: stop.append(1))
+print("FR3 夹爪 BOX 596523097，手持 BOX 5 " + " ".join(args), flush=True)
+print("2026-10-13 18:15:32.788 [INFO ] [rx] [device] log dev=596523097 ts=308644265 msg=Set gripper position to 10683 steps", flush=True)
+while not stop:
+    print("STATUS " + json.dumps({"state": "following", "targetMm": 0.0}), flush=True)
+    time.sleep(0.05)
+print("退出遥控：FR3 夹爪保持 0.0 mm（模式 1），不卸力", flush=True)
+print("STATUS " + json.dumps({"state": "exited", "targetMm": 0.0, "armMode": 1}), flush=True)
+'''
+
+
+def _gripper_teleop_state(tmp_path, monkeypatch, device_id="596523097"):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    (tmp_path / "tools" / "fr3" / "fr3_gripper_teleop.py").write_text(_FAKE_GRIPPER_TELEOP_TOOL)
+    config = tmp_path / gateway.FR3_REPLAY_THOR_CONFIG
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        f"robot:\n  corenetic_device_id: {device_id}\n"
+        "input:\n  grasp_trigger_close_pct: 90\n  grasp_closed_width_m: 0.0\n"
+    )
+    return state
+
+
+def _await_gripper_teleop(state, predicate, timeout_s=10.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        job = gateway._gripper_teleop_job_view(state)
+        if predicate(job):
+            return job
+        time.sleep(0.02)
+    raise AssertionError(f"gripper teleop job stuck in {gateway._gripper_teleop_job_view(state)}")
+
+
+def test_gripper_teleop_follows_until_exit_and_exit_keeps_the_grip(tmp_path, monkeypatch):
+    state = _gripper_teleop_state(tmp_path, monkeypatch)
+    started = gateway._start_gripper_teleop(state, {})
+    assert started["ok"], started["error"]
+    assert started["armDeviceId"] == 596523097 and started["graspTriggerClosePct"] == 90
+    job = _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
+    assert "--arm-device-id 596523097" in job["log"][0] and "--grasp-trigger-close-pct 90" in job["log"][0]
+    assert "已经在遥控" in gateway._start_gripper_teleop(state, {})["error"]
+
+    # It holds the BOX port: the recorder and a real replay must wait for it.
+    with pytest.raises(ValueError, match="FR3 夹爪遥控正在运行"):
+        gateway._connect_recorder(state)
+    with pytest.raises(ValueError, match="FR3 夹爪遥控正在运行"):
+        gateway._start_real_replay(state)
+
+    stopped = gateway._stop_gripper_teleop(state, {})
+    assert stopped["job"]["state"] == "exited", stopped["job"]
+    assert stopped["job"]["status"] == {"state": "exited", "targetMm": 0.0, "armMode": 1}
+    assert any("不卸力" in line for line in stopped["job"]["log"])
+    assert not any("Set gripper position" in line for line in stopped["job"]["log"])  # SDK chatter kept out
+    assert "没有在遥控" in gateway._stop_gripper_teleop(state, {})["error"]
+
+
+def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_holders(tmp_path, monkeypatch):
+    state = _gripper_teleop_state(tmp_path, monkeypatch)
+
+    class Alive:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    state.process = Alive()
+    assert "录制器已连接" in gateway._start_gripper_teleop(state, {})["error"]
+    state.process = None
+    state.replay_process, state.replay_process_kind = Alive(), "real"
+    assert "真机 replay" in gateway._start_gripper_teleop(state, {})["error"]
+    state.replay_process = None
+
+    # A pivot collect holds the FCI (teaching mode), not the BOX: both run at once.
+    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
+    assert gateway._start_gripper_teleop(state, {})["ok"]
+    assert gateway._fr3_pivot_job_view(state)["state"] == "collecting"
+    gateway._stop_gripper_teleop(state, {})
+    gateway._stop_fr3_pivot(state, {})
+    _await_pivot(state)
+
+
+def test_gripper_teleop_reports_why_it_could_not_start(tmp_path, monkeypatch):
+    state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="13")
+    assert gateway._start_gripper_teleop(state, {})["ok"]
+    job = _await_gripper_teleop(state, lambda j: j.get("state") == "error")
+    assert job["returncode"] == 2 and "没发现 FR3 夹爪 BOX 13" in job["error"]
+
+    (tmp_path / gateway.FR3_REPLAY_THOR_CONFIG).write_text("robot: {}\n")
+    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {})["error"]
+
+
+def test_gripper_teleop_over_http(tmp_path, monkeypatch):
+    state = _gripper_teleop_state(tmp_path, monkeypatch)
+    import urllib.request
+
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(route):
+        request = urllib.request.Request(
+            f"{base}{route}", data=b"{}", headers={"Content-Type": "application/json"}, method="POST"
+        )
+        # the BOX-holder check and the log take state.lock: routed inside the locked block this would hang
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    try:
+        started = post("/api/fr3/gripper-teleop/start")
+        _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
+        with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop", timeout=10) as response:
+            running = json.loads(response.read())
+        stopped = post("/api/fr3/gripper-teleop/stop")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert started["ok"], started["error"]
+    assert running["job"]["state"] == "running"
+    assert stopped["job"]["state"] == "exited"
+
+
 # --- FR3 move to start ------------------------------------------------------------
 
 _FAKE_MOVE_TO_START_TOOL = '''
@@ -8419,3 +8907,260 @@ def test_fr3_move_to_start_refuses_while_the_fci_is_taken(tmp_path, monkeypatch)
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
     assert "遥操作" in move(state, {})["error"]
+    state.teleop_process = None
+    state.fr3_pivot_job = {"state": "collecting"}
+    assert "pivot" in move(state, {})["error"]
+
+
+_FAKE_PIVOT_AUTO_TOOL = '''
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+args = sys.argv[1:]
+def opt(name):
+    return args[args.index(name) + 1]
+out = Path(opt("--out"))
+out.parent.mkdir(parents=True, exist_ok=True)
+if args[0] == "capture":
+    out.write_text(json.dumps({"schema": "fr3_pivot_centre/v1", "created": "2026-10-13T20:00:00", "note": opt("--note"),
+                               "q": [0.0] * 7, "centre_m": [0.55, 0.0, 0.1], "tool_from_level_deg": -25.0, "wall_problems": []}))
+    print("centre (socket FK) [550.0, 0.0, 100.0] mm")
+elif args[0] == "plan":
+    bias = [float(x) for x in args[args.index("--bias-mm") + 1: args.index("--bias-mm") + 4]]
+    passed = bias[0] != 5.0
+    summary = {"schema": "fr3_pivot_plan/v1", "centre": Path(args[1]).name, "created": "x", "passed": passed,
+               "problems": [] if passed else ["j6 总转角 95°"], "duration_s": 136.0,
+               "params": {"bias_mm": bias, "press_mm": 3.0}, "joint_travel_deg": [1] * 7,
+               "max_joint_speed_deg_s": [8] * 7, "min_margin_wall_deg": [28] * 7, "min_margin_fr3_deg": [30] * 7,
+               "table_clearance_mm": 74.6, "table_clearance_body": "link_gripper_tip_right", "mujoco_checked": True}
+    out.with_name(out.name.replace(".json", ".summary.json")).write_text(json.dumps(summary))
+    out.write_text(json.dumps({**summary, "q": [[0.0] * 7]}))
+    print("plan PASS" if passed else "plan FAIL")
+    raise SystemExit(0 if passed else 3)
+elif args[0] == "guide":
+    import signal
+    done = []
+    signal.signal(signal.SIGUSR1, lambda *a: done.append(1))
+    print("guide: up to " + opt("--duration-s") + " s, bias " + " ".join(args[args.index("--bias-mm") + 1: args.index("--bias-mm") + 4]), flush=True)
+    if "--anchor-mm" in args:
+        print("anchor " + " ".join(args[args.index("--anchor-mm") + 1: args.index("--anchor-mm") + 4]) + " from " + opt("--anchor-from"), flush=True)
+    deadline = time.time() + (30 if opt("--note") == "slow" else 0.2)
+    while not done and time.time() < deadline:
+        time.sleep(0.02)
+    out.write_text(json.dumps({"note": opt("--note"), "created": "2026-10-13T21:00:00", "mode": "guided", "q": []}))
+    print("wrote", out, "finished" if done else "timed out", flush=True)
+else:
+    plan = json.loads(Path(args[1]).read_text())
+    print("execute: 136 s pivot", flush=True)
+    if opt("--note") == "slow":
+        time.sleep(30)
+    out.write_text(json.dumps({"note": opt("--note"), "created": "2026-10-13T20:05:00", "mode": "commanded",
+                               "bias_mm": plan["params"]["bias_mm"], "q": []}))
+    print("wrote", out, flush=True)
+'''
+
+
+def _pivot_auto_state(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    (tmp_path / "tools" / "fr3" / "fr3_pivot_auto.py").write_text(_FAKE_PIVOT_AUTO_TOOL)
+    return state
+
+
+def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+
+    captured = gateway._capture_fr3_pivot_centre(state, {"note": "球 A"})
+    assert captured["ok"], captured["error"]
+    (centre,) = captured["centres"]
+    assert centre["name"] == captured["captured"] and centre["centreMm"] == [550.0, 0.0, 100.0]
+    assert centre["note"] == "球 A"
+
+    planned = gateway._plan_fr3_pivot(state, {"centre": centre["name"], "biasMm": [3, 0, 0]})
+    assert planned["ok"], planned["error"]
+    (plan,) = planned["plans"]
+    assert plan["name"] == planned["planned"] and plan["passed"] and plan["biasMm"] == [3.0, 0.0, 0.0]
+    assert plan["tableClearanceMm"] == 74.6 and plan["centre"] == centre["name"]
+
+    started = gateway._execute_fr3_pivot(state, {"plan": plan["name"]})
+    assert started["ok"], started["error"]
+    assert started["job"]["mode"] == "auto" and started["job"]["biasMm"] == [3.0, 0.0, 0.0]
+    job = _await_pivot(state)
+    assert job["state"] == "done", job
+    assert any("execute: 136 s pivot" in line for line in job["log"])
+    assert gateway._fr3_pivot_payload(state)["runs"][0]["name"] == job["run"]
+
+
+def test_fr3_pivot_auto_refuses_failed_plans_bad_input_and_a_busy_fci(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    assert "先取球心" in gateway._plan_fr3_pivot(state, {"centre": "../x_centre.json"})["error"]
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    assert "±5 mm" in gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [9, 0, 0]})["error"]
+
+    failed = gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [5, 0, 0]})
+    assert failed["ok"] and not failed["plans"][0]["passed"]  # written, shown, not runnable
+    assert "没通过演算" in gateway._execute_fr3_pivot(state, {"plan": failed["planned"]})["error"]
+    assert "找不到规划" in gateway._execute_fr3_pivot(state, {"plan": "nope_plan.json"})["error"]
+
+    good = gateway._plan_fr3_pivot(state, {"centre": centre})["planned"]
+
+    class Alive:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    state.replay_process, state.replay_process_kind = Alive(), "real"
+    assert "真机 replay" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
+    assert "真机 replay" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    state.replay_process = None
+
+    assert gateway._execute_fr3_pivot(state, {"plan": good, "note": "slow"})["ok"]
+    assert "已有一次" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
+    assert "还在进行" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    gateway._stop_fr3_pivot(state, {})
+    assert _await_pivot(state)["state"] == "stopped"
+
+
+def test_fr3_pivot_guide_runs_until_finish_then_fits(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    assert "找不到球心" in gateway._guide_fr3_pivot(state, {"centre": "x"})["error"]
+    assert "20–180" in gateway._guide_fr3_pivot(state, {"centre": centre, "durationS": 5})["error"]
+    assert "±5 mm" in gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [0, 7, 0]})["error"]
+    assert "没有正在进行的引导" in gateway._finish_fr3_pivot(state, {})["error"]
+
+    started = gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [-3, 0, 0], "durationS": 90, "note": "slow"})
+    assert started["ok"], started["error"]
+    assert started["job"]["mode"] == "guided" and started["job"]["biasMm"] == [-3.0, 0.0, 0.0]
+    assert "已有一次" in gateway._guide_fr3_pivot(state, {"centre": centre})["error"]
+    deadline = time.monotonic() + 5
+    while not any("guide: up to 90 s, bias -3 0 0" in line for line in gateway._fr3_pivot_job_view(state)["log"]):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    assert gateway._finish_fr3_pivot(state, {})["ok"]
+    job = _await_pivot(state)
+    assert job["state"] == "done", job
+    assert any("finished" in line for line in job["log"])
+
+
+def _guided_fit(state, name, *, rms=1.2, span=22.8, weak=0.12, s=(0.4, -1.5, 6.5), kind="guided", fk=None):
+    root = gateway._fr3_pivot_root(state)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{name}_pivot.json").write_text("{}")
+    fit = {
+        "commanded": {"kind": kind},
+        "socket_frame": {"frame": "corenetic_socket_ee", "s_ee_mm": list(s), "s_sigma_mm": [0.8, 0.9, 0.6],
+                         "residual_rms_mm": rms, "span_deg": span, "weak_singular": weak},
+    }
+    if fk is not None:
+        fit["fk"] = {"s_ee_mm": list(fk)}
+    (root / f"{name}_pivot.fit.json").write_text(json.dumps(fit))
+
+
+def test_fr3_pivot_guide_anchors_on_the_latest_good_fit_of_the_same_grip(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    assert "先跑一轮不挂球心" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+
+    _guided_fit(state, "20261013_180847")
+    _guided_fit(state, "20261013_181013", span=16.3, weak=0.03)  # newer, barely turned: not used, and says why
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert not anchor["available"] and anchor["run"] == "20261013_181013_pivot.json" and "转得不够" in anchor["reason"]
+    assert "转得不够" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+
+    _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert anchor["available"] and anchor["sMm"] == [0.13, -0.53, 7.87]
+    assert anchor["fitName"] == "20261013_181645_pivot.fit.json"
+
+    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    assert started["ok"], started["error"]
+    assert started["job"]["anchorMm"] == [0.13, -0.53, 7.87]
+    job = _await_pivot(state)
+    assert any("anchor 0.13 -0.53 7.87 from 20261013_181645_pivot.fit.json" in line for line in job["log"]), job["log"]
+    # without the box ticked nothing changes: no --anchor-mm, the frame's origin held as before
+    plain = gateway._guide_fr3_pivot(state, {"centre": centre})
+    assert plain["job"]["anchorMm"] == [0.0, 0.0, 0.0]
+    assert not any(line.startswith("anchor") for line in _await_pivot(state)["log"])
+
+
+def test_fr3_pivot_anchor_follows_the_socket_frame_the_urdf_has_now(tmp_path, monkeypatch):
+    # 10-14 corenetic_socket_ee moved from z -10.3 to the pivot's (1.45, -0.78, -5.06): a fit made before
+    # then holds its socket_frame against the old origin, so the anchor comes from its gripper_ee value.
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    _guided_fit(state, "20261014_141856", s=(1.45, -0.78, 5.24), fk=(1.45, -0.78, -5.06))
+    assert gateway._fr3_pivot_payload(state)["anchor"]["sMm"] == [1.45, -0.78, 5.24]  # no URDF: as fitted
+    urdf = state.repo_root / gateway._FR3_PIVOT_URDF
+    urdf.parent.mkdir(parents=True, exist_ok=True)
+    joint = '<joint name="corenetic_socket_joint" type="fixed">\n    <origin rpy="0 0 0" xyz="{}" />'
+    urdf.write_text(joint.format("0.00145 -0.00078 -0.00506"))
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert anchor["available"] and anchor["sMm"] == [0.0, 0.0, 0.0]
+    urdf.write_text(joint.format("0 0 -0.0103"))
+    assert gateway._fr3_pivot_payload(state)["anchor"]["sMm"] == [1.45, -0.78, 5.24]
+
+
+def test_fr3_pivot_anchor_warns_but_stays_usable_once_the_gripper_teleop_ran_after_the_fit(tmp_path, monkeypatch):
+    # 10-14: the gripper drops out on its own and the insert re-seats within 0.2 mm, so a re-clamp is
+    # said, not refused; a bad fit still is.
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    _guided_fit(state, "20261013_180847")
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert anchor["available"] and "warning" not in anchor
+    hold = gateway._gripper_teleop_root(state) / "hold.json"
+    hold.parent.mkdir(parents=True, exist_ok=True)
+    hold.write_text("{}")
+    before = datetime.strptime("20261013_180800", "%Y%m%d_%H%M%S").timestamp()
+    os.utime(hold, (before, before))  # re-clamped before that run: the same grip
+    assert "warning" not in gateway._fr3_pivot_payload(state)["anchor"]
+    after = datetime.strptime("20261013_181546", "%Y%m%d_%H%M%S").timestamp()
+    os.utime(hold, (after, after))  # 10-13: the BOX reboot dropped the insert, teleop re-clamped it
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert anchor["available"] and "夹持可能变了" in anchor["warning"] and "仍可沿用" in anchor["warning"]
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    assert started["ok"], started["error"]
+    assert started["job"]["anchorMm"] == [0.4, -1.5, 6.5]
+    _await_pivot(state)
+
+    class Alive:
+        def poll(self):
+            return None
+
+    os.utime(hold, (before, before))
+    state.gripper_teleop_process = Alive()
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert anchor["available"] and "夹爪遥控正在运行" in anchor["warning"]
+    state.gripper_teleop_process = None
+    _guided_fit(state, "20261013_181645", rms=4.1, s=(0.1, -0.5, 25.0))
+    anchor = gateway._fr3_pivot_payload(state)["anchor"]
+    assert not anchor["available"] and "残差 4.1 mm" in anchor["reason"] and "不像球心" in anchor["reason"]
+
+
+def test_fr3_pivot_joint_fit_takes_the_chosen_runs_and_becomes_the_anchor(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    _guided_fit(state, "20261014_113021")
+    _guided_fit(state, "20261014_114709", s=(1.1, -0.4, 2.6))
+    assert gateway._fr3_pivot_payload(state)["anchor"]["run"] == "20261014_114709_pivot.json"
+    fit_joint = gateway._FR3_PIVOT_ROUTES["/api/calibration/fr3-pivot/fit-joint"]
+    assert "至少要选两次" in fit_joint(state, {"runs": ["20261014_113021_pivot.json"]})["error"]
+    assert "找不到" in fit_joint(state, {"runs": ["20261014_113021_pivot.json", "../x_pivot.json"]})["error"]
+
+    done = fit_joint(state, {"runs": ["20261014_114709_pivot.json", "20261014_113021_pivot.json"]})
+    assert done["ok"], done["error"]
+    (joint,) = done["joints"]
+    assert joint["name"] == done["jointFitted"] and joint["sharedCentre"]
+    assert joint["runs"] == ["20261014_113021_pivot.json", "20261014_114709_pivot.json"]
+    # made after the last run: the spring now holds the joint fit's ball centre
+    anchor = done["anchor"]
+    assert anchor["available"] and anchor["joint"] and anchor["sMm"] == [1.5, -0.5, 6.0]
+    assert anchor["fitName"] == joint["name"]
+
+    apart = fit_joint(state, {"runs": ["20261014_114709_pivot.json", "20261014_113021_pivot.json"], "perRunCentre": True})
+    assert not apart["joints"][0]["sharedCentre"]
+    # a joint fit that warns (here: the fake's per-run warning) is not held
+    assert not apart["anchor"]["available"] and "per run" in apart["anchor"]["reason"]
+    # a run collected after the joint fit is newer data: its own fit is the anchor again
+    _guided_fit(state, "20991231_235959")
+    assert gateway._fr3_pivot_payload(state)["anchor"]["run"] == "20991231_235959_pivot.json"

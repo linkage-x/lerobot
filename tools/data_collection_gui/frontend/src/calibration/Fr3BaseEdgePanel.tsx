@@ -2,13 +2,14 @@
 //
 // Every fr3_base trajectory -- MuJoCo preview, IK QC, real replay, export --
 // goes through this one edge, so it gets its own panel next to the world frame
-// it leaves from. Capturing a P0 single-tag run stays at the robot (the arm is
-// hand-guided in zero-stiffness mode and the capture tool opens its own
-// recorder); the panel solves runs, compares candidates and swaps the edge.
+// it leaves from. Two ways to measure it, compared in one table: a P0
+// single-tag run (captured at the robot: the arm is hand-guided in
+// zero-stiffness mode and the capture tool opens its own recorder), or the
+// laser -- a tracker station times the FR3's FK fitted to the laser on replays.
 //
 // Swapping is separate and confirmed, and a passing verdict alone does not make
 // a candidate better than the live edge: see fr3BaseEdge.ts.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import type { Fr3BaseEdgeResponse } from "../types";
 import { Modal } from "./ConfirmModal";
@@ -16,10 +17,13 @@ import {
   applyConfirmation,
   candidateSpread,
   fmtNum,
+  laserSelectionWarnings,
   liveEdgeSummary,
   liveEdgeWarnings,
+  methodLabel,
   moveSummary,
-  runLabel,
+  qualitySummary,
+  replayRelation,
   verdictLabel,
 } from "./fr3BaseEdge";
 
@@ -31,6 +35,8 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
   const [confirming, setConfirming] = useState<Candidate | null>(null);
+  const [stationName, setStationName] = useState("");
+  const [replayPaths, setReplayPaths] = useState<string[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -62,6 +68,21 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
   const warnings = payload ? liveEdgeWarnings(current, payload.referenceWorld) : [];
   const spread = payload ? candidateSpread(payload.candidates) : null;
   const disabled = busy || running !== "";
+  const stations = payload?.stations ?? [];
+  const laserReplays = payload?.laserReplays ?? [];
+  // default: the newest station that could pass
+  const station =
+    stations.find((s) => s.name === stationName) ??
+    stations.find((s) => s.certifies && s.matchesReference) ??
+    stations[0] ??
+    null;
+  const chosenReplays = useMemo(
+    () => laserReplays.filter((r) => replayPaths.includes(r.path)),
+    [laserReplays, replayPaths]
+  );
+  const laserWarnings = laserSelectionWarnings(station, chosenReplays);
+  const toggleReplay = (path: string) =>
+    setReplayPaths((paths) => (paths.includes(path) ? paths.filter((p) => p !== path) : [...paths, path]));
 
   return (
     <section className="panel">
@@ -77,8 +98,9 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
 
       <p className="cali-muted">
         <b>作用：</b>相机世界系里的位姿要交给 FR3，必须经过这条边。MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都走它，
-        所以它的误差会<b>原样</b>叠加到每一条 replay 上。这条边由 FR3 工具上的 tag36h11 id6 测出：机械臂停在若干个位姿，
-        基准世界系的相机<b>固定在原位不动</b>，一起拟合 T_world_base、T_tcp_tag 和 tag 尺度。
+        所以它的误差会<b>原样</b>叠加到每一条 replay 上。有两种测法：
+        <b>单 tag</b>——FR3 工具上的 tag36h11 id6 停在若干个位姿，基准世界系的相机<b>固定在原位不动</b>，一起拟合 T_world_base、T_tcp_tag 和 tag 尺度；
+        <b>激光</b>——跟踪仪站位（world ← 跟踪仪）乘上 FR3 回放时 FK 对激光的拟合（跟踪仪 ← fr3_base），不经过 tag。
       </p>
 
       <div className="cali-result-box">
@@ -99,7 +121,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
-          <b>① 采集</b>
+          <b>① 采集 · 单 tag</b>
           <span className="cali-muted">在机器人旁边做，不在这里</span>
         </div>
         <p className="cali-muted">
@@ -116,7 +138,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
-          <b>② 解算</b>
+          <b>② 解算 · 单 tag</b>
           <span className="cali-muted">只写候选报告，不改现役边</span>
         </div>
         {payload && payload.runs.length ? (
@@ -164,6 +186,80 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
+          <b>②′ 解算 · 激光</b>
+          <span className="cali-muted">只写候选报告，不改现役边</span>
+        </div>
+        <p className="cali-muted">
+          两段必须是跟踪仪的<b>同一个摆放位置</b>：从采驻点到 FR3 回放，跟踪仪不能动。驻点在「跟踪仪站位」面板里采集、解算（结果在{" "}
+          <code>{payload?.stationsRoot ?? "outputs/laser_tracker"}</code>）；回放在 Episode Replay 页带激光跑。
+          最好在驻点前后各回放一次：两次拟合一致，才说明这段时间跟踪仪没动。回放的姿态跨度要 ≥ 8°，否则 SMR 偏置和变换分不开。
+        </p>
+        {stations.length ? (
+          <label className="cali-muted">
+            站位拟合{" "}
+            <select value={station?.name ?? ""} disabled={disabled} onChange={(e) => setStationName(e.target.value)}>
+              {stations.map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name} · {s.poses ?? "—"} 点 · rms {fmtNum(s.rmsMm, 2, " mm")} · {s.certifies ? "已认证" : "未认证"}
+                  {s.matchesReference ? "" : ` · ${s.world}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <p className="cali-muted">还没有站位拟合。</p>
+        )}
+        {laserReplays.length ? (
+          <table className="metric-table">
+            <thead>
+              <tr>
+                <th />
+                <th>带激光的 FR3 回放</th>
+                <th>数据集</th>
+                <th>跟踪仪 session（UTC）</th>
+                <th>相对驻点</th>
+              </tr>
+            </thead>
+            <tbody>
+              {laserReplays.map((r) => (
+                <tr key={r.path}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={replayPaths.includes(r.path)}
+                      disabled={disabled}
+                      onChange={() => toggleReplay(r.path)}
+                    />
+                  </td>
+                  <td>{r.name}</td>
+                  <td>{r.dataset}</td>
+                  <td>{r.sessionUtc || r.sessionId}</td>
+                  <td>{replayRelation(r, station)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="cali-muted">还没有带激光的 FR3 回放。</p>
+        )}
+        {laserWarnings.map((w) => (
+          <p className="cali-warn" key={w}>
+            {w}
+          </p>
+        ))}
+        <button
+          className="cali-mini-btn"
+          disabled={disabled || !station || !chosenReplays.length}
+          onClick={() =>
+            act("laser", () => api.solveFr3BaseLaserEdge(station!.name, chosenReplays.map((r) => r.path)))
+          }
+        >
+          {running === "laser" ? "解算中…" : "解算激光边"}
+        </button>
+      </div>
+
+      <div className="cali-result-box">
+        <div className="cali-result-box-head">
           <b>③ 候选边</b>
           <span className="cali-muted">样本外误差只说明这一轮自身是否一致，还要看它会把现役边挪多远</span>
         </div>
@@ -171,11 +267,10 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
           <table className="metric-table">
             <thead>
               <tr>
-                <th>run</th>
+                <th>来源</th>
+                <th>方法</th>
                 <th>判定</th>
-                <th>样本外 p95</th>
-                <th>tag 尺度</th>
-                <th>重投影 RMSE</th>
+                <th>质量</th>
                 <th>相对现役边（该轮工作区）</th>
                 <th />
               </tr>
@@ -184,13 +279,19 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
               {payload.candidates.map((c) => (
                 <tr key={c.name} title={c.reasons.join("；")}>
                   <td>
-                    {runLabel(c.p0Run)}
+                    {c.label}
                     <div className="cali-muted">{c.generatedUtc}</div>
                   </td>
-                  <td>{verdictLabel(c)}</td>
-                  <td>{fmtNum(c.quality.outOfSampleP95Mm, 2, " mm")}</td>
-                  <td>{fmtNum(c.quality.tagScale, 4)}</td>
-                  <td>{fmtNum(c.quality.rmsePx, 2, " px")}</td>
+                  <td>{methodLabel(c.quality)}</td>
+                  <td>
+                    {verdictLabel(c)}
+                    {c.warnings.map((w) => (
+                      <div className="cali-warn" key={w}>
+                        {w}
+                      </div>
+                    ))}
+                  </td>
+                  <td>{qualitySummary(c.quality)}</td>
                   <td>{c.sameAsLive ? "—" : moveSummary(c.moveVsLive)}</td>
                   <td>
                     <button
@@ -212,8 +313,8 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
         {spread ? (
           <p className={spread.mm >= 2 ? "cali-warn" : "cali-muted"}>
             通过判定的各轮（含现役边）在工作区里最多相差 <b>{spread.mm.toFixed(1)} mm</b>（{spread.a} 与 {spread.b}）。
-            这就是这种方法的轮间重复性：差距大于 2 mm 时，单看某一轮「通过」不能说明它比现役边更准，
-            换边之前先用激光跟踪仪 replay 做独立验证。
+            差距大于 2 mm 时，单看某一轮「通过」不能说明它比现役边更准：单 tag 各轮之间本身就差约 4 mm（10-10 两轮），
+            换边之前用激光边或一次新的激光 replay 端到端检查做独立验证。
           </p>
         ) : null}
       </div>
