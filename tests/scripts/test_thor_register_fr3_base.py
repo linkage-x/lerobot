@@ -230,3 +230,125 @@ def test_cli_apply_replace_writes_the_graph(tmp_path: Path) -> None:
     graph = json.loads((tmp_path / wp.WORLD_GRAPH_FILE).read_text())
     assert graph["edges"][0]["T_to_from"][0][3] == 0.7
     assert not (tmp_path / (wp.WORLD_GRAPH_FILE + ".tmp")).exists()
+
+
+# --- laser edge: station (world <- tracker) @ FR3 FK fit (tracker <- base) ---
+
+
+def _rigid(np, rotvec, t):
+    w = np.asarray(rotvec, dtype=float)
+    theta = np.linalg.norm(w)
+    K = np.zeros((3, 3)) if theta == 0 else np.cross(np.eye(3), w / theta)
+    T = np.eye(4)
+    T[:3, :3] = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * K @ K
+    T[:3, 3] = t
+    return T
+
+
+def _station(T_world_tracker, **overrides) -> dict:
+    station = {
+        "T_world_tracker": T_world_tracker.tolist(),
+        "world_frame_id": "world_a",
+        "sessions": [{"session_id": "lt_20261013_061349"}],
+        "n_poses_total": 15,
+        "rms_mm": 0.8,
+        "certifies": True,
+        "certify_reasons": [],
+        "observability": {"extent_m": 0.6},
+        "sigma": {"rotation_sigma_deg": 0.08, "translation_sigma_mm": 1.4},
+    }
+    station.update(overrides)
+    return station
+
+
+def _replay(np, T_tracker_base, session_id, **overrides) -> dict:
+    points = np.random.default_rng(1).uniform([0.3, -0.3, 0.1], [0.7, 0.3, 0.5], (400, 3))
+    report = {
+        "run": f"run_{session_id}",
+        "run_dir": f"/x/outputs/datasets/d/real_replay/run_{session_id}",
+        "session_id": session_id,
+        "used_frames": 900,
+        "laser_vs_fk": {"rms_mm": 0.3, "p95_mm": 0.5},
+        "orientation_span_deg": 15.0,
+        "smr_in_tcp_mm": [68.0, -2.3, -67.3],
+        "T_tracker_base": T_tracker_base.tolist(),
+    }
+    report.update(overrides)
+    return {"report": report, "points": points}
+
+
+def test_laser_edge_is_the_station_times_the_fk_fit() -> None:
+    np = pytest.importorskip("numpy")
+    T_world_tracker = _rigid(np, [0.1, 0.2, 2.0], [-1.2, 0.4, 0.1])
+    T_tracker_base = _rigid(np, [0.0, -0.1, 1.0], [0.9, -0.5, -0.3])
+    report = reg.laser_report(
+        _station(T_world_tracker),
+        "outputs/laser_tracker/station.json",
+        [
+            _replay(np, T_tracker_base, "lt_20261013_034118"),
+            _replay(np, _rigid(np, [0, 0, 0], [0.0002, 0, 0]) @ T_tracker_base, "lt_20261013_070000"),
+        ],
+        reference_world="world_a",
+        reference_sha256="abc",
+    )
+    assert report["verdict"] == "ok", report["reasons"]
+    assert report["warnings"] == []
+    T_base_world = np.asarray(report["edge"]["T_to_from"])
+    assert np.linalg.inv(T_base_world) == pytest.approx(T_world_tracker @ T_tracker_base, abs=2e-4)
+    assert report["edge"]["quality"]["replay_spread"]["mean_mm"] == pytest.approx(0.2, abs=1e-6)
+    assert report["edge"]["source"]["replays"][0].startswith("outputs/datasets/")
+    # it is a report apply takes, and the graph then routes world -> fr3_base through it
+    graph = reg.apply_report(report, {"nodes": [{"world_frame_id": "world_a"}], "edges": []})
+    T, _ = wp.world_transform(graph, "world_a", "fr3_base")
+    assert np.asarray(T) == pytest.approx(T_base_world)
+    assert "workspace_points_base_m" not in graph["edges"][0]
+
+
+def test_laser_edge_refuses_replays_that_disagree_and_warns_on_one_replay() -> None:
+    np = pytest.importorskip("numpy")
+    T = _rigid(np, [0.0, 0.0, 1.0], [0.9, -0.5, -0.3])
+    moved = _rigid(np, [0, 0, 0], [0.003, 0, 0]) @ T
+    report = reg.laser_report(
+        _station(np.eye(4)), "s", [_replay(np, T, "lt_20261013_034118"), _replay(np, moved, "lt_20261013_070000")],
+        reference_world="world_a", reference_sha256="abc",
+    )
+    assert report["verdict"] == "rejected"
+    assert any("tracker moved" in r for r in report["reasons"])
+
+    one = reg.laser_report(
+        _station(np.eye(4)), "s", [_replay(np, T, "lt_20261012_034118")], reference_world="world_a", reference_sha256="abc"
+    )
+    assert one["verdict"] == "ok"
+    assert any("one replay" in w for w in one["warnings"])
+    assert any("another day" in w for w in one["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("station", "replay", "reason"),
+    [
+        ({"certifies": False, "certify_reasons": ["extent 0.2 m"]}, {}, "does not certify (extent 0.2 m)"),
+        ({"world_frame_id": "world_old"}, {}, "reference world is world_a"),
+        ({"rms_mm": 3.43, "scale_error_ppm": -6471.1}, {}, "station rms 3.43 mm > 1.5 (camera vs laser scale -6471 ppm)"),
+        ({}, {"orientation_span_deg": 4.0}, "not separable"),
+        ({}, {"laser_vs_fk": {"rms_mm": 1.0, "p95_mm": 2.0}}, "laser vs FK p95"),
+        ({}, {"used_frames": 50}, "frames with the beam on"),
+    ],
+)
+def test_laser_edge_gates(station, replay, reason) -> None:
+    np = pytest.importorskip("numpy")
+    report = reg.laser_report(
+        _station(np.eye(4), **station), "s", [_replay(np, np.eye(4), "lt_20261013_034118", **replay)],
+        reference_world="world_a", reference_sha256="abc",
+    )
+    assert report["verdict"] == "rejected"
+    assert any(reason in r for r in report["reasons"]), report["reasons"]
+
+
+def test_laser_edge_names_a_replay_the_analysis_could_not_read() -> None:
+    np = pytest.importorskip("numpy")
+    report = reg.laser_report(
+        _station(np.eye(4)), "s", [{"report": {"run": "r1", "error": "only 3 frames with the beam on"}, "points": []}],
+        reference_world="world_a", reference_sha256="abc",
+    )
+    assert report["verdict"] == "rejected"
+    assert "r1: only 3 frames with the beam on" in report["reasons"]

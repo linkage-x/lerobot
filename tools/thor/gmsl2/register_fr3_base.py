@@ -375,6 +375,263 @@ def _solve(args: argparse.Namespace) -> int:
     return 0 if not reasons else 2
 
 
+# ------------------------------------------------------------------- laser ---
+
+LASER_METHOD = "fr3_laser_station_fk"
+#: The station's own residual. Its ``certifies`` judges the geometry only: on
+#: 2026-10-13 a 15-pose station certified at 3.43 mm rms, the camera world 0.65 %
+#: short of the laser across it -- a disagreement a rigid T cannot absorb, which
+#: then grows with the distance from the station's points. 09-28's was 0.74 mm.
+GATE_STATION_RMS_MM = 1.5
+#: Laser vs the FR3's own FK on a replay: 0.25-0.51 mm p95 on 2026-10-10..13.
+GATE_LASER_FK_P95_MM = 1.0
+#: Below this the SMR offset p trades against (R, t) (2026-10-10, 10-17 deg).
+GATE_MIN_ORIENTATION_SPAN_DEG = 8.0
+GATE_MIN_REPLAY_FRAMES = 200
+#: Two replays' T_tracker_base, mean disagreement over the workspace. The FR3
+#: base does not move, so more than this is the tracker having moved (or FK
+#: error a single rigid fit cannot absorb).
+GATE_REPLAY_SPREAD_MM = 1.0
+WORKSPACE_POINTS = 300
+
+
+def _session_utc(session_id: str) -> datetime | None:
+    """``lt_YYYYMMDD_HHMMSS`` (UTC, as the tracker logger names its sessions)."""
+    try:
+        return datetime.strptime(session_id, "lt_%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)  # noqa: UP017
+    except ValueError:
+        return None
+
+
+def laser_report(
+    station: dict[str, Any],
+    station_path: str,
+    replays: list[dict[str, Any]],
+    *,
+    reference_world: str,
+    reference_sha256: str,
+    target_world: str = DEFAULT_TARGET_WORLD,
+) -> dict[str, Any]:
+    """The world -> fr3_base edge through the laser tracker, as a report ``apply`` takes.
+
+    ``T_world_base = T_world_tracker (station) @ T_tracker_base (FR3 FK vs laser)``.
+    ``replays``: ``{"report": fr3_replay_laser_error run report, "points": (n, 3)
+    TCP positions in the base}``. Both halves are only one edge if the tracker
+    stayed where it was between the station and the replays: nothing in either
+    measurement can show that, except two replays on either side of the station
+    agreeing -- so that is checked when there are two, and warned about when not.
+    """
+    import numpy as np
+
+    def inv(T):
+        Ti = np.eye(4)
+        Ti[:3, :3] = T[:3, :3].T
+        Ti[:3, 3] = -T[:3, :3].T @ T[:3, 3]
+        return Ti
+
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if str(station.get("world_frame_id") or "") != reference_world:
+        reasons.append(f"the station is in {station.get('world_frame_id')!r}, the reference world is {reference_world}")
+    if not station.get("certifies"):
+        why = "; ".join(station.get("certify_reasons") or []) or "no reason given"
+        reasons.append(f"the station does not certify ({why})")
+    station_rms = station.get("rms_mm")
+    if station_rms is None or station_rms > GATE_STATION_RMS_MM:
+        scale = station.get("scale_error_ppm")
+        reasons.append(
+            f"station rms {station_rms if station_rms is None else round(station_rms, 2)} mm > {GATE_STATION_RMS_MM}"
+            + (f" (camera vs laser scale {scale:+.0f} ppm)" if scale is not None else "")
+        )
+    T_world_tracker = np.asarray(station["T_world_tracker"], dtype=np.float64)
+    station_sessions = [str(s.get("session_id") or "") for s in station.get("sessions") or []]
+
+    usable: list[tuple[np.ndarray, np.ndarray]] = []
+    replay_rows: list[dict[str, Any]] = []
+    for item in replays:
+        r = item["report"]
+        name = str(r.get("run") or "?")
+        if "T_tracker_base" not in r:
+            reasons.append(f"{name}: {r.get('error') or 'no laser registration in the report'}")
+            replay_rows.append({"run": name, "error": r.get("error") or "no registration"})
+            continue
+        lf = r.get("laser_vs_fk") or {}
+        row = {
+            "run": name,
+            "run_dir": _repo_relative(Path(str(r.get("run_dir") or name))),
+            "session_id": r.get("session_id"),
+            "used_frames": r.get("used_frames"),
+            "laser_vs_fk_rms_mm": lf.get("rms_mm"),
+            "laser_vs_fk_p95_mm": lf.get("p95_mm"),
+            "orientation_span_deg": r.get("orientation_span_deg"),
+            "smr_in_tcp_mm": r.get("smr_in_tcp_mm"),
+        }
+        replay_rows.append(row)
+        bad = []
+        if (r.get("used_frames") or 0) < GATE_MIN_REPLAY_FRAMES:
+            bad.append(f"{r.get('used_frames')} frames with the beam on (< {GATE_MIN_REPLAY_FRAMES})")
+        if lf.get("p95_mm") is None or lf["p95_mm"] > GATE_LASER_FK_P95_MM:
+            bad.append(f"laser vs FK p95 {lf.get('p95_mm')} mm > {GATE_LASER_FK_P95_MM}")
+        if (r.get("orientation_span_deg") or 0.0) < GATE_MIN_ORIENTATION_SPAN_DEG:
+            bad.append(
+                f"orientation span {r.get('orientation_span_deg', 0.0):.1f} deg < {GATE_MIN_ORIENTATION_SPAN_DEG}: "
+                "the SMR offset is not separable from the transform"
+            )
+        if bad:
+            reasons.append(f"{name}: " + "; ".join(bad))
+            continue
+        usable.append((np.asarray(r["T_tracker_base"], dtype=np.float64), np.asarray(item["points"], dtype=np.float64)))
+
+    if not usable:
+        reasons.append("no usable replay")
+        T_tracker_base = np.eye(4)
+        points = np.zeros((0, 3))
+    else:
+        # Chordal mean: the nearest rotation to the summed matrices.
+        U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T, _ in usable))
+        T_tracker_base = np.eye(4)
+        T_tracker_base[:3, :3] = U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+        T_tracker_base[:3, 3] = np.mean([T[:3, 3] for T, _ in usable], axis=0)
+        points = np.vstack([p for _, p in usable])
+
+    spread = None
+    if len(usable) >= 2:
+        h = np.c_[points, np.ones(len(points))]
+        pair = [
+            np.linalg.norm((h @ (a - b).T)[:, :3], axis=1)
+            for i, (a, _) in enumerate(usable)
+            for b, _ in usable[i + 1 :]
+        ]
+        spread = {"mean_mm": float(max(d.mean() for d in pair) * 1e3), "max_mm": float(max(d.max() for d in pair) * 1e3)}
+        if spread["mean_mm"] > GATE_REPLAY_SPREAD_MM:
+            reasons.append(
+                f"the replays disagree by {spread['mean_mm']:.2f} mm over the workspace (> {GATE_REPLAY_SPREAD_MM}): "
+                "the tracker moved between them, or the FK error is not rigid there"
+            )
+    elif usable:
+        warnings.append(
+            "one replay: nothing shows the tracker stayed put between it and the station -- "
+            "add a replay on the other side of the station"
+        )
+    station_times = [t for t in map(_session_utc, station_sessions) if t]
+    replay_times = [t for t in (_session_utc(str(row.get("session_id") or "")) for row in replay_rows) if t]
+    if station_times and replay_times:
+        if any(t.date() != station_times[0].date() for t in replay_times):
+            warnings.append("a replay is from another day than the station")
+        if len(usable) >= 2 and not (min(replay_times) < min(station_times) and max(replay_times) > max(station_times)):
+            warnings.append("the replays do not bracket the station: their agreement says nothing about the tracker during it")
+
+    T_world_base = T_world_tracker @ T_tracker_base
+    sigma = station.get("sigma") or {}
+    observability = station.get("observability") or {}
+    step = max(1, len(points) // WORKSPACE_POINTS)
+    return {
+        "schema": REPORT_SCHEMA,
+        "generated_utc": _now_iso(),
+        "verdict": "ok" if not reasons else "rejected",
+        "reasons": reasons,
+        "warnings": warnings,
+        "edge": {
+            "from_world_frame_id": reference_world,
+            "to_world_frame_id": target_world,
+            "T_to_from": inv(T_world_base).tolist(),
+            "covariance_6x6": None,
+            "method": (
+                f"{LASER_METHOD}: T_world_tracker from a laser-tracker station (camera-tracked tool at parked "
+                f"poses, cameras at their {reference_world} poses) @ T_tracker_base from the FR3's FK against "
+                f"the laser on {len(usable)} replay(s), the tracker not moved in between"
+            ),
+            "source": {
+                "station": station_path,
+                "station_sessions": station_sessions,
+                "replays": [row["run_dir"] for row in replay_rows if "run_dir" in row],
+                "world_reference_sha256": reference_sha256,
+            },
+            "quality": {
+                "station": {
+                    "poses": station.get("n_poses_total"),
+                    "rms_mm": station.get("rms_mm"),
+                    "scale_error_ppm": station.get("scale_error_ppm"),
+                    "certifies": bool(station.get("certifies")),
+                    "extent_m": observability.get("extent_m"),
+                    "rotation_sigma_deg": sigma.get("rotation_sigma_deg"),
+                    "translation_sigma_mm": sigma.get("translation_sigma_mm"),
+                },
+                "replays": replay_rows,
+                "replay_spread": spread,
+                "T_tracker_base": T_tracker_base.tolist(),
+            },
+            "valid_while": (
+                f"the rig cameras stay at their {reference_world} poses and the FR3 is not re-mounted; "
+                "either change needs a new edge"
+            ),
+        },
+        "target_node": {
+            "world_frame_id": target_world,
+            "calibration_id": "",
+            "parent_world_frame_id": None,
+            "reason": "robot_base",
+            "definition": "FR3 base frame (libfranka O frame) of the arm at its current mount",
+        },
+        # where the replays put the TCP, for "how far does this move the live edge"
+        "workspace_points_base_m": points[::step].round(5).tolist(),
+    }
+
+
+def _laser(args: argparse.Namespace) -> int:
+    world_dir = (args.world_dir or _REPO_ROOT / wp.WORLD_SUBDIR).resolve()
+    reference_path = world_dir / wp.WORLD_REFERENCE_FILE
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    kalibr = _REPO_ROOT / "third_party" / "opencv_kalibr"
+    if str(kalibr) not in sys.path:
+        sys.path.insert(0, str(kalibr))
+    from metrology.fr3_replay_laser_error import analyze_run, load_replay_trace
+
+    station_path = args.station.resolve()
+    station = json.loads(station_path.read_text(encoding="utf-8"))
+    replays = []
+    for run_dir in args.replay:
+        run_dir = run_dir.resolve()
+        try:
+            report = analyze_run(run_dir)
+            traces = sorted((run_dir / "replay_pose_traces").glob("*.csv"))
+            points = load_replay_trace(traces[0]).actual_t
+        except Exception as exc:  # noqa: BLE001 - reported as a rejection reason
+            report, points = {"run": run_dir.name, "run_dir": str(run_dir), "error": f"{type(exc).__name__}: {exc}"}, []
+        replays.append({"report": report, "points": points})
+    report = laser_report(
+        station,
+        _repo_relative(station_path),
+        replays,
+        reference_world=str(reference["world_frame_id"]),
+        reference_sha256=_sha256(reference_path),
+        target_world=args.target_world,
+    )
+    out = args.out.resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    q = report["edge"]["quality"]
+    s = q["station"]
+    print(f"station {station_path.name}: {s['poses']} poses, rms {s['rms_mm']:.2f} mm, certifies {s['certifies']}")
+    for row in q["replays"]:
+        if "error" in row:
+            print(f"replay {row['run']}: {row['error']}")
+        else:
+            print(
+                f"replay {row['run']}: {row['used_frames']} frames, laser vs FK p95 {row['laser_vs_fk_p95_mm']:.2f} mm, "
+                f"orientation span {row['orientation_span_deg']:.1f} deg"
+            )
+    if q["replay_spread"]:
+        print(f"replays agree to {q['replay_spread']['mean_mm']:.2f} mm (max {q['replay_spread']['max_mm']:.2f})")
+    for w in report["warnings"]:
+        print(f"warning: {w}")
+    reasons = report["reasons"]
+    print(f"verdict: {report['verdict']}" + (f" ({'; '.join(reasons)})" if reasons else ""))
+    print(f"written: {out}")
+    return 0 if not reasons else 2
+
+
 # ------------------------------------------------------------------- apply ---
 
 
@@ -481,6 +738,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     solve.add_argument("--target-world", default=DEFAULT_TARGET_WORLD)
     solve.add_argument("--out", required=True, type=Path, help="report json to write")
+    laser = sub.add_parser(
+        "laser", help="compose the edge from a laser-tracker station and FR3 replays with the laser (numpy)"
+    )
+    laser.add_argument("--station", required=True, type=Path, help="fit_tracker_mount station artifact")
+    laser.add_argument(
+        "--replay",
+        required=True,
+        action="append",
+        type=Path,
+        help="real_replay/<stamp>_episode_<n>_<cube> dir with a landed tracker session; repeat, ideally one each side of the station",
+    )
+    laser.add_argument("--target-world", default=DEFAULT_TARGET_WORLD)
+    laser.add_argument("--out", required=True, type=Path, help="report json to write")
     apply = sub.add_parser("apply", help="append a solved edge to world_graph.json")
     apply.add_argument("report", type=Path)
     apply.add_argument(
@@ -489,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         help="swap out an existing direct edge between the same worlds (kept in the new edge's supersedes)",
     )
     args = parser.parse_args(argv)
-    return _solve(args) if args.command == "solve" else _apply(args)
+    return {"solve": _solve, "laser": _laser, "apply": _apply}[args.command](args)
 
 
 if __name__ == "__main__":
