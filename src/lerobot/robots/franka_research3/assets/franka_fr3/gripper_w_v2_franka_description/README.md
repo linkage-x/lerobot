@@ -8,7 +8,9 @@ The finger meshes do not match the real gripper along the tool axis. With the se
 gripper closed, the meshes put the nose 184 mm below the flange (EE z +12). On 2026-10-13 a tape measured
 about 175 mm. On the real gripper the EE therefore sits about 3 mm inside the nose, not at the pad centre.
 Do not use the meshes to locate points on the fingertip, such as the pivot insert's socket. The laser measures
-that socket at EE z −10.3 mm in the TCP frame while the insert is gripped, with a 35 mm gap between the pads.
+that socket at EE (1.45, −0.78, −5.06) mm in the TCP frame while the insert is gripped, with a 35 mm gap
+between the pads: the FR3 pivot about a fixed ball, 2026-10-14, and a caliper reads flange face → socket
+166.9 mm. The earlier −10.3 mm came from the laser end to end and included the world → fr3_base edge.
 The repo URDF matches Thor's replay model (`box_api/replay_p0_arm_only_20260908/model.urdf`) frame for frame.
 
 - `urdf/gripper_w_v2_franka_description.urdf`: the vendor file, verbatim, for reference only. It does not

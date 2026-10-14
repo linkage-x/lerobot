@@ -869,14 +869,15 @@
   </joint>
   <!-- socket centre of the pivot insert v2 held by the sensor fingertips (35 mm pad gap): the point the
        camera EE trajectories label (bundle 0929 puts the TCP at the socket, d = 0 by definition). Real
-       replay, its MuJoCo preview and the IK QC drive this frame. EE axes, z -10.3 mm, toward the flange,
-       measured with the laser tracker on 2026-10-12/13, replay vs recording, p_rep - p_rec:
-       z -10.7 (10-12, 4 runs) and -9.9 (10-13). x and y are 0 because the insert's slots centre it to
-       0.2 mm; the measured 0.2-1.3 / -2.2-0.7 mm differ between days. Not from CAD: the finger meshes
-       sit 9 mm long on the tool axis (closed nose 184 vs 175 mm by tape). -->
+       replay, its MuJoCo preview and the IK QC drive this frame. EE axes, (1.45, -0.78, -5.06) mm:
+       the FR3 pivot about a fixed ball, 2026-10-14, 9 runs fitted together (fr3_tcp_pivot.py fit-joint),
+       sigma (0.27, 0.26, 0.35) mm, leave-one-run-out <= 0.36 mm; a caliper reads flange face -> socket
+       centre 166.9 mm (171.99 - 5.06 = 166.93). Until then this was z -10.3, fitted end to end by the laser
+       tracker (replay vs recording, 10-12 / 10-13); that fit had absorbed ~5 mm of the world -> fr3_base
+       edge's error along the tool axis. Not from CAD: the finger meshes sit 9 mm long on the tool axis. -->
   <link name="corenetic_socket_ee" />
   <joint name="corenetic_socket_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 -0.0103" />
+    <origin rpy="0 0 0" xyz="0.00145 -0.00078 -0.00506" />
     <parent link="corenetic_gripper_ee" />
     <child link="corenetic_socket_ee" />
   </joint>

@@ -3,10 +3,10 @@
 """Real replay drives the pivot insert's socket centre, not the vendor TCP.
 
 The camera EE trajectories put their TCP at the socket of insert v2 (bundle 0929, d = 0 by
-definition) and label it with corenetic_gripper_ee's axes. That socket sits 10.3 mm up the tool axis
-from corenetic_gripper_ee: the laser tracker measured -10.7 mm on 10-12 and -9.9 mm on 10-13, comparing
-replay with recording. Driving corenetic_gripper_ee onto the trajectory therefore placed every replayed
-pose 10 mm too far along the tool. The real replay, its MuJoCo preview and the IK QC must all drive
+definition) and label it with corenetic_gripper_ee's axes. That socket sits at (1.45, -0.78, -5.06) mm
+in corenetic_gripper_ee: the FR3 pivot about a fixed ball on 10-14, confirmed by a caliper (flange face
+-> socket 166.9 mm). Driving corenetic_gripper_ee onto the trajectory therefore placed every replayed
+pose 5 mm too far along the tool. The real replay, its MuJoCo preview and the IK QC must all drive
 the same socket frame, and must keep the EE axes so that no replayed orientation changes.
 """
 
@@ -28,7 +28,7 @@ THOR_CONFIGS = (
     REPLAY / "replay_cube_pose_in_robot_base.thor.yaml",
     REPO / "third_party/opencv_kalibr/verification/verify_fr3_cube_pose_ik.thor.yaml",
 )
-SOCKET_IN_EE_M = np.array([0.0, 0.0, -0.0103])
+SOCKET_IN_EE_M = np.array([0.00145, -0.00078, -0.00506])
 PROBE_Q = (0.31, -0.52, 0.18, -2.05, 0.12, 1.83, 0.71)
 
 
@@ -90,7 +90,10 @@ def test_replay_contract_accepts_the_socket_frame_only_as_a_pure_translation(tmp
     # A turned socket frame would rotate every replayed orientation by the same amount, silently.
     turned = tmp_path / "turned.urdf"
     turned.write_text(
-        URDF.read_text().replace('<origin rpy="0 0 0" xyz="0 0 -0.0103" />', '<origin rpy="0 0 0.1" xyz="0 0 -0.0103" />')
+        URDF.read_text().replace(
+            '<origin rpy="0 0 0" xyz="0.00145 -0.00078 -0.00506" />',
+            '<origin rpy="0 0 0.1" xyz="0.00145 -0.00078 -0.00506" />',
+        )
     )
     with pytest.raises(ValueError, match="pure translation"):
         replay._validate_replay_target_frame_contract(_cfg(turned, "corenetic_socket_ee"))

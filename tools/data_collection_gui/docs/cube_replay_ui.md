@@ -59,12 +59,16 @@ for the model's TCP, so after any model change (2026-10-12: the TCP moved from
 The trajectory is driven by the frame named in `robot.target_frame_name` of
 `replay_cube_pose_in_robot_base.thor.yaml`. The gateway passes the same frame to
 MuJoCo (`--target-frame-name`), and the IK QC config uses it too. Since 2026-10-13 it is
-`corenetic_socket_ee`: the pivot insert's socket centre, 10.3 mm up the tool axis
-from `corenetic_gripper_ee`, with the same axes. The camera trajectories put their
+`corenetic_socket_ee`: the pivot insert's socket centre, (1.45, −0.78, −5.06) mm
+in `corenetic_gripper_ee` (5 mm up the tool axis), with the same axes. Until 2026-10-14 it was
+z −10.3 mm, fitted end to end with the laser tracker; that fit had absorbed about 5 mm of the
+world → fr3_base edge. The FR3 pivot about a fixed ball and a caliper (flange face → socket
+166.9 mm) agree on −5.06. The camera trajectories put their
 TCP at that socket, while `corenetic_gripper_ee` sits at the fingertip: with the gripper closed,
 a tape measured about 175 mm from the flange to the nose. Driving the EE frame put every
 replayed pose about 10 mm out along the tool, which was 15.7 mm p95 end to end; on the socket
-frame it is 7.7 mm. The replay refuses a socket frame that is not a pure translation of
+frame at −10.3 it was 7.7 mm. At −5.06 the ~5 mm of edge error that −10.3 hid is back in the
+end-to-end number until the world → fr3_base edge is fixed. The replay refuses a socket frame that is not a pure translation of
 the EE frame.
 
 ## Single-cube hardware replay
