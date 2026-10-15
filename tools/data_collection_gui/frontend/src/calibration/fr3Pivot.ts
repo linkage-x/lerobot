@@ -279,11 +279,24 @@ export function planSummaryText(plan: Fr3PivotPlan): string {
     plan.tableClearanceMm == null
       ? "没做 MuJoCo 检查"
       : `离桌面${plan.tableZMm == null ? "" : `（z=${plan.tableZMm.toFixed(0)} mm）`}最近 ${plan.tableClearanceMm.toFixed(0)} mm（${plan.tableClearanceBody}）`;
+  const stand =
+    plan.socketStandMm == null
+      ? ""
+      : `，离球的支架：球窝 ${plan.socketStandMm.toFixed(1)} mm、${plan.gripperStandBody || "夹爪"} ${(plan.gripperStandMm ?? 0).toFixed(1)} mm`;
   return (
-    `通过：${(plan.durationS ?? 0).toFixed(0)} s，最快关节 ${maxOf(plan.maxJointSpeedDegS).toFixed(0)}°/s，` +
+    `通过：${dwellText(plan)}${(plan.durationS ?? 0).toFixed(0)} s，最快关节 ${maxOf(plan.maxJointSpeedDegS).toFixed(0)}°/s，` +
     `离 panda_py 的墙最近 ${minOf(plan.minMarginWallDeg).toFixed(0)}°，j6 转 ${(plan.jointTravelDeg?.[5] ?? 0).toFixed(0)}°、` +
-    `j7 转 ${(plan.jointTravelDeg?.[6] ?? 0).toFixed(0)}°，${clearance}`
+    `j7 转 ${(plan.jointTravelDeg?.[6] ?? 0).toFixed(0)}°，${clearance}${stand}`
   );
+}
+
+// "14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.27 mm，"
+function dwellText(plan: Fr3PivotPlan): string {
+  if (plan.kind !== "dwells" || !plan.dwells) return "";
+  const s = plan.sigmaPerUnit?.s;
+  const sigma = s && s.length ? `，每个驻点误差 0.5 mm 时球窝 σ ≤ ${(0.5 * maxOf(s)).toFixed(2)} mm` : "";
+  const anchor = plan.anchorFrom ? `，绕拟合的球心 ${fmtVec(plan.anchorMm)} mm` : "";
+  return `${plan.dwells} 个驻点${sigma}${anchor}，`;
 }
 
 export function biasLabel(mm: number[] | null | undefined): string {

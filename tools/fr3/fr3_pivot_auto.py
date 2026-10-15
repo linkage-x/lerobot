@@ -295,7 +295,16 @@ class Kinematics:
         pin.updateFramePlacements(self.model, self.data)
         return self.data.oMf[self.fid].homogeneous.copy()
 
-    def ik(self, T_des: np.ndarray, seed, q_null, *, iters: int = 60, damping: float = 1e-4, null_gain: float = 0.05):
+    def ik(
+        self,
+        T_des: np.ndarray,
+        seed,
+        q_null,
+        *,
+        iters: int = 60,
+        damping: float = 1e-4,
+        null_gain: float = 0.05,
+    ):
         """Damped least squares from ``seed``; the nullspace leans towards ``q_null`` (keeps the posture)."""
         pin = self.pin
         q = np.asarray(seed, dtype=float).copy()
@@ -322,7 +331,9 @@ class Kinematics:
 class SceneCheck:
     """Contact pairs the start pose does not have, and how close any moving mesh comes to the table."""
 
-    def __init__(self, xml: Path = DEFAULT_XML, table_z_m: float = DEFAULT_TABLE_Z_M, max_vertices: int = 300):
+    def __init__(
+        self, xml: Path = DEFAULT_XML, table_z_m: float = DEFAULT_TABLE_Z_M, max_vertices: int = 300
+    ):
         import mujoco
 
         self.mj = mujoco
@@ -405,13 +416,39 @@ def plan(
     path = build_path(T0[:3, :3], T0[:3, 3], params, a1, a2)
     n = len(path["t"])
     qs = np.zeros((n, 7))
-    ik_pos, ik_rot = np.zeros(n), np.zeros(n)
     q = q0
     for i in range(n):
         T = np.eye(4)
         T[:3, :3], T[:3, 3] = path["R"][i], path["p"][i]
-        q, ik_pos[i], ik_rot[i] = kin.ik(T, q, q0)
+        q, _, _ = kin.ik(T, q, q0)
         qs[i] = q
+    summary = check_path(
+        path, qs, q0, kin, scene, params.rate_hz, check_every=check_every, table_z_m=table_z_m
+    )
+    summary["tilt_axes_base"] = [np.round(a1, 3).tolist(), np.round(a2, 3).tolist()]
+    return path, qs, summary
+
+
+def check_path(
+    path: dict[str, np.ndarray],
+    qs: np.ndarray,
+    q0: np.ndarray,
+    kin: Kinematics,
+    scene: SceneCheck | None,
+    rate_hz: float,
+    *,
+    check_every: int = 10,
+    table_z_m: float = DEFAULT_TABLE_Z_M,
+) -> dict[str, Any]:
+    """Everything a path must pass before ``execute`` may run it: limits and walls, speeds, wrist travel,
+    IK error against the commanded poses, and in MuJoCo self-contact and the table."""
+    T0 = kin.fk(q0)
+    n = len(qs)
+    ik_pos, ik_rot = np.zeros(n), np.zeros(n)
+    for i in range(n):
+        T = kin.fk(qs[i])
+        ik_pos[i] = np.linalg.norm(T[:3, 3] - path["p"][i])
+        ik_rot[i] = rot_angle(T[:3, :3].T @ path["R"][i])
 
     problems: list[str] = []
     above_mm = (T0[2, 3] - table_z_m) * 1e3
@@ -427,16 +464,20 @@ def plan(
             problems.append(
                 f"j{j + 1} 离 panda_py 的墙只有 {m_wall[j]:.1f}°（要 ≥ {LIMIT_MARGIN_DEG:.0f}°；越墙进程会直接退出）"
             )
-    dq = np.degrees(np.abs(np.diff(qs, axis=0))) * params.rate_hz
+    dq = np.degrees(np.abs(np.diff(qs, axis=0))) * rate_hz
     speed = dq.max(axis=0)
     for j in range(7):
         if speed[j] > MAX_JOINT_SPEED_DEG_S:
             problems.append(f"j{j + 1} 最快 {speed[j]:.0f}°/s（上限 {MAX_JOINT_SPEED_DEG_S:.0f}°/s）")
     travel = np.degrees(qs.max(axis=0) - qs.min(axis=0))
     if travel[5] > MAX_J6_TRAVEL_DEG:
-        problems.append(f"j6 总转角 {travel[5]:.0f}°（上限 {MAX_J6_TRAVEL_DEG:.0f}°：手腕大幅摆动曾让夹爪 BOX 掉电）")
+        problems.append(
+            f"j6 总转角 {travel[5]:.0f}°（上限 {MAX_J6_TRAVEL_DEG:.0f}°：手腕大幅摆动曾让夹爪 BOX 掉电）"
+        )
     if speed[5] > MAX_J6_SPEED_DEG_S:
-        problems.append(f"j6 最快 {speed[5]:.0f}°/s（上限 {MAX_J6_SPEED_DEG_S:.0f}°/s：10-13 掉电那次是 89°/s 的快摆）")
+        problems.append(
+            f"j6 最快 {speed[5]:.0f}°/s（上限 {MAX_J6_SPEED_DEG_S:.0f}°/s：10-13 掉电那次是 89°/s 的快摆）"
+        )
     if ik_pos.max() * 1e3 > MAX_IK_POS_MM or np.degrees(ik_rot.max()) > MAX_IK_ROT_DEG:
         problems.append(
             f"IK 没解到（最差 {ik_pos.max() * 1e3:.2f} mm / {np.degrees(ik_rot.max()):.2f}°）：这个球心附近转不开"
@@ -478,8 +519,7 @@ def plan(
         "table_z_mm": round((scene.table_z if scene is not None else table_z_m) * 1e3, 1),
         "centre_above_table_mm": round(float(above_mm), 1),
     }
-    summary["tilt_axes_base"] = [np.round(a1, 3).tolist(), np.round(a2, 3).tolist()]
-    return path, qs, summary
+    return summary
 
 
 # --- commands --------------------------------------------------------------------------------------
@@ -527,7 +567,9 @@ def capture(args) -> int:
         "wall_problems": beyond + close,
     }
     _write(out, payload)
-    print(f"centre (socket FK) {np.round(T[:3, 3] * 1e3, 1).tolist()} mm in fr3_base, tool axis {payload['tool_from_level_deg']}° from level (+ = up)")
+    print(
+        f"centre (socket FK) {np.round(T[:3, 3] * 1e3, 1).tolist()} mm in fr3_base, tool axis {payload['tool_from_level_deg']}° from level (+ = up)"
+    )
     for line in beyond:
         print(f"ERROR: {line}")
     for line in close:
@@ -541,6 +583,8 @@ def plan_cmd(args) -> int:
     if centre.get("schema") != CENTRE_SCHEMA:
         print(f"ERROR: {args.centre} is not a {CENTRE_SCHEMA}")
         return 2
+    if not args.star:
+        return plan_dwells_cmd(args, centre)
     params = PlanParams(
         tilt_deg=args.tilt_deg,
         spin_deg=args.spin_deg,
@@ -554,6 +598,7 @@ def plan_cmd(args) -> int:
     out = args.out or OUT_ROOT / "plans" / f"{_stamp()}_plan.json"
     header = {
         "schema": PLAN_SCHEMA,
+        "kind": "star",
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "centre": args.centre.name,
         "centre_m": centre["centre_m"],
@@ -579,6 +624,99 @@ def plan_cmd(args) -> int:
         f"plan {verdict}: {summary['duration_s']} s, joint travel {summary['joint_travel_deg']}°, "
         f"wall margin {summary['min_margin_wall_deg']}°, table clearance {summary['table_clearance_mm']} mm"
     )
+    for line in summary["problems"]:
+        print(f"  {line}")
+    print(f"wrote {out}")
+    return 0 if summary["passed"] else 3
+
+
+def plan_dwells_cmd(args, centre: dict[str, Any]) -> int:
+    """Survey the orientations about the ball, pick the dwells, route them, check the timed path."""
+    from tools.fr3 import fr3_pivot_plan as pp
+
+    if np.linalg.norm(args.anchor_mm) > GUIDE_MAX_ANCHOR_MM:
+        print(
+            f"ERROR: --anchor-mm {args.anchor_mm} is further than {GUIDE_MAX_ANCHOR_MM:g} mm off the socket frame"
+        )
+        return 2
+    params = pp.DwellParams(
+        dwells=args.dwells,
+        dwell_s=args.dwell_s,
+        speed_deg_s=args.speed_deg_s,
+        press_mm=args.press_mm,
+        bias_mm=[float(x) for x in args.bias_mm],
+        anchor_mm=[float(x) for x in args.anchor_mm],
+    )
+    kin = Kinematics(args.urdf)
+    scene = None if args.no_mujoco else SceneCheck(args.xml, table_z_m=args.table_z_m)
+    stand = pp.Stand.load()
+    t0 = time.monotonic()
+    path, qs, names, info, survey = pp.plan_dwells(
+        centre, kin, scene, stand, params, pp.SurveyParams(table_z_m=args.table_z_m)
+    )
+    problems = list(info["problems"])
+    summary: dict[str, Any] = {"passed": False, "problems": problems}
+    if len(qs):
+        summary = check_path(
+            path, qs, np.asarray(centre["q"]), kin, scene, params.rate_hz, table_z_m=args.table_z_m
+        )
+        more, stand_info = pp.stand_problems(survey, path, qs)
+        summary.update(stand_info)
+        summary["problems"] = problems + summary["problems"] + more
+        summary["passed"] = not summary["problems"]
+    out = args.out or OUT_ROOT / "plans" / f"{_stamp()}_plan.json"
+    header = {
+        "schema": PLAN_SCHEMA,
+        "kind": "dwells",
+        "created": dt.datetime.now().isoformat(timespec="seconds"),
+        "centre": args.centre.name,
+        "centre_m": centre["centre_m"],
+        "ball_m": np.round(survey.centre_m, 6).tolist(),
+        "anchor_from": args.anchor_from,
+        "params": asdict(params),
+        **summary,
+        "survey": info["survey"],
+        "dwells_deg": info.get("dwells_deg", []),
+        "sigma_per_unit": info.get("sigma_per_unit"),
+        "notes": info.get("notes", []),
+        "planning_s": round(time.monotonic() - t0, 1),
+    }
+    _write(out.with_name(out.name.removesuffix(".json") + ".summary.json"), header)
+    body = {**header, "q_start": centre["q"], "dwell_q": info.get("dwell_q", []), "phase_names": names}
+    if len(qs):
+        body.update(
+            {
+                "t": np.round(path["t"], 4).tolist(),
+                "q": np.round(qs, 6).tolist(),
+                "p": np.round(path["p"], 6).tolist(),
+                "quat_xyzw": np.round([quat_xyzw(R) for R in path["R"]], 7).tolist(),
+                "phase": path["phase"].tolist(),
+            }
+        )
+    _write(out, body)
+    sv = info["survey"]
+    print(
+        f"survey: {sv['transit']} of {sv['cells']} orientations pass (heading {sv['span_deg']['heading']}, "
+        f"pitch {sv['span_deg']['pitch']}, roll {sv['span_deg']['roll']} deg); failing: {sv['why']}"
+    )
+    for line in info.get("notes", []):
+        print(f"  {line}")
+    if info.get("sigma_per_unit"):
+        sig = info["sigma_per_unit"]
+        print(
+            f"{len(info['dwells_deg'])} dwells: predicted 1-sigma per mm of dwell error s {sig['s']}, c {sig['c']} "
+            f"(at 0.5 mm per dwell: s <= {0.5 * max(sig['s']):.2f} mm)"
+        )
+    verdict = "PASS" if summary["passed"] else "FAIL"
+    if len(qs):
+        print(
+            f"plan {verdict}: {summary['duration_s']} s, joint travel {summary['joint_travel_deg']}°, "
+            f"wall margin {summary['min_margin_wall_deg']}°, table clearance {summary['table_clearance_mm']} mm, "
+            f"stand: socket {summary['socket_stand_mm']} mm, gripper {summary['gripper_stand_mm']} mm "
+            f"({summary['gripper_stand_body']})"
+        )
+    else:
+        print(f"plan {verdict}")
     for line in summary["problems"]:
         print(f"  {line}")
     print(f"wrote {out}")
@@ -666,10 +804,20 @@ def execute(args) -> int:
     signal.signal(signal.SIGTERM, _sigint)
     t_plan = np.asarray(plan_data["t"])
     P, Q, QN = np.asarray(plan_data["p"]), np.asarray(plan_data["quat_xyzw"]), np.asarray(plan_data["q"])
-    rec: dict[str, list] = {"t": [], "q": [], "dq": [], "O_T_EE": [], "F_ext": [], "cmd_socket": [], "phase": []}
+    rec: dict[str, list] = {
+        "t": [],
+        "q": [],
+        "dq": [],
+        "O_T_EE": [],
+        "F_ext": [],
+        "cmd_socket": [],
+        "phase": [],
+    }
     monitor = Monitor()
-    print(f"execute: {t_plan[-1]:.0f} s pivot, soft impedance {params['translational_stiffness']:.0f} N/m, "
-          f"press {params['press_mm']} mm, bias {params['bias_mm']} mm")
+    print(
+        f"execute: {t_plan[-1]:.0f} s pivot, soft impedance {params['translational_stiffness']:.0f} N/m, "
+        f"press {params['press_mm']} mm, bias {params['bias_mm']} mm"
+    )
     panda.start_controller(ctrl)
     try:
         ee0 = _ee_matrix(state)
@@ -704,8 +852,10 @@ def execute(args) -> int:
                 break
             panda.raise_error()
             if elapsed >= next_print:
-                print(f"  {elapsed:5.1f} / {t_plan[-1]:.0f} s  {plan_data['phase_names'][rec['phase'][-1]]:7s} "
-                      f"press {-f_ext[2]:+4.1f} N  |F| {np.linalg.norm(f_ext[:3]):4.1f} N  off cmd {np.linalg.norm(socket - P[k]) * 1e3:4.1f} mm")
+                print(
+                    f"  {elapsed:5.1f} / {t_plan[-1]:.0f} s  {plan_data['phase_names'][rec['phase'][-1]]:7s} "
+                    f"press {-f_ext[2]:+4.1f} N  |F| {np.linalg.norm(f_ext[:3]):4.1f} N  off cmd {np.linalg.norm(socket - P[k]) * 1e3:4.1f} mm"
+                )
                 next_print += 5.0
             time.sleep(1.0 / params["rate_hz"])
     except RuntimeError as exc:
@@ -730,7 +880,9 @@ def execute(args) -> int:
     if stop["why"]:
         aborted = (args.out or OUT_ROOT / f"{_stamp()}_pivot.json").with_suffix(".aborted.json")
         _write(aborted, payload)
-        print(f"STOPPED: {stop['why']} -- {len(rec['t'])} samples kept for diagnosis in {aborted.name}, nothing to fit")
+        print(
+            f"STOPPED: {stop['why']} -- {len(rec['t'])} samples kept for diagnosis in {aborted.name}, nothing to fit"
+        )
         return 4
     out = args.out or OUT_ROOT / f"{_stamp()}_pivot.json"
     _write(out, payload)
@@ -782,7 +934,9 @@ def guide(args) -> int:
     T_sock = kin.fk(q_now)
     anchor = np.asarray(args.anchor_mm, dtype=float) / 1e3
     if np.linalg.norm(anchor) * 1e3 > GUIDE_MAX_ANCHOR_MM:
-        print(f"ERROR: --anchor-mm {list(args.anchor_mm)} is more than {GUIDE_MAX_ANCHOR_MM:g} mm off the socket frame")
+        print(
+            f"ERROR: --anchor-mm {list(args.anchor_mm)} is more than {GUIDE_MAX_ANCHOR_MM:g} mm off the socket frame"
+        )
         return 2
     # The held point where the centre was taken: the fitted ball centre, if the socket was seated then.
     R_cap = np.asarray(centre.get("R") or T_sock[:3, :3], dtype=float)
@@ -818,7 +972,15 @@ def guide(args) -> int:
     signal.signal(signal.SIGINT, _abort)
     signal.signal(signal.SIGTERM, _abort)
     signal.signal(signal.SIGUSR1, _finish)
-    rec: dict[str, list] = {"t": [], "q": [], "dq": [], "O_T_EE": [], "F_ext": [], "cmd_socket": [], "phase": []}
+    rec: dict[str, list] = {
+        "t": [],
+        "q": [],
+        "dq": [],
+        "O_T_EE": [],
+        "F_ext": [],
+        "cmd_socket": [],
+        "phase": [],
+    }
     monitor = Monitor(force_n=GUIDE_STOP_FORCE_N)
     R_start = T_sock[:3, :3]
     seen: list[np.ndarray] = []
@@ -873,7 +1035,11 @@ def guide(args) -> int:
             if elapsed >= next_print:
                 tilt, spin = guide_progress(R_start, seen)
                 margin = np.degrees(np.minimum(q - PANDA_WALL_LOWER, PANDA_WALL_UPPER - q))
-                near = f"  j{int(margin.argmin()) + 1} 离墙 {margin.min():.0f}°!" if margin.min() < GUIDE_WALL_WARN_DEG else ""
+                near = (
+                    f"  j{int(margin.argmin()) + 1} 离墙 {margin.min():.0f}°!"
+                    if margin.min() < GUIDE_WALL_WARN_DEG
+                    else ""
+                )
                 print(
                     f"  {elapsed:5.1f} / {args.duration_s:.0f} s  {GUIDE_PHASES[phase]:7s} press {-f_ext[2]:+4.1f} N  "
                     f"off {np.linalg.norm(T_s[:3, 3] - cmd) * 1e3:4.1f} mm  tilt max {tilt:4.1f}°  spin {spin:5.1f}°{near}",
@@ -909,7 +1075,9 @@ def guide(args) -> int:
     if flags["abort"]:
         aborted = out.with_suffix(".aborted.json")
         _write(aborted, payload)
-        print(f"STOPPED: {flags['abort']} -- {len(rec['t'])} samples kept for diagnosis in {aborted.name}, nothing to fit")
+        print(
+            f"STOPPED: {flags['abort']} -- {len(rec['t'])} samples kept for diagnosis in {aborted.name}, nothing to fit"
+        )
         return 4
     _write(out, payload)
     print(f"wrote {out} ({len(rec['t'])} samples; tilt max {tilt:.0f}°, spin {spin:.0f}°)")
@@ -927,7 +1095,9 @@ def _quat_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("capture", help="read only: the seated socket's FK is the centre")
     p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
@@ -937,11 +1107,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.set_defaults(func=capture)
     p = sub.add_parser("plan", help="IK + MuJoCo checks of the pivot about a captured centre")
     p.add_argument("centre", type=Path)
-    p.add_argument("--tilt-deg", type=float, default=PlanParams.tilt_deg)
-    p.add_argument("--spin-deg", type=float, default=PlanParams.spin_deg)
+    p.add_argument(
+        "--star",
+        action="store_true",
+        help="the 10-13 fixed star (--tilt-deg / --spin-deg) instead of planned dwells",
+    )
+    p.add_argument("--tilt-deg", type=float, default=PlanParams.tilt_deg, help="--star only")
+    p.add_argument("--spin-deg", type=float, default=PlanParams.spin_deg, help="--star only")
+    p.add_argument("--dwells", type=int, default=14, help="dwell poses, the start included")
+    p.add_argument("--dwell-s", type=float, default=1.5)
     p.add_argument("--speed-deg-s", type=float, default=PlanParams.speed_deg_s)
     p.add_argument("--press-mm", type=float, default=PlanParams.press_mm)
-    p.add_argument("--bias-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], help="deliberate offset, fr3_base")
+    p.add_argument(
+        "--bias-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], help="deliberate offset, fr3_base"
+    )
+    p.add_argument(
+        "--anchor-mm",
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.0],
+        help="the ball centre in corenetic_socket_ee (an earlier fit's s): the plan turns about it",
+    )
+    p.add_argument("--anchor-from", default="", help="which fit the anchor came from (recorded in the plan)")
     p.add_argument("--table-z-m", type=float, default=DEFAULT_TABLE_Z_M, help="table top in fr3_base")
     p.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     p.add_argument("--xml", type=Path, default=DEFAULT_XML)
@@ -953,10 +1140,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     p.add_argument("--duration-s", type=float, default=GUIDE_DEFAULT_DURATION_S)
     p.add_argument("--press-mm", type=float, default=PlanParams.press_mm)
-    p.add_argument("--bias-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], help="deliberate offset, fr3_base")
+    p.add_argument(
+        "--bias-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], help="deliberate offset, fr3_base"
+    )
     p.add_argument("--stiffness", type=float, default=PlanParams.translational_stiffness, help="N/m")
     p.add_argument(
-        "--anchor-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+        "--anchor-mm",
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.0],
         help=f"the point the spring holds, in {SOCKET_FRAME}: a fit's socket_frame.s_ee_mm from the same grip",
     )
     p.add_argument("--anchor-from", default="", help="which fit the anchor came from (recorded in the run)")

@@ -1395,8 +1395,9 @@ export class DataCollectionGuiApi {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/capture-centre", { robotIp, note });
   }
 
-  async planFr3Pivot(centre: string, biasMm: number[]): Promise<Fr3PivotResponse | null> {
-    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm });
+  // Survey + dwells + route + checks: a minute or two.
+  async planFr3Pivot(centre: string, biasMm: number[], anchorFromFit = false): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm, anchorFromFit });
   }
 
   // Moves the real FR3 along a plan that passed: the panel confirms first.

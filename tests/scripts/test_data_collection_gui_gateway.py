@@ -8928,11 +8928,15 @@ if args[0] == "capture":
 elif args[0] == "plan":
     bias = [float(x) for x in args[args.index("--bias-mm") + 1: args.index("--bias-mm") + 4]]
     passed = bias[0] != 5.0
-    summary = {"schema": "fr3_pivot_plan/v1", "centre": Path(args[1]).name, "created": "x", "passed": passed,
+    anchor = [float(x) for x in args[args.index("--anchor-mm") + 1: args.index("--anchor-mm") + 4]] if "--anchor-mm" in args else [0.0] * 3
+    summary = {"schema": "fr3_pivot_plan/v1", "kind": "dwells", "centre": Path(args[1]).name, "created": "x", "passed": passed,
                "problems": [] if passed else ["j6 总转角 95°"], "duration_s": 136.0,
-               "params": {"bias_mm": bias, "press_mm": 3.0}, "joint_travel_deg": [1] * 7,
+               "params": {"bias_mm": bias, "press_mm": 3.0, "anchor_mm": anchor}, "joint_travel_deg": [1] * 7,
                "max_joint_speed_deg_s": [8] * 7, "min_margin_wall_deg": [28] * 7, "min_margin_fr3_deg": [30] * 7,
-               "table_clearance_mm": 74.6, "table_clearance_body": "link_gripper_tip_right", "mujoco_checked": True}
+               "table_clearance_mm": 74.6, "table_clearance_body": "link_gripper_tip_right", "mujoco_checked": True,
+               "dwells_deg": [[0, -10, 0]] * 14, "sigma_per_unit": {"s": [0.54, 0.43, 0.54], "c": [0.5, 0.5, 0.5]},
+               "socket_stand_mm": 1.7, "gripper_stand_mm": 3.6, "gripper_stand_body": "link_gripper_tip_right",
+               "anchor_from": opt("--anchor-from") if "--anchor-from" in args else ""}
     out.with_name(out.name.replace(".json", ".summary.json")).write_text(json.dumps(summary))
     out.write_text(json.dumps({**summary, "q": [[0.0] * 7]}))
     print("plan PASS" if passed else "plan FAIL")
@@ -8980,6 +8984,9 @@ def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypa
     (plan,) = planned["plans"]
     assert plan["name"] == planned["planned"] and plan["passed"] and plan["biasMm"] == [3.0, 0.0, 0.0]
     assert plan["tableClearanceMm"] == 74.6 and plan["centre"] == centre["name"]
+    assert plan["kind"] == "dwells" and plan["dwells"] == 14 and plan["sigmaPerUnit"]["s"] == [0.54, 0.43, 0.54]
+    assert plan["socketStandMm"] == 1.7 and plan["gripperStandBody"] == "link_gripper_tip_right"
+    assert plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
 
     started = gateway._execute_fr3_pivot(state, {"plan": plan["name"]})
     assert started["ok"], started["error"]
@@ -9083,6 +9090,17 @@ def test_fr3_pivot_guide_anchors_on_the_latest_good_fit_of_the_same_grip(tmp_pat
     plain = gateway._guide_fr3_pivot(state, {"centre": centre})
     assert plain["job"]["anchorMm"] == [0.0, 0.0, 0.0]
     assert not any(line.startswith("anchor") for line in _await_pivot(state)["log"])
+
+
+def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, monkeypatch):
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    assert "先跑一轮不挂球心" in gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+    _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
+    planned = gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    assert planned["ok"], planned["error"]
+    (plan,) = planned["plans"]
+    assert plan["anchorMm"] == [0.13, -0.53, 7.87] and plan["anchorFrom"] == "20261013_181645_pivot.fit.json"
 
 
 def test_fr3_pivot_anchor_follows_the_socket_frame_the_urdf_has_now(tmp_path, monkeypatch):

@@ -231,6 +231,22 @@ describe("fr3Pivot", () => {
       "通过：136 s，最快关节 8°/s，离 panda_py 的墙最近 28°，j6 转 78°、j7 转 116°，离桌面（z=120 mm）最近 75 mm（link_gripper_tip_right）"
     );
     expect(planSummaryText({ ...plan, passed: false, problems: ["a", "b"] })).toBe("没通过：a；b");
+    const dwells = {
+      ...plan,
+      kind: "dwells",
+      dwells: 14,
+      sigmaPerUnit: { s: [0.54, 0.43, 0.6], c: [0.5, 0.5, 0.5] },
+      socketStandMm: 1.73,
+      gripperStandMm: 3.6,
+      gripperStandBody: "link_gripper_tip_right",
+      anchorFrom: "x.fit.json",
+      anchorMm: [0.1, 0.5, -1.5],
+    };
+    expect(planSummaryText(dwells)).toBe(
+      "通过：14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.30 mm，绕拟合的球心 (0.1, 0.5, -1.5) mm，136 s，最快关节 8°/s，" +
+        "离 panda_py 的墙最近 28°，j6 转 78°、j7 转 116°，离桌面（z=120 mm）最近 75 mm（link_gripper_tip_right），" +
+        "离球的支架：球窝 1.7 mm、link_gripper_tip_right 3.6 mm"
+    );
     expect(biasLabel([-3, 0, 0])).toBe("偏置 −3 mm（x）");
     expect(biasLabel([1, 2, 0])).toBe("偏置 (1.0, 2.0, 0.0) mm");
   });

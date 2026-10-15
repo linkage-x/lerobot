@@ -4104,6 +4104,8 @@ _FR3_PIVOT_AUTO_SCRIPT = Path("tools") / "fr3" / "fr3_pivot_auto.py"
 _FR3_PIVOT_CENTRE_RE = re.compile(r"^\d{8}_\d{6}_centre\.json$")
 _FR3_PIVOT_PLAN_RE = re.compile(r"^\d{8}_\d{6}_plan\.json$")
 _FR3_PIVOT_MAX_BIAS_MM = 5.0
+# The dwell planner surveys ~3000 orientations about the ball before it routes them: 1-2 min on a PC.
+_FR3_PIVOT_PLAN_TIMEOUT_S = 600
 _FR3_PIVOT_GUIDE_DEFAULT_S = 60.0
 _FR3_PIVOT_GUIDE_RANGE_S = (20.0, 180.0)
 # guide --anchor-mm from the latest guided fit: the spring held on the fitted ball centre instead of
@@ -4287,6 +4289,16 @@ def _fr3_pivot_plans(state: GatewayState) -> list[dict[str, Any]]:
                 "tableClearanceBody": summary.get("table_clearance_body"),
                 "tableZMm": summary.get("table_z_mm"),
                 "mujocoChecked": bool(summary.get("mujoco_checked")),
+                # dwell plans (fr3_pivot_plan): the star has none of these
+                "kind": str(summary.get("kind") or "star"),
+                "dwells": len(summary.get("dwells_deg") or []),
+                "sigmaPerUnit": summary.get("sigma_per_unit"),
+                "socketStandMm": summary.get("socket_stand_mm"),
+                "gripperStandMm": summary.get("gripper_stand_mm"),
+                "gripperStandBody": summary.get("gripper_stand_body"),
+                "anchorFrom": str(summary.get("anchor_from") or ""),
+                "anchorMm": params.get("anchor_mm"),
+                "notes": list(summary.get("notes") or []),
             }
         )
     return out
@@ -4531,11 +4543,20 @@ def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     bias = _fr3_pivot_bias(body)
     if isinstance(bias, str):
         return _fr3_pivot_refusal(state, bias)
+    # The plan turns about the fitted ball centre too, as guide holds it there.
+    anchor_args: list[str] = []
+    if body.get("anchorFromFit"):
+        anchor = _fr3_pivot_anchor(state)
+        if not anchor["available"]:
+            return _fr3_pivot_refusal(state, anchor["reason"])
+        anchor_args = ["--anchor-mm", *[f"{x:g}" for x in anchor["sMm"]], "--anchor-from", anchor["fitName"]]
     out = _fr3_pivot_root(state) / "plans" / f"{datetime.now():%Y%m%d_%H%M%S}_plan.json"
     code, output = _run_fr3_pivot_tool(
         state,
-        _fr3_pivot_auto_command(state, "plan", str(centre), "--bias-mm", *[f"{x:g}" for x in bias], "--out", str(out)),
-        300,
+        _fr3_pivot_auto_command(
+            state, "plan", str(centre), "--bias-mm", *[f"{x:g}" for x in bias], *anchor_args, "--out", str(out)
+        ),
+        _FR3_PIVOT_PLAN_TIMEOUT_S,
     )
     if code not in (0, 3) or not out.is_file():  # 3: written, did not pass
         return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {code}"), "output": output}

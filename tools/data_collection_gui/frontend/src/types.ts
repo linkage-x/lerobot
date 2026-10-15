@@ -1672,6 +1672,17 @@ export type Fr3PivotPlan = {
   /** The table top the clearance was measured from, in fr3_base. */
   tableZMm?: number | null;
   mujocoChecked: boolean;
+  /** "dwells" (surveyed, chosen, routed) or the 10-13 "star". */
+  kind?: string;
+  dwells?: number;
+  /** Predicted 1-sigma of the fit per mm of error at each dwell: s (socket frame), c (fr3_base). */
+  sigmaPerUnit?: { s: number[]; c: number[] } | null;
+  socketStandMm?: number | null;
+  gripperStandMm?: number | null;
+  gripperStandBody?: string | null;
+  anchorFrom?: string;
+  anchorMm?: number[] | null;
+  notes?: string[];
 };
 
 /** POST /api/robot/move-to-start: panda_py move_to_start() on one FR3, run to completion. */

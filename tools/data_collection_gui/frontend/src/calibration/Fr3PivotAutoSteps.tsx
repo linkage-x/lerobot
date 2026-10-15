@@ -204,8 +204,10 @@ export function Fr3PivotAutoSteps({
       ) : (
         <>
       <p className="cali-muted">
-        <b>2 规划 + MuJoCo 演算：</b>绕球心俯仰、滚转各 ±20°，再绕过球心的竖直轴左右摆 ±30°，峰值 5°/s，约 1.5 分钟；球窝往下压进球 3 mm（约 2 N）。
-        先检查关节限位（含 panda_py 那组更窄的墙）、速度、j6 摆幅、自碰撞、离桌面高度（桌面按 fr3_base 上方 120 mm；倾斜时指尖比球心低约 4 cm，球心要比桌面高约 6 cm 以上；球的支架不在模型里，宽支架要自己留意），全过才能执行。
+        <b>2 规划 + 演算（约 1–2 分钟）：</b>先在仿真里把球心周围的姿态（工具轴朝向、俯仰 −20°～+10°、绕工具轴滚转 ±40°）逐格解 IK，
+        每格查关节限位（含 panda_py 那组更窄的墙）、自碰撞、离桌面高度（fr3_base 上方 120 mm），以及球窝和夹爪离球的支架多远（支架和球窝按插件 CAD，夹爪按厂商网格；10-13/10-14 的 21 次引导都落在它算出的可行域里）。
+        再从能到的格子里挑 14 个驻点，使拟合的不确定度最小，按关节走得最少的顺序连起来，每个驻点停 1.5 s；球窝往下压进球 3 mm（约 2 N），峰值 5°/s。
+        整条路径再查一遍限位、速度、j6 摆幅、桌面和支架，全过才能执行。
         <b>建议同一个球心跑「+3 mm」和「−3 mm」两次</b>：两次拟合一致，才证明结果由球决定、不是跟着指令走。
       </p>
       <div className="cali-op-actions">
@@ -231,10 +233,19 @@ export function Fr3PivotAutoSteps({
             ))}
           </select>
         </label>
+        <label className="cali-muted" title={anchorLine.text}>
+          <input
+            type="checkbox"
+            checked={anchored && !!anchor?.available}
+            disabled={locked || !anchor?.available}
+            onChange={(e) => setAnchored(e.target.checked)}
+          />{" "}
+          绕上次拟合的球心转
+        </label>
         <button
           className="cali-btn-primary"
           disabled={locked || !chosen}
-          onClick={() => act("plan", () => api.planFr3Pivot(centre, BIAS_PRESETS[bias].mm))}
+          onClick={() => act("plan", () => api.planFr3Pivot(centre, BIAS_PRESETS[bias].mm, anchored && !!anchor?.available))}
         >
           {running === "plan" ? "演算中…" : "规划 + 演算"}
         </button>

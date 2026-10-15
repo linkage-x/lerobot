@@ -1,0 +1,23 @@
+{
+  "schema": "fr3_pivot_stand/v1",
+  "source": "Assembly Final.step (Onshape, 2026-10-15): pivot, connector, base; socket.stl is the insert's socket part from the same file",
+  "units": "mm",
+  "frame": "ball centre at the origin, z up the stand's axis; socket.stl in the insert frame: z = corenetic_socket_ee x (the cup axis, up when seated), x = -corenetic_socket_ee z (back towards the flange), y = corenetic_socket_ee y",
+  "ball_radius": 12.47,
+  "profile_rz": [
+    [0.0, -11.4],
+    [5.0, -11.4],
+    [5.0, -26.79],
+    [6.075, -26.79],
+    [6.075, -32.34],
+    [12.485, -32.34],
+    [12.485, -37.2],
+    [16.53, -37.2],
+    [24.85, -86.2],
+    [0.0, -86.2]
+  ],
+  "profile_note": "the stand below the ball, turned about z: neck, collar, connector, then the cone of the base",
+  "plate": {"half_xy": 50.0, "z_top": -86.2, "z_bottom": -92.2},
+  "plate_note": "the square foot on the table; its heading about z is not known, so it is checked as the disc that holds it (radius 50 * sqrt 2)",
+  "fingers_note": "the two fingers in the STEP only show how the fingertips hold the insert, they are not the real fingertips: the gripper's own meshes (MJCF) are used instead"
+}
