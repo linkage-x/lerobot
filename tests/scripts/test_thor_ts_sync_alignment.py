@@ -647,32 +647,115 @@ def test_readout_offset_default_is_uncalibrated_zero(tmp_path):
     assert lr3.READOUT_OFFSET_S == 0.0
 
 
-def test_exposure_centre_is_recorded_but_not_applied_by_default(tmp_path):
-    """The shipped default leaves the BOX lookup on the stamp the hardware gave.
+def test_exposure_centre_is_applied_together_with_the_box_delay(tmp_path):
+    """Production reads the camera at mid-exposure, -0.5 (measured 2026-09-28).
 
-    Not because the sign is unknown -- it was measured on 2026-09-28 as -0.5
-    (EOF-SOF flat vs exposure, the 09-11 blur note, and the laser tracker's best
-    offset -5.0 ms at E = 10 ms) -- but because this term's only production
+    For years that was held back at 0.0 because the term's only production
     consumer is the BOX nearest-neighbour target, whose right value is
-    ``T + d_box``.  The BOX transport delay d_box is not subtracted anywhere, and
-    the late SOF was half-cancelling it (ts_sync.md s5.5: raw-SOF offset +4.4 /
-    -1.2 ms -> d_box ~ 8.7 / 3.2 ms).  -0.5 alone moves both boxes further off.
-    If this assertion changes, the same commit must subtract a re-measured
-    per-box d_box from BOX stamps.
+    ``T + d_box``, and the late SOF was half-cancelling the unsubtracted BOX
+    transport delay.  It moved in the same commit as the per-box d_box
+    (``BOX_TIME_DELAYS_PATH``, re-measured 2026-10-14), and a BOX without one
+    stays on the raw SOF -- see the tests just below.
     """
     t0_mono = 100.0
     _write_sidecar_with_exposure(tmp_path, "cam_00", t0_mono, 0.0, [4000, 12000])
 
-    assert lr3.EXPOSURE_CENTER_FRACTION == 0.0
+    assert lr3.EXPOSURE_CENTER_FRACTION == -0.5
     default = lr3.camera_frame_times_rel(tmp_path, t0_mono)
     raw = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=0.0)
-    assert default == raw
-    # And the exposure really was there to be applied, per frame from that
-    # frame's own exposure, so this is a decision about the default rather than
-    # a test that passes because the fixture is missing the column.
-    applied = lr3.camera_frame_times_rel(tmp_path, t0_mono, exposure_fraction=-0.5)
-    assert applied[0] - raw[0] == pytest.approx(-0.002, abs=1e-9)
-    assert applied[1] - raw[1] == pytest.approx(-0.006, abs=1e-9)
+    # per frame, from that frame's own exposure
+    assert default[0] - raw[0] == pytest.approx(-0.002, abs=1e-9)
+    assert default[1] - raw[1] == pytest.approx(-0.006, abs=1e-9)
+
+
+def _ramp_samples(box: str, *, rate_hz: float, seconds: float = 1.0) -> dict:
+    """A BOX whose gripper distance (m) equals the true sample time (s): any
+    reading says exactly which instant it was taken from."""
+    prefix = f"{box}/" if box else ""
+    n = int(rate_hz * seconds)
+    return {
+        f"{prefix}box_gripper": [
+            {"t_rel_s": i / rate_hz, "wall_s": i / rate_hz,
+             "data": {"timestamp": i, "distance_m": i / rate_hz}}
+            for i in range(n)
+        ]
+    }
+
+
+def _gripper_reading(rows, frame, box_slot=0):
+    width = len(lr3.BOX_STATE_NAMES)
+    return rows[frame]["observation.state"][box_slot * width]
+
+
+def test_a_measured_box_is_read_at_mid_exposure_plus_its_delay_an_unmeasured_one_at_sof():
+    fps, frames = 60, 30
+    sof = [0.2 + f / fps for f in range(frames)]
+    mid = [t - 0.005 for t in sof]  # E = 10 ms
+    samples = {**_ramp_samples("box1", rate_hz=1000.0), **_ramp_samples("box2", rate_hz=1000.0)}
+    rows = lr3._build_episode_rows(
+        fps=fps, episode_index=0, snapshots=[], duration_s=frames / fps, sensor_samples=samples,
+        frame_times_s=mid, sof_frame_times_s=sof, box_delays_s={"box1": 0.009}, interpolate=True,
+    )
+    for f in (0, 10, 29):
+        assert _gripper_reading(rows, f, 0) == pytest.approx(mid[f] + 0.009, abs=1e-9)  # stamped 9 ms late
+        assert _gripper_reading(rows, f, 1) == pytest.approx(sof[f], abs=1e-9)  # as before 2026-10-15
+    # without the SOF timeline the delays are not applied: frame_times_s may be SOF itself
+    plain = lr3._build_episode_rows(
+        fps=fps, episode_index=0, snapshots=[], duration_s=frames / fps, sensor_samples=samples,
+        frame_times_s=mid, box_delays_s={"box1": 0.009}, interpolate=True,
+    )
+    assert _gripper_reading(plain, 5, 0) == pytest.approx(mid[5], abs=1e-9)
+
+
+def test_a_one_box_recording_names_no_device_and_is_never_corrected():
+    fps, frames = 60, 10
+    sof = [0.2 + f / fps for f in range(frames)]
+    rows = lr3._build_episode_rows(
+        fps=fps, episode_index=0, snapshots=[], duration_s=frames / fps,
+        sensor_samples=_ramp_samples("", rate_hz=1000.0),
+        frame_times_s=[t - 0.005 for t in sof], sof_frame_times_s=sof,
+        box_delays_s={"box1819152274": 0.009}, interpolate=True,
+    )
+    assert _gripper_reading(rows, 3) == pytest.approx(sof[3], abs=1e-9)
+
+
+def test_interpolation_reads_between_samples_and_nearest_keeps_the_old_quantisation():
+    fps, frames = 60, 20
+    sof = [0.2 + f / fps for f in range(frames)]
+    samples = _ramp_samples("box1", rate_hz=120.0)  # the gripper's real rate
+    kw = dict(fps=fps, episode_index=0, snapshots=[], duration_s=frames / fps, sensor_samples=samples,
+              frame_times_s=sof, sof_frame_times_s=sof)
+    interp = lr3._build_episode_rows(**kw, interpolate=True)
+    near = lr3._build_episode_rows(**kw, interpolate=False)
+    err_i = [abs(_gripper_reading(interp, f) - sof[f]) for f in range(frames)]
+    err_n = [abs(_gripper_reading(near, f) - sof[f]) for f in range(frames)]
+    assert max(err_i) < 1e-9
+    assert 0.0 < max(err_n) <= 0.5 / 120.0 + 1e-9
+    # box.timestamps follow: the MCU time the value stands for
+    assert interp[4]["box.timestamps"][0] == pytest.approx(sof[4] * 120.0, abs=1e-6)
+
+
+def test_interpolation_does_not_bridge_a_dropout_or_an_antipodal_quaternion():
+    times = [0.0, 0.004, 0.100, 0.104]
+    samples = [{"data": {"timestamp": i, "acc_g": [t, 0.0, 0.0], "quat_wxyz": q}}
+               for i, (t, q) in enumerate(zip(times, ([1, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, -1, 0, 0]),
+                                              strict=True))]
+    fields = lr3.BOX_INTERPOLATED_FIELDS["box_imu"]
+    mid = lr3._interpolated_sample_data(times, samples, 0.002, fields)
+    assert mid["acc_g"][0] == pytest.approx(0.002) and mid["quat_wxyz"] == pytest.approx([1, 0, 0, 0])
+    gap = lr3._interpolated_sample_data(times, samples, 0.03, fields)  # 96 ms apart: nearest
+    assert gap["acc_g"][0] == 0.004
+    flip = lr3._interpolated_sample_data(times, samples, 0.101, fields)  # dot < 0: nearest quaternion
+    assert flip["quat_wxyz"] == [0, 1, 0, 0] and flip["acc_g"][0] == pytest.approx(0.101)
+
+
+def test_box_delay_table_loads_and_rejects_a_foreign_file(tmp_path):
+    shipped = lr3.load_box_time_delays()
+    assert shipped["box1819152274"] == pytest.approx(0.009, abs=0.0015)
+    other = tmp_path / "t.json"
+    other.write_text('{"schema": "something_else", "boxes": {"b": {"d_box_ms": 5}}}')
+    assert lr3.load_box_time_delays(other) == {}
+    assert lr3.load_box_time_delays(tmp_path / "missing.json") == {}
 
 
 # --------------------------------------------------------------------------

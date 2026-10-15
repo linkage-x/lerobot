@@ -724,6 +724,8 @@ def _box_camera_alignment_summary(
     exposure_fraction: float = lr3.EXPOSURE_CENTER_FRACTION,
     readout_offset_s: float = lr3.READOUT_OFFSET_S,
     exposure_spread: dict[str, Any] | None = None,
+    box_delays_s: dict[str, float] | None = None,
+    box_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Episode-level record of how BOX state was time-aligned to the cameras.
 
@@ -733,12 +735,12 @@ def _box_camera_alignment_summary(
     experiments/ts_sync_skew_20260716/.
 
     "Auditable" has to mean the whole formula, including the terms that are
-    currently zero. ``camera_frame_times_rel`` can add
-    ``exposure_fraction * exposure + readout_offset_s`` per frame, and ships
-    with ``exposure_fraction = 0.0`` -- the exposure is recorded, the shift is
-    not applied.  The sign is measured (-0.5, 2026-09-28), but the uncorrected
-    BOX transport delay was half-cancelled by the late SOF, so the camera half on
-    its own moves the BOX lookup further off; see ``EXPOSURE_CENTER_FRACTION``.
+    currently zero. ``camera_frame_times_rel`` adds
+    ``exposure_fraction * exposure + readout_offset_s`` per frame; since
+    2026-10-15 the fraction is -0.5 and each BOX with a measured transport delay
+    is read at that mid-exposure time + ``d_box``, every other BOX at the raw SOF
+    (``box_targets`` names which, per BOX); see ``EXPOSURE_CENTER_FRACTION``.
+    Until then it was 0.0: the exposure recorded, the shift not applied.
 
     "Not corrected" is exactly as much a claim about the data as "corrected by
     half an exposure", so both get written down. The terms in force are named
@@ -789,6 +791,24 @@ def _box_camera_alignment_summary(
     }
     if exposure_spread is not None:
         summary["cross_camera_exposure"] = exposure_spread
+    if box_ids is not None:
+        # Per BOX, which target it was read at: mid-exposure + d_box, or the raw
+        # SOF for a BOX with no measured delay (and every BOX of a one-BOX
+        # recording, whose sensor ids name no device).
+        delays = box_delays_s or {}
+        summary["box_targets"] = {
+            (box or "unnamed"): (
+                {"target": "mid_exposure_plus_d_box", "d_box_ms": round(delays[box] * 1000.0, 3)}
+                if box and box in delays
+                else {"target": "raw_sof", "d_box_ms": None}
+            )
+            for box in (box_ids or [""])
+        }
+        summary["box_delay_table"] = str(lr3.BOX_TIME_DELAYS_PATH.name)
+        summary["box_interpolation"] = {
+            "fields": {k: list(v) for k, v in lr3.BOX_INTERPOLATED_FIELDS.items()},
+            "max_gap_s": lr3.BOX_INTERPOLATION_MAX_GAP_S,
+        }
     return summary
 
 
@@ -2325,6 +2345,15 @@ def main(argv: list[str] | None = None) -> int:
                     ep_dir, getattr(handle, "t0_mono_s", None),
                     exposure_fraction=0.0, readout_offset_s=0.0,
                 )
+                # Each BOX is read at mid-exposure + its transport delay when the
+                # delay table has it, at the raw SOF otherwise (thor_lerobot_v3.
+                # EXPOSURE_CENTER_FRACTION); re-read per episode so a re-measured
+                # table takes effect without a restart.
+                box_delays = lr3.load_box_time_delays()
+                episode_boxes = sorted(
+                    {split[0] for sid in recorded_samples
+                     if (split := lr3._split_box_sensor_id(str(sid))) is not None}
+                )
                 annotations: dict[str, Any] = {
                     "cleanup_duration_s": cleanup_duration_s,
                     "split_emit_ms": split_emit_ms,
@@ -2332,6 +2361,8 @@ def main(argv: list[str] | None = None) -> int:
                         frame_times, cfg.cameras.fps,
                         raw_frame_times_s=raw_frame_times,
                         exposure_spread=lr3.camera_exposure_spread(ep_dir),
+                        box_delays_s=box_delays,
+                        box_ids=episode_boxes,
                     ),
                 }
                 if frame_sync_payload is not None:
@@ -2393,6 +2424,9 @@ def main(argv: list[str] | None = None) -> int:
                             t0_wall_s=t_start,
                             pts_offset_s=pts_offset,
                             frame_times_s=frame_times,
+                            sof_frame_times_s=raw_frame_times,
+                            box_delays_s=box_delays,
+                            interpolate=True,
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)

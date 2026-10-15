@@ -1,0 +1,15 @@
+{
+  "schema": "box_time_delays/v1",
+  "note": "d_box per BOX device: a sample stamped t (MCU->host regression) was taken at t - d_box. The recorder reads each BOX at camera mid-exposure + d_box; a BOX not listed here is read at the raw SOF, as before 2026-10-15. Measured with metrology.cli.estimate_camera_imu_time_offset --exposure-fraction -0.5 (gyro vs the tracked cube's angular velocity), only episodes with peak correlation >= 0.8. See thor_lerobot_v3.BOX_TIME_DELAYS_PATH.",
+  "boxes": {
+    "box1819152274": {
+      "d_box_ms": 9.0,
+      "cube": "right",
+      "measured": "2026-10-14",
+      "episodes": 7,
+      "range_ms": [7.9, 9.6],
+      "source": "Thor outputs/metrology/dbox_20261015_mid (median of the per-episode estimates)",
+      "earlier": "2026-10-13 7.4 ms, 10-09/10-11 ~8.6-9.3 ms (raw SOF + E/2): the value moves between sessions by ~1-2 ms"
+    }
+  }
+}
