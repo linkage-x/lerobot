@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>周报 · 2026-10-12 ~ 10-15 · FR3 回放与 3 mm GT</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;font-size:14px}
+  .wrap{max-width:980px;margin:0 auto;padding:24px 18px 40px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:16px;padding:18px 24px;box-shadow:var(--shadow);margin-bottom:14px}
+  .hero h1{margin:0 0 4px;font-size:22px}
+  .hero p{margin:2px 0;color:#d1d5db}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 18px;box-shadow:var(--shadow);margin-bottom:12px}
+  h2{margin:0 0 8px;font-size:17px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:8px 14px;border-radius:8px;margin:6px 0}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .small{font-size:12.5px;color:var(--muted)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f3f4f6;border-radius:5px;padding:1px 4px;font-size:.92em}
+  ul{margin:4px 0;padding-left:20px} li{margin:2px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:760px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>周报 · 2026-10-12 ~ 10-15 · FR3 回放与 3 mm GT</h1>
+  <p>目标：手持 UMI 的 TCP 标签在 FR3 基座系（fr3_base）下 p95 ≤ 3 mm，FR3 能按标签真机回放。</p>
+  <p class="small" style="color:#9ca3af">详细数据与推导：<code>docs/box_umi_laser_tracker_gt_roadmap.html</code>（v1.14–v1.24）、<code>docs/box_umi_laser_gt_3mm_stage_summary_20261012.html</code></p>
+</div>
+
+<div class="card">
+  <h2>本周一句话</h2>
+  <div class="callout">FR3 回放从「差 1 cm 多、原因不明」推进到每一项误差都有了来源和数值：
+    <ul>
+      <li>FR3 执行误差 7.8 → 2.7 mm。</li>
+      <li>两个 1 cm 级的恒定偏差都查明并消掉了：TCP 定义差，以及 world → fr3_base 的注册边。</li>
+      <li>相机外参重标，换上了生产。</li>
+    </ul>
+    在当前相机状态下，手持标签到 fr3_base 的端到端误差估计约 <b>2.0 mm rms、p95 约 3.3 mm</b>。<b>这还是估计，3 mm 尚未证实。</b></div>
+</div>
+
+<div class="card">
+  <h2>关键数字：周初 → 周末</h2>
+  <table>
+    <tr><th>量</th><th>周初</th><th>周末</th><th>怎么做到的</th></tr>
+    <tr><td>FR3 回放执行误差（激光 vs 指令）</td><td class="num">7.8 mm RMS</td><td class="num"><b>2.7 mm RMS</b>，滞后 0</td><td>Desk 负载改为实测值，指令提前 3 帧发</td></tr>
+    <tr><td>回放端到端（人手运动 vs FR3 回放，激光对激光）</td><td class="num">p95 15.7 mm</td><td class="num"><b>p95 7.74 mm</b></td><td>查明并消掉 10.3 mm 的 TCP 定义差（10-13）</td></tr>
+    <tr><td>world → fr3_base 注册边，在球位处的误差</td><td class="num">10.7–13.3 mm</td><td class="num">留一 rms <b>2.63 mm</b></td><td>同球检验：5 个球位上拟合刚体边</td></tr>
+    <tr><td>激光站位（跟踪仪 ↔ 相机 world）</td><td class="num">rms 3.43 mm，尺度 −0.65%</td><td class="num">rms <b>1.02 mm</b>，尺度 +0.045%</td><td>重标外参后重算</td></tr>
+    <tr><td>手持 pivot 残差</td><td class="num">1.4–2.7 mm</td><td class="num"><b>0.5–1.2 mm</b></td><td>重标外参后重算</td></tr>
+    <tr><td>手持标签 → fr3_base 端到端</td><td class="num">p95 6.50 mm<br/><span class="small">10-13 激光实测，含约 4.6 mm 常量</span></td><td class="num">约 <b>2.0 rms / p95 3.3 mm</b><br/><span class="small">5 个球位拆分的估计</span></td><td>新外参 + 新球边，限 10-14 下午的相机状态</td></tr>
+  </table>
+</div>
+
+<div class="grid">
+<div class="card">
+  <h2>主要成果</h2>
+  <ul>
+    <li><b>10-12 FR3 回放精度</b>：
+      <ul>
+        <li>末端负载辨识：Desk 里设的是 0.75 kg，实际 1.11 kg，5.5 mm 的下沉因此消失；</li>
+        <li>150 ms 跟随滞后拆清并消掉；</li>
+        <li>夹爪模型换成厂商 v2；</li>
+        <li>GUI 上加了一键激光回放分析。</li>
+      </ul></li>
+    <li><b>10-13 TCP 定义差</b>：URDF 的 TCP 在指尖，相机标签用的是球窝中心，两者沿工具轴差 10.3 mm。加了 <code>corenetic_socket_ee</code>，回放改为驱动它。同时修了多 BOX 录制时回放夹爪不动的问题。</li>
+    <li><b>10-14 FR3 球窝 pivot 第一次过门禁</b>：球窝位置 σ ≤ 0.35 mm，和卡尺读数差 0.03 mm。URDF 改成了实测值。</li>
+    <li><b>10-14 同球检验，换注册边</b>：
+      <ul>
+        <li>FR3 和手持 UMI 先后绕同一个固定球转，两边的球心互相对比；</li>
+        <li>查出旧边有约 1 cm 的竖直偏差；</li>
+        <li>按 5 个球位重拟刚体边，经标定页换上，旧边留在可回退的链里。</li>
+      </ul></li>
+    <li><b>10-14 ~ 10-15 外参过期，查明并重标</b>：
+      <ul>
+        <li>此前「相机 world 尺度偏小」的读数被推翻：真正的原因是 7 台相机低头了 0.18–0.60°，光心都没动；</li>
+        <li>新增按相机光心注册 world（<code>--register-by camera_centres</code>）。world id 沿用原来的，旧标签和旧边照常有效；</li>
+        <li>新外参已换上生产，10-09 起的 13 个数据集已重跟，旧结果做了备份。</li>
+      </ul></li>
+    <li><b>10-15 激光边和球边差 4 mm，原因查明</b>：两者录在两个不同的相机状态下，中间相机又跳了一次。证据是 corner BA 残差：10-09 ~ 10-13 一直平在约 1.6 px，到 10-14 下午突然降到 0.4–0.7 px。</li>
+    <li><b>工具</b>：标定页现在能做 FR3 pivot、同球检验、激光边和球边的计算与换边，以及用手持 BOX 遥控 FR3 夹爪。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>风险与下周计划</h2>
+  <div class="callout warn"><b>最大风险：相机支架不稳。</b>两周内相机跳了两次，每次 0.2–0.6°，方向都是低头。在工作区里这相当于约 4 mm，和目标同量级。</div>
+  <ul>
+    <li><b>查支架</b>：云台、球头锁紧。以后每次关键采集前后看一眼 BA 残差，超过约 1 px 就重标。</li>
+    <li><b>同日闭合测试</b>：在相机状态不变的同一天依次做：
+      <ul>
+        <li>棋盘；</li>
+        <li>激光站位；</li>
+        <li>按真实速度的手持录制（带激光）；</li>
+        <li>真机回放；</li>
+        <li>同球检验。</li>
+      </ul>
+      目标有两个：激光边和球边闭合到 ≤ 2 mm，并在 fr3_base 下拿到逐帧实测的端到端 p95，替代本周的估计。</li>
+    <li><b>数据</b>：
+      <ul>
+        <li>已导出的 fr3_base 数据集要用新边重导出，新旧数据不要混着训练；</li>
+        <li>10-05 ~ 10-08 的数据集还不清楚当时相机处于哪种状态，暂时没有重跟；</li>
+        <li>10-09 ~ 10-13 的数据用新外参只到约 1.6 px，要么用那段时间的数据自标一次外参，要么接受这个精度。</li>
+      </ul></li>
+    <li><b>3 mm 达标还欠</b>：
+      <ul>
+        <li>生产时间偏置 −5 ms 上线（要连同逐 BOX 延迟一起改）；</li>
+        <li>工作区任一点都有 ≥ 4 台相机覆盖；</li>
+        <li>left cube 实测；</li>
+        <li>pivot 过认证门槛。</li>
+      </ul></li>
+  </ul>
+</div>
+</div>
+
+<p class="small">口径：TCP 位置，3D 距离；「估计」指的是由 5 个球位的同球检验拆分出来的误差预算（球边 1.2 + 标签系统偏差 ≤ 1.4 + 单帧 0.93 mm），不是逐帧实测。只测了 right cube。</p>
+
+</div>
+</body>
+</html>
