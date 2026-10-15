@@ -48,6 +48,12 @@ reference). The 09-23 island was exported but never committed here, so episodes
 recorded 09-23 18:55 → 09-28 were stamped 08-19; they were corrected on
 2026-09-28 with `restamp_world.py` (below).
 
+On 2026-10-15 the reference took its first revision: the cameras were
+re-solved (`calib_20261014_180431`) and registered back onto
+`world_20260928_063531` by their centres, every orientation replaced (see
+[Recalibration by camera centres](#recalibration-by-camera-centres-2026-10-15)).
+The id did not change.
+
 ### The FR3 base (2026-10-09)
 
 `fr3_base` is a node with one edge, `world_20260928_063531 -> fr3_base`. It is
@@ -287,7 +293,8 @@ fr3_base, 0.35–0.72 m apart, all at nearly one height
   similarity fit gives a scale of −0.67 % with residuals of 1.1–2.3 mm. That
   agrees with the 10-13 station's −0.65 % against the laser. A rigid edge
   cannot absorb the scale: the three-ball rigid edge (`ball_edges`) still
-  leaves 1.7–3.3 mm.
+  leaves 1.7–3.3 mm. (Corrected 2026-10-14 night: the camera world's scale is right; see
+  [Scale and camera pointing](#scale-and-camera-pointing-2026-10-14-night).)
 - Still open, with only three points, one height and no held-out position:
   replace the edge with the ball edge (rigid), use a similarity edge, or fix
   the camera world's scale at its source. Next, record two more positions, one
@@ -337,11 +344,13 @@ This agrees with earlier evidence. The 10-13 laser end-to-end saw only
 absorbed about 5 mm of this edge's error. The scale (−0.44 to −0.60 %,
 depending on how `s` is taken) matches the 10-13 station's −0.65 %. The rigid
 edge's remaining 2–3 mm is about what that scale predicts at 0.3–0.6 m from
-the centroid.
+the centroid. (Corrected 2026-10-14 night: with five positions the scale's σ
+is about 0.26 %, so −0.34 % is 1.3σ, and the P0 single-tag runs show the
+camera world's scale is right; see below.)
 
 Recommendation: adopt the rigid ball edge, without scale. The base-to-world
-transform is physically rigid; the scale belongs to the camera world and is
-fixed there. Adopting it means swapping it in through the calibration page,
+transform is physically rigid; a scale would belong to the camera world (and
+there turned out to be none). Adopting it means swapping it in through the calibration page,
 re-exporting fr3_base datasets (earlier exports keep the old edge and must
 not be mixed with new ones), and refitting the edge from the same ball data
 whenever the camera world changes.
@@ -374,7 +383,8 @@ an edge that sees neither the balls nor the handheld labels. Over the replay's
 | 10-09 single tag (old) | 9.7 mm | 10.3 mm | (0.3, −4.2, +8.7) | 1.20° |
 
 - The old edge's offset against the laser is mostly vertical, as the ball
-  check found: two independent paths point at the same error.
+  check found. The two are not fully independent: the station, like the
+  ball check, locates the tool through the handheld cube.
 - The 5.9 mm left is what the laser path itself carries: the station has rms
   3.4 mm, translation σ 4.9 mm and a camera-vs-laser scale of −0.65 %
   (`register_fr3_base.py` rejects it as an edge for rms > 1.5 mm). Combined
@@ -385,6 +395,125 @@ an edge that sees neither the balls nor the handheld labels. Over the replay's
   old edge (2.1 / 3.8 mm); it is lag, not the edge.
 
 So the laser confirms the swap at the 5–6 mm level and cannot test it at
-3 mm. That needs the camera world's scale fixed at its source (the station's
-−0.65 % and the balls' −0.34 % both say the camera world is small), then the
-ball check rerun and both the edge and the station refitted.
+3 mm. ~~That needs the camera world's scale fixed at its source~~ — corrected
+below: the scale is right; four cameras turned after 09-30.
+
+### Scale and camera pointing (2026-10-14, night)
+
+The camera world's scale is right; do not rescale it. Each link was checked
+with data already on disk:
+
+- The ChArUco board is the size the extrinsics assumed.
+- FK vs laser, 12 usable replays: within one trajectory the fitted scale
+  repeats to ±0.03 %, but the 10-09 trajectory gives −0.15 to −0.23 % and the
+  10-13 one +0.18 to +0.25 %. Opposite signs over 0.1 m: local FK error of
+  about 0.2 mm, not a scale.
+- Camera rig vs FK: the P0 single-tag solve with every camera position
+  multiplied by a free k gives +0.05 / +0.12 / +0.07 % (σ 0.04 / 0.10 /
+  0.06 %) for 10-02 / 10-10 / 10-10, the tag moving over up to 0.58–0.76 m.
+  Its free tag scale is 0.992 every time, which is the tag's measured
+  158.7 mm against a nominal 160: corner detection and intrinsics do not
+  read objects small.
+- The ball check's −0.34 % has σ about 0.26 % (dropping one position moves it
+  between −0.17 and −0.74 %); the station's −0.65 % is about 2σ. Both go
+  through the handheld cube.
+
+What is consistent is an offset of about 1 cm between the two paths. The
+three P0 edges agree with each other to 3.7–4.6 mm, yet at the five balls
+each is 7–16 mm off the ball edge, and 7–11 mm off the laser edge. Both paths
+read the same extrinsics (byte for byte); dropping any one camera from a P0
+solve moves its edge by 3.4 mm at most.
+
+Per-camera pointing over time explains it. In production handheld tracking,
+each camera's own single-camera PnP of the cube was compared with the corner
+BA consensus, in that camera's frame: lateral offset over depth, in pixels
+through its focal length (1 px ≈ 0.057°, about 0.8 mm at 0.75–0.95 m). Over
+the 19 datasets tracked with the 0928 extrinsics (standard error ≈ 0.1 px),
+taking 09-28 / 09-30 as the baseline, from 10-09 on:
+
+| Camera | 09-28 / 09-30 | 10-09 … 10-14 |
+|---|---|---|
+| cam_03 (y) | +1 to −4.5 px | −8 to −15 px |
+| cam_13 (y) | −1 to −4 px | −6 to −9 px |
+| cam_14 (y) | +1.6 to +2.6 px | +6.5 to +13 px |
+| cam_07 (x) | −2 to −6 px | −6 to −14 px |
+| cam_06, 08, 09, 12 | — | unchanged |
+
+cam_03, cam_13 and cam_14 sit 0.1–0.2 m apart near the world origin. The P0
+runs show the same drift: cam_12's and cam_14's mean residuals grew from about
+2 px (10-02) to about 3.8 px (10-10), against 0.23 px when the extrinsics were
+solved. So the 0928 extrinsics went stale some time after 09-30, about
+0.3–0.6° on four cameras. That accounts for the 10-13 station's 3.43 mm rms
+(0.74 mm on 09-28) and the 1 cm between the paths.
+
+Next: recalibrate the extrinsics (a few minutes of board footage). That mints
+a new world island. (2026-10-15: it did not; the world was kept by the camera
+centres, and seven cameras had pitched down, not four — see the next section.) The handheld labels, the ball check and the station can
+then be recomputed from the recordings already made (the FR3 side does not
+change); no ball position needs recording again. Until then the ball edge
+stays live: it was fitted from handheld labels against FK, so it is
+consistent for replaying labels.
+
+Separately, a batch of datasets from 10-03 to 10-11 was tracked with the camera
+poses of the 10-02 P0 run, not the 0928 extrinsics; their world stamps need
+checking.
+
+### Recalibration by camera centres (2026-10-15)
+
+Board capture `calib_20261014_180431` (10-14 18:04, 30 s): 8 cameras, 250
+frames, BA 0.282 px, lenses by serial and identical to 0928. Against the
+reference every centre is within 0.2–0.7 mm of 09-28 (centre-spread ratio
+0.99997), while seven cameras pitched **down** about their own x axis:
+cam_03 0.60°, 08 0.48°, 09 0.42°, 13 0.41°, 07 0.30°, 06 0.26°, 12 0.18°;
+cam_14 0.08°. The mounts did not move; the cameras nodded. The pointing table
+above saw only the part that is not common to all cameras.
+
+The pose consensus has no right answer for this. With its 0.75° tolerance the
+re-pointed cameras count as "stable" and keep orientations that are ~6 mm off
+at the work volume; any tighter, the consensus is ambiguous and the export
+mints an island for a frame that did not move. So `metrology.cli.world_registration
+register` and `export_production_calibration` take `--register-by
+camera_centres`: pairwise centre distances pick the cluster (3 mm tolerance),
+the alignment weighs centres only, and the commit re-places every camera,
+recorded as one revision (`register_by`, `alignment_rms_translation_mm`,
+`alignment_max_rotation_deg`). Here: CONTINUOUS, 0.42 mm RMS, σ(W) 0.07 mm /
+0.013°. The FR3 edge and the 09-28 → 10-02 labels keep their meaning.
+
+Production (`fixed_camera_run_name` / `intrinsics_run_name` →
+`calib_20261014_180431_*`, one line in `outputs/calibration/promotions.jsonl`).
+The 13 datasets from 10-09 on that had a sidecar, and `tm_20261013_141532`,
+were re-tracked; the old sidecars and analysis runs are under
+`outputs/recal_backup_20261015/`. With the new labels:
+
+| | 0928 extrinsics | 10-14 extrinsics |
+|---|---|---|
+| handheld pivot rms, 5 balls | 1.4–2.7 mm | 0.5–1.2 mm |
+| ball edge residual / leave-one-out rms | 2.34 / 3.63 mm | 1.47 / 2.63 mm |
+| ball edge scale | −0.34 % | −0.07 % |
+| 10-13 station rms / scale / translation σ | 3.43 mm / −0.65 % / 4.9 mm | 1.02 mm / +0.045 % / 1.3 mm |
+
+The new ball edge (`ball_check_20261015T030840Z.json`) is live; the previous
+ball edge and the 10-09 single-tag edge are in its `supersedes` chain.
+
+**The cameras jump.** A laser edge composed from the new station sits 4.0–5.1 mm
+below the ball edge at all five balls (world +y, nearly position-independent).
+Not extrapolation: ball 0 is 23 mm from the laser replay's points, where FK is
+checked against the laser, and is 4.9 mm off. Not the FR3 pressing on the
+ball: contact force median 1–2 N, max 12 N. The corner BA reprojection RMSE per
+dataset dates it. With the 10-14 extrinsics: 10-09 1.70, 10-11 1.62, 10-13
+morning 1.55–1.57, 10-13 afternoon (station) 1.39, 10-14 afternoon 0.40–0.69 px.
+With the 0928 extrinsics: 09-28 / 09-30 1.0–1.4, 10-08 3.1, 10-09 → 10-13
+2.6–3.3, 10-14 3.7–4.4 px. Flat in between, so two steps: one between 09-30
+and 10-08, one between 10-13 afternoon and 10-14 14:45. The station is before
+the second, the balls and the board after it; 4 mm of common pitch is the
+difference. Consequences:
+
+- Data from 10-14 afternoon on is consistent with these extrinsics and with
+  the live edge.
+- 10-09 → 10-13 data reaches only ~1.6 px with them (better than 2.6–3.3 px
+  with 0928, still not that period's extrinsics). A self-calibration from that
+  period's cube data would fix it; otherwise accept it.
+- 10-05 → 10-08 is not yet placed on either side and was not re-tracked.
+- For 3 mm the extrinsics must hold during a capture: check the camera heads
+  and brackets, and look at the corner BA RMSE before and after each capture
+  that matters (above ~1 px, recalibrate).
