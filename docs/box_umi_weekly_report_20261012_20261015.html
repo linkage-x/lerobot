@@ -58,6 +58,7 @@
     <tr><td>激光站位（跟踪仪 ↔ 相机 world）</td><td class="num">rms 3.43 mm，尺度 −0.65%</td><td class="num">rms <b>1.02 mm</b>，尺度 +0.045%</td><td>重标外参后重算</td></tr>
     <tr><td>手持 pivot 残差</td><td class="num">1.4–2.7 mm</td><td class="num"><b>0.5–1.2 mm</b></td><td>重标外参后重算</td></tr>
     <tr><td>手持标签 → fr3_base 端到端</td><td class="num">p95 6.50 mm<br/><span class="small">10-13 激光实测，含约 4.6 mm 常量</span></td><td class="num">约 <b>2.0 rms / p95 3.3 mm</b><br/><span class="small">5 个球位拆分的估计</span></td><td>新外参 + 新球边，限 10-14 下午的相机状态</td></tr>
+    <tr><td>回放端到端（人手运动 vs FR3 回放）</td><td class="num">p95 7.74 mm<br/><span class="small">10-13 激光实测</span></td><td class="num">p95 约 <b>4–4.5 mm</b>（3.5–5.5）<br/><span class="small">估计；其中执行误差单独 p95 3.4–3.8</span></td><td>上一行的标签误差，叠加 10-13 / 10-14 两次回放实测的执行误差</td></tr>
   </table>
 </div>
 
@@ -105,6 +106,7 @@
         <li>同球检验。</li>
       </ul>
       目标有两个：激光边和球边闭合到 ≤ 2 mm，并在 fr3_base 下拿到逐帧实测的端到端 p95，替代本周的估计。</li>
+    <li><b>回放要达到 3 mm，先压执行误差</b>：现在执行误差单独就有 p95 3.4–3.8 mm，标签做到完美，回放也过不了 3 mm。按上一次实测误差修正指令（迭代学习），预计能把执行误差压到约 1 mm，届时端到端 p95 约 2.5–3 mm（粗估）。放在同日闭合测试之后做。</li>
     <li><b>数据</b>：
       <ul>
         <li>已导出的 fr3_base 数据集要用新边重导出，新旧数据不要混着训练；</li>
@@ -122,7 +124,7 @@
 </div>
 </div>
 
-<p class="small">口径：TCP 位置，3D 距离；「估计」指的是由 5 个球位的同球检验拆分出来的误差预算（球边 1.2 + 标签系统偏差 ≤ 1.4 + 单帧 0.93 mm），不是逐帧实测。只测了 right cube。</p>
+<p class="small">口径：TCP 位置，3D 距离；「估计」指的是由 5 个球位的同球检验拆分出来的误差预算（球边 1.2 + 标签系统偏差 ≤ 1.4 + 单帧 0.93 mm），不是逐帧实测。回放端到端是这个估计叠加两次慢速回放实测的执行误差（Monte Carlo），执行误差只来自一条 18 s、速度 p50 52 mm/s 的轨迹。只测了 right cube。</p>
 
 </div>
 </body>
