@@ -854,6 +854,15 @@ export type TrackingDetectionSummary = {
     medianRmsePx: number | null;
     medianEdgeSamples: number | null;
   }>;
+  /** Whether the extrinsics that labelled this recording were still right (corner-BA residual). */
+  cameraState?: {
+    verdict: "ok" | "stale" | "unknown";
+    worstMedianPx: number | null;
+    worstCube: string;
+    thresholdPx: number;
+    extrinsics: string;
+    message: string;
+  } | null;
 };
 
 export type ReplayTimeline = {

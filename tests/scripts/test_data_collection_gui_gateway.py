@@ -6276,6 +6276,16 @@ def test_tracking_detection_summary_reports_per_camera_evidence(tmp_path):
     assert result["perCamera"][0]["medianAnchors"] == pytest.approx(2.5)
     assert result["perCamera"][0]["medianRmsePx"] == pytest.approx(1.5)
     assert result["perCamera"][0]["medianEdgeSamples"] == pytest.approx(120.0)
+    assert result["cameraState"] is None  # tracked without corner BA: nothing to say
+
+    # with corner BA: the residual against the fixed extrinsics says whether the cameras had moved
+    summary = json.loads((tracking_run / "summary.json").read_text(encoding="utf-8"))
+    summary["calibration_inputs"] = {"fixed_camera_run_name": "calib_20261014_180431_extrinsics"}
+    summary["corner_ba"] = {"result_by_cube": {"right": {"num_solved": 1073, "median_reproj_rmse_px": 1.57}}}
+    (tracking_run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    camera = gateway._tracking_detection_summary(state, dataset_root, "hybrid_carrier_v1")["cameraState"]
+    assert camera["verdict"] == "stale" and camera["worstMedianPx"] == 1.57 and camera["worstCube"] == "right"
+    assert camera["extrinsics"] == "calib_20261014_180431_extrinsics" and "recalibrate" in camera["message"]
 
 
 def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(tmp_path):

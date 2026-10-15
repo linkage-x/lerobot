@@ -9248,6 +9248,32 @@ def _capture_intent_module() -> Any:
     return _CAPTURE_INTENT_MODULE
 
 
+_CAMERA_STATE_MODULE: Any = None
+
+
+def _camera_state_view(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """Whether the extrinsics that labelled this recording were still right (metrology.camera_state:
+    the tracker's corner-BA residual with the extrinsics held fixed, > 1 px = the cameras had moved)."""
+    global _CAMERA_STATE_MODULE
+    if _CAMERA_STATE_MODULE is None:
+        if str(_METROLOGY_ROOT) not in sys.path:
+            sys.path.insert(0, str(_METROLOGY_ROOT))
+        from metrology import camera_state
+
+        _CAMERA_STATE_MODULE = camera_state
+    cs = _CAMERA_STATE_MODULE.from_tracking_summary(summary)
+    if cs is None:
+        return None
+    return {
+        "verdict": cs["verdict"],
+        "worstMedianPx": cs.get("worst_median_reproj_px"),
+        "worstCube": cs.get("worst_cube") or "",
+        "thresholdPx": cs.get("threshold_px"),
+        "extrinsics": cs.get("extrinsics_run_name") or "",
+        "message": _CAMERA_STATE_MODULE.describe(cs),
+    }
+
+
 def _capture_videos(episodes: Path) -> list[tuple[str, Path]]:
     """(npz stem, video) for every video the detection step will read.
 
@@ -12840,6 +12866,7 @@ def _tracking_detection_summary(
         "detectionRatePct": round(100.0 * detected_views / total_views, 1) if total_views else 0.0,
         "perCamera": per_camera,
         "overlayAvailable": detected_views > 0,
+        "cameraState": _camera_state_view(summary),
     }
 
 
