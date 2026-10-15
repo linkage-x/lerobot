@@ -34,7 +34,7 @@
 <div class="hero">
   <h1>周报 · 2026-10-12 ~ 10-15 · FR3 回放与 3 mm GT</h1>
   <p>目标：手持 UMI 的 TCP 标签在 FR3 基座系（fr3_base）下 p95 ≤ 3 mm，FR3 能按标签真机回放。</p>
-  <p class="small" style="color:#9ca3af">详细数据与推导：<code>docs/box_umi_laser_tracker_gt_roadmap.html</code>（v1.14–v1.24）、<code>docs/box_umi_laser_gt_3mm_stage_summary_20261012.html</code></p>
+  <p class="small" style="color:#9ca3af">详细数据与推导：<code>docs/box_umi_laser_tracker_gt_roadmap.html</code>（v1.14–v1.25）、<code>docs/box_umi_laser_gt_3mm_stage_summary_20261012.html</code></p>
 </div>
 
 <div class="card">
@@ -107,6 +107,8 @@
       </ul>
       目标有两个：激光边和球边闭合到 ≤ 2 mm，并在 fr3_base 下拿到逐帧实测的端到端 p95，替代本周的估计。</li>
     <li><b>回放要达到 3 mm，先压执行误差</b>：现在执行误差单独就有 p95 3.4–3.8 mm，标签做到完美，回放也过不了 3 mm。按上一次实测误差修正指令（迭代学习），预计能把执行误差压到约 1 mm，届时端到端 p95 约 2.5–3 mm（粗估）。放在同日闭合测试之后做。</li>
+    <li><b>FR3 pivot 自动化</b>：现有规划只试过一次，没过检查，20 次成功采集都靠人手转。改为在仿真里先算出球心处 yaw / roll 的可行域（pitch 由用户给限位），选驻点使拟合协方差最小，再用软阻抗执行，自动拟合并套门禁。</li>
+    <li><b>快速运动</b>：曝光实际约 10 ms，0.5 m/s 时拖影约 5 mm，约 1 m/s 时会漏检。试锁短曝光（2–3 ms，配合补光或加增益）。</li>
     <li><b>数据</b>：
       <ul>
         <li>已导出的 fr3_base 数据集要用新边重导出，新旧数据不要混着训练；</li>
@@ -115,7 +117,7 @@
       </ul></li>
     <li><b>3 mm 达标还欠</b>：
       <ul>
-        <li>生产时间偏置 −5 ms 上线（要连同逐 BOX 延迟一起改）；</li>
+        <li>BOX 配帧对齐：相机 −E/2 和逐 BOX 延迟 d_box 一起上。10-15 晚重测了 right：d_box 7.4–8.9 ms，随 session 变，所以要每个 episode 录完自动估。现状配帧差约 2–5 ms。注意这一项不改变标签的空间精度，只影响 BOX 数据（IMU、夹爪、力）和标签之间的对齐；</li>
         <li>工作区任一点都有 ≥ 4 台相机覆盖；</li>
         <li>left cube 实测；</li>
         <li>pivot 过认证门槛。</li>
