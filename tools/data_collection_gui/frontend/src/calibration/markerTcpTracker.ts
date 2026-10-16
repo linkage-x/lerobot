@@ -61,6 +61,7 @@ export function e1pChoices(samples: MarkerTcpSample[]): E1pChoice[] {
 type RecordingLike = {
   state: string;
   laserTracker?: boolean;
+  laserTrackerState?: string;
   laserTrackerReady?: boolean;
   laserTrackerHomed?: boolean;
   laserTrackerBeamBroken?: boolean;
@@ -84,6 +85,12 @@ export function trackerLink(recording: RecordingLike): TrackerLink {
       dot: "idle",
       text:
         "这次 Connect 没开跟踪仪，样本只能做相机 pivot。要顺便测 E1p：Disconnect，打开跟踪仪开关，重新 Connect。",
+    };
+  }
+  if (recording.laserTrackerState === "error") {
+    return {
+      dot: "warning",
+      text: `跟踪仪不可用（${recording.laserTrackerDetail || "连接或采集失败"}），「录制样本」会被拒绝。请先检查采集机网络、SSH 和跟踪仪服务，恢复后退出录制器并重新 Connect。`,
     };
   }
   if (!recording.laserTrackerHomed) {

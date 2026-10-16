@@ -52,12 +52,19 @@ class FrankaResearch3Config(RobotConfig):
     # Optional absolute-pose IK orientation weight. None preserves the hardware/teleop default;
     # replay can set this explicitly to match the MuJoCo validation objective.
     ik_orientation_weight: float | None = None
+    # Keep IK inside the joint range panda_py's virtual wall allows (Panda limits, narrower
+    # than the URDF's FR3 range on j2/j3/j4/j6/j7). Off, IK can plan a j6 the arm never reaches.
+    ik_respect_controller_joint_limits: bool = True
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
     corenetic_bind_ip: str = "0.0.0.0"
     corenetic_bind_port: int = 15000
     corenetic_remote_ip: str = "192.168.2.60"
+    # BOX device_id of the gripper mounted on this arm. Leave None only with a single
+    # BOX on the network: otherwise discovery picks by IP order and can drive the
+    # handheld collection BOX instead of the arm's gripper.
+    corenetic_device_id: int | None = None
     corenetic_remote_port: int = 15000
     corenetic_sdk_dir: str = "tools/thor/box_sdk"
     corenetic_urdf_relpath: str = "share/monte_gripper.urdf"

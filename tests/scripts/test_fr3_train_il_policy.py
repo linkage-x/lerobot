@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from tools.fr3 import fr3_train_il_policy
 
@@ -87,3 +90,11 @@ def test_select_state_matrix_concatenates_full_features_and_selected_dims():
     assert state.shape == (2, 8)
     assert np.allclose(state[:, :7], np.asarray(df["observation.state.right"].tolist(), dtype=np.float32))
     assert np.allclose(state[:, 7], [61.0, 71.0])
+
+
+def test_view_refuses_sources_in_different_world_frames():
+    roots = [Path("a_export"), Path("b_export")]
+    fr3 = {"world_frame": {"world_frame_id": "fr3_base"}}
+    fr3_train_il_policy.assert_single_source_world(roots, [fr3, fr3])
+    with pytest.raises(ValueError, match="a_export=fr3_base, b_export=<unstamped>"):
+        fr3_train_il_policy.assert_single_source_world(roots, [fr3, {}])

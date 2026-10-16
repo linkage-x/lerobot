@@ -141,6 +141,42 @@ _TRACKER_GEOMETRY_PROTOCOLS = {
 }
 
 
+def _tracker_reject_reason(tracker_record: dict[str, Any], lt_cfg: Any, capture_intent: Any) -> str:
+    """Why this episode is not laser GT and is to be discarded, or "" to keep it.
+
+    Calibration captures are kept whatever the tracker says: a dwell is meant to
+    sit still, and their own checks (LT_SEGMENT, the solves) judge them.
+    """
+    if not tracker_record.get("incomplete") or not getattr(lt_cfg, "discard_incomplete", True):
+        return ""
+    purpose = str(capture_intent.get("purpose") or "") if isinstance(capture_intent, dict) else ""
+    if purpose.startswith("calibration_"):
+        return ""
+    return str(tracker_record.get("error") or "too little of the episode has a laser point")
+
+
+def _tracker_episode_summary(
+    ep_idx: int, rec: dict[str, Any], *, rejected: bool, kept: bool
+) -> dict[str, Any]:
+    """``LT_EPISODE <json>``: the laser verdict on the episode just stopped, for the GUI.
+
+    ``rejected``: discarded for its laser data; ``kept``: saved at all (an operator
+    Discard or another gate leaves it False without ``rejected``).
+    """
+    return {
+        "episode": int(ep_idx),
+        "rejected": bool(rejected),
+        "kept": bool(kept),
+        "incomplete": bool(rec.get("incomplete")),
+        "window_s": rec.get("beam_window_s", -1.0),
+        "usable": rec.get("usable_fraction", -1.0),
+        "coverage": rec.get("stream_coverage", -1.0),
+        "max_gap_ms": rec.get("max_gap_ms", -1.0),
+        "nest": rec.get("nest_fraction", -1.0),
+        "error": str(rec.get("error") or ""),
+    }
+
+
 def _emit_tracker_segment_geometry(
     tracker: Any, tracker_record: dict[str, Any], capture_intent: Any, ep_idx: int
 ) -> None:
@@ -157,9 +193,11 @@ def _emit_tracker_segment_geometry(
     if kind is None:
         return
     try:
-        window = int(round(max(0.0, float(tracker_record.get("t_end_wall_s") or 0.0)
-                               - float(tracker_record.get("t_start_wall_s") or 0.0)) * 1000.0))
-        pts = tracker.segment_points(last_rows=window)
+        now = time.time()
+        pts = tracker.segment_points(
+            ago_start_s=max(0.0, now - float(tracker_record.get("t_start_wall_s") or now)),
+            ago_end_s=max(0.0, now - float(tracker_record.get("t_end_wall_s") or now)),
+        )
         out: dict[str, Any] = {"episode": int(ep_idx), "kind": kind, "n": len(pts)}
         if kind == "dwell" and pts:
             med = tlg.median_point(pts)
@@ -408,6 +446,18 @@ def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
         _CALI_LOCK.release()
 
 
+def _stdin_was_made_nonblocking() -> bool:
+    """Restore a blocking stdin and say whether it had been made non-blocking."""
+    try:
+        fd = sys.stdin.fileno()
+        if os.get_blocking(fd):
+            return False
+        os.set_blocking(fd, True)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _read_stdin_loop(
     queue: list[StdinCommand],
     stop: threading.Event,
@@ -421,6 +471,13 @@ def _read_stdin_loop(
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
+        if line == "" and _stdin_was_made_nonblocking():
+            # Not EOF: a child that inherited this stdin (ssh does this) switched
+            # it to non-blocking, and readline() turned an empty pipe's EAGAIN into
+            # "". Treating that as "the GUI closed stdin" quit a whole session on
+            # 2026-10-13. Put the pipe back and keep listening.
+            logger.warning("stdin was switched to non-blocking by a child process; restored")
+            continue
         if line == "":  # parent closed our stdin
             queue.append(StdinCommand(kind="quit", raw=""))
             return
@@ -667,6 +724,8 @@ def _box_camera_alignment_summary(
     exposure_fraction: float = lr3.EXPOSURE_CENTER_FRACTION,
     readout_offset_s: float = lr3.READOUT_OFFSET_S,
     exposure_spread: dict[str, Any] | None = None,
+    box_delays_s: dict[str, float] | None = None,
+    box_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Episode-level record of how BOX state was time-aligned to the cameras.
 
@@ -676,12 +735,12 @@ def _box_camera_alignment_summary(
     experiments/ts_sync_skew_20260716/.
 
     "Auditable" has to mean the whole formula, including the terms that are
-    currently zero. ``camera_frame_times_rel`` can add
-    ``exposure_fraction * exposure + readout_offset_s`` per frame, and ships
-    with ``exposure_fraction = 0.0`` -- the exposure is recorded, the shift is
-    not applied.  The sign is measured (-0.5, 2026-09-28), but the uncorrected
-    BOX transport delay was half-cancelled by the late SOF, so the camera half on
-    its own moves the BOX lookup further off; see ``EXPOSURE_CENTER_FRACTION``.
+    currently zero. ``camera_frame_times_rel`` adds
+    ``exposure_fraction * exposure + readout_offset_s`` per frame; since
+    2026-10-15 the fraction is -0.5 and each BOX with a measured transport delay
+    is read at that mid-exposure time + ``d_box``, every other BOX at the raw SOF
+    (``box_targets`` names which, per BOX); see ``EXPOSURE_CENTER_FRACTION``.
+    Until then it was 0.0: the exposure recorded, the shift not applied.
 
     "Not corrected" is exactly as much a claim about the data as "corrected by
     half an exposure", so both get written down. The terms in force are named
@@ -732,6 +791,24 @@ def _box_camera_alignment_summary(
     }
     if exposure_spread is not None:
         summary["cross_camera_exposure"] = exposure_spread
+    if box_ids is not None:
+        # Per BOX, which target it was read at: mid-exposure + d_box, or the raw
+        # SOF for a BOX with no measured delay (and every BOX of a one-BOX
+        # recording, whose sensor ids name no device).
+        delays = box_delays_s or {}
+        summary["box_targets"] = {
+            (box or "unnamed"): (
+                {"target": "mid_exposure_plus_d_box", "d_box_ms": round(delays[box] * 1000.0, 3)}
+                if box and box in delays
+                else {"target": "raw_sof", "d_box_ms": None}
+            )
+            for box in (box_ids or [""])
+        }
+        summary["box_delay_table"] = str(lr3.BOX_TIME_DELAYS_PATH.name)
+        summary["box_interpolation"] = {
+            "fields": {k: list(v) for k, v in lr3.BOX_INTERPOLATED_FIELDS.items()},
+            "max_gap_s": lr3.BOX_INTERPOLATION_MAX_GAP_S,
+        }
     return summary
 
 
@@ -1306,7 +1383,8 @@ def _run_recover_argus(
     cmd = ["bash", str(script), "--sdk", str(sdk_dir), "--skip-kill"]
     runner = _runner or subprocess.run
     try:
-        r = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
+        # Not our stdin: it is the GUI's command channel (see _read_stdin_loop).
+        r = runner(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return False, f"recover_argus.sh timed out after {timeout_s:.0f}s"
     except Exception as exc:
@@ -2155,10 +2233,18 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 recorded_samples = {}
             tracker_record: dict[str, Any] = {}
+            tracker_reject = ""
             if tracker_started:
                 tracker_record = tracker.stop_recording()
-                if tracker_record.get("error"):
-                    _emit(f"WARNING: laser tracker episode {ep_idx}: {tracker_record['error']}")
+                # A rejected episode's reason is said once, below, as the reason it
+                # is discarded -- not as a WARNING, which the GUI reads as the
+                # tracker being unavailable and refuses the retake for.
+                tracker_reject = _tracker_reject_reason(tracker_record, lt_cfg, capture_intent)
+                if tracker_record.get("error") and not tracker_reject:
+                    # Not every note is a warning: "the target did not move" is
+                    # what a dwell is meant to look like.
+                    level = "WARNING: laser" if tracker_record.get("incomplete") else "Laser"
+                    _emit(f"{level} tracker episode {ep_idx}: {tracker_record['error']}")
                 elif tracker_record.get("stream_advanced"):
                     # The session total, not this episode's -- the per-episode
                     # slice is taken offline by timestamp. Worded to match.
@@ -2183,6 +2269,14 @@ def main(argv: list[str] | None = None) -> int:
                     deadline_s=0.2,
                 )
                 decision = (decision_cmd.kind if decision_cmd else "save")
+
+            # Laser GT gate: an episode recorded for its laser trajectory that has
+            # too little of one is deleted now, while the rig is still set up to
+            # record it again, instead of being found days later (2026-10-09 ep0).
+            tracker_rejected = bool(tracker_reject) and decision in ("save", "operator_save", "stream_exit")
+            if tracker_rejected:
+                _emit(f"ERROR: tracker data incomplete; episode will be discarded. {tracker_reject}")
+                decision = "laser_tracker_incomplete"
 
             frame_sync_payload: dict[str, Any] | None = None
             online_sync_payload: dict[str, Any] | None = None
@@ -2221,6 +2315,16 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     decision = online_sync_failure
 
+            if tracker_started and tracker_record:
+                # After every gate, so the GUI says what actually became of the take.
+                _emit("LT_EPISODE " + json.dumps(
+                    _tracker_episode_summary(
+                        ep_idx, tracker_record, rejected=tracker_rejected,
+                        kept=decision in ("save", "operator_save", "stream_exit"),
+                    ),
+                    separators=(",", ":"),
+                ))
+
             if decision in ("save", "operator_save", "stream_exit"):
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
@@ -2241,6 +2345,15 @@ def main(argv: list[str] | None = None) -> int:
                     ep_dir, getattr(handle, "t0_mono_s", None),
                     exposure_fraction=0.0, readout_offset_s=0.0,
                 )
+                # Each BOX is read at mid-exposure + its transport delay when the
+                # delay table has it, at the raw SOF otherwise (thor_lerobot_v3.
+                # EXPOSURE_CENTER_FRACTION); re-read per episode so a re-measured
+                # table takes effect without a restart.
+                box_delays = lr3.load_box_time_delays()
+                episode_boxes = sorted(
+                    {split[0] for sid in recorded_samples
+                     if (split := lr3._split_box_sensor_id(str(sid))) is not None}
+                )
                 annotations: dict[str, Any] = {
                     "cleanup_duration_s": cleanup_duration_s,
                     "split_emit_ms": split_emit_ms,
@@ -2248,6 +2361,8 @@ def main(argv: list[str] | None = None) -> int:
                         frame_times, cfg.cameras.fps,
                         raw_frame_times_s=raw_frame_times,
                         exposure_spread=lr3.camera_exposure_spread(ep_dir),
+                        box_delays_s=box_delays,
+                        box_ids=episode_boxes,
                     ),
                 }
                 if frame_sync_payload is not None:
@@ -2309,6 +2424,9 @@ def main(argv: list[str] | None = None) -> int:
                             t0_wall_s=t_start,
                             pts_offset_s=pts_offset,
                             frame_times_s=frame_times,
+                            sof_frame_times_s=raw_frame_times,
+                            box_delays_s=box_delays,
+                            interpolate=True,
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
@@ -2350,6 +2468,8 @@ def main(argv: list[str] | None = None) -> int:
                 # splitmuxsink just closed, then drop the (now-empty)
                 # episode directory so it doesn't show up in dataset scans.
                 pcs.discard_episode(handle)
+                if tracker_started and tracker_record:
+                    tracker.mark_discarded(decision)
                 try:
                     if ep_dir.is_dir():
                         # Remove ep_dir only if nothing else slipped in.

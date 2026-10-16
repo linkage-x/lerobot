@@ -321,6 +321,21 @@ def resize_camera_feature(feature: dict[str, Any], image_resize_shape: list[int]
     return resized
 
 
+def assert_single_source_world(src_roots: list[Path], source_infos: list[dict[str, Any]]) -> None:
+    """Refuse sources whose poses live in different world frames.
+
+    The view copies the first source's info.json, world_frame included, and deployment
+    reads the training frame from there; sources in different frames would make that
+    stamp a lie about the rest of the rows.
+    """
+    worlds = [str((info.get("world_frame") or {}).get("world_frame_id") or "") for info in source_infos]
+    if len(set(worlds)) > 1:
+        listing = ", ".join(
+            f"{root.name}={world or '<unstamped>'}" for root, world in zip(src_roots, worlds, strict=True)
+        )
+        raise ValueError(f"Source datasets are in different world frames ({listing}); export them in one frame.")
+
+
 def prepare_dataset_view(
     *,
     src_root: Path,
@@ -345,6 +360,7 @@ def prepare_dataset_view(
         raise FileExistsError(f"{dst_root} already exists. Pass --overwrite-view to replace it.")
 
     source_infos = [load_json(root / "meta/info.json") for root in src_roots]
+    assert_single_source_world(src_roots, source_infos)
     first_info = source_infos[0]
     first_features = first_info["features"]
     first_stats = (

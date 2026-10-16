@@ -130,6 +130,13 @@ normalise_pointers() {
 # Nothing is refused -- the rest of the tree still deploys.
 world_dir="tools/thor/gmsl2/world"
 extract_world="grep -hoE '\"(world_frame_id|created_utc)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' '$remote_dir/$world_dir/world_reference.json' 2>/dev/null | head -n 2"
+# The graph changes without the reference changing: the calibration page swaps
+# the world -> fr3_base edge on the target. Its newest stamp (edges, nodes and
+# the edges an edge supersedes all carry one) says which side is newer.
+extract_graph="grep -hoE '\"(created_utc|superseded_utc)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' '$remote_dir/$world_dir/world_graph.json' 2>/dev/null"
+newest_stamp() {
+  sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' | sort | tail -n 1
+}
 world_field() {
   # $1 = field name; stdin = the grep output above
   grep -E "\"$1\"" | head -n 1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
@@ -139,13 +146,15 @@ echo "==> Preparing ${remote}:${remote_dir}"
 # The trailing `true` is load-bearing: the probe ends in a bare grep, and on a
 # target that has neither file yet that grep exits 1 -- which would make ssh
 # fail, and `set -e` abort the deploy before it had done anything.
-remote_probe="$(ssh -o ConnectTimeout=5 "$remote" "mkdir -p '$remote_dir'; $extract_schema_version; echo '---POINTERS---'; $extract_pointers; echo '---WORLD---'; $extract_world; true")"
+remote_probe="$(ssh -o ConnectTimeout=5 "$remote" "mkdir -p '$remote_dir'; $extract_schema_version; echo '---POINTERS---'; $extract_pointers; echo '---WORLD---'; $extract_world; echo '---GRAPH---'; $extract_graph; true")"
 # `|| true` on both: with `set -o pipefail`, a grep that matches nothing (a
 # target with neither file yet -- a first deploy) is a failed assignment, and
 # `set -e` would turn that into an aborted deploy.
 remote_schema_version="$(printf '%s\n' "$remote_probe" | sed -n '1,/^---POINTERS---$/p' | grep -v '^---POINTERS---$' | tr -d '[:space:]' || true)"
 remote_pointers="$(printf '%s\n' "$remote_probe" | sed -n '/^---POINTERS---$/,/^---WORLD---$/p' | grep -vE '^---(POINTERS|WORLD)---$' | normalise_pointers || true)"
-remote_world="$(printf '%s\n' "$remote_probe" | sed -n '/^---WORLD---$/,$p' | grep -v '^---WORLD---$' || true)"
+remote_world="$(printf '%s\n' "$remote_probe" | sed -n '/^---WORLD---$/,/^---GRAPH---$/p' | grep -vE '^---(WORLD|GRAPH)---$' || true)"
+remote_graph_newest="$(printf '%s\n' "$remote_probe" | sed -n '/^---GRAPH---$/,$p' | grep -v '^---GRAPH---$' | newest_stamp || true)"
+local_graph_newest="$(grep -hoE '"(created_utc|superseded_utc)"[[:space:]]*:[[:space:]]*"[^"]*"' "$local_dir$world_dir/world_graph.json" 2>/dev/null | newest_stamp || true)"
 remote_world_id="$(printf '%s\n' "$remote_world" | world_field world_frame_id || true)"
 remote_world_created="$(printf '%s\n' "$remote_world" | world_field created_utc || true)"
 local_world="$(grep -hoE '"(world_frame_id|created_utc)"[[:space:]]*:[[:space:]]*"[^"]*"' "$local_dir$world_dir/world_reference.json" 2>/dev/null | head -n 2 || true)"
@@ -210,6 +219,14 @@ elif [[ -n "$remote_world_id" && "$remote_world_id" != "$local_world_id" ]]; the
   echo "    world reference: this tree's ${local_world_id} replaces ${target}'s older ${remote_world_id}"
 else
   echo "    world reference: ${local_world_id:-none}, match"
+  if [[ -n "$remote_graph_newest" && "$remote_graph_newest" > "$local_graph_newest" ]]; then
+    world_excludes=(--exclude="/$world_dir/world_graph.json")
+    echo "WARNING: ${target}'s world_graph.json is newer than this tree's, and it is being KEPT:" >&2
+    echo "           ${target} newest entry: ${remote_graph_newest}; this tree: ${local_graph_newest:-none}" >&2
+    echo "         It holds the world -> fr3_base edge every FR3 replay and export goes through;" >&2
+    echo "         overwriting it would silently put the old edge back. Bring it into this checkout:" >&2
+    echo "           scp ${remote}:${remote_dir}/${world_dir}/world_graph.json ${world_dir}/" >&2
+  fi
 fi
 
 echo "==> Incrementally replacing files on ${target}..."

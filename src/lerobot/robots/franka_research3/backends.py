@@ -148,6 +148,33 @@ def _resolve_das_databus_cls(gen_con_sdk_path: str | None):
     )
 
 
+# panda_py (0.8.1, the Thor and workstation build) compiles in the *Panda's* joint limits and
+# runs a virtual-wall controller at them, so the FR3 it drives stops there even where the FR3
+# itself goes further -- most of all j6, walled at 3.7525 rad against the FR3's 4.5169. IK that
+# plans past these drives the arm into the wall (2026-10-09: j6 pinned at 3.757, replay abort).
+PANDA_PY_JOINT_LIMITS_LOWER = (-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973)
+PANDA_PY_JOINT_LIMITS_UPPER = (2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973)
+# panda_py JOINT_POSITION_START: where move_to_start() leaves the arm.
+PANDA_PY_JOINT_POSITION_START = (0.0, -np.pi / 4.0, 0.0, -3.0 * np.pi / 4.0, 0.0, np.pi / 2.0, np.pi / 4.0)
+
+
+def _intersect_joint_limits(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    extra_lower: Any | None,
+    extra_upper: Any | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower = np.asarray(lower, dtype=np.float64).copy()
+    upper = np.asarray(upper, dtype=np.float64).copy()
+    if extra_lower is not None:
+        lower = np.maximum(lower, np.asarray(extra_lower, dtype=np.float64).reshape(lower.shape))
+    if extra_upper is not None:
+        upper = np.minimum(upper, np.asarray(extra_upper, dtype=np.float64).reshape(upper.shape))
+    if np.any(lower > upper):
+        raise ValueError(f"Joint limits do not overlap: lower={lower.tolist()} upper={upper.tolist()}")
+    return lower, upper
+
+
 @dataclass
 class PandaPyArmDriver:
     robot_ip: str
@@ -179,6 +206,7 @@ class PandaPyArmDriver:
         # timestamp them by when they were read *from the arm* rather than by when it happened
         # to pick them up -- those differ by up to one poll period.
         self._cached_joint_positions_at_s: float | None = None
+        self._cached_external_torques: np.ndarray | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -283,10 +311,18 @@ class PandaPyArmDriver:
         # the moment it arrived, which is the part this process can actually observe.
         sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
+        tau_ext = getattr(state, "tau_ext_hat_filtered", None)
+        external_torques = None if tau_ext is None else np.asarray(tau_ext, dtype=np.float64)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
             self._cached_joint_positions_at_s = sampled_at_s
+            self._cached_external_torques = external_torques
         return joint_positions
+
+    def get_external_joint_torques(self) -> np.ndarray | None:
+        """libfranka's filtered external-torque estimate from the latest cached state, if any."""
+        with self._state_lock:
+            return None if self._cached_external_torques is None else self._cached_external_torques.copy()
 
     def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Cached joint positions together with when they were read from the arm.
@@ -345,6 +381,7 @@ class PandaPyArmDriver:
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None
+            self._cached_external_torques = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
@@ -528,6 +565,7 @@ class CoreneticGripperHardwareDriver:
     bind_port: int = 15000
     remote_ip: str = "192.168.2.60"
     remote_port: int = 15000
+    device_id: int | None = None
     sdk_dir: str = "tools/thor/box_sdk"
     urdf_relpath: str = "share/monte_gripper.urdf"
     max_width_m: float = 0.09
@@ -556,6 +594,8 @@ class CoreneticGripperHardwareDriver:
         self._last_command_distance_m: float | None = None
         self._last_command_time_s: float | None = None
         self._pending_command_distance_m: float | None = None
+        self._last_device_timestamp_us: int | None = None
+        self.reboot_count = 0
 
     def connect(self) -> None:
         cfg = self._box_client_module.BoxClientConfig(
@@ -574,11 +614,12 @@ class CoreneticGripperHardwareDriver:
             stale_threshold_s=self.stale_threshold_s,
             expected_devices=["box_gripper"],
         )
-        client = self._box_client_module.BoxClient(cfg)
+        client = self._box_client_module.BoxClient(cfg, device_id=self.device_id)
         if not client.start():
+            pinned = "" if self.device_id is None else f" Pinned device_id={self.device_id}: is that BOX on and answering?"
             raise ConnectionError(
                 "Could not start Corenetic gripper client. Check BOX SDK installation, "
-                f"host bind {self.bind_ip}:{self.bind_port}, and BOX MCU {self.remote_ip}:{self.remote_port}."
+                f"host bind {self.bind_ip}:{self.bind_port}, and BOX MCU {self.remote_ip}:{self.remote_port}.{pinned}"
             )
         self._client = client
 
@@ -627,6 +668,7 @@ class CoreneticGripperHardwareDriver:
         self._last_command_distance_m = None
         self._last_command_time_s = None
         self._pending_command_distance_m = None
+        self._last_device_timestamp_us = None
 
     def _latest_distance_m(self) -> float | None:
         if self._client is None:
@@ -635,6 +677,7 @@ class CoreneticGripperHardwareDriver:
         gripper = sample.get("sensors", {}).get("box_gripper")
         if not isinstance(gripper, dict):
             return None
+        self._recover_if_rebooted(gripper)
         distance_m = gripper.get("distance_m")
         if distance_m is None:
             return None
@@ -642,6 +685,43 @@ class CoreneticGripperHardwareDriver:
         if not np.isfinite(distance_m):
             return None
         return max(0.0, distance_m)
+
+    def _recover_if_rebooted(self, gripper: dict) -> None:
+        """Re-take control after the BOX restarts; it comes back in collection mode.
+
+        A restarted BOX (10-10: power lost twice as the wrist swung to the replay start)
+        boots in mode 0, where it logs clamp commands but does not drive the jaw, so the
+        replay ran with the gripper parked open. Its sample clock (us since boot) running
+        backwards is the tell.
+        """
+        try:
+            timestamp_us = int(gripper.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return
+        if timestamp_us <= 0:
+            return
+        previous = self._last_device_timestamp_us
+        self._last_device_timestamp_us = timestamp_us
+        if previous is None or timestamp_us >= previous - 1_000_000:
+            return
+        self.reboot_count += 1
+        logger.warning(
+            "Corenetic BOX restarted (device clock %.1fs -> %.1fs, restart #%d): it lost control mode; "
+            "re-entering mode 1. Check the BOX power/cable on the wrist.",
+            previous / 1e6,
+            timestamp_us / 1e6,
+            self.reboot_count,
+        )
+        mode_rc = self._client.set_mode(1)
+        if mode_rc != 0:
+            raise RuntimeError(f"Corenetic BOX restarted and set_mode(1) failed with rc={mode_rc}.")
+        target_m = self._last_command_distance_m
+        if target_m is None:
+            target_m = max(0.0, float(gripper.get("distance_m") or 0.0))
+        rc = self._client.set_clamp_pos(target_m)
+        if rc != 0:
+            raise RuntimeError(f"Corenetic BOX restarted and re-sending {target_m:.4f}m failed with rc={rc}.")
+        self._last_command_time_s = time.perf_counter()
 
     def get_position(self) -> float:
         if self._client is None:
@@ -654,6 +734,7 @@ class CoreneticGripperHardwareDriver:
     def set_position(self, normalized_position: float) -> None:
         if self._client is None:
             raise RuntimeError("Corenetic gripper backend is not connected.")
+        self._latest_distance_m()  # notices a BOX restart even while the target holds still
         target_distance_m = float(np.clip(normalized_position, 0.0, 1.0) * self.max_width_m)
         if (
             self._last_command_distance_m is not None
@@ -1445,6 +1526,9 @@ class HirolLMKinematicsDriver:
     joint_names: list[str]
     tolerance: float = 1e-6
     max_iterations: int = 200
+    # Narrower than the URDF where the arm's controller walls it off (PANDA_PY_JOINT_LIMITS_*).
+    position_limits_lower: Any | None = None
+    position_limits_upper: Any | None = None
 
     def __post_init__(self):
         try:
@@ -1467,14 +1551,22 @@ class HirolLMKinematicsDriver:
         if not self._model.existFrame(self.target_frame_name):
             raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
         self._frame_id = self._model.getFrameId(self.target_frame_name)
-        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
-        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+        self._lower_limits, self._upper_limits = _intersect_joint_limits(
+            self._model.lowerPositionLimit,
+            self._model.upperPositionLimit,
+            self.position_limits_lower,
+            self.position_limits_upper,
+        )
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         self._pin.forwardKinematics(self._model, self._data, q)
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._lower_limits.copy(), self._upper_limits.copy()
 
     def inverse_kinematics(
         self,
@@ -1541,6 +1633,9 @@ class HirolGaussianNewtonKinematicsDriver:
     tolerance: float = 1e-6
     max_iterations: int = 200
     damping: float = 1e-3
+    # Narrower than the URDF where the arm's controller walls it off (PANDA_PY_JOINT_LIMITS_*).
+    position_limits_lower: Any | None = None
+    position_limits_upper: Any | None = None
 
     def __post_init__(self):
         try:
@@ -1564,14 +1659,22 @@ class HirolGaussianNewtonKinematicsDriver:
         if not self._model.existFrame(self.target_frame_name):
             raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
         self._frame_id = self._model.getFrameId(self.target_frame_name)
-        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
-        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+        self._lower_limits, self._upper_limits = _intersect_joint_limits(
+            self._model.lowerPositionLimit,
+            self._model.upperPositionLimit,
+            self.position_limits_lower,
+            self.position_limits_upper,
+        )
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         self._pin.forwardKinematics(self._model, self._data, q)
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._lower_limits.copy(), self._upper_limits.copy()
 
     def inverse_kinematics(
         self,

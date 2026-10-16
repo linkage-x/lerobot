@@ -139,7 +139,18 @@ export function TrackingDetectionBlock({
         <Metric label="Detected views" value={`${summary.detectedViews}/${summary.totalViews}`} />
         <Metric label="Detection rate" value={`${summary.detectionRatePct.toFixed(1)}%`} />
         <Metric label="Replay evidence" value={summary.overlayAvailable ? "available" : "none"} />
+        {summary.cameraState ? (
+          <Metric
+            label="Camera state"
+            value={
+              summary.cameraState.worstMedianPx == null
+                ? summary.cameraState.verdict
+                : `${summary.cameraState.verdict} · ${summary.cameraState.worstMedianPx.toFixed(2)} px`
+            }
+          />
+        ) : null}
       </div>
+      {summary.cameraState?.verdict === "stale" ? <p className="panel-note error">{summary.cameraState.message}</p> : null}
       <div className="tracking-camera-table">
         <div className="tracking-camera-row tracking-camera-header">
           <span>Camera</span>
