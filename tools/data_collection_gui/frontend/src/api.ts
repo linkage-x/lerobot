@@ -26,10 +26,15 @@ import type {
   RigCheckResponse,
   CrossCameraResponse,
   WorldFrameResponse,
+  Fr3BaseEdgeResponse,
+  Fr3MoveToStartResponse,
+  Fr3PivotResponse,
+  GripperTeleopResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
   MujocoPreview,
+  LaserReplayReport,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -454,17 +459,53 @@ export class DataCollectionGuiApi {
     cubeMode: RealCubeMode,
     robotIp: string,
     endEffectorMode: RealEndEffectorMode,
-    overrideMujocoFailure = false
+    overrideMujocoFailure = false,
+    recordTracker = false,
+    commandLeadFrames = 0
   ): Promise<GuiSnapshot> {
     const params = new URLSearchParams({
       cube: cubeMode,
       robot_ip: robotIp,
       end_effector: endEffectorMode,
-      override_mujoco_failure: String(overrideMujocoFailure)
+      override_mujoco_failure: String(overrideMujocoFailure),
+      record_tracker: String(recordTracker),
+      lead_frames: String(commandLeadFrames)
     });
     const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
     if (remote) return remote;
     throw new Error("Gateway unavailable; real-robot replay cannot start.");
+  }
+
+  async executeRealCubeReplay(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/replay/execute-real");
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; the trajectory cannot be executed.");
+  }
+
+  async analyzeRealReplayLaser(cubeMode: RealCubeMode): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/analyze-laser?cube=${encodeURIComponent(cubeMode)}`);
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; the laser analysis runs on the gateway.");
+  }
+
+  // null when there is no report yet; availableRuns then says whether there is anything to analyse.
+  async fetchLaserReplayReport(
+    datasetPath: string,
+    episode: number,
+    cubeMode: RealCubeMode
+  ): Promise<{ report: LaserReplayReport | null; availableRuns: string[] }> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/laser-analysis?path=${encodeURIComponent(datasetPath)}&episode=${episode}&cube=${encodeURIComponent(cubeMode)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      const body = await response.json();
+      if (!response.ok) return { report: null, availableRuns: body.availableRuns ?? [] };
+      const report = body as LaserReplayReport;
+      return { report, availableRuns: report.availableRuns ?? [] };
+    } catch {
+      return { report: null, availableRuns: [] };
+    }
   }
 
   async fetchMujocoPreview(
@@ -1288,6 +1329,188 @@ export class DataCollectionGuiApi {
         return null;
       }
       return (await response.json()) as TrackerAlignment;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchFr3BaseEdge(): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-base-edge`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as Fr3BaseEdgeResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Solving writes a candidate report and nothing else; applying swaps the live
+  // edge. Both answer with the whole panel payload, failure included.
+  async solveFr3BaseEdge(run: string): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/solve", { run });
+  }
+
+  async applyFr3BaseEdge(report: string): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/apply", { report });
+  }
+
+  async solveFr3BaseLaserEdge(station: string, replays: string[]): Promise<Fr3BaseEdgeResponse | null> {
+    return this.fr3BaseEdgePost("/api/calibration/fr3-base-edge/solve-laser", { station, replays });
+  }
+
+  private async fr3BaseEdgePost(path: string, body: Record<string, string | string[]>): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<Fr3BaseEdgeResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as Fr3BaseEdgeResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-pivot`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as Fr3PivotResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Collecting puts the real FR3 in teaching mode: the panel confirms first.
+  async startFr3Pivot(robotIp: string, durationS: number, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/collect", { robotIp, durationS, note });
+  }
+
+  // Read only: FK of the seated socket becomes the centre to plan about.
+  async captureFr3PivotCentre(robotIp: string, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/capture-centre", { robotIp, note });
+  }
+
+  // Survey + dwells + route + checks: a minute or two.
+  async planFr3Pivot(centre: string, biasMm: number[], anchorFromFit = false): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm, anchorFromFit });
+  }
+
+  // Moves the real FR3 along a plan that passed: the panel confirms first.
+  async executeFr3Pivot(plan: string, robotIp: string, note: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/execute", { plan, robotIp, note });
+  }
+
+  // A virtual ball joint on the real FR3: the socket is held on the ball, the operator turns it.
+  async guideFr3Pivot(
+    centre: string,
+    biasMm: number[],
+    durationS: number,
+    robotIp: string,
+    note: string,
+    anchorFromFit = false
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/guide", { centre, biasMm, durationS, robotIp, note, anchorFromFit });
+  }
+
+  // Ends a guided pivot early and keeps it (Stop discards).
+  async finishFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/finish", {});
+  }
+
+  async stopFr3Pivot(): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/stop", {});
+  }
+
+  async refitFr3Pivot(run: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/fit", { run });
+  }
+
+  // One socket centre from several runs; perRunCentre when the ball may have moved between them.
+  async fitJointFr3Pivot(runs: string[], perRunCentre: boolean): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/fit-joint", { runs, perRunCentre });
+  }
+
+  async runFr3BallCheck(
+    positions: { pivot: string; dataset: string; episode: number }[]
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/check", { positions });
+  }
+
+  /** Write a check's ball edge as a candidate report; swapping it in is the FR3-base edge panel's. */
+  async saveFr3BallEdge(check: string): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/ball-edge", { check });
+  }
+
+  async fetchGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as GripperTeleopResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The FR3's gripper follows the handheld BOX; exit leaves it holding (no release).
+  async startGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start");
+  }
+
+  async stopGripperTeleop(): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop");
+  }
+
+  private async gripperTeleopPost(path: string): Promise<GripperTeleopResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      });
+      const payload = (await response.json()) as Partial<GripperTeleopResponse>;
+      if (!response.ok && !payload.job) return null;
+      return payload as GripperTeleopResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fr3PivotPost(path: string, body: Record<string, unknown>): Promise<Fr3PivotResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<Fr3PivotResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as Fr3PivotResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  // Homes the real FR3; the request lasts as long as the move. null: gateway unreachable.
+  async moveFr3ToStart(robotIp: string): Promise<Fr3MoveToStartResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/move-to-start`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ robotIp })
+      });
+      const payload = (await response.json()) as Partial<Fr3MoveToStartResponse>;
+      return {
+        ok: response.ok && Boolean(payload.ok),
+        error: String(payload.error ?? (response.ok ? "" : `HTTP ${response.status}`)),
+        robotIp: String(payload.robotIp ?? robotIp),
+        output: String(payload.output ?? "")
+      };
     } catch {
       return null;
     }

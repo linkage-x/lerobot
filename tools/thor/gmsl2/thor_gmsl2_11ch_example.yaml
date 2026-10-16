@@ -183,6 +183,10 @@ box_collection:
   sdk_setup_script: setup_env.sh
   urdf_relpath: share/monte_gripper.urdf
   startup_mode: 0          # 0 = collection (trigger-controlled), 1 = control
+  # Recorded but never set_mode()d: the FR3's gripper BOX (robot.corenetic_device_id in
+  # replay_cube_pose_in_robot_base.thor.yaml). startup_mode 0 would hand its jaw back to
+  # its own trigger and drop whatever the arm holds (the pivot insert) on every Connect.
+  keep_mode_device_ids: [596523097]
   poll_interval_s: 0.001   # 1 kHz idle/Connect poll; exposes 480 Hz six_d_force in rate reports
   record_poll_interval_s: 0.0005  # 2 kHz recording wait; absorbs Python sleep jitter for 480 Hz six_d_force
   stale_threshold_s: 1.0   # consider a sensor offline after this gap
@@ -246,7 +250,7 @@ auto_recover:
 # (~/.ssh/id_ed25519_lt -> C:\ProgramData\ssh\administrators_authorized_keys).
 laser_tracker:
   enabled: false
-  win_host: 18713@192.168.147.72
+  win_host: 18713@192.168.1.227
   ssh_key: ~/.ssh/id_ed25519_lt
   # Where the staged python tools and the sessions live ON THE CAPTURE PC.
   # Note this is D:, not the C:\lt that deploy_windows.sh defaults to.
@@ -283,6 +287,14 @@ laser_tracker:
   home_on_connect: true
   smr_size: '1.5'         # '1.5' | '0.5' | '7/8'  -- REQUIRED, never guessed
   adm_offset_mm: 0.0      # only for a solid SMR
+  # Episode gate, checked at every Stop on the capture PC's own clock: below this
+  # fraction of the episode with a ranged point off the home nest, the recorder
+  # discards the episode (its files are deleted) and the GUI says why. 2026-10-09
+  # ep0 had 13% (RadianCAL-Pro starving the stream) and was saved. Calibration
+  # captures are never discarded by it.
+  min_usable_fraction: 0.8
+  discard_incomplete: true
+  nest_max_mm: 300        # the home nest is ~158 mm from the head
   # Copy the sealed session back under <dataset>/laser_tracker/ and verify it
   # against its manifest before the recorder exits.
   land: true

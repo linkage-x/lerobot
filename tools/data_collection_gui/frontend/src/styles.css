@@ -1930,6 +1930,18 @@ button.danger {
   gap: 12px;
 }
 
+.real-robot-tracker-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.real-robot-tracker-toggle input {
+  margin-top: 2px;
+}
+
 .real-robot-ip-field {
   display: grid;
   gap: 5px;
@@ -1946,9 +1958,21 @@ button.danger {
   width: 100%;
 }
 
+.real-robot-ip-field select {
+  width: 100%;
+}
+
 .real-robot-run {
   min-height: 42px;
   width: 100%;
+}
+
+.real-robot-home {
+  width: 100%;
+}
+
+.real-robot-home-error {
+  color: #b42318;
 }
 
 .real-replay-log-block {
@@ -4371,6 +4395,34 @@ button.danger {
   padding: 8px 10px;
 }
 
+/* The last episode's laser verdict. A discarded take is red: its files are
+   already gone and the operator records it again now. */
+.laser-episode-banner {
+  border-left: 3px solid #d79b00;
+  border-radius: 4px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+}
+
+.laser-episode-error {
+  background: #fde8e7;
+  border-left-color: #b42318;
+  color: #7a1a12;
+  font-weight: 600;
+}
+
+.laser-episode-warning {
+  background: #fff4d6;
+  color: #6b4e00;
+}
+
+.laser-episode-ok {
+  background: transparent;
+  border-left-color: #2e7d32;
+  color: #2e5e31;
+  font-size: 13px;
+}
+
 /* Homed is its own line: "not homed" and "beam off the SMR" need different
    actions, and W2 looked green while never having homed. */
 .tracker-home-state {
@@ -4395,4 +4447,83 @@ button.danger {
 
 .tracker-capture-scroll tbody tr {
   cursor: pointer;
+}
+
+/* Laser vs FR3 replay error (Episode Replay, Thor) */
+.laser-analysis-controls {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.laser-analysis-controls label {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.laser-analysis-table tbody tr {
+  cursor: pointer;
+}
+
+.laser-analysis-table tbody tr.selected td {
+  background: rgba(15, 118, 110, 0.12);
+}
+
+.laser-analysis-error {
+  color: #b91c1c;
+  text-align: left !important;
+}
+
+.laser-analysis-detail {
+  margin-top: 8px;
+}
+
+.laser-error-chart {
+  margin: 0;
+}
+
+.laser-error-chart svg {
+  display: block;
+  height: auto;
+  max-width: 100%;
+  width: 100%;
+}
+
+.laser-error-grid {
+  stroke: rgba(148, 163, 184, 0.35);
+  stroke-width: 1;
+}
+
+.laser-error-loss {
+  stroke: #b91c1c;
+  stroke-dasharray: 4 3;
+  stroke-width: 1.2;
+}
+
+.laser-error-axis {
+  fill: currentColor;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.laser-error-chart figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 14px;
+  opacity: 0.8;
+}
+
+.laser-error-chart figcaption i {
+  display: inline-block;
+  height: 3px;
+  margin-right: 4px;
+  vertical-align: middle;
+  width: 14px;
+}
+
+.laser-analysis-panel .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
 }

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>FR3 末端负载辨识实验报告 · 2026-10-12</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.7}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 20px 60px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:20px;padding:28px 32px;box-shadow:var(--shadow);margin-bottom:20px}
+  .hero h1{margin:0 0 8px;font-size:26px}
+  .hero p{margin:4px 0;color:#d1d5db}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:20px}
+  h3{margin:16px 0 6px;font-size:16px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:12px 16px;border-radius:10px;margin:10px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  table{width:100%;border-collapse:collapse;font-size:14px;margin:8px 0}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  tr.hl td{background:#fffbeb}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .done{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  .eq{font-family:"Cambria Math","STIX Two Math",serif;background:#f9fafb;border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0;font-size:15px}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}
+  code{background:#f3f4f6;border-radius:6px;padding:1px 5px}
+  pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:12px 14px;overflow-x:auto}
+  ul,ol{margin:6px 0;padding-left:22px} li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>FR3 末端负载辨识实验报告</h1>
+  <p>用机械臂自己的关节力矩传感器给末端负载「称重」（质量 + 质心），产出 Franka Desk 末端配置</p>
+  <p class="small" style="color:#9ca3af">2026-10-12 · FR3 192.168.11.102 · Corenetic v2.0 夹爪 + 相机 + SMR 适配件 · 数据 <code>outputs/fr3_payload/</code></p>
+</div>
+
+<div class="card">
+  <h2>结论</h2>
+  <table>
+    <tr><th>Desk 配置名</th><th>质量</th><th>质心（法兰系，mm）</th><th>闭环 Fz（预测）</th><th>重复性</th></tr>
+    <tr class="hl"><td>Corenetic v2.0 BOX + cam</td><td class="num">0.9755 kg</td><td class="num">(12.8, −19.0, 56.9)</td><td class="num">−0.17 N（−0.18）</td><td class="num">973.7 / 977.4 / 976.2 g</td></tr>
+    <tr class="hl"><td>Corenetic v2.0 BOX + cam + SMR</td><td class="num">1.1108 kg</td><td class="num">(16.8, −22.2, 60.9)</td><td class="num">−0.11 N（−0.15）</td><td class="num">1110.8 / 1116.2 g</td></tr>
+  </table>
+  <p class="small">TCP 沿用厂商配置：z 0.17199 m、yaw −45°；惯量取 URDF 子树合成值，再按实测质量缩放。文件 <code>~/文档/fr3+corenetic+cam(+smr)_20261012b.json</code>（不带 b 的两份已作废），表格同步在 <code>gripper_w_v2_franka_description/README.md</code>。</p>
+  <div class="callout ok"><b>Desk 原来设的是 0.7496 kg，比实际轻了 0.36 kg。</b>
+    <ul>
+      <li>按回放刚度推算，少补偿的重力会让 TCP 偏 (−1.0, −1.4, −5.7) mm；10-10 实测的固定偏置是 (−1.1, −1.0 ~ −1.5, −5.8) mm。</li>
+      <li>换成新配置重采后，偏置变成 (0.0, 0.2, 0.7) mm，j3 外力矩均值从 1.92 降到 −0.14 Nm。</li>
+      <li>激光测得的回放误差从 7.8 降到 5.3 mm RMS。</li>
+    </ul></div>
+  <div class="callout warn"><b>这不是称重。</b>Desk 要的是「配合 libfranka 空臂模型、不扣传感器零偏时最能解释力矩」的等效负载，这才是机器人自己用来补偿重力的量。物理质量只能确定到约 ±60 g。几种拟合口径之间最多差约 110 g，见第 4 节。所以 URDF / MJCF 里的质量保持 CAD 值（0.867 / 1.007 kg），不用这里的结果。</div>
+</div>
+
+<div class="card">
+  <h2>1 · 为什么要辨识</h2>
+  <ul>
+    <li>夹爪和 SMR 适配件（Part 1）装上后拆不下来，没法上秤；CAD 质量也漏了线缆、紧固件和胶。</li>
+    <li>回放控制器是软关节阻抗，刚度 [300, 300, 300, 300, 120, 80, 30]，只有 panda_py 默认值的一半。重力补偿少了多少力矩，除以刚度就是多大的关节偏差，最后表现为 TCP 的固定下沉。</li>
+    <li>SMR 有时装、有时不装（相差 140 g），所以要两份 Desk 配置，按现场状态切换。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>2 · 原理</h2>
+  <h3>2.1 把手臂当秤</h3>
+  <p>静止时，各关节力矩传感器的读数是三部分之和：</p>
+  <div class="eq">τ<sub>J</sub>(q) = g<sub>arm</sub>(q) + Y(q)·θ + b，　θ = [m, m·c<sub>x</sub>, m·c<sub>y</sub>, m·c<sub>z</sub>]</div>
+  <ul>
+    <li><b>g<sub>arm</sub></b>：libfranka 的空臂重力模型，即负载设为 0 时的 <code>Model.gravity</code>。</li>
+    <li><b>Y(q)θ</b>：撑住负载所需的关节力矩，等于 −Jᵀw。w 是负载重力在法兰原点的力旋量：F = m·g，M = (R·m·c) × g，c 是法兰系 <code>fr3_link8</code> 下的质心。它对 θ 是线性的。</li>
+    <li><b>b</b>：每个关节一个恒定的传感器零偏。</li>
+  </ul>
+  <p>多个静止姿态叠起来，就是关于 θ 和 b 的线性最小二乘。只用静态数据，所以看不到惯量；g<sub>arm</sub> 本身的误差会原样进入结果。</p>
+
+  <h3>2.2 Desk 要的是哪一个拟合</h3>
+  <p>机器人用 Desk 里的负载做重力补偿，并据此估计外力 <code>O_F_ext_hat_K</code>。我们用同样的公式逐姿态复现了机器人报的外力，力和力矩都对到 ≤ 3 mN / mNm：</p>
+  <div class="eq">F<sub>ext</sub> = pinv(J<sub>0</sub>ᵀ) · (τ<sub>J</sub> − g<sub>arm</sub> − g<sub>load</sub>)，力矩取在<b>基座原点</b>，<b>不扣任何关节零偏</b></div>
+  <p>既然机器人自己不扣 b，Desk 要的就应该是<b>不带 b 的拟合</b>。带 b 的拟合会把传感器零偏吸收掉，算出来的负载在物理上也许更「对」，导入 Desk 后反而补偿错了（第 4 节有实测）。</p>
+
+  <h3>2.3 一个只能当传感器自检的差分</h3>
+  <p>同一组姿态各跑一次带 SMR、一次不带，两次相减就是 SMR 本身，b 和空臂模型误差都会抵消。所以它能检查传感器的线性和噪声，<b>证明不了绝对精度</b>。</p>
+</div>
+
+<div class="card">
+  <h2>3 · 姿态设计（先在 MuJoCo 里用假数据验证）</h2>
+  <ul>
+    <li><b>32 个静止姿态</b>：
+      <ul>
+        <li>20 个在 panda_py 的起始构型上：j5/j6 把工具最多倾 0.8 rad，j7 转 4 个角度。这样能把 m·c<sub>z</sub> 和水平质心分开。</li>
+        <li>另外 12 个换了两种上臂伸展量（法兰伸出 465 mm / 230 mm，起始构型是 307 mm），每种 6 个。</li>
+      </ul></li>
+    <li><b>为什么要换伸展量</b>：上臂不动时，负载在 j2/j4 上产生的力矩在每个姿态里几乎一样，质量和这两个关节的零偏分不开。0.02 Nm 噪声下质量的 1σ 是 27 g；换伸展量后约 5 g。</li>
+    <li><b>代价</b>：上臂一动，空臂模型的误差就会悄悄混进结果。仿真里连杆质量偏 1 %，负载就偏 −55 g，残差看起来却仍像噪声。所以每次同时做两种拟合：一种全局一套零偏，一种每个伸展量各一套零偏；两者不一致时，就不信那个更「精确」的全局拟合。</li>
+    <li><b>防碰撞</b>：j6 往前臂方向折 0.8 rad 时，SMR / 相机适配件离 link5 只有 10 mm，所以这个方向只折 0.5 rad。用网格表面采点来查间隙，因为 MuJoCo 自带的 <code>mj_geomDistance</code> 对网格用凸包，读数会在 0 和 56 mm 之间乱跳。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>4 · 实验过程（2026-10-12，真机）</h2>
+  <table>
+    <tr><th>#</th><th>做法</th><th>看到什么</th><th>结论</th></tr>
+    <tr><td>1</td><td>单向到达，读 panda_py <code>get_state()</code></td><td>没启动控制器时，每帧读到的都是同一个缓存值</td><td><span class="badge bad">作废</span>改为 <code>read_once()</code>，拿 1 kHz 的新帧；Thor 偶发的通信 reflex 自动恢复后重试</td></tr>
+    <tr><td>2</td><td>单向到达，32 姿态，不带 SMR / 带 SMR</td><td>残差 0.05–0.23 Nm，正负号跟着来时的方向走（j5 ±0.25、j7 ±0.15 Nm）。绝对质量随拟合口径在 0.71–1.06 kg 之间变；SMR 差分 122 g，实际 140 g</td><td><span class="badge bad">不可用</span>关节静摩擦有迟滞，它在 j2/j4 上和质量混在一起</td></tr>
+    <tr><td>3</td><td><b>双向到达</b>：每个姿态分别从 q − 0.03 rad 和 q + 0.03 rad 到达，两次取平均。仿真里加迟滞：双向能还原真值，单向复现了真机的症状</td><td>残差降到 0.01–0.04 Nm。两次运行的迟滞一致：j2 0.11、j5 0.23、j7 0.11 Nm（j1 两次是 0.15 / 0.09，不太稳）。SMR 差分 141 g（实际 140 g）</td><td><span class="badge done">数据有效</span></td></tr>
+    <tr><td>4</td><td>先交付「全局、带零偏」的拟合：不带 SMR 1.0558 kg</td><td>导入 Desk 再跑一次：Fz 从 +2.0 N 变成 −0.94 N，说明设重了</td><td><span class="badge bad">推翻</span>找出 2.2 的原因：机器人不扣零偏</td></tr>
+    <tr><td>5</td><td>改交付<b>不带零偏</b>的拟合（同一 SMR 状态的多次运行合并）</td><td>不带 SMR：Fz −0.17 N（预测 −0.18），|F| 最大 1.22 N（预测 1.29）。带 SMR：Fz −0.11 N（预测 −0.15）</td><td><span class="badge done">闭环通过，定稿</span></td></tr>
+  </table>
+
+  <h3>不带 SMR 时，同一份数据在不同口径下的质量</h3>
+  <table>
+    <tr><th>口径</th><th>质量</th><th>说明</th></tr>
+    <tr><td>全局一套零偏</td><td class="num">1.054–1.057 kg</td><td>σ 6 g，但会吸收空臂模型误差</td></tr>
+    <tr><td>每个伸展量一套零偏</td><td class="num">0.931–0.944 kg</td><td>σ 20 g；和全局拟合差 126 g，判为不一致</td></tr>
+    <tr class="hl"><td><b>不带零偏（Desk 用）</b></td><td class="num"><b>0.976 kg</b></td><td>就是机器人自己的补偿口径，闭环验证过</td></tr>
+    <tr><td>CAD</td><td class="num">0.867 kg</td><td>漏了线缆、紧固件等</td></tr>
+  </table>
+  <p class="small">口径之间的分歧（约 110 g）就是这台空臂模型和零偏处理下，「物理质量」的真实不确定度。Desk 的取值不受它影响，因为它和机器人用的是同一个口径。</p>
+
+  <h3>还剩的外力</h3>
+  <p>新配置下，每次运行都还剩 Fx ≈ −0.76 N、Fy ≈ −0.36 N 的恒定外力。它来自传感器零偏，改负载消不掉，这就是这台机器外力估计的底噪。带 / 不带 SMR 连续各跑一次，差分是 140.1 g，质心偏移 3.6 mm，和 SMR 的实际质量、位置相符。</p>
+</div>
+
+<div class="card">
+  <h2>5 · 局限与使用注意</h2>
+  <ul>
+    <li><b>现场按 SMR 状态切换 Desk 配置。</b>SMR 坐在夹爪上时用 1.1108 kg，平时用 0.9755 kg。选错是 135 g 的差，按回放刚度会造成毫米级的固定偏差。</li>
+    <li><b>夹爪、线缆或适配件有改动，就要重新辨识。</b>一次 collect 约 13 分钟（10-12 两次相隔 13.5 分钟，含换 SMR），带 / 不带 SMR 各一次，要有人在场。</li>
+    <li><b>惯量没有辨识</b>，取的是 URDF 合成值。静态方法看不到惯量；对慢速回放影响很小。</li>
+    <li><b>SMR 差分只是传感器自检</b>，不能拿来证明绝对质量。</li>
+    <li><b>关节静摩擦迟滞</b>（0.1–0.25 Nm）在单向到达时和负载信号一样大。以后任何「静止读力矩」的测量都要双向到达取平均。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>6 · 代码与复现</h2>
+  <ul>
+    <li><b>数学部分（纯 numpy，带单测）</b>：<code>src/lerobot/robots/franka_research3/payload_identification.py</code>，包括回归矩阵、拟合、差分、<code>franka_external_wrench</code> 和姿态序列。</li>
+    <li><b>工具</b>：<code>tools/fr3/fr3_payload_identification_runtime.py</code>，子命令有 check-poses、sim、collect、fit、diff、desk-config。</li>
+    <li><b>测试</b>：<code>tests/robots/test_fr3_payload_identification.py</code>。</li>
+    <li><b>数据</b>：<code>outputs/fr3_payload/</code>（本机和 Thor 都有）。双向有效运行是 <code>20261012_121453_fr3_smr_out</code> 和 <code>20261012_122819_fr3_smr_in</code>；闭环验证是 <code>151012</code>、<code>153157</code>、<code>154421</code>。</li>
+  </ul>
+<pre># Thor，有人在场，先 move_to_start（collect 会检查 j1–j4）
+PYTHONPATH=src ~/Code/infer/.venv-fr3/bin/python tools/fr3/fr3_payload_identification_runtime.py collect            # 带 SMR
+PYTHONPATH=src ~/Code/infer/.venv-fr3/bin/python tools/fr3/fr3_payload_identification_runtime.py collect --smr-out  # 不带 SMR
+# 本机：生成 Desk 配置（不带零偏的拟合，同状态多次运行合并）
+python tools/fr3/fr3_payload_identification_runtime.py desk-config outputs/fr3_payload/*_smr_in.json outputs/fr3_payload/*_smr_out.json \
+  --template ~/文档/fr3+corenetic.json --name-smr "Corenetic v2.0 BOX + cam + SMR" --name-no-smr "Corenetic v2.0 BOX + cam" --out-dir ~/文档
+# 导入 Desk 后再 collect 一次：desk-config 会把机器人报的外力和复现值并排打印，Fz 应在 0 附近 ±0.2 N 以内</pre>
+  <p class="small">注意：desk-config 会拒绝单向采集的数据。命令里的通配符会把作废的单向运行也匹配进来，实际使用时要列出具体文件。</p>
+</div>
+
+</div>
+</body>
+</html>

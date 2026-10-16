@@ -147,3 +147,44 @@ def test_a_root_is_scanned_once_and_then_the_session_counts(tmp_path):
     assert tr._next_episode_index_for_root(root, cache) == 1
     cache[root] = 2
     assert tr._next_episode_index_for_root(root, cache) == 2
+
+
+_NONBLOCKING_CHILD = r"""
+import subprocess, sys, threading, time
+from tools.thor.gmsl2 import thor_record as tr
+queue = []
+stop = threading.Event()
+reader = threading.Thread(target=tr._read_stdin_loop, args=(queue, stop), daemon=True)
+reader.start()
+# What ssh does to a stdin it inherits: switch the shared pipe to non-blocking.
+subprocess.run([sys.executable, "-c", "import os, time; os.set_blocking(0, False); time.sleep(1.5)"])
+reader.join(timeout=5)
+print(",".join(c.kind for c in queue), flush=True)
+"""
+
+
+def test_a_child_making_stdin_nonblocking_does_not_end_the_session():
+    """2026-10-13: a Discard pressed during the episode-stop ssh quit the whole recorder.
+
+    ssh switched the inherited stdin to non-blocking; the reader's next readline()
+    on the empty pipe came back "" and was taken for the GUI closing stdin.
+    """
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _NONBLOCKING_CHILD], cwd=repo, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, text=True,
+    )
+    time.sleep(0.8)  # the child holds the pipe non-blocking now
+    proc.stdin.write("n\n")
+    proc.stdin.flush()
+    time.sleep(1.5)  # past the child's exit
+    proc.stdin.write("\n")
+    proc.stdin.flush()
+    proc.stdin.close()  # a real EOF still ends the session
+    proc.wait(timeout=15)
+    assert proc.stdout.read().strip() == "discard,start,quit"

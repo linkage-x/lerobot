@@ -46,8 +46,10 @@ interpreter that must not import numpy or cv2 to write a json field.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import math
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,16 @@ from typing import Any
 WORLD_SUBDIR = Path("tools") / "thor" / "gmsl2" / "world"
 WORLD_REFERENCE_FILE = "world_reference.json"
 WORLD_REGISTRATION_FILE = "world_registration.json"
+WORLD_GRAPH_FILE = "world_graph.json"
+
+#: The arm's base frame as a node of ``world_graph.json``.  It is the frame the
+#: FR3 commands in, so a dataset stamped with it replays on the arm without any
+#: transform being estimated at deploy time; tools/fr3/fr3_act_infer_real_runtime.py
+#: keys on this id.
+FR3_BASE_WORLD_ID = "fr3_base"
+#: ``export_v3 --target-world`` value meaning: FR3_BASE_WORLD_ID when a recorded
+#: edge reaches it from the episodes' world, else the world they were recorded in.
+TARGET_WORLD_AUTO = "auto"
 
 #: Value of ``world_frame["status"]``.
 STATUS_OK = "ok"
@@ -254,6 +266,199 @@ def assert_single_world(entries: Iterable[tuple[str, Mapping[str, Any] | None]])
             "provenance and cannot be proven to be in any of them."
         )
     return next(iter(stamped))
+
+
+# ------------------------------------------------- cross-world registration ---
+#
+# ``world_graph.json`` edges are written by ``metrology.world_frame.WorldGraph``
+# (``T_to_from`` takes coordinates in ``from_world_frame_id`` into
+# ``to_world_frame_id``).  The lookup is repeated here, stdlib-only, because the
+# exporter runs in Thor's system interpreter; the two must agree on direction,
+# and ``test_thor_world_provenance`` pins this one against hand-built chains.
+
+
+def read_world_graph(repo_root: Path | str) -> dict[str, Any]:
+    """The tracked world graph, or an empty one when the file is absent."""
+    payload, status = _read_json(Path(repo_root) / WORLD_SUBDIR / WORLD_GRAPH_FILE)
+    if payload is None:
+        if status == STATUS_MISSING:
+            return {"version": 1, "nodes": [], "edges": []}
+        raise RuntimeError(f"{WORLD_SUBDIR / WORLD_GRAPH_FILE} is {status}; restore it from git")
+    return payload
+
+
+def _matmul4(A: list[list[float]], B: list[list[float]]) -> list[list[float]]:
+    return [[sum(A[r][k] * B[k][c] for k in range(4)) for c in range(4)] for r in range(4)]
+
+
+def _rigid_inverse(T: list[list[float]]) -> list[list[float]]:
+    Rt = [[T[c][r] for c in range(3)] for r in range(3)]
+    t = [-sum(Rt[r][k] * T[k][3] for k in range(3)) for r in range(3)]
+    return [Rt[0] + [t[0]], Rt[1] + [t[1]], Rt[2] + [t[2]], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _checked_rigid(value: Any, label: str) -> list[list[float]]:
+    try:
+        T = [[float(v) for v in row] for row in value]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}: not a 4x4 matrix") from exc
+    if len(T) != 4 or any(len(row) != 4 for row in T) or not all(math.isfinite(v) for row in T for v in row):
+        raise ValueError(f"{label}: not a finite 4x4 matrix")
+    RtR = [[sum(T[k][r] * T[k][c] for k in range(3)) for c in range(3)] for r in range(3)]
+    if any(abs(RtR[r][c] - (1.0 if r == c else 0.0)) > 1e-6 for r in range(3) for c in range(3)) or T[3] != [0.0, 0.0, 0.0, 1.0]:
+        raise ValueError(f"{label}: not a rigid transform")
+    return T
+
+
+def world_transform(
+    graph: Mapping[str, Any], from_world: str, to_world: str
+) -> tuple[list[list[float]], list[dict[str, Any]]] | None:
+    """``(T_to_from, edges_used)``, or ``None`` when the worlds are not connected.
+
+    Breadth-first over the edges in both directions, as
+    ``metrology.world_frame.WorldGraph.transform``.  ``None`` is the honest
+    answer for two islands; a caller must refuse rather than substitute an
+    identity.  ``edges_used`` is each traversed edge's provenance (endpoints,
+    method, created_utc, and whether it was walked backwards), for the record a
+    re-expressed dataset carries about itself.
+    """
+    identity = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+    if from_world == to_world:
+        return identity, []
+    edges = list(graph.get("edges") or [])
+    frontier: list[tuple[str, list[list[float]], list[dict[str, Any]]]] = [(from_world, identity, [])]
+    seen = {from_world}
+    while frontier:
+        world, accumulated, path = frontier.pop(0)
+        for index, edge in enumerate(edges):
+            src = str(edge.get("from_world_frame_id") or "")
+            dst = str(edge.get("to_world_frame_id") or "")
+            T = _checked_rigid(edge.get("T_to_from"), f"world_graph edge {index} ({src} -> {dst})")
+            for a, b, step, reversed_ in ((src, dst, T, False), (dst, src, _rigid_inverse(T), True)):
+                if a != world or b in seen:
+                    continue
+                combined = _matmul4(step, accumulated)
+                hop = {
+                    "from_world_frame_id": src,
+                    "to_world_frame_id": dst,
+                    "traversed_reversed": reversed_,
+                    "method": str(edge.get("method") or ""),
+                    "created_utc": str(edge.get("created_utc") or ""),
+                }
+                if b == to_world:
+                    return combined, [*path, hop]
+                seen.add(b)
+                frontier.append((b, combined, [*path, hop]))
+    return None
+
+
+def _quat_from_matrix(Rm: list[list[float]]) -> tuple[float, float, float, float]:
+    """(qx, qy, qz, qw) of a rotation matrix (Shepperd)."""
+    trace = Rm[0][0] + Rm[1][1] + Rm[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return ((Rm[2][1] - Rm[1][2]) / s, (Rm[0][2] - Rm[2][0]) / s, (Rm[1][0] - Rm[0][1]) / s, 0.25 * s)
+    if Rm[0][0] > Rm[1][1] and Rm[0][0] > Rm[2][2]:
+        s = math.sqrt(1.0 + Rm[0][0] - Rm[1][1] - Rm[2][2]) * 2.0
+        return (0.25 * s, (Rm[0][1] + Rm[1][0]) / s, (Rm[0][2] + Rm[2][0]) / s, (Rm[2][1] - Rm[1][2]) / s)
+    if Rm[1][1] > Rm[2][2]:
+        s = math.sqrt(1.0 + Rm[1][1] - Rm[0][0] - Rm[2][2]) * 2.0
+        return ((Rm[0][1] + Rm[1][0]) / s, 0.25 * s, (Rm[1][2] + Rm[2][1]) / s, (Rm[0][2] - Rm[2][0]) / s)
+    s = math.sqrt(1.0 + Rm[2][2] - Rm[0][0] - Rm[1][1]) * 2.0
+    return ((Rm[0][2] + Rm[2][0]) / s, (Rm[1][2] + Rm[2][1]) / s, 0.25 * s, (Rm[1][0] - Rm[0][1]) / s)
+
+
+def transform_pose7(T: list[list[float]], pose7: list[float]) -> list[float]:
+    """Left-multiply an ``(x, y, z, qx, qy, qz, qw)`` pose by the rigid ``T``.
+
+    A non-finite pose (a frame the tracker did not see) stays exactly as it was,
+    so a gap remains a gap rather than becoming ``T``'s translation.  The output
+    quaternion is ``q(T) * q`` with no sign canonicalisation: ``q(T)`` is one
+    constant, so a column that was sign-continuous stays sign-continuous.
+    """
+    if len(pose7) != 7 or not all(math.isfinite(v) for v in pose7):
+        return list(pose7)
+    x, y, z, qx, qy, qz, qw = (float(v) for v in pose7)
+    t = [T[r][0] * x + T[r][1] * y + T[r][2] * z + T[r][3] for r in range(3)]
+    ax, ay, az, aw = _quat_from_matrix([row[:3] for row in T[:3]])
+    out = (
+        aw * qx + ax * qw + ay * qz - az * qy,
+        aw * qy - ax * qz + ay * qw + az * qx,
+        aw * qz + ax * qy - ay * qx + az * qw,
+        aw * qw - ax * qx - ay * qy - az * qz,
+    )
+    norm = math.sqrt(sum(v * v for v in out)) or 1.0
+    return [*t, *(v / norm for v in out)]
+
+
+def reexpressed_world_frame(
+    source_block: Mapping[str, Any],
+    target_world_frame_id: str,
+    T_target_source: list[list[float]],
+    edges_used: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The ``world_frame`` block of a dataset whose poses were moved to another world.
+
+    The source block is kept whole under ``reexpressed_from``: the recording was
+    made in that world, and this dataset's numbers are a function of it *and*
+    of the edges named here.  Replacing an edge later changes what the same
+    recording should export to, which is why the edges are recorded and not just
+    the product.
+    """
+    return {
+        "world_frame_id": target_world_frame_id,
+        "status": STATUS_OK,
+        "reexpressed_from": dict(source_block),
+        "T_target_source": T_target_source,
+        "edges": edges_used,
+    }
+
+
+_POSE7_SUFFIXES = ("_x_m", "_y_m", "_z_m", "_qx", "_qy", "_qz", "_qw")
+
+
+def reexpress_pose_csv(
+    src: Path | str,
+    dst: Path | str,
+    transform_by_episode: Mapping[int, list[list[float]]],
+) -> int:
+    """Copy a tracking ``state_action`` CSV with every pose7 column group moved by its episode's T.
+
+    A group is any ``<prefix>_x_m ... <prefix>_qw`` set (``state``, ``action``, ...).
+    Non-finite poses stay gaps. A row whose ``episode_index`` has no transform raises:
+    leaving it as recorded would mix two worlds in one file. Returns the row count.
+    """
+    with Path(src).open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    prefixes = [
+        name[: -len("_x_m")]
+        for name in fieldnames
+        if name.endswith("_x_m") and all(name[: -len("_x_m")] + sfx in fieldnames for sfx in _POSE7_SUFFIXES)
+    ]
+    for row in rows:
+        episode = int(float(row.get("episode_index") or 0))
+        if episode not in transform_by_episode:
+            raise RuntimeError(f"{src}: episode {episode} has no transform")
+        T = transform_by_episode[episode]
+        for prefix in prefixes:
+            keys = [prefix + sfx for sfx in _POSE7_SUFFIXES]
+            try:
+                pose = [float(row[k]) for k in keys]
+            except (TypeError, ValueError):
+                continue
+            if all(math.isfinite(v) for v in pose):
+                row.update({k: repr(v) for k, v in zip(keys, transform_pose7(T, pose), strict=True)})
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(dst)
+    return len(rows)
 
 
 def inspect_dataset(dataset_root: Path | str) -> tuple[int, list[str]]:

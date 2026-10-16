@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackerMountSession } from "../types";
+import { laserEpisodeBanner } from "../laserEpisodeVerdict";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
@@ -208,13 +209,16 @@ export function RecordingPanel({
   // Ready also means homed: a locked beam without a Home measures every distance
   // against a stale reference, so "not homed" is named on its own.
   const trackerBlocking = Boolean(status.laserTracker) && !status.laserTrackerReady;
+  const trackerUnavailable = Boolean(status.laserTracker) && status.laserTrackerState === "error";
   const trackerNotHomed = Boolean(status.laserTracker) && !status.laserTrackerHomed;
   const trackerBeamBroken = Boolean(status.laserTracker) && Boolean(status.laserTrackerBeamBroken);
-  const trackerBlockReason = trackerNotHomed
-    ? `激光跟踪仪还没 Home 成功，不能开录：把 SMR 放进 home 窝等待自动 Home（${status.laserTrackerDetail || "等待中"}）`
-    : trackerBeamBroken
-      ? "激光跟踪仪断过光，当前距离不是绝对的，不能开录：请把 SMR 放回 home 窝，会自动重新 Home"
-      : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
+  const trackerBlockReason = trackerUnavailable
+    ? `激光跟踪仪不可用，不能开录：${status.laserTrackerDetail || "连接或采集失败"}。请先检查采集机网络、SSH 和跟踪仪服务，恢复后退出录制器并重新 Connect。`
+    : trackerNotHomed
+      ? `激光跟踪仪还没 Home 成功，不能开录：把 SMR 放进 home 窝等待自动 Home（${status.laserTrackerDetail || "等待中"}）`
+      : trackerBeamBroken
+        ? "激光跟踪仪断过光，当前距离不是绝对的，不能开录：请把 SMR 放回 home 窝，会自动重新 Home"
+        : status.laserTrackerDetail || "激光跟踪仪尚未锁定 SMR";
   // The gateway refuses StartEpisode while a mount capture owns the recorder,
   // because a task episode there does two invisible kinds of damage: it clears
   // the calibration redirect and lands a stationary rig in the training set, and
@@ -226,6 +230,7 @@ export function RecordingPanel({
     : "";
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
+  const laserBanner = status.laserTracker ? laserEpisodeBanner(status.laserTrackerEpisode) : null;
   const isGmsl = config.rigType === "gmsl2";
   const panelTitle = backendPicker ? "FR3 Record" : isGmsl ? "GMSL2 Record" : "Handheld Record";
 
@@ -253,14 +258,16 @@ export function RecordingPanel({
       {status.laserTracker && isConnected && (
         <p
           className="tracker-home-state"
-          data-homed={status.laserTrackerHomed && !status.laserTrackerBeamBroken ? "yes" : "no"}
+          data-homed={!trackerUnavailable && status.laserTrackerHomed && !status.laserTrackerBeamBroken ? "yes" : "no"}
         >
           跟踪仪 Home：
-          {!status.laserTrackerHomed
-            ? "❌ 未 Home"
-            : status.laserTrackerBeamBroken
-              ? "⚠️ 断过光，请把 SMR 放回窝里重新 Home（放回后自动 Home）"
-              : "✅ 已 Home（有绝对距离）"}
+          {trackerUnavailable
+            ? "⚠️ 跟踪仪不可用，无法确认 Home 状态"
+            : !status.laserTrackerHomed
+              ? "❌ 未 Home"
+              : status.laserTrackerBeamBroken
+                ? "⚠️ 断过光，请把 SMR 放回窝里重新 Home（放回后自动 Home）"
+                : "✅ 已 Home（有绝对距离）"}
         </p>
       )}
       {trackerBlocking && (
@@ -297,6 +304,12 @@ export function RecordingPanel({
         <Metric label="PID" value={status.pid ?? "none"} />
       </div>
       <p className="panel-note">{status.message}</p>
+      {laserBanner && (
+        <p className={`laser-episode-banner laser-episode-${laserBanner.tone}`}>
+          {laserBanner.tone === "error" ? "⛔ " : laserBanner.tone === "warning" ? "⚠️ " : "✅ "}
+          {laserBanner.text}
+        </p>
+      )}
       <SyncAuditPanel status={status} />
       {logLines && logLines.length > 0
         ? <RecorderLogStream lines={logLines} />
@@ -511,4 +524,3 @@ export function LiveRecordPage({
     </div>
   );
 }
-

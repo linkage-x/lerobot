@@ -10,6 +10,15 @@ from pathlib import Path
 from tools.thor.gmsl2 import laser_tracker_session as lts
 
 
+def _stats(**over):
+    """An episode window as ``episode_window_stats`` returns it: healthy unless told otherwise."""
+    base = {"rows": 20000, "valid": 1.0, "tracking": 1.0, "dist_min_mm": 400.0, "dist_max_mm": 1800.0,
+            "window_s": 20.0, "coverage": 1.0, "max_gap_ms": 2.0, "nest_fraction": 0.0,
+            "usable_fraction": 1.0}
+    base.update(over)
+    return base
+
+
 def _cfg(**over):
     base = {"enabled": True, "win_host": "user@10.0.0.1", "ssh_key": "/nonexistent/key"}
     base.update(over)
@@ -96,11 +105,12 @@ def test_a_stalled_stream_is_caught_at_episode_stop() -> None:
     session._connected = True
     session._rows_mark = 5000
     session._count_rows = lambda _name: 5000  # type: ignore[method-assign]
-    session.beam_stats = lambda **_k: {"rows": 20000, "valid": 1.0, "tracking": 1.0, "dist_min_mm": 400.0, "dist_max_mm": 1800.0}  # type: ignore[method-assign]
+    session.episode_window_stats = lambda **_k: _stats()  # type: ignore[method-assign]
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
     assert rec["stream_advanced"] is False
+    assert rec["incomplete"] is True
     assert "did not advance" in rec["error"]
 
     # And an advancing, locked-on stream is quiet.
@@ -109,6 +119,7 @@ def test_a_stalled_stream_is_caught_at_episode_stop() -> None:
     rec = session.stop_recording()
     assert rec["stream_advanced"] is True
     assert rec["error"] == ""
+    assert rec["incomplete"] is False
     assert rec["rt_rows_total_at_stop"] == 9000
 
 
@@ -123,7 +134,9 @@ def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
     session._connected = True
     session._rows_mark = 0
     session._count_rows = lambda _name: 81343  # type: ignore[method-assign]
-    session.beam_stats = lambda **_k: {"rows": 20000, "valid": 0.0, "tracking": 0.0, "dist_min_mm": -1.0, "dist_max_mm": -1.0}  # type: ignore[method-assign]
+    session.episode_window_stats = lambda **_k: _stats(  # type: ignore[method-assign]
+        valid=0.0, tracking=0.0, dist_min_mm=-1.0, dist_max_mm=-1.0, usable_fraction=0.0
+    )
     # op_mode 2 throughout, which is what the first real session recorded.
     session.gimbal_mode = "Position"
 
@@ -135,6 +148,7 @@ def test_a_full_rate_stream_of_nothing_is_not_success() -> None:
     # Naming the mode is the point: "Position" says an SMR in the beam would
     # still not be acquired, which "0% tracking" alone does not.
     assert "Position" in rec["error"]
+    assert rec["incomplete"] is True
 
 
 def test_tracking_without_measuring_is_caught() -> None:
@@ -150,10 +164,10 @@ def test_tracking_without_measuring_is_caught() -> None:
     session._connected = True
     session._rows_mark = 0
     session._count_rows = lambda _name: 35322  # type: ignore[method-assign]
-    session.beam_stats = lambda **_k: {  # type: ignore[method-assign]
-        "rows": 20000, "valid": 0.465, "tracking": 0.861,
-        "dist_min_mm": 157.7, "dist_max_mm": 158.9,
-    }
+    session.episode_window_stats = lambda **_k: _stats(  # type: ignore[method-assign]
+        valid=0.465, tracking=0.861, dist_min_mm=157.7, dist_max_mm=158.9,
+        nest_fraction=0.465, usable_fraction=0.0,
+    )
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
@@ -164,45 +178,146 @@ def test_tracking_without_measuring_is_caught() -> None:
 
 
 def test_a_motionless_target_is_not_a_trajectory() -> None:
-    """Valid, dense, and all at one distance: the SMR never left the nest."""
+    """Valid, dense, and all at one distance: the target never moved."""
     session = lts.LaserTrackerSession(_cfg())
     session._connected = True
     session._rows_mark = 0
     session._count_rows = lambda _name: 20000  # type: ignore[method-assign]
-    session.beam_stats = lambda **_k: {  # type: ignore[method-assign]
-        "rows": 20000, "valid": 1.0, "tracking": 1.0,
-        "dist_min_mm": 157.7, "dist_max_mm": 158.2,
-    }
+    session.episode_window_stats = lambda **_k: _stats(  # type: ignore[method-assign]
+        dist_min_mm=1157.7, dist_max_mm=1158.2
+    )
 
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
     assert "did not move" in rec["error"]
     # A dwell recording looks exactly like this and is correct, so the wording
-    # has to say which one it is rather than call it a fault.
+    # has to say which one it is rather than call it a fault -- and it is kept.
     assert "dwell" in rec["error"]
-    assert rec["beam_dist_min_mm"] == 157.7
+    assert rec["incomplete"] is False
+    assert rec["beam_dist_min_mm"] == 1157.7
 
 
 def test_episode_stats_cover_the_episode_not_the_tail() -> None:
-    """The window asked for is the episode's duration in milliseconds."""
+    """The window asked for is the episode's own span, in seconds before now."""
     session = lts.LaserTrackerSession(_cfg())
     session._connected = True
     session._rows_mark = 0
     session._count_rows = lambda _name: 35322  # type: ignore[method-assign]
     seen = {}
 
-    def _stats(*, last_rows=0, **_k):
-        seen["last_rows"] = last_rows
-        return {"rows": last_rows, "valid": 1.0, "tracking": 1.0,
-                "dist_min_mm": 400.0, "dist_max_mm": 1800.0}
+    def _window(*, ago_start_s, ago_end_s):
+        seen["span"] = ago_start_s - ago_end_s
+        seen["ago_end_s"] = ago_end_s
+        return _stats()
 
-    session.beam_stats = _stats  # type: ignore[method-assign]
+    session.episode_window_stats = _window  # type: ignore[method-assign]
     session.start_recording(0, 1.0)
     rec = session.stop_recording()
-    # 20 s of episode is 20000 rows at the stream's hard 1 kHz.
-    expected = int(round((rec["t_end_wall_s"] - rec["t_start_wall_s"]) * 1000.0))
-    assert seen["last_rows"] == expected
-    assert rec["beam_window_rows"] == expected
+    assert abs(seen["span"] - (rec["t_end_wall_s"] - rec["t_start_wall_s"])) < 0.01
+    assert 0.0 <= seen["ago_end_s"] < 1.0
+
+
+_RT_HEADER = (
+    "seq,ctrl_ts_ms,qpc,az_deg,el_deg,dist_mm,x_mm,y_mm,z_mm,valid,tracking,warmed,op_mode,"
+    "body_temp_c,level_x,level_y,global_ts,lock,ranged\n"
+)
+_QPC_HZ = 10_000_000
+
+
+def _rt_csv(path: Path, ms: list[int], dist_mm) -> Path:
+    """An rt.csv with one row per controller ms in ``ms``; QPC ticks follow the controller."""
+    lines = [_RT_HEADER]
+    for i, t in enumerate(ms):
+        d = dist_mm(t) if callable(dist_mm) else dist_mm
+        lines.append(f"{i},{t},{t * (_QPC_HZ // 1000)},0,0,{d},1,2,3,1,1,1,1,30,0,0,0,1,1\n")
+    path.write_text("".join(lines), encoding="ascii")
+    return path
+
+
+def _run_stats_code(rt: Path, *, now_ms: int, ago_start_s: float, ago_end_s: float) -> dict:
+    """``_EPISODE_STATS_CODE`` as the capture PC runs it, with the PC's clock handed in."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", lts._EPISODE_STATS_CODE, str(rt), str(10**8),
+         f"{ago_start_s}", f"{ago_end_s}", "300", str(_QPC_HZ), str(now_ms * (_QPC_HZ // 1000))],
+        capture_output=True, text=True, check=True,
+    )
+    return lts.parse_episode_stats(out.stdout)
+
+
+def test_a_stream_in_gaps_is_measured_over_the_episode_not_the_last_rows(tmp_path) -> None:
+    """2026-10-09 ep0, as a test: RadianCAL-Pro left ~1 s of stream in every 5.
+
+    The last (duration in ms) rows reached a minute back, read 100% valid, and the
+    episode was saved. On the PC's clock the 15 s episode holds 3 s of stream.
+    """
+    before = list(range(0, 60_000))  # a minute of full-rate stream before StartEpisode
+    episode = [t for t in range(60_000, 75_000) if (t - 60_000) % 5000 < 1000]
+    rt = _rt_csv(tmp_path / "s.rt.csv", before + episode, 1200.0)
+    st = _run_stats_code(rt, now_ms=76_000, ago_start_s=16.0, ago_end_s=1.0)
+    assert abs(st["window_s"] - 15.0) < 1e-6
+    assert abs(st["coverage"] - 0.2) < 0.01
+    assert st["max_gap_ms"] >= 3999
+    error, incomplete = lts.episode_verdict(st, min_usable_fraction=0.8, nest_max_mm=300.0)
+    assert incomplete is True
+    assert "RadianCAL" in error
+    assert "covered 20%" in error
+
+
+def test_the_home_nest_counts_as_no_measurement_of_the_target(tmp_path) -> None:
+    """Ready means homed and locked -- on the nest, ~158 mm from the head."""
+    rt = _rt_csv(tmp_path / "s.rt.csv", list(range(0, 20_000)), lambda t: 157.7 if t < 8000 else 1200.0 + t / 100)
+    st = _run_stats_code(rt, now_ms=20_000, ago_start_s=20.0, ago_end_s=0.0)
+    assert abs(st["nest_fraction"] - 0.4) < 0.01
+    assert abs(st["usable_fraction"] - 0.6) < 0.01
+    error, incomplete = lts.episode_verdict(st, min_usable_fraction=0.8, nest_max_mm=300.0)
+    assert incomplete is True
+    assert "home nest" in error
+
+    # A healthy episode passes quietly.
+    st = _run_stats_code(rt, now_ms=20_000, ago_start_s=10.0, ago_end_s=0.0)
+    assert st["usable_fraction"] > 0.99
+    assert lts.episode_verdict(st, min_usable_fraction=0.8, nest_max_mm=300.0) == ("", False)
+
+
+def test_an_unreadable_window_is_reported_but_never_thrown_away() -> None:
+    st = lts.parse_episode_stats("ssh: connect to host 10.0.0.1 port 22: timed out")
+    assert st["rows"] == -1
+    error, incomplete = lts.episode_verdict(st, min_usable_fraction=0.8, nest_max_mm=300.0)
+    assert incomplete is False
+    assert "could not read" in error
+
+
+def test_the_stats_code_survives_cmd_quoting() -> None:
+    # It travels as python -c "<code>" through cmd.exe.
+    assert '"' not in lts._EPISODE_STATS_CODE
+    assert "%" not in lts._EPISODE_STATS_CODE
+
+
+def test_a_discarded_take_is_marked_in_the_episode_index() -> None:
+    """The next take reuses the episode index; the index must not carry both as one."""
+    session = lts.LaserTrackerSession(_cfg())
+    session._connected = True
+    session._rows_mark = 0
+    session._count_rows = lambda _name: 9000  # type: ignore[method-assign]
+    session.episode_window_stats = lambda **_k: _stats(  # type: ignore[method-assign]
+        coverage=0.13, usable_fraction=0.13, max_gap_ms=4442.0
+    )
+    session.start_recording(0, 1.0)
+    rec = session.stop_recording()
+    assert rec["incomplete"] is True
+    session.mark_discarded("laser_tracker_incomplete")
+    assert session._episodes[-1].discarded is True
+    assert session._episodes[-1].discard_reason == "laser_tracker_incomplete"
+
+
+def test_the_gate_is_configurable_from_the_yaml_block() -> None:
+    cfg = _cfg(min_usable_fraction=0.9, discard_incomplete=False, nest_max_mm=250)
+    assert cfg.min_usable_fraction == 0.9
+    assert cfg.discard_incomplete is False
+    assert cfg.nest_max_mm == 250.0
 
 
 def test_position_mode_gets_its_own_instruction() -> None:
@@ -707,3 +822,64 @@ def test_recovery_attempts_reach_the_recorder_log(caplog) -> None:
     assert "at the home nest without a range" in text
     assert "home: nest at az" in text
     assert session.homed is False  # the nest line is not the home marker
+
+
+def test_the_recorder_discards_only_task_episodes_short_of_laser_data() -> None:
+    from tools.thor.gmsl2 import thor_record
+
+    bad = {"incomplete": True, "error": "only 13% of this 15.3 s episode has a ranged laser point"}
+    cfg = _cfg()
+    assert "13%" in thor_record._tracker_reject_reason(bad, cfg, None)
+    assert "13%" in thor_record._tracker_reject_reason(bad, cfg, {"purpose": "task"})
+    # A calibration capture is judged by its own checks, never thrown away here.
+    assert thor_record._tracker_reject_reason(bad, cfg, {"purpose": "calibration_tracker_mount"}) == ""
+    assert thor_record._tracker_reject_reason(bad, _cfg(discard_incomplete=False), None) == ""
+    # Unknown (unreadable window) and a dwell are kept.
+    assert thor_record._tracker_reject_reason({"incomplete": False, "error": "could not read"}, cfg, None) == ""
+
+    summary = thor_record._tracker_episode_summary(
+        4, {"incomplete": True, "usable_fraction": 0.13, "stream_coverage": 0.13, "max_gap_ms": 4442.0,
+            "nest_fraction": 0.0, "beam_window_s": 15.3, "error": "x"}, rejected=True, kept=False,
+    )
+    assert summary == {"episode": 4, "rejected": True, "kept": False, "incomplete": True, "window_s": 15.3, "usable": 0.13,
+                       "coverage": 0.13, "max_gap_ms": 4442.0, "nest": 0.0, "error": "x"}
+
+
+def test_segment_points_are_this_dwell_not_the_pose_before_it(tmp_path) -> None:
+    """With the stream in gaps, the last N rows reach back to the previous parked pose."""
+    import subprocess
+    import sys
+
+    before = list(range(0, 30_000))  # previous pose, full rate
+    dwell = [t for t in range(30_000, 40_000) if (t - 30_000) % 5000 < 1000]  # this one, in gaps
+    rt = _rt_csv(tmp_path / "s.rt.csv", before + dwell, lambda t: 500.0 if t < 30_000 else 900.0)
+    # _rt_csv writes x/y/z = 1/2/3 for every row; put the distance in x to tell the poses apart.
+    rt.write_text(
+        "".join(
+            line if i == 0 else ",".join(f[:6] + [f[5]] + f[7:])
+            for i, (line, f) in enumerate((ln, ln.split(",")) for ln in rt.read_text().splitlines(True))
+        )
+    )
+    now_ms = 40_500
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", lts._SEGMENT_POINTS_CODE, str(rt), str(10**8), "10.5", "0.5", "3000",
+         str(_QPC_HZ), str(now_ms * (_QPC_HZ // 1000))],
+        capture_output=True, text=True, check=True,
+    )
+    pts = lts.parse_segment_points(out.stdout)
+    assert len(pts) == 2000
+    assert {p[0] for p in pts} == {900.0}
+
+
+def test_a_beam_lost_mid_take_is_named_as_such_not_as_a_missing_routine() -> None:
+    """2026-10-13 ep0: lost 5 s in, spiral search timed out, re-homed to the nest.
+
+    Some ranged points off the nest exist, so the measurement routine was running;
+    "is --measure-ms running?" sent the operator after the wrong thing.
+    """
+    st = _stats(valid=0.386, tracking=0.561, dist_min_mm=157.7, dist_max_mm=1205.4,
+                window_s=20.3, nest_fraction=0.145, usable_fraction=0.241)
+    error, incomplete = lts.episode_verdict(st, min_usable_fraction=0.8, nest_max_mm=300.0)
+    assert incomplete is True
+    assert "measure-ms" not in error
+    assert "line of sight" in error

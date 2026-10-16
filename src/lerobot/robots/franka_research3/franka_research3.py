@@ -37,6 +37,8 @@ from .backends import (
     HirolGaussianNewtonKinematicsDriver,
     HirolLMKinematicsDriver,
     MockGripperDriver,
+    PANDA_PY_JOINT_LIMITS_LOWER,
+    PANDA_PY_JOINT_LIMITS_UPPER,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
     PlacoKinematicsDriver,
@@ -276,6 +278,7 @@ class FrankaResearch3(Robot):
                 bind_port=self.config.corenetic_bind_port,
                 remote_ip=self.config.corenetic_remote_ip,
                 remote_port=self.config.corenetic_remote_port,
+                device_id=self.config.corenetic_device_id,
                 sdk_dir=self.config.corenetic_sdk_dir,
                 urdf_relpath=self.config.corenetic_urdf_relpath,
                 max_width_m=self.config.gripper_max_width_mm / 1000.0,
@@ -301,18 +304,17 @@ class FrankaResearch3(Robot):
         }
         if self.kinematics_driver_cls is not PlacoKinematicsDriver:
             return self.kinematics_driver_cls(**kwargs)
+        hirol_kwargs = {
+            "tolerance": self.config.ik_tolerance,
+            "max_iterations": self.config.ik_max_iterations,
+        }
+        if self.config.ik_respect_controller_joint_limits:
+            hirol_kwargs["position_limits_lower"] = PANDA_PY_JOINT_LIMITS_LOWER
+            hirol_kwargs["position_limits_upper"] = PANDA_PY_JOINT_LIMITS_UPPER
         if self.config.ik_solver == "hirol_lm":
-            return HirolLMKinematicsDriver(
-                **kwargs,
-                tolerance=self.config.ik_tolerance,
-                max_iterations=self.config.ik_max_iterations,
-            )
+            return HirolLMKinematicsDriver(**kwargs, **hirol_kwargs)
         if self.config.ik_solver == "hirol_gaussian_newton":
-            return HirolGaussianNewtonKinematicsDriver(
-                **kwargs,
-                tolerance=self.config.ik_tolerance,
-                max_iterations=self.config.ik_max_iterations,
-            )
+            return HirolGaussianNewtonKinematicsDriver(**kwargs, **hirol_kwargs)
         return self.kinematics_driver_cls(**kwargs)
 
     @check_if_already_connected
@@ -449,6 +451,11 @@ class FrankaResearch3(Robot):
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
+
+    def get_external_joint_torques(self) -> np.ndarray | None:
+        """Estimated external joint torques (N*m) when the arm backend reports them."""
+        getter = getattr(self._arm, "get_external_joint_torques", None)
+        return getter() if callable(getter) else None
 
     def _read_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
         """Joint positions and when they were read from the arm, not when we picked them up.

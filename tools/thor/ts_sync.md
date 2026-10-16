@@ -376,6 +376,23 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 后误差 = −d_box，**两个 BOX 都更偏**。所以曝光修正只能和「逐 BOX 扣 d_box」一起上，
 且 d_box 要在带曝光列的新录制上重测（工具默认已是 −0.5，输出即 d_box；right 这里 σ 2.5 ms 太大）。
 
+**2026-10-15：已上线。** 重测：right box1819152274 在 10-14 七段（r ≥ 0.81）d_box 7.9–9.6 ms，
+10-13 一段 6.5 ms，session 之间差 1–2 ms；MCU 回归改用下包络不会让它更稳（每段一致平移约 0.35 ms），
+所以不是排队延迟。生产改为：
+
+- `EXPOSURE_CENTER_FRACTION = −0.5`；每个 BOX 读在「曝光中点 + d_box」，d_box 取
+  `tools/thor/gmsl2/box_time_delays.json`（right 9.0 ms）；表里没有的 BOX（含单 BOX 录制，
+  sensor id 不带设备号）仍读在原始 SOF，和以前完全一样，不会变差。
+- 连续通道（夹爪、扳机、IMU 加速度/角速度/四元数、六维力）改为线性插值，去掉上面说的最近邻量化；
+  触觉仍取最近邻；相邻样本间隔 > 25 ms 不插值。
+- 跟踪完成后 `tools/thor/gmsl2/box_realign.py --estimate --write` 自动按本数据集各 episode
+  自己的 d_box（r ≥ 0.8 才用，否则用表）重建 BOX 列。改写前先按 parquet 当时的配帧重建一遍，
+  要求复现存量（每个传感器 ≥ 99% 的帧选中同一样本），复现不了就不动。
+- 每个 episode 的 `meta.json` `box_camera_alignment.box_targets` 记录每个 BOX 用了哪种目标；
+  重建后数据集 `meta/info.json` 的 `box_alignment` 记录逐 episode 的选择。
+- 验收（10-13/10-14 原始数据，配好的陀螺幅值对跟踪角速度的残余延迟）：旧配帧 +2.0 ~ +6.0 ms，
+  新配帧 −0.25 ~ +0.75 ms。
+
 > **不要把它读成「标完就到亚毫秒了」。** 标定去掉的是**偏置**，去不掉的是逐帧
 > **最近邻量化**，而后者按传感器不同、且更大：`间隔/√12` = six_d_force 0.6 ms、
 > imu 1.2 ms、gripper/trigger 2.4 ms、**touch 4.8 ms**。也就是说端到端的主导项是
@@ -427,11 +444,9 @@ Stop / auto-duration
        │    = (sensor_timestamp_ns/1e9 + exposure_fraction×E_median[N]
        │       + readout_offset_s) − t0_mono_s
        │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4;
-       │      SOF 不是曝光中点;2026-09-28 实测 SOF = 积分终点 → 物理上应为 −0.5,
-       │      但 exposure_fraction **仍默认 0.0:只记录曝光列,不施加**——BOX 最近邻的正确目标是
-       │      T + d_box,BOX 传输延迟 d_box 没人扣(§5.5),偏晚的 SOF 恰好抵掉一半;
-       │      单改 −0.5 会让 left/right 误差从 ≈−4.4/+1.2 ms 变成 ≈−8.7/−3.2 ms。
-       │      须与逐 BOX 的 d_box 同一次提交一起施加）
+       │      SOF 不是曝光中点;2026-09-28 实测 SOF = 积分终点 → −0.5。
+       │      2026-10-15 起 −0.5 与逐 BOX 的 d_box 一起施加:有 d_box 的 BOX 目标 = 该时刻 + d_box,
+       │      其余 BOX 目标 = 原始 SOF(§5.5);连续通道线性插值）
        │    E_median[N] = 该帧**跨相机曝光中位数**（2026-09-21;原先取 glob 排序第一台相机的曝光）。
        │      一条融合位姿只带一个时间,所以逐帧只能有一个曝光项代表全部相机,各相机必留
        │      fraction×(E_median − E_k) 残差 —— 但用哪台代表是个选择,不该由文件名顺序决定

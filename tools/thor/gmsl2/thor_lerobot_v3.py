@@ -670,11 +670,69 @@ def _nearest_sample_data(
     return samples[idx].get("data", {})
 
 
+def _interpolated_sample_data(
+    times: list[float],
+    samples: list[dict[str, Any]],
+    t: float,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """The nearer sample's data with ``fields`` (and ``timestamp``) linearly
+    interpolated to *t*; the nearer sample as is outside the samples, across a
+    gap over :data:`BOX_INTERPOLATION_MAX_GAP_S`, or where a field is missing or
+    differently shaped in the two."""
+    near = _nearest_sample_data(times, samples, t)
+    idx = bisect.bisect_left(times, t)
+    if not fields or idx == 0 or idx >= len(samples):
+        return near
+    t0, t1 = times[idx - 1], times[idx]
+    if not 0.0 < t1 - t0 <= BOX_INTERPOLATION_MAX_GAP_S:
+        return near
+    a = samples[idx - 1].get("data", {})
+    b = samples[idx].get("data", {})
+    u = (t - t0) / (t1 - t0)
+    out = dict(near)
+
+    def lerp(x: Any, y: Any) -> Any:
+        if isinstance(x, (list, tuple)) and isinstance(y, (list, tuple)) and len(x) == len(y):
+            return [(1.0 - u) * _finite_float(p) + u * _finite_float(q) for p, q in zip(x, y)]
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)) and not isinstance(x, bool):
+            return (1.0 - u) * float(x) + u * float(y)
+        return None
+
+    for key in (*fields, "timestamp"):
+        if key not in a or key not in b:
+            continue
+        if key == "quat_wxyz":
+            qa, qb = a[key], b[key]
+            if not (isinstance(qa, (list, tuple)) and isinstance(qb, (list, tuple)) and len(qa) == len(qb) == 4):
+                continue
+            if sum(_finite_float(p) * _finite_float(q) for p, q in zip(qa, qb)) < 0.0:
+                continue  # an antipodal step: the nearer sample, not a lerp through zero
+            q = lerp(qa, qb)
+            norm = math.sqrt(sum(v * v for v in q))
+            if norm > 0.0:
+                out[key] = [v / norm for v in q]
+            continue
+        value = lerp(a[key], b[key])
+        if value is not None:
+            out[key] = value
+    return out
+
+
 #: Fraction of the integration window that separates ``sensor_timestamp_ns``
 #: from the instant the scene was actually sampled.
 #:
-#: **The sign is measured (2026-09-28): -0.5.  The production value stays 0.0**,
-#: because on its own the camera half makes BOX alignment worse, not better.
+#: **2026-10-15: production is -0.5, together with each BOX's transport delay.**
+#: The BOX lookup target is ``SOF - E/2 + d_box`` for a BOX whose ``d_box`` is in
+#: :data:`BOX_TIME_DELAYS_PATH`, and the raw SOF -- the alignment of everything
+#: recorded before -- for any other BOX, so a BOX nobody has measured is aligned
+#: exactly as before instead of half an exposure worse.  Both halves together is
+#: the fix the history below asks for: right box1819152274 measured d_box
+#: 7.9-9.6 ms on 2026-10-14 (seven episodes, r >= 0.81), so its pairing moved from
+#: ``E/2 - d_box`` ~ -4.4 ms (session to session 2-5 ms) to the spread of d_box.
+#:
+#: Until 2026-10-15: **the sign is measured (2026-09-28): -0.5.  The production
+#: value stays 0.0**, because on its own the camera half makes BOX alignment worse.
 #:
 #: The sign.  Three independent lines on ``thor_gmsl2_9ch_v1_20260928_154725``
 #: episode 0 agree:
@@ -762,7 +820,55 @@ def _nearest_sample_data(
 #: Episodes recorded in the meantime lose nothing: every frame's exposure is in
 #: its sidecar and every episode's ``meta.json`` records the terms that were in
 #: force, so the correction can be applied offline, retroactively, once.
-EXPOSURE_CENTER_FRACTION = 0.0
+EXPOSURE_CENTER_FRACTION = -0.5
+
+#: Per-BOX transport delay ``d_box``: BOX stamps come from an MCU->host regression
+#: whose intercept absorbs the device->host delay, so a BOX sample stamped ``t``
+#: was taken at ``t - d_box``.  Measured with ``metrology.cli.estimate_camera_imu_time_offset``
+#: (gyro vs the tracked cube's angular velocity, camera at mid-exposure), keyed by
+#: the BOX device id in the sensor ids (``box1819152274/box_imu``).  A recording
+#: with one BOX names none (bare ``box_imu``) and so is never corrected: which
+#: device it was is not in the data.  The lower envelope of the MCU fit does not
+#: steady it (2026-10-15: it moves every episode by the same ~0.35 ms), so the
+#: session-to-session spread is not queueing; re-measure per episode where the
+#: motion allows (``tools/thor/gmsl2/box_realign.py``, run after tracking).
+BOX_TIME_DELAYS_PATH = Path(__file__).with_name("box_time_delays.json")
+BOX_TIME_DELAYS_SCHEMA = "box_time_delays/v1"
+
+#: BOX channels that change continuously: read at the target instant by linear
+#: interpolation between the two samples around it rather than taken from the
+#: nearer one, which costs a uniform error of +-half a sample interval (gripper
+#: and trigger at 120 Hz: sigma 2.4 ms; IMU 240 Hz: 1.2 ms) -- as large as the
+#: delay being corrected.  Quaternions are lerped and renormalised (the SDK
+#: stream is continuous, see ``_imu_quat_xyzw``; a step with ``dot < 0`` falls
+#: back to the nearer sample).  Touch frames are taxel arrays and point counts:
+#: nearest.  Two samples further apart than the gap are a dropout, and nothing
+#: is invented across it.
+BOX_INTERPOLATED_FIELDS: dict[str, tuple[str, ...]] = {
+    "box_gripper": ("distance_m",),
+    "box_trigger": ("travel_pct",),
+    "box_imu": ("acc_g", "gyr_deg_s", "quat_wxyz"),
+    "box_six_d_force": ("fxyz_mxyz", "fxyz_mxyz_no_gravity"),
+}
+BOX_INTERPOLATION_MAX_GAP_S = 0.025
+
+
+def load_box_time_delays(path: Path | None = None) -> dict[str, float]:
+    """``box id -> d_box`` in seconds from the delay table; empty if there is none."""
+    path = BOX_TIME_DELAYS_PATH if path is None else Path(path)
+    try:
+        table = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if table.get("schema") != BOX_TIME_DELAYS_SCHEMA:
+        logger.warning("%s is not a %s; no BOX delay applied", path, BOX_TIME_DELAYS_SCHEMA)
+        return {}
+    out: dict[str, float] = {}
+    for box_id, entry in (table.get("boxes") or {}).items():
+        d_ms = _finite_float((entry or {}).get("d_box_ms"), default=float("nan"))
+        if math.isfinite(d_ms):
+            out[str(box_id)] = d_ms / 1000.0
+    return out
 
 #: Fixed sensor->stamp latency, in seconds, on top of the exposure term.
 #:
@@ -1122,6 +1228,38 @@ def _box_features(
     }
 
 
+def _frame_lookup_times(
+    frame_times_s: list[float | None] | None,
+    frame_count: int,
+    fps: int,
+    frame_origin_s: float,
+) -> tuple[list[float], int, tuple[float, float] | None]:
+    """Per-frame target time: the sidecar's where it has one, its linear fit where
+    it has a gap or a short tail, ``origin + N/fps`` without a usable sidecar.
+    Returns ``(times, frames extrapolated, fit)``."""
+    fps = max(int(fps), 1)
+    fit: tuple[float, float] | None = None
+    if frame_times_s is not None:
+        xs = [i for i, t in enumerate(frame_times_s) if t is not None and math.isfinite(t)]
+        if len(xs) >= 2:
+            slope, intercept, _ = calibrate_mcu_clock(xs, [float(frame_times_s[i]) for i in xs])
+            if slope != 0.0:
+                fit = (slope, intercept)
+    out: list[float] = []
+    n_extrapolated = 0
+    for f in range(frame_count):
+        t = frame_origin_s + f / fps
+        if frame_times_s is not None:
+            ft = frame_times_s[f] if f < len(frame_times_s) else None
+            if ft is not None and math.isfinite(ft):
+                t = float(ft)
+            elif fit is not None:
+                t = fit[0] * f + fit[1]
+                n_extrapolated += 1
+        out.append(t)
+    return out, n_extrapolated, fit
+
+
 def _build_episode_rows(
     *,
     fps: int,
@@ -1134,7 +1272,20 @@ def _build_episode_rows(
     start_index: int = 0,
     box_ids: tuple[str, ...] | list[str] | None = None,
     frame_times_s: list[float | None] | None = None,
+    sof_frame_times_s: list[float | None] | None = None,
+    box_delays_s: dict[str, float] | None = None,
+    interpolate: bool = False,
 ) -> list[dict[str, Any]]:
+    """One row per camera frame, each BOX sensor read at that frame's target time.
+
+    ``frame_times_s`` is the camera timeline (``camera_frame_times_rel``).  Given
+    ``sof_frame_times_s`` as well (the same sidecar at ``exposure_fraction=0``),
+    ``frame_times_s`` is taken to be mid-exposure and each BOX is read at
+    ``frame_time + d_box`` if ``box_delays_s`` has it, at the raw SOF otherwise
+    (exactly what it got before the delays existed).  Without it every BOX is read
+    at ``frame_times_s`` and no delay is applied.  ``interpolate`` reads the
+    channels in :data:`BOX_INTERPOLATED_FIELDS` between samples (the recorder turns
+    it on; off keeps nearest-neighbour throughout)."""
     use_hf = bool(sensor_samples and any(sensor_samples.values()))
     resolved_box_ids = tuple(box_ids or box_ids_from_inputs(snapshots, sensor_samples))
     if not snapshots and not use_hf:
@@ -1154,7 +1305,7 @@ def _build_episode_rows(
             slist = sorted(slist_raw, key=lambda s: s["t_rel_s"])
             per_sensor[sid] = ([s["t_rel_s"] for s in slist], slist)
 
-        # BOX nearest-neighbor target = the frame's hardware SOF capture time
+        # BOX nearest-neighbor target = the frame's hardware camera time
         # (frame_times_s, from the online-sync sidecar) instead of the idealized
         # N/fps grid, correcting the per-episode camera skew (ts_sync.md §5.4).
         # The parquet ``timestamp`` column stays N/fps (loader contract).
@@ -1163,31 +1314,36 @@ def _build_episode_rows(
         # ~µs), NOT by dropping to N/fps mid-episode — that would splice two time
         # bases and hide a discontinuity right at the tail. Only when there is no
         # usable SOF at all do we fall back to a uniform N/fps grid.
-        cam_fit: tuple[float, float] | None = None
-        if frame_times_s is not None:
-            xs = [i for i, t in enumerate(frame_times_s)
-                  if t is not None and math.isfinite(t)]
-            if len(xs) >= 2:
-                slope, intercept, _ = calibrate_mcu_clock(
-                    xs, [float(frame_times_s[i]) for i in xs]
-                )
-                if slope != 0.0:
-                    cam_fit = (slope, intercept)
-        n_extrapolated = 0
+        lookup_main, n_extrapolated, main_fit = _frame_lookup_times(
+            frame_times_s, frame_count, fps, frame_origin_s
+        )
+        lookup_sof = lookup_main
+        delays: dict[str, float] = {}
+        if sof_frame_times_s is not None and frame_times_s is not None:
+            lookup_sof, _, _ = _frame_lookup_times(sof_frame_times_s, frame_count, fps, frame_origin_s)
+            delays = dict(box_delays_s or {})
+        sensor_lookup: dict[str, tuple[list[float], float]] = {}
+        for sid in per_sensor:
+            split = _split_box_sensor_id(sid)
+            box = split[0] if split is not None else ""
+            if box and box in delays:
+                sensor_lookup[sid] = (lookup_main, delays[box])
+            else:
+                sensor_lookup[sid] = (lookup_sof, 0.0)
 
         for local_frame in range(frame_count):
             timestamp_s = frame_origin_s + local_frame / max(int(fps), 1)
-            lookup_s = timestamp_s
-            if frame_times_s is not None:
-                ft = frame_times_s[local_frame] if local_frame < len(frame_times_s) else None
-                if ft is not None and math.isfinite(ft):
-                    lookup_s = float(ft)
-                elif cam_fit is not None:
-                    lookup_s = cam_fit[0] * local_frame + cam_fit[1]
-                    n_extrapolated += 1
             sensors: dict[str, Any] = {}
             for sid, (times, slist) in per_sensor.items():
-                data = _nearest_sample_data(times, slist, lookup_s)
+                lookup, delay = sensor_lookup[sid]
+                target = lookup[local_frame] + delay
+                split = _split_box_sensor_id(sid)
+                fields = BOX_INTERPOLATED_FIELDS.get(split[1], ()) if interpolate and split else ()
+                data = (
+                    _interpolated_sample_data(times, slist, target, fields)
+                    if fields
+                    else _nearest_sample_data(times, slist, target)
+                )
                 if data:
                     sensors[sid] = data
             snap = {"valid": bool(sensors), "sensors": sensors}
@@ -1207,7 +1363,7 @@ def _build_episode_rows(
                 "fit (sidecar gap/short tail); single time basis preserved",
                 n_extrapolated, frame_count,
             )
-        elif frame_times_s is not None and cam_fit is None:
+        elif frame_times_s is not None and main_fit is None:
             logger.warning(
                 "camera SOF times unusable (fewer than 2 valid sensor_timestamps); "
                 "BOX alignment fell back to the uniform N/fps grid"
@@ -1306,6 +1462,9 @@ class Lr3Writer:
         t0_wall_s: float = 0.0,
         pts_offset_s: float | None = None,
         frame_times_s: list[float | None] | None = None,
+        sof_frame_times_s: list[float | None] | None = None,
+        box_delays_s: dict[str, float] | None = None,
+        interpolate: bool = False,
     ) -> Path | None:
         if self._closed:
             raise RuntimeError("cannot append to a closed Lr3Writer")
@@ -1333,6 +1492,9 @@ class Lr3Writer:
             start_index=self.total_frames,
             box_ids=box_ids,
             frame_times_s=frame_times_s,
+            sof_frame_times_s=sof_frame_times_s,
+            box_delays_s=box_delays_s,
+            interpolate=interpolate,
         )
         if not rows:
             return None
@@ -1495,6 +1657,9 @@ def write_box_lerobot_v3_episode(
     t0_wall_s: float = 0.0,
     pts_offset_s: float | None = None,
     frame_times_s: list[float | None] | None = None,
+    sof_frame_times_s: list[float | None] | None = None,
+    box_delays_s: dict[str, float] | None = None,
+    interpolate: bool = False,
 ) -> Path | None:
     """Append BOX snapshots for one episode to a minimal LeRobot v3 dataset.
 
@@ -1552,6 +1717,9 @@ def write_box_lerobot_v3_episode(
         pts_offset_s=pts_offset_s,
         box_ids=box_ids,
         frame_times_s=frame_times_s,
+        sof_frame_times_s=sof_frame_times_s,
+        box_delays_s=box_delays_s,
+        interpolate=interpolate,
     )
     if not rows:
         return None

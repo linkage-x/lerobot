@@ -132,6 +132,24 @@ export type RecordingStatus = {
   laserTrackerHomed?: boolean;
   /** Homed, but the beam broke since: the current lock has no absolute range. */
   laserTrackerBeamBroken?: boolean;
+  // The laser verdict on the last episode stopped; see LaserEpisodeVerdict.
+  laserTrackerEpisode?: LaserEpisodeVerdict;
+};
+
+/** Recorder's LT_EPISODE line: how much of the episode has a usable laser point. Fractions are -1 when unread. */
+export type LaserEpisodeVerdict = {
+  episode?: number;
+  // The recorder discarded the episode for it (its files are already deleted).
+  rejected?: boolean;
+  // Saved at all: an operator Discard (or another gate) leaves it false without `rejected`.
+  kept?: boolean;
+  incomplete?: boolean;
+  window_s?: number;
+  usable?: number;
+  coverage?: number;
+  max_gap_ms?: number;
+  nest?: number;
+  error?: string;
 };
 
 export type MarkerTcpSample = {
@@ -239,8 +257,19 @@ export type ReplayStatus = {
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;
   realEndEffectorMode?: RealEndEffectorMode;
+  // replay.pose_command_lead_frames of the last real replay started (Thor).
+  realCommandLeadFrames?: number;
   mujocoOverrideAccepted?: boolean;
   realReplayLog?: string[];
+  // Thor two-step real replay: move to the trajectory start, then Execute.
+  realPhase?: RealReplayPhase;
+  realRecordTracker?: boolean;
+  realTrackerState?: RealTrackerState;
+  realTrackerDetail?: string;
+  realRunDir?: string;
+  // Laser vs FR3 error analysis of the selected episode's real replays (status only; the
+  // report itself comes from /api/replay/laser-analysis).
+  laserAnalysis?: LaserAnalysisStatus;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -276,6 +305,85 @@ export type MujocoValidation = {
 export type MujocoCubeMode = "left" | "right" | "both";
 export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
 export type RealEndEffectorMode = "pika_gripper_ee" | "corenetic_gripper_ee" | "fr3_ee";
+export type RealReplayPhase = "" | "moving_to_start" | "at_start" | "executing" | "finished";
+export type RealTrackerState =
+  | ""
+  | "warming"
+  | "waiting"
+  | "ready"
+  | "recording"
+  | "recorded"
+  | "landing"
+  | "landed"
+  | "cancelled"
+  | "error";
+
+export type LaserAnalysisStatus = {
+  status?: "running" | "done" | "failed";
+  datasetRoot?: string;
+  episode?: number;
+  cube?: RealCubeMode;
+  runs?: number;
+  reportPath?: string;
+  message?: string;
+  output?: string[];
+  updatedAt?: string;
+};
+
+export type LaserErrorStats = { n: number; rms_mm?: number; p50_mm?: number; p95_mm?: number; max_mm?: number };
+
+// One run of metrology.fr3_replay_laser_error, at the SMR point. A run that could not be
+// analysed carries only run/run_dir/error (plus the beam counts when it got that far).
+export type LaserReplayRun = {
+  run: string;
+  run_dir: string;
+  // Added by the gateway from the run's trace; null for traces that predate the column.
+  command_lead_frames?: number | null;
+  error?: string;
+  frames?: number;
+  beam_frames?: number;
+  used_frames?: number;
+  first_loss_frame?: number;
+  trace_to_tracker_lag_ms?: number;
+  smr_in_tcp_mm?: number[];
+  smr_in_tcp_sigma_mm?: number[];
+  smr_lever_arm_mm?: number;
+  orientation_span_deg?: number;
+  laser_vs_desired?: LaserErrorStats;
+  fk_vs_desired?: LaserErrorStats;
+  laser_vs_fk?: LaserErrorStats;
+  laser_vs_desired_bias_mm?: number[];
+  decomposition?: {
+    follow_lag_frames: number;
+    follow_lag_ms: number;
+    laser_vs_desired_rms_mm: number;
+    without_bias_rms_mm: number;
+    without_bias_and_lag_rms_mm: number;
+    fk_without_bias_and_lag_rms_mm: number;
+  };
+  by_speed?: { from_mm_s: number; to_mm_s: number | null; frames: number; laser_vs_desired_rms_mm: number; laser_vs_fk_rms_mm: number }[];
+  line_of_sight?: {
+    seen_max_deg: number;
+    trajectory_max_deg: number;
+    at_first_loss_deg?: number;
+    first_loss_new_direction_deg?: number;
+  };
+  per_frame?: {
+    frame_index: number[];
+    laser_vs_desired_mm: (number | null)[];
+    laser_vs_fk_mm: (number | null)[];
+    fk_vs_desired_mm: (number | null)[];
+  };
+};
+
+export type LaserReplayReport = {
+  schema: string;
+  runs: LaserReplayRun[];
+  repeatability: { runs: number; frames?: number; pairwise_max?: LaserErrorStats; smr_in_tcp_spread_mm?: number; note?: string };
+  reportPath?: string;
+  modifiedAt?: string;
+  availableRuns?: string[];
+};
 
 export type RealSensePreviewCameraStatus = {
   cameraKey: string;
@@ -746,6 +854,15 @@ export type TrackingDetectionSummary = {
     medianRmsePx: number | null;
     medianEdgeSamples: number | null;
   }>;
+  /** Whether the extrinsics that labelled this recording were still right (corner-BA residual). */
+  cameraState?: {
+    verdict: "ok" | "stale" | "unknown";
+    worstMedianPx: number | null;
+    worstCube: string;
+    thresholdPx: number;
+    extrinsics: string;
+    message: string;
+  } | null;
 };
 
 export type ReplayTimeline = {
@@ -1156,6 +1273,433 @@ export type WorldFrameResponse = {
   graph: { worlds: number; edges: number; nodes: { world_frame_id: string; parent_world_frame_id?: string | null }[] };
   currentBundle?: string;
   extrinsicsRun?: string;
+};
+
+// The world -> fr3_base registration edge (register_fr3_base.py): the live edge,
+// the P0 single-tag runs it can be solved from, and the solved candidates.
+export type Fr3BaseEdgeQuality = {
+  /** singleTag: P0 tag hand-eye; laser: tracker station x FR3 FK fitted to the laser on replays;
+   * ball: rigid fit of the ball check's positions (fr3_base_ball_check.py edge). */
+  method?: "singleTag" | "laser" | "ball";
+  positions?: number | null;
+  residualRmsMm?: number | null;
+  /** Each ball position predicted from the others: what the verdict rests on. */
+  leaveOneOutRmsMm?: number | null;
+  leaveOneOutMaxMm?: number | null;
+  rotationSpreadDeg?: number | null;
+  /** Camera world vs the FR3's FK over the balls, %: reported, not absorbed by the rigid edge. */
+  scalePct?: number | null;
+  handheldS?: "shared" | "per-position" | null;
+  extentMm?: number[] | null;
+  captures?: number | null;
+  outOfSampleP95Mm?: number | null;
+  tagScale?: number | null;
+  rmsePx?: number | null;
+  observationsKept?: number | null;
+  observationsIn?: number | null;
+  stationPoses?: number | null;
+  stationRmsMm?: number | null;
+  stationCertifies?: boolean | null;
+  stationExtentM?: number | null;
+  replays?: number;
+  laserVsFkP95Mm?: number | null;
+  orientationSpanDeg?: number | null;
+  replaySpreadMm?: number | null;
+  folds: {
+    name: string;
+    heldOutCaptures?: number | null;
+    tagCentreP50Mm?: number | null;
+    tagCentreP95Mm?: number | null;
+    edgeShiftMm?: number | null;
+    edgeShiftDeg?: number | null;
+  }[];
+};
+
+export type Fr3BaseEdgeMove = {
+  points: number;
+  meanMm: [number, number, number];
+  meanNormMm: number;
+  maxMm: number;
+  rotationDeg: number;
+};
+
+export type Fr3BaseEdgeResponse = {
+  ok: boolean;
+  error?: string;
+  output?: string;
+  solved?: string;
+  applied?: string;
+  referenceWorld: string;
+  current: {
+    world: string;
+    createdUtc: string;
+    method: string;
+    label: string;
+    p0Run: string;
+    intrinsicsRun: string;
+    fromReferenceWorld: boolean;
+    referenceUnchanged: boolean;
+    supersedes: number;
+    edgeCount: number;
+    quality: Fr3BaseEdgeQuality;
+  } | null;
+  runs: {
+    name: string;
+    captures: number;
+    live: number;
+    imported: number;
+    p0Status: string;
+    solvable: boolean;
+    isLiveEdgeSource: boolean;
+  }[];
+  candidates: {
+    name: string;
+    generatedUtc: string;
+    label: string;
+    p0Run: string;
+    verdict: string;
+    reasons: string[];
+    warnings: string[];
+    intrinsicsRun: string;
+    quality: Fr3BaseEdgeQuality;
+    moveVsLive: Fr3BaseEdgeMove | null;
+    sameAsLive: boolean;
+    applyBlockers: string[];
+  }[];
+  runsRoot?: string;
+  reportsRoot?: string;
+  captureCommand?: string;
+  /** Laser edge, first half: station fits (world <- tracker). */
+  stations: {
+    name: string;
+    world: string;
+    matchesReference: boolean;
+    poses?: number | null;
+    rmsMm?: number | null;
+    certifies: boolean;
+    extentM?: number | null;
+    sessions: string[];
+    sessionUtc: string;
+  }[];
+  /** Laser edge, second half: FR3 real replays that carried the laser. */
+  laserReplays: {
+    path: string;
+    name: string;
+    dataset: string;
+    sessionId: string;
+    sessionUtc: string;
+  }[];
+  stationsRoot?: string;
+};
+
+/** One pivot fit (tools/fr3/fr3_tcp_pivot.py, lerobot.robots.franka_research3.tcp_pivot). */
+export type PivotFitSummary = {
+  s_ee_mm: number[];
+  s_sigma_mm: number[];
+  c_base_mm: number[];
+  c_sigma_mm?: number[];
+  residual_rms_mm: number;
+  residual_p95_mm: number;
+  n_used: number;
+  n_total: number;
+  span_deg: number;
+  weak_singular: number;
+};
+
+/** A ball position as fr3_base_ball_check.py scored it (centres in fr3_base / the world). */
+export type BallCheckPosition = {
+  fr3_pivot: string;
+  dataset: string;
+  episode: number;
+  cube?: string;
+  world?: string;
+  usable: boolean;
+  reasons: string[];
+  warnings: string[];
+  fr3?: { centre_mm: number[]; centre_sigma_mm: number[]; s_mm?: number[]; s_in_socket_frame_mm?: number[]; span_deg: number };
+  handheld?: {
+    s_mm: number[];
+    centre_mm: number[];
+    centre_sigma_mm: number[];
+    residual_rms_mm: number;
+    residual_p95_mm: number;
+    span_deg: number;
+    weak_singular: number;
+    n_used: number;
+    n_total: number;
+    on_ball_fraction?: number;
+  };
+  /** The centre with one handheld lever arm shared by every position of its world (the default). */
+  handheld_shared?: {
+    centre_mm: number[];
+    centre_sigma_mm: number[];
+    residual_rms_mm: number;
+    n_used: number;
+    /** Shared-s centre minus the position's own-s centre. */
+    shift_mm: number[];
+  };
+};
+
+/** The rigid edge the balls alone imply; verdict by leave one out (each position from the others). */
+export type BallEdge = {
+  error?: string;
+  positions?: number;
+  position_indices?: number[];
+  extent_mm?: number[];
+  residual_mm?: number[];
+  residual_rms_mm?: number;
+  leave_one_out_mm?: (number | null)[];
+  leave_one_out_rms_mm?: number | null;
+  leave_one_out_max_mm?: number | null;
+  rotation_spread_deg?: number | null;
+  scale_pct?: number;
+  handheld_s?: "shared" | "per-position";
+  verdict?: "ok" | "rejected";
+  reasons?: string[];
+  warnings?: string[];
+};
+
+export type BallCheckEdge = {
+  name: string;
+  world?: string;
+  method?: string;
+  error?: string;
+  /** A ball edge's candidate: scored on balls it may have been fitted to, so in-sample small. */
+  from_balls?: boolean;
+  positions?: { position: number; error_mm: number[]; norm_mm: number }[];
+  mean_mm?: number[];
+  rms_mm?: number;
+  max_mm?: number;
+};
+
+export type BallCheckReport = {
+  name: string;
+  schema: string;
+  generated_utc: string;
+  positions: BallCheckPosition[];
+  edges: BallCheckEdge[];
+  ball_edges: Record<string, BallEdge>;
+  handheld_s?: "shared" | "per-position";
+  handheld_shared?: Record<string, { positions: number[]; s_mm?: number[]; s_sigma_mm?: number[]; s_per_position_mm?: number[][]; error?: string }>;
+  reference_world?: string;
+  world_reference_sha256?: string;
+};
+
+export type Fr3PivotJob = {
+  state?: "collecting" | "fitting" | "done" | "error" | "stopped";
+  /** teach: teaching mode, moved by hand; auto: a planned pivot under soft impedance. */
+  mode?: "teach" | "auto" | "guided";
+  plan?: string;
+  centre?: string;
+  finishRequested?: boolean;
+  biasMm?: number[] | null;
+  /** guided: the socket-frame point the spring held ([0,0,0] = the frame's origin). */
+  anchorMm?: number[] | null;
+  run?: string;
+  robotIp?: string;
+  durationS?: number;
+  note?: string;
+  startedUnixS?: number;
+  elapsedS?: number;
+  returncode?: number;
+  stopRequested?: boolean;
+  log: string[];
+  error?: string;
+};
+
+/** Live readout of tools/fr3/fr3_gripper_teleop.py (its STATUS lines). */
+export type GripperTeleopStatus = {
+  state: "waiting" | "following" | "exited";
+  handheldFresh?: boolean;
+  handheldWidthMm?: number | null;
+  triggerPct?: number | null;
+  commandMm?: number | null;
+  targetMm?: number | null;
+  armWidthMm?: number | null;
+  armReboots?: number;
+  armMode?: number | null;
+};
+
+export type GripperTeleopJob = {
+  state?: "running" | "exited" | "error";
+  startedUnixS?: number;
+  armDeviceId?: number;
+  returncode?: number;
+  stopRequested?: boolean;
+  status?: GripperTeleopStatus;
+  log: string[];
+  error?: string;
+};
+
+/** GET/POST /api/fr3/gripper-teleop: the FR3's gripper BOX following the handheld BOX. */
+export type GripperTeleopResponse = {
+  ok: boolean;
+  error?: string;
+  job: GripperTeleopJob;
+  armDeviceId: number | null;
+  graspTriggerClosePct: number | null;
+  graspClosedWidthM: number | null;
+  /** What the last exit left the arm's BOX holding (outputs/fr3_gripper_teleop/hold.json). */
+  hold: { device_id: number; target_m: number | null; mode: number | null; written: string } | null;
+};
+
+export type Fr3PivotResponse = {
+  ok: boolean;
+  error?: string;
+  output?: string;
+  checked?: string;
+  /** A check's ball edge written as a candidate of the FR3-base edge panel. */
+  edgeSaved?: string;
+  job: Fr3PivotJob;
+  runs: {
+    name: string;
+    fitName: string;
+    note: string;
+    created: string;
+    fk: PivotFitSummary | null;
+    deskOTEE: PivotFitSummary | null;
+    socketFrame: (PivotFitSummary & { frame: string }) | null;
+    /** A planned run (fr3_pivot_auto.py execute): what it was told and how hard it pressed. */
+    commanded?: Fr3PivotCommanded | null;
+  }[];
+  /** Pivot centres captured with the socket seated on the ball (FK of corenetic_socket_ee). */
+  centres?: Fr3PivotCentre[];
+  /** Planned pivots with their IK + MuJoCo checks, newest first. */
+  plans?: Fr3PivotPlan[];
+  captured?: string;
+  planned?: string;
+  robotIp: string;
+  guideDefaultS?: number;
+  guideRangeS?: [number, number];
+  /** The latest guided fit's ball centre in corenetic_socket_ee, for holding the spring there. */
+  anchor?: Fr3PivotAnchor;
+  /** Joint fits (fr3_tcp_pivot.py fit-joint), newest first. */
+  joints?: Fr3PivotJointFit[];
+  jointFitted?: string;
+  defaultDurationS: number;
+  durationRangeS: [number, number];
+  runsRoot: string;
+  /** Recent recorded episodes, any of which could be the handheld pivot. */
+  episodes: {
+    dataset: string;
+    datasetName: string;
+    episode: number;
+    world: string;
+    recordedUnixS: number;
+    hasTrajectory: boolean;
+  }[];
+  checks: BallCheckReport[];
+  checksRoot: string;
+};
+
+export type Fr3PivotCommanded = {
+  /** commanded: followed a plan; guided: socket held on the ball, turned by hand. */
+  kind?: "commanded" | "guided";
+  plan: string;
+  centre: string;
+  bias_mm: number[] | null;
+  press_mm: number | null;
+  /** guide: the socket-frame point the spring held, and the fit it came from. */
+  anchor_mm?: number[] | null;
+  anchor_from?: string;
+  completed: boolean;
+  contact: {
+    press_median_n: number;
+    press_p05_n: number;
+    in_contact_fraction: number;
+    max_force_n: number;
+  } | null;
+};
+
+/** Whether the spring may be held on the latest guided fit's ball centre, and if not, why. The
+ * gripper teleop having run since that fit is a warning only (the insert re-seats within 0.2 mm). */
+export type Fr3PivotAnchor = {
+  available: boolean;
+  reason: string;
+  /** Usable, but the grip may have changed since the fit. */
+  warning?: string;
+  /** The offset comes from a joint fit of several runs (``run`` is then the joint report). */
+  joint?: boolean;
+  sMm?: number[];
+  run?: string;
+  fitName?: string;
+  residualRmsMm?: number | null;
+};
+
+/** One fit_pivot_joint result (src/lerobot/robots/franka_research3/tcp_pivot.py), as_dict. */
+export type JointPivotFitSummary = {
+  s_ee_mm: number[];
+  s_sigma_mm?: number[];
+  c_base_mm?: number[][];
+  shared_centre?: boolean;
+  run_rms_mm?: number[];
+  run_n_used?: number[];
+  run_centre_offset_mm?: number[][];
+  s_leave_one_run_out_mm?: number[][];
+  residual_rms_mm?: number;
+  span_deg?: number;
+  weak_singular?: number;
+};
+
+/** Several runs, one socket centre: each run from its own heading pins what one sweep leaves loose. */
+export type Fr3PivotJointFit = {
+  name: string;
+  created: string;
+  runs: string[];
+  /** One ball centre for all runs (the ball not moved), else one per run. */
+  sharedCentre: boolean;
+  fk: JointPivotFitSummary | null;
+  socketFrame: (JointPivotFitSummary & { frame?: string }) | null;
+  warnings: string[];
+};
+
+export type Fr3PivotCentre = {
+  name: string;
+  created: string;
+  note: string;
+  centreMm: number[];
+  /** Tool axis above (+) or below (-) level; the cup faces down across it. */
+  toolFromLevelDeg: number | null;
+  wallProblems: string[];
+};
+
+export type Fr3PivotPlan = {
+  name: string;
+  centre: string;
+  created: string;
+  passed: boolean;
+  problems: string[];
+  durationS: number | null;
+  biasMm: number[] | null;
+  params: Record<string, unknown>;
+  jointTravelDeg: number[] | null;
+  maxJointSpeedDegS: number[] | null;
+  minMarginWallDeg: number[] | null;
+  minMarginFr3Deg: number[] | null;
+  tableClearanceMm: number | null;
+  tableClearanceBody: string | null;
+  /** The table top the clearance was measured from, in fr3_base. */
+  tableZMm?: number | null;
+  mujocoChecked: boolean;
+  /** "dwells" (surveyed, chosen, routed) or the 10-13 "star". */
+  kind?: string;
+  dwells?: number;
+  /** Predicted 1-sigma of the fit per mm of error at each dwell: s (socket frame), c (fr3_base). */
+  sigmaPerUnit?: { s: number[]; c: number[] } | null;
+  socketStandMm?: number | null;
+  gripperStandMm?: number | null;
+  gripperStandBody?: string | null;
+  anchorFrom?: string;
+  anchorMm?: number[] | null;
+  notes?: string[];
+};
+
+/** POST /api/robot/move-to-start: panda_py move_to_start() on one FR3, run to completion. */
+export type Fr3MoveToStartResponse = {
+  ok: boolean;
+  error: string;
+  robotIp: string;
+  output: string;
 };
 
 // Guided calibration: per-camera intrinsics sweeps, then one shared extrinsics

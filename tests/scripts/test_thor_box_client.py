@@ -953,6 +953,31 @@ def test_box_pool_two_boxes_namespace_sensors(fake_box_module):
     pool.stop()
 
 
+def test_box_pool_leaves_the_mode_of_a_kept_box_alone(fake_box_module):
+    # The FR3's gripper BOX: mode 0 hands its jaw to its own trigger and drops what it holds,
+    # so neither the recorder's Connect nor its rearm may set_mode() it.
+    fake_box_module.Box = _MultiDeviceBox
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=7, ip="192.168.2.61", capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=9, ip="192.168.2.62", capabilities=box_client.CAP_GRIPPER),
+    ]
+    fleet = box_client.fleet_from_yaml_dict(
+        {"enabled": True, "keep_mode_device_ids": [9], "rearm_interval_s": 0.01, "poll_interval_s": 0.005}
+    )
+    assert fleet.keep_mode_device_ids == [9]
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.08)
+    box = pool._shared_box
+    assert box.mode.get(7) == 0
+    assert 9 not in box.mode
+    assert pool.client_for_device(9) is not None and pool.client_for_device(3) is None
+    assert pool.client_for_device(9).set_clamp_pos(0.03) == 0  # still commandable
+    assert box.clamp_cmds[-1] == (0.03, 9)
+    pool.stop()
+
+
 class _TwoBoxSharedSocket(_FakeBox):
     """Two BOXes streaming on one socket while broadcast discovery answers nothing.
 
@@ -1096,6 +1121,43 @@ def test_discover_boxes_returns_empty_when_wheel_missing(monkeypatch):
 
     monkeypatch.setattr("builtins.__import__", _import)
     assert box_client.discover_boxes() == []
+
+
+def _two_boxes_on_the_bench(fake_box_module):
+    created: list[_FakeBox] = []
+
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        created.append(b)
+        return b
+
+    fake_box_module.Box = _factory  # type: ignore[assignment]
+    # 2026-10-09: the handheld BOX that recorded and the BOX on the FR3, both on Thor.
+    # IP order puts the arm's first today; DHCP can swap that tomorrow.
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=596523097, sn="box", ip="192.168.2.134", capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=1819152274, sn="box", ip="192.168.216.196", capabilities=box_client.CAP_GRIPPER),
+    ]
+    return created
+
+
+def test_box_client_drives_the_pinned_device_not_the_first_discovered(fake_box_module):
+    created = _two_boxes_on_the_bench(fake_box_module)
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01), device_id=1819152274)
+    assert client.start() is True
+    try:
+        assert client.set_clamp_pos(0.03) == 0
+    finally:
+        client.stop()
+    assert created[-1].clamp_cmds == [(0.03, 1819152274)]
+
+
+def test_box_client_refuses_to_stand_in_for_a_pinned_device_that_is_absent(fake_box_module):
+    created = _two_boxes_on_the_bench(fake_box_module)
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01), device_id=42)
+    assert client.start() is False
+    assert created[-1].stopped
+    assert created[-1].clamp_cmds == [] and created[-1].mode == {}
 
 
 def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):

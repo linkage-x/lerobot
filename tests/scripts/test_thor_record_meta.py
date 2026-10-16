@@ -512,11 +512,27 @@ def test_the_alignment_block_states_the_formula_that_was_actually_applied() -> N
 
     assert "exposure_fraction*median_k(sensor_exposure_time_ns[k])" in summary["reference"]
     assert "median across cameras" in summary["reference"]
-    # 0.0 is the shipped default -- the exposure column is recorded, the shift
-    # is not applied -- and the block has to say so, because "not corrected" is
-    # exactly as much a claim about the data as "corrected by half an exposure".
-    assert summary["exposure_fraction"] == 0.0
+    # -0.5 is the shipped value since 2026-10-15 (with each BOX's d_box), and the
+    # block has to say so: an episode built under 0.0 says 0.0, and "corrected by
+    # half an exposure" is as much a claim about the data as "not corrected".
+    assert summary["exposure_fraction"] == -0.5
     assert summary["readout_offset_s"] == 0.0
+
+
+def test_the_alignment_block_names_each_boxs_target() -> None:
+    """Which BOX was read where: mid-exposure + its delay, or the raw SOF."""
+    thor_record = _load_thor_record_module()
+    summary = thor_record._box_camera_alignment_summary(
+        [0.0, 1 / 60], 60, raw_frame_times_s=[0.0, 1 / 60],
+        box_delays_s={"box1819152274": 0.009}, box_ids=["box1819152274", "box596523097"],
+    )
+    assert summary["box_targets"]["box1819152274"] == {"target": "mid_exposure_plus_d_box", "d_box_ms": 9.0}
+    assert summary["box_targets"]["box596523097"] == {"target": "raw_sof", "d_box_ms": None}
+    assert summary["box_interpolation"]["fields"]["box_imu"] == ["acc_g", "gyr_deg_s", "quat_wxyz"]
+    one = thor_record._box_camera_alignment_summary(
+        [0.0, 1 / 60], 60, raw_frame_times_s=[0.0, 1 / 60], box_delays_s={"box1819152274": 0.009}, box_ids=[""],
+    )
+    assert one["box_targets"] == {"unnamed": {"target": "raw_sof", "d_box_ms": None}}
 
 
 def test_the_alignment_block_carries_the_residual_the_median_cannot_remove() -> None:
