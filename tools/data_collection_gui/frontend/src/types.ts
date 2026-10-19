@@ -1261,6 +1261,8 @@ export type RolloutRun = {
    *  Absent when no terminal servo pose was configured, which means the policy owns the
    *  descent. */
   terminalServoConfig?: RolloutArm;
+  /** The align phase of the rollout phase schedule. Absent when none was configured. */
+  phaseScheduleConfig?: RolloutArm;
   /** Progress of a grasp-loop session, folded from the runtime's log lines. Empty otherwise. */
   graspLoop?: GraspLoopProgress;
 };
@@ -1363,6 +1365,12 @@ export type RolloutArm = {
   /** Landings the search may use, counting the nominal pose. 1 means the search is off, which
    *  is E5's control arm exactly. */
   terminalServoSearchLandings?: number;
+  /** The align phase: below this measured z the queue replans every `phaseAlignExecutedSteps`.
+   *  Absent means every step ran the approach settings above, the runtime as it was. */
+  phaseAlignBelowZ?: number;
+  phaseAlignExecutedSteps?: number;
+  phaseAlignExecutionHorizon?: number;
+  phaseAlignActionSamples?: number;
 };
 
 /** What the rig concluded about the terminal descent, from its own `terminal_servo=done` line.
@@ -1623,6 +1631,17 @@ export type RolloutRuntimeOptions = {
    *  actually run before the next replan, which is `chunk_size - rtcReplanQueueSize` -- not the
    *  RTC execution horizon, which is the guidance schedule and a different number. */
   actionSampleHorizon?: number;
+  /** Measured TCP z (m, base frame) below which the RTC queue runs the align phase: a shorter
+   *  executed run, so the newest frame steers the last stretch of each descent. null or
+   *  undefined: no align phase, every step runs the settings above. */
+  phaseAlignBelowZ?: number | null;
+  /** Replan queue size in the align phase; 42 runs 50 - 42 = 8 steps a chunk. */
+  phaseAlignReplanQueueSize?: number;
+  /** RTC guidance window in the align phase. */
+  phaseAlignExecutionHorizon?: number;
+  phaseAlignActionSamples?: number;
+  /** How far above the line the arm must rise before the approach phase returns. */
+  phaseHysteresisMm?: number;
   /** E5. `x,y,z` in metres: below the handoff height, with the peg held, the arm comes off the
    *  policy and is driven here, then lets go. Empty or undefined leaves the policy in charge. */
   terminalServoPose?: string;

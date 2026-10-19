@@ -6637,6 +6637,7 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
         "arm": {
             **dict(state.rollout.policyArm or {}),
             **dict(state.rollout.terminalServoConfig or {}),
+            **dict(state.rollout.phaseScheduleConfig or {}),
         },
         # The rig's own verdict on the descent, recorded next to the grade the operator is about
         # to give and never merged with it. The agreement between the two is what the unattended

@@ -244,6 +244,13 @@ _DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE = RTCAttentionSchedule.EXP
 # queue runs. 25 left steps 17-25 of each chunk executed blind (roadmap v12 (7)-(8)); 39 and
 # above are latency-locked at ~11 steps and the window stops being what was set.
 _DEFAULT_RTC_REPLAN_QUEUE_SIZE = 34
+# The alignment phase of `RolloutPhaseSchedule`, off unless --phase-align-below-z is given.
+# 50 - 42 = 8 executed steps a chunk, about the floor the latency allows: one single-draw forward
+# is ~210 ms, ~7 steps at 30 Hz, before the NUC -> dev-box hop. Below the floor the queue replans
+# the moment each chunk lands, which is the fastest it can go, not an error.
+_DEFAULT_PHASE_ALIGN_REPLAN_QUEUE_SIZE = 42
+_DEFAULT_PHASE_ALIGN_EXECUTION_HORIZON = 8
+_DEFAULT_PHASE_HYSTERESIS_MM = 10.0
 _JOINT_NAMES = [
     'fr3_joint1',
     'fr3_joint2',
@@ -644,6 +651,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help='Optional fixed inference delay in policy steps. Omit to estimate from measured chunk latency.',
+    )
+    parser.add_argument(
+        '--phase-align-below-z',
+        type=float,
+        default=None,
+        help=(
+            'Measured TCP z in metres (robot base frame) below which the rollout is in its align '
+            'phase and the RTC queue runs the --phase-align-* settings; above it the --rtc-* and '
+            '--action-samples settings as before. Off by default: no align phase.'
+        ),
+    )
+    parser.add_argument(
+        '--phase-align-replan-queue-size',
+        type=int,
+        default=_DEFAULT_PHASE_ALIGN_REPLAN_QUEUE_SIZE,
+        help='--rtc-replan-queue-size for the align phase. 42 runs 50 - 42 = 8 steps a chunk.',
+    )
+    parser.add_argument(
+        '--phase-align-execution-horizon',
+        type=int,
+        default=_DEFAULT_PHASE_ALIGN_EXECUTION_HORIZON,
+        help='--rtc-execution-horizon (the guidance window) for the align phase.',
+    )
+    parser.add_argument(
+        '--phase-align-action-samples',
+        type=int,
+        default=1,
+        help=(
+            '--action-samples for the align phase. 1 by default: an 8-draw forward takes ~15 steps, '
+            'which is longer than the run it would choose.'
+        ),
+    )
+    parser.add_argument(
+        '--phase-hysteresis-mm',
+        type=float,
+        default=_DEFAULT_PHASE_HYSTERESIS_MM,
+        help='How far above --phase-align-below-z the arm must rise before the approach phase returns.',
     )
     parser.add_argument(
         '--command-ema-alpha',
@@ -4856,6 +4900,293 @@ def merge_completed_rtc_plan(
         'observation_step': int(result.observation_step),
     }
 
+
+@dataclass(frozen=True)
+class RolloutPhase:
+    """How the RTC queue is driven while the arm is in one phase of a rollout."""
+
+    name: str
+    # Replan when this many actions remain: `chunk_size - replan_queue_size` steps of each chunk
+    # run before the next replaces it (or the inference latency, if that is longer).
+    replan_queue_size: int
+    # RTC's guidance window. Not the executed run above -- see `resolve_action_selection_horizon`.
+    execution_horizon: int
+    action_samples: int
+    action_sample_horizon: int
+
+
+class RolloutPhaseSchedule:
+    """Which `RolloutPhase` drives the queue, chosen from the measured tool height.
+
+    Far from the target a long executed run costs nothing -- no correction within a chunk's
+    reach needs the newest frame -- and it leaves time for an N-draw forward (batch 8 is ~500 ms,
+    ~15 steps). Near it, every step run blind is one the latest image cannot correct. 09-08's
+    "horizon 16 -> 4" arm moved only RTC's guidance window while the queue still ran 25 steps a
+    chunk, so the replan rate, which is what this schedule changes, has never been varied on the
+    arm.
+
+    Height rather than distance to a target: the policy is not told where the peg or the hole is,
+    and on this rig both sit at about the same height (first closure 0.0535 m, seat 0.058 m), so
+    one plane marks the last stretch of either descent. The align phase is entered below
+    `align_below_z` and left only above it plus `hysteresis_m`, so an arm hovering at the line does
+    not flip the replan rate every step. Without `align` the schedule is the approach phase
+    throughout, which is the runtime as it was before the schedule existed.
+    """
+
+    def __init__(
+        self,
+        approach: RolloutPhase,
+        align: RolloutPhase | None = None,
+        *,
+        align_below_z: float | None = None,
+        hysteresis_m: float = 0.0,
+    ) -> None:
+        if (align is None) != (align_below_z is None):
+            raise ValueError('An align phase needs align_below_z, and align_below_z needs an align phase.')
+        if hysteresis_m < 0.0:
+            raise ValueError('hysteresis_m must not be negative.')
+        self.approach = approach
+        self.align = align
+        self.align_below_z = align_below_z
+        self.hysteresis_m = float(hysteresis_m)
+        self.current = approach
+
+    def reset(self) -> None:
+        self.current = self.approach
+
+    def update(self, observed_z: float) -> bool:
+        """Move to the phase `observed_z` calls for. True when that changed the phase."""
+        if self.align is None or self.align_below_z is None:
+            return False
+        if self.current is self.approach and observed_z < self.align_below_z:
+            self.current = self.align
+            return True
+        if self.current is self.align and observed_z > self.align_below_z + self.hysteresis_m:
+            self.current = self.approach
+            return True
+        return False
+
+
+def build_rollout_phase_schedule(
+    args: argparse.Namespace,
+    *,
+    rtc_enabled: bool,
+    chunk_size: int,
+    approach: RolloutPhase,
+    lateral_action_indices: tuple[int, int] | None,
+) -> RolloutPhaseSchedule:
+    """The run's phase schedule, refused at startup when its align phase could not run as asked."""
+    if args.phase_align_below_z is None:
+        return RolloutPhaseSchedule(approach)
+    if not rtc_enabled or chunk_size <= 1:
+        raise SystemExit(
+            '--phase-align-below-z changes how the RTC queue replans, and RTC is disabled for this '
+            'run, so the align phase would have been logged while changing nothing.'
+        )
+    execution_horizon = int(args.phase_align_execution_horizon)
+    if execution_horizon <= 0:
+        raise SystemExit('--phase-align-execution-horizon must be > 0.')
+    action_samples = max(1, int(args.phase_align_action_samples))
+    if action_samples > 1 and lateral_action_indices is None:
+        raise SystemExit(
+            f'--phase-align-action-samples {action_samples} needs lateral delta columns to select '
+            'among the draws, and this action contract has none.'
+        )
+    replan_queue_size = min(max(int(args.phase_align_replan_queue_size), 0), chunk_size - 1)
+    align = RolloutPhase(
+        name='align',
+        replan_queue_size=replan_queue_size,
+        execution_horizon=execution_horizon,
+        action_samples=action_samples,
+        action_sample_horizon=resolve_action_selection_horizon(
+            int(args.action_sample_horizon),
+            chunk_size=chunk_size,
+            replan_queue_size=replan_queue_size,
+        ),
+    )
+    return RolloutPhaseSchedule(
+        approach,
+        align,
+        align_below_z=float(args.phase_align_below_z),
+        hysteresis_m=float(args.phase_hysteresis_mm) / 1000.0,
+    )
+
+
+def _rtc_latency_tracker(rtc_state: dict[str, Any], action_samples: int) -> LatencyTracker:
+    # One per draw count, because the draw count is what sets the latency (8 draws ~2.4x one), and
+    # a tracker reports its all-time max: shared, it would guide every single-draw chunk after the
+    # first 8-draw one as if it had taken 500 ms.
+    return rtc_state['latency_trackers'].setdefault(int(action_samples), LatencyTracker())
+
+
+def _rtc_guidance_delay_steps(
+    rtc_state: dict[str, Any],
+    *,
+    action_samples: int,
+    time_per_step_s: float,
+    inference_delay_steps: int | None,
+) -> int:
+    if inference_delay_steps is not None:
+        return max(int(inference_delay_steps), 0)
+    trackers: dict[int, LatencyTracker] = rtc_state['latency_trackers']
+    tracker = trackers.get(int(action_samples))
+    if tracker is not None and len(tracker) > 0:
+        tracked_latency = tracker.max() or 0.0
+    else:
+        # A draw count not yet timed this rollout: the other phase's figure beats assuming zero.
+        tracked_latency = max((t.max() or 0.0 for t in trackers.values()), default=0.0)
+    return max(int(math.ceil(float(tracked_latency) / time_per_step_s)), 0)
+
+
+def advance_rtc_queue(
+    rtc_state: dict[str, Any],
+    planner: AsyncActionChunkPlanner,
+    policy_observation: dict[str, np.ndarray],
+    *,
+    phase: RolloutPhase,
+    step_idx: int,
+    time_per_step_s: float,
+    inference_delay_steps: int | None,
+    predict_kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """One control step of the RTC queue: merge a finished plan, replan if `phase` says so, pop.
+
+    `predict_kwargs` holds what stays fixed for the run -- the policy and its processors, the
+    prompt, the sampling's column indices and aggregate. `phase` supplies the rest. Leaves its
+    record in `rtc_state['last_debug']`.
+    """
+    action_queue = rtc_state['queue']
+    if not isinstance(action_queue, ActionQueue):
+        raise RuntimeError('RTC is enabled but the rollout action queue was not initialized.')
+
+    completed_plan = planner.pop_completed()
+    if completed_plan is not None:
+        rtc_state['last_debug'] = merge_completed_rtc_plan(
+            action_queue,
+            completed_plan,
+            _rtc_latency_tracker(rtc_state, rtc_state['planning_samples']),
+        )
+
+    if action_queue.empty():
+        if planner.running():
+            # This is an overload path, not the intended steady state. Wait for the
+            # in-flight plan rather than crashing, but make the stall explicit in logs.
+            print('[WARN] rtc_queue_starved_waiting_for_async_plan')
+            if not planner.join(timeout_s=5.0):
+                raise RuntimeError(
+                    'RTC action queue starved and async chunk prediction did not finish within 5s.'
+                )
+            completed_plan = planner.pop_completed()
+            if completed_plan is None:
+                raise RuntimeError('RTC async chunk prediction completed without a mergeable result.')
+            rtc_state['last_debug'] = merge_completed_rtc_plan(
+                action_queue,
+                completed_plan,
+                _rtc_latency_tracker(rtc_state, rtc_state['planning_samples']),
+            )
+
+        if action_queue.empty():
+            prev_chunk_left_over = action_queue.get_left_over()
+            if prev_chunk_left_over is not None:
+                prev_chunk_left_over = prev_chunk_left_over.detach().clone()
+            guidance_delay_steps = _rtc_guidance_delay_steps(
+                rtc_state,
+                action_samples=phase.action_samples,
+                time_per_step_s=time_per_step_s,
+                inference_delay_steps=inference_delay_steps,
+            )
+            chunk_start_t = time.perf_counter()
+            original_actions, processed_actions = predict_action_chunk_for_rollout(
+                policy_observation,
+                **predict_kwargs,
+                inference_delay=guidance_delay_steps,
+                prev_chunk_left_over=prev_chunk_left_over,
+                execution_horizon=phase.execution_horizon,
+                action_samples=phase.action_samples,
+                action_sample_horizon=phase.action_sample_horizon,
+                # This path merges with `real_delay=0` -- nothing is consumed while
+                # the main thread blocks here -- so the chunk runs from its own
+                # first step and the window starts there.
+                action_sample_offset=0,
+            )
+            chunk_latency_s = time.perf_counter() - chunk_start_t
+            _rtc_latency_tracker(rtc_state, phase.action_samples).add(chunk_latency_s)
+            # No queued actions are consumed while the main thread blocks here. Skipping
+            # by wall-clock latency would jump into the middle of the new chunk and create
+            # exactly the discontinuity RTC is supposed to avoid.
+            action_queue.merge(
+                original_actions,
+                processed_actions,
+                real_delay=0,
+                action_index_before_inference=action_queue.get_action_index(),
+            )
+            rtc_state['last_debug'] = {
+                'status': 'replan_sync_bootstrap' if prev_chunk_left_over is None else 'replan_sync_starved',
+                'latency_s': chunk_latency_s,
+                'guidance_delay_steps': guidance_delay_steps,
+                'merge_delay_steps': 0,
+                'actual_consumed_steps': 0,
+                'queue_size': action_queue.qsize(),
+                'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
+            }
+
+    elif action_queue.qsize() <= phase.replan_queue_size:
+        if planner.running():
+            rtc_state['last_debug'] = {
+                'status': 'replan_async_pending',
+                'queue_size': action_queue.qsize(),
+            }
+        else:
+            prev_chunk_left_over = action_queue.get_left_over()
+            if prev_chunk_left_over is not None:
+                prev_chunk_left_over = prev_chunk_left_over.detach().clone()
+            guidance_delay_steps = _rtc_guidance_delay_steps(
+                rtc_state,
+                action_samples=phase.action_samples,
+                time_per_step_s=time_per_step_s,
+                inference_delay_steps=inference_delay_steps,
+            )
+            started = planner.start(
+                policy_observation,
+                predict_kwargs={
+                    **predict_kwargs,
+                    'inference_delay': guidance_delay_steps,
+                    'prev_chunk_left_over': prev_chunk_left_over,
+                    'execution_horizon': phase.execution_horizon,
+                    'action_samples': phase.action_samples,
+                    'action_sample_horizon': phase.action_sample_horizon,
+                    # `merge_completed_rtc_plan` will drop this many steps off the
+                    # front of the returned chunk: they cover the inference the
+                    # previous chunk drove through. They never reach the robot, so
+                    # they get no vote in which draw is executed.
+                    'action_sample_offset': guidance_delay_steps,
+                },
+                action_index_before_inference=action_queue.get_action_index(),
+                guidance_delay_steps=guidance_delay_steps,
+                observation_step=step_idx,
+            )
+            if started:
+                rtc_state['planning_samples'] = phase.action_samples
+            rtc_state['last_debug'] = {
+                'status': 'replan_async_start' if started else 'replan_async_pending',
+                'latency_s': 0.0,
+                'guidance_delay_steps': guidance_delay_steps,
+                'merge_delay_steps': 0,
+                'queue_size': action_queue.qsize(),
+                'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
+            }
+    else:
+        rtc_state['last_debug'] = {
+            'status': 'replan_async_pending' if planner.running() else 'reuse',
+            'queue_size': action_queue.qsize(),
+        }
+    rtc_state['last_debug']['phase'] = phase.name
+    action_tensor = action_queue.get()
+    if action_tensor is None:
+        raise RuntimeError('RTC action queue is empty after chunk prediction.')
+    return action_tensor
+
+
 def prepare_rollout_policy_config(
     pretrained_dir: Path,
     *,
@@ -5098,7 +5429,9 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
     )
     rtc_state: dict[str, Any] = {
         'queue': ActionQueue(rtc_config) if rtc_enabled else None,
-        'latency_tracker': LatencyTracker(),
+        # Keyed by draw count; see `_rtc_latency_tracker`.
+        'latency_trackers': {},
+        'planning_samples': 1,
         'last_debug': {'status': 'disabled'},
     }
     if rtc_enabled and args.act_temporal_stuck_max_offset is not None:
@@ -5188,6 +5521,30 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 f'(chunk_size={policy_chunk_size} - replan_queue_size={int(rtc_replan_queue_size)}); '
                 'RTC guides over a different span than the queue runs. Unchanged by design.'
             )
+    rollout_phases = build_rollout_phase_schedule(
+        args,
+        rtc_enabled=rtc_enabled,
+        chunk_size=policy_chunk_size,
+        approach=RolloutPhase(
+            name='approach',
+            replan_queue_size=int(rtc_replan_queue_size),
+            execution_horizon=int(args.rtc_execution_horizon),
+            action_samples=action_samples,
+            action_sample_horizon=action_sample_horizon,
+        ),
+        lateral_action_indices=lateral_action_indices,
+    )
+    for phase in (rollout_phases.approach, rollout_phases.align):
+        if phase is None or not rtc_enabled:
+            continue
+        print(
+            f'[INFO] rollout_phase_config phase={phase.name} '
+            f'below_z={"-" if phase is rollout_phases.approach else f"{rollout_phases.align_below_z:.4f}"} '
+            f'replan_queue_size={phase.replan_queue_size} '
+            f'executed_steps={max(1, policy_chunk_size - phase.replan_queue_size)} '
+            f'execution_horizon={phase.execution_horizon} '
+            f'action_samples={phase.action_samples} selection_horizon={phase.action_sample_horizon}'
+        )
     # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
     # is a startup error, not something discovered with a peg in the gripper 12 cm above the
     # fixture. The reach check is not run yet -- it needs the arm -- so this is the deterministic
@@ -5651,8 +6008,10 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         postprocessor.reset()
         if rtc_enabled:
             rtc_state['queue'] = ActionQueue(rtc_config)
-            rtc_state['latency_tracker'] = LatencyTracker()
+            rtc_state['latency_trackers'] = {}
+            rtc_state['planning_samples'] = 1
             rtc_state['last_debug'] = {'status': 'reset'}
+        rollout_phases.reset()
 
     def run_policy_rollout(
         interactive_keyboard: InteractiveRolloutKeyboard | None = None,
@@ -5697,6 +6056,19 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         terminal_servo_state: dict[str, bool] = {'armed': False, 'fired': False}
         terminal_servo_widths: deque[float] = deque(maxlen=_TERMINAL_SERVO_WIDTH_WINDOW)
         rtc_planner = AsyncActionChunkPlanner() if rtc_enabled else None
+        # What `advance_rtc_queue` passes on every prediction; the active phase supplies the rest.
+        rtc_predict_kwargs = {
+            'policy': policy,
+            'device': device,
+            'preprocessor': preprocessor,
+            'postprocessor': postprocessor,
+            'use_amp': bool(policy.config.use_amp),
+            'task': task_prompt,
+            'robot_type': robot.name,
+            'action_aggregate': str(args.action_aggregate),
+            'lateral_action_indices': lateral_action_indices,
+            'gripper_action_index': gripper_action_index,
+        }
 
         def finish_rollout(status: str) -> str:
             if rtc_planner is not None and not rtc_planner.join(timeout_s=5.0):
@@ -5915,157 +6287,27 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 )
                 print(f'[INFO] step0_capture_dump={dump_dir}')
             if rtc_enabled:
-                action_queue = rtc_state['queue']
-                if not isinstance(action_queue, ActionQueue):
-                    raise RuntimeError('RTC is enabled but the rollout action queue was not initialized.')
-                latency_tracker = rtc_state['latency_tracker']
-                if not isinstance(latency_tracker, LatencyTracker):
-                    raise RuntimeError('RTC is enabled but the latency tracker was not initialized.')
                 if rtc_planner is None:
                     raise RuntimeError('RTC is enabled but the async planner was not initialized.')
-
-                completed_plan = rtc_planner.pop_completed()
-                if completed_plan is not None:
-                    rtc_state['last_debug'] = merge_completed_rtc_plan(
-                        action_queue,
-                        completed_plan,
-                        latency_tracker,
+                if rollout_phases.update(float(robot_observation['ee.z'])):
+                    print(
+                        f'[INFO] rollout_phase={rollout_phases.current.name} step={step_idx} '
+                        f'z={float(robot_observation["ee.z"]):.4f} '
+                        f'replan_queue_size={rollout_phases.current.replan_queue_size} '
+                        f'execution_horizon={rollout_phases.current.execution_horizon} '
+                        f'action_samples={rollout_phases.current.action_samples}'
                     )
-
-                if action_queue.empty():
-                    if rtc_planner.running():
-                        # This is an overload path, not the intended steady state. Wait for the
-                        # in-flight plan rather than crashing, but make the stall explicit in logs.
-                        print('[WARN] rtc_queue_starved_waiting_for_async_plan')
-                        if not rtc_planner.join(timeout_s=5.0):
-                            raise RuntimeError(
-                                'RTC action queue starved and async chunk prediction did not finish within 5s.'
-                            )
-                        completed_plan = rtc_planner.pop_completed()
-                        if completed_plan is None:
-                            raise RuntimeError('RTC async chunk prediction completed without a mergeable result.')
-                        rtc_state['last_debug'] = merge_completed_rtc_plan(
-                            action_queue,
-                            completed_plan,
-                            latency_tracker,
-                        )
-
-                    if action_queue.empty():
-                        prev_chunk_left_over = action_queue.get_left_over()
-                        if prev_chunk_left_over is not None:
-                            prev_chunk_left_over = prev_chunk_left_over.detach().clone()
-                        tracked_latency = latency_tracker.max() or 0.0
-                        guidance_delay_steps = (
-                            int(args.rtc_inference_delay_steps)
-                            if args.rtc_inference_delay_steps is not None
-                            else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
-                        )
-                        guidance_delay_steps = max(guidance_delay_steps, 0)
-                        chunk_start_t = time.perf_counter()
-                        original_actions, processed_actions = predict_action_chunk_for_rollout(
-                            policy_observation,
-                            policy=policy,
-                            device=device,
-                            preprocessor=preprocessor,
-                            postprocessor=postprocessor,
-                            use_amp=bool(policy.config.use_amp),
-                            inference_delay=guidance_delay_steps,
-                            prev_chunk_left_over=prev_chunk_left_over,
-                            execution_horizon=int(args.rtc_execution_horizon),
-                            task=task_prompt,
-                            robot_type=robot.name,
-                            action_samples=action_samples,
-                            action_aggregate=str(args.action_aggregate),
-                            lateral_action_indices=lateral_action_indices,
-                            gripper_action_index=gripper_action_index,
-                            action_sample_horizon=action_sample_horizon,
-                            # This path merges with `real_delay=0` -- nothing is consumed while
-                            # the main thread blocks here -- so the chunk runs from its own
-                            # first step and the window starts there.
-                            action_sample_offset=0,
-                        )
-                        chunk_latency_s = time.perf_counter() - chunk_start_t
-                        latency_tracker.add(chunk_latency_s)
-                        # No queued actions are consumed while the main thread blocks here. Skipping
-                        # by wall-clock latency would jump into the middle of the new chunk and create
-                        # exactly the discontinuity RTC is supposed to avoid.
-                        action_queue.merge(
-                            original_actions,
-                            processed_actions,
-                            real_delay=0,
-                            action_index_before_inference=action_queue.get_action_index(),
-                        )
-                        rtc_state['last_debug'] = {
-                            'status': 'replan_sync_bootstrap' if prev_chunk_left_over is None else 'replan_sync_starved',
-                            'latency_s': chunk_latency_s,
-                            'guidance_delay_steps': guidance_delay_steps,
-                            'merge_delay_steps': 0,
-                            'actual_consumed_steps': 0,
-                            'queue_size': action_queue.qsize(),
-                            'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
-                        }
-
-                elif action_queue.qsize() <= rtc_replan_queue_size:
-                    if rtc_planner.running():
-                        rtc_state['last_debug'] = {
-                            'status': 'replan_async_pending',
-                            'queue_size': action_queue.qsize(),
-                        }
-                    else:
-                        prev_chunk_left_over = action_queue.get_left_over()
-                        if prev_chunk_left_over is not None:
-                            prev_chunk_left_over = prev_chunk_left_over.detach().clone()
-                        tracked_latency = latency_tracker.max() or 0.0
-                        guidance_delay_steps = (
-                            int(args.rtc_inference_delay_steps)
-                            if args.rtc_inference_delay_steps is not None
-                            else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
-                        )
-                        guidance_delay_steps = max(guidance_delay_steps, 0)
-                        started = rtc_planner.start(
-                            policy_observation,
-                            predict_kwargs={
-                                'policy': policy,
-                                'device': device,
-                                'preprocessor': preprocessor,
-                                'postprocessor': postprocessor,
-                                'use_amp': bool(policy.config.use_amp),
-                                'inference_delay': guidance_delay_steps,
-                                'prev_chunk_left_over': prev_chunk_left_over,
-                                'execution_horizon': int(args.rtc_execution_horizon),
-                                'task': task_prompt,
-                                'robot_type': robot.name,
-                                'action_samples': action_samples,
-                                'action_aggregate': str(args.action_aggregate),
-                                'lateral_action_indices': lateral_action_indices,
-                                'gripper_action_index': gripper_action_index,
-                                'action_sample_horizon': action_sample_horizon,
-                                # `merge_completed_rtc_plan` will drop this many steps off the
-                                # front of the returned chunk: they cover the inference the
-                                # previous chunk drove through. They never reach the robot, so
-                                # they get no vote in which draw is executed.
-                                'action_sample_offset': guidance_delay_steps,
-                            },
-                            action_index_before_inference=action_queue.get_action_index(),
-                            guidance_delay_steps=guidance_delay_steps,
-                            observation_step=step_idx,
-                        )
-                        rtc_state['last_debug'] = {
-                            'status': 'replan_async_start' if started else 'replan_async_pending',
-                            'latency_s': 0.0,
-                            'guidance_delay_steps': guidance_delay_steps,
-                            'merge_delay_steps': 0,
-                            'queue_size': action_queue.qsize(),
-                            'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
-                        }
-                else:
-                    rtc_state['last_debug'] = {
-                        'status': 'replan_async_pending' if rtc_planner.running() else 'reuse',
-                        'queue_size': action_queue.qsize(),
-                    }
-                action_tensor = action_queue.get()
-                if action_tensor is None:
-                    raise RuntimeError('RTC action queue is empty after chunk prediction.')
+                action_tensor = advance_rtc_queue(
+                    rtc_state,
+                    rtc_planner,
+                    policy_observation,
+                    phase=rollout_phases.current,
+                    step_idx=step_idx,
+                    time_per_step_s=rtc_time_per_step,
+                    inference_delay_steps=args.rtc_inference_delay_steps,
+                    predict_kwargs=rtc_predict_kwargs,
+                )
+                action_queue = rtc_state['queue']
                 temporal_offset_used = 0
             else:
                 action_tensor = predict_action(
@@ -6395,6 +6637,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                             f" rtc_lat_ms={float(rtc_state['last_debug'].get('latency_s', 0.0)) * 1000.0:.1f}"
                             f" rtc_delay={int(rtc_state['last_debug'].get('guidance_delay_steps', 0))}"
                             f"->{int(rtc_state['last_debug'].get('merge_delay_steps', 0))}"
+                            f" rtc_phase={rtc_state['last_debug'].get('phase', '-')}"
                         )
                     )
                     + (

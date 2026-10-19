@@ -737,8 +737,12 @@ _ARM_INT_FIELDS = (
     # default. Present means it was pinned, and a pinned offset is a different arm.
     "selectionOffsetSteps",
     "terminalServoSearchLandings",
+    "phaseAlignExecutedSteps",
+    "phaseAlignExecutionHorizon",
+    "phaseAlignActionSamples",
 )
 _ARM_SCALAR_FIELDS = (
+    "phaseAlignBelowZ",
     "terminalServoHandoffZ",
     "terminalServoMaxSpeedMs",
     "terminalServoSearchRingM",

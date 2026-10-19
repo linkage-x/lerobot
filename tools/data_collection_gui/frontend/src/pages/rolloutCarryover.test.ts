@@ -30,6 +30,21 @@ describe("carriedOverNotice", () => {
   });
 });
 
+describe("the align phase across rollouts", () => {
+  it("is named when it comes back on, and silent when it is off", () => {
+    expect(
+      carriedOverNotice({ mode: "real", runtimeOptions: { phaseAlignBelowZ: 0.12 } })
+    ).toContain("align phase is on from last time, below z = 0.12 m");
+    expect(
+      carriedOverNotice({ mode: "real", runtimeOptions: { phaseAlignBelowZ: null } })
+    ).not.toContain("align phase");
+  });
+
+  it("reaches the page's fields from the last rollout", () => {
+    expect(rolloutPageSource).toContain("setPhaseAlignBelowZ(options.phaseAlignBelowZ == null");
+  });
+});
+
 describe("the takeover switch across rollouts", () => {
   it("comes back from the last rollout instead of starting off every time", () => {
     // The switch lives in a subcard that a rollout can be started without ever scrolling to, so

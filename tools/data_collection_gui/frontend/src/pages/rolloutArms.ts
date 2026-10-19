@@ -41,6 +41,11 @@ export function describeArm(arm: RolloutArm | undefined): string {
   } else if (arm.terminalServoXyz) {
     parts.push("fixed pose");
   }
+  if (arm.phaseAlignBelowZ !== undefined) {
+    parts.push(
+      `align < ${arm.phaseAlignBelowZ.toFixed(3)} m: ${arm.phaseAlignExecutedSteps ?? "?"} steps`
+    );
+  }
   return parts.join(" · ");
 }
 

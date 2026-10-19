@@ -2688,3 +2688,176 @@ def test_a_dataset_of_one_kind_of_episode_refuses_the_other(tmp_path: Path, monk
     args.grasp_loop_record_whole_trial = recorded_whole
     _, writer = fr3_act_infer_real_runtime.build_dagger_writer(args, ds_meta=ds_meta, fps=30)
     assert writer is not None
+
+
+def _phase(name='approach', *, replan_queue_size=34, execution_horizon=16, action_samples=1, action_sample_horizon=16):
+    return fr3_act_infer_real_runtime.RolloutPhase(
+        name=name,
+        replan_queue_size=replan_queue_size,
+        execution_horizon=execution_horizon,
+        action_samples=action_samples,
+        action_sample_horizon=action_sample_horizon,
+    )
+
+
+def _phase_schedule(*extra: str, rtc_enabled=True, lateral=(0, 1), approach=None):
+    args = fr3_act_infer_real_runtime.parse_args(list(extra))
+    return fr3_act_infer_real_runtime.build_rollout_phase_schedule(
+        args,
+        rtc_enabled=rtc_enabled,
+        chunk_size=50,
+        approach=approach or _phase(),
+        lateral_action_indices=lateral,
+    )
+
+
+def test_the_phase_schedule_is_off_unless_a_height_is_given():
+    """Without --phase-align-below-z every step is the approach phase: the runtime as it was."""
+    args = fr3_act_infer_real_runtime.parse_args([])
+    assert args.phase_align_below_z is None
+    schedule = _phase_schedule()
+    assert schedule.align is None
+    for z in (0.30, 0.10, 0.02):
+        assert schedule.update(z) is False
+        assert schedule.current is schedule.approach
+
+
+def test_the_align_phase_runs_eight_steps_a_chunk_by_default():
+    schedule = _phase_schedule('--phase-align-below-z', '0.12')
+    align = schedule.align
+    assert align is not None
+    assert (align.replan_queue_size, align.execution_horizon, align.action_samples) == (42, 8, 1)
+    # The selection window is the run the queue executes, not the guidance horizon.
+    assert align.action_sample_horizon == 8
+    # A replan threshold past the chunk is clamped the same way the approach phase's is.
+    clamped = _phase_schedule('--phase-align-below-z', '0.12', '--phase-align-replan-queue-size', '80')
+    assert clamped.align.replan_queue_size == 49
+
+
+def test_the_phase_schedule_enters_below_the_line_and_leaves_only_past_the_hysteresis():
+    schedule = _phase_schedule('--phase-align-below-z', '0.12', '--phase-hysteresis-mm', '10')
+    assert schedule.update(0.125) is False and schedule.current.name == 'approach'
+    assert schedule.update(0.1199) is True and schedule.current.name == 'align'
+    # Hovering at the line, or just above it, does not flip the replan rate back.
+    assert schedule.update(0.121) is False and schedule.current.name == 'align'
+    assert schedule.update(0.1299) is False and schedule.current.name == 'align'
+    assert schedule.update(0.1301) is True and schedule.current.name == 'approach'
+    schedule.update(0.05)
+    schedule.reset()
+    assert schedule.current is schedule.approach
+
+
+def test_an_align_phase_that_could_not_run_as_asked_is_refused_at_startup():
+    with pytest.raises(SystemExit, match='RTC is disabled'):
+        _phase_schedule('--phase-align-below-z', '0.12', rtc_enabled=False)
+    with pytest.raises(SystemExit, match='lateral delta columns'):
+        _phase_schedule('--phase-align-below-z', '0.12', '--phase-align-action-samples', '8', lateral=None)
+    with pytest.raises(SystemExit, match='execution-horizon'):
+        _phase_schedule('--phase-align-below-z', '0.12', '--phase-align-execution-horizon', '0')
+    with pytest.raises(ValueError, match='align_below_z'):
+        fr3_act_infer_real_runtime.RolloutPhaseSchedule(_phase(), _phase('align'))
+
+
+def test_guidance_delay_is_timed_per_draw_count():
+    """An 8-draw forward is ~2.4x a single one; one shared all-time max would guide every
+    single-draw chunk after the first 8-draw one as if it had taken the longer time."""
+    rt = fr3_act_infer_real_runtime
+    rtc_state = {'latency_trackers': {}}
+    delay = lambda samples: rt._rtc_guidance_delay_steps(
+        rtc_state, action_samples=samples, time_per_step_s=1.0 / 30.0, inference_delay_steps=None
+    )
+    assert delay(1) == 0
+    rt._rtc_latency_tracker(rtc_state, 8).add(0.50)
+    # Not yet timed: the other count's figure, rather than zero.
+    assert delay(1) == 15
+    rt._rtc_latency_tracker(rtc_state, 1).add(0.21)
+    assert delay(1) == 7
+    assert delay(8) == 15
+    assert rt._rtc_guidance_delay_steps(
+        rtc_state, action_samples=8, time_per_step_s=1.0 / 30.0, inference_delay_steps=3
+    ) == 3
+
+
+class _FakeDescendingRobot:
+    """A tool that moves down by whatever dz each executed action carries."""
+
+    def __init__(self, z: float):
+        self.z = z
+
+    def execute(self, action: torch.Tensor) -> None:
+        self.z += float(action[0])
+
+
+def test_a_fake_robot_descending_through_the_line_replans_twice_as_often_below_it(monkeypatch):
+    """The real queue, planner and merge, driven step by step by a robot descending 2 mm a step.
+
+    Each plan is joined before the next step, so it merges one step after it started and the
+    cadence is exactly `chunk_size - replan_queue_size`: 16 steps above the line, 8 below.
+    """
+    rt = fr3_act_infer_real_runtime
+    predictions: list[dict] = []
+
+    def fake_predict(observation, **kwargs):
+        predictions.append(
+            {
+                'step': int(observation['step'][0]),
+                'z': float(observation['z'][0]),
+                'execution_horizon': kwargs['execution_horizon'],
+                'action_samples': kwargs['action_samples'],
+                'action_sample_horizon': kwargs['action_sample_horizon'],
+                'task': kwargs['task'],
+            }
+        )
+        chunk = torch.full((50, 1), -0.002, dtype=torch.float32)
+        return chunk, chunk.clone()
+
+    monkeypatch.setattr(rt, 'predict_action_chunk_for_rollout', fake_predict)
+    schedule = _phase_schedule(
+        '--phase-align-below-z', '0.12', approach=_phase(action_samples=8)
+    )
+    rtc_state = {
+        'queue': rt.ActionQueue(rt.RTCConfig(enabled=True)),
+        'latency_trackers': {},
+        'planning_samples': 1,
+        'last_debug': {'status': 'reset'},
+    }
+    planner = rt.AsyncActionChunkPlanner()
+    robot = _FakeDescendingRobot(z=0.201)
+    phases: list[str] = []
+    for step_idx in range(70):
+        schedule.update(robot.z)
+        observation = {
+            'step': np.array([step_idx], dtype=np.float32),
+            'z': np.array([robot.z], dtype=np.float32),
+        }
+        action = rt.advance_rtc_queue(
+            rtc_state,
+            planner,
+            observation,
+            phase=schedule.current,
+            step_idx=step_idx,
+            time_per_step_s=1.0 / 30.0,
+            inference_delay_steps=None,
+            predict_kwargs={'task': 'insert the peg'},
+        )
+        phases.append(rtc_state['last_debug']['phase'])
+        robot.execute(action)
+        assert planner.join(timeout_s=2.0)
+
+    # 0.201 m down past 0.12 m at 2 mm a step: the line is crossed on step 41.
+    first_align = phases.index('align')
+    assert first_align == 41 and set(phases[first_align:]) == {'align'}
+    steps = [p['step'] for p in predictions]
+    # Bootstrap at 0, then every 16 steps while above the line ...
+    assert steps[:3] == [0, 16, 32]
+    # ... and the step it is crossed already replans: 8 steps had run of a 16-step chunk, which
+    # is past the align phase's 42 threshold. From then on every 8 steps.
+    assert steps[3:] == list(range(41, 70, 8))
+    for prediction in predictions:
+        if prediction['z'] < 0.12:
+            assert (prediction['execution_horizon'], prediction['action_samples'], prediction['action_sample_horizon']) == (8, 1, 8)
+        else:
+            assert (prediction['execution_horizon'], prediction['action_samples'], prediction['action_sample_horizon']) == (16, 8, 16)
+        assert prediction['task'] == 'insert the peg'
+    # The robot really followed the queue: 70 steps of 2 mm.
+    assert math.isclose(robot.z, 0.201 - 70 * 0.002, abs_tol=1e-6)

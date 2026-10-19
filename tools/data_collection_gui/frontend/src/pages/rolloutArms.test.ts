@@ -35,6 +35,12 @@ describe("describeArm", () => {
     ).toBe("medoid of 8 · 9 landings @ 7.0 mm");
   });
 
+  it("names the align phase, so a run with it is not filed as the control", () => {
+    expect(
+      describeArm({ actionSamples: 8, actionAggregate: "medoid", phaseAlignBelowZ: 0.12, phaseAlignExecutedSteps: 8 })
+    ).toBe("medoid of 8 · align < 0.120 m: 8 steps");
+  });
+
   it("says nothing when the runtime announced nothing", () => {
     // Empty, not "default": silence is a runtime older than the announce, and printing a
     // default here would invent the one fact this field exists to record.

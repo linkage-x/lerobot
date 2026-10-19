@@ -19,5 +19,9 @@ export function carriedOverNotice(params: RolloutLastParams): string {
   if (params.runtimeOptions?.daggerTakeover) {
     parts.push("SpaceMouse takeover is on from last time — somebody has to be at the rig.");
   }
+  const alignBelowZ = params.runtimeOptions?.phaseAlignBelowZ;
+  if (alignBelowZ != null) {
+    parts.push(`The align phase is on from last time, below z = ${alignBelowZ} m.`);
+  }
   return parts.join(" ");
 }

@@ -132,6 +132,12 @@ action_samples="${FR3_ACTION_SAMPLES-}"
 action_aggregate="${FR3_ACTION_AGGREGATE-}"
 action_sample_horizon="${FR3_ACTION_SAMPLE_HORIZON-}"
 terminal_servo_pose="${FR3_TERMINAL_SERVO_POSE-}"
+# The align phase of the rollout's phase schedule. Unset FR3_PHASE_ALIGN_BELOW_Z = no align phase.
+phase_align_below_z="${FR3_PHASE_ALIGN_BELOW_Z-}"
+phase_align_replan_queue_size="${FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE-}"
+phase_align_execution_horizon="${FR3_PHASE_ALIGN_EXECUTION_HORIZON-}"
+phase_align_action_samples="${FR3_PHASE_ALIGN_ACTION_SAMPLES-}"
+phase_hysteresis_mm="${FR3_PHASE_HYSTERESIS_MM-}"
 terminal_servo_handoff_z="${FR3_TERMINAL_SERVO_HANDOFF_Z-}"
 terminal_servo_search_ring="${FR3_TERMINAL_SERVO_SEARCH_RING-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
@@ -297,6 +303,21 @@ fi
 if [[ -n "${action_sample_horizon}" ]]; then
   common_args+=(--action-sample-horizon "${action_sample_horizon}")
 fi
+if [[ -n "${phase_align_below_z}" ]]; then
+  common_args+=(--phase-align-below-z "${phase_align_below_z}")
+fi
+if [[ -n "${phase_align_replan_queue_size}" ]]; then
+  common_args+=(--phase-align-replan-queue-size "${phase_align_replan_queue_size}")
+fi
+if [[ -n "${phase_align_execution_horizon}" ]]; then
+  common_args+=(--phase-align-execution-horizon "${phase_align_execution_horizon}")
+fi
+if [[ -n "${phase_align_action_samples}" ]]; then
+  common_args+=(--phase-align-action-samples "${phase_align_action_samples}")
+fi
+if [[ -n "${phase_hysteresis_mm}" ]]; then
+  common_args+=(--phase-hysteresis-mm "${phase_hysteresis_mm}")
+fi
 if [[ -n "${terminal_servo_pose}" ]]; then
   common_args+=(--terminal-servo-pose "${terminal_servo_pose}")
 fi
@@ -345,6 +366,11 @@ case "$mode" in
     echo "FR3_ACTION_SAMPLES=${action_samples:-1}"
     echo "FR3_ACTION_AGGREGATE=${action_aggregate:-<runtime default>}"
     echo "FR3_ACTION_SAMPLE_HORIZON=${action_sample_horizon:-<steps the queue runs: chunk_size - replan_q>}"
+    echo "FR3_PHASE_ALIGN_BELOW_Z=${phase_align_below_z:-<off>}"
+    echo "FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE=${phase_align_replan_queue_size:-<runtime default>}"
+    echo "FR3_PHASE_ALIGN_EXECUTION_HORIZON=${phase_align_execution_horizon:-<runtime default>}"
+    echo "FR3_PHASE_ALIGN_ACTION_SAMPLES=${phase_align_action_samples:-<runtime default>}"
+    echo "FR3_PHASE_HYSTERESIS_MM=${phase_hysteresis_mm:-<runtime default>}"
     echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
     echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
     echo "FR3_TERMINAL_SERVO_SEARCH_RING=${terminal_servo_search_ring:-<off>}"

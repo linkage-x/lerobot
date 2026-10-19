@@ -4269,3 +4269,75 @@ def test_the_funnel_takeover_height_is_passed_as_one_value_or_a_range():
         with pytest.raises(rollout_backend.RolloutError, match="graspLoopFunnelTakeoverDzMm"):
             sanitize({"graspLoopFunnelTakeoverDzMm": bad})
     assert "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+
+
+def test_the_phase_schedule_options_reach_the_launcher(tmp_path: Path):
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {
+            "phaseAlignBelowZ": 0.12,
+            "phaseAlignReplanQueueSize": 42,
+            "phaseAlignExecutionHorizon": 8,
+            "phaseAlignActionSamples": 1,
+            "phaseHysteresisMm": 10,
+        }
+    )
+
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+
+    assert env["FR3_PHASE_ALIGN_BELOW_Z"] == "0.12"
+    assert env["FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE"] == "42"
+    assert env["FR3_PHASE_ALIGN_EXECUTION_HORIZON"] == "8"
+    assert env["FR3_PHASE_ALIGN_ACTION_SAMPLES"] == "1"
+    assert env["FR3_PHASE_HYSTERESIS_MM"] == "10"
+
+
+def test_the_phase_schedule_is_off_unless_the_page_names_a_height(tmp_path: Path):
+    _, env = _command(tmp_path, runtime_options=rollout_backend.sanitize_rollout_runtime_options({}))
+
+    assert "FR3_PHASE_ALIGN_BELOW_Z" not in env
+
+
+def test_the_align_phase_the_runtime_announces_becomes_part_of_the_arm():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] rollout_phase_config phase=align below_z=0.1200 replan_queue_size=42 "
+        "executed_steps=8 execution_horizon=8 action_samples=1 selection_horizon=8"
+    )
+
+    assert parsed["phaseScheduleConfig"] == {
+        "phaseAlignBelowZ": 0.12,
+        "phaseAlignExecutedSteps": 8,
+        "phaseAlignExecutionHorizon": 8,
+        "phaseAlignActionSamples": 1,
+    }
+    assert "every 8 steps" in parsed["message"]
+    # The approach line carries no align phase, and must not be read as the sampling arm either.
+    approach = rollout_backend.parse_rollout_line(
+        "[INFO] rollout_phase_config phase=approach below_z=- replan_queue_size=34 "
+        "executed_steps=16 execution_horizon=16 action_samples=8 selection_horizon=16"
+    )
+    assert "phaseScheduleConfig" not in approach and "policyArm" not in approach
+
+
+def test_the_align_phase_survives_the_arm_whitelist_into_the_outcome_log(tmp_path: Path):
+    """A field the whitelist drops reads as `(absent)` -- the control arm -- for every rollout."""
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        step=214,
+        pendingOutcomeFor=1,
+        policyArm={"actionSamples": 1, "actionAggregate": "medoid", "selectionHorizon": 16},
+        phaseScheduleConfig={
+            "phaseAlignBelowZ": 0.12,
+            "phaseAlignExecutedSteps": 8,
+            "phaseAlignExecutionHorizon": 8,
+            "phaseAlignActionSamples": 1,
+        },
+    )
+
+    entry = gateway._record_rollout_outcome(state, {"outcome": "success"})["entry"]
+
+    assert entry["arm"]["phaseAlignBelowZ"] == 0.12
+    assert entry["arm"]["phaseAlignExecutedSteps"] == 8
+    assert entry["arm"]["phaseAlignExecutionHorizon"] == 8
+    assert entry["arm"]["phaseAlignActionSamples"] == 1

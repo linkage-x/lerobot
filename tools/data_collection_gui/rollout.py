@@ -75,6 +75,13 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_ACTION_SAMPLES",
     "FR3_ACTION_AGGREGATE",
     "FR3_ACTION_SAMPLE_HORIZON",
+    # The rollout phase schedule's align phase. Cleared so a stale shell cannot change the replan
+    # rate near the target in a rollout the page launched without one.
+    "FR3_PHASE_ALIGN_BELOW_Z",
+    "FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE",
+    "FR3_PHASE_ALIGN_EXECUTION_HORIZON",
+    "FR3_PHASE_ALIGN_ACTION_SAMPLES",
+    "FR3_PHASE_HYSTERESIS_MM",
     "FR3_TERMINAL_SERVO_POSE",
     "FR3_TERMINAL_SERVO_HANDOFF_Z",
     "FR3_TERMINAL_SERVO_SEARCH_RING",
@@ -403,6 +410,18 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options, raw, "actionSampleHorizon", "FR3_ACTION_SAMPLE_HORIZON", minimum=0
     )
 
+    _set_optional_float_env(options, raw, "phaseAlignBelowZ", "FR3_PHASE_ALIGN_BELOW_Z", minimum=0.0)
+    _set_optional_int_env(
+        options, raw, "phaseAlignReplanQueueSize", "FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE", minimum=1
+    )
+    _set_optional_int_env(
+        options, raw, "phaseAlignExecutionHorizon", "FR3_PHASE_ALIGN_EXECUTION_HORIZON", minimum=1
+    )
+    _set_optional_int_env(
+        options, raw, "phaseAlignActionSamples", "FR3_PHASE_ALIGN_ACTION_SAMPLES", minimum=1
+    )
+    _set_optional_float_env(options, raw, "phaseHysteresisMm", "FR3_PHASE_HYSTERESIS_MM", minimum=0.0)
+
     # E5. Refused here as well as at startup, because the page is where a mistyped pose is
     # cheapest to catch -- the alternative is a launcher that comes up, homes the arm and then
     # exits on its own argument.
@@ -582,6 +601,8 @@ class RolloutStatus:
     # of every rollout in the session can be filed against the configuration that produced it.
     policyArm: dict[str, Any] = field(default_factory=dict)
     terminalServoConfig: dict[str, Any] = field(default_factory=dict)
+    # The align phase of the rollout phase schedule, the same way: announced once, session-scoped.
+    phaseScheduleConfig: dict[str, Any] = field(default_factory=dict)
     # The grasp loop's own progress, folded from its log lines by `apply_grasp_loop_event`.
     # Empty for every other mode.
     graspLoop: dict[str, Any] = field(default_factory=dict)
@@ -759,6 +780,12 @@ _POLICY_ARM_RE = re.compile(
     # Optional because runtimes before 2026-09-21 announced no offset at all, and a log written by
     # one of those must keep parsing as the arm it was rather than becoming unreadable.
     r"(?:\s+selection_offset=(\S+))?"
+)
+# The rollout phase schedule's align phase. Printed once at startup, only when one is configured,
+# so absence means every step ran the approach phase -- the runtime as it was before the schedule.
+_PHASE_ALIGN_CONFIG_RE = re.compile(
+    r"rollout_phase_config phase=align below_z=(-?[\d.]+)\s+replan_queue_size=\d+"
+    r"\s+executed_steps=(\d+)\s+execution_horizon=(\d+)\s+action_samples=(\d+)"
 )
 # E5 / E7-C. Printed once, only when a terminal servo pose is configured, so absence means the
 # rollout ended wherever the policy left it.
@@ -1000,6 +1027,15 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
                 f"Executing the {arm['actionAggregate']} of {arm['actionSamples']} draws "
                 f"over {arm['selectionHorizon']} steps."
             )
+        )
+        return parsed
+
+    phase_config = parse_phase_schedule_config(stripped)
+    if phase_config:
+        parsed["phaseScheduleConfig"] = phase_config
+        parsed["message"] = (
+            f"Align phase below z = {phase_config['phaseAlignBelowZ']:.3f} m: replanning every "
+            f"{phase_config['phaseAlignExecutedSteps']} steps."
         )
         return parsed
 
@@ -1327,6 +1363,23 @@ def parse_policy_arm(text: str) -> dict[str, Any]:
     if offset is not None and offset.isdigit():
         arm["selectionOffsetSteps"] = int(offset)
     return arm
+
+
+def parse_phase_schedule_config(text: str) -> dict[str, Any]:
+    """The align phase the runtime will switch to below a height, as fields for the arm.
+
+    A run with it and one without are different arms of the same comparison even when every
+    other knob matches, and the page cannot otherwise tell them apart afterwards.
+    """
+    match = _PHASE_ALIGN_CONFIG_RE.search(text)
+    if not match:
+        return {}
+    return {
+        "phaseAlignBelowZ": float(match.group(1)),
+        "phaseAlignExecutedSteps": int(match.group(2)),
+        "phaseAlignExecutionHorizon": int(match.group(3)),
+        "phaseAlignActionSamples": int(match.group(4)),
+    }
 
 
 def parse_terminal_servo_config(text: str) -> dict[str, Any]:

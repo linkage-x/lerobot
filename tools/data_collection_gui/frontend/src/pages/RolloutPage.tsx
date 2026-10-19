@@ -131,6 +131,11 @@ export function RolloutPage() {
   // one draw executed as drawn, and the policy in charge to the end.
   const [actionSamples, setActionSamples] = useState("");
   const [actionAggregate, setActionAggregate] = useState<RolloutActionAggregate>("medoid");
+  // The phase schedule's align phase. Blank height is off, which is the runtime as it was.
+  const [phaseAlignBelowZ, setPhaseAlignBelowZ] = useState("");
+  const [phaseAlignReplanQueueSize, setPhaseAlignReplanQueueSize] = useState("42");
+  const [phaseAlignExecutionHorizon, setPhaseAlignExecutionHorizon] = useState("8");
+  const [phaseAlignActionSamples, setPhaseAlignActionSamples] = useState("1");
   const [terminalServoPose, setTerminalServoPose] = useState("");
   const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
   const [terminalServoSearchRing, setTerminalServoSearchRing] = useState("");
@@ -257,6 +262,10 @@ export function RolloutPage() {
       commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha),
       actionSamples: positiveNumberOr(actionSamples, 1),
       actionAggregate,
+      phaseAlignBelowZ: optionalNumberOrNull(phaseAlignBelowZ),
+      phaseAlignReplanQueueSize: positiveNumberOr(phaseAlignReplanQueueSize, 42),
+      phaseAlignExecutionHorizon: positiveNumberOr(phaseAlignExecutionHorizon, 8),
+      phaseAlignActionSamples: positiveNumberOr(phaseAlignActionSamples, 1),
       // The grasp loop ends every trial at the grasp, so a servo pose there is refused by the
       // runtime; not sending it keeps a leftover field from blocking the start.
       terminalServoPose: modeId === "grasp_loop" ? undefined : terminalServoPose.trim() || undefined,
@@ -290,6 +299,10 @@ export function RolloutPage() {
       commandEmaAlpha,
       actionSamples,
       actionAggregate,
+      phaseAlignBelowZ,
+      phaseAlignReplanQueueSize,
+      phaseAlignExecutionHorizon,
+      phaseAlignActionSamples,
       terminalServoPose,
       terminalServoHandoffZ,
       terminalServoSearchRing,
@@ -439,6 +452,15 @@ export function RolloutPage() {
         );
         if (options.actionSamples !== undefined) setActionSamples(String(options.actionSamples));
         if (options.actionAggregate !== undefined) setActionAggregate(options.actionAggregate);
+        // Carried over like the draw count: it changes how the policy runs, not who drives the
+        // arm. The notice names it when it comes back on.
+        setPhaseAlignBelowZ(options.phaseAlignBelowZ == null ? "" : String(options.phaseAlignBelowZ));
+        if (options.phaseAlignReplanQueueSize !== undefined)
+          setPhaseAlignReplanQueueSize(String(options.phaseAlignReplanQueueSize));
+        if (options.phaseAlignExecutionHorizon !== undefined)
+          setPhaseAlignExecutionHorizon(String(options.phaseAlignExecutionHorizon));
+        if (options.phaseAlignActionSamples !== undefined)
+          setPhaseAlignActionSamples(String(options.phaseAlignActionSamples));
         // Deliberately not carried over. Every other knob here tunes how the policy runs; this
         // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
         // an E5 trial that nobody asked for.
@@ -523,6 +545,10 @@ export function RolloutPage() {
     setRtcReplanQueueSize("34");
     setRtcInferenceDelaySteps("");
     setCommandEmaAlpha("");
+    setPhaseAlignBelowZ("");
+    setPhaseAlignReplanQueueSize("42");
+    setPhaseAlignExecutionHorizon("8");
+    setPhaseAlignActionSamples("1");
     setShowRolloutAdvanced(false);
   }, [selected?.id]);
 
@@ -625,7 +651,11 @@ export function RolloutPage() {
   const takeoverSpans = run?.lastRolloutIntervention?.spans ?? [];
   // The arm this session is running, both halves of it. From the runtime's announce, so what
   // is on screen is what the process did rather than what the form asked for.
-  const armLabel = describeArm({ ...(run?.policyArm ?? {}), ...(run?.terminalServoConfig ?? {}) });
+  const armLabel = describeArm({
+    ...(run?.policyArm ?? {}),
+    ...(run?.terminalServoConfig ?? {}),
+    ...(run?.phaseScheduleConfig ?? {})
+  });
   const lastServo = run?.lastRolloutTerminalServo;
   // One reason per takeover, or one for the rollout when nobody reached in. The count comes
   // from the runtime's span list, so the form cannot ask for a reason belonging to a takeover
@@ -1541,6 +1571,53 @@ export function RolloutPage() {
                 More than one draw costs one batched forward, measured at 521 ms p90 for eight
                 against a 1.2 s replan interval. It aims at the 52-55&deg; conditional width the
                 offline probe measured below z = 0.20: the mean direction is right, one draw is not.
+              </p>
+              <div className="row-actions">
+                <label className="field inline">
+                  <span>Align below z (m)</span>
+                  <input
+                    value={phaseAlignBelowZ}
+                    onChange={(event) => setPhaseAlignBelowZ(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="off; e.g. 0.12"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Align replan queue</span>
+                  <input
+                    value={phaseAlignReplanQueueSize}
+                    onChange={(event) => setPhaseAlignReplanQueueSize(event.target.value)}
+                    inputMode="numeric"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Align horizon</span>
+                  <input
+                    value={phaseAlignExecutionHorizon}
+                    onChange={(event) => setPhaseAlignExecutionHorizon(event.target.value)}
+                    inputMode="numeric"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Align draws</span>
+                  <input
+                    value={phaseAlignActionSamples}
+                    onChange={(event) => setPhaseAlignActionSamples(event.target.value)}
+                    inputMode="numeric"
+                    disabled={isLive}
+                  />
+                </label>
+              </div>
+              <p className="hint">
+                Below the align height the queue replans every 50 &minus; replan-queue steps (8 at
+                42) instead of 16, so the newest frame steers the last stretch of the grasp and
+                the insertion descents. The draws and replan queue above still apply above it.
+                The floor is the inference latency, ~7 steps for one draw: shorter than that, the
+                queue replans as each chunk lands. Keep align draws at 1 &mdash; eight take ~15
+                steps.
               </p>
               <div className="row-actions">
                 <label className="field inline">
