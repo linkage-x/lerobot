@@ -1213,6 +1213,8 @@ export type RolloutRun = {
   /** Where corrections are being written; empty when the operator chose to steer without
    *  recording. */
   daggerDatasetPath?: string;
+  /** `host:port` the forward pass runs on; empty for the gateway's own machine. */
+  policyServer?: string;
   /** Correction episodes written so far this session, summed across rollouts. */
   daggerEpisodes?: number;
   /** Frames dropped past the buffer cap. Non-zero means a correction was longer than the buffer
@@ -1647,6 +1649,8 @@ export type RolloutRuntimeOptions = {
   graspLoopInsertPose?: string;
   /** Record arm B's funnel steps (held grasps only) into the checkpoint's funnel_ dataset. */
   graspLoopRecord?: boolean;
+  /** With graspLoopRecord: whole held trials, the policy's steps too, into the checkpoint's trial_ dataset. */
+  graspLoopRecordWholeTrial?: boolean;
   /** Arm B: how far above the peg the funnel takes over, "h" or "low,high" mm (drawn per trial). */
   graspLoopFunnelTakeoverDzMm?: string;
 };
@@ -1664,6 +1668,33 @@ export type RolloutLastParams = {
   maxSteps?: number;
   moveToStart?: boolean;
   runtimeOptions?: RolloutRuntimeOptions;
+  /** "" for this machine, else `host:port`; re-checked against the gateway's list on start. */
+  policyServer?: string;
+};
+
+/** What a policy server reports about itself (tools/fr3/policy_remote.py, `PolicyHost.status`). */
+export type PolicyServerStatus = {
+  loaded: { spec: Record<string, unknown>; fingerprint: Record<string, unknown>; device: string } | null;
+  /** The spec being loaded right now, while a client waits on its hello. */
+  loading: Record<string, unknown> | null;
+  /** The client holding the policy -- a rollout in progress -- or null. */
+  holder: string | null;
+  idle_s: number | null;
+  idle_unload_s: number | null;
+  gpu?: { name: string; free_mb: number; total_mb: number; allocated_mb: number };
+};
+
+export type PolicyServerEntry = {
+  address: string;
+  reachable: boolean;
+  error?: string;
+  status?: PolicyServerStatus;
+};
+
+/** /api/policy-servers: where a rollout's forward pass can run. */
+export type PolicyServerListing = {
+  local: { available: boolean; detail: string };
+  servers: PolicyServerEntry[];
 };
 
 
@@ -1701,6 +1732,8 @@ export type RolloutStartRequest = {
   maxSteps?: number;
   moveToStart?: boolean;
   runtimeOptions?: RolloutRuntimeOptions;
+  /** "" (or absent) runs the forward pass on the gateway's machine; else one of its policy servers. */
+  policyServer?: string;
 };
 
 /** A run that outlives the page watching it. See tools/data_collection_gui/unattended.py.

@@ -15,8 +15,15 @@
  * meant it: the workspace fence and the reach check both bound the arm, not the drop.
  */
 
-/** Where the pick starts before any dataset has been measured, in metres. */
-export const TABLE_Z_M = 0.035;
+/** Where the pick starts before any dataset has been measured, in metres: the hole, where every
+ *  rollout leaves the peg. The same point as `GRASP_LOOP_PICK_XYZ` in tools/fr3/grasp_loop.py --
+ *  the grasp loop's fixture pick, which held on every 09-29 fetch.
+ *
+ *  Was (0.40, 0.00, 0.035), a point nothing stands at. With no measurement to replace it (a view
+ *  without demonstration parquet, such as funnel105) it stayed on the map labelled "pick", and on
+ *  10-16 a mask was drawn around it as if it were the hole: 130-200 mm left of where the policy
+ *  had learned to grasp. */
+export const DEFAULT_PICK_XYZ: readonly [number, number, number] = [0.3597, -0.1328, 0.055];
 
 /** The height the peg is released from, in metres. Fixed, and not derived from the
  *  demonstrations -- the panel still shows what they measured, but the place height defaults
@@ -26,8 +33,8 @@ export const PLACE_Z_M = 0.058;
 
 /** How far above the pick a place height may sit before it counts as a drop, in metres.
  *
- * Has to clear the gap the two defaults above sit apart (23 mm), or a fresh panel -- one with no
- * measurement yet, so the pick falls back to the table -- opens on a warning about the rig's own
+ * Has to clear the gap the two defaults above sit apart (3 mm), or a fresh panel -- one with no
+ * measurement yet, so the pick falls back to the hole -- opens on a warning about the rig's own
  * setup, which is a banner nobody can act on. It stays far below the 50 cm the constant exists
  * to catch, and far below any release height that would actually let the peg fall. */
 export const DROP_WARNING_M = 0.025;

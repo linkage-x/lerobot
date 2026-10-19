@@ -7,6 +7,7 @@
 #   bash run/deploy.sh thor
 #   bash run/deploy.sh workstation
 #   bash run/deploy.sh workstation --sync-only
+#   bash run/deploy.sh nuc                     # FR3 rig split: NUC robot host + GPU policy server
 #   bash run/deploy.sh thor --no-frontend
 set -euo pipefail
 
@@ -19,12 +20,12 @@ sync_only=false
 no_frontend=false
 
 usage() {
-  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
   case "$arg" in
-    thor|workstation)
+    thor|workstation|nuc)
       if $target_explicit; then
         echo "ERROR: specify exactly one deployment target" >&2
         exit 2
@@ -46,6 +47,14 @@ for arg in "$@"; do
   esac
 done
 
+# Where a rollout's forward pass may run besides the gateway's own machine. Empty for the
+# targets whose robot host has its own GPU.
+policy_remote=""
+policy_dir=""
+policy_address=""
+# The grasp loop's peg mask, when the launcher's default (the 09-22 rollout log) is not on this host.
+grasp_loop_mask=""
+
 case "$target" in
   thor)
     remote="nvidia@192.168.111.122"
@@ -60,6 +69,24 @@ case "$target" in
     profile="workstation"
     config_path="tools/fr3/fr3_record_config.yaml"
     gateway_target="http://192.168.100.155:8765"
+    ;;
+  nuc)
+    # The same FR3 rig as `workstation` -- same profile, same record config -- with its two halves
+    # on two machines. The NUC owns everything with a cable to the cell (arm, gripper, cameras,
+    # SpaceMouse) and the 1 kHz loop; it has no GPU, so a rollout's forward pass runs on the
+    # policy server below and the Rollout page offers it.
+    remote="delta@192.168.1.156"
+    remote_dir="/data/lerobot"
+    profile="workstation"
+    config_path="tools/fr3/fr3_record_config.yaml"
+    gateway_target="http://192.168.1.156:8765"
+    policy_remote="hanyu@192.168.1.179"
+    policy_dir="/home/hanyu/Codes/lerobot_workstation"
+    policy_address="192.168.1.179:8790"
+    # The 09-22 outputs/rollouts/rollout_log.jsonl the grasp loop draws pegs from stayed on tele;
+    # until it is copied over (and merged with whatever the NUC has logged by then), the loop
+    # stages from the mask drawn on the Rollout page.
+    grasp_loop_mask="outputs/metrology/scene_reset_mask.json"
     ;;
 esac
 
@@ -112,18 +139,44 @@ if $sync_only; then
   exit 0
 fi
 
+if [[ -n "$policy_address" ]]; then
+  # Restarted only when a file the server imported has changed (the hello refuses a server speaking
+  # another protocol version, and the robot host was just given this tree's code). A restart loads
+  # the last policy again in the background (--warm-last, skipped when training has the card), so
+  # the first rollout after a deploy does not wait the minute pi0.5 takes.
+  #
+  # The server runs the policy host's own checkout and is never synced from here. That checkout is
+  # a development tree, and an rsync --delete onto it from whatever machine ran this deploy would
+  # be a way to lose work; run the deploy from the policy host, where the two are the same tree.
+  policy_ip="${policy_address%%:*}"
+  policy_port="${policy_address##*:}"
+  echo "==> Ensuring policy server ${policy_address} runs this code..."
+  if ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$policy_ip"; then
+    if [[ "$repo_root" != "$policy_dir" ]]; then
+      echo "WARN: deploying from ${repo_root}, but the policy server runs ${policy_dir}" >&2
+    fi
+    bash "${policy_dir}/run/policy_server.sh" ensure --port "$policy_port" --warm-last
+  else
+    echo "WARN: this is not the policy host; the server there keeps its own checkout of ${policy_dir}" >&2
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$policy_remote" \
+      "bash '${policy_dir}/run/policy_server.sh' ensure --port '${policy_port}' --warm-last"
+  fi
+fi
+
 echo "==> Restarting ${profile} gateway on ${remote}..."
 # flock -n reports a lock conflict with -E's exit code, so a failure inside the
 # remote script stays distinguishable from "someone else is deploying".
 restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path'" \
+  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path' '$policy_address' '$grasp_loop_mask'" \
   <<'REMOTE' || restart_rc=$?
 set -euo pipefail
 
 repo_dir="$1"
 profile="$2"
 config_path="$3"
+policy_address="${4:-}"
+grasp_loop_mask="${5:-}"
 gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
 
 matching_pids() {
@@ -291,6 +344,9 @@ gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1)
 if [[ "$profile" == "workstation" && -d /home/tele/Models/models--google--paligemma-3b-pt-224 ]]; then
   gateway_env+=(HF_HUB_CACHE=/home/tele/Models HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1)
 fi
+if [[ -n "$grasp_loop_mask" ]]; then
+  gateway_env+=(FR3_GRASP_LOOP_MASK="$grasp_loop_mask")
+fi
 if [[ -n "$display" ]]; then
   gateway_env+=(DISPLAY="$display")
 fi
@@ -299,6 +355,11 @@ if [[ -n "$xauthority" ]]; then
 fi
 if [[ -n "$xdg_runtime_dir" ]]; then
   gateway_env+=(XDG_RUNTIME_DIR="$xdg_runtime_dir")
+fi
+
+gateway_args=()
+if [[ -n "$policy_address" ]]; then
+  gateway_args+=(--policy-server "$policy_address")
 fi
 
 mkdir -p run/logs
@@ -312,6 +373,7 @@ setsid env \
     --port 8765 \
     --host 0.0.0.0 \
     --repo-root "$repo_dir" \
+    "${gateway_args[@]}" \
   </dev/null >run/logs/gateway.log 2>&1 &
 disown
 

@@ -65,7 +65,7 @@ from tools.fr3.terminal_servo import parse_terminal_servo_pose
 from tools.fr3.workspace_fence import resolve_workspace_fence
 
 DEFAULT_ROBOT_IP = "192.168.1.206"
-DEFAULT_GRIPPER_PORT = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0"
+DEFAULT_GRIPPER_PORT = "/dev/pika_gripper"
 DEFAULT_RECORD_CONFIG = "tools/fr3/fr3_record_config.yaml"
 DEFAULT_URDF = "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf"
 

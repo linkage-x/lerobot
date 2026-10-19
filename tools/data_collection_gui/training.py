@@ -62,6 +62,19 @@ _TARGET_MODULES_MAX_CHARS = 512
 EXTRA_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 _MAX_EXTRAS = 8
 TELE_MODEL_CACHE = Path("/home/tele/Models")
+# What makes a directory a Hugging Face hub cache (`models--<org>--<name>`). The cache is used,
+# and the hub switched offline, only when the directory has one: the dev box has a root-owned
+# /home/tele/Models holding a bare symlink to pi05_base's weights, and pointing the hub at that
+# made `lerobot/pi05_base` unresolvable (10-19).
+_HUB_CACHE_ENTRY_GLOB = "models--*"
+
+
+# Where huggingface_hub would look before this module redirects XDG_CACHE_HOME for W&B.
+_PIN_HF_HOME = 'export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"'
+
+
+def _is_hub_cache(path: Path) -> bool:
+    return path.is_dir() and any(path.glob(_HUB_CACHE_ENTRY_GLOB))
 
 
 class TrainingError(RuntimeError):
@@ -604,8 +617,13 @@ def build_launch_command(
         for relative_dir in wandb_dirs.values():
             (wandb_root / relative_dir).mkdir(parents=True, exist_ok=True)
         env = {**os.environ, "PYTHONPATH": "src:.", "PYTHONUNBUFFERED": "1"}
+        # Pinned before the XDG redirect below, for the reason given at the remote command.
+        env.setdefault(
+            "HF_HOME",
+            str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "huggingface"),
+        )
         env.update({name: str(wandb_root / relative_dir) for name, relative_dir in wandb_dirs.items()})
-        if TELE_MODEL_CACHE.is_dir():
+        if _is_hub_cache(TELE_MODEL_CACHE):
             env.update(
                 {
                     "HF_HUB_CACHE": str(TELE_MODEL_CACHE),
@@ -634,15 +652,26 @@ def build_launch_command(
         f"{name}={shlex.quote(f'{remote_wandb_root}/{relative_dir}') }"
         for name, relative_dir in wandb_dirs.items()
     )
+    # huggingface_hub puts its cache under $XDG_CACHE_HOME, which the W&B redirect above moves
+    # into outputs/: pinned first, the host's model cache stays where it is (10-19: the dev box's
+    # trainer looked in outputs/wandb/xdg-cache, found nothing and ran pi05 on random weights
+    # until the preprocessor load failed).
+    # Offline whenever the host already has a hub cache. Training hosts here reach the internet
+    # only through a desktop session's proxy, which an ssh command does not get: online, every
+    # hub lookup sat through five ~60 s retries before falling back to the cache (dev box, 10-19).
     remote_hf_cache = (
-        f"if [ -d {shlex.quote(str(TELE_MODEL_CACHE))} ]; then "
+        f"if ls -d {shlex.quote(str(TELE_MODEL_CACHE))}/{_HUB_CACHE_ENTRY_GLOB} >/dev/null 2>&1; then "
         f"export HF_HUB_CACHE={shlex.quote(str(TELE_MODEL_CACHE))} "
-        "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; fi; "
+        "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; "
+        'elif ls -d "${HF_HUB_CACHE:-$HF_HOME/hub}"/'
+        f"{_HUB_CACHE_ENTRY_GLOB} >/dev/null 2>&1; then "
+        "export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; fi; "
     )
     remote = (
         f"cd {shlex.quote(host.repoDir)} && "
         f"{key_prefix}"
         f"mkdir -p {remote_wandb_dirs} && "
+        f"{_PIN_HF_HOME} && "
         f"export {remote_wandb_env} && "
         f"{remote_hf_cache}"
         f"export PYTHONPATH=src:. PYTHONUNBUFFERED=1 && "

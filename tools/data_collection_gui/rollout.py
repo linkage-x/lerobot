@@ -91,6 +91,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
     "FR3_GRASP_LOOP_DATASET_ROOT",
+    "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL",
     "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
@@ -128,6 +129,18 @@ def funnel_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
     """The default dataset for funnel steps recorded against `checkpoint_id`; see `FUNNEL_PREFIX`."""
     flattened = checkpoint_id.replace("/", "_") or "unknown_checkpoint"
     return repo_root / DAGGER_ROOT / f"{FUNNEL_PREFIX}{flattened}"
+
+
+# Whole grasp-loop trials, the policy's steps ahead of the funnel's. Not the funnel's directory:
+# their episodes start at the start pose and a funnel episode starts mid-air, and a view solves
+# its start contract from the mean of exactly those first frames.
+TRIAL_PREFIX = "trial_"
+
+
+def trial_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
+    """The default dataset for whole trials recorded against `checkpoint_id`; see `TRIAL_PREFIX`."""
+    flattened = checkpoint_id.replace("/", "_") or "unknown_checkpoint"
+    return repo_root / DAGGER_ROOT / f"{TRIAL_PREFIX}{flattened}"
 
 
 def dagger_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
@@ -441,6 +454,10 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         options["FR3_GRASP_LOOP_DATASET_ROOT"] = ""
+        if _parse_bool_field(raw.get("graspLoopRecordWholeTrial", False), "graspLoopRecordWholeTrial"):
+            options["FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL"] = "1"
+    elif _parse_bool_field(raw.get("graspLoopRecordWholeTrial", False), "graspLoopRecordWholeTrial"):
+        raise RolloutError("graspLoopRecordWholeTrial says what to record: turn graspLoopRecord on too.")
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
@@ -504,6 +521,8 @@ class RolloutStatus:
     # recording. Shown for the reason `tracePath` is: an afternoon of corrections nobody can find
     # afterwards is an afternoon of corrections nobody trains on.
     daggerDatasetPath: str = ""
+    # `host:port` the forward pass ran on, or empty for this machine.
+    policyServer: str = ""
     # Summed over the session, not per rollout: the question the operator is actually asking is
     # "have I collected enough corrections to retrain yet", which no single rollout answers.
     daggerEpisodes: int = 0
@@ -585,7 +604,9 @@ def build_rollout_command(
     trace_dir: Path | None = None,
     dagger_dataset_fallback: Path | None = None,
     funnel_dataset_fallback: Path | None = None,
+    trial_dataset_fallback: Path | None = None,
     base_env: dict[str, str] | None = None,
+    policy_server: str = "",
 ) -> tuple[list[str], dict[str, str]]:
     """The launcher invocation for one rollout, plus the environment that configures it.
 
@@ -598,6 +619,10 @@ def build_rollout_command(
     `dagger_dataset_fallback` is where corrections go when takeover is on and the operator named
     no directory. Passed in rather than derived here because it is keyed to the checkpoint, which
     this function knows only as a path on disk.
+
+    `policy_server` is `host:port` of the machine to run the forward pass on, or empty for this
+    one. Always set or cleared here, never inherited: which GPU a rollout uses is the operator's
+    choice on the page, and a gateway started from a shell that once exported it must not make it.
 
     `base_env` is whatever the caller needs the process to inherit (PYTHONPATH and friends).
     The rollout settings are applied *on top* of it and are never overwritten by it: an
@@ -643,11 +668,18 @@ def build_rollout_command(
             env["FR3_DAGGER_DATASET_ROOT"] = str(dagger_dataset_fallback)
 
     if env.get("FR3_GRASP_LOOP_DATASET_ROOT") == "":
-        if funnel_dataset_fallback is None:
-            raise RolloutError("Recording the funnel needs a dataset directory for this checkpoint.")
-        env["FR3_GRASP_LOOP_DATASET_ROOT"] = str(funnel_dataset_fallback)
+        whole_trial = env.get("FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL") == "1"
+        fallback = trial_dataset_fallback if whole_trial else funnel_dataset_fallback
+        if fallback is None:
+            what = "whole trials" if whole_trial else "the funnel"
+            raise RolloutError(f"Recording {what} needs a dataset directory for this checkpoint.")
+        env["FR3_GRASP_LOOP_DATASET_ROOT"] = str(fallback)
 
     env["FR3_INFER_CHECKPOINT"] = checkpoint_path
+    if policy_server:
+        env["FR3_POLICY_SERVER"] = policy_server
+    else:
+        env.pop("FR3_POLICY_SERVER", None)
     env["FR3_MOVE_TO_START"] = "1" if move_to_start else "0"
     env["PYTHONUNBUFFERED"] = "1"
     if dataset_root:

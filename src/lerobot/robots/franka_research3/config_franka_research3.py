@@ -98,6 +98,10 @@ class FrankaResearch3Config(RobotConfig):
     # mass: for a peg of a few hundred grams the force term dominates and the inertia is noise.
     payload_inertia: tuple[float, ...] | None = None
     camera_max_age_ms: float = 100.0
+    # How long a read that finds a frame older than camera_max_age_ms keeps re-reading before it
+    # raises. A one-off stall (both cameras 135 ms old at once, threads alive; NUC 2026-10-16)
+    # clears within a frame or two; a dead camera does not. 0 raises on the first stale read.
+    camera_stale_grace_ms: float = 100.0
     # Frames whose cameras disagree by more than this are suspect. By default the hardware robot
     # refuses them outright, which is appropriate for replay/inference. Workstation recording can
     # set camera_skew_hard_fail=false: the capture timestamps still reach the episode buffer, and
@@ -158,6 +162,8 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("corenetic_connect_timeout_s must be positive.")
         if self.camera_max_age_ms <= 0:
             raise ValueError("camera_max_age_ms must be positive.")
+        if self.camera_stale_grace_ms < 0:
+            raise ValueError("camera_stale_grace_ms must be non-negative.")
         if self.camera_max_skew_ms < 0:
             raise ValueError("camera_max_skew_ms must be non-negative.")
         if self.das_baudrate <= 0:

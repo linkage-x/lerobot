@@ -7,9 +7,11 @@ import { blockersToSend, mismatchCount, reasonSlots, slotLabel } from "./takeove
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
 import { carriedOverNotice } from "./rolloutCarryover";
 import { LIVE_STATES, sessionAvailability, sessionNote } from "./rolloutSessionControls";
+import { LOCAL_POLICY, defaultPolicyChoice, describeServer, startNote } from "./policyServers";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type {
   Checkpoint,
+  PolicyServerListing,
   RolloutMode,
   RolloutLandmarks,
   RolloutOutcomeEntry,
@@ -140,6 +142,7 @@ export function RolloutPage() {
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
   const [graspLoopRecord, setGraspLoopRecord] = useState(false);
+  const [graspLoopRecordWholeTrial, setGraspLoopRecordWholeTrial] = useState(false);
   // 09-30: the policy's aim is set well above the funnel's old 60 mm, so recordings draw the
   // takeover from the whole approach by default.
   const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
@@ -157,6 +160,11 @@ export function RolloutPage() {
   const [assistedSuccessAck, setAssistedSuccessAck] = useState(false);
   const [showRolloutAdvanced, setShowRolloutAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Where the forward pass runs: "" for this machine, else a policy server's `host:port`. null
+  // until the first listing (or the last rollout's choice) decides it, so the page never sends a
+  // default it has not checked against what the gateway can actually reach.
+  const [policyListing, setPolicyListing] = useState<PolicyServerListing | null>(null);
+  const [policyChoice, setPolicyChoice] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [outcomeNote, setOutcomeNote] = useState("");
@@ -257,6 +265,8 @@ export function RolloutPage() {
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
+      graspLoopRecordWholeTrial:
+        modeId === "grasp_loop" && graspLoopRecord ? graspLoopRecordWholeTrial : undefined,
       graspLoopFunnelTakeoverDzMm:
         modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
@@ -294,6 +304,7 @@ export function RolloutPage() {
       graspLoopArms,
       graspLoopInsertPose,
       graspLoopRecord,
+      graspLoopRecordWholeTrial,
       graspLoopFunnelTakeoverDzMm
     ]
   );
@@ -405,6 +416,7 @@ export function RolloutPage() {
       }
       if (params.maxSteps !== undefined) setMaxSteps(String(params.maxSteps));
       if (params.moveToStart !== undefined) setMoveToStart(params.moveToStart);
+      if (params.policyServer !== undefined) setPolicyChoice(params.policyServer);
       const options = params.runtimeOptions;
       if (options) {
         if (options.taskPrompt !== undefined) setTaskPrompt(options.taskPrompt);
@@ -447,6 +459,8 @@ export function RolloutPage() {
         // subcard holding it can sit unscrolled-to.
         if (options.daggerTakeover !== undefined) setDaggerTakeover(options.daggerTakeover);
         if (options.graspLoopRecord !== undefined) setGraspLoopRecord(options.graspLoopRecord);
+        if (options.graspLoopRecordWholeTrial !== undefined)
+          setGraspLoopRecordWholeTrial(options.graspLoopRecordWholeTrial);
         if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
         if (options.daggerDatasetRoot !== undefined)
           setDaggerDatasetRoot(options.daggerDatasetRoot);
@@ -512,6 +526,22 @@ export function RolloutPage() {
     setShowRolloutAdvanced(false);
   }, [selected?.id]);
 
+  // Polled rather than fetched once: what a server holds changes under the page -- another
+  // rollout takes it, its idle timeout drops the weights -- and the note under Start is only
+  // worth reading if it is current. Each poll is one status round trip per server.
+  const refreshPolicyServers = useCallback(async () => {
+    const listing = await api.fetchPolicyServers();
+    if (!listing) return;
+    setPolicyListing(listing);
+    setPolicyChoice((current) => (current === null ? defaultPolicyChoice(listing) : current));
+  }, []);
+  useEffect(() => {
+    void refreshPolicyServers();
+    const timer = window.setInterval(() => void refreshPolicyServers(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshPolicyServers]);
+  const policyEntry = policyListing?.servers.find((entry) => entry.address === policyChoice);
+
   const wrap = async (label: string, action: () => Promise<{ ok: boolean; error?: string }>) => {
     setBusy(true);
     setError("");
@@ -532,7 +562,8 @@ export function RolloutPage() {
         overrideContract,
         moveToStart,
         maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0,
-        runtimeOptions: rolloutRuntimeOptions
+        runtimeOptions: rolloutRuntimeOptions,
+        policyServer: policyChoice ?? LOCAL_POLICY
       })
     );
     if (result.ok) {
@@ -546,6 +577,12 @@ export function RolloutPage() {
   ) => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
+  };
+
+  const onUnloadPolicy = async (address: string) => {
+    const result = await wrap("Free policy server GPU", () => api.unloadPolicyServer(address));
+    if (result.ok) setNotice(`${address}: GPU memory released.`);
+    await refreshPolicyServers();
   };
 
   const onStop = async () => {
@@ -1329,9 +1366,20 @@ export function RolloutPage() {
               />
               <span>录制漏斗数据：B 臂每次抓住后，把漏斗接管的那段存成一条训练数据（DAgger，is_intervention=1）</span>
             </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopRecordWholeTrial}
+                onChange={(event) => setGraspLoopRecordWholeTrial(event.target.checked)}
+                disabled={isLive || !graspLoopRecord}
+              />
+              <span>录整次 trial：从起始位姿的第一步录到合手，策略自己走的那段 is_intervention=0，漏斗接管那段 =1</span>
+            </label>
             <p className="hint">
-              写进 outputs/datasets/funnel_&lt;checkpoint&gt;，格式与该 checkpoint 的训练数据相同；没抓住的不存。
-              每条在插完、机械臂停稳后写入，约多几秒。
+              {graspLoopRecordWholeTrial
+                ? "写进 outputs/datasets/trial_<checkpoint>（和只录漏斗段的 funnel_ 数据分开存，两种不能混在一个数据集里）。"
+                : "写进 outputs/datasets/funnel_<checkpoint>。"}
+              格式与该 checkpoint 的训练数据相同；没抓住的不存。每条在插完、机械臂停稳后写入，约多几秒。
             </p>
           </div>
         )}
@@ -1663,6 +1711,62 @@ export function RolloutPage() {
             {successRate(selected)}.
           </p>
         )}
+
+        {/* Where the forward pass runs. Beside Start, because it is a per-launch choice. */}
+        <div className="subcard">
+          <h4>Policy compute</h4>
+          {policyListing === null ? (
+            <p className="hint">Asking the gateway where a policy can run…</p>
+          ) : (
+            <>
+              <label className="checkbox">
+                <input
+                  type="radio"
+                  name="policy-compute"
+                  checked={policyChoice === LOCAL_POLICY}
+                  onChange={() => setPolicyChoice(LOCAL_POLICY)}
+                  disabled={isLive || !policyListing.local.available}
+                />
+                <span>This machine — {policyListing.local.detail}</span>
+              </label>
+              {policyListing.servers.map((entry) => (
+                <div key={entry.address} className="policy-server-row">
+                  <label className="checkbox">
+                    <input
+                      type="radio"
+                      name="policy-compute"
+                      checked={policyChoice === entry.address}
+                      onChange={() => setPolicyChoice(entry.address)}
+                      disabled={isLive || (!entry.reachable && policyChoice !== entry.address)}
+                    />
+                    <span>
+                      <code>{entry.address}</code> — {describeServer(entry)}
+                    </span>
+                  </label>
+                  {entry.status?.loaded && !entry.status.holder && (
+                    <button
+                      type="button"
+                      onClick={() => void onUnloadPolicy(entry.address)}
+                      disabled={busy || isLive}
+                      title="Drop the loaded policy now instead of after the server's idle timeout, e.g. before training on that GPU"
+                    >
+                      Free GPU
+                    </button>
+                  )}
+                </div>
+              ))}
+              {policyListing.servers.length === 0 && (
+                <p className="hint">
+                  No policy server configured. A robot host without a GPU is deployed with one:{" "}
+                  <code>bash run/deploy.sh nuc</code>.
+                </p>
+              )}
+              {policyEntry && selected && startNote(policyEntry, selected.id) && (
+                <p className="hint">{startNote(policyEntry, selected.id)}</p>
+              )}
+            </>
+          )}
+        </div>
 
         <button type="button" onClick={() => void onStart()} disabled={startDisabled}>
           {isLive ? "Rollout in progress" : `Start ${mode?.label ?? "rollout"}`}

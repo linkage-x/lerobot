@@ -34,6 +34,7 @@ from tools.fr3.dagger_dataset import (
     HandoverSeam,
     build_dagger_frame,
     dagger_dataset_can_load_locally,
+    dagger_step_role,
     dagger_dataset_has_tasks,
     dagger_dataset_features,
     dagger_dataset_is_unfinalized,
@@ -732,6 +733,68 @@ def test_a_frame_carries_observation_action_task_and_the_intervention_flag():
     assert frame[IS_INTERVENTION_KEY] == np.array([1.0], dtype=np.float32)
 
 
+def test_a_policy_step_of_a_whole_trial_is_written_as_no_intervention():
+    features = dagger_dataset_features(
+        {'action': {'dtype': 'float32', 'shape': (1,), 'names': ['ee.x']}}
+    )
+    frame = build_dagger_frame(
+        dataset_features=features,
+        observation_values={},
+        action_values={'ee.x': 0.4},
+        task='t',
+        is_intervention=False,
+    )
+    assert frame[IS_INTERVENTION_KEY] == np.array([0.0], dtype=np.float32)
+
+
+# --- whole trials ------------------------------------------------------------------------------
+
+
+def test_a_whole_trial_buffer_keeps_the_policy_and_the_funnel_in_one_span():
+    buffer = DaggerFrameBuffer(keep_policy_frames=True)
+
+    for n, is_expert in enumerate((False, False, False, True, True)):
+        buffer.append({'n': n}, is_expert=is_expert)
+
+    assert buffer.keeps_policy_frames
+    assert buffer.span_count == 1
+    assert [frame['n'] for span in buffer.spans() for frame in span] == [0, 1, 2, 3, 4]
+
+
+def test_a_whole_trial_buffer_still_closes_the_span_on_a_frameless_step():
+    buffer = DaggerFrameBuffer(keep_policy_frames=True)
+
+    buffer.append({'n': 0}, is_expert=False)
+    buffer.append({}, is_expert=False)
+    buffer.append({'n': 1}, is_expert=True)
+
+    assert [len(span) for span in buffer.spans()] == [1, 1]
+
+
+def test_the_default_buffer_still_drops_policy_frames_even_when_given_one():
+    buffer = DaggerFrameBuffer()
+
+    buffer.append({'n': 0}, is_expert=False)
+    buffer.append({'n': 1}, is_expert=True)
+
+    assert not buffer.keeps_policy_frames
+    assert [frame['n'] for span in buffer.spans() for frame in span] == [1]
+
+
+def test_a_whole_trial_drops_the_handover_seam_without_cutting_the_trial():
+    def role(source, *, seam=False, whole):
+        return dagger_step_role(command_source=source, on_seam=seam, keeps_policy_frames=whole)
+
+    assert role('policy', whole=True) == 'policy'
+    assert role('funnel', seam=True, whole=True) == 'skip'
+    assert role('funnel', whole=True) == 'expert'
+    # Funnel-only recording: exactly what it did before the switch existed.
+    assert role('policy', whole=False) == 'gap'
+    assert role('funnel', seam=True, whole=False) == 'gap'
+    assert role('funnel', whole=False) == 'expert'
+    assert role('expert', whole=False) == 'expert'
+
+
 # --- helpers used only by the round trips --------------------------------------------------
 
 
@@ -872,9 +935,27 @@ def test_a_failed_write_is_reported_on_the_callers_thread_not_raised_from_the_wr
 
 
 def test_the_expert_record_round_trips_and_defaults_to_a_takeover(tmp_path):
-    assert read_expert_source(tmp_path) == {'expert': 'takeover', 'labelsEveryActionDim': False}
+    assert read_expert_source(tmp_path) == {
+        'expert': 'takeover',
+        'labelsEveryActionDim': False,
+        'recordsPolicyFrames': False,
+    }
     write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True)
-    assert read_expert_source(tmp_path) == {'expert': 'grasp_funnel', 'labelsEveryActionDim': True}
+    assert read_expert_source(tmp_path) == {
+        'expert': 'grasp_funnel',
+        'labelsEveryActionDim': True,
+        'recordsPolicyFrames': False,
+    }
+
+
+def test_a_whole_trial_dataset_says_so_and_a_funnel_one_keeps_its_old_record(tmp_path):
+    import json
+
+    write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True)
+    # The 10-16 funnel datasets were written before the field existed: same bytes as before.
+    assert 'recordsPolicyFrames' not in json.loads((tmp_path / 'meta' / 'expert_source.json').read_text())
+    write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True, records_policy_frames=True)
+    assert read_expert_source(tmp_path)['recordsPolicyFrames'] is True
 
 
 def test_a_root_holding_only_metadata_and_the_expert_record_can_be_recreated(tmp_path):
@@ -883,3 +964,46 @@ def test_a_root_holding_only_metadata_and_the_expert_record_can_be_recreated(tmp
     (tmp_path / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
     write_expert_source(tmp_path, expert='grasp_funnel', labels_every_action_dim=True)
     assert dagger_dataset_root_is_recreatable(tmp_path)
+
+
+def test_each_episode_records_the_frame_its_poses_were_written_in(tmp_path):
+    """T_B_Ws moves with every view's start mean; without this row a merge cannot tell the frames
+    of two recording rounds apart (the funnel105 view mixed them 24/-57/-87 mm apart)."""
+    import json
+    from types import SimpleNamespace
+
+    from tools.fr3.dagger_dataset import EPISODE_FRAMES_PATH, rollout_frame_record
+
+    class FramedDataset(FakeDataset):
+        def __init__(self, root, already):
+            super().__init__()
+            self.root = root
+            self.meta = SimpleNamespace(total_episodes=already)
+
+        def save_episode(self, **kwargs):
+            super().save_episode(**kwargs)
+            self.meta.total_episodes += 1
+
+    dataset = FramedDataset(tmp_path, already=5)
+    T = np.eye(4)
+    T[:3, 3] = (-0.064, 0.149, 0.295)
+    buffer = DaggerFrameBuffer(max_still_frames=None)
+    buffer.frame = rollout_frame_record(T, start_contract_xyzquat=[0.381, -0.135, 0.097, 1, 0, 0, 0], view_root='v')
+    for x in (0.40, 0.41):
+        buffer.append({}, is_expert=True, sent_command=command(x=x))
+    buffer.append({}, is_expert=False)
+    for x in (0.42, 0.43):
+        buffer.append({}, is_expert=True, sent_command=command(x=x))
+    DaggerEpisodeWriter(dataset, emit=lambda _: None).write(buffer, rollout_index=9)
+
+    rows = [json.loads(line) for line in (tmp_path / EPISODE_FRAMES_PATH).read_text().splitlines()]
+    assert [row['episode_index'] for row in rows] == [5, 6]
+    assert all(row['rollout'] == 9 and row['view_root'] == 'v' for row in rows)
+    assert np.allclose(rows[0]['T_B_Ws'], T)
+
+    # A buffer nobody gave a frame (auto-collect, older callers) writes no row.
+    plain = DaggerFrameBuffer(max_still_frames=None)
+    for x in (0.40, 0.41):
+        plain.append({}, is_expert=True, sent_command=command(x=x))
+    DaggerEpisodeWriter(dataset, emit=lambda _: None).write(plain, rollout_index=10)
+    assert len((tmp_path / EPISODE_FRAMES_PATH).read_text().splitlines()) == 2

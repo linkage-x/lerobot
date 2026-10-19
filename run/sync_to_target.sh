@@ -2,10 +2,10 @@
 # Incrementally replace repository files on a deployment target.
 #
 # Usage:
-#   bash run/sync_to_target.sh [thor|workstation] [rsync options...]
+#   bash run/sync_to_target.sh [thor|workstation|nuc] [rsync options...]
 #   bash run/sync_to_target.sh user@host [rsync options...]      # REMOTE_DIR required
 #
-# The named targets are the two standing deployments. An arbitrary user@host is for
+# The named targets are the standing deployments. An arbitrary user@host is for
 # training machines chosen at run time from the GUI, which are not known here -- they
 # share this script rather than their own rsync so that the exclude list below, which
 # is what keeps a sync from clobbering a target's venv or its recorded datasets, has
@@ -26,6 +26,11 @@ case "$target" in
     remote="hph@192.168.100.155"
     remote_dir="/home/hph/Code/lerobot"
     ;;
+  nuc)
+    # The FR3 rig's robot host while tele is down. /data, not /home: see the NUC handover notes.
+    remote="delta@192.168.1.156"
+    remote_dir="/data/lerobot"
+    ;;
   *@*)
     remote="$target"
     remote_dir="${REMOTE_DIR:-}"
@@ -39,7 +44,7 @@ case "$target" in
     fi
     ;;
   *)
-    echo "ERROR: unknown deployment target '$target' (expected thor, workstation, or user@host)" >&2
+    echo "ERROR: unknown deployment target '$target' (expected thor, workstation, nuc, or user@host)" >&2
     exit 2
     ;;
 esac

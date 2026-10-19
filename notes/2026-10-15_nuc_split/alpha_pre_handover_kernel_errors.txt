@@ -1,0 +1,111 @@
+# alpha kernel log: crashes and thermal clamps before 2026-10-15 (first remote login by hph 2026-10-15 10:59)
+2026-09-08T22:23:39+08:00 alpha kernel: realsense2_came[175128]: segfault at 647473b2 ip 00007f07a41aa893 sp 00007f07931fc280 error 4 in librealsense2.so.2.57.7[7aa893,7f07a3c43000+667000] likely on CPU 8 (core 16, socket 0)
+2026-09-09T00:46:46+08:00 alpha kernel: BUG: kernel NULL pointer dereference, address: 00000000000000b0
+2026-09-09T00:46:46+08:00 alpha kernel: Oops: Oops: 0002 [#1] SMP NOPTI
+2026-09-10T03:08:47+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-10T17:17:18+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-10T18:02:19+08:00 alpha kernel: BUG: kernel NULL pointer dereference, address: 00000000000000b0
+2026-09-10T18:02:19+08:00 alpha kernel: Oops: Oops: 0002 [#1] SMP NOPTI
+2026-09-10T18:09:44+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-10T18:41:17+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-10T18:44:28+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-11T13:24:23+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-11T14:26:14+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-11T14:37:44+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-11T15:03:27+08:00 alpha kernel: Oops: general protection fault, probably for non-canonical address 0xdead000000000110: 0000 [#1] SMP NOPTI
+2026-09-12T10:57:14+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:08:20+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:11:27+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:17:00+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:18:56+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:19:09+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:19:13+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:19:22+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:19:25+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:21:35+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:23:04+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:45:46+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:46:44+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:49:46+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:49:48+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:53:13+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T11:53:16+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:39:15+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:39:26+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:39:42+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:54:53+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:54:55+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:55:09+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T12:55:20+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:01:59+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:06:57+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:08:48+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:25:02+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:47:05+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T13:55:53+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T14:00:09+08:00 alpha kernel: recvMC[414343]: segfault at 74908cbf96da ip 000074908cbf96da sp 000074907affb4b0 error 14 likely on CPU 2 (core 4, socket 0)
+2026-09-12T14:03:30+08:00 alpha kernel: Oops: general protection fault, probably for non-canonical address 0xdead000000000110: 0000 [#1] SMP NOPTI
+2026-09-12T14:23:08+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T14:25:58+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T14:30:34+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T14:51:29+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T14:57:35+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:05:08+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:12:58+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:16:02+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:19:11+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:36:09+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T15:49:50+08:00 alpha kernel: watch[94663]: segfault at c8 ip 000079c07c76a67f sp 00007ffc0d6ac028 error 4 in libncursesw.so.6.6[2167f,79c07c755000+26000] likely on CPU 28 (core 44, socket 0)
+2026-09-12T15:49:57+08:00 alpha kernel: watch[94739]: segfault at c8 ip 00007d8e4189367f sp 00007ffc81f2d568 error 4 in libncursesw.so.6.6[2167f,7d8e4187e000+26000] likely on CPU 30 (core 46, socket 0)
+2026-09-12T16:05:27+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:21:30+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:28:50+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:30:44+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:44:32+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:44:36+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T16:52:20+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T17:03:17+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T17:13:32+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T17:17:23+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T17:20:35+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T17:20:39+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T20:17:56+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T20:50:59+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-12T21:21:12+08:00 alpha kernel: package-data-do[5017]: segfault at ffffffffffffff8c ip 00000000005aed04 sp 00007fff739021c0 error 7 in python3.12[1aed04,420000+2e3000] likely on CPU 10 (core 20, socket 0)
+2026-09-13T10:29:58+08:00 alpha kernel: wireplumber[10511]: segfault at 6114cd823bab ip 00007f57af6709b0 sp 00007fff6b8efb30 error 6 in libasound.so.2.0.0[4c9b0,7f57af64f000+9f000] likely on CPU 11 (core 20, socket 0)
+2026-09-13T10:37:44+08:00 alpha kernel: gnome-shell[12948]: segfault at 77 ip 000075e77fc4feb6 sp 00007ffe5e94b410 error 6 in libmozjs-115.so.115.10.0[24feb6,75e77fb17000+b71000] likely on CPU 8 (core 16, socket 0)
+2026-09-13T10:39:59+08:00 alpha kernel: traps: gnome-shell[13625] general protection fault ip:7c980475cf1b sp:7ffcb6568b30 error:0 in libmozjs-115.so.115.10.0[55cf1b,7c9804317000+b71000]
+2026-09-13T10:41:02+08:00 alpha kernel: JITWorker[15838]: segfault at ffffffffffffe718 ip 000078cb760632ce sp 000078cb009fbfa0 error 7 in libjavascriptcoregtk-4.1.so.0.10.14[8632ce,78cb75966000+1869000] likely on CPU 10 (core 20, socket 0)
+2026-09-13T11:02:35+08:00 alpha kernel: intel_powerclamp: Start idle injection to reduce power
+2026-09-17T08:09:35+08:00 alpha kernel: apt-get[77999]: segfault at 40 ip 000077f9373c046c sp 00007ffd3e1acca0 error 4 in libapt-pkg.so.6.0.0[16146c,77f937299000+162000] likely on CPU 8 (core 16, socket 0)
+2026-09-18T06:06:31+08:00 alpha kernel: apt-check[93979]: segfault at 2693f8 ip 0000788ceb741df4 sp 00007ffe837839a0 error 4 in libapt-pkg.so.6.0.0[12ddf4,788ceb64e000+162000] likely on CPU 8 (core 16, socket 0)
+2026-09-19T01:48:58+08:00 alpha kernel: cloud-id[106109]: segfault at 8 ip 00000000005db0a0 sp 00007ffd3778b710 error 4 in python3.12[1db0a0,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-09-20T06:57:33+08:00 alpha kernel: list-oem-metapa[121967]: segfault at 0 ip 0000000000000000 sp 00007fff8cf15848 error 14 likely on CPU 8 (core 16, socket 0)
+2026-09-21T06:29:04+08:00 alpha kernel: whoopsie-upload[137328]: segfault at 768965dc7a89 ip 0000768965c34601 sp 00007fff1f42e350 error 7 in libapt-pkg.so.6.0.0[76601,768965bf8000+162000] likely on CPU 8 (core 16, socket 0)
+2026-09-23T16:30:01+08:00 alpha kernel: apt-get[175443]: segfault at 2db ip 00007c4708d58e8f sp 00007ffc53088748 error 4 in libapt-pkg.so.6.0.0[160e8f,7c4708c32000+162000] likely on CPU 8 (core 16, socket 0)
+2026-09-24T19:30:46+08:00 alpha kernel: cloud-id[13059]: segfault at 8 ip 00000000005d8a54 sp 00007ffce7c68dc0 error 4 in python3.12[1d8a54,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-09-25T01:21:47+08:00 alpha kernel: apt-get[15378]: segfault at 597172eb24c0 ip 0000597172eb24c0 sp 00007ffef4f79bc0 error 15 likely on CPU 8 (core 16, socket 0)
+2026-09-25T01:21:50+08:00 alpha kernel: unattended-upgr[15488]: segfault at 78af369b1a97 ip 000078af3680f601 sp 00007ffd5e452560 error 7 in libapt-pkg.so.6.0.0[76601,78af367d3000+162000] likely on CPU 8 (core 16, socket 0)
+2026-09-25T09:08:04+08:00 alpha kernel: unattended-upgr[18945]: segfault at 70c468a1bdc0 ip 00000000005a7914 sp 00007fff183049f0 error 7 in python3.12[1a7914,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-09-27T06:24:48+08:00 alpha kernel: unattended-upgr[34940]: segfault at 0 ip 0000000000000000 sp 00007ffc0b33ba18 error 14 likely on CPU 8 (core 16, socket 0)
+2026-09-27T06:24:48+08:00 alpha kernel: apport[34993]: segfault at b48e28 ip 0000000000b48e28 sp 00007fff1e2b01b8 error 15 in python3.12[747e28,a29000+17e000] likely on CPU 8 (core 16, socket 0)
+2026-09-27T19:02:12+08:00 alpha kernel: cloud-id[39350]: segfault at 8 ip 00000000005d7595 sp 00007ffc186f73a0 error 4 in python3.12[1d7595,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-02T15:04:55+08:00 alpha kernel: cloud-id[80854]: segfault at 7074a427bc1c ip 00007074a427bc1c sp 00007ffe7c9f5da8 error 15 likely on CPU 8 (core 16, socket 0)
+2026-10-03T04:51:01+08:00 alpha kernel: cloud-id[85828]: segfault at 8 ip 00000000005db0a0 sp 00007ffdb33ee980 error 4 in python3.12[1db0a0,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-06T10:37:40+08:00 alpha kernel: cloud-id[114214]: segfault at 8 ip 00000000005d8dd8 sp 00007ffe16f52bd0 error 4 in python3.12[1d8dd8,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-07T13:12:02+08:00 alpha kernel: cloud-id[123783]: segfault at 7ffcc13ee771 ip 00000000005af0df sp 00007ffc753ee730 error 4 in python3.12[1af0df,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-07T13:12:10+08:00 alpha kernel: apt-get[123767]: segfault at 2fe8ecfd8 ip 0000799c2692377c sp 00007ffcfe8ecd20 error 4 in libapt-pkg.so.6.0.0[16377c,799c267fa000+162000] likely on CPU 8 (core 16, socket 0)
+2026-10-08T00:40:11+08:00 alpha kernel: cloud-id[128454]: segfault at 0 ip 0000000000000000 sp 00007ffc55d64910 error 14 likely on CPU 8 (core 16, socket 0)
+2026-10-08T07:26:08+08:00 alpha kernel: cloud-id[130760]: segfault at 70dd027476a0 ip 000070dd027476a0 sp 00007ffcf3fd22f8 error 15 likely on CPU 8 (core 16, socket 0)
+2026-10-09T02:34:03+08:00 alpha kernel: apt-get[137431]: segfault at 2cd920268 ip 00007d52db26977c sp 00007ffccd91ffb0 error 4 in libapt-pkg.so.6.0.0[16377c,7d52db140000+162000] likely on CPU 8 (core 16, socket 0)
+2026-10-09T06:39:03+08:00 alpha kernel: apt-get[139352]: segfault at 39 ip 000070973137d345 sp 00007ffd357156d0 error 4 in libapt-pkg.so.6.0.0[161345,709731256000+162000] likely on CPU 8 (core 16, socket 0)
+2026-10-10T13:29:35+08:00 alpha kernel: unattended-upgr[150273]: segfault at 7ffe0c5702e8 ip 00007ffe0c5702e8 sp 00007ffe0c570288 error 15 likely on CPU 8 (core 16, socket 0)
+2026-10-10T18:23:12+08:00 alpha kernel: traps: cloud-id[152245] general protection fault ip:586ee4 sp:7ffcb6553510 error:0 in python3.12[186ee4,420000+2e3000]
+2026-10-11T01:10:40+08:00 alpha kernel: cloud-id[154918]: segfault at ab ip 0000000000572b53 sp 00007ffc3fc5d050 error 4 in python3.12[172b53,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-11T06:45:00+08:00 alpha kernel: apt-get[156951]: segfault at 2db ip 000074032cea7e8f sp 00007ffc6aa1ac08 error 4 in libapt-pkg.so.6.0.0[160e8f,74032cd81000+162000] likely on CPU 8 (core 16, socket 0)
+2026-10-11T23:34:03+08:00 alpha kernel: apt-get[163532]: segfault at 2db ip 000077e758335e8f sp 00007fff9f31b4c8 error 4 in libapt-pkg.so.6.0.0[160e8f,77e75820f000+162000] likely on CPU 8 (core 16, socket 0)
+2026-10-12T02:51:01+08:00 alpha kernel: cloud-id[164726]: segfault at 7 ip 0000000000574a76 sp 00007ffde02d6e30 error 4 in python3.12[174a76,420000+2e3000] likely on CPU 8 (core 16, socket 0)
+2026-10-12T06:45:01+08:00 alpha kernel: apt-get[166171]: segfault at 773d563ffff8 ip 0000773d588ade55 sp 00007fffe0806660 error 4 in libc.so.6[ade55,773d58828000+189000] likely on CPU 8 (core 16, socket 0)
+2026-10-13T11:58:48+08:00 alpha kernel: ubuntu-drivers[4824]: segfault at 7a494f4c7a89 ip 00007a494e56a063 sp 00007ffd54efd990 error 7 in libstdc++.so.6.0.33[16a063,7a494e49d000+148000] likely on CPU 8 (core 16, socket 0)
+2026-10-13T11:59:14+08:00 alpha kernel: ubuntu-drivers[5097]: segfault at ffffffff ip 00000000ffffffff sp 00007fffdc4ef2a8 error 14 likely on CPU 8 (core 16, socket 0)
+2026-10-13T12:34:44+08:00 alpha kernel: gnome-shell[5368]: segfault at 713700000070 ip 0000713700000070 sp 00007ffeb42f4e60 error 14 likely on CPU 8 (core 16, socket 0)

@@ -47,6 +47,7 @@ import type {
   TrainingRun,
   TrainingStartRequest,
   RolloutLastParams,
+  PolicyServerListing,
   RolloutLandmarks,
   TableAlignment,
   TableWindow,
@@ -1044,6 +1045,16 @@ export class DataCollectionGuiApi {
       "/api/rollout/last-params"
     );
     return payload?.params ?? {};
+  }
+
+  /** This machine and each policy server the gateway was deployed with, probed live. */
+  async fetchPolicyServers(): Promise<PolicyServerListing | null> {
+    return this.trainingGet<PolicyServerListing>("/api/policy-servers");
+  }
+
+  /** Free a policy server's GPU memory now instead of waiting for its idle timeout. */
+  async unloadPolicyServer(address: string) {
+    return this.trainingPost<{ unloaded?: boolean }>("/api/policy-servers/unload", { address });
   }
 
   async startRollout(request: RolloutStartRequest) {

@@ -1656,6 +1656,36 @@ def validate_prompt_args(args: argparse.Namespace) -> None:
         )
 
 
+PRETRAINED_WEIGHTS_FILE = "model.safetensors"
+
+
+def assert_pretrained_weights_resolve(pretrained_path: str, download: Callable[..., str] | None = None) -> str:
+    """Find the base weights now, or refuse to start.
+
+    `PreTrainedPolicy.from_pretrained` catches a failed weight load, logs "Returning model without
+    loading pretrained weights" and carries on: the run then finetunes a randomly initialised
+    pi0.5. On 10-19 that happened on the dev box (the hub cache was looked up under a redirected
+    XDG_CACHE_HOME) and was caught only because the processor load failed next. Resolved through
+    the same hub lookup, so HF_HUB_OFFLINE and the cache location apply exactly as they will in
+    the run.
+    """
+    local = Path(pretrained_path).expanduser()
+    if local.is_dir():
+        weights = local / PRETRAINED_WEIGHTS_FILE
+        if not weights.is_file():
+            raise ValueError(f"--pretrained-path {local} has no {PRETRAINED_WEIGHTS_FILE}")
+        return str(weights)
+    if download is None:
+        from huggingface_hub import hf_hub_download as download
+    try:
+        return download(pretrained_path, PRETRAINED_WEIGHTS_FILE)
+    except Exception as exc:  # noqa: BLE001 - every failure here means the same thing
+        raise ValueError(
+            f"--pretrained-path {pretrained_path}: cannot find {PRETRAINED_WEIGHTS_FILE} ({exc}). "
+            "Training would start from random weights; check the hub cache and HF_HUB_OFFLINE."
+        ) from exc
+
+
 def validate_finetune_args(args: argparse.Namespace) -> None:
     """Refuse LoRA without a base model, here rather than 300 seconds into a training run.
 
@@ -2522,6 +2552,8 @@ def main() -> None:
         if not steps_supplied:
             print("[resume] --steps was not supplied; using total steps saved in the checkpoint config.")
     else:
+        if args.pretrained_path:
+            print(f"[train] base weights: {assert_pretrained_weights_resolve(str(args.pretrained_path))}")
         cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train", f"--config_path={config_path}"]
     print("[train] " + " ".join(cmd))
     subprocess.run(cmd, check=True)

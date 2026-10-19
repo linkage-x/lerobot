@@ -256,10 +256,10 @@ def test_workstation_profile_exposes_fr3_teleop_contract():
     )
     devices_by_id = {device["id"]: device for device in snapshot["devices"]}
     assert devices_by_id["fr3"]["label"] == "Franka Research 3"
-    # A persistent /dev/serial alias, not a bare /dev/ttyUSB* whose number moves on replug.
-    # by-path is preferred over by-id here because the gripper's CH340 adapter reports no
-    # USB serial number, so its by-id name is not unique when several are attached.
-    assert devices_by_id["pika"]["config"]["port"].startswith("/dev/serial/by-")
+    # The udev name tools/fr3/install_pika_gripper_udev.sh pins to the gripper's USB socket, not a
+    # bare /dev/ttyUSB* whose number moves on replug, nor a by-path alias that names one robot
+    # host's USB topology (and by-id is no better: the CH340 reports no serial number).
+    assert devices_by_id["pika"]["config"]["port"] == "/dev/pika_gripper"
     assert snapshot["teleop"]["urdfPath"].endswith("fr3_pika_gripper.urdf")
     assert snapshot["teleop"]["simXmlPath"].endswith("fr3_pika_gripper_scene.xml")
     assert "ati" not in Path(snapshot["teleop"]["urdfPath"]).name.lower()

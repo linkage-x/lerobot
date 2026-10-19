@@ -1198,3 +1198,23 @@ def test_checkpoints_are_not_uploaded_to_wandb_unless_asked(tmp_path):
     args.policy = "act"
     fr3_train_il_policy.make_train_config(args, root, "local/v", config_path)
     assert json.loads(config_path.read_text(encoding="utf-8"))["wandb"]["disable_artifact"] is False
+
+
+def test_a_base_checkpoint_whose_weights_cannot_be_found_refuses_to_train(tmp_path):
+    """lerobot would log a warning and finetune random weights; this stops the run first."""
+
+    def unreachable(repo_id, filename):
+        raise OSError(f"{repo_id}/{filename} not in cache and offline")
+
+    with pytest.raises(ValueError, match="random weights"):
+        fr3_train_il_policy.assert_pretrained_weights_resolve("lerobot/pi05_base", download=unreachable)
+    assert fr3_train_il_policy.assert_pretrained_weights_resolve(
+        "lerobot/pi05_base", download=lambda repo_id, filename: f"/cache/{repo_id}/{filename}"
+    ) == "/cache/lerobot/pi05_base/model.safetensors"
+
+    local = tmp_path / "pretrained_model"
+    local.mkdir()
+    with pytest.raises(ValueError, match="has no model.safetensors"):
+        fr3_train_il_policy.assert_pretrained_weights_resolve(str(local))
+    (local / "model.safetensors").write_bytes(b"")
+    assert fr3_train_il_policy.assert_pretrained_weights_resolve(str(local)) == str(local / "model.safetensors")

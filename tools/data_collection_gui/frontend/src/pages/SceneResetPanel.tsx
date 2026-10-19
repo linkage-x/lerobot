@@ -9,7 +9,7 @@ import type {
   TableWindow
 } from "../types";
 import type { PlottedPoint } from "./landingMapPoints";
-import { PLACE_Z_M, TABLE_Z_M, dropWarning } from "./sceneResetHeights";
+import { DEFAULT_PICK_XYZ, PLACE_Z_M, dropWarning } from "./sceneResetHeights";
 import { strokesAfterLoad } from "./sceneResetMask";
 import { windowForPlot } from "./tableWindow";
 
@@ -112,9 +112,9 @@ export function SceneResetPanel({
    *  rejected. Expected to be a stable callback that stores what it is given. */
   onRunnableChange?: (runnable: (() => Promise<void>) | null) => void;
 }) {
-  const [pickX, setPickX] = useState("0.40");
-  const [pickY, setPickY] = useState("0.00");
-  const [pickZ, setPickZ] = useState(TABLE_Z_M.toFixed(3));
+  const [pickX, setPickX] = useState(DEFAULT_PICK_XYZ[0].toFixed(4));
+  const [pickY, setPickY] = useState(DEFAULT_PICK_XYZ[1].toFixed(4));
+  const [pickZ, setPickZ] = useState(DEFAULT_PICK_XYZ[2].toFixed(3));
   // The pick pose follows the measured place point until an operator overrides it, and then
   // stops: a nudge that a newly loaded dataset silently undoes is worse than no default.
   const [pickFollowsDemos, setPickFollowsDemos] = useState(true);
@@ -211,7 +211,7 @@ export function SceneResetPanel({
     setPickFollowsDemos(false);
     setter(value);
   };
-  const placeDropWarning = dropWarning(numberOr(pickZ, TABLE_Z_M), numberOr(targetZ, PLACE_Z_M));
+  const placeDropWarning = dropWarning(numberOr(pickZ, DEFAULT_PICK_XYZ[2]), numberOr(targetZ, PLACE_Z_M));
 
   const gridValues = useMemo(() => {
     const values: number[] = [];
@@ -241,7 +241,11 @@ export function SceneResetPanel({
   const runReset = async () => {
     setMessage("");
     const request: SceneResetRequest = {
-      pickXyz: [numberOr(pickX, 0.4), numberOr(pickY, 0), numberOr(pickZ, TABLE_Z_M)],
+      pickXyz: [
+        numberOr(pickX, DEFAULT_PICK_XYZ[0]),
+        numberOr(pickY, DEFAULT_PICK_XYZ[1]),
+        numberOr(pickZ, DEFAULT_PICK_XYZ[2])
+      ],
       targetZ: numberOr(targetZ, PLACE_Z_M),
       liftM: FIXED_LIFT_M,
       approachClearanceM: FIXED_LIFT_M,

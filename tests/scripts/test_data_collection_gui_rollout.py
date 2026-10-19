@@ -4214,6 +4214,42 @@ def test_recording_the_funnel_goes_to_the_checkpoints_own_funnel_dataset(tmp_pat
     assert env["FR3_GRASP_LOOP_DATASET_ROOT"] == str(fallback)
 
 
+def test_whole_trials_go_to_their_own_trial_dataset_not_the_funnels(tmp_path: Path):
+    options = rollout_backend.sanitize_rollout_runtime_options(
+        {"graspLoopRecord": True, "graspLoopRecordWholeTrial": True}
+    )
+    assert options == {"FR3_GRASP_LOOP_DATASET_ROOT": "", "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL": "1"}
+    funnel = rollout_backend.funnel_dataset_dir(tmp_path, "job_a/020000")
+    trial = rollout_backend.trial_dataset_dir(tmp_path, "job_a/020000")
+    assert trial == tmp_path / "outputs" / "datasets" / "trial_job_a_020000"
+    _, env = _command(
+        tmp_path,
+        mode="grasp_loop",
+        runtime_options=options,
+        funnel_dataset_fallback=funnel,
+        trial_dataset_fallback=trial,
+    )
+    assert env["FR3_GRASP_LOOP_DATASET_ROOT"] == str(trial)
+    assert env["FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL"] == "1"
+    assert "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+
+
+def test_whole_trials_need_recording_on_and_a_leftover_shell_switch_is_cleared(tmp_path: Path):
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopRecord"):
+        rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecordWholeTrial": True})
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": True})
+    _, env = _command(
+        tmp_path,
+        mode="grasp_loop",
+        runtime_options=options,
+        base_env={"FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL": "1"},
+        funnel_dataset_fallback=tmp_path / "f",
+        trial_dataset_fallback=tmp_path / "t",
+    )
+    assert env["FR3_GRASP_LOOP_DATASET_ROOT"] == str(tmp_path / "f")
+    assert "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL" not in env
+
+
 def test_the_funnel_is_not_recorded_unless_the_page_asks(tmp_path: Path):
     _, env = _command(
         tmp_path,

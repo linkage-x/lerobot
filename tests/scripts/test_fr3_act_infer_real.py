@@ -1790,6 +1790,53 @@ def test_dataset_start_gripper_contract_prefers_first_action_target(tmp_path: Pa
     assert np.isclose(summary['median_gripper_abs_delta'], 0.75)
 
 
+def test_start_contract_comes_from_the_episodes_a_merged_view_says_start_at_home(tmp_path: Path):
+    """A funnel episode starts mid-air; averaging it in moves the frame T_B_Ws is solved in."""
+    pytest.importorskip('pyarrow')
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset_root = tmp_path / 'view'
+    (dataset_root / 'meta' / 'episodes' / 'chunk-000').mkdir(parents=True)
+    (dataset_root / 'data' / 'chunk-000').mkdir(parents=True)
+    state_names = ['ee.x', 'ee.y', 'ee.z', 'ee.qx', 'ee.qy', 'ee.qz', 'ee.qw', 'gripper.pos']
+    (dataset_root / 'meta' / 'info.json').write_text(
+        json.dumps(
+            {
+                'data_path': 'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',
+                'features': {'observation.state': {'names': state_names}, 'action': {'names': ['dx', 'gripper']}},
+            }
+        ),
+        encoding='utf-8',
+    )
+    pq.write_table(
+        pa.table({'episode_index': [0, 1, 2], 'data/chunk_index': [0, 0, 0], 'data/file_index': [0, 0, 0]}),
+        dataset_root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet',
+    )
+    home = [0.3, 0.0, 0.4, 0.0, 0.0, 0.0, 1.0, 1.0]
+    mid_air = [0.5, 0.1, 0.1, 0.0, 0.0, 0.0, 1.0, 1.0]
+    pq.write_table(
+        pa.table({'episode_index': [0, 1, 2], 'observation.state': [home, mid_air, home]}),
+        dataset_root / 'data' / 'chunk-000' / 'file-000.parquet',
+    )
+
+    # No list: a view from before it, whose checkpoint was rolled out against every episode's mean.
+    legacy, legacy_stats = fr3_act_infer_real_runtime.estimate_dataset_start_pose_contract(dataset_root)
+    assert legacy_stats['episodes'] == 3
+    assert np.isclose(legacy[0], (0.3 + 0.5 + 0.3) / 3)
+
+    manifest_path = dataset_root / 'meta' / 'il_view_manifest.json'
+    manifest_path.write_text(json.dumps({'start_pose_episodes': [0, 2]}), encoding='utf-8')
+    contract, stats = fr3_act_infer_real_runtime.estimate_dataset_start_pose_contract(dataset_root)
+    assert stats['episodes'] == 2
+    np.testing.assert_allclose(contract[:3], [0.3, 0.0, 0.4])
+    assert np.allclose(stats['position_std_xyz_mm'], 0.0)
+
+    manifest_path.write_text(json.dumps({'start_pose_episodes': []}), encoding='utf-8')
+    with pytest.raises(ValueError, match='no start_pose_episodes'):
+        fr3_act_infer_real_runtime.estimate_dataset_start_pose_contract(dataset_root)
+
+
 def test_preview_and_real_alignment_share_step0_policy_observation_state():
     robot_cfg = FrankaResearch3Config(
         robot_ip='192.168.1.208',
@@ -2553,3 +2600,91 @@ def test_a_rollout_nobody_took_over_emits_nothing():
     assert _takeover_trace(["policy"] * 20).expert_span_log_lines() == []
     assert fr3_act_infer_real_runtime.RolloutGeometryTrace(1).expert_span_details() == []
 
+
+
+def _train_cfg_with_dataset_root(root: str) -> SimpleNamespace:
+    return SimpleNamespace(dataset=SimpleNamespace(root=root))
+
+
+def test_resolve_dataset_root_relocates_missing_absolute_path_under_repo_outputs(tmp_path: Path, monkeypatch):
+    view = tmp_path / 'outputs' / 'exports' / 'training_views' / 'view_a'
+    view.mkdir(parents=True)
+    monkeypatch.setattr(fr3_act_infer_real_runtime, '_REPO_ROOT', tmp_path)
+    cfg = _train_cfg_with_dataset_root('/home/someone_else/Code/lerobot/outputs/exports/training_views/view_a')
+
+    assert fr3_act_infer_real_runtime.resolve_dataset_root(tmp_path, cfg, None) == view
+
+
+def test_resolve_dataset_root_keeps_existing_absolute_path(tmp_path: Path, monkeypatch):
+    existing = tmp_path / 'elsewhere' / 'outputs' / 'view_a'
+    existing.mkdir(parents=True)
+    (tmp_path / 'repo' / 'outputs' / 'view_a').mkdir(parents=True)
+    monkeypatch.setattr(fr3_act_infer_real_runtime, '_REPO_ROOT', tmp_path / 'repo')
+
+    assert fr3_act_infer_real_runtime.resolve_dataset_root(tmp_path, _train_cfg_with_dataset_root(str(existing)), None) == existing
+
+
+def test_resolve_dataset_root_does_not_relocate_explicit_override(tmp_path: Path, monkeypatch):
+    (tmp_path / 'outputs' / 'view_a').mkdir(parents=True)
+    monkeypatch.setattr(fr3_act_infer_real_runtime, '_REPO_ROOT', tmp_path)
+    missing = '/nonexistent/outputs/view_a'
+
+    assert fr3_act_infer_real_runtime.resolve_dataset_root(tmp_path, _train_cfg_with_dataset_root('unused'), missing) == Path(missing)
+
+
+def test_resolve_dataset_root_returns_missing_path_unchanged_when_no_relocation_exists(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(fr3_act_infer_real_runtime, '_REPO_ROOT', tmp_path)
+    missing = '/nonexistent/outputs/view_a'
+
+    assert fr3_act_infer_real_runtime.resolve_dataset_root(tmp_path, _train_cfg_with_dataset_root(missing), None) == Path(missing)
+
+
+def _grasp_loop_dataset_args(tmp_path: Path, *extra: str):
+    return fr3_act_infer_real_runtime.parse_args(
+        [
+            '--checkpoint', '/tmp/ckpt', '--camera-config', '/tmp/cams.yaml',
+            '--grasp-loop-dataset-root', str(tmp_path / 'ds'),
+            *extra,
+        ]
+    )
+
+
+def test_recording_whole_trials_is_off_unless_asked(tmp_path: Path):
+    assert _grasp_loop_dataset_args(tmp_path).grasp_loop_record_whole_trial is False
+    assert _grasp_loop_dataset_args(tmp_path, '--grasp-loop-record-whole-trial').grasp_loop_record_whole_trial
+
+
+@pytest.mark.parametrize('recorded_whole, run_whole', [(False, True), (True, False)])
+def test_a_dataset_of_one_kind_of_episode_refuses_the_other(tmp_path: Path, monkeypatch, recorded_whole, run_whole):
+    """Funnel episodes start mid-air, whole trials at the start pose: one dataset of both would put
+    a view's start contract -- the mean of those first frames -- somewhere neither started."""
+    from tools.fr3.dagger_dataset import write_expert_source
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+
+    root = tmp_path / 'ds'
+    write_expert_source(root, expert='grasp_funnel', labels_every_action_dim=True, records_policy_frames=recorded_whole)
+    features = dagger_dataset_features({'action': {'dtype': 'float32', 'shape': (1,), 'names': ['ee.x']}})
+
+    class _Existing:
+        def __init__(self, repo_id, root):
+            self.meta = SimpleNamespace(features=features, total_episodes=3)
+
+    monkeypatch.setattr(lerobot_dataset, 'LeRobotDataset', _Existing)
+    monkeypatch.setattr(fr3_act_infer_real_runtime, 'dagger_dataset_can_load_locally', lambda _root: True)
+    args = SimpleNamespace(
+        dagger_takeover=False,
+        dagger_dataset_root=None,
+        grasp_loop_trials=10,
+        grasp_loop_dataset_root=root,
+        grasp_loop_dataset_repo_id=None,
+        grasp_loop_record_whole_trial=run_whole,
+        dagger_min_span_frames=2,
+    )
+    ds_meta = SimpleNamespace(features={'action': features['action']}, repo_id='view')
+
+    with pytest.raises(SystemExit, match='Point it at a fresh directory'):
+        fr3_act_infer_real_runtime.build_dagger_writer(args, ds_meta=ds_meta, fps=30)
+
+    args.grasp_loop_record_whole_trial = recorded_whole
+    _, writer = fr3_act_infer_real_runtime.build_dagger_writer(args, ds_meta=ds_meta, fps=30)
+    assert writer is not None

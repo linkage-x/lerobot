@@ -108,6 +108,8 @@ class FrankaResearch3(Robot):
         self._reach_stall_error_m: float = 0.0
         self._reach_stall_since_s: float | None = None
         self._reach_stall_last_warned_s: float = 0.0
+        # Reads that found a stale frame and got a fresh one within camera_stale_grace_ms.
+        self.camera_stale_recoveries = 0
         self._state_snapshot_lock = threading.Lock()
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
@@ -906,6 +908,68 @@ class FrankaResearch3(Robot):
             f"ee_z_m={float(ee_pose[2, 3]):.4f}{timing_text} cameras=[{'; '.join(camera_states)}]"
         )
 
+    def _read_latest_camera_sample(self, camera: Any) -> tuple[np.ndarray, float]:
+        read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
+        if callable(read_latest_with_timestamp):
+            return read_latest_with_timestamp(max_age_ms=self.config.camera_max_age_ms)
+        try:
+            frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+        except TypeError as exc:
+            if "max_age_ms" not in str(exc):
+                raise
+            frame = camera.read_latest()
+        return frame, float(getattr(camera, "latest_timestamp", time.perf_counter()))
+
+    def _read_latest_camera_samples(
+        self, *, ee_pose: np.ndarray, stage_timings_ms: dict[str, float]
+    ) -> dict[str, tuple[np.ndarray, float]]:
+        """Every camera's newest frame, waiting out a short stall before calling one dead.
+
+        On the NUC (2026-10-16) both cameras' frames were 133-137 ms old at the same instant with
+        their threads alive -- the process or the bus had paused, once in ~25k reads -- and that
+        single read halted a 50-trial unattended run. A dead camera stays stale through
+        `camera_stale_grace_ms`; a stall does not. The whole set is read again after a stale one,
+        because the frames read before the wait are older by the wait, and anchoring on them
+        would pick frames that fail `read_closest`'s age check.
+        """
+        grace_s = float(self.config.camera_stale_grace_ms) / 1e3
+        started_s = time.perf_counter()
+        first_stale: str | None = None
+        while True:
+            samples: dict[str, tuple[np.ndarray, float]] = {}
+            stale: tuple[str, TimeoutError] | None = None
+            for camera_name, camera in self.cameras.items():
+                try:
+                    samples[camera_name] = self._read_latest_camera_sample(camera)
+                except TimeoutError as exc:
+                    stale = (camera_name, exc)
+                    break
+            waited_ms = (time.perf_counter() - started_s) * 1e3
+            if stale is None:
+                if first_stale is not None:
+                    self.camera_stale_recoveries += 1
+                    logger.warning(
+                        "FR3 camera_stale_recovered camera=%s waited_ms=%.1f recoveries=%d",
+                        first_stale,
+                        waited_ms,
+                        self.camera_stale_recoveries,
+                    )
+                return samples
+            camera_name, exc = stale
+            if first_stale is None:
+                first_stale = camera_name
+            if waited_ms >= grace_s * 1e3:
+                waited_text = f" (still stale after waiting {waited_ms:.1f} ms)" if grace_s > 0 else ""
+                raise TimeoutError(
+                    f"{exc}{waited_text}"
+                    f"{self._camera_timeout_context(
+                        failed_camera_name=camera_name,
+                        ee_pose=ee_pose,
+                        stage_timings_ms=stage_timings_ms,
+                    )}"
+                ) from exc
+            time.sleep(0.002)
+
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
@@ -944,34 +1008,7 @@ class FrankaResearch3(Robot):
             "pre_camera": (before_camera_read_s - observation_start_s) * 1e3,
         }
         if include_cameras:
-            latest_samples: dict[str, tuple[np.ndarray, float]] = {}
-            for camera_name, camera in self.cameras.items():
-                try:
-                    read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
-                    if callable(read_latest_with_timestamp):
-                        latest_samples[camera_name] = read_latest_with_timestamp(
-                            max_age_ms=self.config.camera_max_age_ms
-                        )
-                    else:
-                        try:
-                            frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
-                        except TypeError as exc:
-                            if "max_age_ms" not in str(exc):
-                                raise
-                            frame = camera.read_latest()
-                        latest_samples[camera_name] = (
-                            frame,
-                            float(getattr(camera, "latest_timestamp", time.perf_counter())),
-                        )
-                except TimeoutError as exc:
-                    raise TimeoutError(
-                        f"{exc}"
-                        f"{self._camera_timeout_context(
-                            failed_camera_name=camera_name,
-                            ee_pose=ee_pose,
-                            stage_timings_ms=stage_timings_ms,
-                        )}"
-                    ) from exc
+            latest_samples = self._read_latest_camera_samples(ee_pose=ee_pose, stage_timings_ms=stage_timings_ms)
 
             if latest_samples:
                 # Anchor every camera on the oldest of their latest frames and take each

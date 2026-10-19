@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend
+from tools.data_collection_gui import policy_servers
 from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import table_plane
 from tools.data_collection_gui import task_ladders
@@ -335,6 +336,8 @@ class GatewayState:
     datasets_root: Path | None = None
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
+    # `host:port` of every policy server a rollout may run its forward pass on; see policy_servers.
+    policy_servers: list[str] = field(default_factory=list)
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
@@ -6107,7 +6110,9 @@ def _rollout_last_params_path(state: GatewayState) -> Path:
 # "yes" is a gate that answers itself, so both are re-asked on every start no matter what the
 # last rollout did -- including when the checkpoint that comes back is the one they were answered
 # for last time.
-_ROLLOUT_LAST_PARAM_KEYS = ("mode", "checkpointId", "maxSteps", "moveToStart", "runtimeOptions")
+_ROLLOUT_LAST_PARAM_KEYS = (
+    "mode", "checkpointId", "maxSteps", "moveToStart", "runtimeOptions", "policyServer",
+)
 
 
 def _record_rollout_params(state: GatewayState, params: dict[str, Any]) -> None:
@@ -6204,6 +6209,9 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     runtime_options = rollout_backend.sanitize_rollout_runtime_options(
         payload.get("runtimeOptions")
     )
+    policy_server = policy_servers.resolve_choice(
+        payload.get("policyServer"), state.policy_servers, needs_policy=mode.id != "env"
+    )
 
     # Recorded before launch, and from the values that were actually validated: a rollout that
     # dies on startup still tells the next one what was tried. The two safety gates are not here.
@@ -6219,6 +6227,7 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
             "runtimeOptions": payload.get("runtimeOptions")
             if isinstance(payload.get("runtimeOptions"), dict)
             else {},
+            "policyServer": policy_server,
         },
     )
 
@@ -6262,7 +6271,9 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         trace_dir=trace_dir,
         dagger_dataset_fallback=dagger_fallback,
         funnel_dataset_fallback=rollout_backend.funnel_dataset_dir(state.repo_root, checkpoint_id),
+        trial_dataset_fallback=rollout_backend.trial_dataset_dir(state.repo_root, checkpoint_id),
         base_env=_tool_env(state.repo_root),
+        policy_server=policy_server,
     )
 
     log_dir = state.repo_root / "outputs" / "logs" / "rollout"
@@ -6311,11 +6322,12 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         # typed. Empty when takeover is off, and when it is on but they chose to steer only.
         daggerDatasetPath=env.get("FR3_DAGGER_DATASET_ROOT", ""),
         previewDir=str(rollout_backend.PREVIEW_DIR),
+        policyServer=policy_server,
     )
     state.log(
         "warn" if mode.movesArm else "info",
         f"Started rollout {mode.id} on {checkpoint_id} "
-        f"(tool_frame={target_frame}, pid={process.pid})",
+        f"(tool_frame={target_frame}, policy={policy_server or 'this machine'}, pid={process.pid})",
     )
     Thread(
         target=_follow_rollout_run,
@@ -13815,6 +13827,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with state.lock:
                 _json_response(self, HTTPStatus.OK, _table_alignment_snapshot(state, camera_key))
             return
+        if path == "/api/policy-servers":
+            state = self.server.state
+            # Outside the lock: each probe is a network round trip, up to a timeout per dead host.
+            _json_response(self, HTTPStatus.OK, policy_servers.listing(list(state.policy_servers)))
+            return
         if path == "/api/checkpoints":
             state = self.server.state
             host_id = query.get("host", [training_backend.LOCAL_HOST_ID])[0]
@@ -14366,6 +14383,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                 return
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
+            return
+        if path == "/api/policy-servers/unload":
+            state = self.server.state
+            body = _read_json_body(self)
+            try:
+                address = policy_servers.normalise_address(str(body.get("address") or ""))
+                result = policy_servers.unload(address, list(state.policy_servers))
+            except policy_servers.PolicyServerChoiceError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            with state.lock:
+                state.log("info", f"Policy server {address}: unloaded={result['unloaded']}")
+            _json_response(self, HTTPStatus.OK, result)
             return
         if path.startswith("/api/checkpoints/"):
             state = self.server.state
@@ -14988,6 +15018,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
     parser.add_argument("--log-dir", type=Path, default=None)
+    parser.add_argument(
+        "--policy-server",
+        dest="policy_servers",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]",
+        help="A policy server the Rollout page may run the forward pass on (repeatable).",
+    )
     return parser.parse_args()
 
 
@@ -15013,6 +15051,9 @@ def main() -> None:
         repo_root, args.config_path, args.datasets_root, args.exports_root,
         log_dir=log_dir, gateway_log_path=gateway_log_path, profile=args.profile,
     )
+    state.policy_servers = [policy_servers.normalise_address(item) for item in args.policy_servers]
+    if state.policy_servers:
+        state.log("info", f"Policy servers: {', '.join(state.policy_servers)}")
     if state.profile == "workstation":
         _probe_workstation_devices(state)
     server = DataCollectionGuiServer((args.host, args.port), state)

@@ -5245,3 +5245,11 @@ button.danger {
 @media (max-width: 860px) {
   .scene-reset-layout { grid-template-columns: 1fr; }
 }
+
+/* Rollout page: one policy server per row, its Free GPU button beside the choice. */
+.policy-server-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}

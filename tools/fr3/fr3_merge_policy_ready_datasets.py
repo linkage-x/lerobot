@@ -29,6 +29,22 @@ IS_INTERVENTION_KEY = "is_intervention"
 # importing it, so this tool keeps needing nothing but pandas and pyarrow.
 EXPERT_SOURCE_PATH = Path("meta") / "expert_source.json"
 BOOKKEEPING_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+# The view episodes whose first frame is a start pose; read by the rollout
+# (fr3_act_infer_real_runtime._load_start_pose_episodes), which solves its start contract -- and
+# so the frame T_B_Ws maps live poses into -- from those first frames only.
+START_POSE_EPISODES_KEY = "start_pose_episodes"
+# Set on a view rebuilt from a rollout log after its data was lost: metadata only.
+RECOVERED_STUB_KEY = "recovered_stub"
+# What `fr3_train_il_policy.adopt_existing_view` reads off a view's manifest to train it with
+# --skip-prepare. A merged view inherits them from the base, so a base without them would merge
+# fine and only fail when its training run starts.
+TRAINING_VIEW_SCHEMA_KEYS = (
+    "cameras",
+    "state_keys",
+    "action_append_selectors",
+    "action_append_names",
+    "image_resize_shape",
+)
 
 
 class MergeError(RuntimeError):
@@ -286,12 +302,61 @@ def labels_every_action_dim(root: Path) -> bool:
     return bool(record.get("labelsEveryActionDim", False))
 
 
+def records_policy_frames(root: Path) -> bool:
+    """Whether a correction dataset holds whole trials, policy steps included.
+
+    Such an episode starts where the rollout started -- at the start pose -- while a takeover
+    episode starts wherever the takeover happened. Recorded by `dagger_dataset.write_expert_source`.
+    """
+    path = root / EXPERT_SOURCE_PATH
+    if not path.is_file():
+        return False
+    try:
+        record = load_json(path)
+    except (OSError, json.JSONDecodeError, MergeError):
+        return False
+    return bool(record.get("recordsPolicyFrames", False))
+
+
+def aggregate_feature_stats(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """One feature's stats over several datasets, from each dataset's own stats.
+
+    For the camera features, whose pixels the merge never decodes. Moments combine exactly
+    (count-weighted mean, pooled variance); quantiles do not, so they are count-weighted means of
+    the sources' quantiles -- the same approximation LeRobot's own `aggregate_stats` makes.
+    """
+    counts = np.asarray([float(np.reshape(part["count"], -1)[0]) for part in parts])
+    weights = counts / counts.sum()
+    mean = sum(w * np.asarray(part["mean"], dtype=np.float64) for w, part in zip(weights, parts))
+    variance = sum(
+        w * (np.asarray(part["std"], dtype=np.float64) ** 2 + (np.asarray(part["mean"], dtype=np.float64) - mean) ** 2)
+        for w, part in zip(weights, parts)
+    )
+    stats: dict[str, Any] = {
+        "count": [int(counts.sum())],
+        "min": np.min([np.asarray(part["min"], dtype=np.float64) for part in parts], axis=0).tolist(),
+        "max": np.max([np.asarray(part["max"], dtype=np.float64) for part in parts], axis=0).tolist(),
+        "mean": np.asarray(mean).tolist(),
+        "std": np.sqrt(variance).tolist(),
+    }
+    for key in STATS_QUANTILES:
+        if all(key in part for part in parts):
+            stats[key] = np.asarray(
+                sum(w * np.asarray(part[key], dtype=np.float64) for w, part in zip(weights, parts))
+            ).tolist()
+    return stats
+
+
 def intervention_feature() -> dict[str, Any]:
     return {"dtype": "float32", "shape": [1], "names": [IS_INTERVENTION_KEY]}
 
 
 def validate_policy_ready_merge(
-    base_view: Path, dagger_roots: Sequence[Path], *, base_episodes: Sequence[int] | None = None
+    base_view: Path,
+    dagger_roots: Sequence[Path],
+    *,
+    base_episodes: Sequence[int] | None = None,
+    no_base_episodes: bool = False,
 ) -> dict[str, Any]:
     if not dagger_roots:
         raise MergeError("Pass at least one DAgger dataset root.")
@@ -312,11 +377,26 @@ def validate_policy_ready_merge(
     action_mode = str(base_manifest.get("action_mode") or "")
     if not action_mode:
         raise MergeError(f"{base_view} manifest has no action_mode; it is not a training view")
+    missing_schema = [key for key in TRAINING_VIEW_SCHEMA_KEYS if key not in base_manifest]
+    if missing_schema:
+        raise MergeError(
+            f"{base_view.name} manifest has no {', '.join(missing_schema)}; training reads them off the "
+            "merged view's manifest, which takes them from the base"
+        )
 
     assert_every_shard_opens(base_view)
     base_episode_rows = load_episodes(base_view)
     base_episode_filter = sorted({int(episode) for episode in (base_episodes or [])})
-    if base_episode_filter:
+    if no_base_episodes and base_episode_filter:
+        raise MergeError("Pass either baseEpisodes or noBaseEpisodes, not both.")
+    if RECOVERED_STUB_KEY in base_manifest and not no_base_episodes:
+        raise MergeError(
+            f"{base_view.name} is a recovered stub (manifest {RECOVERED_STUB_KEY!r}): its episode is not "
+            "training data. Merge with noBaseEpisodes to use it for the schema, prompts and crops only."
+        )
+    if no_base_episodes:
+        base_episode_rows = base_episode_rows.iloc[0:0]
+    elif base_episode_filter:
         known_base_episodes = {int(index) for index in base_episode_rows["episode_index"]}
         unknown = sorted(set(base_episode_filter) - known_base_episodes)
         if unknown:
@@ -336,7 +416,9 @@ def validate_policy_ready_merge(
         )
     ]
     base_message = f"{base_view.name} action_mode={action_mode}"
-    if base_episode_filter:
+    if no_base_episodes:
+        base_message += ", schema only (no base episodes)"
+    elif base_episode_filter:
         base_message += f", baseEpisodes={base_episode_filter}"
     checks: list[dict[str, Any]] = [
         {"name": "base_training_view", "status": "pass", "message": base_message}
@@ -386,8 +468,16 @@ def validate_policy_ready_merge(
                     ", scripted expert: every action dim labelled (is_intervention written 0)"
                     if labels_every_action_dim(dagger_root)
                     else ""
-                ),
+                )
+                + (", whole trials: episodes start at the start pose" if records_policy_frames(dagger_root) else ""),
             }
+        )
+
+    if base_episode_rows.empty and not any(records_policy_frames(root) for root in dagger_roots):
+        raise MergeError(
+            "No episode in this merge starts at the start pose: no base episodes, and every DAgger "
+            "dataset starts its episodes at a takeover. A rollout of the result would have no start "
+            "contract to solve its frame against; add a whole-trial dataset."
         )
 
     total_episodes = sum(source.episodes for source in sources)
@@ -492,20 +582,26 @@ def merge_policy_ready_datasets(
     output_root: Path,
     repo_id: str,
     base_episodes: Sequence[int] | None = None,
+    no_base_episodes: bool = False,
     overwrite: bool = False,
     copy_videos: bool = False,
 ) -> dict[str, Any]:
-    validation = validate_policy_ready_merge(base_view, dagger_roots, base_episodes=base_episodes)
-    roots = [base_view, *dagger_roots]
-    roles = ["base", *["dagger" for _ in dagger_roots]]
+    validation = validate_policy_ready_merge(
+        base_view, dagger_roots, base_episodes=base_episodes, no_base_episodes=no_base_episodes
+    )
+    # Without base episodes the base view still supplies the schema, prompts, crops and camera
+    # metadata; none of its files are copied.
+    roots = [*([] if no_base_episodes else [base_view]), *dagger_roots]
+    roles = [*([] if no_base_episodes else ["base"]), *["dagger" for _ in dagger_roots]]
     fully_labelled = {root for root in dagger_roots if labels_every_action_dim(root)}
+    whole_trial_roots = {root for root in dagger_roots if records_policy_frames(root)}
     if overwrite and output_root.exists():
         shutil.rmtree(output_root)
     if output_root.exists():
         raise MergeError(f"{output_root} already exists; pass --overwrite to replace it.")
 
     infos = [load_json(root / "meta" / "info.json") for root in roots]
-    base_info = copy.deepcopy(infos[0])
+    base_info = load_json(base_view / "meta" / "info.json")
     base_features = copy.deepcopy(base_info["features"])
     base_features[IS_INTERVENTION_KEY] = intervention_feature()
     chunks_size = int(base_info.get("chunks_size") or 1000)
@@ -538,10 +634,11 @@ def merge_policy_ready_datasets(
     base_episode_filter = sorted({int(episode) for episode in (base_episodes or [])})
 
     next_file_index = 0
-    for source_idx, root in enumerate(roots):
+    start_pose_episodes: list[int] = []
+    for source_idx, (root, role) in enumerate(zip(roots, roles, strict=True)):
         data_files = dataset_data_files(root)
         episodes = load_episodes(root)
-        if source_idx == 0 and base_episode_filter:
+        if role == "base" and base_episode_filter:
             episodes = episodes[episodes["episode_index"].isin(base_episode_filter)].reset_index(drop=True)
         source_frame_offsets.append(total_rows)
         episode_map = {
@@ -549,6 +646,13 @@ def merge_policy_ready_datasets(
             for position, source_index in enumerate(episodes["episode_index"])
         }
         source_episode_maps.append(episode_map)
+        if role == "base":
+            base_manifest_starts = load_json(base_view / "meta" / "il_view_manifest.json").get(START_POSE_EPISODES_KEY)
+            # A base view without the list was built from recordings: every episode starts at home.
+            listed = set(episode_map) if base_manifest_starts is None else {int(e) for e in base_manifest_starts}
+            start_pose_episodes.extend(view for source, view in episode_map.items() if source in listed)
+        elif root in whole_trial_roots:
+            start_pose_episodes.extend(episode_map.values())
         file_map: dict[tuple[int, int], tuple[int, int]] = {}
         for src_file in data_files:
             old_pair = chunk_file_from_path(src_file.relative_to(root))
@@ -610,7 +714,7 @@ def merge_policy_ready_datasets(
             pq.write_table(pa.Table.from_pandas(out, preserve_index=False), dst_file)
 
         episodes = load_episodes(root).copy()
-        if source_idx == 0 and base_episode_filter:
+        if role == "base" and base_episode_filter:
             episodes = episodes[episodes["episode_index"].isin(base_episode_filter)].reset_index(drop=True)
         episodes["episode_index"] = [episode_map[int(index)] for index in episodes["episode_index"]]
         lengths = episodes["length"].to_numpy()
@@ -649,11 +753,19 @@ def merge_policy_ready_datasets(
     write_json(output_root / "meta" / "info.json", merged_info)
 
     base_stats = load_json(base_view / "meta" / "stats.json") if (base_view / "meta" / "stats.json").is_file() else {}
-    stats: dict[str, Any] = {
-        key: base_stats[key]
-        for key in camera_keys
-        if key in base_stats
-    }
+    if no_base_episodes:
+        # The base view's pixel stats describe frames this dataset does not hold.
+        source_stats = [load_json(root / "meta" / "stats.json") for root in roots]
+        missing_stats = [str(root) for root, part in zip(roots, source_stats, strict=True) if any(key not in part for key in camera_keys)]
+        if missing_stats:
+            raise MergeError(f"No camera stats in {missing_stats}; cannot describe this merge's pixels without its base view.")
+        stats: dict[str, Any] = {key: aggregate_feature_stats([part[key] for part in source_stats]) for key in camera_keys}
+    else:
+        stats = {
+            key: base_stats[key]
+            for key in camera_keys
+            if key in base_stats
+        }
     for key, parts in stats_parts.items():
         if parts:
             stats[key] = vector_stats(np.concatenate(parts, axis=0))
@@ -668,6 +780,7 @@ def merge_policy_ready_datasets(
                 "dagger_roots": [str(root) for root in dagger_roots],
                 "fully_labelled_dagger_roots": sorted(str(root) for root in fully_labelled),
                 "base_episodes": base_episode_filter,
+                "no_base_episodes": bool(no_base_episodes),
                 "tasks": base_tasks,
                 "features": feature_without_intervention(base_features),
             },
@@ -676,14 +789,24 @@ def merge_policy_ready_datasets(
         ).encode("utf-8")
     ).hexdigest()[:16]
     base_manifest = load_json(base_view / "meta" / "il_view_manifest.json")
+    # The stub mark says "not trainable"; it describes the base view, not this dataset.
+    schema_stub = base_manifest.pop(RECOVERED_STUB_KEY, None)
     manifest = {
         **base_manifest,
         "source_dataset_root": None,
-        "source_dataset_roots": [str(root) for root in roots],
+        # The base view leads even when none of its episodes are taken: the rollout follows this
+        # list to the recording its camera crops were drawn on
+        # (fr3_act_infer_real_runtime._load_crop_source_frame_shapes), and the DAgger roots only
+        # hold the already-cropped pixels.
+        "source_dataset_roots": [str(root) for root in [base_view, *dagger_roots]],
         "base_training_view_root": str(base_view),
         "dagger_dataset_roots": [str(root) for root in dagger_roots],
         "fully_labelled_dagger_roots": [str(root) for root in dagger_roots if root in fully_labelled],
         "base_episode_filter": base_episode_filter,
+        "no_base_episodes": bool(no_base_episodes),
+        **({"base_view_recovered_stub": schema_stub} if schema_stub is not None else {}),
+        "whole_trial_dagger_roots": [str(root) for root in dagger_roots if root in whole_trial_roots],
+        START_POSE_EPISODES_KEY: sorted(start_pose_episodes),
         "merge_type": "policy_ready_dagger",
         "build_id": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_digest": source_digest,
@@ -736,6 +859,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--base-episodes", default="", help="Comma-separated base view episode indices to keep.")
+    parser.add_argument(
+        "--no-base-episodes",
+        action="store_true",
+        help="Take none of the base view's episodes; use it for the schema, prompts and crops only.",
+    )
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--copy-videos", action="store_true")
@@ -748,7 +876,9 @@ def main() -> int:
     try:
         base_episodes = parse_episode_list(args.base_episodes)
         if args.check_only:
-            result = validate_policy_ready_merge(args.base_view, args.dagger_roots, base_episodes=base_episodes)
+            result = validate_policy_ready_merge(
+                args.base_view, args.dagger_roots, base_episodes=base_episodes, no_base_episodes=args.no_base_episodes
+            )
         else:
             result = merge_policy_ready_datasets(
                 base_view=args.base_view,
@@ -756,6 +886,7 @@ def main() -> int:
                 output_root=args.output_root,
                 repo_id=args.repo_id,
                 base_episodes=base_episodes,
+                no_base_episodes=args.no_base_episodes,
                 overwrite=args.overwrite,
                 copy_videos=args.copy_videos,
             )

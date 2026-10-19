@@ -104,6 +104,11 @@ DAGGER_DATA_DIR = Path('data')
 # a dataset without it is a takeover's.
 EXPERT_SOURCE_PATH = Path('meta/expert_source.json')
 DAGGER_RECREATABLE_FILES = {DAGGER_INFO_PATH, *DAGGER_TASK_PATHS, EXPERT_SOURCE_PATH}
+# The frame each episode's poses are in, one JSON row per episode. Frames are written through the
+# running rollout's T_B_Ws (`sent_command_to_dataset_action`), and T moves with every view's start
+# mean: the funnel105 view mixed data 24/-57/-87 mm apart without anyone knowing (10-16). A merge
+# can undo T with this row; nothing reads it yet.
+EPISODE_FRAMES_PATH = Path('meta/episode_frames.jsonl')
 
 # The four bytes a finished parquet file ends with. A file whose footer was never written --
 # the shape a killed or still-running session leaves -- ends with frame data instead, and no
@@ -215,14 +220,21 @@ def dagger_dataset_root_is_recreatable(root: Path) -> bool:
     return files.issubset(DAGGER_RECREATABLE_FILES)
 
 
-def write_expert_source(root: Path, *, expert: str, labels_every_action_dim: bool) -> None:
-    """Record, in the dataset, who drove its frames and whether they label every action dim."""
+def write_expert_source(
+    root: Path, *, expert: str, labels_every_action_dim: bool, records_policy_frames: bool = False
+) -> None:
+    """Record, in the dataset, who drove its frames and whether they label every action dim.
+
+    ``records_policy_frames`` marks a dataset whose episodes are whole trials: the policy's own
+    steps (``is_intervention`` 0) ahead of the expert's (1). Written only when set, so a dataset of
+    expert spans keeps the record it always had.
+    """
     path = Path(root) / EXPERT_SOURCE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({'expert': str(expert), 'labelsEveryActionDim': bool(labels_every_action_dim)}, indent=2) + '\n',
-        encoding='utf-8',
-    )
+    record: dict[str, Any] = {'expert': str(expert), 'labelsEveryActionDim': bool(labels_every_action_dim)}
+    if records_policy_frames:
+        record['recordsPolicyFrames'] = True
+    path.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
 
 
 def read_expert_source(root: Path) -> dict[str, Any]:
@@ -233,10 +245,11 @@ def read_expert_source(root: Path) -> dict[str, Any]:
     except (OSError, ValueError):
         record = None
     if not isinstance(record, dict):
-        return {'expert': 'takeover', 'labelsEveryActionDim': False}
+        return {'expert': 'takeover', 'labelsEveryActionDim': False, 'recordsPolicyFrames': False}
     return {
         'expert': str(record.get('expert') or 'takeover'),
         'labelsEveryActionDim': bool(record.get('labelsEveryActionDim', False)),
+        'recordsPolicyFrames': bool(record.get('recordsPolicyFrames', False)),
     }
 
 
@@ -268,6 +281,10 @@ class DaggerFrameBuffer:
     refuses an operator who has stopped moving -- see ``max_still_frames``. They are counted
     apart because they mean opposite things: the first says this rollout's corrections are
     incomplete, the second says they were trimmed on purpose.
+
+    With ``keep_policy_frames`` the policy's steps are kept too, in the same span as the expert's
+    that follow them: one span is then a whole trial, and ``is_intervention`` (set by
+    ``build_dagger_frame``) is what tells the two kinds of step apart.
     """
 
     def __init__(
@@ -275,6 +292,7 @@ class DaggerFrameBuffer:
         *,
         max_frames: int = DEFAULT_MAX_BUFFERED_FRAMES,
         max_still_frames: int | None = DEFAULT_MAX_STILL_FRAMES,
+        keep_policy_frames: bool = False,
     ):
         """``max_still_frames`` is how many consecutive frames the arm may go nowhere before the
         rest of that run stops being written; ``None`` (or a negative) keeps every frame.
@@ -287,6 +305,7 @@ class DaggerFrameBuffer:
         a time.
         """
         self._max_frames = max(0, int(max_frames))
+        self._keep_policy_frames = bool(keep_policy_frames)
         self._max_still_frames = (
             None if max_still_frames is None or int(max_still_frames) < 0 else int(max_still_frames)
         )
@@ -297,6 +316,13 @@ class DaggerFrameBuffer:
         self._still_dropped = 0
         self._still_run = 0
         self._still_reference: dict[str, float] | None = None
+        # Set by the rollout once it has solved T_B_Ws, before any frame lands: what
+        # `DaggerEpisodeWriter` records beside each episode of this buffer (EPISODE_FRAMES_PATH).
+        self.frame: dict[str, Any] | None = None
+
+    @property
+    def keeps_policy_frames(self) -> bool:
+        return self._keep_policy_frames
 
     @property
     def frame_count(self) -> int:
@@ -325,6 +351,9 @@ class DaggerFrameBuffer:
     ) -> None:
         """Offer one control step. Only the expert's are kept; the rest close the open span.
 
+        Unless the buffer keeps policy frames: then a policy step with a frame is kept like an
+        expert one, and only a step offered without a frame closes the span.
+
         ``sent_command`` is the command that actually reached the arm this step, in the robot's
         own base frame (``ee.x``/``ee.y``/``ee.z``, ``ee.wx``/``ee.wy``/``ee.wz``,
         ``gripper.pos``) -- the pose is read from it rather than from ``frame`` because the
@@ -333,7 +362,7 @@ class DaggerFrameBuffer:
         Omitting it leaves the dead-time rule off for that frame: a step whose motion cannot be
         measured is never assumed to be motionless.
         """
-        if not is_expert:
+        if not is_expert and not (self._keep_policy_frames and frame):
             # The span ends the moment the policy is driving again, which is the same instant
             # `expert_spans` ends it. Closing here rather than counting a gap keeps the two
             # definitions of "a span" from having to agree by coincidence.
@@ -430,12 +459,29 @@ class HandoverSeam:
         return on_seam
 
 
+def dagger_step_role(*, command_source: str, on_seam: bool, keeps_policy_frames: bool) -> str:
+    """What one control step is to the buffer: 'expert', 'policy' (both written), 'skip' or 'gap'.
+
+    'gap' is offered to the buffer as a frameless step, which closes the open span; 'skip' is not
+    offered at all. The two differ only for a whole-trial buffer: there the funnel's handover seam
+    is left out of the episode without cutting the trial in two at the moment the expert arrives.
+    """
+    if command_source in ('expert', 'funnel'):
+        if not on_seam:
+            return 'expert'
+        return 'skip' if keeps_policy_frames else 'gap'
+    if command_source == 'policy' and keeps_policy_frames:
+        return 'policy'
+    return 'gap'
+
+
 def build_dagger_frame(
     *,
     dataset_features: dict[str, dict],
     observation_values: dict[str, Any],
     action_values: dict[str, Any],
     task: str,
+    is_intervention: bool = True,
 ) -> dict[str, Any]:
     """One dataset frame, assembled the way ``record_loop`` assembles its own.
 
@@ -448,6 +494,8 @@ def build_dagger_frame(
     the buffer is flushed, which is after the operator has driven the whole correction -- so the
     caller passes what the policy was shown (``build_policy_observation``'s output), not what the
     robot reported.
+
+    ``is_intervention`` is False only for the policy's own steps of a whole-trial recording.
     """
     frame = {
         **build_dataset_frame(dataset_features, observation_values, prefix=OBSERVATION_PREFIX),
@@ -455,7 +503,7 @@ def build_dagger_frame(
         'task': task,
     }
     if IS_INTERVENTION_KEY in dataset_features:
-        frame[IS_INTERVENTION_KEY] = np.array([1.0], dtype=np.float32)
+        frame[IS_INTERVENTION_KEY] = np.array([1.0 if is_intervention else 0.0], dtype=np.float32)
     return frame
 
 
@@ -512,6 +560,8 @@ class DaggerEpisodeWriter:
             # save_episode has been observed never to return with two cameras and parallel
             # encoding on.
             self._dataset.save_episode(parallel_encoding=False)
+            if buffer.frame is not None:
+                self._record_frame(buffer.frame, rollout_index=rollout_index)
             written += 1
             frames_written += len(span)
         summary = {
@@ -533,6 +583,23 @@ class DaggerEpisodeWriter:
                 'these corrections matter.'
             )
         return summary
+
+
+    def _record_frame(self, frame: dict[str, Any], *, rollout_index: int) -> None:
+        row = {'episode_index': int(self._dataset.meta.total_episodes) - 1, 'rollout': int(rollout_index), **frame}
+        path = Path(self._dataset.root) / EPISODE_FRAMES_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(row) + '\n')
+
+
+def rollout_frame_record(T_B_Ws: Any, *, start_contract_xyzquat: Any, view_root: Any) -> dict[str, Any]:
+    """The row `DaggerEpisodeWriter` keeps per episode: the dataset pose is inv(T_B_Ws) @ base pose."""
+    return {
+        'T_B_Ws': [[float(v) for v in row] for row in np.asarray(T_B_Ws, dtype=np.float64)],
+        'start_contract_xyzquat': [float(v) for v in np.asarray(start_contract_xyzquat, dtype=np.float64)],
+        'view_root': str(view_root),
+    }
 
 
 # The niceness the background write runs at (absolute; the control loop runs at 0). A thread's

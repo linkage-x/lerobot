@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -307,7 +309,7 @@ def test_a_remote_launch_runs_in_the_hosts_own_repo_directory(tmp_path):
 
 def test_a_local_launch_uses_the_tele_model_cache_when_present(tmp_path, monkeypatch):
     model_cache = tmp_path / "Models"
-    model_cache.mkdir()
+    (model_cache / "models--lerobot--pi05_base").mkdir(parents=True)
     monkeypatch.setattr(training, "TELE_MODEL_CACHE", model_cache)
 
     _, env = training.build_launch_command(
@@ -318,6 +320,75 @@ def test_a_local_launch_uses_the_tele_model_cache_when_present(tmp_path, monkeyp
     assert env["HF_HUB_CACHE"] == str(model_cache)
     assert env["HF_HUB_OFFLINE"] == "1"
     assert env["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_a_models_directory_that_is_not_a_hub_cache_leaves_the_hub_alone(tmp_path, monkeypatch):
+    """The dev box's /home/tele/Models holds a bare symlink; offline there, pi05_base did not resolve."""
+    model_cache = tmp_path / "Models"
+    (model_cache / "pi05_base").mkdir(parents=True)
+    monkeypatch.setattr(training, "TELE_MODEL_CACHE", model_cache)
+
+    _, env = training.build_launch_command(
+        tmp_path, training.local_host(tmp_path), ["{python}", "train.py"], wandb_key=""
+    )
+
+    assert env is not None
+    assert "HF_HUB_CACHE" not in env or env["HF_HUB_CACHE"] != str(model_cache)
+    assert env.get("HF_HUB_OFFLINE") != "1" or "HF_HUB_OFFLINE" in os.environ
+
+
+def test_the_remote_hub_cache_guard_needs_a_hub_cache_layout(tmp_path):
+    """Run the guard as the remote shell would (POSIX sh) against a bare and a real cache."""
+    command, _ = training.build_launch_command(
+        tmp_path, _remote_host(), [".venv-fr3/bin/python", "train.py"], wandb_key=""
+    )
+    assert training._PIN_HF_HOME in command[-1]
+    guard = training._PIN_HF_HOME + "; if ls -d " + command[-1].split("if ls -d ", 1)[1].split("fi; ", 1)[0] + "fi; "
+    cache = tmp_path / "Models"
+    (cache / "pi05_base").mkdir(parents=True)
+    guard = guard.replace("/home/tele/Models", str(cache)) + "echo ${HF_HUB_OFFLINE:-online}"
+    home = tmp_path / "home"
+    home.mkdir()
+    run = lambda: subprocess.run(
+        ["sh", "-c", guard], capture_output=True, text=True, env={"HOME": str(home)}
+    ).stdout.strip()
+    assert run() == "online"
+    (home / ".cache" / "huggingface" / "hub" / "models--lerobot--pi05_base").mkdir(parents=True)
+    assert run() == "1", "the host's own hub cache goes offline too"
+    (cache / "models--lerobot--pi05_base").mkdir()
+    assert run() == "1"
+
+
+def test_the_wandb_xdg_redirect_does_not_move_the_hub_cache(tmp_path):
+    """Run the real remote script up to the trainer and ask huggingface_hub where its cache is."""
+    command, _ = training.build_launch_command(
+        tmp_path, _remote_host(), ["python", "-c", "from huggingface_hub import constants; print(constants.HF_HUB_CACHE)"],
+        wandb_key="",
+    )
+    home = tmp_path / "home"
+    (home / ".cache" / "huggingface" / "hub" / "models--lerobot--pi05_base").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = command[-1].replace("cd /home/user/lerobot", f"cd {repo}").replace("exec python", f"exec {sys.executable}")
+    result = subprocess.run(
+        ["sh", "-c", script + "; echo ${HF_HUB_OFFLINE:-online}"],
+        capture_output=True, text=True, env={"HOME": str(home), "PATH": os.environ["PATH"]},
+    )
+    assert result.stdout.splitlines()[0] == str(home / ".cache" / "huggingface" / "hub"), result.stderr
+
+
+def test_a_local_launch_pins_hf_home_before_the_xdg_redirect(tmp_path, monkeypatch):
+    monkeypatch.setattr(training, "TELE_MODEL_CACHE", tmp_path / "absent")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    _, env = training.build_launch_command(
+        tmp_path, training.local_host(tmp_path), ["{python}", "train.py"], wandb_key=""
+    )
+
+    assert env["HF_HOME"] == str(tmp_path / ".cache" / "huggingface")
+    assert "wandb" in env["XDG_CACHE_HOME"]
 
 
 # ----------------------------------------------------------------------- wandb ---

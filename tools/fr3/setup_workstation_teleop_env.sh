@@ -162,4 +162,13 @@ print(f"ruckig={ruckig.__version__ if hasattr(ruckig, '__version__') else ruckig
 PY
 fi
 
+# After the venv sync: finding the gripper takes the pika SDK's frame parser. The configs name it
+# /dev/pika_gripper, which only this host's udev rule can point at the right USB socket.
+if [[ "$configure_device_access" == "1" ]]; then
+  if ! PYTHON_BIN="$venv_path/bin/python" bash tools/fr3/install_pika_gripper_udev.sh; then
+    echo "WARNING: /dev/pika_gripper is not set up; power and cable the Pika gripper, then run" >&2
+    echo "         bash tools/fr3/install_pika_gripper_udev.sh" >&2
+  fi
+fi
+
 echo "==> FR3 workstation environment ready: ${repo_root}/${venv_path}"

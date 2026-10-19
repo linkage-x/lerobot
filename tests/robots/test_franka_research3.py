@@ -3592,3 +3592,63 @@ def test_recovery_holds_the_arm_where_it_stopped_rather_than_where_it_was_being_
     robot._arm = DummyArmDriver()
     assert robot.control_loop_alive
     robot.disconnect()
+
+
+class _StallingCamera:
+    """Stale for its first `stale_reads` reads, then fresh: a process or bus stall, not a dead camera."""
+
+    def __init__(self, robot, stale_reads, value):
+        self.robot, self.stale_reads, self.value, self.reads = robot, stale_reads, value, 0
+
+    def read_latest_with_timestamp(self, max_age_ms):
+        self.reads += 1
+        if self.reads <= self.stale_reads:
+            raise TimeoutError(f"stale at {max_age_ms}")
+        return np.full((2, 2, 3), self.value, dtype=np.uint8), time.perf_counter()
+
+    def read_closest(self, timestamp_s, max_age_ms):
+        del timestamp_s, max_age_ms
+        return np.full((2, 2, 3), self.value, dtype=np.uint8), time.perf_counter()
+
+
+def test_a_stall_shorter_than_the_grace_is_waited_out_and_every_camera_reread(robot, caplog):
+    """NUC 10-16: both cameras 135 ms old at once, threads alive, halted run 162608 at trial 47."""
+    robot.connect()
+    side = _StallingCamera(robot, stale_reads=0, value=2)
+    robot.cameras = {"ee": _StallingCamera(robot, stale_reads=3, value=1), "side": side}
+
+    with caplog.at_level("WARNING"):
+        observation = robot.get_observation()
+
+    assert int(observation["ee"][0, 0, 0]) == 1 and int(observation["side"][0, 0, 0]) == 2
+    # side was read in every pass that got past ee: the frames from before the wait are not used.
+    assert side.reads == 1 and robot.cameras["ee"].reads == 4
+    assert robot.camera_stale_recoveries == 1
+    assert "camera_stale_recovered camera=ee" in caplog.text
+
+
+def test_a_camera_still_stale_after_the_grace_raises_with_the_wait_in_the_message(robot):
+    robot.config.camera_stale_grace_ms = 20.0
+    robot.connect()
+    robot.cameras = {"ee": _StallingCamera(robot, stale_reads=10**9, value=1)}
+
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError) as exc_info:
+        robot.get_observation()
+
+    assert 0.02 <= time.perf_counter() - started < 0.5
+    message = str(exc_info.value)
+    assert message.startswith("stale at 100.0 (still stale after waiting")
+    assert "FR3 camera_timeout_context failed_camera=ee" in message
+    assert robot.camera_stale_recoveries == 0
+
+
+def test_zero_grace_raises_on_the_first_stale_read(robot):
+    robot.config.camera_stale_grace_ms = 0.0
+    robot.connect()
+    camera = _StallingCamera(robot, stale_reads=1, value=1)
+    robot.cameras = {"ee": camera}
+
+    with pytest.raises(TimeoutError, match="stale at 100.0 FR3 camera_timeout_context"):
+        robot.get_observation()
+    assert camera.reads == 1

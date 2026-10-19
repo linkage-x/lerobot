@@ -1,15 +1,32 @@
 import { describe, expect, it } from "vitest";
 
 import panelSource from "./SceneResetPanel.tsx?raw";
-import { PLACE_Z_M, TABLE_Z_M, dropWarning } from "./sceneResetHeights";
+import { DEFAULT_PICK_XYZ, PLACE_Z_M, dropWarning } from "./sceneResetHeights";
 
-describe("TABLE_Z_M", () => {
+describe("DEFAULT_PICK_XYZ", () => {
   it("is a height on the table, not a height above it", () => {
     // The regression these constants come from: the place height was 0.55, so the reset
     // released the peg 50 cm over the table. Any plausible table-top height is a few
     // centimetres, and one that is not is a fall.
-    expect(TABLE_Z_M).toBeGreaterThan(0);
-    expect(TABLE_Z_M).toBeLessThan(0.1);
+    expect(DEFAULT_PICK_XYZ[2]).toBeGreaterThan(0);
+    expect(DEFAULT_PICK_XYZ[2]).toBeLessThan(0.1);
+  });
+
+  it("is the hole, the grasp loop's fixture pick", () => {
+    // GRASP_LOOP_PICK_XYZ in tools/fr3/grasp_loop.py. The old (0.40, 0.00) was drawn on the map
+    // as "pick" with nothing there, and a mask painted around it put every peg 130-200 mm left
+    // of the grasps the policy was trained on.
+    expect(DEFAULT_PICK_XYZ[0]).toBeCloseTo(0.3597, 6);
+    expect(DEFAULT_PICK_XYZ[1]).toBeCloseTo(-0.1328, 6);
+    expect(DEFAULT_PICK_XYZ[2]).toBeCloseTo(0.055, 6);
+  });
+});
+
+describe("the pick in the panel", () => {
+  it("starts at the default rather than at a typed literal", () => {
+    expect(panelSource).toContain("useState(DEFAULT_PICK_XYZ[0].toFixed(4))");
+    expect(panelSource).toContain("useState(DEFAULT_PICK_XYZ[1].toFixed(4))");
+    expect(panelSource).not.toContain('useState("0.40")');
   });
 });
 
@@ -28,7 +45,7 @@ describe("PLACE_Z_M", () => {
   it("does not, with the default pick, order a drop", () => {
     // The two defaults have to be a pair that the panel's own warning is happy with, or every
     // fresh session opens on a banner nobody can act on.
-    expect(dropWarning(TABLE_Z_M, PLACE_Z_M)).toBe("");
+    expect(dropWarning(DEFAULT_PICK_XYZ[2], PLACE_Z_M)).toBe("");
   });
 });
 

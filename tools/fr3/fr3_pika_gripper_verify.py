@@ -408,9 +408,9 @@ def main(argv: list[str] | None = None) -> int:
             aliases = stable_aliases(found)
             print(f"\nPika gripper is on {found} ({Path(found).resolve()}).")
             if aliases["by_path"]:
-                print("Set robot.gripper_port to this by-path alias -- it survives replugs into the")
-                print("same USB socket, unlike the CH340's non-unique by-id name:")
-                print(f"  gripper_port: {aliases['by_path']}")
+                print("The configs name it /dev/pika_gripper; if that is missing or points elsewhere,")
+                print("pin it to this USB socket with: bash tools/fr3/install_pika_gripper_udev.sh")
+                print(f"(by-path alias, stable across replugs into the same socket: {aliases['by_path']})")
             else:
                 print("No /dev/serial/by-path alias exists for it; the bare node below is not stable")
                 print("across replugs, so re-run --scan after any reconnection:")

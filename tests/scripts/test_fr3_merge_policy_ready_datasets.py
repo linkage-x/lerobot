@@ -82,6 +82,11 @@ def _write_dataset(
         {
             "repo_id": f"local/{root.name}",
             "action_mode": "delta_ee_from_prev_cmd",
+            "cameras": ["observation.images.ee"],
+            "state_keys": ["observation.state"],
+            "action_append_selectors": [],
+            "action_append_names": [],
+            "image_resize_shape": None,
             "task_prompts": [prompt],
             "fps": fps,
             "total_episodes": episodes,
@@ -475,3 +480,174 @@ def test_a_dataset_with_no_expert_record_is_a_takeovers(tmp_path):
 
     manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
     assert manifest["fully_labelled_dagger_roots"] == []
+
+
+def _whole_trial(root: Path) -> None:
+    _write_json(
+        root / "meta" / "expert_source.json",
+        {"expert": "grasp_funnel", "labelsEveryActionDim": True, "recordsPolicyFrames": True},
+    )
+
+
+def _funnel_only(root: Path) -> None:
+    _write_json(root / "meta" / "expert_source.json", {"expert": "grasp_funnel", "labelsEveryActionDim": True})
+
+
+def _stub(root: Path) -> None:
+    manifest_path = root / "meta" / "il_view_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["recovered_stub"] = {"why": "metadata-only stand-in, NOT trainable"}
+    _write_json(manifest_path, manifest)
+
+
+def test_a_recovered_stub_is_refused_as_training_data(tmp_path):
+    base = tmp_path / "stub"
+    trial = tmp_path / "trial_ckpt"
+    _write_dataset(base, episodes=1)
+    _stub(base)
+    _write_dataset(trial, episodes=1, include_intervention=True)
+    _write_qc(trial)
+    _whole_trial(trial)
+
+    with pytest.raises(MergeError, match="recovered stub"):
+        validate_policy_ready_merge(base, [trial])
+
+
+def test_a_base_without_the_training_schema_is_refused_at_merge_time(tmp_path):
+    """The 030000 stub had no state_keys; the merge passed and the training run died on start."""
+    base = tmp_path / "stub"
+    trial = tmp_path / "trial_ckpt"
+    _write_dataset(base, episodes=1)
+    _stub(base)
+    manifest_path = base / "meta" / "il_view_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["state_keys"], manifest["image_resize_shape"]
+    _write_json(manifest_path, manifest)
+    _write_dataset(trial, episodes=1, include_intervention=True)
+    _write_qc(trial)
+    _whole_trial(trial)
+
+    with pytest.raises(MergeError, match="no state_keys, image_resize_shape"):
+        validate_policy_ready_merge(base, [trial], no_base_episodes=True)
+
+
+def test_a_merge_without_base_episodes_takes_only_the_corrections(tmp_path):
+    """The stub supplies schema, prompts and crops; its episode and its files stay out."""
+    base = tmp_path / "stub"
+    trial = tmp_path / "trial_ckpt"
+    funnel = tmp_path / "funnel_ckpt"
+    out = tmp_path / "combined"
+    _write_dataset(base, episodes=1)
+    _stub(base)
+    _write_dataset(trial, episodes=2, include_intervention=True)
+    _write_dataset(funnel, episodes=3, include_intervention=True)
+    for root in (trial, funnel):
+        _write_qc(root)
+    _whole_trial(trial)
+    _funnel_only(funnel)
+
+    check = validate_policy_ready_merge(base, [trial, funnel], no_base_episodes=True)
+    assert check["totalEpisodes"] == 5
+    assert "schema only" in check["checks"][0]["message"]
+    assert "whole trials" in check["checks"][1]["message"] and "whole trials" not in check["checks"][2]["message"]
+
+    merge_policy_ready_datasets(
+        base_view=base, dagger_roots=[trial, funnel], output_root=out, repo_id="local/c", no_base_episodes=True
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert info["total_episodes"] == 5 and info["total_frames"] == 10
+    data = pd.concat(
+        [pq.read_table(path).to_pandas() for path in sorted((out / "data").glob("chunk-*/*.parquet"))],
+        ignore_index=True,
+    )
+    assert data["episode_index"].tolist() == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    assert data["index"].tolist() == list(range(10))
+    assert set(data[IS_INTERVENTION_KEY].tolist()) == {0.0}
+    # One data file and one video per correction dataset; nothing of the stub's.
+    assert len(list((out / "data").glob("chunk-*/*.parquet"))) == 2
+    videos = sorted((out / "videos").rglob("*.mp4"))
+    assert len(videos) == 2 and all(base not in video.resolve().parents for video in videos)
+
+    manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    # Only the whole trials start at home; the funnel episodes start mid-air.
+    assert manifest["start_pose_episodes"] == [0, 1]
+    assert manifest["whole_trial_dagger_roots"] == [str(trial)]
+    assert manifest["no_base_episodes"] is True
+    # The stub's "not trainable" describes the stub, not this dataset.
+    assert "recovered_stub" not in manifest
+    assert manifest["base_view_recovered_stub"]["why"].startswith("metadata-only")
+    # The rollout follows the base view to the frame its crops were drawn on.
+    assert manifest["source_dataset_roots"][0] == str(base)
+    assert {row["source_dataset_root"] for row in manifest["episode_source_index"]} == {str(trial), str(funnel)}
+
+    stats = json.loads((out / "meta" / "stats.json").read_text(encoding="utf-8"))
+    # Pixel stats come from the corrections' own, weighted by their frame counts (4 and 6).
+    assert stats["observation.images.ee"]["count"] == [10]
+    assert stats["observation.images.ee"]["mean"] == pytest.approx([0.0, 1.0, 2.0])
+    assert set(stats["observation.images.ee"]) >= {"q01", "q99"}
+
+
+def test_aggregated_pixel_stats_pool_the_variance():
+    from tools.fr3.fr3_merge_policy_ready_datasets import aggregate_feature_stats
+
+    a = np.array([0.0, 2.0]); b = np.array([4.0, 4.0, 4.0, 8.0])
+    part = lambda v: {"count": [len(v)], "min": [v.min()], "max": [v.max()], "mean": [v.mean()], "std": [v.std()], "q50": [0.0]}
+    merged = aggregate_feature_stats([part(a), part(b)])
+    both = np.concatenate([a, b])
+    assert merged["count"] == [6]
+    assert merged["mean"] == pytest.approx([both.mean()])
+    assert merged["std"] == pytest.approx([both.std()])
+    assert merged["min"] == [0.0] and merged["max"] == [8.0]
+
+
+def test_a_merge_with_nothing_starting_at_home_is_refused(tmp_path):
+    base = tmp_path / "stub"
+    funnel = tmp_path / "funnel_ckpt"
+    _write_dataset(base, episodes=1)
+    _write_dataset(funnel, episodes=1, include_intervention=True)
+    _write_qc(funnel)
+    _funnel_only(funnel)
+
+    with pytest.raises(MergeError, match="start pose"):
+        validate_policy_ready_merge(base, [funnel], no_base_episodes=True)
+    with pytest.raises(MergeError, match="not both"):
+        validate_policy_ready_merge(base, [funnel], base_episodes=[0], no_base_episodes=True)
+
+
+def test_start_pose_episodes_are_the_base_episodes_and_whole_trials(tmp_path):
+    base = tmp_path / "base"
+    takeover = tmp_path / "dagger_ckpt"
+    trial = tmp_path / "trial_ckpt"
+    out = tmp_path / "combined"
+    _write_dataset(base, episodes=3)
+    _write_dataset(takeover, episodes=2, include_intervention=True)
+    _write_dataset(trial, episodes=1, include_intervention=True)
+    for root in (takeover, trial):
+        _write_qc(root)
+    _whole_trial(trial)
+
+    merge_policy_ready_datasets(
+        base_view=base, dagger_roots=[takeover, trial], output_root=out, repo_id="local/c", base_episodes=[0, 2]
+    )
+
+    manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    # Base 0 and 2 become view 0 and 1; the takeovers (2, 3) start mid-trajectory; the trial is 4.
+    assert manifest["start_pose_episodes"] == [0, 1, 4]
+
+
+def test_a_merged_base_views_own_start_list_is_carried_through(tmp_path):
+    base = tmp_path / "base_merged"
+    trial = tmp_path / "trial_ckpt"
+    out = tmp_path / "combined"
+    _write_dataset(base, episodes=3)
+    manifest_path = base / "meta" / "il_view_manifest.json"
+    _write_json(manifest_path, {**json.loads(manifest_path.read_text(encoding="utf-8")), "start_pose_episodes": [1]})
+    _write_dataset(trial, episodes=1, include_intervention=True)
+    _write_qc(trial)
+    _whole_trial(trial)
+
+    merge_policy_ready_datasets(base_view=base, dagger_roots=[trial], output_root=out, repo_id="local/c")
+
+    manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["start_pose_episodes"] == [1, 3]

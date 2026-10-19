@@ -91,6 +91,7 @@ from tools.fr3.dagger_takeover import (
     undated_backend_error,
 )
 from tools.fr3.workspace_fence import resolve_workspace_fence
+from tools.fr3.policy_remote import RemotePolicyClient, ServerSideProcessor, policy_fingerprint, policy_load_spec
 from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
     DEFAULT_MAX_STILL_FRAMES,
@@ -100,12 +101,15 @@ from tools.fr3.dagger_dataset import (
     HandoverSeam,
     build_dagger_frame,
     dagger_dataset_can_load_locally,
+    dagger_step_role,
     dagger_dataset_features,
     dagger_dataset_is_unfinalized,
     dagger_dataset_root_is_recreatable,
     dagger_dataset_unreadable_shards,
     image_source_keys,
+    rollout_frame_record,
     sent_command_to_dataset_action,
+    read_expert_source,
     write_expert_source,
 )
 from tools.fr3.interactive_control import InteractiveRolloutKeyboard
@@ -181,6 +185,8 @@ _DEFAULT_ACTION_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_OPENCV_FOURCC = 'MJPG'
 _DEFAULT_OPENCV_BACKEND = Cv2Backends.V4L2
 _OBS_IMAGES_PREFIX = 'observation.images.'
+# Written by fr3_merge_policy_ready_datasets into il_view_manifest.json; see _load_start_pose_episodes.
+START_POSE_EPISODES_KEY = 'start_pose_episodes'
 _DEFAULT_FIRST_FRAME_MAX_POS_DELTA_MM = 30.0
 _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
 # How far the *policy* may ask the EE to move in one step, measured against the pose its action is
@@ -558,6 +564,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-record-whole-trial',
+        action='store_true',
+        help=(
+            'With --grasp-loop-dataset-root: one episode per held trial from its first step, the '
+            "policy's own steps (is_intervention=0) ahead of the funnel's (1), instead of the "
+            'funnel steps alone -- the approach a policy trained on it has to drive too. Its own '
+            'dataset: a root holding funnel-only episodes is refused, and the other way round.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-dataset-repo-id',
         type=str,
         default=None,
@@ -804,6 +820,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Optional panda_py joint-position controller filter coefficient.',
     )
     parser.add_argument('--device', default=None, help='Optional torch device override.')
+    parser.add_argument(
+        '--policy-server',
+        default=None,
+        metavar='HOST[:PORT]',
+        help=(
+            'Run the forward pass on a policy server (tools/fr3/fr3_policy_server.py, default port '
+            '8790) instead of loading the weights here. RTC chunk policies only. Omitted, the '
+            'policy loads and runs in this process exactly as before.'
+        ),
+    )
     parser.add_argument('--log-interval', type=int, default=30, help='Step interval for runtime logging.')
     parser.add_argument(
         '--first-frame-max-pos-delta-mm',
@@ -1163,7 +1189,16 @@ def resolve_dataset_root(pretrained_dir: Path, train_cfg: TrainPipelineConfig, d
         raise ValueError(
             f"No dataset root resolved from {pretrained_dir / 'train_config.json'}. Pass --dataset-root explicitly."
         )
-    return _resolve_repo_path(root_value)
+    resolved = _resolve_repo_path(root_value)
+    if dataset_root is None and not resolved.exists():
+        # train_config.json records the training machine's absolute path (e.g. /home/hph/Code/lerobot/outputs/...);
+        # on another machine the same view lives under this checkout's outputs/.
+        parts = resolved.parts
+        if 'outputs' in parts:
+            relocated = _REPO_ROOT.joinpath(*parts[parts.index('outputs'):])
+            if relocated.exists():
+                return relocated
+    return resolved
 
 
 def _feature_has_ee_pose(info: dict[str, Any], state_key: str) -> bool:
@@ -3023,6 +3058,27 @@ def _load_episode_data_locations(dataset_root: Path) -> list[tuple[int, int, int
     return episode_rows
 
 
+def _load_start_pose_episodes(dataset_root: Path) -> set[int] | None:
+    """The episodes a merged view says begin at the start pose, or None for "all of them".
+
+    A correction episode begins wherever the takeover happened -- mid-air, for the grasp funnel --
+    so its first frame is not a start pose, and averaging it into the start contract moves the
+    frame T_B_Ws is solved in. `fr3_merge_policy_ready_datasets` lists the ones that are
+    (``START_POSE_EPISODES_KEY`` there). A view without the list predates it; its contract stays
+    the mean of every episode, which is what its checkpoint was rolled out against.
+    """
+    manifest_path = dataset_root / 'meta' / 'il_view_manifest.json'
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    listed = manifest.get(START_POSE_EPISODES_KEY)
+    if listed is None:
+        return None
+    if not listed:
+        raise ValueError(f'{manifest_path} lists no {START_POSE_EPISODES_KEY}; there is no start pose to solve against')
+    return {int(episode) for episode in listed}
+
+
 def _load_episode_start_state_rows(
     dataset_root: Path,
     *,
@@ -3031,8 +3087,11 @@ def _load_episode_start_state_rows(
     import pyarrow.parquet as pq
 
     dataset_root = _resolve_repo_path(dataset_root)
+    start_pose_episodes = _load_start_pose_episodes(dataset_root)
     start_state_rows: list[tuple[int, np.ndarray]] = []
     for episode_index, chunk_index, file_index in _load_episode_data_locations(dataset_root):
+        if start_pose_episodes is not None and episode_index not in start_pose_episodes:
+            continue
         data_file = _resolve_dataset_data_file(dataset_root, chunk_index=chunk_index, file_index=file_index)
         table = pq.read_table(str(data_file), columns=['episode_index', state_key]).to_pydict()
         for row_episode_index, state in zip(table['episode_index'], table[state_key], strict=True):
@@ -4329,8 +4388,22 @@ def build_dagger_writer(
             shutil.rmtree(root)
         dataset = create_dataset()
     if flag == '--grasp-loop-dataset-root':
+        whole_trial = bool(getattr(args, 'grasp_loop_record_whole_trial', False))
+        if int(dataset.meta.total_episodes) > 0:
+            recorded = read_expert_source(root)['recordsPolicyFrames']
+            if recorded != whole_trial:
+                # Two kinds of episode in one dataset would leave nothing to tell them apart by
+                # but their first frame -- and the start contract a view solves T_B_Ws against
+                # is the mean of exactly those frames.
+                kinds = {True: 'whole trials', False: 'funnel steps only'}
+                raise SystemExit(
+                    f'{flag} {root} holds {kinds[recorded]} and this run records '
+                    f'{kinds[whole_trial]}. Point it at a fresh directory.'
+                )
         # The funnel commands every axis, the close included: see EXPERT_SOURCE_PATH.
-        write_expert_source(root, expert='grasp_funnel', labels_every_action_dim=True)
+        write_expert_source(
+            root, expert='grasp_funnel', labels_every_action_dim=True, records_policy_frames=whole_trial
+        )
     return dataset, DaggerEpisodeWriter(dataset, min_span_frames=int(args.dagger_min_span_frames))
 
 
@@ -4562,6 +4635,21 @@ def predict_action_chunk_for_rollout(
     from ``execution_horizon``, which is a different quantity and was wrong by 9 steps on the
     deployed configuration; a loud refusal is the point of removing it.
     """
+    if isinstance(policy, RemotePolicyClient):
+        return policy.predict_action_chunk_for_rollout(
+            observation,
+            inference_delay=inference_delay,
+            prev_chunk_left_over=prev_chunk_left_over,
+            execution_horizon=execution_horizon,
+            task=task,
+            robot_type=robot_type,
+            action_samples=action_samples,
+            action_aggregate=action_aggregate,
+            lateral_action_indices=lateral_action_indices,
+            gripper_action_index=gripper_action_index,
+            action_sample_horizon=action_sample_horizon,
+            action_sample_offset=action_sample_offset,
+        )
     observation = dict(observation)
     samples = max(1, int(action_samples))
     if samples > 1 and lateral_action_indices is None:
@@ -4768,18 +4856,21 @@ def merge_completed_rtc_plan(
         'observation_step': int(result.observation_step),
     }
 
-def load_policy_stack(
+def prepare_rollout_policy_config(
     pretrained_dir: Path,
     *,
-    ds_meta: LeRobotDatasetMetadata,
-    device: torch.device,
     n_action_steps_override: int | None = None,
     act_temporal_ensemble_coeff: float | None = None,
     rtc_mode: str = 'disabled',
     rtc_execution_horizon: int = _DEFAULT_RTC_EXECUTION_HORIZON,
     rtc_max_guidance_weight: float = _DEFAULT_RTC_MAX_GUIDANCE_WEIGHT,
     rtc_prefix_attention_schedule: str = _DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE.value,
-) -> tuple[Any, PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]:
+) -> Any:
+    """The checkpoint's policy config with the rollout's overrides applied, no weights loaded.
+
+    Shared by the local stack and the remote one so a policy server and its client derive the
+    same config from the same flags -- the handshake then checks that they did.
+    """
     policy_cfg = load_train_config(pretrained_dir).policy
     if policy_cfg is None:
         raise ValueError(f"No policy config found in {pretrained_dir / 'train_config.json'}")
@@ -4827,7 +4918,30 @@ def load_policy_stack(
             f'coeff_from={old_temporal_ensemble_coeff} coeff_to={temporal_ensemble_coeff:.6g} '
             f'n_action_steps_from={old_n_action_steps} n_action_steps_to=1 chunk_size={chunk_size}'
         )
+    return policy_cfg
 
+
+def load_policy_stack(
+    pretrained_dir: Path,
+    *,
+    ds_meta: LeRobotDatasetMetadata,
+    device: torch.device,
+    n_action_steps_override: int | None = None,
+    act_temporal_ensemble_coeff: float | None = None,
+    rtc_mode: str = 'disabled',
+    rtc_execution_horizon: int = _DEFAULT_RTC_EXECUTION_HORIZON,
+    rtc_max_guidance_weight: float = _DEFAULT_RTC_MAX_GUIDANCE_WEIGHT,
+    rtc_prefix_attention_schedule: str = _DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE.value,
+) -> tuple[Any, PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]:
+    policy_cfg = prepare_rollout_policy_config(
+        pretrained_dir,
+        n_action_steps_override=n_action_steps_override,
+        act_temporal_ensemble_coeff=act_temporal_ensemble_coeff,
+        rtc_mode=rtc_mode,
+        rtc_execution_horizon=rtc_execution_horizon,
+        rtc_max_guidance_weight=rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
+    )
     policy_cfg.device = str(device)
     policy_cfg.pretrained_path = pretrained_dir
     policy = make_policy(cfg=policy_cfg, ds_meta=ds_meta)
@@ -4838,6 +4952,44 @@ def load_policy_stack(
     )
     policy.eval()
     return policy, preprocessor, postprocessor
+
+
+def load_remote_policy_stack(
+    pretrained_dir: Path,
+    *,
+    policy_server: str,
+    dataset_root: Path | None = None,
+    **config_overrides: Any,
+) -> tuple[RemotePolicyClient, ServerSideProcessor, ServerSideProcessor]:
+    """The client half of a split rollout: the config here, weights and processors on the server.
+
+    Only the RTC chunk path is remote -- ACT's per-step `predict_action` keeps state inside the
+    policy object, and a round trip per 30 Hz step is not what the split is for.
+
+    The server loads what this side names (checkpoint, view, overrides) unless it already holds
+    exactly that, so the connect below can take as long as a pi05 load.
+    """
+    policy_cfg = prepare_rollout_policy_config(pretrained_dir, **config_overrides)
+    rtc_config = getattr(policy_cfg, 'rtc_config', None)
+    if rtc_config is None or not getattr(rtc_config, 'enabled', False):
+        raise SystemExit(
+            f'--policy-server only serves the RTC chunk path, and RTC is not enabled for this '
+            f'{getattr(policy_cfg, "type", "?")} checkpoint (--rtc-mode {config_overrides.get("rtc_mode")}). '
+            'Run it in-process instead.'
+        )
+    policy_cfg.device = 'cpu'
+    policy_cfg.pretrained_path = pretrained_dir
+    client = RemotePolicyClient(
+        policy_server,
+        config=policy_cfg,
+        fingerprint=policy_fingerprint(policy_cfg, pretrained_dir),
+        load_spec=policy_load_spec(pretrained_dir, dataset_root=dataset_root, **config_overrides),
+    )
+    print(f"[INFO] policy_server={policy_server} connecting (the server loads the checkpoint if it does not hold it)")
+    sys.stdout.flush()
+    info = client.connect()
+    print(f"[INFO] policy_server={policy_server} device={info.get('device')} checkpoint={client.fingerprint['checkpoint']}")
+    return client, ServerSideProcessor('preprocessor'), ServerSideProcessor('postprocessor')
 
 
 class TerminateAsKeyboardInterrupt:
@@ -4890,6 +5042,13 @@ class TerminateAsKeyboardInterrupt:
 
 
 def run_inference(args: argparse.Namespace) -> int:
+    # Cover setup as well as robot shutdown: a retained traceback or planner closure can
+    # otherwise keep the remote socket (and the server's exclusive policy hold) alive.
+    with ExitStack() as policy_cleanup:
+        return _run_inference(args, policy_cleanup)
+
+
+def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
     pretrained_dir = resolve_pretrained_model_dir(args.checkpoint)
     train_cfg = load_train_config(pretrained_dir)
     dataset_root = resolve_dataset_root(pretrained_dir, train_cfg, args.dataset_root)
@@ -4902,12 +5061,7 @@ def run_inference(args: argparse.Namespace) -> int:
     )
     camera_configs = load_camera_configs(args.camera_config)
     camera_crop_specs, camera_crop_source_hw = load_camera_crop_specs(dataset_root)
-    device = resolve_policy_device(args.device, torch.cuda.is_available())
-
-    policy, preprocessor, postprocessor = load_policy_stack(
-        pretrained_dir,
-        ds_meta=ds_meta,
-        device=device,
+    policy_config_overrides = dict(
         n_action_steps_override=args.policy_n_action_steps,
         act_temporal_ensemble_coeff=args.act_temporal_ensemble_coeff,
         rtc_mode=args.rtc_mode,
@@ -4915,6 +5069,18 @@ def run_inference(args: argparse.Namespace) -> int:
         rtc_max_guidance_weight=args.rtc_max_guidance_weight,
         rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
     )
+    if getattr(args, 'policy_server', None):
+        # The robot host has no GPU to refuse to fall back from: the forward pass is the server's.
+        device = torch.device('cpu')
+        policy, preprocessor, postprocessor = load_remote_policy_stack(
+            pretrained_dir, policy_server=args.policy_server, dataset_root=dataset_root, **policy_config_overrides
+        )
+        policy_cleanup.callback(policy.close)
+    else:
+        device = resolve_policy_device(args.device, torch.cuda.is_available())
+        policy, preprocessor, postprocessor = load_policy_stack(
+            pretrained_dir, ds_meta=ds_meta, device=device, **policy_config_overrides
+        )
     required_image_keys = extract_required_image_keys(policy.config.input_features)
     required_tactile_keys = extract_required_tactile_keys(policy.config.input_features)
     validate_camera_keys(required_image_keys=required_image_keys, available_camera_keys=list(camera_configs))
@@ -5053,6 +5219,8 @@ def run_inference(args: argparse.Namespace) -> int:
     grasp_loop_out = Path(args.grasp_loop_out).expanduser() if args.grasp_loop_out else Path()
     if args.grasp_loop_dataset_root is not None and int(args.grasp_loop_trials) <= 0:
         raise SystemExit('--grasp-loop-dataset-root records the grasp loop: it needs --grasp-loop-trials.')
+    if args.grasp_loop_record_whole_trial and args.grasp_loop_dataset_root is None:
+        raise SystemExit('--grasp-loop-record-whole-trial says what to record: it needs --grasp-loop-dataset-root.')
     if int(args.grasp_loop_trials) > 0:
         if args.interactive_rollouts or args.dagger_takeover or terminal_servo_request is not None:
             raise SystemExit(
@@ -5626,6 +5794,10 @@ def run_inference(args: argparse.Namespace) -> int:
             if T_B_Ws is None:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
                 T_B_Ws = current_start_pose_i @ _invert_pose(dataset_start_pose_contract)
+                if dagger_buffer is not None:
+                    dagger_buffer.frame = rollout_frame_record(
+                        T_B_Ws, start_contract_xyzquat=dataset_start_pose_contract_xyzquat, view_root=dataset_root
+                    )
                 start_alignment_stats = summarize_live_start_alignment_to_dataset_starts(
                     alignment_dataset_root,
                     T_B_Ws,
@@ -6111,7 +6283,17 @@ def run_inference(args: argparse.Namespace) -> int:
                 on_seam = command_source == 'funnel' and funnel_seam.skip(
                     clamped=command_guard['status'] != 'pass'
                 )
-                if command_source in ('expert', 'funnel') and not on_seam:
+                # A whole-trial buffer keeps the policy's own steps as well, unlabelled as
+                # interventions; the seam is still left out, without closing the span.
+                step_role = dagger_step_role(
+                    command_source=command_source,
+                    on_seam=on_seam,
+                    keeps_policy_frames=dagger_buffer.keeps_policy_frames,
+                )
+                is_intervention = step_role == 'expert'
+                if step_role == 'skip':
+                    pass
+                elif step_role in ('expert', 'policy'):
                     dagger_action, previous_dagger_quaternion_xyzw = sent_command_to_dataset_action(
                         command_to_send,
                         T_B_Ws=T_B_Ws,
@@ -6145,8 +6327,9 @@ def run_inference(args: argparse.Namespace) -> int:
                             },
                             action_values=dagger_action,
                             task=dagger_task,
+                            is_intervention=is_intervention,
                         ),
-                        is_expert=True,
+                        is_expert=is_intervention,
                         # The post-clamp command, which is both what the frame's action encodes
                         # and what the arm was actually told -- so the buffer's "did this step
                         # go anywhere" is asked of the same motion the dataset will teach.
@@ -6496,13 +6679,18 @@ def run_inference(args: argparse.Namespace) -> int:
                 trace = RolloutGeometryTrace(trial + 1, trace_dir=rollout_trace_dir)
                 grasp_segment['buffer'] = (
                     DaggerFrameBuffer(
-                        # A funnel segment is at most its step budget plus the close's settle:
-                        # never truncate one for a cap sized to a SpaceMouse correction.
+                        # A funnel segment is at most its step budget plus the close's settle,
+                        # and a whole trial adds the policy's: never truncate either for a cap
+                        # sized to a SpaceMouse correction.
                         max_frames=max(
                             int(args.dagger_max_buffered_frames),
-                            grasp_loop_request.funnelMaxSteps + grasp_loop_request.closeSettleSteps + 1,
+                            grasp_loop_request.funnelMaxSteps
+                            + grasp_loop_request.closeSettleSteps
+                            + 1
+                            + (grasp_loop_request.maxPolicySteps if args.grasp_loop_record_whole_trial else 0),
                         ),
                         max_still_frames=int(args.dagger_max_still_frames),
+                        keep_policy_frames=bool(args.grasp_loop_record_whole_trial),
                     )
                     if dagger_writer is not None
                     else None

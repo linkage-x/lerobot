@@ -17,6 +17,7 @@
 #     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
 #     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
+#     FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL=1 (with the root: whole held trials, policy steps included)
 #     FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM ("h" or "low,high" mm above the peg; blank = 60)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
@@ -52,7 +53,7 @@ extra_args=("$@")
 # there.
 robot_ip="${FR3_ROBOT_IP-192.168.1.206}"
 gripper_backend="${FR3_GRIPPER_BACKEND-pika}"
-gripper_port="${FR3_GRIPPER_PORT-/dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0}"
+gripper_port="${FR3_GRIPPER_PORT-/dev/pika_gripper}"
 gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_realsense_camera_config.yaml}"
 # The record config, named here because this file is the layer that knows which rig it started.
@@ -93,6 +94,10 @@ checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/fr3_spacemouse__delta_ee_from_p
 # contract and the start-pose reference have to come from.
 dataset_root="${FR3_INFER_DATASET_ROOT-}"
 task_prompt="${FR3_TASK_PROMPT-}"
+# Where the forward pass runs. Empty: in this process, on this machine's GPU, as it always has.
+# HOST[:PORT]: on a policy server (tools/fr3/fr3_policy_server.py) -- for a robot host with no GPU
+# of its own, such as the NUC. Everything else in this file still describes this rig.
+policy_server="${FR3_POLICY_SERVER-}"
 
 # Safety envelope. Same numbers fr3_train_il_policy.py writes into the generated inference config.
 first_frame_max_pos_delta_mm="${FR3_FIRST_FRAME_MAX_POS_DELTA_MM-20}"
@@ -223,6 +228,9 @@ fi
 if [[ -n "${policy_n_action_steps}" ]]; then
   common_args+=(--policy-n-action-steps "${policy_n_action_steps}")
 fi
+if [[ -n "${policy_server}" ]]; then
+  common_args+=(--policy-server "${policy_server}")
+fi
 
 # DAgger takeover, for the interactive modes only: the runtime refuses --dagger-takeover
 # without --interactive-rollouts, because a device connected with nobody at the rig is worse
@@ -307,6 +315,7 @@ home_the_arm() {
 announce() {
   echo "[INFO] host_python=${FR3_HOST_PYTHON}"
   echo "[INFO] checkpoint=${checkpoint}"
+  echo "[INFO] policy_server=${policy_server:-<none: forward pass in this process>}"
   echo "[INFO] dataset_root=${dataset_root:-<from checkpoint train_config.json>}"
   echo "[INFO] task_prompt=${task_prompt:-<auto from single dataset task>}"
   echo "[INFO] cameras=${camera_config} (keys must match the checkpoint's observation.images.*)"
@@ -451,6 +460,8 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-takeover-dz-mm "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM}"); fi
     # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).
     if [[ -n "${FR3_GRASP_LOOP_DATASET_ROOT-}" ]]; then grasp_loop_args+=(--grasp-loop-dataset-root "${FR3_GRASP_LOOP_DATASET_ROOT}"); fi
+    # ... from each trial's first step, the policy's own steps as is_intervention=0 (unset = funnel only).
+    if [[ "${FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-record-whole-trial); fi
     announce
     echo "[INFO] grasp_loop out=${grasp_loop_out} stop_at_trial_boundary=\`touch ${grasp_loop_out%.jsonl}.STOP\`"
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi
