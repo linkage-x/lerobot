@@ -74,8 +74,9 @@ FUNNEL_SETTLE_SPEED_MM_S = 2.0
 # the sideways move -- and it is below where the policy has done its gross positioning.
 FUNNEL_ALIGN_DZ_MM = 60.0
 # Setpoint speeds. The lateral one is a third of the reset's 0.15 m/s because this move ends
-# above a standing peg; the descent is the terminal servo's 0.02 m/s, the speed this rig already
-# descends onto things at.
+# above a standing peg. The descent was the terminal servo's 0.02 m/s until 10-20; the funnel has
+# no contact stop for that speed to protect, and checkpoints trained on its trials copy the slow
+# last 66 mm, closing at a median step ~470, past arm A's old 450 budget.
 FUNNEL_ALIGN_SPEED_M_S = 0.05
 # How far below `alignZ` the *measured* tool may sit and still move across. The arm parks up to
 # ~2.4 mm short along its direction of travel and does not close that with time (scene_reset,
@@ -83,10 +84,10 @@ FUNNEL_ALIGN_SPEED_M_S = 0.05
 # 09-28 trials 9 and 19 entered ALIGN just under alignZ, the setpoint reached it, the arm stopped
 # at alignZ - 2.4 mm, and the funnel held that pose for its whole 360-step budget.
 FUNNEL_ALIGN_Z_SLACK_M = 0.006
-FUNNEL_DESCEND_SPEED_M_S = 0.02
+FUNNEL_DESCEND_SPEED_M_S = 0.03
 # Down to `FUNNEL_SLOW_BELOW_DZ_MM` above the peg, from a takeover higher than that: the align
-# speed, 1.7 mm a step at 30 Hz against the demonstrations' median 1.6. Below it the terminal
-# 0.02 m/s as ever, so a 60 mm takeover descends exactly as it always has.
+# speed, 1.7 mm a step at 30 Hz against the demonstrations' median 1.6. Below it the slow
+# descend speed, so a 60 mm takeover descends at that speed throughout.
 FUNNEL_FAST_DESCEND_SPEED_M_S = 0.05
 FUNNEL_SLOW_BELOW_DZ_MM = 60.0
 # Steps the settle test must hold, so one quiet frame between two moves is not a stop.

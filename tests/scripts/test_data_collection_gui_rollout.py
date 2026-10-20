@@ -2323,6 +2323,116 @@ def test_demo_landing_points_are_memoised_per_dataset(tmp_path: Path):
     assert first is second
 
 
+# A rollout's T_B_Ws as the recorder writes it: a quarter turn about z and a shift, so a test
+# that dropped either half of the transform could not pass. Real ones are ~2 deg and ~300 mm.
+_ROLLOUT_T = [
+    [0.0, -1.0, 0.0, -0.065],
+    [1.0, 0.0, 0.0, 0.148],
+    [0.0, 0.0, 1.0, 0.294],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+
+def _in_base(xyz, transform=_ROLLOUT_T):
+    import numpy as np
+
+    t = np.asarray(transform)
+    return list(t[:3, :3] @ np.asarray(xyz) + t[:3, 3])
+
+
+def _write_episode_frames(root: Path, episodes, transform=_ROLLOUT_T) -> None:
+    path = root / "meta" / "episode_frames.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps({"episode_index": episode, "T_B_Ws": transform}) + "\n" for episode in episodes)
+    )
+
+
+_RELEASING = ([0.20, 0.12, 0.05, 0.05, 0.12, 0.13, 0.06, 0.06, 0.14], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+# What the grasp loop records: the episode stops a few frames after the close, peg still held.
+_ENDS_AT_THE_CLOSE = ([0.20, 0.12, 0.05, 0.05, 0.05], [1.0, 1.0, 0.0, 0.0, 0.0])
+
+
+def test_a_rollout_recorded_episode_is_drawn_where_the_arm_really_was(tmp_path: Path):
+    """10-20: a trial-only view plotted every point at inv(T) . base, pick z at -0.249 m."""
+    root = _write_demo_dataset(tmp_path / "outputs" / "datasets" / "trial_x", {0: _RELEASING})
+    _write_episode_frames(root, [0])
+
+    landmarks = checkpoint_backend.demo_landing_points(root, repo_root=tmp_path)
+
+    assert landmarks["points"][0]["graspXyz"] == pytest.approx(_in_base([0.31, -0.22, 0.05]), abs=1e-5)
+    assert landmarks["frameCorrectedEpisodes"] == 1
+    assert landmarks["frameUnknownEpisodes"] == 0
+
+
+def test_a_merged_view_takes_each_episodes_frame_from_its_source(tmp_path: Path):
+    """The view holds no frames of its own; its manifest says where each episode came from."""
+    trial = "outputs/datasets/trial_x"
+    old_dagger = "outputs/datasets/dagger_before_episode_frames"
+    base = "outputs/exports/training_views/teleop_base"
+    _write_episode_frames(tmp_path / trial, [0, 1])
+    (tmp_path / old_dagger / "meta").mkdir(parents=True)
+    view = _write_demo_dataset(
+        tmp_path / "outputs" / "exports" / "training_views" / "merged",
+        {0: _RELEASING, 1: _RELEASING, 2: _RELEASING, 3: _RELEASING},
+    )
+    _write_json(
+        view / "meta" / "il_view_manifest.json",
+        {
+            "dagger_dataset_roots": [trial, old_dagger],
+            "episode_source_index": [
+                {"episode_index": 0, "source_dataset_root": trial, "source_episode_index": 1},
+                {"episode_index": 1, "source_dataset_root": base, "source_episode_index": 0},
+                {"episode_index": 2, "source_dataset_root": old_dagger, "source_episode_index": 5},
+                {"episode_index": 3, "source_dataset_root": trial, "source_episode_index": 0},
+            ],
+        },
+    )
+
+    landmarks = checkpoint_backend.demo_landing_points(view, repo_root=tmp_path)
+
+    by_episode = {point["episode"]: point for point in landmarks["points"]}
+    assert by_episode[0]["graspXyz"] == pytest.approx(_in_base([0.31, -0.22, 0.05]), abs=1e-5)
+    # A teleop demonstration was recorded in the base frame and stays where it is.
+    assert by_episode[1]["graspXyz"] == pytest.approx([0.31, -0.22, 0.05], abs=1e-5)
+    # Recorded through a rollout frame nobody wrote down: left off, not drawn 300 mm away.
+    assert 2 not in by_episode
+    assert landmarks["frameUnknownEpisodes"] == 1
+    assert landmarks["frameCorrectedEpisodes"] == 2
+
+
+def test_episodes_that_never_release_do_not_measure_the_hole(tmp_path: Path):
+    """Their last frame is a few steps after the close, wherever the peg happened to stand."""
+    root = _write_demo_dataset(tmp_path / "view", {0: _ENDS_AT_THE_CLOSE, 1: _ENDS_AT_THE_CLOSE})
+
+    landmarks = checkpoint_backend.demo_landing_points(root)
+
+    assert landmarks["holeSource"] == "fixture"
+    assert landmarks["placeXyz"] == pytest.approx(list(checkpoint_backend.FIXTURE_HOLE_XYZ))
+    assert landmarks["hole"] == pytest.approx(list(checkpoint_backend.FIXTURE_HOLE_XYZ[:2]))
+    assert landmarks["releasedEpisodes"] == 0
+    # Still on the map: where they grasped is real, only the release is not.
+    assert [point["released"] for point in landmarks["points"]] == [False, False]
+
+
+def test_the_hole_is_measured_from_the_episodes_that_released_only(tmp_path: Path):
+    root = _write_demo_dataset(tmp_path / "view", {0: _RELEASING, 1: _ENDS_AT_THE_CLOSE})
+
+    landmarks = checkpoint_backend.demo_landing_points(root)
+
+    released = next(point for point in landmarks["points"] if point["released"])
+    assert landmarks["holeSource"] == "releases"
+    assert landmarks["releasedEpisodes"] == 1
+    assert landmarks["placeXyz"] == pytest.approx(released["releaseXyz"])
+
+
+def test_the_fixture_hole_is_the_grasp_loops_pick():
+    """Two copies because grasp_loop imports the runtime; this keeps them from drifting apart."""
+    from tools.fr3.grasp_loop import GRASP_LOOP_PICK_XYZ
+
+    assert pytest.approx(GRASP_LOOP_PICK_XYZ) == checkpoint_backend.FIXTURE_HOLE_XYZ
+
+
 def test_demo_landing_points_on_a_dataset_that_is_not_there(tmp_path: Path):
     """A missing or unreadable dataset leaves the map without a backdrop rather than 500ing the
     page: the rollout points are still worth showing."""
@@ -4269,6 +4379,19 @@ def test_the_funnel_takeover_height_is_passed_as_one_value_or_a_range():
         with pytest.raises(rollout_backend.RolloutError, match="graspLoopFunnelTakeoverDzMm"):
             sanitize({"graspLoopFunnelTakeoverDzMm": bad})
     assert "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+
+
+def test_the_grasp_loop_step_budget_is_passed_and_blank_leaves_the_runtime_default():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    assert sanitize({"graspLoopMaxPolicySteps": 600}) == {"FR3_GRASP_LOOP_MAX_POLICY_STEPS": "600"}
+    assert sanitize({"graspLoopMaxPolicySteps": ""}) == {}
+    for bad in (0, -5, "many"):
+        with pytest.raises(rollout_backend.RolloutError, match="graspLoopMaxPolicySteps"):
+            sanitize({"graspLoopMaxPolicySteps": bad})
+    # Cleared from the inherited environment: a budget exported once must not stretch every run.
+    assert "FR3_GRASP_LOOP_MAX_POLICY_STEPS" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert '--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"' in launcher
 
 
 def test_the_phase_schedule_options_reach_the_launcher(tmp_path: Path):

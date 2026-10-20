@@ -981,3 +981,149 @@ def test_no_uv_is_the_one_thing_this_cannot_work_around(tmp_path, monkeypatch):
     assert report["canInstall"] is False
     assert "uv" in report["reason"]
     assert "docs.astral.sh/uv" in report["reason"]
+
+
+# ------------------------------------------------------------- remote stop ---
+#
+# The far side is run here with bash in a fresh session, which is what sshd gives a command
+# without a tty: the launch script and the stop script are the real strings, only `ssh` is not.
+
+
+def _host_at(repo_dir: Path) -> training.TrainingHost:
+    return training.TrainingHost(
+        id=f"user@10.0.0.5:{repo_dir}",
+        label="Training box",
+        kind="remote",
+        sshTarget="user@10.0.0.5",
+        repoDir=str(repo_dir),
+        pythonPath=".venv-fr3/bin/python",
+    )
+
+
+def _run_far_side(monkeypatch):
+    """Route the stop's `ssh <target> <script>` to a local bash running <script>."""
+    real_run = subprocess.run
+
+    def run(command, **kwargs):
+        assert command[0] == "ssh"
+        return real_run(["bash", "-c", command[-1]], **kwargs)
+
+    monkeypatch.setattr(training.subprocess, "run", run)
+
+
+def _is_running(pid: int) -> bool:
+    """Alive and not a zombie: an orphaned worker is reaped by init, not by this test."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _wait_for(predicate, timeout_s: float = 10.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_remote_launch_records_its_pid_before_it_execs_the_trainer(tmp_path):
+    pid_file = training.remote_training_pid_file("baseline__act__20261020")
+    command, _ = training.build_launch_command(
+        tmp_path, _remote_host(), [".venv-fr3/bin/python", "train.py"], wandb_key="", pid_file=pid_file
+    )
+
+    remote_script = command[-1]
+    assert f"echo $$ > {pid_file}" in remote_script
+    assert remote_script.index("echo $$") < remote_script.index("exec ")
+    # Not inside the job's own output directory, which the trainer refuses to start in.
+    assert not pid_file.startswith("outputs/train/")
+
+
+def test_a_local_launch_writes_no_pid_file(tmp_path):
+    command, _ = training.build_launch_command(
+        tmp_path, training.local_host(tmp_path), ["{python}", "train.py"], wandb_key="", pid_file="outputs/x.pid"
+    )
+
+    assert "echo $$" not in " ".join(command)
+
+
+def test_stop_reaches_the_trainer_and_its_workers_on_the_far_side(tmp_path, monkeypatch):
+    """The 10-19 failure: the gateway killed its ssh client and the dev box kept training."""
+    job = "baseline__act__20261020"
+    worker_pid_file = tmp_path / "worker.pid"
+    # A trainer that forks a worker, as the dataloader does.
+    trainer = (
+        "import subprocess, sys, time; "
+        f"w = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+        f"open({str(worker_pid_file)!r}, 'w').write(str(w.pid)); time.sleep(120)"
+    )
+    command, _ = training.build_launch_command(
+        tmp_path,
+        _host_at(tmp_path),
+        [sys.executable, "-c", trainer, "--job-name", job],
+        wandb_key="",
+        pid_file=training.remote_training_pid_file(job),
+    )
+    far = subprocess.Popen(["bash", "-c", command[-1]], start_new_session=True)
+    try:
+        assert _wait_for(worker_pid_file.exists)
+        assert _wait_for(lambda: worker_pid_file.read_text().strip() != "")
+        worker_pid = int(worker_pid_file.read_text())
+        recorded = int((tmp_path / training.remote_training_pid_file(job)).read_text())
+        # exec kept the shell's pid, so the recorded one is the trainer itself.
+        assert recorded == far.pid
+        _run_far_side(monkeypatch)
+
+        message = training.stop_remote_training(_host_at(tmp_path), job)
+
+        assert message.startswith("Stopped the trainer on Training box")
+        assert far.wait(timeout=10) != 0
+        assert _wait_for(lambda: not _is_running(worker_pid))
+        assert not (tmp_path / training.remote_training_pid_file(job)).exists()
+    finally:
+        if far.poll() is None:
+            os.killpg(far.pid, 9)
+
+
+def test_stop_leaves_a_reused_pid_alone(tmp_path, monkeypatch):
+    """A finished run leaves its file behind; by the next stop that pid may be anything."""
+    job = "baseline__act__20261020"
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        pid_path = tmp_path / training.remote_training_pid_file(job)
+        pid_path.parent.mkdir(parents=True)
+        pid_path.write_text(f"{bystander.pid}\n")
+        _run_far_side(monkeypatch)
+
+        message = training.stop_remote_training(_host_at(tmp_path), job)
+
+        assert "already exited" in message
+        assert bystander.poll() is None
+        assert not pid_path.exists()
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+def test_stop_without_a_recorded_pid_says_the_gpu_may_still_be_busy(tmp_path, monkeypatch):
+    _run_far_side(monkeypatch)
+
+    message = training.stop_remote_training(_host_at(tmp_path), "started_by_an_older_gateway")
+
+    assert "No pid was recorded" in message
+    assert "may still be running" in message
+
+
+def test_an_unreachable_host_is_an_error_not_a_stopped_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        training.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 255, "", "ssh: connect to host 10.0.0.5 port 22: No route to host"),
+    )
+
+    with pytest.raises(training.TrainingError, match="No route to host"):
+        training.stop_remote_training(_host_at(tmp_path), "baseline__act")

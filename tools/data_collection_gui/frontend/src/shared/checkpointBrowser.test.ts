@@ -4,6 +4,7 @@ import {
   checkpointMatches,
   checkpointToRestore,
   formatBytes,
+  needsFetch,
   successRate,
   verdictClass
 } from "./CheckpointBrowser";
@@ -142,6 +143,31 @@ describe("restoring the last checkpoint", () => {
   });
 });
 
+describe("needs fetch", () => {
+  const location = {
+    level: "block",
+    field: "location",
+    message: "This checkpoint is on a training host."
+  } as const;
+
+  it("is true for a checkpoint left on a training host", () => {
+    expect(needsFetch(makeCheckpoint({ issues: [location], verdict: "block" }))).toBe(true);
+  });
+
+  it("stays true when other blocks ride along with it", () => {
+    const cameras = { level: "block", field: "cameras", message: "camera keys differ" } as const;
+    expect(needsFetch(makeCheckpoint({ issues: [cameras, location], verdict: "block" }))).toBe(
+      true
+    );
+  });
+
+  it("is false for blocks an operator may overrule", () => {
+    const frame = { level: "block", field: "targetFrameName", message: "frame differs" } as const;
+    expect(needsFetch(makeCheckpoint({ issues: [frame], verdict: "block" }))).toBe(false);
+    expect(needsFetch(makeCheckpoint())).toBe(false);
+  });
+});
+
 describe("rollout page carry-over", () => {
   it("hands the remembered checkpoint to the picker instead of selecting it blind", () => {
     // The page holds an id; only the listing holds the Checkpoint the contract check runs on.
@@ -198,5 +224,14 @@ describe("rollout page safety gating", () => {
     expect(rolloutPageSource).toContain("runtimeOptions: rolloutRuntimeOptions");
     expect(rolloutPageSource).toContain("RTC auto stays disabled for ACT-style policies");
     expect(rolloutPageSource).toContain("Show advanced rollout knobs");
+  });
+
+  it("offers a fetch, not the override, for a checkpoint that is not on this machine", () => {
+    // The gateway starts from its local listing, so ticking the override there only moved the
+    // refusal from the page to Start.
+    expect(rolloutPageSource).toContain("needsLocalCopy ? (");
+    expect(rolloutPageSource).toContain("api.fetchCheckpointToLocal(source.hostId, source.id)");
+    expect(rolloutPageSource).toContain("    needsLocalCopy ||\n");
+    expect(rolloutPageSource).toContain("focusHost={checkpointFocus}");
   });
 });

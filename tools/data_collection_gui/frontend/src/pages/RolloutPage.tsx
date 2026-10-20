@@ -1,7 +1,7 @@
 import { GraspLoopPanel } from "./GraspLoopPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
-import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
+import { CheckpointBrowser, needsFetch, successRate } from "../shared/CheckpointBrowser";
 import { describeArm, verdictAgreement } from "./rolloutArms";
 import { blockersToSend, mismatchCount, reasonSlots, slotLabel } from "./takeoverReasons";
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
@@ -116,6 +116,8 @@ export function RolloutPage() {
   const [modeId, setModeId] = useState("smoke");
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [overrideContract, setOverrideContract] = useState(false);
+  const [fetchingCheckpoint, setFetchingCheckpoint] = useState(false);
+  const [checkpointFocus, setCheckpointFocus] = useState<{ hostId: string; nonce: number }>();
   const [moveToStart, setMoveToStart] = useState(true);
   const [maxSteps, setMaxSteps] = useState("300");
   const [taskPrompt, setTaskPrompt] = useState("");
@@ -142,6 +144,9 @@ export function RolloutPage() {
   // Grasp loop (card 12). Attended by default: the page is open, so somebody is there to put a
   // knocked-over peg back, and the alternative is a run that halts on its first knock.
   const [graspLoopTrials, setGraspLoopTrials] = useState("40");
+  // 10-20: checkpoints trained on arm B trials learn the funnel's slow descent and close around
+  // step 470 (p95 ~520), so the runtime's 450 ends most arm A trials just above the peg.
+  const [graspLoopMaxPolicySteps, setGraspLoopMaxPolicySteps] = useState("600");
   const [graspLoopAttended, setGraspLoopAttended] = useState(true);
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
@@ -246,6 +251,7 @@ export function RolloutPage() {
     () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
     [selected]
   );
+  const needsLocalCopy = selected ? needsFetch(selected) : false;
   const isRtcCheckpoint = useMemo(
     () => isRtcPolicy(selected?.policyType ?? ""),
     [selected?.policyType]
@@ -270,6 +276,8 @@ export function RolloutPage() {
       // runtime; not sending it keeps a leftover field from blocking the start.
       terminalServoPose: modeId === "grasp_loop" ? undefined : terminalServoPose.trim() || undefined,
       graspLoopTrials: modeId === "grasp_loop" ? positiveNumberOr(graspLoopTrials, 40) : undefined,
+      graspLoopMaxPolicySteps:
+        modeId === "grasp_loop" ? positiveNumberOr(graspLoopMaxPolicySteps, 600) : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
@@ -313,6 +321,7 @@ export function RolloutPage() {
       daggerReleaseAfterS,
       modeId,
       graspLoopTrials,
+      graspLoopMaxPolicySteps,
       graspLoopAttended,
       graspLoopArms,
       graspLoopInsertPose,
@@ -578,6 +587,24 @@ export function RolloutPage() {
     return result;
   };
 
+  // The copy keeps the id, so swapping `selected` for it leaves the per-checkpoint knobs alone
+  // (they reset on an id change) -- only the issues, now judged on this machine, change.
+  const onFetchSelected = async () => {
+    if (!selected) return;
+    const source = selected;
+    setFetchingCheckpoint(true);
+    const result = await wrap("Fetch checkpoint", () =>
+      api.fetchCheckpointToLocal(source.hostId, source.id)
+    );
+    if (result.ok) {
+      const local = await api.fetchCheckpoint("local", source.id);
+      if (local) setSelected(local);
+      setCheckpointFocus((current) => ({ hostId: "local", nonce: (current?.nonce ?? 0) + 1 }));
+      setNotice((result as { message?: string }).message || "Checkpoint fetched.");
+    }
+    setFetchingCheckpoint(false);
+  };
+
   const onStart = async () => {
     if (!selected || !mode) return;
     const result = await wrap("Start rollout", () =>
@@ -707,6 +734,7 @@ export function RolloutPage() {
     !selected ||
     !mode ||
     (mode.movesArm && !confirmMotion) ||
+    needsLocalCopy ||
     (blocking.length > 0 && !overrideContract);
 
   return (
@@ -1293,6 +1321,7 @@ export function RolloutPage() {
           selectedId={selected?.id ?? ""}
           onSelect={setSelected}
           restoreId={restoreCheckpointId}
+          focusHost={checkpointFocus}
           disabled={isLive}
         />
       </section>
@@ -1335,6 +1364,20 @@ export function RolloutPage() {
                 disabled={isLive}
               />
             </label>
+            <label className="field">
+              <span>每条最多策略步数（30 Hz）</span>
+              <input
+                value={graspLoopMaxPolicySteps}
+                onChange={(event) => setGraspLoopMaxPolicySteps(event.target.value)}
+                inputMode="numeric"
+                disabled={isLive}
+              />
+            </label>
+            <p className="hint">
+              到这个步数还没合手，这条判为没合手（grasp_timeout）并复位；B 臂是漏斗接管前的上限，接管后另有 600 步。
+              600 步 = 20 s。用 B 臂数据训的 checkpoint 学了漏斗的慢降，中位约第 470 步才合手，原来的 450 会在销上方被截断。
+              配对 A/B 两边要用同一个值。
+            </p>
             <label className="checkbox">
               <input
                 type="checkbox"
@@ -1385,7 +1428,7 @@ export function RolloutPage() {
             </label>
             <p className="hint">
               策略的瞄准在离销 150 mm 以上就基本定了（09-30：到 60 mm 时平均还偏 41 mm，y 方向只跟到销的 0.66）。
-              在 60–300 mm 之间随机接管，录下的纠正覆盖整个下降过程；60 mm 以上漏斗以 0.05 m/s 下降，以下仍是 0.02 m/s。
+              在 60–300 mm 之间随机接管，录下的纠正覆盖整个下降过程；60 mm 以上漏斗以 0.05 m/s 下降，以下 0.03 m/s（10-20 前是 0.02）。
             </p>
             <label className="checkbox">
               <input
@@ -1754,15 +1797,33 @@ export function RolloutPage() {
                 <li key={issue.field}>{issue.message}</li>
               ))}
             </ul>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={overrideContract}
-                onChange={(event) => setOverrideContract(event.target.checked)}
-                disabled={isLive}
-              />
-              <span>I have read these and want to run it anyway</span>
-            </label>
+            {/* No override for this one: Start reads the gateway's own listing, so a checkpoint
+                left on a training host is refused there whatever the box says. */}
+            {needsLocalCopy ? (
+              <div className="row-actions">
+                <button
+                  type="button"
+                  onClick={() => void onFetchSelected()}
+                  disabled={busy || isLive}
+                >
+                  {fetchingCheckpoint ? "Fetching…" : "Fetch to this machine"}
+                </button>
+                <span className="hint">
+                  Copies the weights and the view&apos;s metadata from {selected.hostLabel}; the
+                  remaining checks are then made against this rig.
+                </span>
+              </div>
+            ) : (
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={overrideContract}
+                  onChange={(event) => setOverrideContract(event.target.checked)}
+                  disabled={isLive}
+                />
+                <span>I have read these and want to run it anyway</span>
+              </label>
+            )}
           </div>
         )}
 

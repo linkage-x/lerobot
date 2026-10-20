@@ -94,6 +94,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     # The grasp-only loop (card 12). Cleared like the rest: a shell that once exported a trial
     # count must not turn the next launch into forty unasked-for grasps.
     "FR3_GRASP_LOOP_TRIALS",
+    "FR3_GRASP_LOOP_MAX_POLICY_STEPS",
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
@@ -443,6 +444,11 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     )
 
     _set_optional_int_env(options, raw, "graspLoopTrials", "FR3_GRASP_LOOP_TRIALS", minimum=1)
+    # The policy's steps per trial before a trial with no close is ended (arm B: until the funnel
+    # takes over). Blank leaves the runtime's 450.
+    _set_optional_int_env(
+        options, raw, "graspLoopMaxPolicySteps", "FR3_GRASP_LOOP_MAX_POLICY_STEPS", minimum=1
+    )
     if _parse_bool_field(raw.get("graspLoopAttended", False), "graspLoopAttended"):
         options["FR3_GRASP_LOOP_ATTENDED"] = "1"
     grasp_arms = _optional_text(raw.get("graspLoopArms"))

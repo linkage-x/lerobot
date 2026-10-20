@@ -5553,7 +5553,11 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         wandb_entity=argv_settings["wandbEntity"],
     )
     command, env = training_backend.build_launch_command(
-        state.repo_root, host, argv, wandb_key=wandb_key
+        state.repo_root,
+        host,
+        argv,
+        wandb_key=wandb_key,
+        pid_file=training_backend.remote_training_pid_file(job_name),
     )
 
     log_dir = state.repo_root / "outputs" / "logs" / "training"
@@ -5622,26 +5626,68 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
 
 
 def _stop_training_run(state: GatewayState) -> dict[str, Any]:
-    process = state.training_process
-    # A run re-adopted after a gateway restart has no Popen object -- the pipe died with the
-    # gateway that opened it -- but it is still on the GPU, so "stop" has to reach it by pid.
-    # Without this the only way to end such a run would be to ssh in and kill it by hand.
-    pid = process.pid if process is not None else state.training.pid
-    running = process.poll() is None if process is not None else bool(pid and _process_is_alive(int(pid)))
-    if not pid or not running:
-        return {"ok": True, "training": asdict(state.training), "message": "No training run is active."}
-    state.training.state = "stopped"
-    state.training.message = "Stopping training run…"
+    with state.lock:
+        process = state.training_process
+        # A run re-adopted after a gateway restart has no Popen object -- the pipe died with the
+        # gateway that opened it -- but it is still on the GPU, so "stop" has to reach it by pid.
+        # Without this the only way to end such a run would be to ssh in and kill it by hand.
+        pid = process.pid if process is not None else state.training.pid
+        running = process.poll() is None if process is not None else bool(pid and _process_is_alive(int(pid)))
+        if not pid or not running:
+            return {"ok": True, "training": asdict(state.training), "message": "No training run is active."}
+        state.training.state = "stopped"
+        state.training.message = "Stopping training run…"
+        host_id, job_name = state.training.hostId, state.training.jobName
+
+    # Outside the lock: this is an ssh round trip, and the page polls through the same lock.
+    remote_message = ""
+    remote_error = ""
     try:
-        # The whole session: a remote run is an ssh client with the trainer on the far end,
-        # and killing only the client would leave the GPU busy with an orphan.
+        host = training_backend.resolve_host(state.repo_root, host_id)
+    except training_backend.TrainingError:
+        host = None
+    if host is not None and host.kind == "remote" and job_name:
+        try:
+            remote_message = training_backend.stop_remote_training(host, job_name)
+        except training_backend.TrainingError as exc:
+            remote_error = str(exc)
+
+    with state.lock:
+        return _signal_local_training_process(
+            state, process, int(pid), remote_message=remote_message, remote_error=remote_error
+        )
+
+
+def _signal_local_training_process(
+    state: GatewayState,
+    process: subprocess.Popen | None,
+    pid: int,
+    *,
+    remote_message: str = "",
+    remote_error: str = "",
+) -> dict[str, Any]:
+    try:
+        # The whole local session: a local trainer with its dataloader workers, or the ssh
+        # client of a remote run -- whose trainer this does not reach; stop_remote_training does.
         os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
     except (OSError, ProcessLookupError):
         if process is not None:
             process.terminate()
     state.log("warn", f"Stopped training run {state.training.jobName}")
+    if remote_error:
+        # The local client is gone either way; what the page must not say is that the GPU is free.
+        state.training.message = f"{remote_error} The trainer may still be running there."
+        state.log("error", remote_error)
+    elif remote_message:
+        state.training.message = remote_message
+        state.log("warn", remote_message)
     _persist_training_status(state)
-    return {"ok": True, "training": asdict(state.training)}
+    result: dict[str, Any] = {"ok": not remote_error, "training": asdict(state.training)}
+    if remote_error:
+        result["error"] = state.training.message
+    elif remote_message:
+        result["message"] = remote_message
+    return result
 
 
 # ----------------------------------------------------- dependency install ---
@@ -13917,7 +13963,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # gateway lock for that would stall the 1 Hz status poll of a running rollout.
             dataset_root = (query.get("dataset", [""])[0] or "").strip() or state.rollout.datasetRoot
             landmarks = (
-                checkpoint_backend.demo_landing_points(state.repo_root / dataset_root)
+                checkpoint_backend.demo_landing_points(
+                    state.repo_root / dataset_root, repo_root=state.repo_root
+                )
                 if dataset_root
                 else {}
             )
@@ -14374,8 +14422,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/training/stop":
-                    with state.lock:
-                        _json_response(self, HTTPStatus.OK, _stop_training_run(state))
+                    # Takes the lock itself: a remote stop is an ssh round trip made outside it.
+                    _json_response(self, HTTPStatus.OK, _stop_training_run(state))
                     return
             except training_backend.TrainingError as exc:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})

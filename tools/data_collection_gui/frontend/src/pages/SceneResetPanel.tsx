@@ -415,10 +415,15 @@ export function SceneResetPanel({
           {measuredPick ? (
             <>
               <p className="hint">
-                Pick is measured from where {demoPoints.length} demonstration(s) released the peg:
+                {landmarks.holeSource === "fixture"
+                  ? `None of the ${demoPoints.length} episode(s) releases the peg (they end at the close), so Pick is the fixture hole: `
+                  : `Pick is measured from where ${landmarks.releasedEpisodes ?? demoPoints.length} demonstration(s) released the peg: `}
                 x={measuredPick[0].toFixed(3)}, y={measuredPick[1].toFixed(3)}, z=
                 {measuredPick[2].toFixed(3)} m. The reset goes there first and grasps, then carries
                 the peg to a sampled point in the painted region.
+                {landmarks.frameUnknownEpisodes
+                  ? ` ${landmarks.frameUnknownEpisodes} episode(s) are not drawn: they were recorded in a rollout frame that was not saved.`
+                  : ""}
                 {pickFollowsDemos
                   ? " Edit any Pick field to nudge it."
                   : " Edited by hand — it no longer tracks the demonstrations."}

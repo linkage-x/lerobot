@@ -4054,6 +4054,80 @@ def test_a_re_adopted_run_can_still_be_stopped(tmp_path, monkeypatch):
     assert state.training.state == "stopped"
 
 
+def _remote_training_host():
+    return gateway.training_backend.TrainingHost(
+        id="hanyu@192.168.1.179:/home/hanyu/Codes/lerobot_train",
+        label="dev box 4090D",
+        kind="remote",
+        sshTarget="hanyu@192.168.1.179",
+        repoDir="/home/hanyu/Codes/lerobot_train",
+        pythonPath=".venv-fr3/bin/python",
+    )
+
+
+def _stoppable_remote_run(tmp_path, monkeypatch):
+    host = _remote_training_host()
+    state = _training_run_state(
+        tmp_path, state="running", jobName="trial150__pi05__20261019", pid=4242, hostId=host.id
+    )
+    state.training_process = None
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+    monkeypatch.setattr(gateway.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(gateway.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(gateway.training_backend, "resolve_host", lambda root, host_id: host)
+    return state
+
+
+def test_stopping_a_remote_run_signals_the_trainer_on_its_host(tmp_path, monkeypatch):
+    """Killing the local ssh client alone left the dev box training on 10-19."""
+    state = _stoppable_remote_run(tmp_path, monkeypatch)
+    asked: list[tuple[str, str]] = []
+
+    def stop_remote(host, job_name):
+        asked.append((host.sshTarget, job_name))
+        # The page polls through this lock; an ssh round trip must not hold it.
+        assert not state.lock.locked()
+        return "Stopped the trainer on dev box 4090D (pid 777)."
+
+    monkeypatch.setattr(gateway.training_backend, "stop_remote_training", stop_remote)
+
+    result = gateway._stop_training_run(state)
+
+    assert asked == [("hanyu@192.168.1.179", "trial150__pi05__20261019")]
+    assert result["ok"] is True
+    assert result["message"] == "Stopped the trainer on dev box 4090D (pid 777)."
+    assert state.training.state == "stopped"
+
+
+def test_a_remote_stop_that_fails_does_not_report_a_free_gpu(tmp_path, monkeypatch):
+    state = _stoppable_remote_run(tmp_path, monkeypatch)
+
+    def stop_remote(host, job_name):
+        raise gateway.training_backend.TrainingError("Could not reach hanyu@192.168.1.179 to stop the run: timeout")
+
+    monkeypatch.setattr(gateway.training_backend, "stop_remote_training", stop_remote)
+
+    result = gateway._stop_training_run(state)
+
+    assert result["ok"] is False
+    assert "may still be running" in result["error"]
+
+
+def test_a_local_stop_does_not_go_over_ssh(tmp_path, monkeypatch):
+    state = _training_run_state(tmp_path, state="running", jobName="baseline__act", pid=4242, hostId="local")
+    state.training_process = None
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+    monkeypatch.setattr(gateway.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(gateway.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(
+        gateway.training_backend,
+        "stop_remote_training",
+        lambda host, job_name: pytest.fail("a local run has no far side"),
+    )
+
+    assert gateway._stop_training_run(state)["ok"] is True
+
+
 def test_stopping_when_nothing_runs_says_so_instead_of_killing_a_reused_pid(tmp_path, monkeypatch):
     state = _training_run_state(tmp_path, state="complete", jobName="baseline__act", pid=4242)
     state.training_process = None

@@ -14,6 +14,7 @@
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_once              # one bounded rollout
 #   bash tools/fr3/run_pick_place_infer_workstation.sh grasp_loop             # graded grasp-only trials
 #     FR3_GRASP_LOOP_TRIALS (40), FR3_GRASP_LOOP_MASK, FR3_GRASP_LOOP_OUT, FR3_GRASP_LOOP_ATTENDED=1
+#     FR3_GRASP_LOOP_MAX_POLICY_STEPS (policy steps before a trial with no close ends; blank = 450)
 #     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
 #     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
@@ -480,6 +481,8 @@ case "$mode" in
       --rollout-trace-dir "outputs/rollout_traces/grasp_loop_${grasp_loop_stamp}"
     )
     if [[ "${FR3_GRASP_LOOP_ATTENDED-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-attended); fi
+    # Policy steps before a trial that never closes ends (blank = the runtime's 450).
+    if [[ -n "${FR3_GRASP_LOOP_MAX_POLICY_STEPS-}" ]]; then grasp_loop_args+=(--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"); fi
     # v14 step 4: carry each held grasp into the hole (blank = grasp only, as steps 1-2).
     if [[ -n "${FR3_GRASP_LOOP_INSERT_POSE-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-pose "${FR3_GRASP_LOOP_INSERT_POSE}"); fi
     # Arm B: how high above the peg the funnel takes over, "h" or "low,high" mm (blank = 60).

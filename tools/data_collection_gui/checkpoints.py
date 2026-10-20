@@ -875,7 +875,116 @@ def load_rollout_outcomes(repo_root: Path, limit: int = 500) -> list[dict[str, A
 # clean 1.0.
 _DEMO_GRIPPER_CLOSED_BELOW = 0.5
 
-_demo_landmark_cache: dict[tuple[str, float], dict[str, Any]] = {}
+_demo_landmark_cache: dict[tuple[str, float, str], dict[str, Any]] = {}
+
+# The grasp loop's fixture hole, where every rollout leaves the peg: `GRASP_LOOP_PICK_XYZ` in
+# tools/fr3/grasp_loop.py (not imported -- that module pulls in the whole runtime). The hole is
+# measured from releases when the dataset has any; episodes recorded by the grasp loop end a few
+# frames after the close and never release, so a dataset made only of those falls back to this.
+FIXTURE_HOLE_XYZ = (0.3597, -0.1328, 0.0550)
+
+# How deep a view's manifest is followed into the views it was merged from. Real chains are two
+# long (merged view -> base view -> recording); the bound only stops a manifest naming itself.
+_MAX_VIEW_NESTING = 4
+
+
+def _read_episode_frames(root: Path) -> dict[int, Any] | None:
+    """`meta/episode_frames.jsonl` as {episode: T_B_Ws}, or None when the dataset has no file.
+
+    The recorder writes one row per DAgger/funnel/trial episode with the rollout's T_B_Ws: the
+    transform that took the arm's base-frame pose into the frame the policy -- and so the
+    dataset -- sees. A stored state is inv(T) . base, so T . state is where the arm really was.
+    """
+    import numpy as np
+
+    path = root / "meta" / "episode_frames.jsonl"
+    if not path.is_file():
+        return None
+    frames: dict[int, Any] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for line in lines:
+        try:
+            row = json.loads(line)
+            episode = int(row["episode_index"])
+            transform = np.asarray(row["T_B_Ws"], dtype=np.float64)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if transform.shape == (4, 4) and np.isfinite(transform).all():
+            frames[episode] = transform
+    return frames
+
+
+def _resolve_dataset_path(repo_root: Path, path: str) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else repo_root / candidate
+
+
+def _episode_base_transforms(root: Path, repo_root: Path, depth: int = 0) -> tuple[dict[int, Any], bool]:
+    """Per episode, the transform from its stored frame back to the robot base.
+
+    Returns (transforms, unlisted_is_base). A transform of None means the episode was recorded
+    through a rollout's frame that nobody wrote down -- DAgger rounds from before episode_frames
+    existed -- and its points cannot be placed. An episode absent from the dict is in the base
+    frame when `unlisted_is_base` (a teleop recording), and unplaceable otherwise.
+
+    Teleop demonstrations are stored in the base frame. Everything a rollout recorded is stored
+    in that rollout's frame, which moved by up to 300 mm between rounds (rollout anchor drift),
+    and a merged view holds no frames of its own: its manifest says which source episode each
+    of its episodes came from, and that source's episode_frames says the rest.
+    """
+    import numpy as np
+
+    frames = _read_episode_frames(root)
+    if frames is not None:
+        # Written by the recorder, so every episode here came through a rollout's frame.
+        return frames, False
+    try:
+        manifest = json.loads((root / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, True
+    index = manifest.get("episode_source_index") if isinstance(manifest, dict) else None
+    if not isinstance(index, list):
+        return {}, True
+    if depth >= _MAX_VIEW_NESTING:
+        return {}, False
+
+    rollout_roots = {
+        _resolve_dataset_path(repo_root, str(item)).resolve()
+        for item in manifest.get("dagger_dataset_roots") or []
+    }
+    sources: dict[Path, tuple[dict[int, Any], bool]] = {}
+    transforms: dict[int, Any] = {}
+    for entry in index:
+        try:
+            episode = int(entry["episode_index"])
+            source_episode = int(entry["source_episode_index"])
+            source = _resolve_dataset_path(repo_root, str(entry["source_dataset_root"])).resolve()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if source not in sources:
+            if source in rollout_roots:
+                # A rollout-recorded root without the file still is one: unplaceable, not base.
+                sources[source] = (_read_episode_frames(source) or {}, False)
+            else:
+                sources[source] = _episode_base_transforms(source, repo_root, depth + 1)
+        source_transforms, source_unlisted_is_base = sources[source]
+        if source_episode in source_transforms:
+            transforms[episode] = source_transforms[source_episode]
+        else:
+            transforms[episode] = np.eye(4) if source_unlisted_is_base else None
+    return transforms, False
+
+
+def _infer_repo_root(dataset_root: Path) -> Path:
+    """The checkout a dataset lives in: the parent of its `outputs/` directory."""
+    resolved = dataset_root.resolve()
+    for parent in resolved.parents:
+        if parent.name == "outputs":
+            return parent.parent
+    return resolved.parent
 
 
 def _feature_index(info: dict[str, Any], feature: str, name: str) -> int | None:
@@ -885,7 +994,7 @@ def _feature_index(info: dict[str, Any], feature: str, name: str) -> int | None:
     return None
 
 
-def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
+def demo_landing_points(dataset_root: Path, repo_root: Path | None = None) -> dict[str, Any]:
     """Where the demonstrations grasped and released, as the backdrop for rollout landing points.
 
     A rollout landing point on its own says nothing: the question every one of them is asked is
@@ -895,11 +1004,18 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
     Reduced here rather than shipped as a fixture because the dataset is what the checkpoint was
     trained on and it changes; a hard-coded ring would keep describing an older one. Memoised on
     the dataset's own metadata timestamp, since the scan costs a full pass over its parquet.
+
+    Every point is in the robot base frame. Episodes a rollout recorded are stored in that
+    rollout's frame and are carried back through their episode_frames transform; `repo_root`
+    resolves the relative source paths in a merged view's manifest (default: the checkout the
+    dataset sits in). Episodes whose frame was never recorded are left off rather than drawn
+    up to 300 mm from where they happened, and counted in `frameUnknownEpisodes`.
     """
     root = Path(dataset_root)
+    repo = Path(repo_root) if repo_root is not None else _infer_repo_root(root)
     info_path = root / "meta" / "info.json"
     try:
-        cache_key = (str(root.resolve()), info_path.stat().st_mtime)
+        cache_key = (str(root.resolve()), info_path.stat().st_mtime, str(repo.resolve()))
     except OSError:
         return {}
     cached = _demo_landmark_cache.get(cache_key)
@@ -940,12 +1056,22 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
     if not episodes:
         return {}
 
+    transforms, unlisted_is_base = _episode_base_transforms(root, repo)
     points: list[dict[str, Any]] = []
     releases: list[list[float]] = []
+    frame_corrected = 0
+    frame_unknown = 0
     for episode in sorted(episodes):
+        transform = transforms.get(episode, np.eye(4) if unlisted_is_base else None)
+        if transform is None:
+            frame_unknown += 1
+            continue
         state = np.concatenate([chunk[0] for chunk in episodes[episode]])
         action = np.concatenate([chunk[1] for chunk in episodes[episode]])
         position = state[:, state_indices]
+        if not np.array_equal(transform, np.eye(4)):
+            position = position @ transform[:3, :3].T + transform[:3, 3]
+            frame_corrected += 1
         gripper = action[:, gripper_index]
         # Falling edge, matching the runtime: an episode that starts with the gripper already
         # commanded shut would otherwise report its grasp at the start pose. The demonstrations
@@ -960,7 +1086,8 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
             continue
         close_idx = int(closed_steps[0])
         reopened = np.flatnonzero(gripper[close_idx:] >= _DEMO_GRIPPER_CLOSED_BELOW)
-        release_idx = int(close_idx + reopened[0]) if reopened.size else len(gripper) - 1
+        released = bool(reopened.size)
+        release_idx = int(close_idx + reopened[0]) if released else len(gripper) - 1
         apex_z = float(position[close_idx : release_idx + 1, 2].max())
         points.append(
             {
@@ -969,8 +1096,12 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
                 "releaseXyz": [round(float(value), 5) for value in position[release_idx]],
                 "liftM": round(apex_z - float(position[close_idx, 2]), 5),
                 "descentM": round(apex_z - float(position[release_idx, 2]), 5),
+                "released": released,
             }
         )
+        if not released:
+            # Its last frame is a few steps after the close, wherever the peg stood -- not a hole.
+            continue
         releases.append(
             [
                 float(position[release_idx, 0]),
@@ -986,9 +1117,14 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
     # The z is carried too: it is the height the gripper was at when it let the peg go, which
     # is exactly the height it has to return to in order to pick that peg back up. That makes
     # this point the scene reset's pick pose, not just a marker on the landing map.
-    place_xyz = [
-        round(float(np.mean([release[axis] for release in releases])), 5) for axis in range(3)
-    ]
+    if releases:
+        place_xyz = [
+            round(float(np.mean([release[axis] for release in releases])), 5) for axis in range(3)
+        ]
+        hole_source = "releases"
+    else:
+        place_xyz = [float(value) for value in FIXTURE_HOLE_XYZ]
+        hole_source = "fixture"
     hole = place_xyz[:2]
     radii = [
         float(np.hypot(point["graspXyz"][0] - hole[0], point["graspXyz"][1] - hole[1]))
@@ -998,6 +1134,10 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
         "datasetRoot": str(root),
         "hole": hole,
         "placeXyz": place_xyz,
+        "holeSource": hole_source,
+        "releasedEpisodes": len(releases),
+        "frameCorrectedEpisodes": frame_corrected,
+        "frameUnknownEpisodes": frame_unknown,
         "points": points,
         "graspRadiusM": {
             "min": round(min(radii), 5),

@@ -1462,15 +1462,25 @@ export type DemoLandingPoint = {
   releaseXyz: [number, number, number];
   liftM: number;
   descentM: number;
+  /** False for an episode that ends holding the peg (grasp-loop recordings stop a few frames
+   *  after the close); its releaseXyz is then only its last frame. */
+  released?: boolean;
 };
 
 export type RolloutLandmarks = {
   datasetRoot?: string;
-  /** Measured as the mean of every demonstration's release point, not configured. */
+  /** Measured as the mean of every demonstration's release point, not configured -- unless no
+   *  episode released (`holeSource: "fixture"`), when it is the grasp loop's fixture hole. */
   hole?: [number, number];
   /** The same mean release point with its height: where the demonstrations left the peg, and
    *  therefore where a scene reset has to reach to pick it back up. */
   placeXyz?: [number, number, number];
+  holeSource?: "releases" | "fixture";
+  releasedEpisodes?: number;
+  /** Episodes a rollout recorded, carried back to the base frame through episode_frames. */
+  frameCorrectedEpisodes?: number;
+  /** Episodes recorded through a rollout frame nobody wrote down; left off the map. */
+  frameUnknownEpisodes?: number;
   points?: DemoLandingPoint[];
   graspRadiusM?: { min: number; max: number; mean: number };
 };
@@ -1661,6 +1671,8 @@ export type RolloutRuntimeOptions = {
   daggerReleaseAfterS?: number | null;
   /** Grasp loop only: trials to run, and whether a person is there to put a lost peg back. */
   graspLoopTrials?: number;
+  /** Policy steps (30 Hz) before a trial with no close is ended; arm B: until the funnel takes over. */
+  graspLoopMaxPolicySteps?: number;
   graspLoopAttended?: boolean;
   /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
   graspLoopArms?: "A" | "B" | "AB";

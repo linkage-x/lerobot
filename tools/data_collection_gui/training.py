@@ -590,7 +590,12 @@ def build_train_argv(
 
 
 def build_launch_command(
-    repo_root: Path, host: TrainingHost, argv: list[str], *, wandb_key: str
+    repo_root: Path,
+    host: TrainingHost,
+    argv: list[str],
+    *,
+    wandb_key: str,
+    pid_file: str = "",
 ) -> tuple[list[str], dict[str, str] | None]:
     """Turn the training argv into something Popen can run, local or over ssh.
 
@@ -598,6 +603,9 @@ def build_launch_command(
     remotely it is written to a 0600 file on the target by a separate ssh call and read
     back by the shell that starts training, because a key spelled out in an ssh command
     line is visible in the target's process list to every user on that machine.
+
+    `pid_file` (remote only, relative to the host's repo) is where the far shell writes its
+    own pid before it execs the trainer -- see `stop_remote_training` for why.
     """
     # Do not use W&B's defaults below ~/.cache or ~/.local/share. Those may have been
     # provisioned by a different user (as on tele), while the training process is deliberately
@@ -667,9 +675,17 @@ def build_launch_command(
         f"{_HUB_CACHE_ENTRY_GLOB} >/dev/null 2>&1; then "
         "export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; fi; "
     )
+    # sshd starts a command without a tty in a session of its own, so this shell's pid is also
+    # the process group the trainer and its workers run in -- and `exec` keeps that pid.
+    pid_prefix = (
+        f"mkdir -p {shlex.quote(str(Path(pid_file).parent))} && echo $$ > {shlex.quote(pid_file)} && "
+        if pid_file
+        else ""
+    )
     remote = (
         f"cd {shlex.quote(host.repoDir)} && "
         f"{key_prefix}"
+        f"{pid_prefix}"
         f"mkdir -p {remote_wandb_dirs} && "
         f"{_PIN_HF_HOME} && "
         f"export {remote_wandb_env} && "
@@ -678,6 +694,58 @@ def build_launch_command(
         f"exec {remote_argv}"
     )
     return ["ssh", *SSH_OPTS, host.sshTarget, remote], None
+
+
+# Under outputs/ but not under outputs/train/<job>: the trainer refuses to start in an output
+# directory that already exists, and this file is written before it starts.
+REMOTE_TRAINING_PID_DIR = "outputs/.training_pids"
+
+
+def remote_training_pid_file(job_name: str) -> str:
+    return f"{REMOTE_TRAINING_PID_DIR}/{job_name}.pid"
+
+
+def stop_remote_training(host: TrainingHost, job_name: str, timeout_s: float = 20.0) -> str:
+    """SIGTERM a remote run's process group on the far side, and say what happened.
+
+    Killing the local ssh client is not enough. It runs without a tty, so sshd has no hangup
+    to send when the client goes, and the trainer keeps the GPU (dev box, 10-19). The far pid
+    is the one the launch shell recorded; it is only signalled while its command line still
+    names this job, so a stale file left by a finished run cannot reach a reused pid.
+    """
+    pid_file = shlex.quote(remote_training_pid_file(job_name))
+    remote = (
+        f"cd {shlex.quote(host.repoDir)} || exit 2; "
+        f"pid=$(cat {pid_file} 2>/dev/null); "
+        'case "$pid" in ""|*[!0-9]*) echo no-pid; exit 0;; esac; '
+        f"if ! tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -qF -- {shlex.quote(job_name)}; then "
+        f"rm -f {pid_file}; echo gone; exit 0; fi; "
+        'kill -TERM -- "-$pid" || exit 5; '
+        f"rm -f {pid_file}; echo \"stopped $pid\""
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, host.sshTarget, remote],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise TrainingError(f"Stopping the run on {host.sshTarget} timed out after {timeout_s:.0f}s.") from None
+    except OSError as exc:
+        raise TrainingError(f"Could not reach {host.sshTarget} to stop the run: {exc}") from exc
+    outcome = (result.stdout or "").strip().splitlines()[-1:] or [""]
+    if result.returncode != 0 or not outcome[0]:
+        detail = (result.stderr or result.stdout or "").strip()[:200]
+        raise TrainingError(f"Could not stop the run on {host.sshTarget}: {detail or f'exit {result.returncode}'}")
+    if outcome[0].startswith("stopped "):
+        return f"Stopped the trainer on {host.label} (pid {outcome[0].split()[1]})."
+    if outcome[0] == "gone":
+        return f"The trainer on {host.label} had already exited."
+    return (
+        f"No pid was recorded on {host.label} for this run (it was started before the gateway "
+        "recorded one). Check the GPU there; the trainer may still be running."
+    )
 
 
 # ------------------------------------------------------- dependency install ---

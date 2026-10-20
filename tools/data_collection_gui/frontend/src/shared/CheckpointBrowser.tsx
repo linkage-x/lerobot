@@ -85,6 +85,16 @@ export function checkpointToRestore(
   return checkpoints.find((item) => item.id === restoreId) ?? null;
 }
 
+/** True when the only way to roll this checkpoint out is to copy it here first.
+ *
+ * Every other block is a judgement the operator may overrule. This one is not: the gateway
+ * starts a rollout from its own listing of this machine, so a checkpoint that lives on a
+ * training host is refused at Start whatever the override says.
+ */
+export function needsFetch(checkpoint: Checkpoint): boolean {
+  return checkpoint.issues.some((issue) => issue.level === "block" && issue.field === "location");
+}
+
 type Props = {
   /** "picker" hides the destructive actions and reports the selection upward. */
   mode: "manage" | "picker";
@@ -95,6 +105,9 @@ type Props = {
   restoreId?: string;
   /** Bump to force a refresh from outside (e.g. after a training run finishes). */
   refreshToken?: number;
+  /** Switch the listing to this host (and rescan it) each time `nonce` changes. The Rollout
+   *  page uses it after a fetch, so the row picked is the copy that now sits on this machine. */
+  focusHost?: { hostId: string; nonce: number };
   disabled?: boolean;
 };
 
@@ -104,6 +117,7 @@ export function CheckpointBrowser({
   onSelect,
   restoreId = "",
   refreshToken = 0,
+  focusHost,
   disabled = false
 }: Props) {
   const [hosts, setHosts] = useState<TrainingHost[]>([]);
@@ -197,6 +211,15 @@ export function CheckpointBrowser({
       return next.length === current.length ? current : next;
     });
   }, [deletable]);
+
+  const focusedRef = useRef(0);
+  useEffect(() => {
+    if (!focusHost || focusedRef.current === focusHost.nonce) return;
+    focusedRef.current = focusHost.nonce;
+    // A host switch rescans through the hostId effect; staying put needs the rescan asked for.
+    if (focusHost.hostId === hostId) void refresh(hostId);
+    else setHostId(focusHost.hostId);
+  }, [focusHost, hostId, refresh]);
 
   // One shot, tracked by the id itself so a later restore of a different id still fires. The
   // list refreshes on a timer-free but frequent set of triggers (host switch, delete, the

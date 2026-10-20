@@ -238,8 +238,8 @@ GRASP_LOOP_LOG_STROKE_RADIUS_M = 0.010
 # (`grasp_funnel.py`). "AB" interleaves them in randomised pairs, because the rig drifts within a
 # session and two arms run one after the other would each carry a different stretch of it.
 GRASP_LOOP_ARMS = ("A", "B", "AB")
-# Steps the funnel gets once it has the arm: align, descend at 0.02 m/s from +60 to -6 mm, settle,
-# close. About 6 s when nothing goes wrong from a 60 mm takeover. From 300 mm it is up to ~190 mm
+# Steps the funnel gets once it has the arm: align, descend at 0.03 m/s from +60 to -6 mm, settle,
+# close. About 5 s when nothing goes wrong from a 60 mm takeover. From 300 mm it is up to ~190 mm
 # across and 240 mm down at 0.05 m/s first (09-30 approach traces), ~13 s; 20 s is a stuck funnel.
 GRASP_LOOP_FUNNEL_MAX_STEPS = 600
 # Where the funnel may take over, in mm above the peg (`funnelAlignDzMm`): its v14 (3) 60 mm up to
