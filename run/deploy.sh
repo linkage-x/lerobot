@@ -80,9 +80,9 @@ case "$target" in
     profile="workstation"
     config_path="tools/fr3/fr3_record_config.yaml"
     gateway_target="http://192.168.1.156:8765"
-    policy_remote="hanyu@192.168.1.179"
-    policy_dir="/home/hanyu/Codes/lerobot_workstation"
-    policy_address="192.168.1.179:8790"
+    policy_remote="hph@10.77.0.64"
+    policy_dir="/home/hph/Codes/lerobot_workstation"
+    policy_address="10.77.0.64:8790"
     # The 09-22 outputs/rollouts/rollout_log.jsonl the grasp loop draws pegs from stayed on tele;
     # until it is copied over (and merged with whatever the NUC has logged by then), the loop
     # stages from the mask drawn on the Rollout page.

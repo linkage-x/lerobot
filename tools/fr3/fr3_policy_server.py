@@ -16,6 +16,11 @@ last policy this checkout's server loaded, if the card has room for it. Either l
 background, and a rollout that arrives meanwhile waits for it. Nothing in this process touches
 hardware.
 
+While a training run is going on this machine the server holds nothing: it refuses to load (a
+rollout's hello says why), skips the warm-up, and drops an idle policy it already holds. So a
+deploy, which restarts and warms this server, is safe at any time. `--allow-training-overlap`
+turns that off.
+
 The server records the repo files it has imported, with their hashes, in `CODE_MANIFEST_PATH`;
 `run/policy_server.sh ensure` reads it to restart the server only when one of them has changed.
 """
@@ -43,6 +48,7 @@ from tools.fr3.policy_remote import (
     DEFAULT_POLICY_SERVER_PORT,
     LOAD_SPEC_OVERRIDES,
     LoadedPolicy,
+    PolicyBusy,
     PolicyHost,
     policy_fingerprint,
     policy_load_spec,
@@ -53,9 +59,15 @@ from tools.fr3.policy_remote import (
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 LAST_SPEC_PATH = Path('run/logs/policy_server_last_spec.json')
 CODE_MANIFEST_PATH = Path('run/logs/policy_server_code.json')
-# pi05 holds about 10 GB resident; less free than this means something else (a training run) has
-# the card, and a warm-up nobody asked for would take it away.
+# pi05 holds about 10 GB resident; less free than this means something else has the card, and a
+# warm-up nobody asked for would take it away. Not how a training run is recognised: on a 32 GB
+# card one leaves ~17 GB free (10-21, Dante), and this check let a deploy warm 10 GB beside it.
 DEFAULT_WARM_MIN_FREE_GB = 12.0
+# A training run on this machine, by the interpreter's argv: the trainer
+# (`python -m lerobot.scripts.lerobot_train`, or its script / console entry point) and the fr3
+# wrapper that launches it.
+TRAINING_MODULES = frozenset({'lerobot.scripts.lerobot_train'})
+TRAINING_SCRIPTS = frozenset({'lerobot_train.py', 'lerobot-train', 'fr3_train_il_policy.py'})
 
 
 def _split_args(argv: list[str] | None) -> tuple[argparse.Namespace, argparse.Namespace]:
@@ -74,6 +86,11 @@ def _split_args(argv: list[str] | None) -> tuple[argparse.Namespace, argparse.Na
         help=f'At startup, load the last policy this server loaded ({LAST_SPEC_PATH}) if the card has room.',
     )
     parser.add_argument('--warm-min-free-gb', type=float, default=DEFAULT_WARM_MIN_FREE_GB)
+    parser.add_argument(
+        '--allow-training-overlap',
+        action='store_true',
+        help='Load and keep policies while a training run is going on this machine (by default the card is left to it).',
+    )
     parser.add_argument('-h', '--help', action='store_true')
     server_args, rest = parser.parse_known_args(argv)
     if server_args.help:
@@ -177,8 +194,44 @@ def warm_forward(stack: _PolicyStack, policy_cfg: Any, device: torch.device, *, 
     log(f'[INFO] policy_server warm_forward unguided_s={unguided_s:.3f} guided_s={guided_s:.3f}')
 
 
-def make_loader(repo_root: Path, device: torch.device, *, log=print, on_loaded=None):
+def training_processes(proc_root: Path = Path('/proc')) -> list[str]:
+    """The training runs going on this machine, as 'pid N (what)'; empty when there are none.
+
+    Read off each interpreter's argv, like `run/policy_server.sh` finds the server, so a shell or
+    an ssh command that merely names the trainer does not count.
+    """
+    runs: dict[str, int] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            args = [a.decode('utf-8', 'ignore') for a in (entry / 'cmdline').read_bytes().split(b'\0') if a]
+        except OSError:
+            continue
+        if not args or not os.path.basename(args[0]).startswith('python'):
+            continue
+        what = next((a for a in args[1:] if a in TRAINING_MODULES or os.path.basename(a) in TRAINING_SCRIPTS), None)
+        # One per kind: the trainer's DataLoader workers carry its argv too; the oldest is the trainer.
+        if what is not None:
+            what = os.path.basename(what)
+            runs[what] = min(runs.get(what, int(entry.name)), int(entry.name))
+    return sorted(f'pid {pid} ({what})' for what, pid in runs.items())
+
+
+class TrainingOnCard(RuntimeError):
+    """A load refused because a training run has this machine's card."""
+
+
+def make_loader(repo_root: Path, device: torch.device, *, log=print, on_loaded=None, training=None):
+    """`training` lists the training runs going on now (see `training_processes`); None never refuses."""
+
     def load(spec: dict[str, Any]) -> LoadedPolicy:
+        runs = training() if training is not None else []
+        if runs:
+            raise TrainingOnCard(
+                f'this policy server is on a machine that is training ({", ".join(runs)}), so it loads no '
+                'policy until that finishes. Roll out after the training, or stop it first.'
+            )
         overrides = {key: spec[key] for key in LOAD_SPEC_OVERRIDES if key in spec}
         checkpoint = resolve_outputs_path(repo_root, str(spec['checkpoint']))
         if not checkpoint.exists():
@@ -229,7 +282,12 @@ def _flush_print(line: str) -> None:
     sys.stdout.flush()
 
 
-def last_spec_worth_warming(device: torch.device, min_free_gb: float, *, log=print) -> dict[str, Any] | None:
+def last_spec_worth_warming(
+    device: torch.device, min_free_gb: float, *, training: list[str] | None = None, log=print
+) -> dict[str, Any] | None:
+    if training:
+        log(f'[INFO] policy_server warm_last skipped: training on this machine ({", ".join(training)})')
+        return None
     try:
         spec = json.loads((_REPO_ROOT / LAST_SPEC_PATH).read_text())
     except FileNotFoundError:
@@ -244,6 +302,23 @@ def last_spec_worth_warming(device: torch.device, min_free_gb: float, *, log=pri
             log(f'[INFO] policy_server warm_last skipped: {free_gb:.1f} GB free on the card < {min_free_gb:.1f} (training?)')
             return None
     return spec
+
+
+def yield_card_to_training(host: PolicyHost, training: list[str], *, log=print) -> bool:
+    """Drop the held policy when a training run has started here, unless a rollout is using it.
+
+    A rollout in progress keeps its policy (unloading it would end the trial mid-motion); the next
+    check after it lets go drops it.
+    """
+    if not training:
+        return False
+    try:
+        unloaded = host.unload()
+    except PolicyBusy:
+        return False
+    if unloaded:
+        log(f'[INFO] policy_server yielded the card to training ({", ".join(training)})')
+    return unloaded
 
 
 def _warm(host: PolicyHost, spec: dict[str, Any]) -> None:
@@ -273,8 +348,11 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             _flush_print(f'[WARN] policy_server last_spec_not_saved {type(exc).__name__}: {exc}')
 
+    training = None if server_args.allow_training_overlap else training_processes
     host = PolicyHost(
-        make_loader(_REPO_ROOT, device, log=_flush_print, on_loaded=on_loaded), idle_unload_s=idle_unload_s, log=_flush_print
+        make_loader(_REPO_ROOT, device, log=_flush_print, on_loaded=on_loaded, training=training),
+        idle_unload_s=idle_unload_s,
+        log=_flush_print,
     )
 
     # Bound before the preload, so a second server on the same port fails in a second rather than
@@ -301,7 +379,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         warm_spec = spec
     elif server_args.warm_last:
-        warm_spec = last_spec_worth_warming(device, server_args.warm_min_free_gb, log=_flush_print)
+        warm_spec = last_spec_worth_warming(
+            device, server_args.warm_min_free_gb, training=training() if training else None, log=_flush_print
+        )
     if warm_spec is not None:
         threading.Thread(target=_warm, args=(host, warm_spec), name='warm', daemon=True).start()
 
@@ -310,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     def idle_watch() -> None:
         while not stop.wait(30.0):
             try:
+                yield_card_to_training(host, training() if training else [], log=_flush_print)
                 host.unload_if_idle()
             except Exception as exc:  # never let the watcher die quietly
                 _flush_print(f'[WARN] policy_server idle_unload_failed {type(exc).__name__}: {exc}')

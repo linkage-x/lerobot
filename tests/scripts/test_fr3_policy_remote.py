@@ -506,3 +506,110 @@ def test_warm_forward_runs_an_unguided_then_a_guided_pass_and_resets():
     # Nothing of the blank pass may carry into the first rollout's chunk.
     assert policy.resets == pre.resets == post.resets == 1
     assert lines and 'warm_forward' in lines[0]
+
+
+def _fake_proc(root: Path, pid: int, *argv: str) -> None:
+    (root / str(pid)).mkdir(parents=True)
+    (root / str(pid) / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+
+
+def test_training_processes_are_found_by_the_interpreters_argv(tmp_path):
+    from tools.fr3 import fr3_policy_server as server
+
+    _fake_proc(tmp_path, 101, '/x/.venv-fr3/bin/python', '-m', 'lerobot.scripts.lerobot_train', '--config_path=c.json')
+    _fake_proc(tmp_path, 102, '.venv-fr3/bin/python', 'tools/fr3/fr3_train_il_policy.py', '--view-root', 'v')
+    _fake_proc(tmp_path, 130, '/x/.venv-fr3/bin/python', '-m', 'lerobot.scripts.lerobot_train', '--config_path=c.json')
+    # Naming the trainer is not running it: a shell, an ssh command, the server itself.
+    _fake_proc(tmp_path, 103, '/bin/bash', '-c', 'python -m lerobot.scripts.lerobot_train')
+    _fake_proc(tmp_path, 104, 'ssh', 'host', 'fr3_train_il_policy.py')
+    _fake_proc(tmp_path, 105, '.venv-fr3/bin/python', 'tools/fr3/fr3_policy_server.py', '--warm-last')
+    (tmp_path / 'self').mkdir()
+
+    assert server.training_processes(tmp_path) == ['pid 101 (lerobot.scripts.lerobot_train)', 'pid 102 (fr3_train_il_policy.py)']
+    assert server.training_processes(tmp_path / 'self') == []
+
+
+def test_the_loader_refuses_while_this_machine_trains(tmp_path):
+    from tools.fr3 import fr3_policy_server as server
+
+    load = server.make_loader(tmp_path, torch.device('cpu'), training=lambda: ['pid 7 (lerobot.scripts.lerobot_train)'])
+    with pytest.raises(server.TrainingOnCard, match='pid 7'):
+        load({'checkpoint': 'outputs/train/x/checkpoints/last/pretrained_model'})
+
+
+def test_warm_last_is_skipped_while_this_machine_trains(monkeypatch, tmp_path):
+    from tools.fr3 import fr3_policy_server as server
+
+    monkeypatch.setattr(server, '_REPO_ROOT', tmp_path)
+    (tmp_path / server.LAST_SPEC_PATH).parent.mkdir(parents=True)
+    (tmp_path / server.LAST_SPEC_PATH).write_text('{"checkpoint": "outputs/train/x"}')
+    lines: list[str] = []
+    assert server.last_spec_worth_warming(torch.device('cpu'), 12.0, training=['pid 7 (x)'], log=lines.append) is None
+    assert 'training' in lines[0]
+    assert server.last_spec_worth_warming(torch.device('cpu'), 12.0, training=[], log=lines.append) == {'checkpoint': 'outputs/train/x'}
+
+
+def test_an_idle_policy_yields_the_card_to_training_but_a_rollout_keeps_it(served):
+    from tools.fr3 import fr3_policy_server as server
+
+    client = _client(served.address)
+    assert server.yield_card_to_training(served.host, ['pid 7 (x)']) is False
+    assert served.host.status()['loaded'] is not None
+    client.close()
+    _wait_until(lambda: served.host.status()['holder'] is None)
+
+    lines: list[str] = []
+    assert server.yield_card_to_training(served.host, [], log=lines.append) is False
+    assert server.yield_card_to_training(served.host, ['pid 7 (x)'], log=lines.append) is True
+    assert served.host.status()['loaded'] is None and 'yielded' in lines[0]
+
+
+def test_a_full_checkpoint_needs_its_own_weights(tmp_path):
+    with pytest.raises(FileNotFoundError, match='random weights'):
+        rt.assert_policy_weights_resolve(tmp_path)
+    (tmp_path / 'model.safetensors').write_bytes(b'x')
+    assert rt.assert_policy_weights_resolve(tmp_path) == str(tmp_path / 'model.safetensors')
+
+
+def test_an_adapter_whose_local_base_is_missing_is_refused(tmp_path):
+    import json
+
+    adapter = tmp_path / 'adapter'
+    adapter.mkdir()
+    base = tmp_path / 'other_machine' / 'pi05_base'
+    (adapter / 'adapter_config.json').write_text(json.dumps({'base_model_name_or_path': str(base)}))
+    with pytest.raises(FileNotFoundError, match='randomly initialised base'):
+        rt.assert_policy_weights_resolve(adapter)
+
+    # A link into a cache that is not here is as missing as no file.
+    base.mkdir(parents=True)
+    (base / 'model.safetensors').symlink_to(tmp_path / 'nowhere' / 'blob')
+    with pytest.raises(FileNotFoundError):
+        rt.assert_policy_weights_resolve(adapter)
+
+    (base / 'model.safetensors').unlink()
+    (base / 'model.safetensors').write_bytes(b'x')
+    assert rt.assert_policy_weights_resolve(adapter) == str(base / 'model.safetensors')
+
+
+def test_an_adapter_on_a_hub_base_resolves_through_the_hub_lookup(tmp_path):
+    import json
+
+    (tmp_path / 'adapter_config.json').write_text(json.dumps({'base_model_name_or_path': 'lerobot/pi05_base'}))
+    calls = []
+
+    def found(repo, filename):
+        calls.append((repo, filename))
+        return '/cache/model.safetensors'
+
+    assert rt.assert_policy_weights_resolve(tmp_path, download=found) == '/cache/model.safetensors'
+    assert calls == [('lerobot/pi05_base', 'model.safetensors')]
+
+    def offline(repo, filename):
+        raise OSError('offline and not cached')
+
+    with pytest.raises(FileNotFoundError, match='offline and not cached'):
+        rt.assert_policy_weights_resolve(tmp_path, download=offline)
+    (tmp_path / 'adapter_config.json').write_text(json.dumps({'base_model_name_or_path': ''}))
+    with pytest.raises(ValueError, match='no base_model_name_or_path'):
+        rt.assert_policy_weights_resolve(tmp_path)

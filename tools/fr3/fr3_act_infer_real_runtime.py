@@ -5261,6 +5261,49 @@ def prepare_rollout_policy_config(
     return policy_cfg
 
 
+def assert_policy_weights_resolve(pretrained_dir: Path, *, download: Any = None) -> str:
+    """Find the weights this checkpoint needs on this machine, or refuse to load it.
+
+    `PreTrainedPolicy.from_pretrained` catches a failed weight load, logs "Returning model without
+    loading pretrained weights" and carries on. For a LoRA checkpoint the weights it loads are the
+    BASE named in adapter_config.json, so an adapter trained on another machine lands on a randomly
+    initialised pi0.5 and still reports loaded: on 10-21 the policy server on Dante warmed 071246
+    that way (its base path was the dev box's /home/hanyu/...). The same hub lookup the load uses,
+    so HF_HUB_OFFLINE and the cache location apply exactly as they will there.
+    """
+    adapter_config = pretrained_dir / 'adapter_config.json'
+    if not adapter_config.is_file():
+        weights = pretrained_dir / 'model.safetensors'
+        if not weights.is_file():
+            raise FileNotFoundError(f'{pretrained_dir} has no model.safetensors; it would load with random weights.')
+        return str(weights)
+    base = str(json.loads(adapter_config.read_text()).get('base_model_name_or_path') or '')
+    if not base:
+        raise ValueError(f'{adapter_config} names no base_model_name_or_path; there is nothing to apply the adapter to.')
+    local = Path(base).expanduser()
+    if local.is_absolute() or local.exists():
+        weights = local / 'model.safetensors'
+        # is_file follows links, so a link into a cache that is not on this machine fails here too.
+        if not weights.is_file():
+            raise FileNotFoundError(
+                f'The adapter at {pretrained_dir} is applied to the base weights at {base}, and {weights} is '
+                'not on this machine; loading it anyway would run the adapter on a randomly initialised base. '
+                f'Put the base there (a link to the hub cache will do), or point base_model_name_or_path in '
+                f'{adapter_config} at a local copy.'
+            )
+        return str(weights)
+    if download is None:
+        from huggingface_hub import hf_hub_download as download
+    try:
+        return download(base, 'model.safetensors')
+    except Exception as exc:  # noqa: BLE001 - every failure here means the same thing
+        raise FileNotFoundError(
+            f'The adapter at {pretrained_dir} is applied to {base}, and its model.safetensors cannot be found '
+            f'({exc}); loading it anyway would run the adapter on a randomly initialised base. '
+            'Check the hub cache and HF_HUB_OFFLINE.'
+        ) from exc
+
+
 def load_policy_stack(
     pretrained_dir: Path,
     *,
@@ -5282,6 +5325,7 @@ def load_policy_stack(
         rtc_max_guidance_weight=rtc_max_guidance_weight,
         rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
     )
+    assert_policy_weights_resolve(pretrained_dir)
     policy_cfg.device = str(device)
     policy_cfg.pretrained_path = pretrained_dir
     policy = make_policy(cfg=policy_cfg, ds_meta=ds_meta)
