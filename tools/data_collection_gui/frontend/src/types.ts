@@ -1681,7 +1681,7 @@ export type Fr3PivotPlan = {
   /** The table top the clearance was measured from, in fr3_base. */
   tableZMm?: number | null;
   mujocoChecked: boolean;
-  /** "dwells" (surveyed, chosen, routed) or the 10-13 "star". */
+  /** "dwells" (surveyed, chosen, routed), "probe" (dwells near the start, fitted for the anchor) or the 10-13 "star". */
   kind?: string;
   dwells?: number;
   /** Predicted 1-sigma of the fit per mm of error at each dwell: s (socket frame), c (fr3_base). */

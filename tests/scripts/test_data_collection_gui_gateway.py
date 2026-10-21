@@ -8939,7 +8939,7 @@ elif args[0] == "plan":
     bias = [float(x) for x in args[args.index("--bias-mm") + 1: args.index("--bias-mm") + 4]]
     passed = bias[0] != 5.0
     anchor = [float(x) for x in args[args.index("--anchor-mm") + 1: args.index("--anchor-mm") + 4]] if "--anchor-mm" in args else [0.0] * 3
-    summary = {"schema": "fr3_pivot_plan/v1", "kind": "dwells", "centre": Path(args[1]).name, "created": "x", "passed": passed,
+    summary = {"schema": "fr3_pivot_plan/v1", "kind": "probe" if "--probe" in args else "dwells", "centre": Path(args[1]).name, "created": "x", "passed": passed,
                "problems": [] if passed else ["j6 总转角 95°"], "duration_s": 136.0,
                "params": {"bias_mm": bias, "press_mm": 3.0, "anchor_mm": anchor}, "joint_travel_deg": [1] * 7,
                "max_joint_speed_deg_s": [8] * 7, "min_margin_wall_deg": [28] * 7, "min_margin_fr3_deg": [30] * 7,
@@ -9111,6 +9111,17 @@ def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, 
     assert planned["ok"], planned["error"]
     (plan,) = planned["plans"]
     assert plan["anchorMm"] == [0.13, -0.53, 7.87] and plan["anchorFrom"] == "20261013_181645_pivot.fit.json"
+
+
+def test_fr3_pivot_probe_plans_without_an_anchor(tmp_path, monkeypatch):
+    # the probe is what finds the ball centre: asked with anchorFromFit too, it still turns about the origin
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
+    planned = gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "anchorFromFit": True})
+    assert planned["ok"], planned["error"]
+    (plan,) = planned["plans"]
+    assert plan["kind"] == "probe" and plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
 
 
 def test_fr3_pivot_anchor_follows_the_socket_frame_the_urdf_has_now(tmp_path, monkeypatch):

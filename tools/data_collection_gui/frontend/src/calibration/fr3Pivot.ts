@@ -55,7 +55,7 @@ export function jobStatusText(job: Fr3PivotJob | null | undefined): string {
           : `引导 pivot 中 ${(job.elapsedS ?? 0).toFixed(0)} / ${(job.durationS ?? 0).toFixed(0)} s：扶着夹爪倾斜、旋转，机器人把球窝压在球上（偏置 ${fmtVec(job.biasMm, 0)} mm${isAnchored(job.anchorMm) ? `，弹簧挂在 ${fmtVec(job.anchorMm)} mm` : ""}）`;
       }
       if (job.mode === "auto") {
-        return `自动 pivot 执行中 ${(job.elapsedS ?? 0).toFixed(0)} / ${(job.durationS ?? 0).toFixed(0)} s（柔顺阻抗，偏置 ${fmtVec(job.biasMm, 0)} mm）`;
+        return `自动 pivot 执行中 ${(job.elapsedS ?? 0).toFixed(0)} / ${(job.durationS ?? 0).toFixed(0)} s（关节跟踪，偏置 ${fmtVec(job.biasMm, 0)} mm）`;
       }
       return `采集中 ${(job.elapsedS ?? 0).toFixed(0)} / ${(job.durationS ?? 0).toFixed(0)} s（示教模式，机械臂是软的）`;
     case "fitting":
@@ -292,6 +292,7 @@ export function planSummaryText(plan: Fr3PivotPlan): string {
 
 // "14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.27 mm，"
 function dwellText(plan: Fr3PivotPlan): string {
+  if (plan.kind === "probe") return `试探：${plan.dwells ?? 0} 个驻点、离起点不远，跑完的拟合给完整规划当球心，`;
   if (plan.kind !== "dwells" || !plan.dwells) return "";
   const s = plan.sigmaPerUnit?.s;
   const sigma = s && s.length ? `，每个驻点误差 0.5 mm 时球窝 σ ≤ ${(0.5 * maxOf(s)).toFixed(2)} mm` : "";

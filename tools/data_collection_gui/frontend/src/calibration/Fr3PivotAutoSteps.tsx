@@ -53,9 +53,12 @@ export function Fr3PivotAutoSteps({
   // The offset belongs to one grip and one fit: a re-clamp (the gateway sees the gripper teleop run
   // after the fit) or a newer fit unticks it, so a stale one is never sent by habit.
   const anchorKey = anchor?.available ? anchor.fitName ?? "" : "";
+  // ...except that in the planned variant a fit of a run made after this centre was captured (the probe,
+  // same grip) is what the full plan is meant to turn about.
+  const anchorRun = anchor?.available ? anchor.run ?? "" : "";
   useEffect(() => {
-    setAnchored(false);
-  }, [anchorKey]);
+    setAnchored(variant === "auto" && !!anchorRun && !!centre && anchorRun.slice(0, 15) >= centre.slice(0, 15));
+  }, [anchorKey, anchorRun, centre, variant]);
 
   const chosen = centres.find((c) => c.name === centre);
   const toRun = plans.find((p) => p.name === confirmPlan);
@@ -204,11 +207,14 @@ export function Fr3PivotAutoSteps({
       ) : (
         <>
       <p className="cali-muted">
-        <b>2 规划 + 演算（约 1–2 分钟）：</b>先在仿真里把球心周围的姿态（工具轴朝向、俯仰 −20°～+10°、绕工具轴滚转 ±40°）逐格解 IK，
+        <b>2 试探（演算约 1 分钟，执行 1–1.5 分钟）：</b>杯子真正绕着转的点离 corenetic_socket_ee 的原点多远，随夹持而变（10-19 一次 1.4 mm、一次 8.7 mm）。
+        规划绕错的点转，转大了球窝要跟着挪十几毫米，力环吃不下。所以先只在起点附近 20° 内排 6 个驻点、3°/s 慢慢转一圈，跑完自动拟合出球心；
+        之后的完整规划会自动勾上「绕上次拟合的球心转」。换了夹持（重夹、加装东西）就重新试探。
+        <br />
+        <b>3 规划 + 演算（约 1–2 分钟）：</b>先在仿真里把球心周围的姿态（工具轴朝向、俯仰 −20°～+10°、绕工具轴滚转 ±40°）逐格解 IK，
         每格查关节限位（含 panda_py 那组更窄的墙）、自碰撞、离桌面高度（fr3_base 上方 120 mm），以及球窝和夹爪离球的支架多远（支架和球窝按插件 CAD，夹爪按厂商网格；10-13/10-14 的 21 次引导都落在它算出的可行域里）。
-        再从能到的格子里挑 14 个驻点，使拟合的不确定度最小，按关节走得最少的顺序连起来，每个驻点停 1.5 s；球窝往下压进球 3 mm（约 2 N），峰值 5°/s。
+        再从能到的格子里挑 14 个驻点，使拟合的不确定度最小，按关节走得最少的顺序连起来，每个驻点停 1.5 s；执行时关节跟着规划走，力环以约 3 N 把球窝压在球上、横向随球滑动，峰值 5°/s。
         整条路径再查一遍限位、速度、j6 摆幅、桌面和支架，全过才能执行。
-        <b>建议同一个球心跑「+3 mm」和「−3 mm」两次</b>：两次拟合一致，才证明结果由球决定、不是跟着指令走。
       </p>
       <div className="cali-op-actions">
         <label className="cali-muted">
@@ -242,6 +248,9 @@ export function Fr3PivotAutoSteps({
           />{" "}
           绕上次拟合的球心转
         </label>
+        <button className="cali-btn-primary" disabled={locked || !chosen} onClick={() => act("probe", () => api.planFr3Pivot(centre, [0, 0, 0], false, true))}>
+          {running === "probe" ? "演算中…" : "规划试探"}
+        </button>
         <button
           className="cali-btn-primary"
           disabled={locked || !chosen}
@@ -263,7 +272,7 @@ export function Fr3PivotAutoSteps({
             {plans.slice(0, PLANS_SHOWN).map((p) => (
               <tr key={p.name}>
                 <td>
-                  {biasLabel(p.biasMm)}
+                  {p.kind === "probe" ? "试探" : biasLabel(p.biasMm)}
                   <div className="cali-muted">
                     {p.name} · 球心 {p.centre}
                     {p.centre !== latest ? "（不是最新球心）" : ""}
@@ -303,10 +312,15 @@ export function Fr3PivotAutoSteps({
           }
         >
           <p>
-            FR3（{ip}）会<b>自己动</b>：在柔顺阻抗控制下绕球转约 {(toRun.durationS ?? 0).toFixed(0)} s，{biasLabel(toRun.biasMm)}。
+            FR3（{ip}）会<b>自己动</b>：关节跟着规划的关节角、以约 3 N 把球窝压在球上（横向随球滑动、不顶球）绕球转约 {(toRun.durationS ?? 0).toFixed(0)} s，{biasLabel(toRun.biasMm)}。
           </p>
+          {toRun.kind === "dwells" && !toRun.anchorFrom ? (
+            <p className="cali-warn">
+              这份规划绕 corenetic_socket_ee 的原点转，没有绕拟合的球心：夹持让球心偏开几毫米时，转不了多少就会停（10-19 两次都停在 20° 左右）。先跑一次试探。
+            </p>
+          ) : null}
           <p className="cali-muted">
-            确认球窝还坐在取球心时的位置、夹爪夹紧、周围没人没东西、急停在手边。外力超过 15 N、球窝偏离指令超过 15 mm、
+            确认球窝还坐在取球心时的位置、夹爪夹紧、周围没人没东西、急停在手边。外力超过 10 N、球窝离规划点超过 5 mm、压不住、压力降不下来或横向推不开、关节偏离指令超过 3° 或转得过快、
             关节接近 panda_py 的墙，都会自动停下；也可以随时点「停止」或按急停。
           </p>
         </Modal>
