@@ -92,12 +92,16 @@ def test_the_planned_star_passes_its_checks_and_keeps_the_wrist_slow(kin, centre
     # starts and ends where the socket was seated, nothing pressed
     assert np.allclose(qs[0], centre["q"], atol=1e-6) and np.allclose(qs[-1], centre["q"], atol=1e-4)
     assert np.allclose(path["p"][0], centre["centre_m"]) and np.allclose(path["p"][-1], centre["centre_m"])
-    # mid-pivot the command is 3 mm down into the ball (the cup faces down, across the tool axis)
+    # mid-pivot the command is 1 mm down into the ball (the cup faces down, across the tool axis)
     mid = len(path["t"]) // 2
-    assert path["p"][mid] - np.asarray(centre["centre_m"]) == pytest.approx([0, 0, -0.003], abs=1e-7)
+    assert path["p"][mid] - np.asarray(centre["centre_m"]) == pytest.approx(
+        [0, 0, -pa.EXECUTE_PRESS_MM / 1e3], abs=1e-7
+    )
 
 
-def test_seated_runs_find_the_true_socket_whatever_the_bias_and_a_followed_command_does_not(kin, centre, tmp_path):
+def test_seated_runs_find_the_true_socket_whatever_the_bias_and_a_followed_command_does_not(
+    kin, centre, tmp_path
+):
     gripper = pa.Kinematics(frame="corenetic_gripper_ee")
     delta = [0.4, -0.7, 1.2]  # corenetic_socket_ee is this far off the real socket centre
     fits = {}
@@ -105,7 +109,9 @@ def test_seated_runs_find_the_true_socket_whatever_the_bias_and_a_followed_comma
         params = pa.PlanParams(bias_mm=bias, **FAST)
         path, qs_cmd, summary = pa.plan(centre, params, kin, None)
         assert summary["ik_worst_mm"] < 1e-3  # FAST is over the speed limits; only the geometry matters here
-        fits[f"seated_{name}"] = _run_file(tmp_path, f"seated_{name}", _seated_run(kin, centre, path, delta), bias, gripper)
+        fits[f"seated_{name}"] = _run_file(
+            tmp_path, f"seated_{name}", _seated_run(kin, centre, path, delta), bias, gripper
+        )
         fits[f"followed_{name}"] = _run_file(tmp_path, f"followed_{name}", qs_cmd, bias, gripper)
 
     for name in ("plus", "minus"):
@@ -113,7 +119,9 @@ def test_seated_runs_find_the_true_socket_whatever_the_bias_and_a_followed_comma
         assert sock == pytest.approx(delta, abs=0.05)
         assert fits[f"seated_{name}"]["commanded"]["contact"]["in_contact_fraction"] == 1.0
     dc_seated = np.subtract(fits["seated_plus"]["fk"]["c_base_mm"], fits["seated_minus"]["fk"]["c_base_mm"])
-    dc_followed = np.subtract(fits["followed_plus"]["fk"]["c_base_mm"], fits["followed_minus"]["fk"]["c_base_mm"])
+    dc_followed = np.subtract(
+        fits["followed_plus"]["fk"]["c_base_mm"], fits["followed_minus"]["fk"]["c_base_mm"]
+    )
     assert np.linalg.norm(dc_seated) < 0.05
     assert dc_followed == pytest.approx([6.0, 0.0, 0.0], abs=0.05)
     # a followed command measures the very frame it was planned on (the press is a fixed point below it)
@@ -157,6 +165,13 @@ def test_monitor_and_start_checks():
     elbow[3] += np.radians(6)
     assert m.check(elbow, [0] * 6, [0, 0, 0], [0, 0, 0]) == ""  # no plan given: not checked
     assert "j4 偏离规划 6.0°" in m.check(elbow, [0] * 6, [0, 0, 0], [0, 0, 0], HOME)
+    assert m.check(HOME, [0] * 6, [0, 0, 0], [0, 0, 0], HOME, np.radians([0, 0, 0, 0, 0, 0, 8])) == ""
+    shaking = np.radians([0, 0, 0, 0, 0, 0, -29])  # 10-19, K_rot 150: j7 at 0.07 s
+    assert "j7 转速 29°/s 超过 20°/s" in m.check(HOME, [0] * 6, [0, 0, 0], [0, 0, 0], HOME, shaking)
+    tight = pa.Monitor(tracking_mm=pa.EXECUTE_STOP_TRACKING_MM, joint_deg=pa.EXECUTE_STOP_JOINT_DEG)
+    # 10-19 16:47: the cup 4.7 mm sideways before it climbed out -- the soft run's 15 mm let it go
+    assert "球窝偏离指令 5.7 mm 超过 5 mm" in tight.check(HOME, [0] * 6, [0, -0.0057, 0], [0, 0, 0])
+    assert "j4 偏离规划 6.0°" in tight.check(elbow, [0] * 6, [0, 0, 0], [0, 0, 0], HOME)
     plan = {"q": [HOME.tolist()], "p": [[0.5, 0, 0.1]]}
     assert pa.start_problems(HOME, [0.5, 0, 0.1], plan) == []
     moved = HOME.copy()
@@ -175,30 +190,61 @@ class _FakeClock:
         self.now += max(s, 0.001)
 
 
-def _fake_panda_module(kin_gripper, q_start, *, force_after=None):
-    """A Panda that tracks the command perfectly (q = the nullspace target) and reports a 1.8 N press."""
-    calls = {"started": 0, "stopped": 0, "set": 0}
+def _fake_panda_module(
+    kin_gripper,
+    q_start,
+    *,
+    force_after=None,
+    ball_n_per_m=2000.0,
+    seated_n=1.8,
+    ball_mm=(0, 0, 0),
+    across_n_per_m=10000.0,
+    reads_n=(0, 0, 0),
+    f_ext_only_n=(0, 0, 0, 0, 0, 0),
+):
+    """A Panda whose joints track the command perfectly, its socket on a ball that pushes back at
+    ``ball_n_per_m`` (0: no ball -- the press is ``seated_n`` whatever the arm does). The cup turns
+    about the point ``ball_mm`` off corenetic_socket_ee's origin (in that frame); held off where the ball
+    has that point, the cup wall pushes back sideways at ``across_n_per_m``. The joint torques read
+    ``reads_n`` more than that, as a force on that point; O_F_ext_hat_K reads it too, and ``f_ext_only_n``
+    (a wrench, as its moment-free decomposition does) on top. With ``calls["stuck"]`` set the joints do not follow the force loop's shift (the
+    test puts the last ``Kinematics.shift`` in ``calls["shift_dq"]``)."""
+    calls = {"started": 0, "stopped": 0, "set": 0, "first": None, "stuck": False, "shift_dq": 0.0}
+    socket = pa.Kinematics()
+    s = np.asarray(ball_mm, dtype=float) / 1e3
+    T0 = socket.fk(q_start)
+    ball = T0[:3, 3] + T0[:3, :3] @ s
+
+    def force(q):
+        T = socket.fk(q)
+        d = T[:3, 3] + T[:3, :3] @ s - ball
+        f = across_n_per_m * d * (1.0 if ball_n_per_m else 0.0)
+        f[2] = -(seated_n + ball_n_per_m * max(0.0, -d[2]))  # what the arm applies: down onto the ball
+        return f + np.asarray(reads_n, dtype=float)
 
     class State:
-        def __init__(self, q, force):
+        def __init__(self, q, f):
             self.q = list(q)
             self.dq = [0.0] * 7
             self.O_T_EE = list(kin_gripper.fk(q).T.reshape(-1))
-            self.O_F_ext_hat_K = [0.0, 0.0, -force, 0.0, 0.0, 0.0]  # what the arm applies: down onto the ball
+            f = np.asarray(f, dtype=float)
+            self.O_F_ext_hat_K = (np.r_[f, 0.0, 0.0, 0.0] + np.asarray(f_ext_only_n, dtype=float)).tolist()
+            self.tau_ext_hat_filtered = (socket.point_jacobian(q, s).T @ f).tolist()
 
     class Ctrl:
         def __init__(self, **kw):
-            self.kw = kw
-            calls["nullspace"] = kw.get("nullspace_stiffness")
+            calls["stiffness"] = kw.get("stiffness")
             self.q = np.asarray(q_start)
 
-        def set_control(self, position, orientation, q_nullspace):
+        def set_control(self, position, velocity):
             calls["set"] += 1
-            self.q = np.asarray(q_nullspace)
+            if calls["first"] is None:
+                calls["first"] = np.asarray(position)
+            self.q = np.asarray(position) - (calls["shift_dq"] if calls["stuck"] else 0.0)
 
     class Robot:
         def read_once(self):
-            return State(q_start, 0.0)
+            return State(q_start, [0.0, 0.0, -seated_n])
 
     class Panda:
         def __init__(self, ip):
@@ -215,22 +261,26 @@ def _fake_panda_module(kin_gripper, q_start, *, force_after=None):
             calls["stopped"] += 1
 
         def get_state(self):
-            force = 20.0 if force_after is not None and calls["set"] > force_after else 1.8
-            return State(self.ctrl.q, force)
+            f = (
+                [0.0, 0.0, -20.0]
+                if force_after is not None and calls["set"] > force_after
+                else force(self.ctrl.q)
+            )
+            return State(self.ctrl.q, f)
 
         def raise_error(self):
             pass
 
     module = types.ModuleType("panda_py")
     module.Panda = Panda
-    module.controllers = types.SimpleNamespace(CartesianImpedance=Ctrl)
+    module.controllers = types.SimpleNamespace(JointPosition=Ctrl)
     return module, calls
 
 
-def _plan_file(tmp_path, kin, centre):
-    path, qs, summary = pa.plan(centre, pa.PlanParams(tilt_deg=10, spin_deg=10, **FAST), kin, None)
+def _plan_file(tmp_path, kin, centre, **kw):
+    params = pa.PlanParams(tilt_deg=10, spin_deg=10, **{**FAST, **kw})
+    path, qs, summary = pa.plan(centre, params, kin, None)
     out = tmp_path / "p.json"
-    params = pa.PlanParams(tilt_deg=10, spin_deg=10, **FAST)
     out.write_text(
         json.dumps(
             {
@@ -268,9 +318,203 @@ def test_execute_follows_the_plan_and_writes_a_fittable_run(kin, centre, tmp_pat
             pa.signal.signal(sig, h)
     run = json.loads(out.read_text())
     assert calls["started"] == 1 and calls["stopped"] == 1 and calls["set"] > 100
-    assert calls["nullspace"] == pa.NULLSPACE_STIFFNESS  # holds the elbow where MuJoCo checked it
-    assert run["mode"] == "commanded" and run["completed"] and len(run["q"]) == len(run["F_ext"])
-    assert tp.contact_summary(run)["press_median_n"] == 1.8
+    assert np.array_equal(calls["stiffness"], pa.JOINT_STIFFNESS)  # the plan's joints, not a soft spring
+    assert np.allclose(calls["first"], centre["q"])  # held where it stands, then blended onto the plan
+    assert run["mode"] == "commanded" and run["completed"] and len(run["q"]) == len(run["F_ball"])
+    assert run["controller"] == "joint_position" and len(run["q_cmd"]) == len(run["q"])
+    assert run["press_mm"] == pa.EXECUTE_PRESS_MM == 0.0 and run["press_seated_n"] == 1.8
+    # the force loop shifts the command into the ball until it presses PRESS_FORCE_N
+    pivot = np.asarray(run["press_target_n"]) == pa.PRESS_FORCE_N
+    press = -np.asarray(run["F_ball"])[:, 2]
+    assert np.abs(press[pivot][len(press[pivot]) // 2 :] - pa.PRESS_FORCE_N).max() < 0.1
+    assert 0.4 < max(run["press_shift_mm"]) < 0.8  # (3.0 - 1.8) N at 2 kN/m = 0.6 mm
+    assert abs(press[-1] - 1.8) < pa.PRESS_SETTLE_N  # held at the end until back to how it was seated
+
+
+def test_point_force_is_the_force_at_the_ball_that_explains_the_torques(kin, centre):
+    q = np.asarray(centre["q"])
+    point = np.array([-2.25, -1.35, 5.04]) / 1e3
+    f = np.array([2.5, 2.0, -2.0])
+    tau = kin.point_jacobian(q, point).T @ f
+    assert kin.point_force(q, tau, point) == pytest.approx(f, abs=1e-9)
+    # a probe's plan does not know the point: a few mm of lever arm is next to nothing
+    assert kin.point_force(q, tau, np.zeros(3)) == pytest.approx(f, abs=0.05)
+    # the point moves with the frame: numerically, as the FK has it
+    dq = np.zeros(7)
+    dq[5] = 1e-6
+    T0, T1 = kin.fk(q), kin.fk(q + dq)
+    moved = (T1[:3, 3] + T1[:3, :3] @ point - T0[:3, 3] - T0[:3, :3] @ point) / 1e-6
+    assert kin.point_jacobian(q, point)[:, 5] == pytest.approx(moved, abs=1e-5)
+
+
+def test_execute_acts_on_the_ball_force_not_f_ext(kin, centre, tmp_path, monkeypatch):
+    # 10-20 16:40: O_F_ext_hat_K read 7.1 N (-y 5.8, a 4.1 N pull) with ~4 Nm of moment a ball cannot
+    # put on a cup; the force at the ball explaining the same tau_ext was 3.8 N. Here F_ext reads 8 N on
+    # top of the true press: neither the stop nor the loop sees it.
+    module, calls = _fake_panda_module(
+        pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"], f_ext_only_n=(0.0, -7.0, 5.0, 4.0, 0.0, 0.0)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    clock = _FakeClock()
+    monkeypatch.setattr(pa.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(pa.time, "sleep", clock.sleep)
+    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
+    plan = _plan_file(tmp_path, kin, centre)
+    out = tmp_path / "20261020_170000_pivot.json"
+    try:
+        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+    finally:
+        for sig, h in handlers.items():
+            pa.signal.signal(sig, h)
+    run = json.loads(out.read_text())
+    assert run["force_source"] == "F_ball" and run["F_ball_point_mm"] == [0.0, 0.0, 0.0]
+    assert np.linalg.norm(np.asarray(run["F_ext"])[:, :3], axis=1).min() > pa.EXECUTE_STOP_FORCE_N
+    assert run["force_seated_n"] == pytest.approx([0.0, 0.0, -1.8], abs=1e-3)
+    assert np.abs(np.asarray(run["shift_mm"])[:, :2]).max() < 1e-6  # nothing across to take up
+    assert tp.contact_summary(run)["max_force_n"] < pa.EXECUTE_STOP_FORCE_N
+
+
+def test_execute_lets_the_cup_turn_about_the_ball_not_the_plans_centre(kin, centre, tmp_path, monkeypatch):
+    # 10-19 17:55: turned about a point that was not the ball's centre, the stiff joints pushed the cup
+    # sideways (3.5 N at 20°). Here the ball is 3.6 mm off the plan's centre: held there by the joints
+    # (the lateral gain at 0) the 10° tilt and spin push 5.4 N sideways; what is left is the deadband
+    # and the lag of following it at 5°/s.
+    module, calls = _fake_panda_module(
+        pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"], ball_mm=(3.0, 0.0, 2.0)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    clock = _FakeClock()
+    monkeypatch.setattr(pa.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(pa.time, "sleep", clock.sleep)
+    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
+    plan = _plan_file(tmp_path, kin, centre, speed_deg_s=5.0)
+    out = tmp_path / "20261019_190000_pivot.json"
+    try:
+        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+    finally:
+        for sig, h in handlers.items():
+            pa.signal.signal(sig, h)
+    run = json.loads(out.read_text())
+    F = np.asarray(run["F_ball"])
+    pivot = np.asarray(run["press_target_n"]) == pa.PRESS_FORCE_N
+    assert np.linalg.norm(F[pivot, :2], axis=1).max() < pa.PRESS_LATERAL_DEADBAND_N + 1.5  # followed the ball
+    assert np.abs(-F[pivot, 2] - pa.PRESS_FORCE_N).max() < 1.0
+    lateral = np.linalg.norm(np.asarray(run["shift_mm"])[:, :2], axis=1)
+    assert 0.3 < lateral.max() < pa.PRESS_LATERAL_MM  # (R - R0) s, taken up by the shift
+    # read at the plan's point, 3.6 mm off the ball's: the lever arm costs next to nothing
+    assert run["force_seated_n"] == pytest.approx([0.0, 0.0, -1.8], abs=0.01)
+    assert run["press_lateral_mm"] == pa.PRESS_LATERAL_MM
+
+
+def test_execute_does_not_wind_up_a_shift_the_arm_does_not_follow(kin, centre, tmp_path, monkeypatch, capsys):
+    # 10-20 14:05: the joints' friction kept the socket on the plan whatever the shift asked, F_ext read
+    # 1.7 N across that no shift changed, and the integral ran to the 4 mm cap and stopped the probe.
+    # (Here past the deadband, or the loop would not move at all.)
+    module, calls = _fake_panda_module(
+        pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"], seated_n=2.5, reads_n=(0.0, 3.5, 0.0)
+    )
+    calls["stuck"] = True
+    shift = pa.Kinematics.shift
+
+    def recorded(self, q, dp):
+        calls["shift_dq"] = shift(self, q, dp)
+        return calls["shift_dq"]
+
+    monkeypatch.setattr(pa.Kinematics, "shift", recorded)
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    monkeypatch.setattr(pa, "PRESS_LATERAL_MM", 1.0)  # reached within the short FAST plan
+    clock = _FakeClock()
+    monkeypatch.setattr(pa.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(pa.time, "sleep", clock.sleep)
+    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
+    plan = _plan_file(tmp_path, kin, centre)
+    out = tmp_path / "20261020_150000_pivot.json"
+    try:
+        monkeypatch.setattr(pa, "PRESS_LEAD_MM", 1e3)  # as it was: wound up to the cap, stopped
+        assert pa.main(["execute", str(plan), "--out", str(out)]) == 4
+        assert "横向推不开" in capsys.readouterr().out
+        monkeypatch.setattr(pa, "PRESS_LEAD_MM", 0.5)
+        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+    finally:
+        for sig, h in handlers.items():
+            pa.signal.signal(sig, h)
+    shift_mm = np.asarray(json.loads(out.read_text())["shift_mm"])
+    assert np.linalg.norm(shift_mm[:, :2], axis=1).max() <= 0.5 + 1e-3
+
+
+def test_execute_stops_when_the_force_press_cannot_hold(kin, centre, tmp_path, monkeypatch, capsys):
+    # no ball under the socket (or the cup already off it): pressing deeper never raises the press
+    module, calls = _fake_panda_module(
+        pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"], ball_n_per_m=0.0
+    )
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    monkeypatch.setattr(pa, "EXECUTE_STOP_TRACKING_MM", 10.0)  # this fake follows the shift; a ball would not
+    monkeypatch.setattr(pa, "PRESS_SHIFT_MM", (-2.0, 2.0))  # reached within the short FAST plan
+    clock = _FakeClock()
+    monkeypatch.setattr(pa.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(pa.time, "sleep", clock.sleep)
+    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
+    plan = _plan_file(tmp_path, kin, centre)
+    try:
+        assert pa.main(["execute", str(plan), "--out", str(tmp_path / "20261019_180000_pivot.json")]) == 4
+    finally:
+        for sig, h in handlers.items():
+            pa.signal.signal(sig, h)
+    assert calls["stopped"] == 1
+    assert "压不住：已往球里多压 2 mm，压力仍只有 1.8 N" in capsys.readouterr().out
+
+
+def test_press_stuck_only_at_a_cap():
+    down = pa.PRESS_DIR
+    assert pa.press_stuck(0.005 * down, 1.0 * down, 3.0 * down) == ""  # still shifting
+    assert "压不住" in pa.press_stuck(0.008 * down, 1.0 * down, 3.0 * down)
+    assert pa.press_stuck(0.008 * down, 2.5 * down, 3.0 * down) == ""  # close enough
+    assert "压力降不下来" in pa.press_stuck(-0.004 * down, 5.0 * down, 3.0 * down)
+    x = np.array([1.0, 0.0, 0.0])
+    assert pa.press_stuck(0.003 * x, 3.0 * down + 3.5 * x, 3.0 * down) == ""
+    assert pa.press_stuck(0.004 * x, 3.0 * down + 2.5 * x, 3.0 * down) == ""  # within F_ext's own error
+    assert "横向推不开" in pa.press_stuck(0.004 * x, 3.0 * down + 3.5 * x, 3.0 * down)
+
+
+def test_press_step_integrates_each_way_within_its_caps():
+    down, x = pa.PRESS_DIR, np.array([1.0, 0.0, 0.0])
+    # pressing too little: deeper; pushing +x past the deadband: back off -x at half the gain
+    s = pa.press_step(np.zeros(3), 2.0 * down + (pa.PRESS_LATERAL_DEADBAND_N + 1.0) * x, 3.0 * down, 0.01)
+    assert np.allclose(s, pa.PRESS_GAIN_M_PER_NS * 0.01 * down - pa.PRESS_LATERAL_GAIN_M_PER_NS * 0.01 * x)
+    s = pa.press_step(np.zeros(3), 100.0 * x, np.zeros(3), 0.01)
+    assert np.isclose(np.linalg.norm(s), pa.PRESS_RATE_MM_S / 1e3 * 0.01)  # rate limited
+    s = pa.press_step(0.0039 * x + 0.008 * down, -50.0 * x - 50.0 * down, np.zeros(3), 1.0)
+    assert np.isclose(s @ down, pa.PRESS_SHIFT_MM[1] / 1e3) and np.isclose(
+        abs(s @ x), pa.PRESS_LATERAL_MM / 1e3
+    )
+    # never more than PRESS_LEAD_MM ahead of where the socket is, each way
+    lead = pa.PRESS_LEAD_MM / 1e3
+    realized = 0.0005 * down + 0.001 * x
+    s = pa.press_step(realized + 0.99 * lead * (down - x), 1.0 * down + 4.0 * x, 3.0 * down, 1.0, realized)
+    assert np.isclose((s - realized) @ down, lead) and np.isclose(-(s - realized) @ x, lead)
+    s = pa.press_step(np.zeros(3), 1.0 * down + 1.5 * x, 3.0 * down, 0.01, realized)  # within it: as before
+    assert np.allclose(s, pa.PRESS_GAIN_M_PER_NS * 2.0 * 0.01 * down)  # and 1.5 N across left alone
+
+
+def test_an_anchored_plan_turns_only_as_far_as_its_fit_holds():
+    # 10-20 15:06: anchored on a 20° probe, the full plan turned 52° and the fit was 3 mm off by 33°
+    def within(*extra):
+        return pa._within_deg(pa.parse_args(["plan", "c.json", *extra]))
+
+    assert within() == 0.0  # unanchored: as before
+    assert within("--probe") == pa.PROBE_WITHIN_DEG
+    assert within("--anchor-mm", "-0.9", "1.1", "-0.6") == pa.ANCHORED_WITHIN_DEG
+    assert within("--anchor-mm", "-0.9", "1.1", "-0.6", "--within-deg", "0") == 0.0
+    assert pa.PROBE_WITHIN_DEG < pa.ANCHORED_WITHIN_DEG <= 30.0
+
+
+def test_execute_refuses_a_plan_pressing_too_far_into_the_ball(kin, centre, tmp_path, monkeypatch, capsys):
+    module, calls = _fake_panda_module(pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"])
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    plan = _plan_file(tmp_path, kin, centre, press_mm=3.0)  # the soft run's press: kN/m against the ball now
+    assert pa.main(["execute", str(plan)]) == 2
+    assert calls["started"] == 0
+    assert "3.0 mm off the ball" in capsys.readouterr().out
 
 
 def test_execute_stops_on_force_and_keeps_nothing_to_fit(kin, centre, tmp_path, monkeypatch, capsys):
@@ -360,7 +604,9 @@ def _guide_setup(tmp_path, monkeypatch, kin, centre, **fake):
 
 
 def _run_guide(argv):
-    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM, pa.signal.SIGUSR1)}
+    handlers = {
+        sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM, pa.signal.SIGUSR1)
+    }
     try:
         return pa.main(argv)
     finally:
@@ -368,10 +614,14 @@ def _run_guide(argv):
             pa.signal.signal(sig, h)
 
 
-def test_guide_holds_the_socket_pressed_with_rotation_free_and_writes_a_fittable_run(kin, centre, tmp_path, monkeypatch):
+def test_guide_holds_the_socket_pressed_with_rotation_free_and_writes_a_fittable_run(
+    kin, centre, tmp_path, monkeypatch
+):
     centre_file, calls = _guide_setup(tmp_path, monkeypatch, kin, centre)
     out = tmp_path / "20261013_210100_pivot.json"
-    rc = _run_guide(["guide", str(centre_file), "--duration-s", "30", "--bias-mm", "3", "0", "0", "--out", str(out)])
+    rc = _run_guide(
+        ["guide", str(centre_file), "--duration-s", "30", "--bias-mm", "3", "0", "0", "--out", str(out)]
+    )
     assert rc == 0
     assert np.allclose(np.diag(calls["impedance"]), [600, 600, 600, 0, 0, 0])  # rotation is the operator's
     run = json.loads(out.read_text())
@@ -380,7 +630,9 @@ def test_guide_holds_the_socket_pressed_with_rotation_free_and_writes_a_fittable
     c0 = np.asarray(json.loads(centre_file.read_text())["centre_m"])
     i = run["phase"].index(1) + 5
     assert np.asarray(run["cmd_socket"][i]) == pytest.approx(c0 + [0.003, 0, -0.003], abs=1e-7)
-    assert run["tilt_max_deg"] == pytest.approx(20, abs=0.5) and run["spin_range_deg"] == pytest.approx(60, abs=1)
+    assert run["tilt_max_deg"] == pytest.approx(20, abs=0.5) and run["spin_range_deg"] == pytest.approx(
+        60, abs=1
+    )
     fitted = tmp_path / "g.fit.json"
     assert tp.main(["fit", str(out), "--json", str(fitted)]) == 0
     report = json.loads(fitted.read_text())
@@ -388,7 +640,9 @@ def test_guide_holds_the_socket_pressed_with_rotation_free_and_writes_a_fittable
     assert report["socket_frame"]["s_ee_mm"] == pytest.approx([0.4, -0.7, 1.2], abs=0.05)
 
 
-def test_guide_refuses_a_socket_that_left_the_centre_and_stops_on_force(kin, centre, tmp_path, monkeypatch, capsys):
+def test_guide_refuses_a_socket_that_left_the_centre_and_stops_on_force(
+    kin, centre, tmp_path, monkeypatch, capsys
+):
     centre_file, calls = _guide_setup(tmp_path, monkeypatch, kin, centre, force_after=300)
     moved = json.loads(centre_file.read_text())
     moved["centre_m"] = (np.asarray(moved["centre_m"]) + [0.005, 0, 0]).tolist()
@@ -407,12 +661,18 @@ def test_guide_refuses_a_socket_that_left_the_centre_and_stops_on_force(kin, cen
 
 def test_guide_progress_reads_tilt_and_spin():
     R0 = np.eye(3)
-    seen = [pa.rot((1, 0, 0), np.radians(25)), pa.rot((0, 0, 1), np.radians(60)), pa.rot((0, 0, 1), np.radians(-40))]
+    seen = [
+        pa.rot((1, 0, 0), np.radians(25)),
+        pa.rot((0, 0, 1), np.radians(60)),
+        pa.rot((0, 0, 1), np.radians(-40)),
+    ]
     tilt, spin = pa.guide_progress(R0, seen)
     assert tilt == pytest.approx(25, abs=1e-6) and spin == pytest.approx(100, abs=1e-6)
 
 
-def test_guide_anchored_on_the_fitted_ball_centre_stops_dragging_the_socket_frame(kin, centre, tmp_path, monkeypatch):
+def test_guide_anchored_on_the_fitted_ball_centre_stops_dragging_the_socket_frame(
+    kin, centre, tmp_path, monkeypatch
+):
     """The spring held at the true socket (s mm off the frame): its pull no longer turns with the gripper."""
     true_s = np.array([0.4, -0.7, 1.2])
     errors = {}

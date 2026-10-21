@@ -51,6 +51,7 @@ import numpy as np
 
 from tools.fr3.fr3_pivot_auto import (
     DEFAULT_TABLE_Z_M,
+    EXECUTE_PRESS_MM,
     IK_LOWER,
     IK_UPPER,
     LIMIT_MARGIN_DEG,
@@ -81,10 +82,13 @@ INSERT_PAD_GAP_MM = 35.0
 
 # Margins. The socket model reads true to well under a millimetre (socket on the neck where it says so);
 # the gripper meshes are vendor meshes, and the hands stopped where they left about 1 mm -- so more there.
+# 10-19: the left fingertip hit the stand where the model gave it 2.8 mm (plan 161534, 2/3 mm margins),
+# so the gripper model is off by more than that. At 8/10 the same ball still plans 14 dwells (sigma at
+# 0.5 mm per dwell 0.40 mm, was 0.31), the roll range shrinking from +-40° to -30..25°.
 SOCKET_CLEARANCE_MM = 1.0
 SOCKET_DWELL_CLEARANCE_MM = 1.5
-GRIPPER_CLEARANCE_MM = 2.0
-GRIPPER_DWELL_CLEARANCE_MM = 3.0
+GRIPPER_CLEARANCE_MM = 8.0
+GRIPPER_DWELL_CLEARANCE_MM = 10.0
 DWELL_LIMIT_MARGIN_DEG = 6.0
 # Clearances are only needed up to this: anything further from the stand reads as this.
 CLEARANCE_CAP_MM = 20.0
@@ -103,7 +107,9 @@ J6_DWELL_SPAN_DEG = MAX_J6_TRAVEL_DEG - 2 * J6_ROUTE_SLACK_DEG
 EDGE_MAX_DQ_DEG = 45.0
 # A captured pose already closer to the stand than the margins (10-14 16:21: the socket 0.6 mm into the
 # neck) is where the arm sits anyway: moves may come that close again, not closer. Not so the table or
-# the limits: a capture too near those is taken again.
+# the limits: a capture too near those is taken again. The start is held pressed whatever its
+# stand clearance: it only needs the moves' margins (10-20 15:41: the left fingertip 9.5 mm by the
+# anchored model where a dwell wants 10, the arm having just sat there pressed through a probe).
 START_SLACK_MM = 0.2
 # Moves are solved at this much tool turn per sample; a joint stepping more than DENSE_MAX_DQ_DEG
 # between two samples has jumped branch. Every DENSE_FULL_EVERY-th sample gets the MuJoCo checks too.
@@ -446,13 +452,24 @@ class PoseCheck:
                 why.append(f"gripper on the stand: {out['gripper_body']} {out['gripper_mm']:.1f} mm")
         return why, out
 
-    def dwell_ok(self, out: dict[str, Any]) -> bool:
-        """The stricter margins of a pose held while pressed (``out`` from a passing ``check``)."""
-        return (
-            out["margin_deg"] >= DWELL_LIMIT_MARGIN_DEG
-            and out.get("socket_mm", math.inf) >= SOCKET_DWELL_CLEARANCE_MM
-            and out.get("gripper_mm", math.inf) >= GRIPPER_DWELL_CLEARANCE_MM
-        )
+    def dwell_why(self, out: dict[str, Any], q: np.ndarray, stand: bool = True) -> list[str]:
+        """Which of the stricter margins of a pose held while pressed it misses (``out`` from ``check``)."""
+        why: list[str] = []
+        if out["margin_deg"] < DWELL_LIMIT_MARGIN_DEG:
+            j = int(self.margin_deg(q).argmin()) + 1
+            why.append(f"j{j} 离限位 {out['margin_deg']:.1f}°（驻点要 {DWELL_LIMIT_MARGIN_DEG:g}°）")
+        if not stand:
+            return why
+        if out.get("socket_mm", math.inf) < SOCKET_DWELL_CLEARANCE_MM:
+            why.append(f"球窝离支架 {out['socket_mm']:.1f} mm（驻点要 {SOCKET_DWELL_CLEARANCE_MM:g} mm）")
+        if out.get("gripper_mm", math.inf) < GRIPPER_DWELL_CLEARANCE_MM:
+            why.append(
+                f"夹爪 {out['gripper_body']} 离支架 {out['gripper_mm']:.1f} mm（驻点要 {GRIPPER_DWELL_CLEARANCE_MM:g} mm）"
+            )
+        return why
+
+    def dwell_ok(self, out: dict[str, Any], q: np.ndarray) -> bool:
+        return not self.dwell_why(out, q)
 
 
 # --- the survey ------------------------------------------------------------------------------------
@@ -495,6 +512,17 @@ class Survey:
     def R(self, idx) -> np.ndarray:
         i, j, k = idx
         return socket_rotation(*np.radians([self.heading_deg[i], self.pitch_deg[j], self.roll_deg[k]]))
+
+    def within(self, deg: float) -> np.ndarray:
+        """The cells turned at most ``deg`` from the start cell (all of them for ``deg`` <= 0)."""
+        shape = self.transit.shape
+        if deg <= 0:
+            return np.ones(shape, dtype=bool)
+        R0 = self.R(self.start)
+        out = np.zeros(shape, dtype=bool)
+        for idx in np.ndindex(shape):
+            out[idx] = math.degrees(rot_angle(R0.T @ self.R(idx))) <= deg + 1e-6
+        return out
 
     def angles_deg(self, idx) -> list[float]:
         i, j, k = idx
@@ -595,7 +623,7 @@ def survey(
         why, out = S.checker.check(S.R(idx), q)
         S.transit[idx] = not why
         S.why[idx] = "; ".join(why)
-        S.dwell[idx] = S.transit[idx] and S.checker.dwell_ok(out)
+        S.dwell[idx] = S.transit[idx] and S.checker.dwell_ok(out, q)
 
     # Breadth first from the captured pose: each cell seeded by the neighbour that reached it, so all
     # solutions sit on the posture branch the arm is in. Only cells that pass are expanded.
@@ -646,11 +674,18 @@ def fit_sigma(Rs) -> np.ndarray:
 
 
 def choose_dwells(
-    S: Survey, n: int = 14, *, j6_span_deg: float = J6_DWELL_SPAN_DEG, exclude=(), exchange_rounds: int = 4
+    S: Survey,
+    n: int = 14,
+    *,
+    j6_span_deg: float = J6_DWELL_SPAN_DEG,
+    exclude=(),
+    exchange_rounds: int = 4,
+    allowed: np.ndarray | None = None,
 ) -> list[tuple[int, int, int]]:
-    """The start cell and n-1 more dwell cells, minimising the worst 1-sigma of s (plus a tenth of c's),
-    with j6 over all of them inside ``j6_span_deg`` (the moves between need some more)."""
-    cand = [tuple(int(x) for x in i) for i in np.argwhere(S.dwell) if tuple(int(x) for x in i) not in exclude]
+    """The start cell and n-1 more dwell cells (among ``allowed``), minimising the worst 1-sigma of s
+    (plus a tenth of c's), with j6 over all of them inside ``j6_span_deg`` (the moves between need some more)."""
+    ok = S.dwell if allowed is None else S.dwell & allowed
+    cand = [tuple(int(x) for x in i) for i in np.argwhere(ok) if tuple(int(x) for x in i) not in exclude]
     info = {}
     for i in set(cand) | {S.start}:
         B = np.hstack([S.R(i), -np.eye(3)])
@@ -702,13 +737,16 @@ class Router:
     """Shortest moves (in weighted joint travel) between cells, through cells that pass, over edges whose
     two solutions are on one posture branch and that no densified move has found bad."""
 
-    def __init__(self, S: Survey, j6_window_deg: tuple[float, float]):
+    def __init__(self, S: Survey, j6_window_deg: tuple[float, float], allowed: np.ndarray | None = None):
         self.S = S
         self.lo, self.hi = j6_window_deg
+        self.allowed = allowed
         self.forbidden: set[frozenset] = set()
         self._trees: dict = {}
 
     def _ok(self, v) -> bool:
+        if self.allowed is not None and not self.allowed[v]:
+            return False
         return bool(self.S.transit[v]) and self.lo <= math.degrees(self.S.q[v][5]) <= self.hi
 
     def edge_ok(self, u, v) -> bool:
@@ -787,13 +825,15 @@ class DwellParams:
     dwells: int = 14
     dwell_s: float = 1.5
     speed_deg_s: float = 5.0  # peak angular speed of the tool
-    press_mm: float = 3.0
+    press_mm: float = EXECUTE_PRESS_MM
     bias_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     anchor_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     ramp_s: float = 2.0
     rate_hz: float = 100.0
-    translational_stiffness: float = 600.0
-    rotational_stiffness: float = 40.0
+    # A probe (fr3_pivot_auto.py plan --probe): dwells within this many degrees of the start, the moves
+    # one cell further at most; 0 for no limit.
+    within_deg: float = 0.0
+    min_dwells: int = MIN_DWELLS
 
 
 def _slerp(Ra: np.ndarray, Rb: np.ndarray, u: float) -> np.ndarray:
@@ -829,9 +869,7 @@ def densify(
     seg = [rot_angle(a.T @ b) for a, b in zip(way_R[:-1], way_R[1:], strict=True)]
     arc = np.concatenate([[0.0], np.cumsum(seg)])
     Rs, qs = [R_from], [q_from]
-    if arc[-1] < 1e-9:
-        return Move(Rs, np.asarray(qs))
-    n = max(2, int(math.ceil(math.degrees(arc[-1]) / DENSE_STEP_DEG)))
+    n = 0 if arc[-1] < 1e-9 else max(2, int(math.ceil(math.degrees(arc[-1]) / DENSE_STEP_DEG)))
     q = q_from
     for k, s_arc in enumerate(np.linspace(0.0, arc[-1], n + 1)[1:], start=1):
         j = min(int(np.searchsorted(arc, s_arc, side="right")) - 1, len(seg) - 1)
@@ -856,6 +894,28 @@ def densify(
             return Move(Rs, np.asarray(qs), edge, "; ".join(why))
         q = q_new
         Rs.append(R)
+        qs.append(q)
+    if q_to is None:
+        return Move(Rs, np.asarray(qs))
+    # Home in posture too, not just in pose: continuation leaves the seventh axis wherever the turns took
+    # it (10-20 14:24: the probe ended with j5 2.1° off the capture, past execute's START_TOLERANCE_DEG,
+    # so the full plan could not start there). The pose held, the posture walked back: seeded on the
+    # straight line in joints, as ik stops at once on a pose already met and never leans.
+    T = _socket_target(R_to, S.centre_m, S.anchor_m, offset)
+    gap = q_to - q
+    m = int(math.ceil(np.degrees(np.abs(gap)).max() / DENSE_STEP_DEG))
+    for k in range(1, m + 1):
+        q_line = q_to - gap * (1 - k / m)
+        q_new, ep, er = kin.ik(T, q_line, q_line)
+        why = []
+        if ep * 1e3 > IK_TOL_MM or math.degrees(er) > IK_TOL_DEG:
+            why.append("IK")
+        if not why:
+            why, _ = S.checker.check(R_to, q_new, full=k % DENSE_FULL_EVERY == 0 or k == m)
+        if why:
+            return Move(Rs, np.asarray(qs), None, "; ".join(why))
+        q = q_new
+        Rs.append(R_to)
         qs.append(q)
     return Move(Rs, np.asarray(qs))
 
@@ -981,23 +1041,33 @@ def plan_dwells(
     params = params or DwellParams()
     S = survey(centre, kin, scene, stand, survey_params, params.anchor_mm)
     info: dict[str, Any] = {"survey": S.summary(), "problems": [], "notes": []}
+    start_note = ""
     if not S.dwell[S.start]:
-        why = "; ".join(S.checker.start_why) or S.why[S.start] or "余量不够做驻点"
-        info["problems"].append(f"起始姿态本身不过检查：{why}（换个姿态重新取球心）")
-        return {}, np.zeros((0, 7)), [], info, S
+        C = S.checker
+        cell = C.check(S.R(S.start), S.q[S.start])[1] if S.solved[S.start] else None
+        if S.transit[S.start] and cell is not None and not C.dwell_why(cell, S.q[S.start], stand=False):
+            S.dwell[S.start] = True
+            start_note = "起始姿态离支架不够驻点余量（" + "; ".join(C.dwell_why(cell, S.q[S.start])) + "），机械臂本来就坐在那儿，照样从它出发"
+        else:
+            why = "; ".join(C.start_why or C.dwell_why(C.start, C.q0)) or S.why[S.start] or "余量不够做驻点"
+            info["problems"].append(f"起始姿态本身不过检查：{why}（换个姿态重新取球心）")
+            return {}, np.zeros((0, 7)), [], info, S
     offset = np.asarray(params.bias_mm, dtype=float) / 1e3 + params.press_mm / 1e3 * PRESS_DIR
     dropped: set = set()
+    near = S.within(params.within_deg) if params.within_deg > 0 else None
+    # the moves may pass one survey cell beyond the dwells' limit
+    route = S.within(params.within_deg + max(SurveyParams.heading_step_deg, SurveyParams.roll_step_deg)) if near is not None else None
     for _ in range(3):  # dwells no move reaches are replaced by others
-        dwells = choose_dwells(S, params.dwells, exclude=dropped)
+        dwells = choose_dwells(S, params.dwells, exclude=dropped, allowed=near)
         j6 = [math.degrees(S.q[d][5]) for d in dwells]
-        router = Router(S, (min(j6) - J6_ROUTE_SLACK_DEG, max(j6) + J6_ROUTE_SLACK_DEG))
+        router = Router(S, (min(j6) - J6_ROUTE_SLACK_DEG, max(j6) + J6_ROUTE_SLACK_DEG), route)
         tour = order_tour(router, dwells)
         kept, moves, notes = route_moves(S, kin, router, tour, offset)
         lost = set(dwells) - set(kept)
         if not lost or len(kept) - 1 >= params.dwells:
             break
         dropped |= lost
-    info["notes"] = notes
+    info["notes"] = ([start_note] if start_note else []) + notes
     if notes and notes[-1].startswith("回不到起点"):
         info["problems"].append(notes[-1])
     path, qs, names = timed_path(S, kin, moves, params)
@@ -1015,9 +1085,9 @@ def plan_dwells(
             },
         }
     )
-    if len(kept) - 1 < MIN_DWELLS:
+    if len(kept) - 1 < params.min_dwells:
         info["problems"].append(
-            f"只排进 {len(kept) - 1} 个驻点（拟合至少要 {MIN_DWELLS} 个）：这个球位附近转不开"
+            f"只排进 {len(kept) - 1} 个驻点（拟合至少要 {params.min_dwells} 个）：这个球位附近转不开"
         )
     return path, qs, names, info, S
 
