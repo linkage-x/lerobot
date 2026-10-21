@@ -12,6 +12,7 @@ import type {
 } from "../types";
 import { Metric, Modal, PageHeader, StatusDot } from "../shared/ui";
 import { CheckpointBrowser } from "../shared/CheckpointBrowser";
+import { RUNNING_STATES, runJobToAdopt } from "./trainingRunForm";
 import {
   ACTION_LOSS_WEIGHT_DIMENSIONS,
   FR3_BASELINE_ACTION_LOSS_WEIGHTS,
@@ -128,8 +129,6 @@ function startingPreset(policy: string, actionMode: string | undefined): Trainin
   }
   return null;
 }
-
-const RUNNING_STATES = new Set(["syncing", "starting", "running"]);
 
 function gpuLine(gpu: TrainingMachine["gpus"] extends (infer G)[] | undefined ? G : never): string {
   const total = gpu.memoryTotalMb ?? 0;
@@ -569,6 +568,13 @@ export function TrainingPage() {
    *  default the old run never actually used.
    */
   const applyHistory = (entry: TrainingHistoryEntry) => {
+    copyRunParams(entry);
+    setNotice(
+      `Settings copied from ${entry.jobName}. The training view and job name were left alone.`
+    );
+  };
+
+  function copyRunParams(entry: TrainingHistoryEntry) {
     const p = entry.params;
     if (p.policy !== undefined) setPolicy(p.policy);
     if (p.steps !== undefined) setSteps(String(p.steps));
@@ -610,10 +616,32 @@ export function TrainingPage() {
     if (p.wandbEnabled !== undefined) setWandbEnabled(p.wandbEnabled);
     if (p.wandbProject !== undefined) setWandbProject(p.wandbProject);
     if (p.wandbEntity !== undefined) setWandbEntity(p.wandbEntity);
-    setNotice(
-      `Settings copied from ${entry.jobName}. The training view and job name were left alone.`
-    );
-  };
+  }
+
+  // The running job's own settings, where it ran and on what, rather than this page's defaults
+  // (see runJobToAdopt). Its parameters come from the history record the gateway writes at start;
+  // a run started after this page loaded is not in the list fetched on mount, so that is fetched
+  // again, once for that job.
+  const adoptedRunJob = useRef("");
+  const historyFetchedForJob = useRef("");
+  useEffect(() => {
+    const job = runJobToAdopt(run, adoptedRunJob.current);
+    if (!job || !run) return;
+    const entry = history.find((item) => item.jobName === job);
+    if (!entry) {
+      if (historyFetchedForJob.current !== job) {
+        historyFetchedForJob.current = job;
+        void api.fetchTrainingHistory().then(setHistory);
+      }
+      return;
+    }
+    adoptedRunJob.current = job;
+    setHostId(run.hostId);
+    setViewName(run.viewName);
+    setJobNameEdited(false);
+    copyRunParams(entry);
+    setNotice(`The form shows the settings of the running job ${job}.`);
+  }, [run, history]);
 
   const onPolicyChange = (nextPolicy: string) => {
     setPolicy(nextPolicy);
