@@ -20,6 +20,8 @@
 #     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
 #     FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL=1 (with the root: whole held trials, policy steps included)
 #     FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM ("h" or "low,high" mm above the peg; blank = 60)
+#     FR3_GRASP_LOOP_FUNNEL_CORRECTIVE (1 = arm B records corrective demonstrations)
+#     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
 #   place it elsewhere): expert spans and the handback gap in mm, the number to read before the
@@ -483,10 +485,14 @@ case "$mode" in
     if [[ "${FR3_GRASP_LOOP_ATTENDED-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-attended); fi
     # Policy steps before a trial that never closes ends (blank = the runtime's 450).
     if [[ -n "${FR3_GRASP_LOOP_MAX_POLICY_STEPS-}" ]]; then grasp_loop_args+=(--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"); fi
+    # Where the pegs go and arm B's draws: a paired A/B shares one, recordings each need a new one (blank = 0).
+    if [[ -n "${FR3_GRASP_LOOP_SEED-}" ]]; then grasp_loop_args+=(--grasp-loop-seed "${FR3_GRASP_LOOP_SEED}"); fi
     # v14 step 4: carry each held grasp into the hole (blank = grasp only, as steps 1-2).
     if [[ -n "${FR3_GRASP_LOOP_INSERT_POSE-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-pose "${FR3_GRASP_LOOP_INSERT_POSE}"); fi
     # Arm B: how high above the peg the funnel takes over, "h" or "low,high" mm (blank = 60).
     if [[ -n "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-takeover-dz-mm "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM}"); fi
+    # Arm B: the funnel leaves part of the aim to the descent and sometimes recovers from low (unset = off).
+    if [[ "${FR3_GRASP_LOOP_FUNNEL_CORRECTIVE-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-corrective); fi
     # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).
     if [[ -n "${FR3_GRASP_LOOP_DATASET_ROOT-}" ]]; then grasp_loop_args+=(--grasp-loop-dataset-root "${FR3_GRASP_LOOP_DATASET_ROOT}"); fi
     # ... from each trial's first step, the policy's own steps as is_intervention=0 (unset = funnel only).

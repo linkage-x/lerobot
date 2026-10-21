@@ -86,6 +86,23 @@ def control_loop_alive(robot: Any) -> bool:
         return True
 
 
+# How long to wait for libfranka's reason once the loop is seen dead: panda_py logs it from its
+# own thread, which can land after the 0.1 s stall that `control_loop_alive` goes on.
+REFLEX_ERRORS_WAIT_S = 0.5
+
+
+def reflex_errors(robot: Any, wait_s: float = REFLEX_ERRORS_WAIT_S) -> list[str]:
+    """libfranka's names for why the loop ended ([] when the robot cannot say). Read before recovery."""
+
+    errors = getattr(robot, "last_reflex_errors", None)
+    if not callable(errors):
+        return []
+    try:
+        return [str(name) for name in errors(wait_s=wait_s)]
+    except Exception:  # noqa: BLE001 - a diagnosis must not replace the fault it explains
+        return []
+
+
 class SceneResetUnreachableError(RuntimeError):
     """A waypoint IK cannot realise, found with the arm already part-way through the reset.
 
@@ -936,9 +953,11 @@ def _run_step(
         observation, current_xyz, _current_rotvec, current_gripper = _observation_snapshot(robot)
         if not control_loop_alive(robot):
             trace.flush("control_loop_died")
+            errors = reflex_errors(robot)
             raise ControlLoopDiedError(
                 f"scene reset step {name}: the FR3 control loop has ended (a reflex); the arm "
                 f"stopped at ({current_xyz[0]:+.4f}, {current_xyz[1]:+.4f}, {current_xyz[2]:+.4f})."
+                + (f" errors={','.join(errors)}" if errors else "")
             )
         trace.sample(commanded[2], current_xyz)
         if force_cap is not None:

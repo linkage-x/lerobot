@@ -23,6 +23,8 @@ import importlib
 import logging
 import os
 from pathlib import Path
+import re
+import resource
 import struct
 import sys
 import threading
@@ -156,6 +158,180 @@ def _sphere_inertia(mass_kg: float, radius_m: float = 0.02) -> tuple[float, ...]
     return (value, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, value)
 
 
+# libfranka's RealtimeConfig, per host. panda_py defaults to kIgnore, under which libfranka never
+# touches the scheduling of the thread that runs its 1 kHz loop: on the NUC (PREEMPT_RT) that
+# thread ran SCHED_OTHER, below every threaded IRQ, sharing the housekeeping cores with the
+# desktop, the cameras and the episode writer -- and twice on 2026-10-20 it went 21 and 37 ms
+# without a command (`communication_constraints_violation`). kEnforce makes libfranka raise it to
+# SCHED_FIFO at the top priority, and refuses a kernel that is not realtime, so "auto" asks for
+# it only where it can be had. The environment variable overrides the config: setting it to
+# "ignore" puts the old behaviour back without a code change.
+FR3_REALTIME_CONFIG_ENV = "FR3_REALTIME_CONFIG"
+REALTIME_CONFIG_CHOICES = ("auto", "enforce", "ignore")
+KERNEL_REALTIME_PATH = Path("/sys/kernel/realtime")
+
+# The reflex errors a libfranka loop died of, as panda_py logs them on its own logger:
+#   Control loop interruped: libfranka: Move command aborted: motion aborted by reflex!
+#   ["communication_constraints_violation"]
+PANDA_PY_LOGGER = "panda"
+_REFLEX_ERROR_NAME = re.compile(r'"([a-z0-9_]+)"')
+# Aborts libfranka words without an error list, named here so a caller can still tell them apart.
+# "User Stop pressed!" is the arm's user stop -- on this rig also the robot's daily self-test
+# (2026-10-21 09:55, mid-policy, logged as a collision before this existed).
+USER_STOP_ERROR = "user_stop"
+_ABORT_PHRASES = {"User Stop pressed": USER_STOP_ERROR}
+
+_SCHED_POLICY_NAMES = {
+    getattr(os, name): name for name in ("SCHED_OTHER", "SCHED_FIFO", "SCHED_RR", "SCHED_BATCH", "SCHED_IDLE")
+    if hasattr(os, name)
+}
+
+
+def kernel_is_realtime(path: Path = KERNEL_REALTIME_PATH) -> bool:
+    """The test libfranka's own kEnforce applies: /sys/kernel/realtime reads 1."""
+
+    try:
+        return path.read_text().strip() == "1"
+    except OSError:
+        return False
+
+
+def rtprio_allows_fifo_max() -> bool:
+    """Whether this process may take SCHED_FIFO at the top priority, which is what kEnforce asks.
+
+    libfranka uses sched_get_priority_max(SCHED_FIFO); without the rlimit (or root) that call
+    fails inside the control thread, after `start_controller` has already started waiting on it.
+    """
+
+    if os.geteuid() == 0:
+        return True
+    soft, _hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
+    return soft == resource.RLIM_INFINITY or soft >= os.sched_get_priority_max(os.SCHED_FIFO)
+
+
+def resolve_realtime_config(
+    requested: str,
+    *,
+    environ: dict[str, str] | None = None,
+    kernel_realtime: bool | None = None,
+    rtprio_ok: bool | None = None,
+) -> tuple[str, str]:
+    """("enforce" | "ignore", why). "enforce" on a host that cannot have it raises, before connecting."""
+
+    env = os.environ if environ is None else environ
+    override = env.get(FR3_REALTIME_CONFIG_ENV, "").strip().lower()
+    choice, source = (override, FR3_REALTIME_CONFIG_ENV) if override else (str(requested).lower(), "config")
+    if choice not in REALTIME_CONFIG_CHOICES:
+        raise ValueError(f"{source} realtime_config must be one of {REALTIME_CONFIG_CHOICES}, got {choice!r}.")
+    if choice == "ignore":
+        return "ignore", f"{source}=ignore"
+    realtime = kernel_is_realtime() if kernel_realtime is None else kernel_realtime
+    allowed = rtprio_allows_fifo_max() if rtprio_ok is None else rtprio_ok
+    missing = [] if realtime else ["kernel is not realtime"]
+    if not allowed:
+        missing.append("RLIMIT_RTPRIO is below the SCHED_FIFO maximum")
+    if choice == "enforce":
+        if missing:
+            raise RuntimeError(f"{source}=enforce, but this host cannot run it: {'; '.join(missing)}.")
+        return "enforce", f"{source}=enforce"
+    if missing:
+        return "ignore", f"{source}=auto: {'; '.join(missing)}"
+    return "enforce", f"{source}=auto: realtime kernel"
+
+
+def _thread_ids() -> set[int]:
+    try:
+        return {int(name) for name in os.listdir("/proc/self/task")}
+    except (OSError, ValueError):
+        return set()
+
+
+def _thread_sched(tid: int) -> tuple[str, int] | None:
+    try:
+        policy = os.sched_getscheduler(tid)
+        return _SCHED_POLICY_NAMES.get(policy, str(policy)), int(os.sched_getparam(tid).sched_priority)
+    except OSError:  # the thread has already gone
+        return None
+
+
+@contextlib.contextmanager
+def _keeping_this_threads_scheduling():
+    """Put the calling thread's policy back after a libfranka motion that ran in it.
+
+    panda_py's own motions (move_to_start) run libfranka's loop in the *calling* thread, and under
+    kEnforce libfranka raises that thread to SCHED_FIFO and leaves it there: the interpreter's main
+    thread would go on at the top realtime priority for the rest of the run.
+    """
+
+    try:
+        saved = (os.sched_getscheduler(0), os.sched_getparam(0))
+    except OSError:
+        saved = None
+    try:
+        yield
+    finally:
+        if saved is not None:
+            try:
+                if (os.sched_getscheduler(0), os.sched_getparam(0).sched_priority) != (saved[0], saved[1].sched_priority):
+                    os.sched_setscheduler(0, saved[0], saved[1])
+            except OSError as exc:
+                logger.warning("FR3 could not restore this thread's scheduling after a libfranka motion: %s", exc)
+
+
+class _ReflexLogTap(logging.Handler):
+    """The error names of the last control loop panda_py reported as aborted.
+
+    libfranka's reason reaches this process only as that log line; the loop just stops, and the
+    state reads freeze. Kept so a caller can tell a link that dropped commands from a collision.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self._lock = threading.Lock()
+        self._errors: list[str] = []
+        self._at_s: float | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a log record that cannot be formatted names nothing
+            return
+        if "aborted" not in message:
+            return
+        with self._lock:
+            self._errors = _REFLEX_ERROR_NAME.findall(message) + [
+                name for phrase, name in _ABORT_PHRASES.items() if phrase in message
+            ]
+            self._at_s = time.perf_counter()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._errors, self._at_s = [], None
+
+    def errors(self) -> list[str] | None:
+        """The names, or None when no abort has been logged since the last clear."""
+        with self._lock:
+            return None if self._at_s is None else list(self._errors)
+
+
+def _true_error_flags(errors: Any) -> list[str]:
+    """The set flags of a libfranka `Errors` (e.g. RobotState.last_motion_errors)."""
+
+    if errors is None:
+        return []
+    names = []
+    for name in dir(errors):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(errors, name)
+        except Exception:  # noqa: BLE001
+            continue
+        if value is True:
+            names.append(name)
+    return names
+
+
 @dataclass
 class PandaPyArmDriver:
     robot_ip: str
@@ -166,6 +342,8 @@ class PandaPyArmDriver:
     payload_mass_kg: float = 0.0
     payload_com_m: tuple[float, float, float] | None = None
     payload_inertia: tuple[float, ...] | None = None
+    # "auto" | "enforce" | "ignore"; see FR3_REALTIME_CONFIG_ENV.
+    realtime_config: str = "auto"
 
     def __post_init__(self):
         try:
@@ -203,9 +381,24 @@ class PandaPyArmDriver:
         # frozen, looking exactly like an arm holding still. The clock is what tells them apart.
         self._controller_time: float | None = None
         self._controller_time_advanced_at_s: float | None = None
+        # Which RealtimeConfig connect() chose and why, and what the control thread actually got.
+        self._realtime_mode: str | None = None
+        self._realtime_reason: str | None = None
+        self._control_thread: dict[str, Any] = {}
+        self._reflex_tap = _ReflexLogTap()
 
     def connect(self) -> None:
-        self._robot = self._panda_cls(self.robot_ip)
+        self._realtime_mode, self._realtime_reason = resolve_realtime_config(self.realtime_config)
+        if self._realtime_mode == "enforce":
+            from panda_py import libfranka
+
+            self._robot = self._panda_cls(self.robot_ip, realtime_config=libfranka.RealtimeConfig.kEnforce)
+        else:
+            # The call the single-host workstations have always made: kIgnore by panda_py's default.
+            self._robot = self._panda_cls(self.robot_ip)
+        panda_logger = logging.getLogger(PANDA_PY_LOGGER)
+        if self._reflex_tap not in panda_logger.handlers:
+            panda_logger.addHandler(self._reflex_tap)
         # One state read serves both the mode gate and the controller's initial setpoint. The
         # state reader starts polling immediately afterwards, so a second round-trip here would
         # only add latency to the connect path.
@@ -332,7 +525,80 @@ class PandaPyArmDriver:
             self._controller.set_filter(self.filter_coeff)
         current_joint_positions = self._refresh_joint_positions_cache(state)
         self._controller.set_control(current_joint_positions)
+        self._reflex_tap.clear()
+        threads_before = _thread_ids()
         self._robot.start_controller(self._controller)
+        self._control_thread = self._read_control_thread(threads_before)
+        self._log_control_thread()
+
+    # libfranka sets the policy as its loop starts, which start_controller() waits for; a short
+    # grace covers a binding that returns a moment before.
+    CONTROL_THREAD_SCHED_WAIT_S = 0.2
+
+    def _read_control_thread(self, threads_before: set[int]) -> dict[str, Any]:
+        """The thread(s) start_controller() added, and the scheduling of the highest of them."""
+
+        deadline = time.perf_counter() + (self.CONTROL_THREAD_SCHED_WAIT_S if self._realtime_mode == "enforce" else 0.0)
+        while True:
+            tids = sorted(_thread_ids() - threads_before)
+            scheds = {tid: s for tid in tids if (s := _thread_sched(tid)) is not None}
+            best = max(scheds.items(), key=lambda item: (item[1][0] in ("SCHED_FIFO", "SCHED_RR"), item[1][1]), default=None)
+            if best is None or best[1][0] in ("SCHED_FIFO", "SCHED_RR") or time.perf_counter() >= deadline:
+                break
+            time.sleep(0.01)
+        if best is None:
+            return {"tids": tids, "policy": None, "priority": None}
+        return {"tids": tids, "tid": best[0], "policy": best[1][0], "priority": best[1][1]}
+
+    def control_thread_report(self) -> dict[str, Any]:
+        """realtimeConfig chosen, why, and the policy/priority libfranka's loop thread runs at."""
+
+        return {
+            "realtimeConfig": self._realtime_mode,
+            "reason": self._realtime_reason,
+            "kernelRealtime": kernel_is_realtime(),
+            **self._control_thread,
+        }
+
+    def _log_control_thread(self) -> None:
+        report = self.control_thread_report()
+        text = (
+            f"FR3 control thread realtime_config={report['realtimeConfig']} ({report['reason']}) "
+            f"policy={report.get('policy')} priority={report.get('priority')} tids={report.get('tids')}"
+        )
+        # Worth a warning only where it matters: a realtime kernel whose loop is not realtime.
+        if report["kernelRealtime"] and report.get("policy") not in ("SCHED_FIFO", "SCHED_RR"):
+            logger.warning(text)
+        else:
+            logger.info(text)
+
+    def reflex_errors(self, wait_s: float = 0.0) -> list[str]:
+        """Why the last control loop ended, by libfranka's error names; [] when not known.
+
+        From panda_py's abort log line, which can land a moment after the loop is seen to have
+        stopped (hence `wait_s`), else from the arm's `last_motion_errors` and mode. A user stop,
+        which libfranka words without a name, is USER_STOP_ERROR.
+        """
+
+        deadline = time.perf_counter() + max(0.0, float(wait_s))
+        while True:
+            logged = self._reflex_tap.errors()
+            if logged is not None or time.perf_counter() >= deadline:
+                break
+            time.sleep(0.02)
+        if logged:
+            return logged
+        if self._robot is None:
+            return []
+        try:
+            state = self._robot.get_state()
+        except Exception:  # noqa: BLE001 - a diagnosis must not raise over the fault it explains
+            return []
+        errors = _true_error_flags(getattr(state, "last_motion_errors", None))
+        mode = getattr(state, "robot_mode", None)
+        if mode is not None and getattr(mode, "name", str(mode)) == "kUserStopped":
+            errors.append(USER_STOP_ERROR)
+        return errors
 
     def _stop_controller(self) -> None:
         if self._robot is not None and self._controller is not None:
@@ -475,6 +741,7 @@ class PandaPyArmDriver:
         if self._robot is not None:
             self._stop_controller()
             self._robot = None
+        logging.getLogger(PANDA_PY_LOGGER).removeHandler(self._reflex_tap)
         with self._state_lock:
             self._cached_joint_positions = None
             self._cached_joint_positions_at_s = None
@@ -513,7 +780,8 @@ class PandaPyArmDriver:
         if controller_was_running:
             self._stop_controller()
         try:
-            self._robot.move_to_start()
+            with _keeping_this_threads_scheduling():
+                self._robot.move_to_start()
             self._refresh_joint_positions_cache()
         finally:
             if controller_was_running:

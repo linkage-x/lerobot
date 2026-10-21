@@ -289,3 +289,157 @@ def test_a_60_mm_takeover_descends_at_the_terminal_speed_throughout():
     descend = [s["executed_action"][2] for s in funnel.steps if s["funnel_state"] == DESCEND]
     drops = [a - b for a, b in zip(descend, descend[1:]) if a - b > 1e-9]
     assert drops and max(drops) <= cfg.descendSpeedMS * cfg.controlPeriodS + 2e-5
+
+
+def _corrective(**overrides):
+    return GraspFunnel(FunnelConfig(pegXyz=PEG, settleBeforeDescend=False, **overrides))
+
+
+def test_a_corrective_descent_closes_the_left_residual_on_the_way_down_and_is_centred_above_the_peg_top():
+    """10-20: checkpoints on the plain funnel aim once, high, and descend straight. With a residual
+    left, the recorded descent is the correction the policy never saw below ~127 mm."""
+
+    funnel = _corrective(alignDzMm=190.0, residualMm=20.0)
+    start = (PEG[0] + 0.04, PEG[1], 0.30)
+    _simulate(funnel, (PEG[0] + 0.04, PEG[1], PEG[2] + 0.02), start=start)
+
+    assert funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 2.0
+    assert funnel.residualAtDescendStartMm == pytest.approx(20.0, abs=0.1)
+    centred_z = funnel.config.centredZ
+    descend = [r for r in funnel.steps if r["funnel_state"] in (DESCEND, CLOSE)]
+    offsets = [math.hypot(r["executed_action"][0] - PEG[0], r["executed_action"][1] - PEG[1]) * 1000 for r in descend]
+    # Sideways during the descent, always toward the peg, along the policy's own error (+x) ...
+    assert offsets[0] == pytest.approx(20.0, abs=0.1) and offsets == sorted(offsets, reverse=True)
+    assert all(r["executed_action"][0] >= PEG[0] - 1e-9 for r in descend)
+    # ... and over the peg before the fingertips reach its top.
+    for record, offset in zip(descend, offsets, strict=True):
+        if record["executed_action"][2] < centred_z - 1e-9:
+            assert offset == pytest.approx(0.0, abs=1e-6)
+    assert funnel.realigns == 0
+
+
+def test_a_slow_arm_trailing_the_diagonal_is_not_taken_for_leaving_the_capture_radius():
+    # The steepest diagonal the residual allows: 25 mm across over the 35 mm above the centred height.
+    funnel = _corrective(alignDzMm=70.0, residualMm=25.0)
+    _simulate(funnel, (PEG[0], PEG[1] + 0.05, PEG[2]), start=(PEG[0], PEG[1] + 0.05, 0.30), lag=0.05, steps=4000)
+
+    trailing = [
+        math.hypot(r["ee_xyz"][0] - r["executed_action"][0], r["ee_xyz"][1] - r["executed_action"][1]) * 1000
+        for r in funnel.steps
+        if r["funnel_state"] == DESCEND
+    ]
+    # Far enough behind its setpoint that a point check would have realigned it.
+    assert max(trailing) > funnel.config.captureXyMm
+    assert funnel.realigns == 0 and funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 8.0
+
+
+def test_the_residual_is_never_more_than_the_height_left_above_the_centred_height():
+    funnel = _corrective(alignDzMm=50.0, residualMm=25.0)
+    _simulate(funnel, (PEG[0] + 0.04, PEG[1], PEG[2] + 0.02), start=(PEG[0] + 0.04, PEG[1], 0.20))
+    assert funnel.residualAtDescendStartMm == pytest.approx(15.0, abs=0.5)
+    assert funnel.state == CLOSE
+
+
+def test_a_low_takeover_outside_the_capture_radius_lifts_first_then_realigns_fully():
+    """105703's +x closes stopped at +11..+17 mm, 8-20 mm off: the recovery is up, across, down."""
+
+    funnel = _corrective(alignDzMm=20.0, liftDzMm=45.0, residualMm=20.0)
+    _simulate(funnel, (PEG[0] + 0.015, PEG[1], PEG[2] + 0.012), start=(PEG[0] + 0.015, PEG[1], 0.20))
+
+    lift_z = PEG[2] + 0.045
+    align = [r for r in funnel.steps if r["funnel_state"] == ALIGN]
+    for record in align:
+        if record["ee_xyz"][2] < lift_z - FUNNEL_ALIGN_Z_SLACK_M:
+            # Below the lift height and off the peg: up only.
+            assert record["executed_action"][:2] == pytest.approx(record["ee_xyz"][:2], abs=0.004)
+    assert max(r["executed_action"][2] for r in align) == pytest.approx(lift_z, abs=1e-6)
+    assert funnel.lifted is True and funnel.residualAtDescendStartMm == 0.0
+    assert funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 2.0
+    record = funnel.trial_record()
+    assert record["lifted"] is True and record["funnelLiftDzMm"] == 45.0
+
+
+def test_a_low_takeover_inside_the_capture_radius_does_not_lift():
+    funnel = _corrective(alignDzMm=20.0, liftDzMm=45.0, residualMm=20.0)
+    _simulate(funnel, (PEG[0] + 0.004, PEG[1], PEG[2] + 0.012), start=(PEG[0] + 0.004, PEG[1], 0.20))
+    assert funnel.lifted is False
+    entry_z = funnel.entryXyz[2]
+    assert max(r["executed_action"][2] for r in funnel.steps if r["funnel_state"] != SEARCH) <= entry_z + 1e-9
+    assert funnel.state == CLOSE
+
+
+def test_a_policy_that_stops_above_a_low_takeover_is_taken_over_where_it_stopped():
+    # Blocked at +17 mm (or hovering there): it never reaches a +15 mm takeover and never closes.
+    funnel = _corrective(alignDzMm=15.0, liftDzMm=45.0)
+    _simulate(funnel, (PEG[0] + 0.015, PEG[1], PEG[2] + 0.017), start=(PEG[0] + 0.015, PEG[1], 0.20))
+    assert funnel.entryReason == "stalled_low"
+    assert funnel.entryXyz[2] == pytest.approx(PEG[2] + 0.017, abs=0.001)
+    assert funnel.lifted is True and funnel.state == CLOSE
+
+
+def _descend_onto(funnel, contact_z, *, steps=300, lag=0.4):
+    """Smoke run 151637 trial 0: the policy goes on down 0.66 mm a step, 66 mm off the peg in y,
+    whatever the arm does. With `contact_z` a fingertip is on something there: the arm stands at
+    that height and slides 0.66 mm a step in x. Returns the step the contact began."""
+
+    ee = [PEG[0] - 0.019, PEG[1] - 0.064, PEG[2] + 0.045]
+    policy = list(ee)
+    contact_step, slide = None, 0.0
+    for step in range(steps):
+        policy[2] -= 0.00066
+        command = funnel.step(step, tuple(ee), ROT, _command(tuple(policy)), policy_gripper_raw=1.0)
+        for k, key in enumerate(("ee.x", "ee.y", "ee.z")):
+            ee[k] += lag * (command[key] - ee[k])
+        if contact_z is not None and ee[2] < contact_z and not funnel.active:
+            contact_step = step if contact_step is None else contact_step
+            slide += 0.00066
+            ee[0], ee[2] = command["ee.x"] + slide, contact_z
+    return contact_step
+
+
+def test_a_policy_the_arm_cannot_follow_below_the_lift_height_is_taken_over_and_lifted():
+    funnel = _corrective(alignDzMm=18.6, liftDzMm=45.0, lowContactMm=6.0)
+    contact_step = _descend_onto(funnel, PEG[2] + 0.020)
+    assert funnel.entryReason == "contact_low"
+    # 151637 trial 0 went on pushing for 35 steps and slid 22 mm.
+    assert funnel.entryStep - contact_step <= 10
+    assert funnel.lifted is True
+    align = [r for r in funnel.steps if r["funnel_state"] == ALIGN]
+    assert align[0]["executed_action"][:2] == pytest.approx(funnel.entryXyz[:2], abs=1e-5)
+    assert align[0]["executed_action"][2] > funnel.entryXyz[2]
+
+
+def test_an_arm_that_keeps_up_with_a_low_policy_is_not_taken_for_a_contact():
+    # The late trials of 151637 trailed by at most 2.7 mm below the lift height.
+    funnel = _corrective(alignDzMm=18.6, liftDzMm=45.0, lowContactMm=6.0)
+    _descend_onto(funnel, None)
+    assert funnel.entryReason == "reached_align_z"
+
+
+def test_without_a_contact_threshold_a_blocked_low_policy_keeps_the_arm():
+    funnel = _corrective(alignDzMm=18.6, liftDzMm=45.0)
+    _descend_onto(funnel, PEG[2] + 0.020)
+    assert funnel.state == SEARCH
+
+
+def test_a_policy_that_hovers_above_the_lift_height_is_not_taken_over():
+    funnel = _corrective(alignDzMm=15.0, liftDzMm=45.0)
+    _simulate(funnel, (PEG[0], PEG[1], PEG[2] + 0.08), start=(PEG[0], PEG[1], 0.20), steps=300)
+    assert funnel.state == SEARCH
+
+
+def test_the_policys_steps_below_the_lift_height_are_flagged_until_the_funnel_takes_over():
+    funnel = _corrective(alignDzMm=20.0, liftDzMm=45.0)
+    lift_z = PEG[2] + 0.045
+    _simulate(funnel, (PEG[0] + 0.015, PEG[1], PEG[2] + 0.012), start=(PEG[0] + 0.015, PEG[1], 0.20))
+    low = [r for r in funnel.steps if r["funnel_state"] == SEARCH and r["ee_xyz"][2] < lift_z]
+    assert low and funnel.lowPolicySteps == len(low)
+    assert funnel.trial_record()["lowPolicySteps"] == len(low)
+    # Once the funnel has the arm nothing is flagged, so its recovery is recorded whole.
+    assert funnel.state == CLOSE and funnel.lowPolicyStep is False
+
+
+def test_no_policy_step_is_flagged_without_a_lift_height():
+    funnel = GraspFunnel(FunnelConfig(pegXyz=PEG))
+    _simulate(funnel, (PEG[0], PEG[1] + 0.02, PEG[2] + 0.01), start=(PEG[0], PEG[1] + 0.02, 0.20))
+    assert funnel.lowPolicySteps == 0

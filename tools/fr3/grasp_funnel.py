@@ -37,6 +37,18 @@ brought it near the peg, and puts the fingers where P0 measured the grasp to wor
              takes the arm off the policy after its settle steps; the lift that grades the grasp
              is the grasp loop's, the same one arm A is graded by.
 
+Corrective demonstrations (10-20, `residualMm` / `liftDzMm` / `settleBeforeDescend`, all off by
+default): checkpoints trained on the funnel above aim once, high, and descend straight -- run
+105703 closed exactly as far off the peg as it was at 60 mm, because in 150 recorded trials the
+funnel took over at a median 190 mm, removed the whole 52 mm error there and never moved sideways
+below. So ALIGN may leave up to `residualMm` of the policy's own error (its direction, never an
+invented one) and DESCEND closes it on a straight line that reaches the peg's XY at `centredDzMm`,
+above the fingertips' +28 mm clearance; a takeover below `liftDzMm` outside the capture radius
+goes up to it first and realigns fully, which is the recovery from a low, off-centre approach.
+Below `liftDzMm` a policy that stops (it closes when it stops, copying the settle) is taken over
+as well, and so is one the arm cannot follow (`lowContactMm`): the fingers are on something, and
+pushing on would tip the peg.
+
 Where the funnel takes over is `alignDzMm` above the peg. At the v14 (3) 60 mm the policy has
 already done its aiming: on 09-30 (344 B trials) it arrived there a median 41 mm off the peg,
 with its y aim only 0.66 of the peg's (regression to the training mean), and 82% of its lateral
@@ -92,6 +104,15 @@ FUNNEL_FAST_DESCEND_SPEED_M_S = 0.05
 FUNNEL_SLOW_BELOW_DZ_MM = 60.0
 # Steps the settle test must hold, so one quiet frame between two moves is not a stop.
 FUNNEL_SETTLE_STEPS = 5
+# Where a corrective descent must be over the peg's XY: 7 mm above P0's +28 mm fingertip
+# clearance, so nothing moves sideways at the peg top.
+FUNNEL_CENTRED_DZ_MM = 35.0
+# Below `liftDzMm`, how far the arm may stand from the command it was given before the policy is
+# taken off it: the fingers are on something. Smoke run 151637 (10-20): the four late trials
+# trailed by at most 2.7 mm; in trial 0 a fingertip came down on something at +20 mm, the arm
+# stood still in z while the command went on down, slid 22 mm sideways for 35 steps, and the peg
+# was knocked over. This threshold would have taken over 6 steps into that contact.
+FUNNEL_LOW_CONTACT_MM = 6.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +128,12 @@ class FunnelConfig:
     descendSpeedMS: float = FUNNEL_DESCEND_SPEED_M_S
     fastDescendSpeedMS: float = FUNNEL_FAST_DESCEND_SPEED_M_S
     slowBelowDzMm: float = FUNNEL_SLOW_BELOW_DZ_MM
+    # Corrective demonstrations (module docstring). 0 / None / True are the v14 (3) funnel.
+    residualMm: float = 0.0
+    centredDzMm: float = FUNNEL_CENTRED_DZ_MM
+    liftDzMm: float | None = None
+    lowContactMm: float | None = None
+    settleBeforeDescend: bool = True
     closedBelow: float = 0.5
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -121,12 +148,35 @@ class FunnelConfig:
         return self.pegXyz[2] + self.slowBelowDzMm / 1000.0
 
     @property
+    def centredZ(self) -> float:
+        return self.pegXyz[2] + self.centredDzMm / 1000.0
+
+    @property
+    def upZ(self) -> float:
+        """The height "up first" goes to: `alignZ`, or `liftDzMm` above the peg when that is higher."""
+
+        if self.liftDzMm is None:
+            return self.alignZ
+        return max(self.alignZ, self.pegXyz[2] + self.liftDzMm / 1000.0)
+
+    @property
     def closeXyz(self) -> tuple[float, float, float]:
         return (self.pegXyz[0], self.pegXyz[1], self.pegXyz[2] + self.closeDzMm / 1000.0)
 
 
 def _xy_error_mm(xyz: tuple[float, float, float], peg: tuple[float, float, float]) -> float:
     return math.hypot(xyz[0] - peg[0], xyz[1] - peg[1]) * 1000.0
+
+
+def _off_path_mm(xyz: tuple[float, float, float], start_xy: tuple[float, float], end_xy: tuple[float, float]) -> float:
+    """XY distance from the segment start->end: lag along a moving setpoint is not drift (the
+    arm trails a 0.05 m/s sideways setpoint by up to 9 mm, 10-19 ALIGN steps)."""
+
+    dx, dy = end_xy[0] - start_xy[0], end_xy[1] - start_xy[1]
+    length2 = dx * dx + dy * dy
+    t = 0.0 if length2 <= 0.0 else ((xyz[0] - start_xy[0]) * dx + (xyz[1] - start_xy[1]) * dy) / length2
+    t = min(1.0, max(0.0, t))
+    return math.hypot(xyz[0] - (start_xy[0] + t * dx), xyz[1] - (start_xy[1] + t * dy)) * 1000.0
 
 
 def _walk(
@@ -151,6 +201,7 @@ class GraspFunnel:
     setpoint: tuple[float, float, float] | None = None
     rotvec: tuple[float, float, float] | None = None
     previousXyz: tuple[float, float, float] | None = None
+    previousCommand: tuple[float, float, float] | None = None
     quietSteps: int = 0
     steps: list[dict[str, Any]] = field(default_factory=list)
     # Per-trial readings (v13 (7) second row).
@@ -167,6 +218,15 @@ class GraspFunnel:
     blockedSteps: int = 0
     realigns: int = 0
     maxResidualMm: float = 0.0
+    # Where ALIGN goes across to: the peg's XY, or `residualMm` short of it along the entry error.
+    alignGoalXy: tuple[float, float] | None = None
+    residualAtDescendStartMm: float = 0.0
+    lifted: bool = False
+    # The policy still drove this step, below `liftDzMm`: on a late takeover that is the
+    # off-centre descent the recovery undoes, which a whole-trial recording leaves out rather
+    # than teach (`dagger_step_role`'s `policy_off_course`).
+    lowPolicyStep: bool = False
+    lowPolicySteps: int = 0
 
     def _speed_mm_s(self, xyz: tuple[float, float, float]) -> float:
         if self.previousXyz is None:
@@ -210,8 +270,23 @@ class GraspFunnel:
         if self.state == SEARCH:
             policy_closes = policy_gripper < cfg.closedBelow
             reached = ee_xyz[2] <= cfg.alignZ
-            if reached or policy_closes:
-                transition = "policy_closed" if policy_closes and not reached else "reached_align_z"
+            stalled = contact = False
+            if cfg.liftDzMm is not None and ee_xyz[2] < cfg.pegXyz[2] + cfg.liftDzMm / 1000.0:
+                stalled = self._settled(ee_xyz)
+                contact = (
+                    cfg.lowContactMm is not None
+                    and self.previousCommand is not None
+                    and math.dist(ee_xyz, self.previousCommand) * 1000.0 > cfg.lowContactMm
+                )
+            else:
+                self.quietSteps = 0
+            if reached or policy_closes or stalled or contact:
+                if reached:
+                    transition = "reached_align_z"
+                elif policy_closes:
+                    transition = "policy_closed"
+                else:
+                    transition = "contact_low" if contact else "stalled_low"
                 self.entryStep, self.entryReason = step_idx, transition
                 self.entryXyz = tuple(ee_xyz)  # type: ignore[assignment]
                 self.xyErrorAtEntryMm = round(xy_err, 1)
@@ -222,6 +297,7 @@ class GraspFunnel:
                 # The wrist stays as the policy left it: P0 says the grasp does not need it
                 # changed, and turning it above the peg would move the fingertips as well.
                 self.rotvec = tuple(ee_rotvec)  # type: ignore[assignment]
+                self.alignGoalXy = self._align_goal_xy(ee_xyz, xy_err)
                 self._enter(ALIGN)
 
         executed_gripper = cfg.openGripper
@@ -237,29 +313,46 @@ class GraspFunnel:
             if self.state == ALIGN:
                 # Below until the *setpoint* is up, then across once the arm is within the slack
                 # of it: the peg top is ~40 mm under alignZ, so a few mm of dead band is no risk.
-                below = self.setpoint[2] < cfg.alignZ - 1e-9 or ee_xyz[2] < cfg.alignZ - FUNNEL_ALIGN_Z_SLACK_M
+                up_z = cfg.upZ
+                below = self.setpoint[2] < up_z - 1e-9 or ee_xyz[2] < up_z - FUNNEL_ALIGN_Z_SLACK_M
+                goal_xy = self.alignGoalXy if self.alignGoalXy is not None else (peg[0], peg[1])
                 if xy_err > cfg.captureXyMm and below:
                     # Up first, never sideways at peg height.
-                    goal = (self.setpoint[0], self.setpoint[1], cfg.alignZ)
+                    goal = (self.setpoint[0], self.setpoint[1], up_z)
                 else:
-                    goal = (peg[0], peg[1], self.setpoint[2])
+                    goal = (goal_xy[0], goal_xy[1], self.setpoint[2])
                 self.setpoint, arrived = _walk(self.setpoint, goal, cfg.alignSpeedMS * cfg.controlPeriodS)
                 settled = self._settled(ee_xyz)
-                if arrived and goal[:2] == peg[:2] and xy_err <= cfg.captureXyMm and settled:
+                goal_err = _xy_error_mm(ee_xyz, (goal_xy[0], goal_xy[1], 0.0))
+                if (
+                    arrived
+                    and goal[:2] == goal_xy
+                    and goal_err <= cfg.captureXyMm
+                    and (settled or not cfg.settleBeforeDescend)
+                ):
                     transition = "aligned"
                     self.descendStartStep = step_idx
                     self.xyErrorAtDescendStartMm = round(xy_err, 1)
+                    self.residualAtDescendStartMm = round(_xy_error_mm(self.setpoint, peg), 1)
                     self._enter(DESCEND)
                 elif policy_xyz[2] < ee_xyz[2] - 1e-4:
                     descend_blocked = True
             elif self.state == DESCEND:
-                if xy_err > cfg.captureXyMm:
+                # Off the path down: the peg's XY, or on a corrective diagonal the line to it.
+                start_xy = self.alignGoalXy if self.alignGoalXy is not None else (peg[0], peg[1])
+                if _off_path_mm(ee_xyz, start_xy, (peg[0], peg[1])) > cfg.captureXyMm:
                     transition = "left_capture"
                     self.realigns += 1
+                    self.alignGoalXy = (peg[0], peg[1])
                     self._enter(ALIGN)
                 else:
                     speed = cfg.fastDescendSpeedMS if self.setpoint[2] > cfg.slowBelowZ + 1e-9 else cfg.descendSpeedMS
-                    self.setpoint, arrived = _walk(self.setpoint, cfg.closeXyz, speed * cfg.controlPeriodS)
+                    goal = cfg.closeXyz
+                    if self.setpoint[:2] != (peg[0], peg[1]):
+                        # The residual closes on a straight line, over the peg by `centredZ`.
+                        goal = (peg[0], peg[1], max(cfg.centredZ, cfg.closeXyz[2]))
+                    self.setpoint, arrived = _walk(self.setpoint, goal, speed * cfg.controlPeriodS)
+                    arrived = arrived and goal == cfg.closeXyz
                     if arrived and self._settled(ee_xyz):
                         transition = "settled_at_close_height"
                         self.closeStep = step_idx
@@ -271,12 +364,17 @@ class GraspFunnel:
             executed_xyz = self.setpoint
             executed_rotvec = self.rotvec
 
+        self.lowPolicyStep = (
+            self.state == SEARCH and cfg.liftDzMm is not None and ee_xyz[2] < peg[2] + cfg.liftDzMm / 1000.0
+        )
+        self.lowPolicySteps += int(self.lowPolicyStep)
         if descend_blocked:
             self.blockedSteps += 1
         residual_xy = math.hypot(executed_xyz[0] - policy_xyz[0], executed_xyz[1] - policy_xyz[1]) * 1000.0
         if self.state != SEARCH:
             self.maxResidualMm = max(self.maxResidualMm, residual_xy)
         self.previousXyz = tuple(ee_xyz)  # type: ignore[assignment]
+        self.previousCommand = tuple(executed_xyz)  # type: ignore[assignment]
 
         executed = {
             "ee.x": float(executed_xyz[0]),
@@ -307,6 +405,22 @@ class GraspFunnel:
         )
         return executed
 
+    def _align_goal_xy(self, ee_xyz: tuple[float, float, float], xy_err: float) -> tuple[float, float]:
+        """ALIGN's across target: the peg, or up to `residualMm` short of it along the policy's own
+        error. Full alignment after a lift (the recovery), and never more residual than the height
+        left above `centredZ`, so the diagonal is no flatter than 45 degrees."""
+
+        cfg = self.config
+        peg = cfg.pegXyz
+        lifting = xy_err > cfg.captureXyMm and ee_xyz[2] < cfg.upZ - FUNNEL_ALIGN_Z_SLACK_M
+        self.lifted = lifting and cfg.liftDzMm is not None and cfg.upZ > cfg.alignZ
+        across_z = cfg.upZ if xy_err > cfg.captureXyMm else ee_xyz[2]
+        residual = 0.0 if lifting else min(cfg.residualMm, xy_err, (across_z - cfg.centredZ) * 1000.0)
+        if residual <= 0.0 or xy_err <= 0.0:
+            return (peg[0], peg[1])
+        scale = residual / xy_err
+        return (peg[0] + (ee_xyz[0] - peg[0]) * scale, peg[1] + (ee_xyz[1] - peg[1]) * scale)
+
     @property
     def active(self) -> bool:
         """True once the funnel, not the policy, is driving the arm."""
@@ -333,5 +447,10 @@ class GraspFunnel:
             "maxResidualMm": round(self.maxResidualMm, 1),
             "funnelRotvec": None if self.rotvec is None else [round(v, 5) for v in self.rotvec],
             "funnelAlignDzMm": round(cfg.alignDzMm, 1),
+            "funnelResidualMm": round(cfg.residualMm, 1),
+            "residualAtDescendStartMm": self.residualAtDescendStartMm,
+            "funnelLiftDzMm": cfg.liftDzMm,
+            "lifted": self.lifted,
+            "lowPolicySteps": self.lowPolicySteps,
             "pegSource": cfg.pegSource,
         }

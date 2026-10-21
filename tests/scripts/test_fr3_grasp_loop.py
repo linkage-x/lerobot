@@ -803,6 +803,114 @@ def test_a_reflex_in_a_scripted_step_is_recovered_and_is_not_charged_to_the_poli
     assert result["halted"] == ""
 
 
+class CommLossRig(ReflexRig):
+    """A reflex whose libfranka reason is dropped commands, not contact."""
+
+    def __init__(self, errors=("communication_constraints_violation",)):
+        super().__init__()
+        self.errors = list(errors)
+        self.error_waits = []
+
+    def last_reflex_errors(self, wait_s=0.0):
+        self.error_waits.append(wait_s)
+        return list(self.errors)
+
+
+def test_a_comm_loss_reflex_in_the_policys_segment_is_not_charged_to_the_policy(tmp_path):
+    robot = CommLossRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_reflex_policy(robot, [("reflex", None), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["comm_loss", "held"]
+    assert rows[0]["reflexErrors"] == ["communication_constraints_violation"]
+    # Same recovery as a collision, under the GUI's same "reflex" prefix, with its own wording.
+    assert asked[0].startswith(grasp_loop.GRASP_LOOP_COMM_LOSS_PROMPT) and asked[0].startswith("reflex")
+    assert robot.recoveries == 1 and result["halted"] == ""
+    summary = result["summary"]
+    assert summary["graded"] == 1 and summary["held"] == 1
+    assert summary["collision"] == 0 and summary["commLoss"] == 1
+
+
+def test_a_reflex_with_another_cause_stays_a_collision_and_keeps_its_errors(tmp_path):
+    robot = CommLossRig(errors=["cartesian_reflex"])
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=1),
+        run_policy_trial=_reflex_policy(robot, [("reflex", None)]),
+        out_path=out,
+    )
+    row = _trials(out)[0]
+    assert row["verdict"] == "collision" and row["reflexErrors"] == ["cartesian_reflex"]
+    assert result["summary"]["collision"] == 1 and result["summary"]["commLoss"] == 0
+    assert result["halted"] == "control_loop_died"
+
+
+def test_a_user_stop_in_the_policys_segment_is_its_own_verdict_and_asks_for_the_stop_released(tmp_path):
+    # 2026-10-21 09:55: the robot's daily self-test stopped a descent 6 cm above the peg.
+    robot = CommLossRig(errors=["user_stop"])
+    asked = []
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_reflex_policy(robot, [("reflex", None), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    assert [r["verdict"] for r in _trials(out)] == ["user_stop", "held"]
+    assert asked[0].startswith(grasp_loop.GRASP_LOOP_USER_STOP_PROMPT) and asked[0].startswith("reflex")
+    summary = result["summary"]
+    assert summary["graded"] == 1 and summary["userStop"] == 1 and summary["collision"] == 0
+
+
+@pytest.mark.parametrize(
+    ("errors", "cause"),
+    [
+        (["communication_constraints_violation"], "comm_loss"),
+        (["user_stop"], "user_stop"),
+        (["communication_constraints_violation", "user_stop"], "comm_loss"),
+        (["cartesian_reflex"], "collision"),
+        ([], "collision"),
+    ],
+)
+def test_reflex_cause(errors, cause):
+    assert grasp_loop.reflex_cause(errors) == cause
+
+
+def test_a_comm_loss_in_a_scripted_step_is_marked_on_its_reflex_row(tmp_path):
+    class DiesOnSetDown(CommLossRig):
+        def send_action(self, action):
+            if self.held and action["ee.z"] < 0.07 and not getattr(self, "died", False):
+                self.died = True
+                self.control_loop_alive = False
+                return dict(action)
+            return super().send_action(action)
+
+    robot = DiesOnSetDown()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    reflex = [json.loads(line) for line in out.read_text().splitlines() if json.loads(line)["kind"] == "reflex"]
+    assert len(reflex) == 1 and reflex[0]["commLoss"] is True and reflex[0]["cause"] == "comm_loss"
+    assert reflex[0]["reflexErrors"] == ["communication_constraints_violation"]
+    assert "errors=communication_constraints_violation" in reflex[0]["error"]
+    assert asked[0].startswith(grasp_loop.GRASP_LOOP_COMM_LOSS_PROMPT)
+
+
 class PadRig(FakeRobot):
     """Fingers that centre the peg only along their closing axis (tool y), on a pad 20 mm wide
     (tool x). `knock_once_m` is one bad close: the first grasp the fingers make lands that far off
@@ -1790,3 +1898,32 @@ def test_the_summary_reads_the_aims_gain_on_the_peg():
     loc = summarize_grasp_loop(rows)["localization"]["60"]
     assert loc["n"] == 8 and loc["gainY"] == pytest.approx(0.66, abs=0.01)
     assert loc["errorMmP50"] > 0.0
+
+
+def test_corrective_trials_draw_a_residual_and_some_low_takeovers_and_leave_the_others_heights_alone():
+    plain = _request(arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4)
+    corrective = _request(arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4, funnelCorrective=True)
+    peg = (0.40, -0.15, 0.058)
+    configs = [grasp_loop.funnel_config(corrective, t, peg) for t in range(200)]
+    late = [c for c in configs if c.alignDzMm < 60.0]
+    assert 0.2 < len(late) / len(configs) < 0.4
+    low, high = grasp_loop.GRASP_LOOP_CORRECTIVE_LATE_DZ_MM
+    assert all(low <= c.alignDzMm <= high for c in late)
+    for t, c in enumerate(configs):
+        if c.alignDzMm >= 60.0:
+            assert c.alignDzMm == grasp_loop.funnel_align_dz_mm(plain, t)
+        assert 0.0 <= c.residualMm <= 25.0
+        assert c.liftDzMm == grasp_loop.GRASP_LOOP_CORRECTIVE_LIFT_DZ_MM and c.settleBeforeDescend is False
+        assert c.lowContactMm == grasp_loop.FUNNEL_LOW_CONTACT_MM
+    # Drawn per trial, so a resumed run agrees.
+    assert configs == [grasp_loop.funnel_config(corrective, t, peg) for t in range(200)]
+    # Off: the v14 (3) funnel.
+    off = grasp_loop.funnel_config(plain, 3, peg)
+    assert off.residualMm == 0.0 and off.liftDzMm is None and off.settleBeforeDescend is True
+    assert off.lowContactMm is None
+
+
+def test_corrective_demonstrations_without_arm_b_are_refused():
+    with pytest.raises(scene_reset.SceneResetError, match="funnelCorrective"):
+        grasp_loop.validate_grasp_loop_request(_request(arms="A", funnelCorrective=True))
+    grasp_loop.validate_grasp_loop_request(_request(arms="AB", funnelCorrective=True))

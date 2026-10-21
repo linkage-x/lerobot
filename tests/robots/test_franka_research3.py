@@ -51,6 +51,14 @@ from lerobot.utils.rotation import Rotation
 import json
 
 
+@pytest.fixture(autouse=True)
+def _not_a_realtime_host(monkeypatch):
+    """Every test sees a non-realtime kernel and no override, wherever it runs (the NUC is RT)."""
+
+    monkeypatch.setattr(fr3_backends, "kernel_is_realtime", lambda *args, **kwargs: False)
+    monkeypatch.delenv(fr3_backends.FR3_REALTIME_CONFIG_ENV, raising=False)
+
+
 class DummyArmDriver:
     instances: list["DummyArmDriver"] = []
 
@@ -3652,3 +3660,292 @@ def test_zero_grace_raises_on_the_first_stale_read(robot):
     with pytest.raises(TimeoutError, match="stale at 100.0 FR3 camera_timeout_context"):
         robot.get_observation()
     assert camera.reads == 1
+
+
+# ------------------------------------------------- libfranka realtime config and reflex causes ---
+
+
+@pytest.mark.parametrize(
+    ("requested", "kernel_realtime", "rtprio_ok", "expected"),
+    [
+        ("auto", True, True, "enforce"),
+        ("auto", False, True, "ignore"),
+        ("auto", True, False, "ignore"),
+        ("ignore", True, True, "ignore"),
+        ("enforce", True, True, "enforce"),
+    ],
+)
+def test_realtime_config_enforces_only_where_the_host_can_have_it(requested, kernel_realtime, rtprio_ok, expected):
+    mode, reason = fr3_backends.resolve_realtime_config(
+        requested, environ={}, kernel_realtime=kernel_realtime, rtprio_ok=rtprio_ok
+    )
+    assert mode == expected
+    if requested == "auto" and expected == "ignore":
+        assert "not realtime" in reason or "RLIMIT_RTPRIO" in reason
+
+
+def test_realtime_config_enforce_on_a_host_that_cannot_refuses_before_connecting():
+    with pytest.raises(RuntimeError, match="not realtime"):
+        fr3_backends.resolve_realtime_config("enforce", environ={}, kernel_realtime=False, rtprio_ok=True)
+    with pytest.raises(RuntimeError, match="RLIMIT_RTPRIO"):
+        fr3_backends.resolve_realtime_config("enforce", environ={}, kernel_realtime=True, rtprio_ok=False)
+
+
+def test_realtime_config_environment_overrides_the_config():
+    env = {fr3_backends.FR3_REALTIME_CONFIG_ENV: "ignore"}
+    mode, reason = fr3_backends.resolve_realtime_config("enforce", environ=env, kernel_realtime=True, rtprio_ok=True)
+    assert mode == "ignore" and fr3_backends.FR3_REALTIME_CONFIG_ENV in reason
+    with pytest.raises(ValueError):
+        fr3_backends.resolve_realtime_config("auto", environ={fr3_backends.FR3_REALTIME_CONFIG_ENV: "fifo"})
+
+
+def test_config_refuses_an_unknown_realtime_config():
+    with pytest.raises(ValueError, match="realtime_config"):
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            workspace_min=(0.2, -0.3, 0.2),
+            workspace_max=(0.6, 0.3, 0.5),
+            realtime_config="fifo",
+        )
+
+
+def _fake_panda_py(monkeypatch, *, start_thread: bool = False, last_motion_errors=None):
+    """A panda_py whose start_controller starts a real thread, as the C++ binding does."""
+
+    class Controller:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class FakePanda:
+        instances: list["FakePanda"] = []
+
+        def __init__(self, robot_ip, **kwargs):
+            self.robot_ip = robot_ip
+            self.kwargs = kwargs
+            self.stop = threading.Event()
+            self.thread = None
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7), last_motion_errors=last_motion_errors
+            )
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            del controller
+            if start_thread:
+                self.thread = threading.Thread(target=self.stop.wait, daemon=True)
+                self.thread.start()
+
+        def stop_controller(self):
+            self.stop.set()
+            if self.thread is not None:
+                self.thread.join(timeout=1.0)
+
+        def get_state(self):
+            return self.state
+
+    libfranka = types.SimpleNamespace(RealtimeConfig=types.SimpleNamespace(kEnforce="kEnforce", kIgnore="kIgnore"))
+    module = types.SimpleNamespace(
+        Panda=FakePanda, controllers=types.SimpleNamespace(JointPosition=Controller), libfranka=libfranka
+    )
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    return FakePanda
+
+
+def test_pandapy_driver_asks_libfranka_to_enforce_realtime_on_a_realtime_host(monkeypatch):
+    fake = _fake_panda_py(monkeypatch)
+    monkeypatch.setattr(fr3_backends, "kernel_is_realtime", lambda *args, **kwargs: True)
+    monkeypatch.setattr(fr3_backends, "rtprio_allows_fifo_max", lambda: True)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        assert fake.instances[-1].kwargs == {"realtime_config": "kEnforce"}
+        assert driver.control_thread_report()["realtimeConfig"] == "enforce"
+    finally:
+        driver.disconnect()
+
+
+def test_pandapy_driver_keeps_the_single_host_call_elsewhere(monkeypatch):
+    fake = _fake_panda_py(monkeypatch)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        # Exactly Panda(robot_ip): panda_py's own default, kIgnore.
+        assert fake.instances[-1].kwargs == {}
+        assert driver.control_thread_report()["realtimeConfig"] == "ignore"
+    finally:
+        driver.disconnect()
+
+
+def test_control_thread_report_names_the_thread_start_controller_added(monkeypatch, caplog):
+    fake = _fake_panda_py(monkeypatch, start_thread=True)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    with caplog.at_level(logging.INFO, logger=fr3_backends.__name__):
+        driver.connect()
+    try:
+        report = driver.control_thread_report()
+        assert report["tids"] == [fake.instances[-1].thread.native_id]
+        assert report["policy"] == "SCHED_OTHER" and report["priority"] == 0
+        # Not a realtime kernel here, so a SCHED_OTHER loop is expected: info, not a warning.
+        assert any("FR3 control thread" in r.message and r.levelno == logging.INFO for r in caplog.records)
+    finally:
+        driver.disconnect()
+
+
+def test_a_realtime_kernel_whose_control_thread_is_not_realtime_is_a_warning(monkeypatch, caplog):
+    _fake_panda_py(monkeypatch, start_thread=True)
+    monkeypatch.setattr(fr3_backends, "kernel_is_realtime", lambda *args, **kwargs: True)
+    monkeypatch.setenv(fr3_backends.FR3_REALTIME_CONFIG_ENV, "ignore")
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    with caplog.at_level(logging.INFO, logger=fr3_backends.__name__):
+        driver.connect()
+    try:
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "FR3 control thread" in r.message]
+        assert warnings and "policy=SCHED_OTHER" in warnings[0].message
+    finally:
+        driver.disconnect()
+
+
+ABORT_LINE = (
+    'Control loop interruped: libfranka: Move command aborted: motion aborted by reflex! '
+    '["communication_constraints_violation"]'
+)
+
+
+def test_reflex_errors_come_from_panda_pys_abort_log_line(monkeypatch):
+    _fake_panda_py(monkeypatch)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        assert driver.reflex_errors() == []
+        logging.getLogger(fr3_backends.PANDA_PY_LOGGER).error(ABORT_LINE)
+        assert driver.reflex_errors() == ["communication_constraints_violation"]
+        # A fresh loop (recover) forgets the last one's reason.
+        driver._start_controller()
+        assert driver.reflex_errors() == []
+    finally:
+        driver.disconnect()
+    assert driver._reflex_tap not in logging.getLogger(fr3_backends.PANDA_PY_LOGGER).handlers
+
+
+def test_reflex_errors_fall_back_to_the_arms_last_motion_errors(monkeypatch):
+    errors = types.SimpleNamespace(cartesian_reflex=True, communication_constraints_violation=False, joint_reflex=False)
+    _fake_panda_py(monkeypatch, last_motion_errors=errors)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        assert driver.reflex_errors() == ["cartesian_reflex"]
+    finally:
+        driver.disconnect()
+
+
+def test_move_to_start_puts_the_calling_threads_scheduling_back(monkeypatch):
+    """Under kEnforce libfranka raises the thread that runs panda_py's own motion to SCHED_FIFO."""
+
+    fake = _fake_panda_py(monkeypatch)
+    sched = {"policy": fr3_backends.os.SCHED_OTHER, "priority": 0}
+    set_calls = []
+
+    def move_to_start(self):
+        sched.update(policy=fr3_backends.os.SCHED_FIFO, priority=99)
+
+    def setscheduler(pid, policy, param):
+        set_calls.append((pid, policy, param.sched_priority))
+        sched.update(policy=policy, priority=param.sched_priority)
+
+    fake.move_to_start = move_to_start
+    monkeypatch.setattr(fr3_backends.os, "sched_getscheduler", lambda pid: sched["policy"])
+    monkeypatch.setattr(fr3_backends.os, "sched_getparam", lambda pid: fr3_backends.os.sched_param(sched["priority"]))
+    monkeypatch.setattr(fr3_backends.os, "sched_setscheduler", setscheduler)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        driver.move_to_start()
+    finally:
+        driver.disconnect()
+    assert set_calls == [(0, fr3_backends.os.SCHED_OTHER, 0)]
+    assert sched == {"policy": fr3_backends.os.SCHED_OTHER, "priority": 0}
+
+
+def test_robot_passes_realtime_config_and_reports_through_the_arm(monkeypatch):
+    seen = {}
+
+    class ReportingArm(DummyArmDriver):
+        def reflex_errors(self, wait_s=0.0):
+            seen["wait_s"] = wait_s
+            return ["communication_constraints_violation"]
+
+        def control_thread_report(self):
+            return {"realtimeConfig": "enforce", "policy": "SCHED_FIFO", "priority": 99}
+
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", ReportingArm)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    device = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            workspace_min=(0.2, -0.3, 0.2),
+            workspace_max=(0.6, 0.3, 0.5),
+        )
+    )
+    device.connect()
+    try:
+        assert device.last_reflex_errors(wait_s=0.3) == ["communication_constraints_violation"]
+        assert seen["wait_s"] == 0.3
+        assert device.control_thread_report()["policy"] == "SCHED_FIFO"
+    finally:
+        device.disconnect()
+
+
+def test_robot_hands_realtime_config_only_to_a_driver_that_takes_it(monkeypatch):
+    built = {}
+
+    class CapturingDriver(PandaPyArmDriver):
+        # The dataclass __init__ and fields are PandaPyArmDriver's; only the panda_py import goes.
+        def __post_init__(self):
+            built["realtime_config"] = self.realtime_config
+            raise RuntimeError("stop after construction")
+
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", CapturingDriver)
+    device = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            workspace_min=(0.2, -0.3, 0.2),
+            workspace_max=(0.6, 0.3, 0.5),
+            realtime_config="ignore",
+        )
+    )
+    with pytest.raises(RuntimeError, match="stop after construction"):
+        device.connect()
+    assert built["realtime_config"] == "ignore"
+
+
+def test_a_user_stop_abort_is_named_though_libfranka_gives_no_error_name(monkeypatch):
+    # 2026-10-21 09:55, the robot's daily self-test, word for word.
+    _fake_panda_py(monkeypatch)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        logging.getLogger(fr3_backends.PANDA_PY_LOGGER).error(
+            "Control loop interruped: libfranka: Move command aborted: User Stop pressed!"
+        )
+        assert driver.reflex_errors() == [fr3_backends.USER_STOP_ERROR]
+    finally:
+        driver.disconnect()
+
+
+def test_a_user_stopped_mode_names_a_user_stop_when_nothing_was_logged(monkeypatch):
+    fake = _fake_panda_py(monkeypatch)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+    try:
+        fake.instances[-1].state.robot_mode = types.SimpleNamespace(name="kUserStopped")
+        assert driver.reflex_errors() == [fr3_backends.USER_STOP_ERROR]
+    finally:
+        driver.disconnect()

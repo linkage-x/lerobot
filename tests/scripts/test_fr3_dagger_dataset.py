@@ -795,6 +795,19 @@ def test_a_whole_trial_drops_the_handover_seam_without_cutting_the_trial():
     assert role('expert', whole=False) == 'expert'
 
 
+def test_a_late_takeovers_low_policy_descent_is_left_out_of_a_whole_trial_without_cutting_it():
+    def role(source, *, whole, off):
+        return dagger_step_role(
+            command_source=source, on_seam=False, keeps_policy_frames=whole, policy_off_course=off
+        )
+
+    assert role('policy', whole=True, off=True) == 'skip'
+    assert role('policy', whole=True, off=False) == 'policy'
+    # Funnel-only recording never wrote policy steps; the expert's are never off course.
+    assert role('policy', whole=False, off=True) == 'gap'
+    assert role('funnel', whole=True, off=True) == 'expert'
+
+
 # --- helpers used only by the round trips --------------------------------------------------
 
 

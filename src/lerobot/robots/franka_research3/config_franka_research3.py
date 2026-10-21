@@ -97,6 +97,10 @@ class FrankaResearch3Config(RobotConfig):
     # Row-major 3x3 inertia of the payload about its centre of mass. None treats it as a point
     # mass: for a peg of a few hundred grams the force term dominates and the inertia is noise.
     payload_inertia: tuple[float, ...] | None = None
+    # libfranka's RealtimeConfig: "auto" enforces SCHED_FIFO for its 1 kHz loop on a realtime
+    # kernel the process may use, and keeps panda_py's kIgnore elsewhere; env FR3_REALTIME_CONFIG
+    # overrides it (see backends.FR3_REALTIME_CONFIG_ENV).
+    realtime_config: str = "auto"
     camera_max_age_ms: float = 100.0
     # How long a read that finds a frame older than camera_max_age_ms keeps re-reading before it
     # raises. A one-off stall (both cameras 135 ms old at once, threads alive; NUC 2026-10-16)
@@ -122,6 +126,8 @@ class FrankaResearch3Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.realtime_config not in ("auto", "enforce", "ignore"):
+            raise ValueError("realtime_config must be one of 'auto', 'enforce', or 'ignore'.")
         if self.gripper_backend not in {"pika", "das", "franka_hand", "corenetic", "mock"}:
             raise ValueError("gripper_backend must be one of 'pika', 'das', 'franka_hand', 'corenetic', or 'mock'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:

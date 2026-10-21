@@ -4394,6 +4394,36 @@ def test_the_grasp_loop_step_budget_is_passed_and_blank_leaves_the_runtime_defau
     assert '--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"' in launcher
 
 
+def test_the_grasp_loop_seed_is_passed_and_blank_leaves_the_runtime_default():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    assert sanitize({"graspLoopSeed": "7"}) == {"FR3_GRASP_LOOP_SEED": "7"}
+    assert sanitize({"graspLoopSeed": 0}) == {"FR3_GRASP_LOOP_SEED": "0"}
+    assert sanitize({"graspLoopSeed": ""}) == {}
+    for bad in (-1, "abc", "1.5"):
+        with pytest.raises(rollout_backend.RolloutError, match="graspLoopSeed"):
+            sanitize({"graspLoopSeed": bad})
+    # Cleared from the inherited environment: one exported seed must not repeat every run's pegs.
+    assert "FR3_GRASP_LOOP_SEED" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert '--grasp-loop-seed "${FR3_GRASP_LOOP_SEED}"' in launcher
+
+
+def test_the_funnel_corrective_switch_reaches_the_launcher_only_with_arm_b():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    assert sanitize({"graspLoopArms": "B", "graspLoopFunnelCorrective": True}) == {
+        "FR3_GRASP_LOOP_ARMS": "B",
+        "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE": "1",
+    }
+    assert sanitize({"graspLoopArms": "AB", "graspLoopFunnelCorrective": False}) == {"FR3_GRASP_LOOP_ARMS": "AB"}
+    # Arm A alone (or blank, which the launcher reads as A) has no funnel to shape.
+    for raw in ({"graspLoopArms": "A", "graspLoopFunnelCorrective": True}, {"graspLoopFunnelCorrective": True}):
+        with pytest.raises(rollout_backend.RolloutError, match="graspLoopFunnelCorrective"):
+            sanitize(raw)
+    assert "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert "grasp_loop_args+=(--grasp-loop-funnel-corrective)" in launcher
+
+
 def test_the_phase_schedule_options_reach_the_launcher(tmp_path: Path):
     runtime_options = rollout_backend.sanitize_rollout_runtime_options(
         {
@@ -4464,3 +4494,18 @@ def test_the_align_phase_survives_the_arm_whitelist_into_the_outcome_log(tmp_pat
     assert entry["arm"]["phaseAlignExecutedSteps"] == 8
     assert entry["arm"]["phaseAlignExecutionHorizon"] == 8
     assert entry["arm"]["phaseAlignActionSamples"] == 1
+
+
+def test_grasp_loop_reflex_prompt_tells_a_comm_loss_and_a_user_stop_from_a_collision():
+    from tools.fr3.grasp_loop import (
+        GRASP_LOOP_COMM_LOSS_PROMPT,
+        GRASP_LOOP_REFLEX_PROMPT,
+        GRASP_LOOP_USER_STOP_PROMPT,
+    )
+
+    def message(prompt):
+        return rollout_backend.parse_rollout_line(f"[ATTENTION] grasp_loop_needs_operator {prompt}: check nothing is trapped")["message"]
+
+    assert "commands stopped arriving" in message(GRASP_LOOP_COMM_LOSS_PROMPT)
+    assert "collision reflex" in message(GRASP_LOOP_REFLEX_PROMPT)
+    assert "daily self-test" in message(GRASP_LOOP_USER_STOP_PROMPT)

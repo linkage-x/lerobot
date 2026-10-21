@@ -89,7 +89,13 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from lerobot.utils.rotation import Rotation
-from tools.fr3.grasp_funnel import FUNNEL_ALIGN_DZ_MM, FUNNEL_CLOSE_DZ_MM, FunnelConfig, GraspFunnel
+from tools.fr3.grasp_funnel import (
+    FUNNEL_ALIGN_DZ_MM,
+    FUNNEL_CLOSE_DZ_MM,
+    FUNNEL_LOW_CONTACT_MM,
+    FunnelConfig,
+    GraspFunnel,
+)
 from tools.fr3.scene_reset import (
     SCENE_RESET_LIFT_M,
     SceneResetError,
@@ -110,6 +116,7 @@ from tools.fr3.scene_reset import (
     parse_mask_strokes,
     precise_sleep,
     read_fz,
+    reflex_errors,
     set_force_trace_path,
     traced_hold,
     unload_before_open,
@@ -246,6 +253,16 @@ GRASP_LOOP_FUNNEL_MAX_STEPS = 600
 # a little below where the policy starts (~340 mm), so the policy always drives the first stretch
 # and every recorded correction starts from a state the policy itself reached.
 GRASP_LOOP_FUNNEL_ALIGN_DZ_RANGE_MM = (40.0, 320.0)
+# `funnelCorrective` (10-20): arm B records both halves of what arm A lacks. Every trial's ALIGN
+# leaves up to the drawn residual of the policy's own error for the descent to close (the aim
+# refined on the way down, which 150 v14 (3) trials never showed below ~127 mm); a drawn fraction
+# instead lets the policy come down to a drawn low takeover, and from outside the capture radius
+# the funnel lifts to the lift height and realigns (the recovery from 105703's low, off-centre
+# stops at +11..+17 mm). The lift is what makes a takeover below the 40 mm floor safe.
+GRASP_LOOP_CORRECTIVE_RESIDUAL_MM = (0.0, 25.0)
+GRASP_LOOP_CORRECTIVE_LATE_FRACTION = 0.3
+GRASP_LOOP_CORRECTIVE_LATE_DZ_MM = (15.0, 40.0)
+GRASP_LOOP_CORRECTIVE_LIFT_DZ_MM = 45.0
 # Heights above the peg at which the policy's aim is read (`aimXyAboveMm`): where it is still
 # travelling, where it has mostly arrived, and the funnel's v14 (3) takeover.
 GRASP_LOOP_AIM_HEIGHTS_MM = (150, 100, 60)
@@ -308,6 +325,8 @@ class GraspLoopRequest:
     # Arm B: the funnel takes over this far above the peg, drawn per trial from [low, high]
     # (`funnel_align_dz_mm`). Equal ends, the default, is the fixed v14 (3) takeover.
     funnelAlignDzMm: tuple[float, float] = (FUNNEL_ALIGN_DZ_MM, FUNNEL_ALIGN_DZ_MM)
+    # Arm B: corrective demonstrations (GRASP_LOOP_CORRECTIVE_*, `funnel_config`).
+    funnelCorrective: bool = False
     seed: int = 0
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -359,6 +378,35 @@ def funnel_align_dz_mm(request: GraspLoopRequest, trial: int) -> float:
     return random.Random(f"{request.seed}:{trial}:funnel_align_dz").uniform(low, high)
 
 
+def funnel_config(request: GraspLoopRequest, trial: int, peg_xyz: tuple[float, float, float]) -> FunnelConfig:
+    """Arm B's funnel for this trial. The corrective draws come from their own streams, so the
+    takeover height of a trial that is not late is the one `funnel_align_dz_mm` always drew."""
+
+    align_dz = funnel_align_dz_mm(request, trial)
+    corrective: dict[str, Any] = {}
+    if request.funnelCorrective:
+        if random.Random(f"{request.seed}:{trial}:funnel_late").random() < GRASP_LOOP_CORRECTIVE_LATE_FRACTION:
+            align_dz = random.Random(f"{request.seed}:{trial}:funnel_late_dz").uniform(*GRASP_LOOP_CORRECTIVE_LATE_DZ_MM)
+        corrective = {
+            "residualMm": random.Random(f"{request.seed}:{trial}:funnel_residual").uniform(
+                *GRASP_LOOP_CORRECTIVE_RESIDUAL_MM
+            ),
+            "liftDzMm": GRASP_LOOP_CORRECTIVE_LIFT_DZ_MM,
+            "lowContactMm": FUNNEL_LOW_CONTACT_MM,
+            # The pause before descending is what checkpoints copy as a hover.
+            "settleBeforeDescend": False,
+        }
+    return FunnelConfig(
+        pegXyz=peg_xyz,
+        closedBelow=request.closedBelow,
+        openGripper=request.openGripper,
+        closedGripper=request.closedGripper,
+        controlPeriodS=request.controlPeriodS,
+        alignDzMm=align_dz,
+        **corrective,
+    )
+
+
 def validate_grasp_loop_request(
     request: GraspLoopRequest,
     *,
@@ -379,6 +427,8 @@ def validate_grasp_loop_request(
         raise SceneResetError(f"arms must be one of {', '.join(GRASP_LOOP_ARMS)}, not {request.arms!r}.")
     if request.funnelMaxSteps <= 0:
         raise SceneResetError("funnelMaxSteps must be positive.")
+    if request.funnelCorrective and "B" not in request.arms:
+        raise SceneResetError("funnelCorrective shapes arm B's funnel; a run of arm A alone has none.")
     low_dz, high_dz = (float(v) for v in request.funnelAlignDzMm)
     min_dz, max_dz = GRASP_LOOP_FUNNEL_ALIGN_DZ_RANGE_MM
     if not min_dz <= low_dz <= high_dz <= max_dz:
@@ -989,6 +1039,37 @@ def return_to_table(
 
 
 GRASP_LOOP_REFLEX_PROMPT = "reflex: the arm tripped its collision reflex and stopped"
+# Same "reflex:" prefix, so the GUI's continue/recover flow is the same; only the cause differs.
+GRASP_LOOP_COMM_LOSS_PROMPT = "reflex: the arm lost its control link (commands dropped) and stopped"
+GRASP_LOOP_USER_STOP_PROMPT = (
+    "reflex: the arm's user stop ended its control loop (the button, or the robot's daily self-test); "
+    "release it and wait for the self-test to finish first"
+)
+
+# libfranka reflexes that are this host failing to send, not the arm meeting something. 2026-10-20
+# (NUC): 21 and 37 commands missed in a row; the first was graded "collision" against the policy.
+COMM_LOSS_REFLEX_ERRORS = frozenset({"communication_constraints_violation"})
+# The arm's user stop, as the FR3 driver names it (libfranka words it without an error name).
+# 2026-10-21 09:55: the robot's daily self-test stopped a policy descent 6 cm above the peg.
+USER_STOP_REFLEX_ERROR = "user_stop"
+
+# Why a loop died -> the verdict a policy-segment trial gets. Only "collision" is the policy's.
+REFLEX_PROMPTS = {
+    "collision": GRASP_LOOP_REFLEX_PROMPT,
+    "comm_loss": GRASP_LOOP_COMM_LOSS_PROMPT,
+    "user_stop": GRASP_LOOP_USER_STOP_PROMPT,
+}
+
+
+def reflex_cause(errors: Iterable[str]) -> str:
+    """comm_loss, user_stop, or collision for anything else (or when nothing is known)."""
+
+    errors = set(errors)
+    if COMM_LOSS_REFLEX_ERRORS & errors:
+        return "comm_loss"
+    if USER_STOP_REFLEX_ERROR in errors:
+        return "user_stop"
+    return "collision"
 GRASP_LOOP_HOLD_PROMPT = "hold: the run stopped with the peg still in the fingers"
 
 
@@ -1032,6 +1113,7 @@ def recover_from_reflex(
     wait_for_operator: OperatorWait | None,
     *,
     request_id: str,
+    cause: str = "collision",
 ) -> bool:
     """After a reflex: a person says the arm is clear, then recover, open, straight up, home.
 
@@ -1042,8 +1124,9 @@ def recover_from_reflex(
     recover = getattr(robot, "recover_control_loop", None)
     if wait_for_operator is None or not callable(recover):
         return False
+    prompt = REFLEX_PROMPTS.get(cause, GRASP_LOOP_REFLEX_PROMPT)
     if not wait_for_operator(
-        f"{GRASP_LOOP_REFLEX_PROMPT}: check nothing is trapped under the fingers, then continue "
+        f"{prompt}: check nothing is trapped under the fingers, then continue "
         "-- the arm will open, back straight up and home"
     ):
         return False
@@ -1201,6 +1284,10 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "wilson95": [round(low, 3), round(high, 3)],
         "noClose": sum(1 for r in graded if r["verdict"] == "no_close"),
         "collision": sum(1 for r in graded if r["verdict"] == "collision"),
+        # The host dropped the arm's commands mid-policy: counted, never charged to the policy.
+        "commLoss": sum(1 for r in rows if r.get("verdict") == "comm_loss"),
+        # The arm's user stop (a person, or the daily self-test): likewise counted, never charged.
+        "userStop": sum(1 for r in rows if r.get("verdict") == "user_stop"),
         # Staged pegs that fell over: counted, so a staging that tips pegs shows, but never graded.
         "voided": sum(1 for r in rows if r.get("verdict") == "voided"),
         "closeAboveTargetMm": {"held": by(("held",), "closeAboveTargetMm"), "empty": by(("empty",), "closeAboveTargetMm")},
@@ -1237,6 +1324,9 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "xyErrorAtEntryMm": med([r["xyErrorAtEntryMm"] for r in funnel if r.get("xyErrorAtEntryMm") is not None]),
             "xyErrorAtCloseMm": med([r["xyErrorAtCloseMm"] for r in funnel if r.get("xyErrorAtCloseMm") is not None]),
             "funnelCloseDzMm": med([r["funnelCloseDzMm"] for r in funnel if r.get("funnelCloseDzMm") is not None]),
+            # Corrective demonstrations: how many recoveries were recorded, and how many realigns.
+            "lifted": sum(1 for r in funnel if r.get("lifted")),
+            "realigns": sum(int(r.get("realigns") or 0) for r in funnel),
         }
     return out
 
@@ -1575,19 +1665,15 @@ def run_grasp_loop(
                 voidRequested=void_requested,
             )
             if arm == "B":
-                handover.funnel = GraspFunnel(
-                    FunnelConfig(
-                        pegXyz=peg_xyz,
-                        closedBelow=request.closedBelow,
-                        openGripper=request.openGripper,
-                        closedGripper=request.closedGripper,
-                        controlPeriodS=request.controlPeriodS,
-                        alignDzMm=funnel_align_dz_mm(request, trial),
-                    )
-                )
+                handover.funnel = GraspFunnel(funnel_config(request, trial, peg_xyz))
             log(
                 f"[INFO] grasp_loop_arm trial={trial} arm={arm}"
                 + (f" funnel_align_dz_mm={handover.funnel.config.alignDzMm:.0f}" if handover.funnel is not None else "")
+                + (
+                    f" funnel_residual_mm={handover.funnel.config.residualMm:.0f}"
+                    if handover.funnel is not None and request.funnelCorrective
+                    else ""
+                )
             )
             status = run_policy_trial(trial, handover)
             row: dict[str, Any] = {
@@ -1628,14 +1714,23 @@ def run_grasp_loop(
             if status == "control_loop_died":
                 # The policy's segment drove the arm into something (09-28: an open finger onto
                 # the peg top). Graded against the arm, then recovered with a person's say-so.
-                row["verdict"] = "collision"
+                # Unless libfranka says the commands stopped arriving ("comm_loss": this host) or
+                # the user stop ended it ("user_stop": a person or the daily self-test): neither is
+                # the policy's, so each is counted apart without being graded.
+                errors = reflex_errors(robot)
+                cause = reflex_cause(errors)
+                row["verdict"] = cause
+                row["reflexErrors"] = errors
                 row["trialS"] = round(time.perf_counter() - started, 1)
                 keep_segment(trial, row)
                 write(row)
                 done.append(row)
-                log(f"[WARN] grasp_loop_trial trial={trial} arm={arm} verdict=collision trial_s={row['trialS']}")
+                log(
+                    f"[WARN] grasp_loop_trial trial={trial} arm={arm} verdict={row['verdict']} "
+                    f"reflex_errors={','.join(errors) or '-'} trial_s={row['trialS']}"
+                )
                 peg = "lost"
-                if not recover_from_reflex(robot, request, wait_for_operator, request_id=request_id):
+                if not recover_from_reflex(robot, request, wait_for_operator, request_id=request_id, cause=cause):
                     halted, peg = "control_loop_died", "unknown"
                     break
                 continue
@@ -1719,9 +1814,15 @@ def run_grasp_loop(
             if isinstance(exc, ControlLoopDiedError) or not control_loop_alive(robot):
                 # A reflex in a scripted step: not the policy's, so no trial row. Recovered with a
                 # person's say-so like any other, and the peg handed to them.
-                write({"kind": "reflex", "trial": trial, "where": "script", "error": f"{type(exc).__name__}: {exc}"})
-                log(f"[WARN] grasp_loop=reflex trial={trial} details={exc}")
-                if recover_from_reflex(robot, request, wait_for_operator, request_id=request_id):
+                errors = reflex_errors(robot)
+                cause = reflex_cause(errors)
+                write({
+                    "kind": "reflex", "trial": trial, "where": "script", "cause": cause,
+                    "commLoss": cause == "comm_loss", "reflexErrors": errors,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                log(f"[WARN] grasp_loop=reflex trial={trial} cause={cause} details={exc}")
+                if recover_from_reflex(robot, request, wait_for_operator, request_id=request_id, cause=cause):
                     peg = "lost"
                     continue
                 halted, peg = "control_loop_died", "unknown"

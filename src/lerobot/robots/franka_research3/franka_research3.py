@@ -470,6 +470,12 @@ class FrankaResearch3(Robot):
             payload_mass_kg=self.config.payload_mass_kg,
             payload_com_m=self.config.payload_com_m,
             payload_inertia=self.config.payload_inertia,
+            # Only to a driver that has the field: the test doubles and the twin take none.
+            **(
+                {"realtime_config": self.config.realtime_config}
+                if "realtime_config" in getattr(self.arm_driver_cls, "__dataclass_fields__", {})
+                else {}
+            ),
         )
         gripper = None
         kinematics = self._make_kinematics_driver()
@@ -600,6 +606,22 @@ class FrankaResearch3(Robot):
             return True
         stalled = stalled_s()
         return stalled is None or stalled < self.CONTROL_LOOP_STALL_S
+
+    def last_reflex_errors(self, wait_s: float = 0.0) -> list[str]:
+        """libfranka's names for why its loop last ended (e.g. communication_constraints_violation).
+
+        Read before `recover_control_loop`, which starts a fresh loop and forgets them. [] on a
+        backend that cannot tell.
+        """
+
+        errors = getattr(self._arm, "reflex_errors", None)
+        return list(errors(wait_s=wait_s)) if callable(errors) else []
+
+    def control_thread_report(self) -> dict[str, Any] | None:
+        """How libfranka's 1 kHz loop thread is scheduled; None on a backend without one."""
+
+        report = getattr(self._arm, "control_thread_report", None)
+        return report() if callable(report) else None
 
     def recover_control_loop(self) -> None:
         """After a reflex: clear it and hold the arm where it stopped.

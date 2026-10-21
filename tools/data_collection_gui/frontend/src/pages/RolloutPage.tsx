@@ -147,6 +147,8 @@ export function RolloutPage() {
   // 10-20: checkpoints trained on arm B trials learn the funnel's slow descent and close around
   // step 470 (p95 ~520), so the runtime's 450 ends most arm A trials just above the peg.
   const [graspLoopMaxPolicySteps, setGraspLoopMaxPolicySteps] = useState("600");
+  // 10-20: every page run was seed 0 until this box, so recordings repeated the same pegs.
+  const [graspLoopSeed, setGraspLoopSeed] = useState("0");
   const [graspLoopAttended, setGraspLoopAttended] = useState(true);
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
@@ -156,6 +158,8 @@ export function RolloutPage() {
   // 09-30: the policy's aim is set well above the funnel's old 60 mm, so recordings draw the
   // takeover from the whole approach by default.
   const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
+  // 10-20: checkpoints on the plain funnel's trials aim once, high, and descend straight.
+  const [graspLoopFunnelCorrective, setGraspLoopFunnelCorrective] = useState(false);
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -278,6 +282,9 @@ export function RolloutPage() {
       graspLoopTrials: modeId === "grasp_loop" ? positiveNumberOr(graspLoopTrials, 40) : undefined,
       graspLoopMaxPolicySteps:
         modeId === "grasp_loop" ? positiveNumberOr(graspLoopMaxPolicySteps, 600) : undefined,
+      // As typed: the gateway refuses what is not a whole number >= 0, rather than this page
+      // quietly running seed 0 again.
+      graspLoopSeed: modeId === "grasp_loop" ? graspLoopSeed.trim() || undefined : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
@@ -286,6 +293,8 @@ export function RolloutPage() {
         modeId === "grasp_loop" && graspLoopRecord ? graspLoopRecordWholeTrial : undefined,
       graspLoopFunnelTakeoverDzMm:
         modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
+      graspLoopFunnelCorrective:
+        modeId === "grasp_loop" && graspLoopArms !== "A" ? graspLoopFunnelCorrective : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -322,12 +331,14 @@ export function RolloutPage() {
       modeId,
       graspLoopTrials,
       graspLoopMaxPolicySteps,
+      graspLoopSeed,
       graspLoopAttended,
       graspLoopArms,
       graspLoopInsertPose,
       graspLoopRecord,
       graspLoopRecordWholeTrial,
-      graspLoopFunnelTakeoverDzMm
+      graspLoopFunnelTakeoverDzMm,
+      graspLoopFunnelCorrective
     ]
   );
 
@@ -492,6 +503,8 @@ export function RolloutPage() {
         if (options.graspLoopRecord !== undefined) setGraspLoopRecord(options.graspLoopRecord);
         if (options.graspLoopRecordWholeTrial !== undefined)
           setGraspLoopRecordWholeTrial(options.graspLoopRecordWholeTrial);
+        if (options.graspLoopFunnelCorrective !== undefined)
+          setGraspLoopFunnelCorrective(options.graspLoopFunnelCorrective);
         if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
         if (options.daggerDatasetRoot !== undefined)
           setDaggerDatasetRoot(options.daggerDatasetRoot);
@@ -1378,6 +1391,19 @@ export function RolloutPage() {
               600 步 = 20 s。用 B 臂数据训的 checkpoint 学了漏斗的慢降，中位约第 470 步才合手，原来的 450 会在销上方被截断。
               配对 A/B 两边要用同一个值。
             </p>
+            <label className="field">
+              <span>随机种子（销的摆放位置、B 臂的接管高度等）</span>
+              <input
+                value={graspLoopSeed}
+                onChange={(event) => setGraspLoopSeed(event.target.value)}
+                inputMode="numeric"
+                disabled={isLive}
+              />
+            </label>
+            <p className="hint">
+              同一个种子，第 N 条的销位和 B 臂抽签每次都一样。配对 A/B 两边用同一个种子；录数据每一轮都换一个没用过的，
+              否则只是把同样的位置再录一遍（10-19 的 150 条都是 0，只有 58 个不同位置）。评测想看没见过的位置，也要避开录数据用过的种子。
+            </p>
             <label className="checkbox">
               <input
                 type="checkbox"
@@ -1429,6 +1455,21 @@ export function RolloutPage() {
             <p className="hint">
               策略的瞄准在离销 150 mm 以上就基本定了（09-30：到 60 mm 时平均还偏 41 mm，y 方向只跟到销的 0.66）。
               在 60–300 mm 之间随机接管，录下的纠正覆盖整个下降过程；60 mm 以上漏斗以 0.05 m/s 下降，以下 0.03 m/s（10-20 前是 0.02）。
+            </p>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopFunnelCorrective}
+                onChange={(event) => setGraspLoopFunnelCorrective(event.target.checked)}
+                disabled={isLive || graspLoopArms === "A"}
+              />
+              <span>纠偏示范（B 臂）：边降边对中 + 低位接管先抬起再对准</span>
+            </label>
+            <p className="hint">
+              开启后每条 trial 随机二选一。约 70%：照常在上面的高度接管，但水平只修掉一部分误差，保留 0–25 mm（沿策略自己偏的方向），
+              剩下的在下降途中斜着收掉，离销 35 mm 时对正（指尖 +28 mm 才离开销顶），并去掉下降前的停稳。约 30%：让策略自己降到离销
+              15–40 mm（或它停住、要合手时）才接管；偏差超过 8 mm 就先竖直抬到 45 mm，再对准、下降。低位接管时策略可能碰倒销，
+              建议有人看着。只跑 A 时不可用。
             </p>
             <label className="checkbox">
               <input

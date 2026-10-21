@@ -1274,7 +1274,7 @@ export type GraspLoopTrial = {
   arm?: string;
   /** held / empty come from the width after a 3 cm lift; no_close means the policy never shut. */
   /** voided: the operator voided it because the staged peg fell over; never graded. */
-  verdict: "held" | "empty" | "no_close" | "collision" | "not_graded" | "voided" | string;
+  verdict: "held" | "empty" | "no_close" | "collision" | "comm_loss" | "user_stop" | "not_graded" | "voided" | string;
   widthLifted: number | null;
   closeAboveTargetMm: number | null;
   lateralMm: number | null;
@@ -1673,6 +1673,8 @@ export type RolloutRuntimeOptions = {
   graspLoopTrials?: number;
   /** Policy steps (30 Hz) before a trial with no close is ended; arm B: until the funnel takes over. */
   graspLoopMaxPolicySteps?: number;
+  /** Peg positions and arm B's per-trial draws, as typed (the gateway checks it); the runtime's 0 when absent. */
+  graspLoopSeed?: string;
   graspLoopAttended?: boolean;
   /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
   graspLoopArms?: "A" | "B" | "AB";
@@ -1684,6 +1686,8 @@ export type RolloutRuntimeOptions = {
   graspLoopRecordWholeTrial?: boolean;
   /** Arm B: how far above the peg the funnel takes over, "h" or "low,high" mm (drawn per trial). */
   graspLoopFunnelTakeoverDzMm?: string;
+  /** Arm B: corrective demonstrations (part of the aim left to the descent; some low takeovers that lift and realign). */
+  graspLoopFunnelCorrective?: boolean;
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.

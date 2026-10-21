@@ -95,12 +95,14 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     # count must not turn the next launch into forty unasked-for grasps.
     "FR3_GRASP_LOOP_TRIALS",
     "FR3_GRASP_LOOP_MAX_POLICY_STEPS",
+    "FR3_GRASP_LOOP_SEED",
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
     "FR3_GRASP_LOOP_DATASET_ROOT",
     "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL",
     "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
+    "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
@@ -449,6 +451,9 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     _set_optional_int_env(
         options, raw, "graspLoopMaxPolicySteps", "FR3_GRASP_LOOP_MAX_POLICY_STEPS", minimum=1
     )
+    # Where the pegs go and arm B's draws. Blank leaves the runtime's 0, which every page run
+    # used until 10-20: the 150 trials of 10-19 were 58 positions, the first 42 three times over.
+    _set_optional_int_env(options, raw, "graspLoopSeed", "FR3_GRASP_LOOP_SEED", minimum=0)
     if _parse_bool_field(raw.get("graspLoopAttended", False), "graspLoopAttended"):
         options["FR3_GRASP_LOOP_ATTENDED"] = "1"
     grasp_arms = _optional_text(raw.get("graspLoopArms"))
@@ -476,6 +481,11 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if not 1 <= len(numbers) <= 2 or len(numbers) != len(parts) or numbers[0] > numbers[-1]:
             raise RolloutError("graspLoopFunnelTakeoverDzMm must be 'h' or 'low,high' in mm, low <= high.")
         options["FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM"] = ",".join(f"{value:g}" for value in numbers)
+    # Arm B's corrective demonstrations; the runtime refuses them without arm B.
+    if _parse_bool_field(raw.get("graspLoopFunnelCorrective", False), "graspLoopFunnelCorrective"):
+        if (grasp_arms or "A") == "A":
+            raise RolloutError("graspLoopFunnelCorrective shapes arm B's funnel: choose arm B or AB.")
+        options["FR3_GRASP_LOOP_FUNNEL_CORRECTIVE"] = "1"
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         options["FR3_GRASP_LOOP_DATASET_ROOT"] = ""
@@ -1192,6 +1202,10 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
                     parsed["message"] = "Grasp loop is waiting: is the peg in the hole? Answer in or out."
                 elif event["message"].startswith("hold"):
                     parsed["message"] = "Grasp loop stopped with the peg still in the fingers: take hold of it, then press Continue and the fingers open."
+                elif event["message"].startswith("reflex") and "user stop" in event["message"]:
+                    parsed["message"] = "Grasp loop is waiting: the arm's user stop ended its control loop (the button, or the robot's daily self-test). Release it, let the self-test finish, check nothing is trapped, then press Continue."
+                elif event["message"].startswith("reflex") and "control link" in event["message"]:
+                    parsed["message"] = "Grasp loop is waiting: the arm stopped because its commands stopped arriving (communication reflex). Check nothing is trapped, then press Continue."
                 elif event["message"].startswith("reflex"):
                     parsed["message"] = "Grasp loop is waiting: the arm tripped its collision reflex. Check nothing is trapped, then press Continue."
                 else:

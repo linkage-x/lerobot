@@ -560,6 +560,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-funnel-corrective',
+        action='store_true',
+        help=(
+            'Arm B: record corrective demonstrations. The funnel leaves part of the policy\'s own aim '
+            'error for the descent to close, and on some trials takes over low and lifts before '
+            'realigning (grasp_loop GRASP_LOOP_CORRECTIVE_*). Off: the v14 (3) funnel.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-dataset-root',
         type=Path,
         default=None,
@@ -5618,6 +5627,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 insertFollowSeat=bool(args.grasp_loop_insert_follow_seat),
                 insertViaHome=bool(args.grasp_loop_insert_via_home),
                 funnelAlignDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_takeover_dz_mm),
+                funnelCorrective=bool(args.grasp_loop_funnel_corrective),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -5643,6 +5653,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 else 'insert=off '
             )
             + 'funnel_takeover_dz_mm=%g..%g ' % grasp_loop_request.funnelAlignDzMm
+            + f'funnel_corrective={int(grasp_loop_request.funnelCorrective)} '
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
@@ -6531,6 +6542,12 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     command_source=command_source,
                     on_seam=on_seam,
                     keeps_policy_frames=dagger_buffer.keeps_policy_frames,
+                    policy_off_course=(
+                        command_source == 'policy'
+                        and grasp_handover is not None
+                        and grasp_handover.funnel is not None
+                        and grasp_handover.funnel.lowPolicyStep
+                    ),
                 )
                 is_intervention = step_role == 'expert'
                 if step_role == 'skip':
@@ -6767,6 +6784,17 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         # of the controller being stopped, and the arm is dropped out of control mid-hold. A
         # path typo should not be able to do that to a running arm.
         robot.connect()
+        control_thread = getattr(robot, 'control_thread_report', lambda: None)()
+        if control_thread is not None:
+            # What libfranka's 1 kHz loop actually runs at (2026-10-20: SCHED_OTHER on the NUC).
+            print(
+                f"[INFO] fr3_control_thread realtime_config={control_thread.get('realtimeConfig')} "
+                f"reason={str(control_thread.get('reason')).replace(' ', '_')} "
+                f"kernel_realtime={int(bool(control_thread.get('kernelRealtime')))} "
+                f"policy={control_thread.get('policy')} priority={control_thread.get('priority')} "
+                f"tids={','.join(str(t) for t in control_thread.get('tids') or []) or '-'}",
+                flush=True,
+            )
         if args.mujoco_viewer:
             mujoco_visualizer = FR3InferenceMujocoVisualizer(
                 model_path=mujoco_model_path,

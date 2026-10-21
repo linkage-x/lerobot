@@ -459,19 +459,25 @@ class HandoverSeam:
         return on_seam
 
 
-def dagger_step_role(*, command_source: str, on_seam: bool, keeps_policy_frames: bool) -> str:
+def dagger_step_role(
+    *, command_source: str, on_seam: bool, keeps_policy_frames: bool, policy_off_course: bool = False
+) -> str:
     """What one control step is to the buffer: 'expert', 'policy' (both written), 'skip' or 'gap'.
 
     'gap' is offered to the buffer as a frameless step, which closes the open span; 'skip' is not
     offered at all. The two differ only for a whole-trial buffer: there the funnel's handover seam
     is left out of the episode without cutting the trial in two at the moment the expert arrives.
+    ``policy_off_course`` leaves a policy step out the same way: the low, off-centre descent a
+    corrective funnel's late takeover then recovers from, which the merge would otherwise
+    supervise like any other step. Not a cut either, since a second episode would start low and
+    pull the start-pose contract with it.
     """
     if command_source in ('expert', 'funnel'):
         if not on_seam:
             return 'expert'
         return 'skip' if keeps_policy_frames else 'gap'
     if command_source == 'policy' and keeps_policy_frames:
-        return 'policy'
+        return 'skip' if policy_off_course else 'policy'
     return 'gap'
 
 

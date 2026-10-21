@@ -6,6 +6,8 @@ const VERDICT_COLORS: Record<string, string> = {
   empty: "#e53e3e",
   no_close: "#dd6b20",
   collision: "#9b2c2c",
+  comm_loss: "#805ad5",
+  user_stop: "#4a5568",
   not_graded: "#718096",
   voided: "#a0aec0"
 };
@@ -20,6 +22,8 @@ const VERDICT_LABELS: Record<string, string> = {
   empty: "空抓",
   no_close: "没合手",
   collision: "碰撞保护",
+  comm_loss: "通信丢包（不计）",
+  user_stop: "急停/自检（不计）",
   not_graded: "未评",
   voided: "作废（销倒了）"
 };
@@ -92,7 +96,13 @@ export function GraspLoopPanel({
             </span>
           ) : progress.needsOperator.startsWith("reflex") ? (
             <span>
-              <strong>需要你：</strong>机械臂触发了碰撞保护，已停住。确认手指下没有压着东西、周围安全后点「安全，恢复」——
+              <strong>需要你：</strong>
+              {progress.needsOperator.includes("user stop")
+                ? "机械臂的急停被触发（按钮，或机器人每日自检），已停住，不是碰撞。先松开急停、等自检结束，"
+                : progress.needsOperator.includes("control link")
+                  ? "机械臂收不到控制指令（通信丢包）触发保护，已停住，不是碰撞。"
+                  : "机械臂触发了碰撞保护，已停住。"}
+              确认手指下没有压着东西、周围安全后点「安全，恢复」——
               机械臂会松爪、竖直抬起、回原位，然后再请你放回销子。
             </span>
           ) : (
