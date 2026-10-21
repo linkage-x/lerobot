@@ -137,6 +137,7 @@
 | lr | 5e-5，warmup 200，cosine 衰减到 5e-6 | 相同 |
 | 衰减步数 | 45000 | 30000 → 45000 |
 | 总步数 | **45000**，每 5k 存一次 | 30000 → 45000 |
+| 训练机 | **Dante，RTX 5090（hph@192.168.1.64）** | dev box 4090D → 5090 |
 | 精度 | bf16，gradient checkpointing，use_amp false（训完再对齐） | 相同 |
 | loss 权重 | [1, 1, 1, 0.2, 2] | 相同 |
 | 训练 seed | 1000 | 相同 |
@@ -146,7 +147,7 @@
 - 071246 训了 313 个 episode、110687 帧，30k × 8 ≈ 2.17 个 epoch。
 - 它的 loss 在第 1 到第 2 个 epoch 之间还在下降（约 0.073 → 0.058），没有饱和。
 - 新视图 178486 帧，30k 步只有 1.34 个 epoch；45k 步是 2.02 个 epoch，和 071246 持平。
-- 用时按 071246 的 1.04 s/步估算，约 13 小时。
+- 用时：071246 在 4090D 上是 1.04 s/步，约 13 小时。10-21 在 5090 上用同一配置做了两次 60 步冒烟，每步 0.68–0.74 s，45k 步约 **8.5–9.2 小时**；显存峰值 13.1 GB（共 32 GB）。
 
 ### 新视图名
 
@@ -154,8 +155,10 @@
 
 ### 启动步骤
 
+训练机从 10-21 起换成 Dante（RTX 5090，hph@192.168.1.64）。准备情况见文末《附：5090 训练机准备（10-21）》。
+
 1. **建议先把工作树提交：** 3a3d420a 之后的改动都还没提交，提交后 checkpoint 才能对应到一个 commit。
-2. **在 NUC 上合并：**
+2. **在 NUC 上合并（10-21 已做）：**
 
    ```bash
    C=fr3_spacemouse-insert__delta_ee_from_prev_cmd__L4_full48_plus_dagger108_plus_funnel105_030000__pi05__20260930_053656_030000
@@ -167,20 +170,20 @@
      --output-root outputs/exports/training_views/$N --repo-id local/$N --no-base-episodes
    ```
 
-   合并后检查三件事：
+   合并后检查三件事（10-21 已查，全部通过：303 个；起始位姿 (0.3811, −0.1353, 0.0970)、std 0，和 071246 视图相同；466 个 episode、178486 帧能打开）：
    - `start_pose_episodes` 是 303 个（150 + 153 个 whole-trial episode）；
    - 起始位姿约定等于 030000 的；
    - LeRobotDataset 能打开。
-3. **拷到 dev box：** 用 `rsync --copy-links` 拷到 `/home/hanyu/Codes/lerobot_train/outputs/exports/training_views/$N`。前端要求两边的相对路径一致。
-4. **停 policy server 腾显存：** 在 dev box 上跑 `bash run/policy_server.sh stop`。训练期间不能 rollout。
+3. **拷到训练机（10-21 已做）：** 用 `rsync --copy-links` 拷到了 `hph@192.168.1.64:~/Codes/lerobot_train/outputs/exports/training_views/$N`，dev box 的 `/home/hanyu/Codes/lerobot_train` 下也有一份（备用）。三处大小都是 1598981867 字节。前端要求两边的相对路径一致。
+4. **policy server 不用停：** 训练在 5090 上跑，policy server 留在 dev box 4090D，训练期间照样能 rollout。只有退回 dev box 训练时，才需要先跑 `bash run/policy_server.sh stop`。
 5. **启动训练：** `POST http://192.168.1.156:8765/api/training/start`，payload 如下：
 
    ```json
    {
-     "hostId": "hanyu@192.168.1.179:/home/hanyu/Codes/lerobot_train",
+     "hostId": "hph@192.168.100.240:/home/hph/Codes/lerobot_train",
      "viewName": "fr3_spacemouse-insert__delta_ee_from_prev_cmd__trial150_plus_funnel163_plus_corrective153_from030000",
      "policy": "pi05",
-     "pretrainedPath": "/home/hanyu/.cache/huggingface/hub/models--lerobot--pi05_base/snapshots/a538eb273274eb30f126a118f39dbc0ee212c883",
+     "pretrainedPath": "/home/hph/.cache/huggingface/hub/models--lerobot--pi05_base/snapshots/a538eb273274eb30f126a118f39dbc0ee212c883",
      "loraEnabled": true, "loraR": 64, "loraAlpha": 64,
      "loraTargetModules": "(.*\\.gemma_expert\\..*\\.(self_attn\\.(q|k|v|o)_proj|mlp\\.(gate|up|down)_proj)|model\\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))",
      "steps": 45000, "batchSize": 8, "numWorkers": 4, "saveFreq": 5000, "logFreq": 50,
@@ -192,8 +195,8 @@
 
 6. **训完之后：**
    - 用 gateway 把 checkpoint 拉到 NUC（会自动设 use_amp=true）。
-   - 两份 dev box 拷贝都跑一次 `fr3_align_checkpoint_use_amp.py`。
-   - 手工拷进 policy server 的 repo，然后 `ensure --warm-last`。
+   - 训练机上的拷贝也跑一次 `fr3_align_checkpoint_use_amp.py`。
+   - 手工拷进 policy server 的 repo（现在是 dev box 的 `lerobot_workstation/outputs`，同一相对路径，带上视图的 `meta/`），然后 `ensure --warm-last`。
 
 ## 五、A 臂对比评估
 
@@ -206,3 +209,33 @@
   - 合手高度和横向误差；
   - 失败方式的分布，特别是“高位停住/漂走”的占比，它决定第二节那个触发要不要做。
 - **为什么要重测：** 071246 之前的 4/10 是在 seed 0、也就是训练见过的位置上测的，偏乐观。030000 也要在 600 步下重测。
+
+## 附：5090 训练机准备（10-21）
+
+`hph@192.168.1.64`（主机名 Dante）：RTX 5090 32 GB，驱动 595.99，32 核，62 GB 内存，剩 1.4 TB 盘。它的 `~/Codes` 和 `~/.cache/huggingface` 是从 dev box 整个拷过去的。
+
+已做：
+- **venv：** 从 dev box 拷过去的两个 `.venv-fr3` 路径不对：editable install 指向 `/home/hanyu/...`，`lerobot_workstation` 用的还是 dev box 的 miniconda Python。我先临时修过。15:17–15:29 用户在 Dante 上用 uv（`tools/fr3/setup_workstation_teleop_env.sh`）把两个 venv 都重建了，基于 `/usr/bin/python3.12`。重建后复查：两个 venv 都是 torch 2.10.0+cu128，sm_120、bf16 可用，editable install 指向各自的 `src`，`tools.fr3.fr3_policy_server` 能导入。
+- **基座权重：** a538eb2 的 `model.safetensors` sha256 和 dev box 的一致；paligemma 也在缓存里。gateway 的远程启动命令在 `/home/tele/Models` 没有 hub 缓存时，会退到 `~/.cache/huggingface/hub` 并切离线，Dante 正是这种情况。
+- **机器探测：** gateway 的 `probe_training_machine.py` 报告 pi05 和 LoRA 都可训。
+- **代码：** 用 `run/sync_to_target.sh` 同步到了 `~/Codes/lerobot_train`；同步前确认 NUC 上的代码和工作站工作树相同。
+- **冒烟训练：** 新视图加正式配置跑了 60 步，venv 重建前后各一次：权重全部加载，loss 2.53 → 0.70（两次完全相同），0.68 / 0.74 s/步，显存峰值 13.1 GB。输出已删。注意 trainer 还会往视图里写 `runs/<job>/` 两个生成的配置文件，这个也删了，视图又和 NUC 的逐字节一致。
+- **网络：** 10-21 下午 Dante 重启后，三个有线口都没接网线（NO-CARRIER），只有 Wi‑Fi `192.168.100.240`。NUC 走 Wi‑Fi 去 Dante，RTT 180–260 ms。训练只同步代码、拉日志，所以够用。policy server 不能走这条路。
+- **NUC gateway 已登记训练机：** `~/.config/lerobot-gui/training_hosts.json` 里新增两条：
+  - 现在用 `hph@192.168.100.240:/home/hph/Codes/lerobot_train`（Wi‑Fi）。
+  - 网线接回后用 `hph@192.168.1.64:...`。
+  - 原 dev box 条目保留，备份在 `.bak-20261021`。
+  - 通过 gateway 的 `/api/training/machine` 探测 Wi‑Fi 那条：pi05 可训，LoRA 可用。
+
+**训练目录仍是 `lerobot_train`，不是 `lerobot_workstation`：** gateway 每次开训前，会用 `--delete-delay` 把 NUC 的代码同步进训练目录（只排除 .git、outputs、notes、venv）。如果训练目录就是开发 checkout，没部署的改动和未跟踪的文件每次开训都会被覆盖或删掉。
+
+还差：
+- （已完成）用户已把 NUC 的训练 key 加进 Dante 的 `authorized_keys`。
+
+迁移其余职能时要做（这次没做）：
+- **policy server 搬到 Dante：**
+  - `sudo ln -s ~/.cache/huggingface/hub/models--lerobot--pi05_base/snapshots/<030000 用的 snapshot>/model.safetensors /home/tele/Models/pi05_base/model.safetensors`。030000 的 adapter 指着这个路径，现在这个目录是空的。
+  - ufw 放行 192.168.1.156 → 8790/tcp。
+  - 改 `run/deploy.sh` 里的 `policy_remote` / `policy_dir` / `policy_address`。
+  - 改前端默认的 policy 地址。
+- **部署机：** Dante 没有 node/npm（deploy 要起前端）和 uv；它的 `lerobot_workstation` 是今天上午的拷贝，缺这份文档，迁移时再同步一次。Dante → NUC 的 SSH 也还没验证。
