@@ -98,3 +98,23 @@ def test_view_refuses_sources_in_different_world_frames():
     fr3_train_il_policy.assert_single_source_world(roots, [fr3, fr3])
     with pytest.raises(ValueError, match="a_export=fr3_base, b_export=<unstamped>"):
         fr3_train_il_policy.assert_single_source_world(roots, [fr3, {}])
+
+
+def test_view_refuses_fr3_base_sources_exported_through_different_edges():
+    roots = [Path("a_export"), Path("b_export")]
+
+    def info(tx, created):
+        return {
+            "world_frame": {
+                "world_frame_id": "fr3_base",
+                "status": "ok",
+                "reexpressed_from": {"world_frame_id": "world_a", "status": "ok"},
+                "T_target_source": [[1, 0, 0, tx], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+                "edges": [{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "created_utc": created}],
+            }
+        }
+
+    with pytest.raises(ValueError, match="edge"):
+        fr3_train_il_policy.assert_single_source_world(
+            roots, [info(0.1, "2026-10-14T09:17:42Z"), info(0.104, "2026-10-15T03:08:47Z")]
+        )
