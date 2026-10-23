@@ -171,13 +171,16 @@ def contact_summary(run: dict[str, Any]) -> dict[str, Any] | None:
     Franka's F_ext_hat_K is what the robot applies to the world (10-12's payload runs read +Fz for a
     load heavier than Desk's: the arm pushing it up). The press is straight down onto the ball's stand,
     so with ``F_ext_frame`` "O" (fr3_base) it is -Fz. Older runs logged K_F_ext_hat_K (tool frame).
+    Runs with ``F_ball`` (fr3_pivot_auto execute from 10-20 17:00: the force at the ball that explains
+    tau_ext, no moment) are read from that instead: F_ext read a pull 19-24% of the time where it never was.
     """
-    if "F_ext" not in run or not run["F_ext"]:
+    key = "F_ball" if run.get("F_ball") else "F_ext"
+    if not run.get(key):
         return None
-    F = np.asarray(run["F_ext"], dtype=float)
+    F = np.asarray(run[key], dtype=float)
     phase = np.asarray(run.get("phase") or [1] * len(F))
     pivot = (phase > 0) & (phase < phase.max()) if phase.max() > 1 else np.ones(len(F), bool)
-    down = -F[:, 2] if run.get("F_ext_frame") == "O" else F[:, 2]
+    down = -F[:, 2] if key == "F_ball" or run.get("F_ext_frame") == "O" else F[:, 2]
     press = down[pivot] if pivot.any() else down
     return {
         "press_median_n": round(float(np.median(press)), 2),

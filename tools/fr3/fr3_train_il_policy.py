@@ -38,6 +38,7 @@ from tools.fr3.fr3_delta_action_transform import (  # noqa: E402
     derive_delta_action,
     summarize_delta_scale,
 )
+from tools.thor.gmsl2 import label_provenance  # noqa: E402
 
 
 DEFAULT_DATASET_ROOT = Path("dataset_test/single_cube2_20260429_165325")
@@ -334,6 +335,17 @@ def assert_single_source_world(src_roots: list[Path], source_infos: list[dict[st
             f"{root.name}={world or '<unstamped>'}" for root, world in zip(src_roots, worlds, strict=True)
         )
         raise ValueError(f"Source datasets are in different world frames ({listing}); export them in one frame.")
+    # One world id is not one set of labels: extrinsics, camera state and the fr3_base
+    # edge each move them by millimetres under the same id (label_provenance).
+    try:
+        key = label_provenance.assert_compatible_datasets(
+            [(root.name, info) for root, info in zip(src_roots, source_infos, strict=True)]
+        )
+    except label_provenance.MixedLabelsError as exc:
+        raise ValueError(str(exc)) from exc
+    current_edge = label_provenance.current_edge_key(_REPO_ROOT, source_infos[0].get("world_frame"))
+    for warning in label_provenance.label_warnings(key, current_edge):
+        print(f"WARNING: {warning}", flush=True)
 
 
 def prepare_dataset_view(

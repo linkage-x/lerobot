@@ -309,7 +309,24 @@ FR3 physical tracking 当前<b>没有独立 GT 实测值</b>；这里的 1–2 m
 <li>UMI 标签在 fr3_base 下对真值（不含 FR3 执行）p95 6.5 mm：恒定约 4.6 mm（world → fr3_base 注册边）+ 扣掉后 p95 2.35 mm。</li>
 <li>FR3 执行（激光 vs 指令）p95 3.8 mm。</li>
 </ul>
-<b>7.7 mm 不是「UMI 轨迹精度」</b>，原因有三：它含 FR3 执行误差；只有一条慢速轨迹；回放目标坐标系的常量（−10.3 mm）有一部分就是用这条录制拟合的。它取代不了上面的规划数，只说明完整 E2E 在当前注册下落在规划区间的上沿之外，最大的一项是注册边。详见激光 roadmap W3f「10-13 端到端第二测」。
+<b>7.7 mm 不是「UMI 轨迹精度」</b>，原因有三：它含 FR3 执行误差；只有一条慢速轨迹；回放目标坐标系的常量（−10.3 mm）有一部分就是用这条录制拟合的。它取代不了上面的规划数，只说明完整 E2E 在当前注册下落在规划区间的上沿之外，最大的一项是注册边。详见激光 roadmap W3f「10-13 端到端第二测」。<b>10-14 更正：</b>−10.3 mm 吃进了约 5 mm 的注册边误差，FR3 pivot 与卡尺都证实球窝在 EE −5.06 mm，常量已改；注册边本身在这块工作区实际差约 10.7 mm，已换成球位刚体边（Phase 9）。
+</div>
+</div>
+
+<div style="background:#fff;border:2px solid #15803d;border-radius:12px;padding:18px 20px;margin:12px 0">
+<div style="font-size:13px;color:#6b7280;letter-spacing:.04em">fr3_base 下的 UMI 标签 · 第一个端到端估计（2026-10-15，只限 10-14 下午这一个相机状态）</div>
+<div style="font-size:26px;font-weight:800;line-height:1.2;margin:6px 0 8px;color:#15803d">单帧 ≈ 2.0 mm rms · p95 ≈ 3.3 mm</div>
+<div class="small" style="margin-top:8px">
+数据是五个球位的同球检验，参考是 FR3 FK 算出的球心（不经过相机；当天激光对 FK 0.46 mm rms）。误差拆成三项：
+<ul>
+<li>球边误差传到工作区：1.2 mm；</li>
+<li>标签随位置的系统偏差：≤ 1.4 mm（全部算在标签头上，所以是上限）；</li>
+<li>单帧抖动：0.93 mm。</li>
+</ul>
+合计与留一 2.63 mm 自洽；多帧平均后的静态点约 1.8 mm。
+<b>这是估计，不是认证</b>，p95 也仍略高于 3 mm。它只对一个相机状态成立，相机一跳就作废（10-13 下午到 10-14 下午就跳过一次），所以 Phase 8 的相机状态检查是引用这个数的前提。逐帧独立的端到端，要在同一天用激光测。
+<br/><b>回放端到端</b>再叠加两次实测的 FR3 执行误差，估计 p95 约 4–4.5 mm。大头是执行（单独 p95 3.4–3.8 mm），所以迭代学习成了回放达到 3 mm 的前提。
+<br/><b>3 mm 但书（10-14）：</b>到 10-13 为止，没有一个数能在生产配置、在数据实际使用的 fr3_base 下证明 TCP p95 ≤ 3 mm。此前 ≤ 3 mm 的数都依赖生产没上线的时间偏置、≥ 4 台相机覆盖，或者扣掉的注册边常量。
 </div>
 </div>
 
@@ -559,6 +576,14 @@ FR3 physical tracking 当前<b>没有独立 GT 实测值</b>；这里的 1–2 m
 </div>
 </details>
 
+<div class="callout ok"><b>2026-10-15 补：上面的 (b) 已经做了，BOX 配帧口径切换上线；顺带更正 −5 ms 的口径。</b>
+<ul>
+<li><b>口径更正。</b>生产里相机时刻只有一个用途：给 BOX 数据（IMU、夹爪、力、触觉）找对应的相机帧（<span class="mono">camera_frame_times_rel</span>）。标签位置本身不随时间偏置变，参与三角化的相机是硬同步的。所以「补上 −5 ms 后 p95 3.12 → 2.02 mm」只在拿激光时钟比相机标签时才成立；生产数据真正吃到的是 BOX 与标签之间的配帧误差。</li>
+<li><b>d_box 不是常量。</b>right BOX（<span class="mono">box1819152274</span>）在 10-13 / 10-14 的传输延迟 d_box 复核为 7.9–9.6 ms（估计器改取跨相机曝光中位数之后），随 session 变，08-25 的 3.2 ms 已不成立。曝光实为约 10 ms，所以快速运动下的主项是拖影 / 漏检，不是时钟。</li>
+<li><b>10-15 深夜切换。</b>相机读在曝光中点（<span class="mono">EXPOSURE_CENTER_FRACTION = −0.5</span>），表里有的 BOX 再加自己的 d_box（<span class="mono">box_time_delays.json</span>，right 9.0 ms）。夹爪、扳机、IMU、六维力改为线性插值（相邻样本间隔 &gt; 25 ms 不插），触觉仍取最近邻。跟踪后 <span class="mono">box_realign.py</span> 按本数据集自估的 d_box（r ≥ 0.8 才用，否则查表）重配，<span class="mono">meta.json</span> 写明每个 BOX 读在哪里。验收：陀螺对跟踪角速度的残余延迟从 +2.0 ~ +6.0 降到 −0.25 ~ +0.75 ms。</li>
+<li><b>还没覆盖的。</b>left BOX 和所有单 BOX 录制不在表里（单 BOX 时传感器 id 不带设备号，认不出是哪台），仍读在原始 SOF。touch 的最近邻（上面的 4.8 ms）没动。</li>
+</ul>
+<span class="small">详见激光 roadmap 10-15（晚）与 10-15（深夜）两条。</span></div>
 <div class="gate"><b>Gate：</b>在 IMU factor graph 前，把 effective timing uncertainty 压到亚毫秒附近，并证明其 p95 motion-equivalent translation / rotation error 落在分配给 timing 的误差预算内。
 <br/><b>2026-08-25 状态：偏移本身已达标（逐 episode σ 0.20–1.16 ms，跨 session 复现到 0.3 ms），端到端未达标。</b>
 瓶颈已定位且不是时钟：<span class="mono">observation.state</span> 的<b>最近邻查表</b>在 touch 上单项就是 4.8 ms。
@@ -636,6 +661,14 @@ FR3 physical tracking 当前<b>没有独立 GT 实测值</b>；这里的 1–2 m
 <div class="callout warn" data-block="world-frame-todo">
 <b>剩余缺口（4 条）：</b>① Thor 上的基准已到位且随例行 deploy 同步（<b>但不得在 Thor 上另跑 freeze</b>——那会让同一个物理系有两个 ID，正是本机制要防的），GUI 面板仍需部署 gateway 与前端 build；② <b>episode 侧已于 2026-08-28 落地、尚待部署</b>（<span class="mono">tools/thor/gmsl2/world_provenance.py</span>：录制器开机读冻结基准，写进每条 episode 的 <span class="mono">meta.json</span> 与数据集 <span class="mono">meta/info.json</span>；export 侧拒绝把两个 world 的 episode 合成一个数据集）。<b>derived trajectory 仍未写</b>；<b>生效需要一次 gateway 重启</b>（见执行主线 P0-Now ③）；③ common-mode watchdog 的锚点接口（<span class="mono">--anchor</span>）已就位，但还没有实际的固定基准可读；④ 新阈值只由「同一天两次采集」一组数据定出，仍缺跨天/跨周的无扰动基线。
 </div>
+<div class="callout warn" data-block="world-frame-1015">
+<b>2026-10-14 ~ 10-15：相机集体低头，外参重标，world 按光心注册、沿用原 id。</b>
+<ul>
+<li><b>不是尺度问题。</b>10-13 / 10-14 读到的「相机 world 比 FR3 FK 小 0.34–0.7%」不显著，而且都经过手持方块。逐环核对后，FK 对激光、相机 rig 对 FK（+0.05 ~ +0.12%）都没有 0.5% 级的尺度。激光 roadmap v1.19–v1.21 里「到源头修尺度」的说法已撤回。</li>
+<li><b>真正的问题。</b>09-30 之后七台相机绕自身 x 轴低头 0.18–0.60°（cam_03 0.60、cam_08 0.48 … cam_12 0.18），光心只动了 0.2–0.7 mm，0928 外参已经过期。各台一起低头的共模部分在相机之间的一致性里看不出来。这又是一个「共模看不见」的例子。</li>
+<li><b>world 怎么延续。</b>位姿共识在这里给不出对的答案。按 0.75° 容差，转了 0.4° 的相机会被当成「稳定」而保留旧朝向，到工作区约差 6 mm；判严一点又变成歧义，只能开新 island。物理事实是光心没动、朝向变了，所以新增了 <span class="mono">--register-by camera_centres</span>（opencv_kalibr）：用光心定 world（0.42 mm RMS），朝向全部重测，<span class="mono">world_20260928_063531</span> 的 id 不变，只记一条 revision。<b>这是上面 stable-camera consensus 的一个例外：全体相机同向小角度转动时，要按光心注册，不能按位姿共识。</b></li>
+<li><b>上线。</b><span class="mono">calib_20261014_180431</span>（BA 0.282 px，内参按序列号取，和 0928 逐字节相同）已换上生产，10-09 起有 sidecar 的 13 个数据集都用新外参重跟过。10-13 下午到 10-14 下午之间相机又跳了一次，所以 10-09 ~ 10-13 的录制重跟后仍判 stale（见 Phase 8 的相机状态）。</li>
+</ul></div>
 <p class="small">gauge 与 canonical frame 的完整理论（8 条）、稳定相机识别算法与不可观测模式、已实现模块清单、阈值实测的完整对拍过程与冻结论证 → <a href="box_umi_metrology_method.html#world"><b>Metrology 方法学</b></a>。</p>
 <div class="gate"><b>Gate：</b>外参/重注册全程不依赖 robot FK。若 stable-camera consensus 成立，则当前 session 注册回原 canonical <span class="mono">W</span>；若所有相机移动且无法恢复 <span class="mono">T_Wnew←Wold</span>，必须进入 <span class="mono">BROKEN</span> 状态并创建新 <span class="mono">world_frame_id</span>。<b>这不阻塞旧数据的 relative / bimanual / training-facing 使用，只阻塞跨 world 的 absolute replay。</b>桌面/环境 anchor 仅用于 common-mode drift watchdog 或后验 reconnect。</div>
 </div>
@@ -1294,6 +1327,23 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <p class="small"><b>已有：</b><span class="mono">verification/verify_processed_pose_dataset.py</span> 已覆盖非有限行、冻结位姿、index 断裂、鲁棒跳变与 FFT 高频检查；<span class="mono">verify_fr3_cube_pose_ik.py</span> 已能做单机/episode 级可达性标签，是 Phase 10 的输入而不是最终 replay 证明。</p>
 </div>
 </details>
+<div class="callout ok"><b>2026-10-15 / 10-19 补：两道新的数据准入检查。</b>
+<ul>
+<li><b>相机状态随每次录制自动记录（10-15）。</b>
+  <ul>
+  <li>指标是跟踪器 corner BA 的重投影残差中位数（外参固定，每个方块 ≥ 100 帧），&gt; 1 px 判为 stale。外参刚标完时是 0.4–0.7 px；10-09 ~ 10-13 七台相机低了头没人发现，那段时间一直是 1.55–1.62 px。</li>
+  <li>结论和所用外参 id 写进 <span class="mono">info.json</span>（<span class="mono">derived.april_cube_tracking_in_robot_base.camera_state</span>），GUI 的 tracking evidence 里能看到。代码在 <span class="mono">metrology/camera_state.py</span>。</li>
+  <li>存量已回填：10-14 下午 7 个 ok；10-09 ~ 10-13 和 10-05 ~ 10-08 都是 stale。</li>
+  <li>不另做「录制前」检查，因为那等于多录一段，用上一段录制的状态代替。</li>
+  </ul></li>
+<li><b>标签链防混用（10-19）。</b>
+  <ul>
+  <li>问题：<span class="mono">world_frame_id</span> 只说位姿在哪个系，不说在那里测得多好。外参重标沿用 world id、相机低头、注册边原地替换、marker→TCP bundle、BOX 配帧口径，都会让标签差几 mm，却不改 world id。</li>
+  <li>做法：<span class="mono">tools/thor/gmsl2/label_provenance.py</span> 按 session 收集这条链，写进 <span class="mono">info.json</span>。导出时任一字段混用就拒绝（<span class="mono">--allow-mixed-labels</span> 可以覆盖，并留痕；<span class="mono">--check</span> 只检查不写）。训练入口拒绝把 key 不同的数据集放在一起。</li>
+  <li>顺带修了导出「先删旧导出、再做检查」的问题，现在被拒时旧导出还在。</li>
+  <li>Thor 实测：10-05 ~ 10-06 的大批 session（p0 外参，stale）和 10-14 混在一起导出会被拒。</li>
+  </ul></li>
+</ul></div>
 <div class="gate"><b>Gate：</b><span class="mono">tracking_pass ∧ qc_pass ∧ bimanual_pass</span> 后，episode 才进入 dual-FR3 executability；不要因为“能数值化输出 pose”就当成可训练、可重播数据。</div>
 </section>
 
@@ -1351,6 +1401,14 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 </ul>
 </div>
 </details>
+<div class="callout warn" data-block="registration-edge-1014">
+<b>2026-10-13 ~ 10-15：单臂 world → fr3_base 注册边的第一轮实测与换边（right；9.1 的平台 ArUco 和左臂都还没开始）。</b>
+<ul>
+<li><b>同球检验。</b>FR3 和手持 UMI 先后绕桌上同一个球 pivot，球心分别落在 fr3_base 和相机 world 里。<span class="mono">e = T_world_base·c − b</span> 就是这条边在该处的误差，不经过激光，也不依赖 TCP 定义。10-14 三个球位：10-09 单 tag 手眼边差 10.7–13.3 mm，主要是约 10.7 mm 的竖直平移，不是此前以为的 4.6 mm（那 4.6 mm 是另有约 5 mm 被回放常量 −10.3 吃掉之后剩下的，见 Phase 12）。</li>
+<li><b>球位刚体边（10-14 晚）。</b>补到五个球位，含一个换高度的 ④ 和一个留出点 ⑤。手持一侧改为各球位共用一个偏移后，用 ①–④ 拟合的刚体边预测 ⑤ 差 3.4 mm（现役边 5.7 mm），留一 rms 3.1 mm。这条边不带尺度，已经通过标定页的换边接口写进 <span class="mono">world_graph.json</span>，旧边保留在 supersedes 里。</li>
+<li><b>激光独立验收只能证到 5–6 mm。</b>用激光站位 × 回放合成一条独立的边，它和新边在回放工作区差 5.9 mm / 0.54°，和旧边差 9.7 mm / 1.20°。5.9 mm 是激光站位自身精度的量级（站位 rms 3.4 mm），证不到 3 mm。</li>
+<li><b>10-15 外参重标后按新标签重解。</b>激光边和球边之间的约 4 mm 差，来自两次录制处在相机的不同状态（见 2.4 的 10-14 ~ 10-15 条）。重解后球边留一 2.63 mm、尺度 −0.07%，激光站位 rms 1.02 mm、尺度 +0.045%。这条边下的端到端估计见误差预算一节的 10-15 框。</li>
+</ul></div>
 <div class="gate"><b>Gate：</b>session registration 通过；左右共享的 alignment / absolute frame contract 可复现；初始 pose、gripper、object/contact state 满足任务要求后，才允许进入 retarget。</div>
 </section>
 
@@ -1454,14 +1512,27 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 </div>
 <div class="callout ok"><b>首个单臂实测（2026-10-13，right，一条轨迹）。</b>
 <ul>
-<li><b>TCP 定义对齐。</b>相机轨迹的 TCP 是插件 v2 的球窝中心，FR3 原来驱动的是 URDF 的 <span class="mono">corenetic_gripper_ee</span>。后者在实物上基本就在指尖端（闭合时法兰到鼻尖尺量 175 mm），两点沿工具轴差约 10 mm。现在回放驱动新加的 <span class="mono">corenetic_socket_ee</span>（EE −10.3 mm，激光量的）。端到端 p95 从 15.7 降到 7.74 mm。</li>
+<li><b>TCP 定义对齐。</b>相机轨迹的 TCP 是插件 v2 的球窝中心，FR3 原来驱动的是 URDF 的 <span class="mono">corenetic_gripper_ee</span>。后者在实物上基本就在指尖端（闭合时法兰到鼻尖尺量 175 mm），两点沿工具轴差约 10 mm。现在回放驱动新加的 <span class="mono">corenetic_socket_ee</span>（EE −10.3 mm，激光量的）。端到端 p95 从 15.7 降到 7.74 mm。<b>10-14 更正：</b>−10.3 mm 是端到端拟合出来的，吃进了约 5 mm 注册边误差。FR3 扣着固定球做 pivot（人手转姿态），9 次合并拟合给出球窝在 <span class="mono">corenetic_gripper_ee</span> 的 (1.45, −0.78, −5.06) mm，σ ≤ 0.35 mm；卡尺量法兰端面到球窝 166.9 mm，和 pivot 预测的 166.93 mm 一致。URDF / MJCF 的 <span class="mono">corenetic_socket_ee</span> 已改成这个实测值。</li>
 <li><b>剩下的分账</b>（mm，p95 / RMS）：
   <ul>
-    <li>注册边（world → fr3_base，10-09 单 tag 手眼）：恒定约 4.6；</li>
+    <li>注册边（world → fr3_base，10-09 单 tag 手眼）：恒定约 4.6。10-14 同球检验查明这条边在这里实际差约 10.7 mm，另有约 5 mm 被 −10.3 吃掉了，已换成球位刚体边，见 Phase 9；</li>
     <li>UMI 标签扣掉恒定后：2.35 / 1.41；</li>
     <li>FR3 执行：3.8 / 2.36，其中 FR3 读回 vs 激光 0.47。</li>
   </ul></li>
-<li><b>下一步。</b>先用激光重求注册边（同日驻点集 + 回放 FK 拟合），在另一条轨迹上做 held-out 验收。然后扩到多条轨迹、快速运动、left cube。双臂还没开始。</li>
+<li><b>2026-10-20 补：FR3 自己做球窝 pivot 第一次跑通，但 <span class="mono">corenetic_socket_ee</span> 未必能当一个写死的常量。</b>FR3 扣着固定的球自动转（execute 关节跟踪 + 三维力环，力按球心点力算）。17:27 锚定完整规划跑完 14 个驻点、转角 43.8°，拟合 rms 0.95 / p95 1.59 mm。问题有三个：
+  <ul>
+    <li>插件在夹爪里的位置随夹持变：当天 7 次拟合，球窝相对 <span class="mono">corenetic_socket_ee</span>（10-14 的实测值）在 z 方向从 −0.56 到 8.77 mm。10-14 那 9 次去掉任意一次只变 ≤ 0.36 mm，量的是同一次夹持的重复性，跨夹持没量过。如果真有这么大，这个常量也只对 10-14 那次夹持成立，每次夹持都要先试探一次。</li>
+    <li>和 10-12 端到端的偏移相差 (−0.41, 1.74, 14.1) mm，主要在 z，还没分析。先要弄清两边比的是不是同一个点、同一个坐标系。</li>
+    <li>rms 0.95 mm 只说明数据和刚体 pivot 模型对得上，是自洽不是精度，还没用激光核过。</li>
+  </ul>
+  过程（10-19 软阻抗三连败 → 关节跟踪 → 力环 → 试探 + 锚定 → 改用球心点力）见激光 roadmap 10-19 与 10-20（下午）条。</li>
+<li><b>下一步</b>（10-20 更新）。注册边已换成球位刚体边；原计划的激光重求边受激光站位精度所限，只能证到 5–6 mm（Phase 9）。接下来：
+  <ul>
+    <li>用新边和实测的 socket 常量重跑端到端，在另一条轨迹上做 held-out 验收；</li>
+    <li>弄清球窝常量跨夹持到底变多少：每次夹持先试探，并用激光核一次；</li>
+    <li>执行误差（p95 3.4–3.8 mm）是回放的大头，到不了 3 mm 就得做迭代学习。</li>
+  </ul>
+  然后扩到多条轨迹、快速运动、left cube。双臂还没开始。</li>
 </ul></div>
 <p class="goal">最终比较的是 UMI 实际录到的双手 TCP 与双 FR3 实际执行出来的双手 TCP，而不是 demo vs command、也不是 command vs FK。</p>
 <details>
@@ -1805,7 +1876,8 @@ training-valid dataset                  replay-certified subset
 </section>
 </div>
 <p class="small" style="margin-top:24px">
-    <b>最近修订</b>（完整版本历史见 <a href="box_umi_roadmap_changelog.html">版本历史</a>；当前主文档 v18.5）：
+    <b>最近修订</b>（完整版本历史见 <a href="box_umi_roadmap_changelog.html">版本历史</a>；当前主文档 v18.6）：
+    版本：2026-10-20 v18.6 · <b>同步激光 roadmap v1.17–v1.29（10-14 ~ 10-20）。</b>① 回放常量 −10.3 mm 吃进了约 5 mm 注册边误差，FR3 pivot + 卡尺证实球窝在 EE −5.06 mm，<span class="mono">corenetic_socket_ee</span> 已改（Phase 12）；② 同球检验量到 10-09 注册边差 10.7–13.3 mm，换成球位刚体边，激光只能证到 5–6 mm（Phase 9）；③ 相机不是尺度错而是集体低头 0.18–0.60°，外参重标，world 按光心注册、沿用原 id（2.4）；④ fr3_base 下标签第一个端到端估计：单帧 2.0 mm rms、p95 约 3.3 mm，只限 10-14 下午的相机状态（误差预算）；⑤ BOX 配帧切到曝光中点 + 逐 BOX d_box，并更正 −5 ms 只影响配帧、不影响标签空间精度（1.2）；⑥ 相机状态随录制自动记录、标签链防混用（Phase 8）；⑦ FR3 自己做球窝 pivot 第一次跑通（14 驻点、43.8°、rms 0.95 mm），但球窝位置随夹持变，在 socket 系 z 方向相差约 9 mm，常量能不能写死要重新看（Phase 12）。
     版本：2026-10-13 v18.5 · <b>Replay 端到端有了第一个独立实测。</b>激光对激光、单条轨迹：FR3 复现 UMI 演示 p95 7.7 mm（RMS 5.35）。之前沿工具轴约 10 mm 的恒定偏差，查明是 TCP 定义差（URDF TCP 在指尖端，相机 TCP 是球窝中心），回放改驱动 <span class="mono">corenetic_socket_ee</span> 后消掉。剩下的最大一项是 world → fr3_base 注册边（约 4.6 mm），其次是 FR3 执行（p95 3.8）。7.7 mm 含执行误差，只有一条轨迹，不能当 UMI 轨迹精度。见 Replay 粗估卡片下的实测卡片和 Phase 12。<br>
     版本：2026-10-12 v18.4 · <b>Phase 11 的 FR3 执行误差有了第一个实测。</b>单条轨迹、3 倍慢放，消掉 150 ms 跟随滞后后激光 vs 指令 RMS 2.7 mm、p95 4.2–4.8 mm，没达到 1–2 mm 的工程 Gate；1–2 mm 仍只是 Gate，不是实测值。迭代学习修正（预计约 1 mm、每条轨迹两次）评估后暂不做。<br>
     版本：2026-10-12 v18.3 · <b>FR3 夹爪 URDF 换成厂商 v2 包后，更正两处「完整建模的固定链」。</b>旧链的 TCP 在法兰下 191 mm，实际是 171.99 mm；旋转不变，旧 FK 算出的 TCP 平移沿工具轴差 19 mm。<span class="mono">link_lt_gripper_tcp</span> 保留为兼容帧。<br>
