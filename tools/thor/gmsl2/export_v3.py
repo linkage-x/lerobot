@@ -67,6 +67,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 # pyarrow-only helpers shared with the recorder's box v3 writer.
 from tools.thor.gmsl2 import (  # noqa: E402
+    label_provenance as lp,
     thor_lerobot_v3 as lr3,
     world_provenance as wp,
 )
@@ -910,6 +911,7 @@ class _V3Writer:
         touch_width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
         world_frame: dict[str, Any] | None = None,
         tcp_frame: dict[str, Any] | None = None,
+        label_provenance: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -932,6 +934,7 @@ class _V3Writer:
         self.touch_width = int(touch_width)
         self.world_frame = dict(world_frame) if world_frame else None
         self.tcp_frame = dict(tcp_frame) if tcp_frame else None
+        self.label_provenance = dict(label_provenance) if label_provenance else None
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -1135,6 +1138,8 @@ class _V3Writer:
         }
         if self.tcp_frame is not None:
             info["tcp_frame"] = self.tcp_frame
+        if self.label_provenance is not None:
+            info["label_provenance"] = self.label_provenance
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
 
@@ -1163,6 +1168,31 @@ def _dataset_tcp_frame(episodes: list[EpisodeSource]) -> dict[str, Any]:
     }
 
 
+def _session_labels(episodes: list[EpisodeSource]) -> dict[str, dict[str, Any]]:
+    """Each session's label chain (label_provenance.session_labels), over the episodes exported."""
+    metas: dict[Path, dict[int, dict[str, Any]]] = {}
+    for src in episodes:
+        metas.setdefault(src.session_dir, {})[src.local_index] = _load_meta(src.ep_dir)
+    return {
+        session_dir.name: lp.session_labels(session_dir, _tracking_run_dir(session_dir), episode_metas)
+        for session_dir, episode_metas in metas.items()
+    }
+
+
+def _describe_labels(labels: dict[str, Any]) -> str:
+    pairing = "/".join(labels.get("box_pairing") or []) or "?"
+    if not labels.get("tracked"):
+        return f"untracked, BOX {pairing}"
+    px = labels.get("camera_state_px")
+    state = labels.get("camera_state") or "?"
+    if isinstance(px, (int, float)):
+        state = f"{state} {px:.2f} px"
+    return (
+        f"extrinsics {labels.get('extrinsics') or '?'}, cameras {state}, "
+        f"TCP {Path(labels.get('marker_to_tcp') or '?').name}, BOX {pairing}"
+    )
+
+
 def export_task_to_v3(
     *,
     datasets_root: Path,
@@ -1174,6 +1204,8 @@ def export_task_to_v3(
     overwrite: bool = False,
     jobs: int = _DEFAULT_JOBS,
     target_world: str | None = None,
+    allow_mixed_labels: bool = False,
+    check_only: bool = False,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
@@ -1190,10 +1222,8 @@ def export_task_to_v3(
     _emit(f"Export plan: {len(episodes)} episodes from {len(sessions)} session(s) -> {repo_id}")
 
     out_root = exports_root / export_name
-    if out_root.exists():
-        if not overwrite:
-            raise RuntimeError(f"Output already exists: {out_root} (pass --overwrite to replace)")
-        shutil.rmtree(out_root)
+    if out_root.exists() and not overwrite and not check_only:
+        raise RuntimeError(f"Output already exists: {out_root} (pass --overwrite to replace)")
 
     first = episodes[0]
     first_meta = _load_meta(first.ep_dir)
@@ -1340,6 +1370,33 @@ def export_task_to_v3(
         )])
         _emit(f"Re-expressing world-frame poses in {target_world} via {route}")
 
+    # Same rule for the rest of the label chain: extrinsics, camera state, edge,
+    # marker->TCP bundle, BOX pairing can each move the labels by millimetres
+    # without changing the world id, so the sessions must agree on every one.
+    session_labels = _session_labels(episodes)
+    for session, labels in session_labels.items():
+        _emit(f"Labels: {session}: {_describe_labels(labels)}")
+    mixed_fields = lp.assert_single_session_chain(session_labels, allow_mixed=allow_mixed_labels)
+    if mixed_fields:
+        _emit(
+            f"WARNING: exporting sessions that disagree on {', '.join(mixed_fields)} "
+            "(--allow-mixed-labels); the dataset records it and training will not combine it"
+        )
+    label_provenance = lp.provenance_block(output_world_frame, session_labels, mixed_fields)
+    for warning in lp.label_warnings(label_provenance["key"]):
+        _emit(f"WARNING: {warning}")
+    if check_only:
+        _emit(
+            f"Check passed: {len(episodes)} episodes, world frame "
+            f"{wp.world_frame_id_of(output_world_frame) or 'unstamped'}, labels "
+            f"{label_provenance['fingerprint']}; nothing written"
+        )
+        return out_root
+    # Only now: a refused export must leave the previous one in place (the GUI
+    # always passes --overwrite).
+    if out_root.exists():
+        shutil.rmtree(out_root)
+
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
@@ -1357,6 +1414,7 @@ def export_task_to_v3(
         touch_width=touch_width,
         world_frame=output_world_frame,
         tcp_frame=_dataset_tcp_frame(episodes) if pose_columns else None,
+        label_provenance=label_provenance,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -1470,6 +1528,8 @@ def export_task_to_v3(
                 "frames": n_frames,
                 "world_frame_id": wp.world_frame_id_of(meta.get("world_frame")),
                 "exported_world_frame_id": wp.world_frame_id_of(output_world_frame),
+                "extrinsics": session_labels[src.session_dir.name].get("extrinsics", ""),
+                "camera_state": session_labels[src.session_dir.name].get("camera_state", lp.UNTRACKED),
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
@@ -1498,7 +1558,8 @@ def export_task_to_v3(
     )
     _emit(
         f"Export complete: {global_index} episodes at {out_root} "
-        f"(world frame: {wp.world_frame_id_of(output_world_frame) or 'unstamped'})"
+        f"(world frame: {wp.world_frame_id_of(output_world_frame) or 'unstamped'}) "
+        f"labels {label_provenance['fingerprint']}"
     )
     return out_root
 
@@ -1524,6 +1585,18 @@ def main(argv: list[str] | None = None) -> int:
         "fr3_base when an edge reaches it and keeps the recorded world otherwise; "
         "default keeps the world the episodes were recorded in",
     )
+    ap.add_argument(
+        "--allow-mixed-labels",
+        action="store_true",
+        help="export sessions whose label chains differ (extrinsics, camera state, marker->TCP, "
+        "BOX pairing, ...) together anyway; recorded in info.json, and training refuses to "
+        "combine the result with another dataset",
+    )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="run the world and label checks and print each session's label chain; write nothing",
+    )
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stderr)
@@ -1538,6 +1611,8 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             jobs=args.jobs,
             target_world=args.target_world,
+            allow_mixed_labels=args.allow_mixed_labels,
+            check_only=args.check,
         )
     except Exception as exc:  # noqa: BLE001
         _emit(f"ERROR: {exc}")

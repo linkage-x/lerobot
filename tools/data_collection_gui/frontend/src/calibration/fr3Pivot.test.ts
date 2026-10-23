@@ -199,7 +199,7 @@ describe("fr3Pivot", () => {
 
   it("says what an auto run is doing and that a stop leaves the arm where it is", () => {
     expect(jobStatusText({ state: "collecting", mode: "auto", elapsedS: 40, durationS: 136, biasMm: [3, 0, 0], log: [] })).toBe(
-      "自动 pivot 执行中 40 / 136 s（柔顺阻抗，偏置 (3, 0, 0) mm）"
+      "自动 pivot 执行中 40 / 136 s（关节跟踪，偏置 (3, 0, 0) mm）"
     );
     expect(jobStatusText({ state: "stopped", mode: "auto", log: [] })).toContain("停在当前位置");
     expect(jobStatusText({ state: "collecting", mode: "guided", elapsedS: 12, durationS: 60, biasMm: [-3, 0, 0], log: [] })).toBe(
@@ -246,6 +246,9 @@ describe("fr3Pivot", () => {
       "通过：14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.30 mm，绕拟合的球心 (0.1, 0.5, -1.5) mm，136 s，最快关节 8°/s，" +
         "离 panda_py 的墙最近 28°，j6 转 78°、j7 转 116°，离桌面（z=120 mm）最近 75 mm（link_gripper_tip_right），" +
         "离球的支架：球窝 1.7 mm、link_gripper_tip_right 3.6 mm"
+    );
+    expect(planSummaryText({ ...dwells, kind: "probe", dwells: 6, anchorFrom: "" })).toMatch(
+      /^通过：试探：6 个驻点、离起点不远，跑完的拟合给完整规划当球心，136 s/
     );
     expect(biasLabel([-3, 0, 0])).toBe("偏置 −3 mm（x）");
     expect(biasLabel([1, 2, 0])).toBe("偏置 (1.0, 2.0, 0.0) mm");

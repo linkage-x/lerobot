@@ -864,3 +864,190 @@ def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_p
     printed = capsys.readouterr().out
     assert "No registration edge reaches fr3_base from world_a" in printed
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
+
+
+# ------------------------------------------------------ label provenance ---
+
+
+def _labelled_sessions(tmp_path: Path, monkeypatch, labels: dict[str, tuple[str, str]]) -> tuple[Path, Path, Path]:
+    """Tracked sessions in world_a, each labelled with (extrinsics, camera state verdict)."""
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    repo_root = tmp_path / "repo"
+    for name, (extrinsics, verdict) in labels.items():
+        session = _make_session(datasets, name, [0], cams=("cam_00",))
+        ep_dir = session / "episodes" / "episode_000000"
+        meta = json.loads((ep_dir / "meta.json").read_text())
+        meta["world_frame"] = {"world_frame_id": "world_a", "status": "ok"}
+        meta["box_camera_alignment"] = {"mode": "sensor_timestamp_sof", "exposure_fraction": 0.0}
+        (ep_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        _write_box_parquet(session, {0: 2}, state_width=4)
+        _write_online_sync_manifest(ep_dir, ("cam_00",), n_frames=2)
+        sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
+        sidecar.mkdir(parents=True)
+        (sidecar / "state_action.left.csv").write_text(
+            "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+            "0,0,0.1,0.2,0.3,0,0,0,1\n",
+            encoding="utf-8",
+        )
+        (session / "meta").mkdir(exist_ok=True)
+        (session / "meta" / "info.json").write_text(
+            json.dumps(
+                {
+                    "derived": {
+                        "april_cube_tracking_in_robot_base": {
+                            "sidecar_schema_version": 2,
+                            "camera_state": {
+                                "verdict": verdict,
+                                "worst_median_reproj_px": 0.5 if verdict == "ok" else 1.6,
+                                "extrinsics_run_name": extrinsics,
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_dir = repo_root / "outputs" / "tracking_analysis" / f"{name}_thor_april_tracking_in_robot_base"
+        run_dir.mkdir(parents=True)
+        (run_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "calibration_inputs": {"fixed_camera_run_name": extrinsics, "intrinsics_run_name": "intr"},
+                    "ee_from_cube": {
+                        "target_child_link": "corenetic_gripper_ee",
+                        "marker_to_tcp_calibration_path": "config_thor/marker_to_tcp_calibration_test.json",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    world_dir = repo_root / "tools" / "thor" / "gmsl2" / "world"
+    world_dir.mkdir(parents=True)
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-10-15T03:08:47Z"}
+    (world_dir / "world_graph.json").write_text(json.dumps({"version": 1, "nodes": [], "edges": [edge]}), encoding="utf-8")
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 2)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+    return datasets, tmp_path / "exports", repo_root
+
+
+def _export(datasets: Path, exports: Path, **kwargs):
+    return export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+        target_world="fr3_base",
+        **kwargs,
+    )
+
+
+def test_export_records_the_label_chain(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261014_150515": ("calib_1014", "ok")}
+    )
+
+    out = _export(datasets, exports)
+
+    block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
+    key = block["key"]
+    assert key["world_frame_id"] == "fr3_base"
+    assert key["edge"]["edges"] == [["world_a", "fr3_base", "2026-10-15T03:08:47Z", False]]
+    assert key["extrinsics"] == ["calib_1014"]
+    assert key["camera_state"] == ["ok"]
+    assert key["box_pairing"] == ["raw_sof"]
+    assert len(block["fingerprint"]) == 16 and block["mixed_fields"] == []
+    session = block["sessions"]["pick_and_place_20261014_150515"]
+    assert session["camera_state_px"] == 0.5 and session["tcp_link"] == "corenetic_gripper_ee"
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
+    assert sources[0]["extrinsics"] == "calib_1014" and sources[0]["camera_state"] == "ok"
+
+
+def test_export_refuses_stale_and_fresh_cameras_together_and_keeps_the_old_export(tmp_path, monkeypatch):
+    # 10-13 retracked on the 10-14 extrinsics is stale (the cameras had tipped), 10-14
+    # afternoon is ok: same world id, same extrinsics id, ~4 mm apart.
+    pytest.importorskip("pyarrow")
+    from tools.thor.gmsl2 import label_provenance as lp
+
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path,
+        monkeypatch,
+        {
+            "pick_and_place_20261013_104520": ("calib_1014", "stale"),
+            "pick_and_place_20261014_150515": ("calib_1014", "ok"),
+        },
+    )
+    previous = exports / "pick_and_place"
+    (previous / "meta").mkdir(parents=True)
+    (previous / "meta" / "info.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(lp.MixedLabelsError) as excinfo:
+        _export(datasets, exports, overwrite=True)
+
+    message = str(excinfo.value)
+    assert "camera_state" in message and "stale: pick_and_place_20261013_104520" in message
+    assert "extrinsics" not in message.split("Each line")[0]
+    # The GUI always passes --overwrite; a refusal must not have deleted the previous export.
+    assert (previous / "meta" / "info.json").is_file()
+
+
+def test_export_can_mix_labels_on_request_and_says_so(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path,
+        monkeypatch,
+        {
+            "pick_and_place_20261009_102307": ("calib_0928", "stale"),
+            "pick_and_place_20261014_150515": ("calib_1014", "ok"),
+        },
+    )
+
+    out = _export(datasets, exports, allow_mixed_labels=True)
+
+    block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
+    assert block["mixed_fields"] == ["camera_state", "extrinsics"]
+    assert block["key"]["extrinsics"] == ["calib_0928", "calib_1014"]
+
+
+def test_export_check_writes_nothing(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261014_150515": ("calib_1014", "ok")}
+    )
+
+    _export(datasets, exports, check_only=True)
+
+    assert not exports.exists()
+    printed = capsys.readouterr().out
+    assert "Labels: pick_and_place_20261014_150515: extrinsics calib_1014, cameras ok 0.50 px" in printed
+    assert "Check passed" in printed.strip().splitlines()[-1]
+
+
+def test_untracked_sessions_do_not_count_as_a_different_chain(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261014_150515": ("calib_1014", "ok")}
+    )
+    session = _make_session(datasets, "pick_and_place_20261014_160000", [0], cams=("cam_00",))
+    ep_dir = session / "episodes" / "episode_000000"
+    meta = json.loads((ep_dir / "meta.json").read_text())
+    meta["world_frame"] = {"world_frame_id": "world_a", "status": "ok"}
+    meta["box_camera_alignment"] = {"mode": "sensor_timestamp_sof", "exposure_fraction": 0.0}
+    (ep_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    _write_box_parquet(session, {0: 2}, state_width=4)
+    _write_online_sync_manifest(ep_dir, ("cam_00",), n_frames=2)
+
+    out = _export(datasets, exports)
+
+    block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
+    assert block["sessions"]["pick_and_place_20261014_160000"]["tracked"] is False
+    assert block["key"]["extrinsics"] == ["calib_1014"]

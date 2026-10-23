@@ -22,18 +22,23 @@ The FR3 pivot about the table ball, planned and driven instead of moved by hand.
   plan     the pivot motion about that centre -- tilt into a cone, sweep it, spin about the tool
            axis -- solved by IK and checked in MuJoCo (limits incl. panda_py's walls, speed, wrist
            travel, self-contact, table clearance) before anything may run it
-  execute  real robot: a soft Cartesian impedance follows the plan, pressing the socket into the ball
+  execute  real robot: the joints follow the plan's joint angles; a force loop presses the socket
+           down onto the ball (PRESS_FORCE_N) and lets it slide sideways to where the ball has it
   guide    real robot, the recommended one: a virtual ball joint. The impedance only holds the socket
            pressed down on the ball (translation spring, zero rotational stiffness, elbow free); the operator
            turns the gripper by hand and so steers clear of the table and everything else, which no
            model has to know about
 
-Not circular, although the plan is built on the very frame being measured: the arm is soft
-(600 N/m) and pressed into the ball, so the ball -- not the command -- decides where the socket
-is, and ``fr3_tcp_pivot.py fit`` uses the *measured* joint angles. A few mm of error in
-corenetic_socket_ee is a newton or two in the spring. Proof by data: run the same centre with the
-pivot point deliberately biased +3 mm and -3 mm (``--bias-mm``); if the socket was seated, both fits
-agree, if it followed the command they differ by 6 mm. Each run also records the contact force.
+Not circular, although the plan is built on the very frame being measured: the ball -- not the
+command -- decides where the socket is, and ``fr3_tcp_pivot.py fit`` uses the *measured* joint
+angles. execute's joints are stiff (10-19: the soft Cartesian impedance this ran under first could not
+turn the wrist through the FR3's joint friction; see JOINT_STIFFNESS), so it is the force loop that
+leaves the ball in charge: the socket's position is shifted until it presses PRESS_FORCE_N down and
+nothing sideways, and the cup turns about the ball although the plan turns about corenetic_socket_ee's
+origin (the 10-14 fits put that 1-3 mm off the ball; ``--anchor-mm`` still makes the plan's points
+the better guess). Each run records the contact force, and the run stops at EXECUTE_STOP_FORCE_N. ``--bias-mm`` (the 10-13 test of the
+soft run: biased +-3 mm, both fits agree if the ball decided) is for ``guide`` now; execute refuses
+a plan more than MAX_EXECUTE_OFFSET_MM into the ball.
 
 The spring holds one point of the socket frame. By default that is corenetic_socket_ee's origin; when
 the true pivot is s mm off it, every turn by θ drags that origin ~|s|·θ sideways against the ball
@@ -102,11 +107,109 @@ START_TOLERANCE_MM = 3.0
 STOP_FORCE_N = 15.0
 STOP_TRACKING_MM = 15.0
 STOP_WALL_MARGIN_DEG = 1.0
-# The impedance holds the socket; only the nullspace term holds the elbow where MuJoCo checked it.
-# 0.5 (panda_py's default) let it drift; 15 is panda_py's move_to_pose default. And a joint off the
-# plan by this much means the posture is no longer the one that was checked against the table.
-NULLSPACE_STIFFNESS = 15.0
 STOP_JOINT_DEVIATION_DEG = 5.0
+# The planned run follows the plan's joint angles, which already put the socket on the ball. 10-19, under
+# the soft Cartesian impedance (600 N/m, 40 Nm/rad) the FR3's joint friction held the rotation back: stuck
+# below ~3 Nm of spring at 40 Nm/rad, the wrist oscillating at 150, and at 40 running 15° late in move2
+# until the spring torque dragged the cup 11 mm sideways and 7 mm up off the ball. Franka's default joint
+# gains put the socket at 1.4-2.4 kN/m along the press (0.6-11.5 kN/m across) and ~2.6 mm off the command
+# per 1 Nm of friction on every joint; half the gains, twice that.
+JOINT_STIFFNESS = np.array([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
+JOINT_DAMPING = np.array([50.0, 50.0, 50.0, 20.0, 20.0, 20.0, 10.0])
+# That stiff, a position press is kN/m times (press + bias + the centre's error), and a plan pushing
+# further into the ball than this is refused.
+MAX_EXECUTE_OFFSET_MM = 1.5
+# So the press is a force instead (10-19 17:32: 1 mm of position press read 0-2.2 N from dwell to dwell,
+# and in the longest move the joints' friction (0.9-1.6 Nm on j1-j5) carried the cup 2.6 mm up off the
+# ball while the press fell to 0.9 N). The plan puts the socket on the ball; a slow integral on F_ext
+# along PRESS_DIR (0.03 N of noise) shifts the command along PRESS_DIR until it presses PRESS_FORCE_N.
+# At 0.6-2.4 kN/m that settles in 0.8-3 s, well below the arm's own dynamics. Replayed on 17:32's
+# friction it holds 2.1-4.2 N (p5-max), the shift reaching 6.7 mm at the end of move12. Down it may go
+# far: the socket itself still stops at EXECUTE_STOP_TRACKING_MM off the plan, a lunge at
+# EXECUTE_STOP_FORCE_N. Pinned at a cap with the press still off by PRESS_STUCK_N, the run stops.
+EXECUTE_PRESS_MM = 0.0
+PRESS_FORCE_N = 3.0
+PRESS_GAIN_M_PER_NS = 5e-4
+PRESS_RATE_MM_S = 2.0
+# Up is not only out of the ball: turned about a point s off the ball's centre, the socket's origin has
+# to rise and fall by |s|·sin(tilt) (10-19 18:16: s 8.7 mm, the 2 mm that was allowed up ran out at 21°).
+# Down is not rigid either: the fingertip pads give, and the three probes that ran through on 10-20 took
+# 3.6, 4.1 and 5.2 mm of it for their ~3 N. 15:06 (anchored, turned past the probe's span) walked on to
+# 6.9 mm at ~2 N, the cup sliding instead of pressing, the operator hearing it rub: past 6.5 mm, deeper
+# does not press.
+PRESS_SHIFT_MM = (-4.0, 6.5)  # (up, out of the ball; down, into it)
+PRESS_STUCK_N = 1.0
+# 10-19 17:55: across the press it was still the joints that held the cup, at up to ~20 kN/m (39 along
+# the stiffest direction of some plans), so the cup could not centre itself on the ball. Turning 20°
+# about a point that was not the ball's centre built up 3.5 N sideways, the ball's push on the cup wall
+# (aimed at its centre) turned that into 4.5 N down, and backing 2 mm up -- all a press loop along
+# PRESS_DIR can do -- relieved nothing. So the loop runs in all three directions: PRESS_FORCE_N along
+# PRESS_DIR, nothing across it. The cup slides to where the ball has it, the pivot falls on the ball's
+# centre whatever the plan's centre was off by, and the joints' sideways lag is taken up by the same
+# integral. The orientation still follows the plan exactly. Across, half the gain: at 39 kN/m it settles in
+# 0.1 s, ten samples of the 100 Hz loop. Following a 3 mm off-centre turning at 5°/s costs ~1 N of lag.
+PRESS_LATERAL_GAIN_M_PER_NS = 2.5e-4
+PRESS_LATERAL_MM = 4.0
+# The shift only leads the socket by so much. 10-20 14:05 (probe): the arm did not follow the shift at all
+# -- the joints' friction took the few Nm a few mm of it asks for, the socket stayed within 0.3 mm of the
+# plan sideways -- while F_ext read 1-2 N across (and 1-3 Nm of moment, which a ball cannot put on a cup:
+# the reading's own error), so the integral wound up to the 4 mm cap and stopped a run that was going
+# fine. 14:03: 2.4 mm wound up along the press let go at once, the socket dropped 3.5 mm in 0.25 s and the
+# cup came off. Held within PRESS_LEAD_MM of where the socket is, the shift stores at most that much
+# spring, and reaches a cap only when the socket itself got near it.
+PRESS_LEAD_MM = 2.0
+# Nor does it chase what F_ext cannot tell apart from its own error. 10-20 14:17 (probe): across the
+# press F_ext read +2.5 N through move1 and -2.5 N through move2, flipping with the direction of the turn
+# within a second (friction, the cup's on the ball or the reading's), the moment at the socket 1-2 Nm
+# throughout. The loop followed each, carried the socket 2.2 mm sideways, and stopped at the 4 mm cap
+# on a 1.1 N residue. Across, the target is the seated reading (its bias with it) and only what is
+# more than PRESS_LATERAL_DEADBAND_N off it is taken up: a ball off the plan's centre still pushes harder
+# than that (17:55: 3.5 N at 20°). Stuck across takes PRESS_STUCK_N beyond the deadband.
+PRESS_LATERAL_DEADBAND_N = 2.0
+# Which force: not O_F_ext_hat_K. Its force is exactly pinv(J_EE^T) tau_ext, a wrench with the moment
+# free, and a ball puts no moment on the cup -- what it reads there (1.4-4 Nm) is ~1 Nm of model error per
+# joint, traded against the force. 10-20 16:40 (anchored, 14 dwells) stopped at 78.6 s on "7.1 N" with
+# the socket still (0.2 mm in the last 0.6 s); the force at the ball that explains the same tau_ext was
+# 3.8 N there and 5.6 N at most (J's condition 9-11 -> 19-20 at pitch -20°). Across, F_ext read -y
+# 4.8 N where the ball force was +y 2-3 N, so the loop pushed the cup the wrong way (3-4.5 N real); along,
+# F_ext read a pull in 19-24% of three runs, the ball force never. So the loop and the force stop take
+# the least-squares force at the plan's ball point (anchor_mm in corenetic_socket_ee; 0 for a probe,
+# whose few mm of lever arm is ~0.01 Nm); F_ext is still recorded.
+# After the plan's end, the last posture is held until the press is back to how it was seated.
+PRESS_SETTLE_N = 0.3
+PRESS_SETTLE_S = 3.0
+# Stop with the socket 5 mm off the plan's point on the ball, at 10 N, or a joint 3° off its command
+# (1 Nm of friction leaves 0.4° on j6, 1.1° on j7). Seated, the socket is off the plan's point by
+# (R - R0) s, s the plan's centre against the ball's: 3 mm of s turned 80° is 3.9 mm, hence 5 (the cup
+# climbing out shows sooner, as a press the loop cannot hold). The force: the runs that went through on
+# 10-20 peaked at 4.6, 4.8 and 6.1 N by F_ext (seated bias included); the 9.7 N of 14:39 was the jaw
+# letting go. By the ball force (below) the probes of 15:42/16:38 peaked at 4.5/5.7 N, 16:40 at 5.6 N.
+EXECUTE_STOP_TRACKING_MM = 5.0
+EXECUTE_STOP_FORCE_N = 7.0
+EXECUTE_STOP_JOINT_DEG = 3.0
+# From where the arm stands (within START_TOLERANCE_DEG of the plan's first posture) onto the plan.
+EXECUTE_BLEND_S = 1.0
+# A joint at twice the plan's fastest (and 20°/s at least) is a fault: 10-19's wrist oscillation would
+# have stopped at 0.07 s instead of 0.58 s.
+STOP_JOINT_SPEED_DEG_S = 20.0
+# The probe (plan --probe): a few dwells close to the start, slow, run like any plan and fitted like any
+# run, so that the full plan can turn about the ball's centre (--anchor-mm, the GUI's "about the last
+# fit"). 10-19 18:16 the grip put the ball 8.7 mm off corenetic_socket_ee's origin (17:32 1.4 mm):
+# turned 80° about the origin that is 11 mm the socket has to follow, more than the force loop may.
+# Within 20° it is <= 3 mm (2.5-2.9 mm on 10-19's two centres), at 3°/s the loop lags by ~1.7 N, and the fit
+# clears the GUI's anchor gate (>= 20° span, weak singular >= 0.1: 0.13-0.17; 15° gave 0.096).
+PROBE_WITHIN_DEG = 20.0
+PROBE_DWELLS = 6
+PROBE_MIN_DWELLS = 5
+PROBE_SPEED_DEG_S = 3.0
+# The full plan turns about the probe's fit, and the fit holds only as far as the probe turned (<= 20°).
+# 10-20 15:06: the fitted s held within 1 mm up to 27° from the start, was 2.7-3.1 mm off at 33-35° and
+# the run stopped there (the press loop 6.9 mm down, the cup rubbing). So an anchored plan keeps its
+# dwells within this of the start; --within-deg widens it (0: no limit).
+ANCHORED_WITHIN_DEG = 30.0
+# guide is soft (the operator turns it): the press can be deeper.
+GUIDE_PRESS_MM = 3.0
+GUIDE_STIFFNESS_N_M = 600.0
 # guide: a hand on the gripper pushes too, so the force stop sits higher than the planned run's.
 GUIDE_STOP_FORCE_N = 20.0
 GUIDE_DEFAULT_DURATION_S = 60.0
@@ -135,12 +238,10 @@ class PlanParams:
     tilt_deg: float = 20.0
     spin_deg: float = 30.0
     speed_deg_s: float = 5.0  # peak angular speed of the tool
-    press_mm: float = 3.0  # pivot point commanded this far into the ball, along the tool axis
+    press_mm: float = EXECUTE_PRESS_MM  # pivot point commanded this far into the ball, along PRESS_DIR
     bias_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # fr3_base, deliberate
     ramp_s: float = 2.0  # press/bias in and out
     rate_hz: float = 100.0
-    translational_stiffness: float = 600.0
-    rotational_stiffness: float = 40.0
 
 
 # --- rotations -------------------------------------------------------------------------------------
@@ -323,6 +424,29 @@ class Kinematics:
             # Kept inside the FR3's limits and panda_py's walls: a solution past either is no solution.
             q = np.clip(q + dq + N @ (null_gain * (q_null - q)), IK_LOWER, IK_UPPER)
         return q, float(np.linalg.norm(e_p)), float(np.linalg.norm(e_r))
+
+    def shift(self, q, dp) -> np.ndarray:
+        """The joint change that moves the frame by ``dp`` (fr3_base, m) without turning it."""
+        pin = self.pin
+        q = np.asarray(q, dtype=float)
+        self.fk(q)
+        J = pin.computeFrameJacobian(self.model, self.data, q, self.fid, pin.LOCAL_WORLD_ALIGNED)
+        return J.T @ np.linalg.solve(J @ J.T + 1e-6 * np.eye(6), np.r_[np.asarray(dp, dtype=float), np.zeros(3)])
+
+    def point_jacobian(self, q, point_m) -> np.ndarray:
+        """3x7: how the point ``point_m`` (in this frame) moves in fr3_base per joint."""
+        pin = self.pin
+        q = np.asarray(q, dtype=float)
+        T = self.fk(q)
+        J = pin.computeFrameJacobian(self.model, self.data, q, self.fid, pin.LOCAL_WORLD_ALIGNED)
+        rx, ry, rz = T[:3, :3] @ np.asarray(point_m, dtype=float)
+        return J[:3] - np.array([[0.0, -rz, ry], [rz, 0.0, -rx], [-ry, rx, 0.0]]) @ J[3:]  # v + w x r
+
+    def point_force(self, q, tau, point_m) -> np.ndarray:
+        """The force (fr3_base, N, what the arm applies) at ``point_m`` (in this frame) that best explains
+        the external joint torques ``tau``: all a ball can put on a socket is a force, no moment."""
+        Jp = self.point_jacobian(q, point_m)
+        return np.linalg.lstsq(Jp.T, np.asarray(tau, dtype=float), rcond=None)[0]
 
 
 # --- MuJoCo checks ---------------------------------------------------------------------------------
@@ -630,6 +754,16 @@ def plan_cmd(args) -> int:
     return 0 if summary["passed"] else 3
 
 
+def _within_deg(args) -> float:
+    """How far from the start the dwells may turn: the probe's limit, ``--within-deg``, an anchored plan's
+    limit, or none."""
+    if args.probe:
+        return PROBE_WITHIN_DEG
+    if args.within_deg is not None:
+        return float(args.within_deg)
+    return ANCHORED_WITHIN_DEG if np.linalg.norm(args.anchor_mm) > 0 else 0.0
+
+
 def plan_dwells_cmd(args, centre: dict[str, Any]) -> int:
     """Survey the orientations about the ball, pick the dwells, route them, check the timed path."""
     from tools.fr3 import fr3_pivot_plan as pp
@@ -640,12 +774,14 @@ def plan_dwells_cmd(args, centre: dict[str, Any]) -> int:
         )
         return 2
     params = pp.DwellParams(
-        dwells=args.dwells,
+        dwells=PROBE_DWELLS if args.probe else args.dwells,
         dwell_s=args.dwell_s,
-        speed_deg_s=args.speed_deg_s,
+        speed_deg_s=PROBE_SPEED_DEG_S if args.probe else args.speed_deg_s,
         press_mm=args.press_mm,
         bias_mm=[float(x) for x in args.bias_mm],
         anchor_mm=[float(x) for x in args.anchor_mm],
+        within_deg=_within_deg(args),
+        min_dwells=PROBE_MIN_DWELLS if args.probe else pp.MIN_DWELLS,
     )
     kin = Kinematics(args.urdf)
     scene = None if args.no_mujoco else SceneCheck(args.xml, table_z_m=args.table_z_m)
@@ -667,7 +803,7 @@ def plan_dwells_cmd(args, centre: dict[str, Any]) -> int:
     out = args.out or OUT_ROOT / "plans" / f"{_stamp()}_plan.json"
     header = {
         "schema": PLAN_SCHEMA,
-        "kind": "dwells",
+        "kind": "probe" if args.probe else "dwells",
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "centre": args.centre.name,
         "centre_m": centre["centre_m"],
@@ -744,8 +880,14 @@ class Monitor:
     tracking_mm: float = STOP_TRACKING_MM
     wall_deg: float = STOP_WALL_MARGIN_DEG
     joint_deg: float = STOP_JOINT_DEVIATION_DEG
+    speed_deg_s: float = STOP_JOINT_SPEED_DEG_S
 
-    def check(self, q, f_ext, socket_actual, socket_cmd, q_plan=None) -> str:
+    def check(self, q, f_ext, socket_actual, socket_cmd, q_plan=None, dq=None) -> str:
+        if dq is not None:
+            speed = np.degrees(np.abs(np.asarray(dq)))
+            if speed.max() > self.speed_deg_s:
+                j = int(speed.argmax())
+                return f"j{j + 1} 转速 {speed[j]:.0f}°/s 超过 {self.speed_deg_s:.0f}°/s（规划没有这么快：在振荡或失控）"
         f = float(np.linalg.norm(np.asarray(f_ext)[:3]))
         if f > self.force_n:
             return f"外力 {f:.1f} N 超过 {self.force_n:.0f} N"
@@ -763,6 +905,59 @@ class Monitor:
         return ""
 
 
+def along_across(v) -> tuple[float, np.ndarray]:
+    """A vector's component along PRESS_DIR, and the rest of it."""
+    v = np.asarray(v, dtype=float)
+    a = float(v @ PRESS_DIR)
+    return a, v - a * PRESS_DIR
+
+
+def press_step(shift_m, force_n, target_n, dt_s: float, realized_m=None) -> np.ndarray:
+    """The force loop's shift (base frame, metres) one step on: integrated towards the target force,
+    rate limited, within PRESS_LEAD_MM of ``realized_m`` (the socket's own offset from the plan, each way),
+    along PRESS_DIR within PRESS_SHIFT_MM, across it within PRESS_LATERAL_MM."""
+    e_along, e_across = along_across(np.asarray(target_n, dtype=float) - np.asarray(force_n, dtype=float))
+    n = float(np.linalg.norm(e_across))
+    e_across = e_across * (max(0.0, n - PRESS_LATERAL_DEADBAND_N) / n if n > 0 else 0.0)
+    step = (PRESS_GAIN_M_PER_NS * e_along * PRESS_DIR + PRESS_LATERAL_GAIN_M_PER_NS * e_across) * dt_s
+    cap = PRESS_RATE_MM_S / 1e3 * dt_s
+    n = float(np.linalg.norm(step))
+    if n > cap:
+        step *= cap / n
+    a, x = along_across(np.asarray(shift_m, dtype=float) + step)
+    if realized_m is not None:
+        lead = PRESS_LEAD_MM / 1e3
+        r_a, r_x = along_across(realized_m)
+        a = float(np.clip(a, r_a - lead, r_a + lead))
+        n = float(np.linalg.norm(x - r_x))
+        if n > lead:
+            x = r_x + (x - r_x) * lead / n
+    a = float(np.clip(a, PRESS_SHIFT_MM[0] / 1e3, PRESS_SHIFT_MM[1] / 1e3))
+    n = float(np.linalg.norm(x))
+    if n > PRESS_LATERAL_MM / 1e3:
+        x *= PRESS_LATERAL_MM / 1e3 / n
+    return a * PRESS_DIR + x
+
+
+def press_stuck(shift_m, force_n, target_n) -> str:
+    """Why the force loop cannot hold, or "": its shift pinned at a cap with the force still off."""
+    lo, hi = PRESS_SHIFT_MM
+    s_along, s_across = along_across(shift_m)
+    press_n, f_across = along_across(force_n)
+    target, t_across = along_across(target_n)
+    if s_along * 1e3 >= hi - 1e-6 and press_n < target - PRESS_STUCK_N:
+        return f"压不住：已往球里多压 {hi:g} mm，压力仍只有 {press_n:.1f} N（要 {target:.1f} N）"
+    if s_along * 1e3 <= lo + 1e-6 and press_n > target + PRESS_STUCK_N:
+        return f"压力降不下来：已往外退 {-lo:g} mm，压力仍有 {press_n:.1f} N（要 {target:.1f} N）"
+    off_across = np.linalg.norm(f_across - t_across)
+    if np.linalg.norm(s_across) * 1e3 >= PRESS_LATERAL_MM - 1e-6 and off_across > PRESS_LATERAL_DEADBAND_N + PRESS_STUCK_N:
+        return (
+            f"横向推不开：已横移 {PRESS_LATERAL_MM:g} mm，横向力仍比坐上时多 {off_across:.1f} N"
+            "（球心可能不在规划以为的地方，或杯子已经滑出）"
+        )
+    return ""
+
+
 def execute(args) -> int:
     plan_data = json.loads(args.plan.read_text(encoding="utf-8"))
     if plan_data.get("schema") != PLAN_SCHEMA:
@@ -770,6 +965,15 @@ def execute(args) -> int:
         return 2
     if not plan_data.get("passed"):
         print("ERROR: the plan did not pass its checks; nothing was started")
+        return 2
+    params = plan_data["params"]
+    into = float(np.linalg.norm(np.asarray(params["bias_mm"], dtype=float) + params["press_mm"] * PRESS_DIR))
+    if into > MAX_EXECUTE_OFFSET_MM:
+        print(
+            f"ERROR: the plan commands the socket {into:.1f} mm off the ball (press {params['press_mm']} mm, "
+            f"bias {params['bias_mm']} mm); followed joint by joint that is kN/m against the ball. "
+            f"Re-plan with --press-mm {EXECUTE_PRESS_MM:g} and no bias (≤ {MAX_EXECUTE_OFFSET_MM:g} mm)"
+        )
         return 2
     from panda_py import Panda, controllers
 
@@ -786,14 +990,8 @@ def execute(args) -> int:
             print(f"  {line}")
         return 2
 
-    # The controller drives Desk's EE (O_T_EE); the plan is in corenetic_socket_ee. Constant between them.
-    X = np.linalg.inv(_ee_matrix(state)) @ T_sock
-    X_inv = np.linalg.inv(X)
-    params = plan_data["params"]
-    K = np.diag([params["translational_stiffness"]] * 3 + [params["rotational_stiffness"]] * 3)
-    ctrl = controllers.CartesianImpedance(
-        impedance=K, damping_ratio=1.0, nullspace_stiffness=NULLSPACE_STIFFNESS, filter_coeff=1.0
-    )
+    X = np.linalg.inv(_ee_matrix(state)) @ T_sock  # Desk's EE -> corenetic_socket_ee, constant
+    ctrl = controllers.JointPosition(stiffness=JOINT_STIFFNESS, damping=JOINT_DAMPING, filter_coeff=1.0)
 
     stop = {"why": ""}
 
@@ -803,50 +1001,91 @@ def execute(args) -> int:
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)
     t_plan = np.asarray(plan_data["t"])
-    P, Q, QN = np.asarray(plan_data["p"]), np.asarray(plan_data["quat_xyzw"]), np.asarray(plan_data["q"])
+    P, QN = np.asarray(plan_data["p"]), np.asarray(plan_data["q"])
+    dQN = np.gradient(QN, t_plan, axis=0) if len(QN) > 1 else np.zeros_like(QN)
+    start_offset = q_now - QN[0]
+    # From the force it was seated with to PRESS_FORCE_N along PRESS_DIR over the plan's ramp, and back at
+    # the end; across, the seated reading throughout.
+    anchor = np.asarray(params.get("anchor_mm", [0.0, 0.0, 0.0]), dtype=float) / 1e3
+    force0 = kin.point_force(q_now, state.tau_ext_hat_filtered, anchor)
+    press0 = float(force0 @ PRESS_DIR)
+    goal = PRESS_FORCE_N * PRESS_DIR + along_across(force0)[1]
+    ramp_s = max(float(params["ramp_s"]), 1e-3)
+    shift_m = np.zeros(3)
     rec: dict[str, list] = {
         "t": [],
         "q": [],
         "dq": [],
         "O_T_EE": [],
         "F_ext": [],
+        # Per joint, so a pull between two links (a cable) can be told from a push on the socket.
+        "tau_ext": [],
+        "F_ball": [],  # what the loop and the stop act on (see PRESS_LATERAL_DEADBAND_N)
         "cmd_socket": [],
+        "q_cmd": [],
+        "press_target_n": [],
+        "press_shift_mm": [],
+        "force_target_n": [],
+        "shift_mm": [],
         "phase": [],
     }
-    monitor = Monitor()
+    plan_speed = float(np.degrees(np.abs(dQN)).max())
+    monitor = Monitor(
+        force_n=EXECUTE_STOP_FORCE_N,
+        tracking_mm=EXECUTE_STOP_TRACKING_MM,
+        joint_deg=EXECUTE_STOP_JOINT_DEG,
+        speed_deg_s=max(STOP_JOINT_SPEED_DEG_S, 2 * plan_speed),
+    )
     print(
-        f"execute: {t_plan[-1]:.0f} s pivot, soft impedance {params['translational_stiffness']:.0f} N/m, "
-        f"press {params['press_mm']} mm, bias {params['bias_mm']} mm"
+        f"execute: {t_plan[-1]:.0f} s pivot, joint tracking of the plan (Franka default gains), "
+        f"press {PRESS_FORCE_N:g} N by the force at the ball (from tau_ext), across within {PRESS_LATERAL_DEADBAND_N:g} N of seated "
+        f"(seated at {press0:+.1f} N, {np.linalg.norm(along_across(force0)[1]):.1f} N across), "
+        f"plan press {params['press_mm']} mm, "
+        f"bias {params['bias_mm']} mm"
     )
     panda.start_controller(ctrl)
     try:
-        ee0 = _ee_matrix(state)
-        ctrl.set_control(ee0[:3, 3], quat_xyzw(ee0[:3, :3]), q_now)
+        ctrl.set_control(q_now, np.zeros(7))
         t0 = time.monotonic()
         next_print = 0.0
+        last = 0.0
+        force = force0
+        realized = np.zeros(3)
         while not stop["why"]:
             elapsed = time.monotonic() - t0
-            if elapsed > t_plan[-1]:
+            settled = np.linalg.norm(force - force0) < PRESS_SETTLE_N
+            if elapsed > t_plan[-1] and (settled or elapsed > t_plan[-1] + PRESS_SETTLE_S):
                 break
             k = int(min(np.searchsorted(t_plan, elapsed), len(t_plan) - 1))
-            T_cmd = np.eye(4)
-            x, y, z, w = Q[k]
-            T_cmd[:3, :3] = _quat_matrix(x, y, z, w)
-            T_cmd[:3, 3] = P[k]
-            T_ee = T_cmd @ X_inv
-            ctrl.set_control(T_ee[:3, 3], quat_xyzw(T_ee[:3, :3]), QN[k])
+            w = float(smoothstep(min(elapsed, t_plan[-1] - elapsed) / ramp_s))
+            target = force0 + (goal - force0) * w
+            shift_m = press_step(shift_m, force, target, elapsed - last, realized)
+            last = elapsed
+            q_cmd = QN[k] + (1.0 - float(smoothstep(elapsed / EXECUTE_BLEND_S))) * start_offset
+            q_cmd = q_cmd + kin.shift(q_cmd, shift_m)
+            ctrl.set_control(q_cmd, dQN[k])
             s = panda.get_state()
             ee = _ee_matrix(s)
             socket = (ee @ X)[:3, 3]
-            f_ext = list(s.O_F_ext_hat_K)
+            force = kin.point_force(s.q, s.tau_ext_hat_filtered, anchor)
+            press, f_across = along_across(force)
+            realized = socket - P[k]
             rec["t"].append(elapsed)
             rec["q"].append(list(s.q))
             rec["dq"].append(list(s.dq))
             rec["O_T_EE"].append(list(s.O_T_EE))
-            rec["F_ext"].append(f_ext)
+            rec["F_ext"].append(list(s.O_F_ext_hat_K))
+            rec["tau_ext"].append(list(s.tau_ext_hat_filtered))
+            rec["F_ball"].append(np.round(force, 4).tolist())
             rec["cmd_socket"].append(P[k].tolist())
+            rec["q_cmd"].append(q_cmd.tolist())
+            rec["press_target_n"].append(round(float(target @ PRESS_DIR), 3))
+            rec["press_shift_mm"].append(round(float(shift_m @ PRESS_DIR) * 1e3, 4))
+            rec["force_target_n"].append(np.round(target, 3).tolist())
+            rec["shift_mm"].append(np.round(shift_m * 1e3, 4).tolist())
             rec["phase"].append(int(plan_data["phase"][k]))
-            why = monitor.check(s.q, f_ext, socket, P[k], QN[k])
+            # the socket against the plan's point on the ball -- not against the shifted command
+            why = press_stuck(shift_m, force, target) or monitor.check(s.q, force, socket, P[k], q_cmd, s.dq)
             if why:
                 stop["why"] = why
                 break
@@ -854,7 +1093,10 @@ def execute(args) -> int:
             if elapsed >= next_print:
                 print(
                     f"  {elapsed:5.1f} / {t_plan[-1]:.0f} s  {plan_data['phase_names'][rec['phase'][-1]]:7s} "
-                    f"press {-f_ext[2]:+4.1f} N  |F| {np.linalg.norm(f_ext[:3]):4.1f} N  off cmd {np.linalg.norm(socket - P[k]) * 1e3:4.1f} mm"
+                    f"press {press:+4.1f} N (shift {shift_m @ PRESS_DIR * 1e3:+4.1f} mm)  "
+                    f"across {np.linalg.norm(f_across - along_across(force0)[1]):3.1f} N off seated (shift {np.linalg.norm(along_across(shift_m)[1]) * 1e3:3.1f} mm)  "
+                    f"off plan {np.linalg.norm(socket - P[k]) * 1e3:4.1f} mm  "
+                    f"joint off {np.degrees(np.abs(np.asarray(s.q) - q_cmd)).max():3.1f}°"
                 )
                 next_print += 5.0
             time.sleep(1.0 / params["rate_hz"])
@@ -868,12 +1110,20 @@ def execute(args) -> int:
         "note": args.note,
         "created": dt.datetime.now().isoformat(),
         "mode": "commanded",
+        "controller": "joint_position",
+        "joint_stiffness": JOINT_STIFFNESS.tolist(),
+        "press_force_n": PRESS_FORCE_N,
+        "press_seated_n": round(press0, 3),
+        "force_seated_n": np.round(force0, 3).tolist(),
+        "press_lateral_mm": PRESS_LATERAL_MM,
         "plan": args.plan.name,
         "centre": plan_data["centre"],
         "bias_mm": params["bias_mm"],
         "press_mm": params["press_mm"],
         "completed": not stop["why"],
         "F_ext_frame": "O",
+        "force_source": "F_ball",
+        "F_ball_point_mm": np.round(anchor * 1e3, 3).tolist(),
         "stopped": stop["why"],
         **rec,
     }
@@ -1114,6 +1364,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--tilt-deg", type=float, default=PlanParams.tilt_deg, help="--star only")
     p.add_argument("--spin-deg", type=float, default=PlanParams.spin_deg, help="--star only")
+    p.add_argument(
+        "--probe",
+        action="store_true",
+        help=f"a short slow plan within {PROBE_WITHIN_DEG:g}° of the start, to fit the ball's centre for --anchor-mm",
+    )
+    p.add_argument(
+        "--within-deg",
+        type=float,
+        default=None,
+        help=f"dwells within this of the start (0: no limit); default {ANCHORED_WITHIN_DEG:g}° with --anchor-mm, else none",
+    )
     p.add_argument("--dwells", type=int, default=14, help="dwell poses, the start included")
     p.add_argument("--dwell-s", type=float, default=1.5)
     p.add_argument("--speed-deg-s", type=float, default=PlanParams.speed_deg_s)
@@ -1139,11 +1400,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("centre", type=Path)
     p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     p.add_argument("--duration-s", type=float, default=GUIDE_DEFAULT_DURATION_S)
-    p.add_argument("--press-mm", type=float, default=PlanParams.press_mm)
+    p.add_argument("--press-mm", type=float, default=GUIDE_PRESS_MM)
     p.add_argument(
         "--bias-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], help="deliberate offset, fr3_base"
     )
-    p.add_argument("--stiffness", type=float, default=PlanParams.translational_stiffness, help="N/m")
+    p.add_argument("--stiffness", type=float, default=GUIDE_STIFFNESS_N_M, help="N/m")
     p.add_argument(
         "--anchor-mm",
         type=float,
@@ -1156,7 +1417,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--note", default="")
     p.add_argument("--out", type=Path)
     p.set_defaults(func=guide)
-    p = sub.add_parser("execute", help="real robot: follow a passed plan under soft impedance")
+    p = sub.add_parser("execute", help="real robot: follow a passed plan's joint angles")
     p.add_argument("plan", type=Path)
     p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     p.add_argument("--urdf", type=Path, default=DEFAULT_URDF)

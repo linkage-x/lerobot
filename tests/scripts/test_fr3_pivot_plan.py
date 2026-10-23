@@ -125,11 +125,16 @@ def test_planned_dwells_pass_every_check_and_measure_the_true_socket(kin, stand,
     assert S.checker.min_mm["socket"] == pytest.approx(S.checker.start["socket_mm"] - pp.START_SLACK_MM)
     assert S.checker.min_mm["socket"] < pp.SOCKET_CLEARANCE_MM
     assert stand_info["socket_stand_mm"] >= S.checker.min_mm["socket"]
-    # starts and ends unpressed at the capture, pressed 3 mm down in between
+    # starts and ends unpressed at the capture, pressed 1 mm down in between
     assert path["p"][0] == pytest.approx(BALL, abs=1e-4) and path["p"][-1] == pytest.approx(BALL, abs=1e-4)
+    # in the captured posture too, not just its pose: a probe's end is where the full plan starts
+    # (10-20 14:24: the return left j5 2.1° off it, past execute's START_TOLERANCE_DEG)
+    assert np.degrees(np.abs(qs[-1] - np.asarray(centre["q"]))).max() < 0.1
     dwell = names.index("dwell1")
     i = int(np.argmax(path["phase"] == dwell))
-    assert path["p"][i] - (S.centre_m - path["R"][i] @ S.anchor_m) == pytest.approx([0, 0, -0.003], abs=1e-9)
+    assert path["p"][i] - (S.centre_m - path["R"][i] @ S.anchor_m) == pytest.approx(
+        [0, 0, -pa.EXECUTE_PRESS_MM / 1e3], abs=1e-9
+    )
     # every dwell is held still for dwell_s
     held = (path["phase"] == dwell).sum() / params.rate_hz
     assert held == pytest.approx(params.dwell_s, abs=0.02)
@@ -155,6 +160,76 @@ def test_planned_dwells_pass_every_check_and_measure_the_true_socket(kin, stand,
     assert fit["socket_frame"]["s_ee_mm"] == pytest.approx(delta, abs=0.05)
 
 
+def test_a_probe_stays_near_the_start_and_fits_well_enough_to_anchor(kin, stand, centre, tmp_path):
+    # 10-19 18:16: the grip put the ball 8.7 mm off corenetic_socket_ee's origin
+    scene = pa.SceneCheck(table_z_m=TABLE_Z)
+    params = pp.DwellParams(
+        dwells=pa.PROBE_DWELLS,
+        speed_deg_s=pa.PROBE_SPEED_DEG_S,
+        within_deg=pa.PROBE_WITHIN_DEG,
+        min_dwells=pa.PROBE_MIN_DWELLS,
+    )
+    path, qs, names, info, S = pp.plan_dwells(
+        centre, kin, scene, stand, params, pp.SurveyParams(table_z_m=TABLE_Z, heading_span_deg=30.0)
+    )
+    assert info["problems"] == [], info
+    R0 = S.R(S.start)
+    assert all(
+        math.degrees(pa.rot_angle(R0.T @ pp.socket_rotation(*np.radians(a)))) <= pa.PROBE_WITHIN_DEG + 1e-6
+        for a in info["dwells_deg"]
+    )
+    turned = [math.degrees(pa.rot_angle(path["R"][0].T @ R)) for R in path["R"]]
+    assert max(turned) <= pa.PROBE_WITHIN_DEG + pp.SurveyParams.heading_step_deg + 0.5
+    summary = pa.check_path(path, qs, np.asarray(centre["q"]), kin, scene, params.rate_hz, table_z_m=TABLE_Z)
+    assert summary["passed"], summary["problems"]
+    assert summary["duration_s"] < 90
+    delta = [-3.2, 0.8, -8.0]
+    qs_seated = _seated_run(kin, centre, path, delta)
+    gripper = pa.Kinematics(frame="corenetic_gripper_ee")
+    T = np.asarray([gripper.fk(q) for q in qs_seated])
+    run_path = tmp_path / "20261019_190000_pivot.json"
+    run_path.write_text(
+        json.dumps(
+            {
+                "mode": "commanded",
+                "q": qs_seated.tolist(),
+                "O_T_EE": [list(m.T.reshape(-1)) for m in T],
+                "F_ext": [[0, 0, -3.0, 0, 0, 0]] * len(qs_seated),
+                "F_ext_frame": "O",
+                "completed": True,
+            }
+        )
+    )
+    out = tmp_path / "fit.json"
+    assert tp.main(["fit", str(run_path), "--json", str(out)]) == 0
+    sock = json.loads(out.read_text())["socket_frame"]
+    assert sock["s_ee_mm"] == pytest.approx(delta, abs=0.05)
+    assert sock["span_deg"] >= 20 and sock["weak_singular"] >= 0.1  # what the GUI asks of an anchor
+
+
+def test_the_move_home_walks_the_posture_back_too(kin, stand, centre):
+    # 10-20 14:24: the probe came home in pose with j5 2.1° off the capture; ik alone never leans a
+    # posture whose pose is already met
+    S = pp.survey(
+        centre, kin, pa.SceneCheck(table_z_m=TABLE_Z), stand, pp.SurveyParams(table_z_m=TABLE_Z, **COARSE)
+    )
+    q0 = np.asarray(centre["q"])
+    q_off = q0.copy()
+    for _ in range(30):  # along the self-motion, the pose kept
+        kin.fk(q_off)
+        J = kin.pin.computeFrameJacobian(kin.model, kin.data, q_off, kin.fid, kin.pin.LOCAL_WORLD_ALIGNED)
+        v = (np.eye(7) - np.linalg.pinv(J) @ J)[:, 4]
+        q_off, ep, _ = kin.ik(kin.fk(q0), q_off + math.radians(0.2) * v / np.linalg.norm(v), q_off)
+    assert ep < 1e-6 and np.degrees(np.abs(q_off - q0)).max() > pa.START_TOLERANCE_DEG
+    assert kin.ik(kin.fk(q0), q_off, q0)[0] == pytest.approx(q_off)
+    R0 = kin.fk(q0)[:3, :3]
+    mv = pp.densify(S, kin, [S.start, S.start], R0, q_off, R0, q0)
+    assert mv.why == ""
+    assert np.degrees(np.abs(mv.q[-1] - q0)).max() < 1e-3
+    assert np.degrees(np.abs(np.diff(mv.q, axis=0))).max() <= pp.DENSE_STEP_DEG + 0.05
+    assert all(np.linalg.norm(kin.fk(q)[:3, 3] - kin.fk(q0)[:3, 3]) < 1e-6 for q in mv.q)
+
+
 def test_a_capture_that_already_breaks_a_check_is_named(kin, stand, centre):
     scene = pa.SceneCheck(table_z_m=TABLE_Z)
     q = np.asarray(centre["q"]).copy()
@@ -166,6 +241,22 @@ def test_a_capture_that_already_breaks_a_check_is_named(kin, stand, centre):
     )
     assert len(qs) == 0
     assert any("起始姿态本身不过检查" in p and "limit: j2" in p for p in info["problems"])
+
+
+def test_a_start_nearer_the_stand_than_a_dwell_wants_still_plans(kin, stand, centre, monkeypatch):
+    # The arm sits there pressed anyway (10-20 15:41: fingertip 9.5 mm by the anchored model, dwells want 10).
+    scene = pa.SceneCheck(table_z_m=TABLE_Z)
+    survey = pp.SurveyParams(table_z_m=TABLE_Z, **COARSE)
+    S = pp.survey(centre, kin, scene, stand, survey)
+    grip = S.checker.check(S.R(S.start), S.q[S.start])[1]["gripper_mm"]
+    monkeypatch.setattr(pp, "GRIPPER_DWELL_CLEARANCE_MM", grip + 0.1)
+    path, qs, _, info, S = pp.plan_dwells(centre, kin, scene, stand, pp.DwellParams(dwells=6), survey)
+    assert not any("起始姿态" in p for p in info["problems"]), info["problems"]
+    assert len(qs) and "照样从它出发" in info["notes"][0]
+    # a start too near a limit is still taken again
+    monkeypatch.setattr(pp, "DWELL_LIMIT_MARGIN_DEG", 180.0)
+    _, qs, _, info, _ = pp.plan_dwells(centre, kin, scene, stand, pp.DwellParams(dwells=6), survey)
+    assert len(qs) == 0 and any("起始姿态本身不过检查" in p for p in info["problems"])
 
 
 def test_plan_cli_writes_a_dwell_plan_execute_accepts(kin, centre, tmp_path, monkeypatch):

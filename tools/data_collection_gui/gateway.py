@@ -4535,7 +4535,8 @@ def _capture_fr3_pivot_centre(state: GatewayState, body: dict[str, Any]) -> dict
 
 
 def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
-    """IK + MuJoCo checks of the pivot about a captured centre. A plan that fails is written too."""
+    """IK + MuJoCo checks of the pivot about a captured centre. A plan that fails is written too.
+    ``probe``: the short slow plan near the start whose run is fitted for the full plan's anchor."""
     name = str(body.get("centre") or "")
     centre = _fr3_pivot_root(state) / "centres" / name
     if not _FR3_PIVOT_CENTRE_RE.match(name) or not centre.is_file():
@@ -4543,13 +4544,14 @@ def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     bias = _fr3_pivot_bias(body)
     if isinstance(bias, str):
         return _fr3_pivot_refusal(state, bias)
-    # The plan turns about the fitted ball centre too, as guide holds it there.
-    anchor_args: list[str] = []
-    if body.get("anchorFromFit"):
+    # The plan turns about the fitted ball centre too, as guide holds it there. A probe is what finds it.
+    probe = bool(body.get("probe"))
+    anchor_args: list[str] = ["--probe"] if probe else []
+    if body.get("anchorFromFit") and not probe:
         anchor = _fr3_pivot_anchor(state)
         if not anchor["available"]:
             return _fr3_pivot_refusal(state, anchor["reason"])
-        anchor_args = ["--anchor-mm", *[f"{x:g}" for x in anchor["sMm"]], "--anchor-from", anchor["fitName"]]
+        anchor_args += ["--anchor-mm", *[f"{x:g}" for x in anchor["sMm"]], "--anchor-from", anchor["fitName"]]
     out = _fr3_pivot_root(state) / "plans" / f"{datetime.now():%Y%m%d_%H%M%S}_plan.json"
     code, output = _run_fr3_pivot_tool(
         state,
@@ -4564,7 +4566,7 @@ def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
 
 
 def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
-    """Real robot: the soft impedance follows a passed plan, then the run is fitted as a collect is."""
+    """Real robot: the joints follow a passed plan, then the run is fitted as a collect is."""
     name = str(body.get("plan") or "")
     plan = _fr3_pivot_root(state) / "plans" / name
     if not _FR3_PIVOT_PLAN_RE.match(name) or not plan.is_file():
