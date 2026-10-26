@@ -10008,6 +10008,19 @@ def _run_extrinsics_calibration(
     if fitted_intrinsics is not None:
         _annotate_intrinsics_coverage(cameras, fitted_intrinsics)
     failed = [c for c in cameras if c["status"] == "fail"]
+    # A view dropped before the bundle is a frame the operator might want to
+    # look at, not a fault; a bundle stopped by its budget is a number that may
+    # still move. Neither is visible in the per-camera RMSE.
+    rejected_views = report.get("rejected_views") or []
+    if rejected_views:
+        state.log(
+            "info",
+            f"BA dropped {len(rejected_views)} view(s) whose own PnP failed: "
+            + ", ".join(f"{v.get('camera')}@{v.get('frame')}" for v in rejected_views[:10]),
+        )
+    not_converged = report.get("converged") is False
+    if not_converged:
+        state.log("warn", f"BA stopped before converging after {report.get('nfev')} evaluations: {report.get('termination')}")
     state.calibration.cameras = cameras
     state.calibration.state = "failed" if failed else "complete"
     _finish_solve_progress(state, complete=True)
@@ -10045,6 +10058,8 @@ def _run_extrinsics_calibration(
         f"BA 重投影 {float(report.get('rmse_px', float('nan'))):.4f} px，"
         f"{report.get('num_frames', 0)} 帧 / {len(cameras)} 相机"
         + ("；有相机残差过大" if failed else "")
+        + (f"；剔除 {len(rejected_views)} 个 PnP 失败的视角" if rejected_views else "")
+        + ("；BA 未收敛" if not_converged else "")
         + ("" if export_production else "。实验模式：未导出，生产标定未改动。")
     )
     state.log(

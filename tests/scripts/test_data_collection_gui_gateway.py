@@ -4573,6 +4573,43 @@ def test_the_bar_walks_all_three_steps_of_a_real_solve(tmp_path, monkeypatch):
     assert state.calibration.progress.fraction == 1.0
 
 
+def test_rejected_views_and_an_unconverged_bundle_reach_the_operator(tmp_path, monkeypatch):
+    """Neither shows in the per-camera RMSE, so the solve has to say them out loud."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    report_path = tmp_path / "outputs" / "metrology" / "run_x" / "extrinsics_report.json"
+    intrinsics = tmp_path / gateway._CALIB_INTRINSICS_REPORT
+    intrinsics.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics.write_text("{}", encoding="utf-8")
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        if "metrology.cli.calibrate_extrinsics" in args:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                "rmse_px": 0.29,
+                "num_frames": 250,
+                "per_camera_rmse": {"cam_00": 0.29},
+                "converged": False,
+                "nfev": 60,
+                "termination": "The maximum number of function evaluations is exceeded.",
+                "rejected_views": [{"episode": "episode_000000", "frame": 948, "camera": "cam_14", "pnp_rmse_px": 156.6}],
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(state, dataset, "run_x", Path(sys.executable))
+
+    assert state.calibration.state == "complete", state.calibration.message
+    assert "剔除 1 个 PnP 失败的视角" in state.calibration.message
+    assert "BA 未收敛" in state.calibration.message
+    logged = " | ".join(entry.message for entry in state.events)
+    assert "cam_14@948" in logged
+    assert "stopped before converging after 60" in logged
+
+
 # ---------------------------------------------------------------------------
 # Which capture gets solved, and reusing its detections on a retry
 # ---------------------------------------------------------------------------
