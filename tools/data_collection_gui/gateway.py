@@ -17023,6 +17023,31 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
     )
 
 
+DUAL_FR3_EXECUTABLE_FILE = Path("meta") / "dual_fr3_executable.json"
+
+
+def _dual_fr3_executability_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """One episode's two-arm verdicts (roadmap C4), per replay mode; None when the dataset has none.
+
+    Written by tools/fr3/dual_fr3_executability.py next to info.json; read-only here. The gateway does not
+    import that tool: it needs numpy and runs in the FR3 environment, the gateway in Thor's system python.
+    """
+    data = _load_json_file(dataset_root / DUAL_FR3_EXECUTABLE_FILE)
+    if not data:
+        return None
+    modes = {}
+    for mode, block in (data.get("modes") or {}).items():
+        if not isinstance(block, dict):
+            continue
+        modes[mode] = {
+            "createdUtc": block.get("created_utc"),
+            "embodiment": block.get("embodiment"),
+            "summary": block.get("summary") or {},
+            "episode": (block.get("episodes") or {}).get(str(int(episode))),
+        }
+    return {"datasetRoot": str(dataset_root), "episode": int(episode), "modes": modes}
+
+
 def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
     """The FR3 replay report, shaped as the inspector's preview payload.
 
@@ -18621,6 +18646,24 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                     return
                 _json_response(self, HTTPStatus.OK, timeline)
+                return
+            if path == "/api/replay/dual-fr3":
+                try:
+                    episode = int(query.get("episode", ["0"])[0])
+                except ValueError:
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
+                    return
+                requested = query.get("path", [""])[0]
+                dataset_root = _resolve_known_dataset(self.server.state, requested) or self.server.state.selected_replay_root
+                payload = None if dataset_root is None else _dual_fr3_executability_payload(dataset_root, episode)
+                if payload is None:
+                    _json_response(
+                        self,
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "No two-arm verdict for this dataset: run tools/fr3/dual_fr3_executability.py."},
+                    )
+                    return
+                _json_response(self, HTTPStatus.OK, payload)
                 return
             if path == "/api/replay/mujoco-preview":
                 requested = query.get("path", [""])[0]

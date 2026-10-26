@@ -35,6 +35,7 @@ import type {
   RealEndEffectorMode,
   MujocoPreview,
   LaserReplayReport,
+  DualFr3Executability,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -505,6 +506,20 @@ export class DataCollectionGuiApi {
       return { report, availableRuns: report.availableRuns ?? [] };
     } catch {
       return { report: null, availableRuns: [] };
+    }
+  }
+
+  // null when the dataset has no two-arm verdicts yet (tools/fr3/dual_fr3_executability.py writes them).
+  async fetchDualFr3Executability(datasetPath: string, episode: number): Promise<DualFr3Executability | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/dual-fr3?path=${encodeURIComponent(datasetPath)}&episode=${episode}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return null;
+      return (await response.json()) as DualFr3Executability;
+    } catch {
+      return null;
     }
   }
 

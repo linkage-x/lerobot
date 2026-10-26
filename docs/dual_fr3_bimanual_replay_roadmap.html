@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>双手轨迹与双 FR3 Replay Roadmap</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 60px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:20px;padding:28px 32px;box-shadow:var(--shadow);margin-bottom:20px}
+  .hero h1{margin:0 0 8px;font-size:26px}
+  .hero p{margin:4px 0;color:#d1d5db}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:20px}
+  h3{margin:16px 0 8px;font-size:16px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:12px 16px;border-radius:10px;margin:10px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;white-space:nowrap}
+  td.id{font-weight:700;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .done{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+  .now{color:var(--accent);background:var(--accent-soft)}
+  .small{font-size:13px;color:var(--muted)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:1px 5px;font-size:.92em}
+  ul,ol{margin:6px 0;padding-left:22px} li{margin:3px 0}
+  pre{background:#f3f4f6;border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>双手轨迹与双 FR3 Replay Roadmap</h1>
+  <p>v1.6 · 2026-10-26（v1.6：C1–C4 落地——双臂 MuJoCo 场景、两种回放模式、整段双臂联合 retarget、可执行性写进数据集并在 replay 页显示；D3 换成 C3 的碰撞模型；三个新发现：「0–18 % 帧够不着」是逐帧 IK 的种子假象、双臂回放必须流关节而不是 TCP、MuJoCo 的网格距离在部分网格对上会返回 0；v1.5：A5① 拼对生成器、D1/D3 双臂 runtime（假机器人）落地；A1 的 T_LR 台阶改在 base 系读；夹爪 10-28 回来，Q4 暂不加工；v1.4：Q3 已答——手持 cube 也送修，A4 改为等 cube；加 A5「cube 回来之前的替代双手轨迹」，调整下一批；v1.3 · 10-23 第一批开工：G1 / G2 / G3 / A1 代码落地，并据此改了四个前提——已有数据里没有双手、C0 不拆数据集、B3 只能到约 3 mm、闭环只抓粗差；v1.1 加「注册：单 FR3 → 双 FR3 → 人形」与「拿到真实数据之前」两节、G 线；v1.2 按 Q1/Q2/Q7 的回答改：第二台放左边、两台定位后不动、人形是轮式可移动，加 H 线）· 从 <code>docs/box_umi_trajectory_gt_replay_roadmap.html</code> 的 Phase 8–12 拆出，专管「双手轨迹 → 双 FR3 回放」这一条线</p>
+  <p>前提：采集端（手持 BOX）和执行端（FR3 上的 Corenetic 夹爪）的夹爪<b>全部返厂维修</b>，回来时间未定。</p>
+  <p class="small" style="color:#9ca3af">主 roadmap 仍是误差预算和 3 mm 口径的唯一出处；本页只排双臂这条线的待办和顺序。激光细节见 <code>docs/box_umi_laser_tracker_gt_roadmap.html</code>。</p>
+</div>
+
+<div class="card">
+  <h2>结论先行</h2>
+  <ul>
+    <li><b>现在能回放的只有一只手。</b>整条链（world → fr3_base 注册边、socket TCP、两步真机 replay、激光误差分析）只在 <b>right cube → 一台 FR3（192.168.11.102）</b>上跑通过。双臂相关的代码、标定、数据契约都还没开始，不是「差一点」。</li>
+    <li><b>夹爪不在，正好做与夹爪无关的那一半。</b>沿用主 roadmap 的判据：「夹爪明天回来，这项会不会白做？」不会白做的现在做：双手数据的 QC 与 benchmark 选集、按臂分开的 base 坐标系、双臂仿真与联合 retarget、双臂执行 runtime、第二台 FR3 上线、用激光测两台 base 之间的关系、FR3 本体执行误差（Phase 11）。会白做的等夹爪：socket 常量、左手 marker→TCP、夹爪回放、接触任务。</li>
+    <li><b>无夹爪下测的执行误差不能直接搬到有夹爪的构型。</b>负载和 TCP 力臂都变了。所以 FR3 本体计量要挂一块和夹爪等质量、等质心的配重；即便如此，结论也只标「配重构型」，夹爪回来后复测一次再定。</li>
+    <li><b>10-23 第一批开工后，四个前提要改：</b>
+      <ol>
+        <li><b>已有数据里没有双手。</b>A1 在 Thor 上全部 37 个 v2/v3 session 里跑了一遍：<b>左手 cube（marker 0–4）在任何相机、任何一帧都没被检测到</b>（10-03 起每段 left sidecar 都是 0 帧解出）。唯一有左手的是 6 月的 <code>dadada</code> 两段 v1 数据，测量链不同，不能用。所以 A2 选集、B0 摆放、C3 retarget 都没有双手轨迹可用。<b>A4（手持 cube 录无夹爪的双手轨迹）从「可选」变成前置</b>。<b>10-26：</b>Q3 已答，手持 cube 也送修了，A4 要等 cube 回来。在那之前用 A5 的替代轨迹开发 C / D 线，但 A2 选集和 B0 摆放的最终结论仍要等 A4。</li>
+        <li><b>C0 不拆数据集的坐标系。</b>一个数据集只放在一个系里（仍是 <code>fr3_base</code> = right 的 base），两只手一起导出，T_LR 还是同一个文件里两列的乘积。左臂需要的 <code>fr3_base → fr3_base_left</code> 由回放时按本体描述（G1）在图上查，用到的边写进回放报告。<code>export_v3</code> 一行不改，旧导出天然逐字节不变。</li>
+        <li><b>B3 只能到约 3 mm，不是 1 mm 级。</b>G3 的合成实验显示：臂-臂同球和激光站位两种方法打平（共享工作区内 T_LR 的 p95 约 3.0 mm），瓶颈是每台 FR3 自身的运动学误差（FK 对激光 0.47 mm）。球位数量和 pivot 落座噪声影响都很小。经两条 world 边绕过去约 4.8 mm，所以 relative 模式仍然更好。要再往下，得做单臂运动学标定，多摆几个球没用。</li>
+        <li><b>闭环检查只能抓粗差。</b>按现在 world 边的水平（留一 2.6 mm），闭环阈值约 15 mm，1% 误报下，10 mm 的错边只能抓到约 1/4。它能发现「base 被碰了」「错用了手眼边」这类错误，但证明不了一条边到毫米级。G2 原来写的退出条件「注入 5 mm 能抓到」在这个精度下做不到，已改。</li>
+      </ol>
+    </li>
+    <li><b>已定（10-23）：</b>第二台 FR3 放在现有这台的左边（新的 = left，192.168.11.102 = right）；两台 base 重新定位后不再挪。人形是轮式的，可以移动，见 H 线。<b>如果现有这台也要挪，它现役的球位边（<code>ball_check_20261015T030840Z</code>）随之作废</b>，已导出到 fr3_base 的数据都要用新边重导（标签链防混用会拦住新旧混用）。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>注册：单 FR3 → 双 FR3 → 人形</h2>
+  <div class="callout warn"><b>先更正一个前提：单 FR3 现役的注册边已经不是手眼标定了。</b>10-09 的单 tag 手眼边（<code>p0_two_marker_calibration.py</code>，相机看臂上 tag-6）在 10-14 同球检验里差 10.7–13.3 mm（主要是约 10.7 mm 的竖直平移），单 tag 法两次重解之间自己就差约 4 mm。10-15 起生产用的是 <b>5 球位刚体边</b>（<code>ball_check_20261015T030840Z</code>，留一 rms 2.63 mm）。激光边（站位 × FK）受站位精度所限，只能证到 5–6 mm。</div>
+
+  <h3>所有注册方法其实是同一件事</h3>
+  <p>同一组物理点（或位姿）在两个坐标系里各量一次，拟合一个刚体变换。区别只在<b>谁当公共观测物</b>、<b>误差经过哪些环节</b>。</p>
+  <div class="scroll"><table>
+    <tr><th>方法</th><th>公共观测物</th><th>误差经过</th><th>实测</th><th>无夹爪能做？</th></tr>
+    <tr><td>手眼（臂带 tag）</td><td>臂上的 marker</td><td>相机外参当时的状态 + marker 可见性 + 旋转误差 × 力臂 + FK</td><td>10-09 单 tag：差约 10.7 mm</td><td>能（tag 装法兰）</td></tr>
+    <tr><td>同球（臂 vs 手持 UMI）</td><td>桌上固定球的球心</td><td>FR3 pivot 拟合 + 手持 pivot 拟合 + FK；<b>不依赖 TCP 定义</b></td><td>5 球位留一 rms 2.63 mm</td><td>不能（手持侧要 UMI）</td></tr>
+    <tr><td>激光站位 × FK</td><td>法兰上的 SMR</td><td>FK + 激光；接到相机 world 还要经过站位（rms 1.0–3.4 mm）</td><td>边 5–6 mm（被站位卡住）</td><td>能（要法兰 SMR 转接件）</td></tr>
+    <tr><td>平台 ArUco</td><td>平台上的 marker layout</td><td>相机 + 一次性的 T_PB</td><td>没做过</td><td>能</td></tr>
+    <tr><td><b>臂-臂同球（新）</b></td><td>同一组球的球心</td><td>两台 FK + 两次 pivot 拟合；<b>不经过相机，也不经过激光</b></td><td>没做过；单次 pivot 拟合 10-20 rms 0.95 mm</td><td>能（要法兰杯）</td></tr>
+  </table></div>
+
+  <h3>双 FR3：先管两臂之间，再管到 world</h3>
+  <ul>
+    <li><b>不要两台各自做手眼。</b>两条边各自带的相机侧误差（相机状态、cube 可见性、旋转 × 力臂）两边不相关，会直接叠进两手间距 T_LR；10-09 那条边单条就差 10 mm。</li>
+    <li><b>拓扑：</b><code>world ─ fr3_base_right ─ fr3_base_left</code>，再加一条 <code>world ─ fr3_base_left</code> 构成闭环。
+      <ul>
+        <li><b>T_BL_BR（两臂之间）</b>：首选臂-臂同球——两臂法兰装同款杯，绕桌上同一组 ≥ 4 个球位（含换高度、留一个点做留出）各做 pivot，球心分别落在两个 base 里，拟合刚体变换。备选是同一激光站位下两臂各做站位 × FK。两种方法独立，互为检验。</li>
+        <li><b>world → 一台 base</b>：right 沿用球位刚体边；left 现在先上激光边，夹爪回来后用同球检验替换。</li>
+        <li><b>闭环残差</b>：<code>inv(T_W_BL)·T_W_BR</code> 和 T_BL_BR 的差，就是三条边误差的直接证据，不用另找 GT。</li>
+      </ul></li>
+    <li><b>球位要摆在两臂共享的工作区，并且要有高度差。</b>T_BL_BR 的旋转误差 × 到工作区的距离会变成 T_LR 误差；10-14 只补到第 ④ 个换高度的球位，竖直方向才约束住。</li>
+    <li><b>软件现状：</b><code>world_transform</code> 已经是在 world_graph 上做 BFS，多一个 base 节点不需要改结构；缺的是每条边的 σ、方法来源，以及「多条路径时做闭环检查，而不是取第一条」。</li>
+  </ul>
+
+  <h3>换成人形：问题的形状变了</h3>
+  <div class="scroll"><table>
+    <tr><th></th><th>双 FR3</th><th>人形</th></tr>
+    <tr><td>两手之间靠什么连</td><td>外部注册边 T_BL_BR（量一次，base 不挪就一直成立）</td><td>机器人自己的运动链（躯干 / 腰）。没有外部边可注册，问题变成<b>整机运动学标定</b>：关节零位、连杆参数、回差、躯干柔性</td></tr>
+    <tr><td>根坐标系</td><td>固定，每 session 一条静态边</td><td>轮式、可移动（10-23 确认）。每停一次位置就变一次，world 注册不能再靠 pivot 这种慢方法，要<b>自动、每次停稳就重测</b>：固定相机网络跟踪底盘/躯干上的 marker rig（即主 roadmap 9.1 的平台 ArUco 思路；现有 cube / carrier 跟踪器就是做这个的）。边走边操作时变成逐帧 T_W_root(t)。离开相机覆盖区就只能靠机载定位，绝对毫米级回放只在相机工作区内成立</td></tr>
+    <tr><td>本体精度</td><td>FR3 读回 vs 激光 0.47 mm</td><td>通常差得多，必须自己量（Phase 11 照做一遍）；很可能撑不起开环 absolute 毫米级回放，要靠 relative 模式或视觉闭环</td></tr>
+    <tr><td>retarget</td><td>两臂各 7 自由度，间距约束</td><td>两臂共享腰部冗余，联合优化拆不开；还有和躯干/头的自碰撞。末端是夹爪（10-23 确认），所以 TCP 定义、开度回放和 FR3 同一套，不用做手部 retarget</td></tr>
+    <tr><td>同球法还能用吗</td><td colspan="2">能。一只手 pivot 同一组球 → 球心在躯干系；两只手 pivot 同一组球 → 直接给出两臂相对运动学的检验，并可作为关节零位标定的数据</td></tr>
+  </table></div>
+
+  <h3>由此得出的设计原则（现在就该定）</h3>
+  <ol>
+    <li><b>标签留在相机 world，按本体导出时再转。</b>不让 <code>fr3_base</code> 成为数据集里唯一的那份坐标。<code>export_v3 --target-world</code> 已经是这个思路，要推广到「按本体、按臂」。</li>
+    <li><b>相对量优先。</b>T_LR、短时 RPE 这些不依赖根注册，换本体也成立；绝对量只在同一 world 且有注册边时使用。</li>
+    <li><b>本体描述抽象成一份文件</b>（见 G1）：运动学树 + 命名 TCP + 根坐标系 + 每个根如何注册进 world（静态边 / session 边 / 逐帧跟踪）+ 碰撞模型 + 控制接口。双 FR3 是「两个固定根、外部边相连」，人形是「一个浮动根、内部链相连」，retarget / 仿真 / runtime / QC 都只读这份描述。</li>
+  </ol>
+</div>
+
+<div class="card">
+  <h2>拿到真实数据之前能做什么</h2>
+  <div class="callout">「真实数据」这里指：夹爪回来后的新录制、第二台 FR3 的实测、人形的实测。<b>更正（10-23）：</b>原以为 10-14 之后的 session 里有现成的双手数据，A1 一跑发现<b>没有</b>：这些 session 里只有 right cube，左手 cube 一帧都没出现过。双手轨迹要先录（A4）。</div>
+  <div class="scroll"><table>
+    <tr><th>工作</th><th>没有真实数据时能证明什么</th><th>证明不了什么</th></tr>
+    <tr><td>G1 本体描述 + C0 坐标系拆分</td><td>旧数据导出结果不变；双 FR3 和人形都能用同一套接口描述</td><td>—</td></tr>
+    <tr><td>G2 world_graph 加边 σ / 方法 / 闭环检查</td><td>有多条路径时能发现不一致；σ 能沿路径传播</td><td>σ 本身准不准</td></tr>
+    <tr><td>G3 注册方法的合成实验</td><td>给定 FK 误差、pivot 噪声（用 10-14 / 10-20 实测的 σ）和球位布局，T_BL_BR 误差在共享工作区折成多少 T_LR；需要几个球位、摆在哪；手眼 vs 同球 vs 激光的敏感度对比</td><td>真实精度。合成实验只证明方法和代码是对的、敏感度有多大；用当前假设生成的数据评不出假设本身错在哪（FR3 选帧那次就是被真机推翻的）</td></tr>
+    <tr><td>A1–A3 双手 QC / 选集 / left 标记</td><td>录到的双手数据里哪些段两手都可靠（10-23：已有数据里没有双手，要先做 A4）</td><td>left 标签链的绝对精度</td></tr>
+    <tr><td>B0 + C1–C4 摆放 / 场景 / retarget</td><td>可达性、间距、retarget 改动量</td><td>真机执行误差</td></tr>
+    <tr><td>D1 / D3 / D4 双臂 runtime（假机器人）</td><td>同步启动、一臂故障双停、间距门禁会触发</td><td>真实 FCI 时序、两臂时钟漂移（D2）</td></tr>
+    <tr><td>机械件设计：法兰杯 ×2、法兰 SMR 转接件、配重盘、球位支架阵列</td><td>出图、下单（有前置期，越早越好）</td><td>—</td></tr>
+    <tr><td>人形调研（看 Q7）</td><td>SDK 能给什么：控制频率、关节 / 笛卡尔接口、能否读外力、根位姿估计；有没有可以装 marker rig 的躯干刚性面</td><td>—</td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>G 线 · 跨本体地基（纯软件）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">G1</td><td>本体描述</td><td>一份 embodiment 文件：URDF/MJCF、每只手的 TCP 帧、根帧及注册方式、碰撞模型、控制接口（IP / SDK / 频率）。单 FR3 现有配置是它的特例；C0 的 <code>fr3_base_left/right</code> 由它生成。</td><td>单 FR3 现有流程改读这份文件后结果不变</td><td><span class="badge done">10-23 格式定了</span><br/><span class="small"><code>tools/thor/gmsl2/embodiment.py</code> + <code>embodiments/fr3_single.json</code> / <code>fr3_dual.json</code>：根（fixed / mobile）、注册方式（static_edge / session_edge / tracked）、每臂的手、TCP、指向现有 replay YAML（不复制 IP 等参数）。<code>replay_modes()</code> 判定 absolute / relative 能不能做、靠哪几条边。gateway 还没改成读它（随 B2 一起改）。</span></td></tr>
+    <tr><td class="id">G2</td><td>world_graph 升级</td><td>每条边记方法（hand_eye / same_ball / laser_station / platform / arm_arm_ball）、σ、相机状态、日期；<code>world_transform</code> 遇多条路径时做闭环检查，超阈值报错而不是取第一条。</td><td><s>注入一条错 5 mm 的边，闭环检查能抓到</s> → 1% 误报下的阈值由 G3 标定；现有边水平下只抓粗差（见结论先行第 4 条）</td><td><span class="badge done">10-23 完成</span><br/><span class="small"><code>world_provenance</code>：σ 从各方法已有的 quality 字段推出（同球用留一 rms，激光用站位 σ，手眼用留出 p95/2），不改生产图；有多条路径时取 σ 最小的那条，其他路径必须在 3.5σ 内一致，否则 <code>WorldGraphClosureError</code>；差异在机器人 base 系的工作区角点上读，不在相机 world 原点读（原点离臂 1.4 m，0.5° 会被读成 12 mm）。<code>register_fr3_base apply --close-loop</code> 允许加第二条独立路径。现役图只有一条路径，行为不变。</span></td></tr>
+    <tr><td class="id">G3</td><td>注册方法合成实验</td><td>见上表。输出：球位数量与布局建议、各方法在共享工作区折算的 T_LR 误差。</td><td>B3 / B4 采集协议（球位、姿态数、驻点时长）</td><td><span class="badge done">10-23 完成</span><br/><span class="small"><code>tools/fr3/dual_fr3_registration_sim.py</code>，结果见下表</span></td></tr>
+  </table></div>
+  <h3>G3 结果（10-23，每个配置 300 次，<code>outputs/fr3/dual_fr3_registration_sim/sim_20261023T092702Z.json</code>）</h3>
+  <p class="small">两台 FR3 并排、朝向相同，left 在 right 的 +y 方向 0.8 m；每台的 DH 参数各自扰动，使 FK 对真值在刚体拟合后 rms 0.47 mm（10-12/13 激光实测）；落座噪声每轴 0.55 mm（复现 10-20 的 pivot rms 0.95 mm，模拟出 0.99）；手持同球 world 噪声每轴 1.2 mm（复现 10-15 边的留一 2.6 mm）。T_LR = 共享工作区 21 个点 × 3 个朝向上，right 读数经估计边映射后和 left 读数之差，取 p95，再取 300 次的 p95。「下限」是两臂 FK 误差本身造成、任何刚体边都消不掉的部分。</p>
+  <div class="scroll"><table>
+    <tr><th>配置</th><th>臂-臂同球 T_LR p95</th><th>激光站位</th><th>经两条 world 边</th><th>下限</th><th>说明</th></tr>
+    <tr><td>基线：5 球（4 角 + 中心抬高 0.15 m），跨度 0.3 m，14 驻点，倾角 30°</td><td><b>3.0 mm</b></td><td>3.1</td><td>4.8</td><td>1.1</td><td>同球和激光打平</td></tr>
+    <tr><td>4 球（平面 / 带高度）</td><td>3.3</td><td>3.2</td><td>5.4</td><td>1.1</td><td>少一个球差 0.3 mm</td></tr>
+    <tr><td>6 球（带高度）</td><td>2.9</td><td>3.1</td><td>4.6</td><td>1.1</td><td>多一个球只好 0.1 mm</td></tr>
+    <tr><td>高度差 0 / 0.25 m</td><td>3.1 / 3.1</td><td>3.1</td><td>5.0 / 4.4</td><td>1.1</td><td>高度差主要帮的是 world 边</td></tr>
+    <tr><td>跨度 0.15 m</td><td>3.2</td><td>3.1</td><td><b>6.6</b></td><td>1.1</td><td>world 边转角不准；留一也看不出来（闭环误报 23%）</td></tr>
+    <tr><td>跨度 0.45 m</td><td colspan="4">够不着：两臂都能做 ≥ 8 个驻点的球只剩 1 个</td><td>0.8 m 间距下共享区就这么大</td></tr>
+    <tr><td>落座噪声 0.3 / 1.0 mm</td><td>3.0 / 3.4</td><td>3.1</td><td>4.7 / 4.9</td><td>1.1</td><td>落座不是瓶颈</td></tr>
+    <tr><td><b>FK 误差 0.27 / 1.0 mm</b></td><td><b>1.9 / 6.3</b></td><td>1.8 / 6.5</td><td>4.1 / 7.1</td><td>0.6 / 2.3</td><td><b>瓶颈在这里</b></td></tr>
+    <tr><td>间距 0.6 / 1.0 m（同一布局）</td><td>3.2 / 3.1</td><td>2.9 / 3.1</td><td>7.2 / 6.6</td><td>1.1</td><td>只剩 3 个球可用；1.0 m 时共享工作区只剩一半。布局要跟着 B0 的摆放重新排</td></tr>
+  </table></div>
+  <p class="small"><b>B3 协议（据此）：</b>5–6 个球、跨度约 0.3 m（受 0.8 m 间距下的可达范围限制）、至少一个抬高 ≥ 0.15 m、每球每臂 14 个驻点、倾角 30°；驻点按每个球实际可达的格子选（<code>fr3_pivot_plan</code> 本来就这么做；固定图案在角上的球会掉一半驻点，8 驻点的图案直接不够用）。同一组球、同一天也做一遍激光站位，两种结果之差就是 B3 的互检。<b>球位支架和法兰杯可以按这个出图。</b>这些结论只说明方法和敏感度，不代表实际精度：模型没有包含 base 柔性、按压时球被推动、随负载变化的重力下垂。</p>
+</div>
+
+<div class="card">
+  <h2>H 线 · 轮式人形（10-23 确认可移动；硬件到之前只做设计）</h2>
+  <div class="callout">和双 FR3 相比，难点从「两台 base 之间」挪到了「底盘在 world 里在哪」：两手之间靠自身运动链，而底盘每停一次都要重新注册。建议先只做<b>停靠操作</b>（开到位、停稳、再操作），边走边操作放到后面。</div>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">H1</td><td>本体描述</td><td>用 G1 的格式描述：轮式底盘根 + 升降/腰（如有）+ 两臂 + 夹爪 TCP。注册方式写成「停靠后由相机测 T_W_root」。</td><td>retarget / 仿真 / runtime 不改代码就能读</td><td><span class="badge warn">看 Q7</span></td></tr>
+    <tr><td class="id">H2</td><td>底盘 marker rig + 停靠注册</td><td>就是主 roadmap 9.1 的平台 ArUco：底盘/躯干刚性面上装分布式 marker layout，相机联合角点求一个位姿；T_rig_root 一次性标（双手绕同一组球 pivot 或激光）。停稳后自动测，操作过程中持续监测，底盘滑了就停。</td><td>停靠注册的重复性 + 操作中底盘位移</td><td><span class="badge warn">看 Q7</span></td></tr>
+    <tr><td class="id">H3</td><td>停靠区的相机覆盖</td><td>底盘 rig 需要 ≥ 4 台相机看见才稳（同 cube 的结论）。先用现有外参在仿真里画停靠区覆盖图，决定人形能停在哪。</td><td>可停靠区域图</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">H4</td><td>整机运动学标定 + 本体计量</td><td>两只夹爪各夹 pivot 插件，绕同一组球 pivot（同球法，和 FR3 用同一套插件与 <code>fr3_pivot_auto</code> 的思路），给出两臂相对运动学的检验和关节零位标定数据；再按 E1 的矩阵用激光量执行误差。精度预期比 FR3 差很多，结论决定能不能开环做 absolute 回放。</td><td>两手相对运动学残差；执行误差 map</td><td><span class="badge warn">硬件到后</span></td></tr>
+    <tr><td class="id">H5</td><td>回放模式</td><td>relative 以底盘/躯干为参考；absolute 只在相机覆盖区内、停靠注册有效时允许；精度不够时改视觉闭环，不硬做开环。</td><td>模式判定写进回放报告</td><td><span class="badge warn">看 H4</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>现状盘点（截至 10-23）</h2>
+  <div class="scroll"><table>
+    <tr><th>项</th><th>现状</th><th>出处</th></tr>
+    <tr><td>FR3 台数（代码里）</td><td><span class="badge bad">只有 1 台</span> 所有配置只有 <code>192.168.11.102</code>；replay YAML、preflight、gateway 的 <code>_real_robot_ip</code> 都是单值。</td><td class="small"><code>replay_cube_pose_in_robot_base.thor.yaml</code>、<code>gateway.py</code></td></tr>
+    <tr><td>base 坐标系</td><td><span class="badge warn">按 C0 新方案保持单值</span> 数据集仍只在 <code>fr3_base</code>（right）里；left 的 base 走本体描述 + 图（G1、C0）。图已能装下第二个 base 节点和闭环（G2）。</td><td class="small"><code>embodiment.py</code>、<code>world_provenance.py</code></td></tr>
+    <tr><td>双手数据</td><td><span class="badge bad">没有</span> Thor 上 37 个 v2/v3 session 里左手 cube 0 帧被检测到（marker 0–4 从未出现）；只有 6 月两段 v1 的 <code>dadada</code>。</td><td class="small">A1，10-23</td></tr>
+    <tr><td>world → fr3_base 注册边</td><td><span class="badge done">right 已上线</span> 5 球位刚体边 <code>ball_check_20261015T030840Z</code>，留一 rms 2.63 mm；激光独立验收只能证到 5–6 mm（站位精度所限）。left 没有。</td><td class="small">主 roadmap Phase 9</td></tr>
+    <tr><td>MuJoCo「both」</td><td><span class="badge warn">仅显示</span> 两条轨迹都在同一个原生 FR3 base 里解 IK，只是画面上左右各挪 0.45 m。不查两臂碰撞，不代表真实摆放。</td><td class="small"><code>replay_cube_pose_in_robot_base_mujoco.py</code> <code>--robot-spacing-m</code></td></tr>
+    <tr><td>retarget</td><td><span class="badge warn">单臂</span> 逐帧 IK + 整段规划起点关节（避开 panda_py 的 j6 墙）。没有双臂联合优化、没有 clearance。</td><td class="small">同上</td></tr>
+    <tr><td>真机 replay</td><td><span class="badge done">单臂可用</span> 两步（停在第 0 帧，Execute 再走）、指令提前 3 帧、夹爪按录制开度回放、可选激光记录。</td><td class="small"><code>_real_replay_command</code></td></tr>
+    <tr><td>单臂执行误差</td><td>10-12/13 一条轨迹、3 倍慢放：FR3 执行 p95 3.8 / RMS 2.36 mm（FR3 读回 vs 激光 0.47 mm）；端到端 p95 7.74 mm（注册边换新之前）。按上次实测修正指令（ILC）评估过、暂不做。</td><td class="small">主 roadmap Phase 11/12</td></tr>
+    <tr><td>socket TCP 常量</td><td><span class="badge warn">随夹持变</span> 10-20 七次拟合 z 从 −0.56 到 8.77 mm；现在只对「这一次夹持」成立。</td><td class="small">激光 roadmap 10-20 条</td></tr>
+    <tr><td>左手标签链</td><td><span class="badge bad">没测过</span> left marker→TCP 仍是 0825 常量（旋转是「挑出来」的，声明 2° → 约 9 mm）；left 的 BOX 配帧延迟 d_box 缺；left 从没上过激光。</td><td class="small">激光 roadmap 结论第 1 条</td></tr>
+    <tr><td>双手 QC</td><td><span class="badge done">代码有了</span> <code>bimanual_qc.py</code>（10-23）；没有双手数据可跑，还没接进 GUI。</td><td class="small">A1</td></tr>
+    <tr><td>激光跟踪仪</td><td>一次只锁一个 SMR。两臂分次测时共享同一个站位，所以<b>静态</b>的两 base 关系可认证；<b>同步的双臂动态相对轨迹</b>认证不了。</td><td class="small">主 roadmap P1-采购</td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>夹爪不在场时的分工</h2>
+  <div class="callout">判据沿用主 roadmap 08-19 的那句：<b>「夹爪明天回来，这项会不会白做？」</b>会白做的就等，不会白做的就现在做。</div>
+  <div class="scroll"><table>
+    <tr><th>类别</th><th>包括</th><th>为什么</th></tr>
+    <tr><td><span class="badge now">现在做</span></td><td>双手数据 QC、benchmark 选集、按臂分开的 base 坐标系、双臂仿真/retarget、双臂 runtime、第二台 FR3 上线、两台 base 的激光注册、配重构型下的 FR3 本体计量</td><td>读的是已有数据、配置文件或机器人本体，和夹爪几何无关</td></tr>
+    <tr><td><span class="badge warn">现在做，回来要复测</span></td><td>执行误差 map、ILC 是否值得做的判断</td><td>配重只复现了质量和质心，没复现夹爪的线缆、刚度和 TCP 力臂</td></tr>
+    <tr><td><span class="badge bad">等夹爪</span></td><td>socket 常量（逐夹持试探）、左手 marker→TCP、left d_box、夹爪开度回放、接触任务、BOX 腕部转动重启；<b>以及 cube 相关的（10-26 cube 也送修）：</b>A4 双手录制、左手 cube 在现支架下的可见性、B4 的同球检验</td><td>测的就是夹爪本身，或必须有夹爪才能采数据</td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>需要你确认 / 提供</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>问题</th><th>影响什么</th></tr>
+    <tr><td class="id">Q1</td><td><span class="badge done">部分已答</span> 放在现有这台左边。还缺：在不在场？IP？FCI 已激活吗？现有这台（right）也要重新摆吗？</td><td>B 线什么时候能开始；right 动不动决定现役球位边是否作废</td></tr>
+    <tr><td class="id">Q2</td><td><span class="badge done">已答</span> 两台 base 重新定位后不动。</td><td>B5（平台 ArUco）对双 FR3 不做，改为 B5′ 的定期复核；平台 ArUco 的方法转给人形（H2）</td></tr>
+    <tr><td class="id">Q3</td><td><span class="badge done">10-26 已答</span> 手持 cube 也随夹爪送修了。A4 等 cube 回来；之前用 A5 替代。<br/><span class="small">原问题：手持 BOX 本体和 marker cube 是否也随夹爪一起送修？左手 cube 还在吗？</span></td><td>已有数据里没有双手（A1 实测），A2 / B0 / C3 全靠 A4 现录。cube 在的话可以手持 cube 录「无夹爪」的双手轨迹（只能当轨迹，不能当操作 demo）</td></tr>
+    <tr><td class="id">Q4</td><td>能否加工两件小东西：① FR3 法兰上装 SMR 的转接件（ISO 9409-1-50-4-M6）；② 和 Corenetic 夹爪等质量、质心在同一处的配重盘</td><td>B3、E 线的前置；没有 ① 就只能用 FK 自证，等于没测<br/><span class="badge done">10-26 已答</span> 夹爪 10-28 回来，<b>暂不设计、不加工</b>。B3 的臂-臂同球改用夹爪夹 pivot 插件（和 10-20 单臂 pivot 同一套，<code>fr3_pivot_auto</code>）；E 线直接在带夹爪的构型下做，不需要配重盘。激光互检仍要法兰或夹爪上的 SMR 转接件，到时再定。</td></tr>
+    <tr><td class="id">Q5</td><td>Thor 到两台 FR3 的网络：第二台走同一个交换机吗？</td><td>09-03 查过 11.102 那段只协商到 100 Mbps，导致 30% 周期掉线；第二台上线前要先核</td></tr>
+    <tr><td class="id">Q6</td><td>首批双手 benchmark 用哪类任务（已有数据里挑）？</td><td>A2 选集；有接触的段落要单独标出，等夹爪回来才能真做</td></tr>
+    <tr><td class="id">Q7</td><td><span class="badge done">部分已答</span> 轮式、可以走动。末端是夹爪。还缺：哪一款、什么时候到、有没有升降/腰部关节、停稳后底盘能否锁死、夹爪型号（能否夹住 pivot 插件）？</td><td>G1 的根注册方式（静态 vs 逐帧跟踪）、是否需要躯干 marker rig、retarget 的手部部分</td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>A 线 · 双手轨迹数据（纯软件，用已有数据）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">A1</td><td>双手 QC（主 roadmap Phase 8 的 bimanual 部分）</td><td>逐帧算 T_LR = inv(T_L)·T_R；按「两手各自几台相机看见」分层；双手同时可见的帧报 common-view T_LR 弥散；标出交叉遮挡、单手丢失段、相机集合切换造成的台阶（08-28 已知的 19.6 mm 台阶类型）。</td><td><code>bimanual_pass</code> + 逐帧标志写进 info.json，GUI tracking evidence 可见</td><td><span class="badge warn">代码完成，没数据可跑</span><br/><span class="small"><code>tools/thor/gmsl2/bimanual_qc.py</code>：分层、T_LR 台阶（及其中有几个落在相机集合切换上）、T_LR 抖动、单手丢失段、可用段（喂 A2）。Thor 上 37 个 v2/v3 session 全部是单手：左手 0 帧。写进 info.json 和接进 GUI 等有了双手数据再做。<b>10-26 改：</b>台阶和抖动改在 base 系的 p_R − p_L 上读。原来读的是左 TCP 系里的 inv(T_L)·T_R，它跟着左手转，左手正常转腕 × 两手间 ~0.8 m 的力臂就被当成台阶：A5① 的替代对上二阶差分 p50 2 mm、p95 8–11 mm，6 对全挂；改后 p50 0.5、p95 1.3–1.7 mm。</span></td></tr>
+    <tr><td class="id">A2</td><td>双手 replay benchmark 选集</td><td>从 camera_state = ok 的 session（10-14 及之后）里挑：两手都有 ≥ 4 台相机的段落、速度覆盖到真实采集分布（p50 270–458 mm/s）、含/不含接触各一类。按 dev / held-out 分开，冻结 episode 列表。</td><td><code>benchmark_bimanual_v1.json</code>（episode、帧段、标签链指纹）</td><td><span class="badge bad">没有双手数据</span><br/><span class="small">等 A4</span></td></tr>
+    <tr><td class="id">A3</td><td>左手标签链的「已知未知」写进 provenance</td><td>left 的 marker→TCP 是 0825 声明值、d_box 缺、没上过激光——这些写进 <code>label_provenance</code>，导出时 left 标 <code>unvalidated</code>。不是拒绝导出，是让 left 的绝对误差不会被误读。</td><td>left 的每个数都带「未验证」标记</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">A4</td><td><b>（10-23 起是前置）</b>无夹爪双手轨迹</td><td>cube 还在的话，手持两个 cube 录双手自由运动，专门给 QC / 仿真 / 执行当参考轨迹，不进训练集。先录一段静止的，确认左手 cube 在现在的相机支架下能被 ≥ 4 台相机看见（自 10-03 起它一次都没进过画面；0825 常量之后相机支架换过两次）。再录覆盖工作区和真实速度的段落，含交接、两手靠近、交叉遮挡。</td><td>A1 能跑出 <code>bimanual_pass</code> 的双手 session；A2、B0、C3 的输入</td><td><span class="badge bad">等 cube</span><br/><span class="small">10-26：cube 随夹爪送修</span></td></tr>
+    <tr><td class="id">A5</td><td>cube 回来之前的替代双手轨迹</td><td>两种来源，用途分开写进 provenance，<b>都不能进 A2 选集，也不能拿来下摆放结论</b>：<br/>① <b>拼对</b>：从已有 right-hand session 里取两段，一段关于 base 的 xz 平面镜像成左手，按时间对齐。单手的速度、抖动、相机分层是真实的，两手协同不是（T_LR 没有物理意义）。只给 C1–C4、D1/D3 当开发和回归输入。<br/><b>10-26 实现</b>（<code>tools/thor/gmsl2/pseudo_bimanual.py</code>）：镜像面在两 base 正中（假设间距 0.8 m、平行）；<b>镜像的是法兰而不是 TCP</b>，再把同一个夹爪装回去——夹爪在法兰上是 −45° yaw，直接镜像 TCP 会让大部分左手帧要求 j6 超过 panda_py 的墙（3.75 rad）；镜像法兰后左臂用右臂关节的镜像 (−q1, q2, −q3, q4, −q5, q6, −q7) 就能到，可达性和源 episode 完全相同（测试锁定）。候选还要过两道：在 fr3_base 里离肩 ≤ 0.85 m（10-03/10-05 的 session 整段在 1.1–1.2 m 外，人手在相机区不在臂展内），以及整段 IK 在墙内可达。<s>附带发现：10-21 的任务演示在墙内也有 0–18 % 的帧够不着</s> <b>10-26 更正：那是筛选方法的假象。</b>原筛选对每帧单独从 Q_READY 解 IK，冗余臂会落进 j6 墙边的局部极小；改成和 C3 一样「从多个种子出发、整段跟踪、选最好的分支」后，10-21 的 25 段任务演示里 24 段全程可跟踪（最后一段 99.9 %）。10-13/14 的 pivot / 球位检验录制倾角极大，仍有大量帧真够不着，那部分是真的。全部 Thor 数据里全程可达的候选从 9 段变成 25 段（<code>ik_reachable_fraction</code> 已改）；冻结的 <code>pseudo_bimanual_a5_seed0</code>（4 对，4/4 过 A1）不变，要更多对可以重新生成。<br/>② <b>示教</b>：第二台 FR3 上线后，两台进示教模式由人同时拖动，记录两臂关节角，参考轨迹 = FK。协同是真的，也不经过相机标签链，正好用来量 D5 的执行误差和 T_LR 读回；但它测不了 UMI 标签链。</td><td>① <code>pseudo_bimanual</code> 生成器 + 一组冻结的拼对 episode；② 示教双臂 session（看 B1）</td><td><span class="badge done">① 10-26 完成</span><br/><span class="badge warn">② 看 B1</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>B 线 · 第二台 FR3 与双 base 注册（需要机器人，不需要夹爪）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">B0</td><td>先在仿真里定摆放</td><td>用 A2 的双手轨迹，在 MuJoCo 里扫左臂 base（在 right 左侧）的位置/朝向；如果 right 也要重摆，两台一起扫：两手全程可达、关节离 panda_py 墙有余量、两臂最小间距最大。装之前做，免得装完才发现够不着。</td><td>推荐摆放 + 每个候选的可达率/余量</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">B1</td><td>第二台上线</td><td>网络先用变包长 ping 核千兆（小包测不出问题）；<code>fr3_cycle_motion_runtime.py</code> 跑 success_rate；Desk 负载按「法兰 + 转接件 + 配重」实测设置（用已有负载辨识）；panda_py 关节墙；独立急停。</td><td>success_rate 稳态 ≥ 0.99；负载辨识残差合格</td><td><span class="badge warn">看 Q1/Q5</span></td></tr>
+    <tr><td class="id">B2</td><td>配置从单臂改成按臂</td><td><code>robot_ip</code>、<code>corenetic_device_id</code>、负载、关节起点都改成 left / right 两份；GUI preflight 两台各跑一遍。</td><td>任何入口都必须显式选臂，不能默认</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">B3</td><td>两台 base 之间的关系 T_BL_BR（两种方法互检）</td><td>① 臂-臂同球：两臂法兰装同款杯，绕同一组 ≥ 4 个球位（含高度差、留一个做留出）各做 pivot（现成的 <code>fr3_pivot_auto</code>），拟合刚体变换。② 激光：法兰装 SMR，站位不动，两台各拟合「站位 × FK」→ T_BL_BR。两者都不经过相机，误差只有 FK + pivot / 激光。协议按 G3 定。</td><td>两种方法的 T_BL_BR 及其差；留出点残差；同一天重复一次</td><td><span class="badge warn">看 Q4</span></td></tr>
+    <tr><td class="id">B4</td><td>world → fr3_base_left 注册边</td><td>现在只能走激光边（站位 × FK），受站位精度限制只能证到约 5–6 mm。同球检验（精度更高）要手持 UMI 那一侧，等夹爪。先上激光边，写明口径，夹爪回来后用同球检验替换。</td><td>world_graph 里有 left 边，标注来源与精度上限</td><td><span class="badge warn">看 Q4</span></td></tr>
+    <tr><td class="id">B4b</td><td>闭环检查</td><td>B3 + 两条 world 边构成闭环，残差进 G2 的检查；超阈值时不允许 absolute 回放。</td><td>闭环残差有数，并写进每次回放报告</td><td><span class="badge warn">看 B3/B4</span></td></tr>
+    <tr><td class="id">B5′</td><td>base 没动的复核（取代平台 ArUco）</td><td>两台定位后不动，所以不做平台 ArUco。但「不动」要有证据：每个底座上贴一两个固定 marker 由相机常驻监测（同 Phase 2.4 的环境固定 marker 思路），或每周用一个球位做一次快速 pivot 复核；超阈值就把这台的边标失效。被碰了没人知道是最常见的失效方式。</td><td>每次回放报告里有「base 自上次注册以来位移」</td><td><span class="badge now">现在设计</span></td></tr>
+  </table></div>
+  <div class="callout warn"><b>为什么 B3 比 B4 重要：</b>双手回放先坏在 T_LR 上。左右注册边各差 5 mm 且方向相反，两手间距就差 10 mm；B3 只经过 FK 和 pivot / 激光。<b>更正（10-23，G3）：</b>原来写「有望到 1 mm 级」不对。合成实验里 B3 在共享工作区折算的 T_LR p95 约 3.0 mm，经两条 world 边约 4.8 mm；两者的瓶颈都是单臂 FK 误差，不是方法。所以 relative 模式（见 C2）仍然先只依赖 B3，absolute 模式才需要 B4。要到 1–2 mm，得先做单臂运动学标定（E1 的数据可以拿来用）。</div>
+</div>
+
+<div class="card">
+  <h2>C 线 · 双臂仿真与联合 retarget（纯软件）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">C0</td><td>坐标系契约：<s>fr3_base 拆成两个</s> 拆的是本体，不是数据集</td><td><b>10-23 改：</b>原方案让 <code>export_v3</code> 把 left cube 写进 left base、right cube 写进 right base。这样一个数据集里就有两个坐标系，T_LR 不再是两列的乘积，A1、训练、world 单一 id 的契约都会被破坏。现方案：数据集仍只在 <code>fr3_base</code>（= right 的 base，id 不改）里，两只手一起导出；左臂通过 G1 的本体描述在图上查 <code>fr3_base → fr3_base_left</code>，在回放时转换，查到的边写进回放报告。图里新增的 left 节点叫 <code>fr3_base_left</code>。</td><td><code>export_v3</code> / <code>label_provenance</code> 不改，旧导出自然不变；<code>embodiment.arm_transform()</code> 给出每臂的变换和所用的边</td><td><span class="badge done">10-23 定了</span></td></tr>
+    <tr><td class="id">C1</td><td>真实双臂 MuJoCo 场景</td><td>用 B0/B3 的 T_BL_BR 摆两台 FR3；<b>夹爪模型照样装上</b>（不管实物在不在），桌面、相机架、激光仪进碰撞场景。替换现在的「both 只是并排显示」。</td><td>场景随 T_BL_BR 自动更新，模型指纹进报告</td><td><span class="badge done">10-26 完成</span><br/><span class="small"><code>tools/fr3/dual_fr3_scene.py</code>：MjSpec 把 <code>fr3_corenetic_gripper.xml</code> 挂两次（<code>right/</code>、<code>left/</code>），左臂放在 T_right_left；环境 = 桌面（半空间，假设 = 两 base 的 z=0）+ 8 台已注册相机（位置来自 <code>world_registration.json</code> 经注册边进 fr3_base，大小假设为 60 mm 的球）。没建模的（相机架立柱、激光仪、桌上物体）写进场景记录的 <code>unmodelled</code>。指纹 = MJCF 和全部网格的 sha256 + 胶囊模型 + 摆放 + 障碍物。能出两臂同框视频。<b>坑：</b>MuJoCo 3.6 的 <code>mj_geomDistance</code> 对某些网格对返回 0.0，但见证点相距 120–190 mm，补凸包也不行；现在凡是与见证点不一致的结果都剔除并计数。好在胶囊包住每个顶点，「胶囊间隙 ≤ 网格间隙」在构造上就成立，网格检查只用来报告真实间隙。</span></td></tr>
+    <tr><td class="id">C2</td><td>两种回放模式</td><td><b>relative</b>：两手共用一个 T_align（禁止各自做 first-frame 对齐，那会改掉两手间距）；只依赖 T_BL_BR。<b>absolute</b>：只用两条注册边，不许逐 episode 吸收偏移；episode 和当前 session 的 world 没有注册边相连时自动拒绝。</td><td>模式和所依赖的边写进每次回放报告</td><td><span class="badge done">10-26 完成</span><br/><span class="small"><code>tools/fr3/dual_fr3_replay_modes.py</code>。absolute：经图上的边进各臂 base，不接受任何对齐参数；另加一条拒绝：重表达过的数据集，导出时用的边不再是图上当前的路线时（base 重注册过），拒绝并要求重导出（<code>embodiment.export_edges_current</code>）。relative：一个 <code>T_align</code> 同时作用于两只手（单位阵 / 数据集自己的注册 / 给定矩阵 / <code>fit</code>：在 ±10 cm、±15° 内找一个让两臂最多帧落在墙内的平移+绕竖直轴转动），另一臂只经 base-to-base 变换。计划里记下模式、每条边、T_right_left 及其声称的 σ、T_align。</span></td></tr>
+    <tr><td class="id">C3</td><td>双臂联合 retarget</td><td>整段轨迹的关节空间优化（不是两臂各自逐帧 IK）：关节连续、关节墙余量、奇异余量、两臂/夹爪/桌面间距 d_min &gt; d_safe；d_safe 由 T_BL_BR 不确定度 + 执行误差尾部推出，不拍常数。几何路径和时间分开，可以 retime，但 raw / reference / executed 三套时间轴都存。</td><td>retarget 改动量 p50/p95/max、T_LR 改动量、最小间距、余量</td><td><span class="badge done">10-26 完成</span><br/><span class="small"><code>tools/fr3/dual_fr3_retarget.py</code>：两臂 14 个关节的整段 Gauss-Newton/LM；每帧的项只依赖本帧关节，正规方程是块三对角（14×14），O(n) 精确解。项：TCP 跟踪（1 mm ≈ 1°）、关节连续、关节墙余量、奇异余量（TCP 雅可比最小奇异值）、两臂间距 &gt; d_safe、对环境 &gt; d_env。起点按 trajectory_start 的办法选分支。碰撞模型 <code>dual_fr3_collision.py</code>：每个连杆 1–2 个胶囊，夹爪本体、手指、SMR 相机支架各一个，包住 MJCF 每一个网格顶点（测试锁定），只用 numpy。<code>d_safe</code> = 3σ(摆放) + 两臂执行误差尾部（10-10 激光 7.8 mm/臂），下限 20 mm；假设摆放时 σ 取 20 mm，d_safe 为 75.6 mm。几何和时间分开：先 retime 到关节速度限值的 50 % 以内，再重采样到命令周期；raw、reference、executed 三条时间轴都存。<b>结果：</b>按 0.45 m 间距拼的替代对里，有一段逐帧 IK 两臂互相穿入（−4.7 mm），retarget 后拉开到 75 mm，TCP 只改 0.21 mm / 0.39°，靠的是冗余自由度（MuJoCo 网格间隙 86 mm）。每段 3–8 s。</span></td></tr>
+    <tr><td class="id">C4</td><td>可执行性进 metadata</td><td><code>dual_fr3_executable</code> + 失败原因 + C3 的各项指标写进数据集；GUI replay 页显示。原始 demo 标签不改。</td><td>A2 选集全部有判定</td><td><span class="badge done">10-26 完成</span><br/><span class="small"><code>tools/fr3/dual_fr3_executability.py</code> 对一个 session 的每段写 <code>meta/dual_fr3_executable.json</code>（按模式分开：判定、原因、C3 指标、场景指纹、依赖的边），完整报告和参考关节路径放在 <code>derived/dual_fr3_retarget/</code>。<code>info.json</code> 和标签不动（测试锁定）。判不可执行的条件：间距 &lt; d_safe / d_env、TCP 改动 p95 &gt; 5 mm 或 max &gt; 20 mm、转动 p95 &gt; 2° 或 max &gt; 8°、T_LR 改动 &gt; 20 mm、撞墙、接近奇异、单帧关节跳 &gt; 0.35 rad（换分支）。replay 页新增只读的「Two-Arm Executability」面板（网关 <code>/api/replay/dual-fr3</code>）。A2 选集还要等 A4 的真实双手数据。</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>D 线 · 双臂执行 runtime（软件先行，真机看 B1）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">D1</td><td>双臂 runtime</td><td>两个进程各管一台（各自 1 kHz FCI，互不阻塞），父进程协调：两臂各自 move-to-start、各自停在第 0 帧、操作者一次 Execute 后在同一个 Thor 单调时钟时刻一起开始。<b>任一臂故障或任一项门禁触发，两臂一起停。</b></td><td>假机器人双臂测试：一臂注入故障，另一臂在一个周期内停</td><td><span class="badge done">10-26 假机器人通过</span><br/><span class="small"><code>tools/fr3/dual_fr3_replay_runtime.py</code>。两臂各一个进程，经内存映射的共享块协调：一个 t0（CLOCK_MONOTONIC）、一个停止字；每臂<b>每次发命令前</b>读停止字，故障臂第一件事就是写它，所以另一臂最多再发一帧。协调器管臂自己报不了的：进程死了、挂住（3 个周期无心跳）；臂也监视协调器心跳。注入 raise / exit / hang / freeze 四种故障，另一臂都在 ≤ 1 帧内停（10 个测试，负载下连跑稳定）。4 对替代轨迹完整跑完：起跑偏差 0.01–0.48 ms。真机驱动只差四个调用（move_to_start / observe / command / hold）接到单臂回放脚本上，等 B1。<br/><b>10-26 发现：双臂必须流关节，不能只流 TCP。</b>C3 靠冗余自由度（肘部）把两臂拉开。按单臂回放那样流笛卡尔目标时，零空间交给执行端的 IK 自己选：在假机器人上，计划 75 mm 的间隙在第 205 帧掉到 54 mm，被门限双停。改为把 C3 的关节路径一起下发后（<code>ArmPlan.joints</code>，假机器人按关节位置控制跟踪），4/4 跑完，实测最小间隙 74.2 mm。真机驱动要用关节位置控制，或者至少把参考关节作为 IK 种子 / 零空间目标。runtime 可以直接回放 C3 的结果（<code>--retarget absolute|relative</code>），C4 判不可执行的段会被拒绝，执行时间轴存进 <code>timelines.npz</code>。</span></td></tr>
+    <tr><td class="id">D2</td><td>两臂时间对齐</td><td>记录两台各自的 <code>robot.time</code> 和 Thor 收包时刻，拟合时钟偏移，量开始时刻偏差和全程漂移。按 v·|Δt| 折算 T_LR 误差，进预算。</td><td>两臂起始偏差 &lt; 1 周期，全程漂移有数</td><td><span class="badge warn">看 B1</span></td></tr>
+    <tr><td class="id">D3</td><td>在线间距监测</td><td>用两台的实测关节角实时算 FK 间距，低于 d_safe 就双停。和 C3 用同一个碰撞模型，避免「检查的和执行的不是一个东西」。</td><td>仿真里人为把间距压到门限以下，确认会停</td><td><span class="badge done">10-26 完成（C3 模型）</span><br/><span class="small">已换成 C3 的胶囊模型（<code>dual_fr3_collision</code>，单次 0.2 ms）。门限 = 3σ(摆放)，下限 20 mm（<code>derive_gate</code>）：门读的是实测关节，执行误差已经在里面，所以不再像 C3 的 d_safe 那样把执行误差尾部加进去。假设摆放时门限 60 mm。第 0 帧就低于门限时拒绝起跑，运行中低于时两臂一起停（测试覆盖）。粗模型阶段的数据：4 对替代轨迹最小间隙 545–613 mm。</span></td></tr>
+    <tr><td class="id">D4</td><td>GUI 双臂回放面板</td><td>选臂/双臂、选模式（relative/absolute）、显示依赖的边和 C4 判定；Connect / Execute 仍由操作者按。</td><td>操作者能在一个页面完成双臂两步回放</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">D5</td><td>无夹爪双臂自由空间首跑</td><td>夹爪命令关闭，target frame 用 socket 的虚拟点（法兰 + 常量），先 3 倍慢放，A2 里不含接触的段落。</td><td>双臂跑完、无误停；记录两臂的执行误差和 T_LR 读回</td><td><span class="badge warn">看 B1–B3</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>E 线 · FR3 本体计量（主 roadmap Phase 11，配重构型）</h2>
+  <div class="callout">现在没有夹爪，正好做 Phase 11「先测机器人本身」：激光量法兰 SMR，不混入 UMI 标签、注册边和 TCP 常量。之前单臂 p95 3.8 mm 的执行误差是回放的大头，但它从来没有和本体分开过。</div>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
+    <tr><td class="id">E1</td><td>单臂基准矩阵</td><td>每台：±10/30/50/100 mm 平移、小角度旋转、直线/圆/8 字；低速静态 + 真实采集速度；分几个工作区位置。每次同时记 T_cmd、FK、激光。</td><td>位置 × 速度 × 工作区的 p50/p95 map，内部误差（cmd vs FK）和物理误差（cmd vs 激光）分开</td><td><span class="badge warn">看 Q4</span></td></tr>
+    <tr><td class="id">E2</td><td>A2 轨迹的单臂回放</td><td>把 benchmark 里每只手的轨迹搬到对应那台 FR3 上回放，激光量。和 10-12/13 那次对比：配重构型下执行误差是不是还在 p95 3–4 mm。</td><td>每臂的执行误差；判断 ILC 值不值得做</td><td><span class="badge warn">看 B3</span></td></tr>
+    <tr><td class="id">E3</td><td>双臂同时运动的干扰</td><td>一臂静止被激光盯着，另一臂按 E1 运动。看共用桌面/平台的振动会不会进静止那台。</td><td>互相干扰的量级（预期很小，但没量过）</td><td><span class="badge warn">看 B1</span></td></tr>
+    <tr><td class="id">E4</td><td>ILC 决策（可选）</td><td>如果 E2 的执行误差仍是大头且每次几乎一样，按上一次实测修正指令。只在配重构型下做原理验证；夹爪回来后必须重学，不能沿用。</td><td>做/不做的决定和依据</td><td><span class="badge warn">看 E2</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>F 线 · 夹爪回来之后（现在只备好流程）</h2>
+  <ol>
+    <li><b>先确认返修修了什么</b>：特别是 BOX 在腕部 j7 转动时重启（10-10 / 10-13 / 10-20 三次，同一特征，怀疑线缆）。回来先做腕部转动通断测试，再上任何长轨迹。</li>
+    <li><b>两台各做一次负载辨识</b>，和配重构型对比；差得多的话，E 线的结论按差值重新解读。</li>
+    <li><b>socket 常量逐夹持试探</b>：每次夹持先试探，用激光核一次，量清楚跨夹持到底变多少。left 的第一次 pivot。</li>
+    <li><b>左手标签链补齐</b>：left marker→TCP 实测（替换 0825 声明值）、left d_box、left 上激光。补齐后 A3 的 <code>unvalidated</code> 标记才能摘。</li>
+    <li><b>left 的同球检验</b>替换 B4 的激光边。</li>
+    <li><b>E2 有夹爪复测</b>，ILC 如果做了就在这里重学。</li>
+    <li><b>主 roadmap Phase 12 的双臂版</b>：带夹爪、带接触的双手 benchmark，报 initial / relative / absolute / bimanual / contact / timing 六组指标。</li>
+  </ol>
+</div>
+
+<div class="card">
+  <h2>建议顺序</h2>
+<pre>现在（无需任何硬件）           有第二台 FR3 后              有法兰杯 / SMR 转接件后      夹爪回来后
+───────────────────           ──────────────              ──────────────────          ──────────
+G1 本体描述 + C0 拆 base       B1 上线 / 网络 / 负载        B3 T_BL_BR（臂-臂同球+激光）  F1–F7
+G2 world_graph σ + 闭环        D2 两臂时钟对齐              B4 left 激光边 → B4b 闭环
+G3 注册方法合成实验 ─────────────────────────────────────→ （定 B3 的球位和姿态）
+A1 双手 QC                     E3 双臂干扰                  E1 本体基准矩阵
+A2 benchmark 选集                                           E2 单臂回放 → E4 ILC 决策
+A3 left 标 unvalidated                                      D5 双臂无夹爪首跑
+B0 仿真里定左臂摆放  ──────→  （按 B0 的结果装）
+B2 配置按臂
+A5① 拼对替代双手轨迹          A5② 示教双臂轨迹             （A4 等 cube 回来）
+C1–C4 双臂场景 / 模式 / retarget / metadata
+D1 D3 D4 双臂 runtime（假机器人测）
+机械件出图下单（前置期最长）</pre>
+  <p class="small">第一批建议：<b>G1 + C0</b>（所有双臂/人形代码的地基）、<b>G3</b>（决定法兰杯和球位支架怎么做，和机械件下单绑在一起）、<b>A1</b>（决定拿什么轨迹测）。<b>10-23 已做：</b>G1、G2、G3、C0（改方案）、A1 代码。<b>10-26 已做：</b>A5① 拼对替代轨迹、D1 / D3 双臂 runtime（假机器人）、A1 判据修正；同日第三批 C1–C4（场景、两种模式、联合 retarget、可执行性 + replay 页面板），D3 换成 C3 模型，D1 改成流关节。<b>下一批：</b>夹爪 10-28 回来后——单臂 pivot 插件和 socket 常量复核（F 线）、cube 若一起回来就先做 A4 的静止可见性检查；软件侧：A3、B2、D4（双臂回放面板的操作部分）；第二台 FR3 上线后：真机驱动接入 D1（用关节位置控制）、B3 用夹爪夹插件做臂-臂同球（有了实测摆放，d_safe 会从 75.6 mm 降到约 20 mm），然后对已有数据重跑 C4、A5② 示教轨迹。</p>
+</div>
+
+<div class="card">
+  <h2>口径红线</h2>
+  <ul>
+    <li><b>两手不能各自做 first-frame 对齐。</b>只允许一个共享 T_align，否则两手间距被悄悄改掉，T_LR 的指标就失去意义。</li>
+    <li><b>配重构型的执行误差不等于有夹爪的执行误差。</b>报告里写明构型；夹爪回来复测前不进 3 mm 预算。</li>
+    <li><b>激光认证不了同步的双臂动态 T_LR</b>（一次只锁一个靶）。能认证的是静态 T_BL_BR 和每只手各自的执行误差；动态 T_LR 只能用 FK 读回 + D2 的时钟对齐来估，标「估计」。</li>
+    <li><b>left 的任何绝对误差都带「标签链未验证」</b>，直到 F4 完成。不要拿 left 的数去归因执行或注册。</li>
+    <li><b>absolute 回放必须有注册边连通</b>，由 metadata 自动判定，不靠操作者记得；没有边只能做 relative。</li>
+    <li><b>retarget 不改原始 demo 标签。</b>demo_raw / retarget_reference / executed 三套分开存，可执行性只作为 metadata。</li>
+    <li><b>合成实验只认证方法和敏感度，不认证精度。</b>用当前模型生成的数据评不出模型自身的错。</li>
+    <li><b>FK 不能自证。</b>T_BL_BR、执行误差都要激光；FK vs FK 的一致只是内部一致性。</li>
+    <li><b>Connect / Execute 由操作者按</b>，两臂都动时工作半径内不能有人。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>与主 roadmap 的对应</h2>
+  <div class="scroll"><table>
+    <tr><th>本页</th><th>主 roadmap</th></tr>
+    <tr><td>A1</td><td>Phase 8 的 bimanual consistency / common-view T_LR</td></tr>
+    <tr><td>G1–G3</td><td>新增（主 roadmap 没有跨本体这一层）；G2 对应 Phase 2.4 的 world continuity graph</td></tr>
+    <tr><td>B0–B5、C0、C2</td><td>Phase 9（双 base 注册、两种回放模式、初始状态）</td></tr>
+    <tr><td>C1、C3、C4</td><td>Phase 10（联合 retarget、碰撞、可执行性）</td></tr>
+    <tr><td>E1–E4</td><td>Phase 11（FR3 本体计量）</td></tr>
+    <tr><td>D5、F7</td><td>Phase 12（UMI → 双 FR3 物理回放）</td></tr>
+    <tr><td>H2</td><td>Phase 9.1 的平台 ArUco（从双 FR3 移到人形）</td></tr>
+    <tr><td>G2 的 σ / 闭环</td><td>Phase 9 的注册边验收（边的「自评分」和闭环残差是两回事：前者是方法自己说的，后者是图自己查出来的）</td></tr>
+  </table></div>
+  <p class="small">状态以本页为准；主 roadmap 的 P1-Replay 各行后续改为指向本页。</p>
+</div>
+
+</div>
+</body>
+</html>

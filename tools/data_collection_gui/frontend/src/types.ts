@@ -376,6 +376,34 @@ export type LaserReplayRun = {
   };
 };
 
+export type DualFr3Stats = { p50: number; p95: number; max: number };
+
+// One episode's row of meta/dual_fr3_executable.json (tools/fr3/dual_fr3_executability.py, roadmap C4).
+export type DualFr3EpisodeVerdict = {
+  dual_fr3_executable: boolean;
+  reasons: string[];
+  frames?: number;
+  placement_assumed?: boolean;
+  d_safe_mm?: number;
+  retarget_change_position_mm?: { right: DualFr3Stats; left: DualFr3Stats };
+  retarget_change_rotation_deg?: { right: DualFr3Stats; left: DualFr3Stats };
+  t_lr_change_position_mm?: DualFr3Stats;
+  min_arm_arm_gap_mm?: number;
+  mesh_min_gap_mm?: number | null;
+  reference_duration_s?: number;
+  slowdown_vs_nominal?: number | null;
+  scene_fingerprint?: string;
+};
+
+export type DualFr3Executability = {
+  datasetRoot: string;
+  episode: number;
+  modes: Record<
+    string,
+    { createdUtc?: string; embodiment?: string; summary: { episodes?: number; executable?: number }; episode: DualFr3EpisodeVerdict | null }
+  >;
+};
+
 export type LaserReplayReport = {
   schema: string;
   runs: LaserReplayRun[];

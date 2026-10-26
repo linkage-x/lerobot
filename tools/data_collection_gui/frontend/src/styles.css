@@ -4527,3 +4527,18 @@ button.danger {
   max-width: 100%;
   overflow-x: auto;
 }
+
+.dual-fr3-panel .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.dual-fr3-panel .dual-fr3-ok {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.dual-fr3-panel .dual-fr3-no {
+  color: #b91c1c;
+  font-weight: 600;
+}
