@@ -37,6 +37,7 @@ import type {
   LaserReplayReport,
   DualFr3Executability,
   RobotArms,
+  DualReplayResponse,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -517,6 +518,32 @@ export class DataCollectionGuiApi {
     try {
       const response = await fetch(`${this.apiBase}/api/robot/arms`, { headers: { Accept: "application/json" } });
       return response.ok ? ((await response.json()) as RobotArms) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchDualReplayJob(): Promise<DualReplayResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/replay/dual-fr3/job`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as DualReplayResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Two-step two-arm replay (roadmap D4): connect (both arms to frame 0) -> execute; abort at any time.
+  async dualReplay(
+    action: "connect" | "execute" | "abort",
+    body: Record<string, unknown> = {}
+  ): Promise<DualReplayResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/replay/dual-fr3/${action}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      return response.ok ? ((await response.json()) as DualReplayResponse) : null;
     } catch {
       return null;
     }

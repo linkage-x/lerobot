@@ -4572,3 +4572,50 @@ button.danger {
   color: #a1560f;
   font-size: 12px;
 }
+
+/* Two-arm replay (roadmap D4) */
+.dual-fr3-run {
+  border-top: 1px solid #e3e8ec;
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.dual-fr3-run h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+
+.dual-fr3-run-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin-bottom: 8px;
+}
+
+.dual-fr3-run-choices > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.dual-fr3-run-choices span {
+  color: #52616d;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dual-fr3-edges {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  margin: 0 0 8px;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.dual-fr3-log {
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+}

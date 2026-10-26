@@ -393,6 +393,51 @@ export type DualFr3EpisodeVerdict = {
   reference_duration_s?: number;
   slowdown_vs_nominal?: number | null;
   scene_fingerprint?: string;
+  // C2's plan for this mode: per arm, the graph edges its targets go through; and the two bases' placement.
+  mode?: {
+    arms?: Record<string, { root?: string; edges?: DualFr3Edge[] }>;
+    placement?: { edges?: DualFr3Edge[]; sigma_mm?: number; assumed?: boolean };
+  };
+};
+
+export type DualFr3Edge = {
+  from_world_frame_id?: string;
+  to_world_frame_id?: string;
+  method?: string;
+  created_utc?: string;
+};
+
+// /api/replay/dual-fr3/job and connect / execute / abort (roadmap D4).
+export type DualReplayState = "connecting" | "at_start" | "executing" | "finished" | "stopped" | "error";
+
+export type DualReplayJob = {
+  state?: DualReplayState;
+  mode?: string;
+  backend?: string;
+  episode?: number;
+  dataset?: string;
+  edges?: Record<string, string[]>;
+  log?: string[];
+  error?: string;
+  report?: {
+    path?: string;
+    backend?: string;
+    startSkewMs?: number;
+    startGapMm?: number;
+    minGapMm?: number;
+    stoppedTogether?: boolean;
+    stop?: string[];
+    arms?: Record<string, { outcome?: string; framesCommanded?: number; framesPlanned?: number }>;
+  };
+};
+
+export type DualReplayResponse = {
+  ok: boolean;
+  error: string;
+  job: DualReplayJob;
+  arms: RobotArm[];
+  modes: string[];
+  backends: string[];
 };
 
 // GET /api/robot/arms: tools/fr3/fr3_arms.json (roadmap B2). `required`: every request that drives an

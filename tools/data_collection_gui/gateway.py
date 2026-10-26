@@ -522,6 +522,10 @@ class GatewayState:
     gripper_teleop_process: subprocess.Popen[str] | None = None
     gripper_teleop_job: dict[str, Any] = field(default_factory=dict)
     gripper_teleop_lock: Lock = field(default_factory=Lock)
+    # Two-arm replay (roadmap D4): tools/fr3/dual_fr3_replay_runtime.py, Connect -> at frame 0 -> Execute.
+    dual_replay_process: subprocess.Popen[str] | None = None
+    dual_replay_job: dict[str, Any] = field(default_factory=dict)
+    dual_replay_lock: Lock = field(default_factory=Lock)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -17067,6 +17071,248 @@ def _dual_fr3_executability_payload(dataset_root: Path, episode: int) -> dict[st
     return {"datasetRoot": str(dataset_root), "episode": int(episode), "modes": modes}
 
 
+# --- Two-arm replay (roadmap D4) -----------------------------------------------
+#
+# The operator's half of tools/fr3/dual_fr3_replay_runtime.py: Connect starts it on the selected episode's
+# C3 reference path (one mode), it moves both arms to frame 0 and waits; Execute says "go" on its stdin;
+# Abort says "abort" there while it waits, or SIGTERMs it once the arms run (one stop word for both, the
+# runtime's own fault path). Only an episode C4 called executable in that mode is started. "fake" drives
+# the runtime's fake arms -- the coordination, gates and timelines, on this machine; "real" is refused
+# until both FR3s are in service and the real driver exists (the runtime says which).
+
+_DUAL_REPLAY_SCRIPT = Path("tools") / "fr3" / "dual_fr3_replay_runtime.py"
+_DUAL_REPLAY_SUBDIR = Path("outputs") / "fr3" / "dual_fr3_replay"
+_DUAL_REPLAY_MODES = ("absolute", "relative")
+_DUAL_REPLAY_BACKENDS = ("fake", "real")
+_DUAL_REPLAY_AT_START = "DUAL_REPLAY_AT_TRAJECTORY_START"
+_DUAL_REPLAY_REPORT = "DUAL_REPLAY_REPORT "
+_DUAL_REPLAY_LOG_LINES = 200
+_DUAL_REPLAY_STOP_WAIT_S = 5.0
+
+
+def _dual_replay_live(state: GatewayState) -> bool:
+    process = state.dual_replay_process
+    return process is not None and process.poll() is None
+
+
+def _dual_replay_job_view(state: GatewayState) -> dict[str, Any]:
+    with state.dual_replay_lock:
+        job = dict(state.dual_replay_job)
+        job["log"] = list(job.get("log") or [])[-40:]
+    return job
+
+
+def _dual_replay_payload(state: GatewayState, error: str = "") -> dict[str, Any]:
+    return {
+        "ok": not error,
+        "error": error,
+        "job": _dual_replay_job_view(state),
+        "arms": _robot_arms_payload(state)["arms"],
+        "modes": list(_DUAL_REPLAY_MODES),
+        "backends": list(_DUAL_REPLAY_BACKENDS),
+    }
+
+
+def _dual_replay_report_summary(path: Path) -> dict[str, Any]:
+    report = _load_json_file(path)
+    if not report:
+        return {}
+    stop = report.get("stop") or {}
+    return {
+        "path": str(path),
+        "backend": report.get("backend"),
+        "startSkewMs": report.get("start_skew_ms"),
+        "startGapMm": report.get("start_gap_mm"),
+        "minGapMm": report.get("min_gap_mm"),
+        "stoppedTogether": report.get("stopped_together"),
+        "stop": [str(e.get("reason") or "") for e in stop.get("events") or []],
+        "arms": {
+            name: {
+                "outcome": row.get("outcome"),
+                "framesCommanded": row.get("frames_commanded"),
+                "framesPlanned": row.get("frames_planned"),
+            }
+            for name, row in (report.get("arms") or {}).items()
+        },
+    }
+
+
+def _watch_dual_replay(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    report = ""
+    for raw in process.stdout:
+        line = raw.rstrip()
+        with state.dual_replay_lock:
+            job = state.dual_replay_job
+            job.setdefault("log", []).append(line)
+            del job["log"][:-_DUAL_REPLAY_LOG_LINES]
+            if line.startswith(_DUAL_REPLAY_AT_START) and job.get("state") == "connecting":
+                job["state"] = "at_start"
+            elif line.startswith("refused:"):
+                job["error"] = line.removeprefix("refused:").strip()
+            elif line.startswith(_DUAL_REPLAY_REPORT):
+                report = line.removeprefix(_DUAL_REPLAY_REPORT).strip()
+    code = process.wait()
+    summary = _dual_replay_report_summary(Path(report)) if report else {}
+    with state.dual_replay_lock:
+        job = state.dual_replay_job
+        job["exitCode"] = code
+        job["report"] = summary
+        if code != 0 or not summary:
+            job["state"] = "error"
+            job["error"] = job.get("error") or f"exit {code}"
+        elif summary.get("stop"):
+            job["state"] = "stopped"
+        else:
+            job["state"] = "finished"
+        job["endedUnixS"] = time.time()
+        if state.dual_replay_process is process:
+            state.dual_replay_process = None
+    with state.lock:
+        state.log("info" if job["state"] == "finished" else "warn", f"two-arm replay {job['state']}: {job.get('error') or report}")
+
+
+def _dual_replay_edges(row: dict[str, Any]) -> dict[str, list[str]]:
+    """Per arm, the graph edges its targets go through (C2's plan in the C4 verdict), as one line each."""
+    arms = (row.get("mode") or {}).get("arms") or {}
+    return {
+        arm: [
+            f"{e.get('from_world_frame_id')} -> {e.get('to_world_frame_id')} ({e.get('method') or '?'})"
+            for e in spec.get("edges") or []
+        ]
+        for arm, spec in arms.items()
+    }
+
+
+def _dual_replay_connect(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Connect: start the runtime on the selected episode; both arms go to frame 0 and wait for Execute."""
+    mode = str(body.get("mode") or "").strip().lower()
+    backend = str(body.get("backend") or "").strip().lower()
+    if mode not in _DUAL_REPLAY_MODES:
+        return _dual_replay_payload(state, f"mode must be one of {', '.join(_DUAL_REPLAY_MODES)}")
+    if backend not in _DUAL_REPLAY_BACKENDS:
+        return _dual_replay_payload(state, f"backend must be one of {', '.join(_DUAL_REPLAY_BACKENDS)}")
+    dataset_root = state.selected_replay_root
+    episode = int(state.replay.episode)
+    if dataset_root is None:
+        return _dual_replay_payload(state, "no dataset selected")
+    verdicts = _dual_fr3_executability_payload(dataset_root, episode) or {}
+    row = ((verdicts.get("modes") or {}).get(mode) or {}).get("episode")
+    if not row:
+        return _dual_replay_payload(
+            state, f"episode {episode} has no {mode} verdict: run tools/fr3/dual_fr3_executability.py --mode {mode}"
+        )
+    if not row.get("dual_fr3_executable"):
+        return _dual_replay_payload(
+            state, f"episode {episode} is not executable in {mode}: " + "; ".join(row.get("reasons") or [])
+        )
+    if backend == "real":
+        holder = _fr3_pivot_fci_holder(state)
+        if holder:
+            return _dual_replay_payload(state, f"{holder}，它占着 FCI")
+    out = state.repo_root / _DUAL_REPLAY_SUBDIR
+    command = [
+        str(_mujoco_replay_python(state)),
+        str(state.repo_root / _DUAL_REPLAY_SCRIPT),
+        str(dataset_root),
+        "--episode", str(episode),
+        "--retarget", mode,
+        "--backend", backend,
+        "--out", str(out),
+    ]  # fmt: skip
+    refusal, process = "", None
+    with state.dual_replay_lock:
+        if _dual_replay_live(state):
+            refusal = "a two-arm replay is already running"
+        else:
+            out.mkdir(parents=True, exist_ok=True)
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(state.repo_root),
+                    env=_real_preflight_env(state),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,  # an abort signals the runtime, never the gateway
+                )
+            except OSError as exc:
+                refusal = str(exc)
+            else:
+                state.dual_replay_process = process
+                state.dual_replay_job = {
+                    "state": "connecting",
+                    "mode": mode,
+                    "backend": backend,
+                    "dataset": str(dataset_root),
+                    "episode": episode,
+                    "verdict": {"dSafeMm": row.get("d_safe_mm"), "minGapMm": row.get("min_arm_arm_gap_mm")},
+                    "edges": _dual_replay_edges(row),
+                    "startedUnixS": time.time(),
+                    "pid": process.pid,
+                    "log": [],
+                    "error": "",
+                    "report": {},
+                }
+    if refusal or process is None:
+        return _dual_replay_payload(state, refusal)
+    with state.lock:
+        state.log("warn", f"two-arm replay ({backend}, {mode}) connecting: episode {episode} of {dataset_root.name}")
+    Thread(target=_watch_dual_replay, args=(state, process), daemon=True, name=f"dual-replay-{process.pid}").start()
+    return _dual_replay_payload(state)
+
+
+def _dual_replay_execute(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Execute: both arms are at frame 0; one "go", one start time for both."""
+    del body
+    with state.dual_replay_lock:
+        process = state.dual_replay_process
+        if not _dual_replay_live(state) or state.dual_replay_job.get("state") != "at_start":
+            error = "both arms must be at frame 0 (Connect first, and wait for it)"
+        else:
+            error = ""
+            try:
+                assert process is not None and process.stdin is not None
+                process.stdin.write("go\n")
+                process.stdin.flush()
+                state.dual_replay_job["state"] = "executing"
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+    return _dual_replay_payload(state, error)
+
+
+def _dual_replay_abort(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Abort: "abort" while the arms wait at frame 0; SIGTERM otherwise (the runtime stops both)."""
+    del body
+    with state.dual_replay_lock:
+        process = state.dual_replay_process
+        if not _dual_replay_live(state):
+            return {**_dual_replay_payload(state, "no two-arm replay is running")}
+        state.dual_replay_job["abortRequested"] = True
+        # Blocked on stdin only at frame 0; moving there or running, the signal reaches the coordinator.
+        waiting = state.dual_replay_job.get("state") == "at_start"
+        try:
+            if waiting and process.stdin is not None:
+                process.stdin.write("abort\n")
+                process.stdin.flush()
+            else:
+                process.send_signal(signal.SIGTERM)
+        except (OSError, ValueError):
+            process.send_signal(signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_DUAL_REPLAY_STOP_WAIT_S)
+    return _dual_replay_payload(state)
+
+
+_DUAL_REPLAY_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/replay/dual-fr3/connect": _dual_replay_connect,
+    "/api/replay/dual-fr3/execute": _dual_replay_execute,
+    "/api/replay/dual-fr3/abort": _dual_replay_abort,
+}
+
+
 def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
     """The FR3 replay report, shaped as the inspector's preview payload.
 
@@ -18733,6 +18979,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             if path == "/api/robot/arms":
                 _json_response(self, HTTPStatus.OK, _robot_arms_payload(self.server.state))
                 return
+            if path == "/api/replay/dual-fr3/job":
+                _json_response(self, HTTPStatus.OK, _dual_replay_payload(self.server.state))
+                return
             if path == "/api/replay/dual-fr3":
                 try:
                     episode = int(query.get("episode", ["0"])[0])
@@ -18971,6 +19220,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             or _FR3_PIVOT_ROUTES.get(path)
             or _GRIPPER_TELEOP_ROUTES.get(path)
             or _FR3_MOVE_TO_START_ROUTES.get(path)
+            or _DUAL_REPLAY_ROUTES.get(path)
         )
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the

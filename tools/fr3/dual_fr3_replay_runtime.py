@@ -57,6 +57,7 @@ import math
 import mmap
 import multiprocessing as mp
 import os
+import signal
 import struct
 import sys
 import threading
@@ -73,7 +74,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from tools.fr3 import dual_fr3_collision as col, fr3_kinematics as kin  # noqa: E402
+from tools.fr3 import dual_fr3_collision as col, fr3_arms, fr3_kinematics as kin  # noqa: E402
 
 SCHEMA = "dual_fr3_replay/v1"
 ARMS = ("right", "left")
@@ -601,6 +602,14 @@ def run(
         if sync.request_stop(by):
             events.append({"t_ns": sync.stop_ns, "by": by, "reason": reason})
 
+    # The operator's abort (the GUI sends SIGTERM once the arms run): one stop word for both, as for a fault.
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(
+                signum, lambda n, _f: stop(STOP_BY_COORDINATOR, f"operator abort ({signal.Signals(n).name})")
+            )
+
     # 1. both at frame 0
     deadline = time.monotonic() + at_start_timeout_s
     while not sync.stopped():
@@ -664,6 +673,8 @@ def run(
         time.sleep(0.001)
     for p in procs:
         p.join()
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
     arms = {}
     for plan, out in zip(plans, outs, strict=True):
@@ -879,6 +890,23 @@ def plans_from_retarget(
     return plans, reference["T_right_left"], reference["fps"], timelines, record
 
 
+def real_backend_refusal(registry: Mapping[str, Any] | None = None) -> str:
+    """Why the two real FR3s cannot be driven yet; "" once they can.
+
+    Both arms must be in service in fr3_arms.json (B1), each named there -- IP, gripper BOX, start --
+    so nothing here falls back to a default arm (B2). Then the four driver calls of the module docstring
+    have to be written against panda_py's joint position control (D1: two arms are kept apart by their
+    elbows, which only joint commands hold).
+    """
+    try:
+        registry = registry or fr3_arms.load()
+        for arm in ARMS:
+            fr3_arms.resolve(registry, arm)
+    except fr3_arms.ArmConfigError as exc:
+        return str(exc)
+    return "the real-arm driver is not written yet (roadmap D1: joint position control on both FR3s, after B1)"
+
+
 def _parse_fault(text: str) -> tuple[str, dict[str, Any]]:
     arm, rest = text.split(":", 1)
     kind, at = rest.split("@", 1)
@@ -905,8 +933,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--d-safe", type=float, default=None, help="gate distance, m (default: derive_gate)")
     parser.add_argument("--yes", action="store_true", help="say go without asking")
+    parser.add_argument(
+        "--backend",
+        choices=("fake", "real"),
+        default="fake",
+        help="fake arms (the coordination, gates and timing on this machine) or the two FR3s of fr3_arms.json",
+    )
     parser.add_argument("--out", type=Path, default=REPO / "outputs" / "fr3" / "dual_fr3_replay")
     args = parser.parse_args(argv)
+    if args.backend == "real":
+        refusal = real_backend_refusal()
+        if refusal:
+            print(f"refused: {refusal}")
+            return 2
     timelines, record, feasibility, edges = None, {}, None, []
     if args.retarget:
         try:
@@ -943,6 +982,7 @@ def main(argv: list[str] | None = None) -> int:
     report["edges"] = edges
     report["ik_precheck"] = feasibility
     report["retarget"] = record or None
+    report["backend"] = args.backend
     (run_dir / "dual_replay_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(
         json.dumps(
@@ -954,6 +994,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(f"wrote {run_dir}")
+    print(f"DUAL_REPLAY_REPORT {run_dir / 'dual_replay_report.json'}", flush=True)
     return 0
 
 

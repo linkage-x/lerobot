@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { dualFr3Rows } from "./dualFr3Executability";
-import type { DualFr3Executability } from "./types";
+import {
+  dualFr3Rows,
+  dualReplayControls,
+  dualReplayStatus,
+  edgeLines,
+  realBackendBlocker
+} from "./dualFr3Executability";
+import type { DualFr3Executability, RobotArm } from "./types";
 
 const stats = (p95: number, max: number) => ({ p50: 0, p95, max });
 
@@ -45,5 +51,56 @@ describe("dualFr3Rows", () => {
 
   it("is empty without a payload", () => {
     expect(dualFr3Rows(null)).toEqual([]);
+  });
+});
+
+describe("two-arm replay controls (roadmap D4)", () => {
+  const arms: RobotArm[] = [
+    { arm: "right", inService: true, whyNot: "", robotIp: "192.168.11.102", gripperBox: 1, payload: null, startJointsRad: null, replayConfig: "" },
+    { arm: "left", inService: false, whyNot: "B1: not installed", robotIp: "", gripperBox: null, payload: null, startJointsRad: null, replayConfig: "" }
+  ];
+  const edge = { from_world_frame_id: "fr3_base_left", to_world_frame_id: "fr3_base", method: "assumed_placement" };
+  const payload: DualFr3Executability = {
+    datasetRoot: "/d",
+    episode: 0,
+    modes: {
+      absolute: {
+        summary: {},
+        episode: {
+          dual_fr3_executable: true,
+          reasons: [],
+          mode: { arms: { right: { root: "fr3_base", edges: [] }, left: { root: "fr3_base_left", edges: [edge] } } }
+        }
+      },
+      relative: { summary: {}, episode: { dual_fr3_executable: false, reasons: ["arms 10 mm apart"] } }
+    }
+  };
+
+  it("connects only an episode C4 cleared, and the real arms only once both are in service", () => {
+    expect(dualReplayControls(payload, null, "absolute", "fake", arms).connectBlocker).toBe("");
+    expect(dualReplayControls(payload, null, "relative", "fake", arms).connectBlocker).toBe("not executable in relative: arms 10 mm apart");
+    expect(dualReplayControls(payload, null, "absolute", "real", arms).connectBlocker).toBe("left: B1: not installed");
+    expect(realBackendBlocker(arms.map((row) => ({ ...row, inService: true })))).toBe("");
+    expect(dualReplayControls(null, null, "absolute", "fake", arms).connectBlocker).toBe("no absolute verdict for this episode");
+  });
+
+  it("executes only at frame 0 and aborts whenever it runs", () => {
+    const at = dualReplayControls(payload, { state: "at_start" }, "absolute", "fake", arms);
+    expect(at).toMatchObject({ canExecute: true, canAbort: true, connectBlocker: "a two-arm replay is running" });
+    expect(dualReplayControls(payload, { state: "executing" }, "absolute", "fake", arms)).toMatchObject({ canExecute: false, canAbort: true });
+    expect(dualReplayControls(payload, { state: "finished" }, "absolute", "fake", arms)).toMatchObject({ canExecute: false, canAbort: false });
+  });
+
+  it("names the edges each arm goes through", () => {
+    expect(edgeLines(payload.modes.absolute.episode)).toEqual([
+      "right (fr3_base): none: the dataset is in its base",
+      "left (fr3_base_left): fr3_base_left → fr3_base (assumed_placement)"
+    ]);
+  });
+
+  it("says why a run stopped, and whether the arms stopped together", () => {
+    expect(dualReplayStatus({ state: "stopped", backend: "fake", mode: "absolute", episode: 2, report: { stop: ["operator abort (SIGTERM)"], stoppedTogether: false } }))
+      .toBe("stopped (fake arms, absolute, episode 2): operator abort (SIGTERM) — the arms did NOT stop together");
+    expect(dualReplayStatus(null)).toBe("idle");
   });
 });
