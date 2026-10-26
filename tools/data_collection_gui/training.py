@@ -111,6 +111,8 @@ class TrainingRunStatus:
     logPath: str = ""
     wandbUrl: str = ""
     wandbEnabled: bool = False
+    # Started outside the page and followed through an ssh log relay (gateway._adopt_training_run).
+    adopted: bool = False
     lastLines: list[str] = field(default_factory=list)
 
 

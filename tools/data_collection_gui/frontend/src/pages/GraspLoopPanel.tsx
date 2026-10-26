@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { GraspLoopProgress, RolloutRun } from "../types";
 import { armRates, gateReading, medianByVerdict, wilsonInterval } from "./graspLoop";
 
@@ -42,13 +43,19 @@ function fmt(value: number | null | undefined, digits = 1): string {
 export function GraspLoopPanel({
   run,
   busy,
-  onControl
+  onControl,
+  onResume
 }: {
   run: RolloutRun;
   busy: boolean;
-  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void") => void;
+  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early") => void;
+  /** Put the form back the way this run was started, its "resume" box filled, so Start finishes
+   *  it. Resolves to what the operator is told. */
+  onResume?: (name: string) => Promise<string>;
 }) {
   const progress: GraspLoopProgress | undefined = run.graspLoop;
+  // Resume only fills the form; say so, or the click looks like it did nothing.
+  const [resumeNote, setResumeNote] = useState<{ run: string; text: string } | null>(null);
   const live = run.state !== "complete" && run.state !== "error" && run.state !== "stopped";
   if (!progress || !progress.planned) {
     return (
@@ -67,6 +74,7 @@ export function GraspLoopPanel({
   const rates = armRates(progress.trials);
   const multiArm = rates.length > 1 || (progress.arms ?? "A") !== "A";
   const current = progress.currentTrial;
+  const runName = (progress.out.split("/").pop() ?? "").replace(/\.jsonl$/, "");
 
   return (
     <div className="subcard">
@@ -89,7 +97,16 @@ export function GraspLoopPanel({
 
       {progress.needsOperator && !progress.needsOperator.startsWith("grade") && (
         <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          {progress.needsOperator.startsWith("hold") ? (
+          {progress.needsOperator.startsWith("fault") ? (
+            <span>
+              <strong>需要你：</strong>脚本步骤出错（不是碰撞，机械臂还在控制中）。确认手指下没有压着东西后点「继续」——
+              {progress.needsOperator.includes("runs again on the same peg")
+                ? "机械臂松爪、竖直抬起、回原位，再请你放回销子，这一条在同一个销位重做（策略还没跑过这一条）。"
+                : "机械臂回原位，再请你放回销子，接着跑下一条；这一条策略已经跑过，结果照记（插入没完成的，不计入端到端）。"}
+              不想继续就点停止。
+              <span className="hint"> {progress.needsOperator.replace(/^fault:\s*/, "")}</span>
+            </span>
+          ) : progress.needsOperator.startsWith("hold") ? (
             <span>
               <strong>需要你：</strong>循环出错停了，销还夹在手指里（进程退出时夹爪会断电松开）。先用手扶住销，再点「已扶住，张开」——
               手指张开后机械臂竖直抬起、回原位。
@@ -114,7 +131,9 @@ export function GraspLoopPanel({
           <button type="button" className="primary" disabled={busy} onClick={() => onControl("grasp_continue")}>
             {progress.needsOperator.startsWith("hold")
               ? "已扶住，张开"
-              : progress.needsOperator.startsWith("reflex")
+              : progress.needsOperator.startsWith("fault")
+                ? "继续"
+                : progress.needsOperator.startsWith("reflex")
                 ? "安全，恢复"
                 : "已放回，继续"}
           </button>
@@ -125,6 +144,25 @@ export function GraspLoopPanel({
         <div className="banner banner-error">
           循环停了：{progress.halted}
           {progress.haltDetails ? ` — ${progress.haltDetails}` : ""}
+          {!live && runName && done < progress.planned && (
+            <div style={{ marginTop: 8, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <span>
+                还差 {progress.planned - done} 条。把销插回孔里，再从这一轮接着跑：同一个记录文件、同样的销位，不用从头再来。
+              </span>
+              {onResume && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setResumeNote({ run: runName, text: "正在读取这一轮的配置…" });
+                    void onResume(runName).then((text) => setResumeNote({ run: runName, text }));
+                  }}
+                >
+                  续跑 {runName}
+                </button>
+              )}
+              {resumeNote?.run === runName && <span className="hint">{resumeNote.text}</span>}
+            </div>
+          )}
         </div>
       )}
 
@@ -185,7 +223,9 @@ export function GraspLoopPanel({
                   : progress.needsOperator.startsWith("hold")
                     ? "等你扶住销"
                     : "等你放回销"
-                : current !== null
+                : progress.insertSearching
+                  ? `第 ${(current ?? 0) + 1} 条插入搜索中`
+                  : current !== null
                   ? `第 ${current + 1} 条进行中`
                   : live
                     ? "准备下一条"
@@ -194,7 +234,25 @@ export function GraspLoopPanel({
         </div>
       </div>
 
-      {live && !progress.done && current !== null && !progress.needsOperator && (
+      {live && !progress.done && progress.insertSearching && !progress.needsOperator && (
+        <div className="banner banner-warn" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>
+            <strong>插入搜索中：</strong>销夹得明显歪、已经看得出插不进，就不用等所有落点试完——
+            点「提前判没进」，当前这个落点做完就停，本条记为没进（gradeEarly），销夹着带回抓取点重夹，不会再问你。
+            要是这个落点恰好进了，还是会照常问你。
+          </span>
+          <button
+            type="button"
+            disabled={busy || progress.outEarlyRequested}
+            onClick={() => onControl("grasp_out_early")}
+            title="Ends the insertion search after the landing in flight and grades this trial out without asking; if that landing seats, you are asked as usual."
+          >
+            {progress.outEarlyRequested ? "已判没进，当前落点后停" : "提前判没进"}
+          </button>
+        </div>
+      )}
+
+      {live && !progress.done && current !== null && !progress.needsOperator && !progress.insertSearching && (
         <div className="row-actions" style={{ marginBottom: 8 }}>
           <button
             type="button"

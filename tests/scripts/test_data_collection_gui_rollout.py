@@ -4312,6 +4312,66 @@ def test_the_page_voids_only_a_trial_in_flight(tmp_path: Path):
         gateway._send_rollout_control(state, "grasp_void")
 
 
+def test_an_insertion_search_opens_the_early_out_window_and_its_end_closes_it():
+    progress: dict = {}
+    for line in (
+        "[INFO] grasp_loop=configured trials=2 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=A insert=on out=g.jsonl",
+        "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500",
+        "[INFO] grasp_loop_insert_search=start trial=0",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["insertSearching"] is True and progress["outEarlyRequested"] is False
+    progress = rollout_backend.apply_grasp_loop_event(
+        progress, rollout_backend.parse_grasp_loop_line("[INFO] grasp_loop_out_early=requested")
+    )
+    assert progress["outEarlyRequested"] is True
+    progress = rollout_backend.apply_grasp_loop_event(
+        progress, rollout_backend.parse_grasp_loop_line("[INFO] grasp_loop_insert_search=end trial=0")
+    )
+    assert progress["insertSearching"] is False and progress["outEarlyRequested"] is False
+    # The servo's own per-insertion line is not a search edge.
+    assert rollout_backend.parse_grasp_loop_line(
+        "[INFO] grasp_loop_insert trial=0 inserted=0 grade=out auto=standing above_target_mm=+5.0"
+    ) == {}
+
+
+OUT_EARLY_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] grasp_loop=configured trials=1 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=A insert=on out=g.jsonl"
+echo "[INFO] grasp_loop_trial_start trial=0 target=0.4300,-0.1500"
+echo "[INFO] grasp_loop_insert_search=start trial=0"
+read -r word
+[ "$word" = out_early ] && echo "[INFO] grasp_loop_out_early=requested"
+echo "[INFO] grasp_loop_insert_search=end trial=0"
+echo "[INFO] grasp_loop_trial trial=0 arm=A verdict=held width_lifted=0.03 close_above_target_mm=5.0 lateral_mm=2.0 trial_s=40.0 inserted=0"
+echo '[INFO] grasp_loop=done halted=no summary={"graded": 1, "held": 1}'
+"""
+
+
+def test_the_page_calls_an_insertion_out_early_only_while_it_searches(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, OUT_EARLY_LAUNCHER)
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 1, "graspLoopAttended": True},
+        },
+    )
+    assert _wait_for(lambda: state.rollout.graspLoop.get("insertSearching") is True), state.rollout.lastLines
+    # Not a grade: there is no question pending.
+    with pytest.raises(ValueError, match="not asking for a grade"):
+        gateway._send_rollout_control(state, "grasp_out")
+    with state.lock:
+        gateway._send_rollout_control(state, "grasp_out_early")
+    assert _wait_for(lambda: state.rollout.graspLoop.get("done") is True), state.rollout.lastLines
+    assert state.rollout.graspLoop["insertSearching"] is False
+    assert state.rollout.graspLoop["trials"][0]["inserted"] is False
+    with pytest.raises(ValueError):
+        gateway._send_rollout_control(state, "grasp_out_early")
+
+
 def test_recording_the_funnel_goes_to_the_checkpoints_own_funnel_dataset(tmp_path: Path):
     options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": True})
     assert options == {"FR3_GRASP_LOOP_DATASET_ROOT": ""}
@@ -4360,6 +4420,28 @@ def test_whole_trials_need_recording_on_and_a_leftover_shell_switch_is_cleared(t
     assert "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL" not in env
 
 
+def test_arm_a_misses_are_kept_only_with_whole_trials_and_arm_a(tmp_path: Path):
+    whole = {"graspLoopRecord": True, "graspLoopRecordWholeTrial": True}
+    options = rollout_backend.sanitize_rollout_runtime_options(dict(whole, graspLoopKeepMisses=True, graspLoopArms="AB"))
+    assert options["FR3_GRASP_LOOP_KEEP_MISSES"] == "1"
+    assert "FR3_GRASP_LOOP_KEEP_MISSES" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    _, env = _command(tmp_path, mode="grasp_loop", runtime_options=options, trial_dataset_fallback=tmp_path / "t")
+    assert env["FR3_GRASP_LOOP_KEEP_MISSES"] == "1"
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopRecordWholeTrial"):
+        rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": True, "graspLoopKeepMisses": True})
+    with pytest.raises(rollout_backend.RolloutError, match="arm A or AB"):
+        rollout_backend.sanitize_rollout_runtime_options(dict(whole, graspLoopKeepMisses=True, graspLoopArms="B"))
+    # A shell left with the switch on does not keep misses for a page that did not ask.
+    _, env = _command(
+        tmp_path,
+        mode="grasp_loop",
+        runtime_options=rollout_backend.sanitize_rollout_runtime_options(whole),
+        base_env={"FR3_GRASP_LOOP_KEEP_MISSES": "1"},
+        trial_dataset_fallback=tmp_path / "t",
+    )
+    assert "FR3_GRASP_LOOP_KEEP_MISSES" not in env
+
+
 def test_the_funnel_is_not_recorded_unless_the_page_asks(tmp_path: Path):
     _, env = _command(
         tmp_path,
@@ -4406,6 +4488,28 @@ def test_the_grasp_loop_seed_is_passed_and_blank_leaves_the_runtime_default():
     assert "FR3_GRASP_LOOP_SEED" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
     launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
     assert '--grasp-loop-seed "${FR3_GRASP_LOOP_SEED}"' in launcher
+
+
+def test_a_halted_grasp_loop_run_is_resumed_by_name_and_only_if_it_exists(tmp_path):
+    # 10-23: the launcher already appended to FR3_GRASP_LOOP_OUT, but the page could not name one.
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    expected = {"FR3_GRASP_LOOP_OUT": "outputs/analysis/grasp_loop/grasp_20261023_093213.jsonl"}
+    for typed in ("grasp_20261023_093213", "grasp_20261023_093213.jsonl",
+                  "outputs/analysis/grasp_loop/grasp_20261023_093213.jsonl"):
+        assert sanitize({"graspLoopResume": typed}) == expected
+    assert sanitize({"graspLoopResume": ""}) == {}
+    for bad in ("../../etc/passwd", "grasp_1", "rollout_20261023_093213"):
+        with pytest.raises(rollout_backend.RolloutError, match="graspLoopResume"):
+            sanitize({"graspLoopResume": bad})
+    # Cleared from the inherited environment, so no launch appends to a run it was not asked to.
+    assert "FR3_GRASP_LOOP_OUT" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    with pytest.raises(rollout_backend.RolloutError, match="no grasp loop run grasp_20261023_093213"):
+        _command(tmp_path, mode="grasp_loop", runtime_options=expected)
+    run = tmp_path / expected["FR3_GRASP_LOOP_OUT"]
+    run.parent.mkdir(parents=True)
+    run.write_text("", encoding="utf-8")
+    _command_, env = _command(tmp_path, mode="grasp_loop", runtime_options=expected)
+    assert env["FR3_GRASP_LOOP_OUT"] == expected["FR3_GRASP_LOOP_OUT"]
 
 
 def test_the_funnel_corrective_switch_reaches_the_launcher_only_with_arm_b():
@@ -4509,3 +4613,120 @@ def test_grasp_loop_reflex_prompt_tells_a_comm_loss_and_a_user_stop_from_a_colli
     assert "commands stopped arriving" in message(GRASP_LOOP_COMM_LOSS_PROMPT)
     assert "collision reflex" in message(GRASP_LOOP_REFLEX_PROMPT)
     assert "daily self-test" in message(GRASP_LOOP_USER_STOP_PROMPT)
+
+
+def _grasp_run_file(repo: Path, run: str, *, at: float, request: dict, policy: str, finished: int) -> Path:
+    path = repo / rollout_backend.GRASP_LOOP_DIR / f"{run}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [{"kind": "run_start", "at": at, "request": request, "policy": policy, "resumedAfter": 0, "startTrial": 0}]
+    rows += [{"kind": "trial", "trial": n, "verdict": "held"} for n in range(finished)]
+    # Replaced by the next trial, so not one of the trials done (34 of 38 rows on 171012).
+    rows.append({"kind": "trial", "trial": finished, "verdict": "voided"})
+    # A later resume's run_start must not be read as the run's own.
+    rows.append({"kind": "run_start", "at": at + 999, "request": {**request, "seed": 1}, "policy": policy})
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+# As 10-23's grasp_20261023_171012 recorded it, trimmed to what the form is filled from.
+RESUME_REQUEST = {
+    "arms": "A", "attended": True, "funnelAlignDzMm": [60.0, 300.0], "funnelCorrective": False,
+    "insertServo": {"handoffZ": 0.12, "searchRingM": 0.007, "xyz": [0.3597, -0.1328, 0.058]},
+    "maxPolicySteps": 600, "seed": 285, "trials": 60,
+}
+RESUME_POLICY = "/data/lerobot/outputs/train/job_r3/checkpoints/035000"
+
+
+def test_a_resume_fills_the_form_from_the_start_that_began_the_run(tmp_path: Path):
+    _grasp_run_file(tmp_path, "grasp_20261023_171012", at=1000.0, request=RESUME_REQUEST, policy=RESUME_POLICY, finished=34)
+    own = {"mode": "grasp_loop", "checkpointId": "job_r3/035000", "policyServer": "10.77.0.64:8790",
+           "runtimeOptions": {"graspLoopSeed": "285", "graspLoopRecord": True, "rtcReplanQueueSize": 34}}
+    later = {"mode": "real", "checkpointId": "job_x/010000", "runtimeOptions": {"graspLoopRecord": False}}
+
+    resumed = rollout_backend.grasp_loop_resume_params(
+        tmp_path, "grasp_20261023_171012",
+        starts=[{"at": 400.0, "params": {"mode": "grasp_loop"}}, {"at": 900.0, "params": own}],
+        last_params=later, last_params_at=5000.0,
+    )
+
+    assert resumed["source"] == "recorded" and resumed["trialsDone"] == 34
+    params = resumed["params"]
+    assert params["mode"] == "grasp_loop" and params["checkpointId"] == "job_r3/035000"
+    assert params["policyServer"] == "10.77.0.64:8790"
+    options = params["runtimeOptions"]
+    assert options["graspLoopRecord"] is True and options["rtcReplanQueueSize"] == 34
+    assert options["graspLoopResume"] == "grasp_20261023_171012"
+    assert options["graspLoopSeed"] == "285" and options["graspLoopArms"] == "A"
+    assert options["graspLoopTrials"] == 60 and options["graspLoopMaxPolicySteps"] == 600
+    assert options["graspLoopAttended"] is True
+    assert options["graspLoopInsertPose"] == "0.3597,-0.1328,0.058"
+    assert options["graspLoopFunnelTakeoverDzMm"] == "60,300"
+    assert "terminalServoSearchRing" not in options
+
+
+def test_a_resume_falls_back_to_the_last_start_only_when_it_began_the_run(tmp_path: Path):
+    _grasp_run_file(tmp_path, "grasp_20261023_171012", at=1000.0, request=RESUME_REQUEST, policy=RESUME_POLICY, finished=2)
+    last = {"mode": "grasp_loop", "checkpointId": "job_r3/035000",
+            "runtimeOptions": {"graspLoopRecord": True, "graspLoopSeed": "285"}}
+
+    own = rollout_backend.grasp_loop_resume_params(
+        tmp_path, "grasp_20261023_171012", starts=[], last_params=last, last_params_at=990.0
+    )
+    assert own["source"] == "last" and own["params"]["runtimeOptions"]["graspLoopRecord"] is True
+
+    # Written after the run started: some later Start. The run's rows still decide what they
+    # record; the rest is the last form's, and the page is told to check it.
+    other = {"mode": "grasp_loop", "checkpointId": "job_x/010000",
+             "runtimeOptions": {"graspLoopRecord": False, "graspLoopSeed": "7", "graspLoopArms": "B"}}
+    rebuilt = rollout_backend.grasp_loop_resume_params(
+        tmp_path, "grasp_20261023_171012", starts=[], last_params=other, last_params_at=1500.0
+    )
+    assert rebuilt["source"] == "rebuilt"
+    options = rebuilt["params"]["runtimeOptions"]
+    assert rebuilt["params"]["checkpointId"] == "job_r3/035000"
+    assert options["graspLoopSeed"] == "285" and options["graspLoopArms"] == "A"
+    assert options["graspLoopRecord"] is False
+    assert options["terminalServoSearchRing"] == 0.007 and options["terminalServoHandoffZ"] == 0.12
+
+
+def test_a_resume_refuses_a_run_it_cannot_read(tmp_path: Path):
+    with pytest.raises(rollout_backend.RolloutError, match="e.g."):
+        rollout_backend.grasp_loop_resume_params(tmp_path, "../etc/passwd", starts=[], last_params={}, last_params_at=None)
+    with pytest.raises(rollout_backend.RolloutError, match="no grasp loop run"):
+        rollout_backend.grasp_loop_resume_params(tmp_path, "grasp_20261023_171012", starts=[], last_params={}, last_params_at=None)
+    path = tmp_path / rollout_backend.GRASP_LOOP_DIR / "grasp_20261023_171012.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"kind": "trial", "trial": 0}\n', encoding="utf-8")
+    with pytest.raises(rollout_backend.RolloutError, match="no run_start"):
+        rollout_backend.grasp_loop_resume_params(tmp_path, "grasp_20261023_171012", starts=[], last_params={}, last_params_at=None)
+
+
+def test_each_grasp_loop_start_is_kept_for_its_resume(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, OUT_EARLY_LAUNCHER)
+    before = time.time()
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 1, "graspLoopSeed": "285", "graspLoopRecord": True},
+        },
+    )
+    gateway._stop_rollout(state)
+
+    entries = [json.loads(line) for line in gateway._grasp_loop_starts_path(state).read_text().splitlines()]
+    assert len(entries) == 1 and entries[0]["at"] >= before
+    assert entries[0]["params"]["runtimeOptions"]["graspLoopRecord"] is True
+    assert "confirmMotion" not in entries[0]["params"]
+
+    _grasp_run_file(state.repo_root, "grasp_20261023_171012", at=time.time() + 1, request=RESUME_REQUEST,
+                    policy="/x/outputs/train/job_a/checkpoints/020000", finished=3)
+    answer = gateway._grasp_loop_resume_params(state, "grasp_20261023_171012")
+    assert answer["ok"] is True and answer["source"] == "recorded"
+    assert answer["params"]["runtimeOptions"]["graspLoopRecord"] is True
+    assert answer["params"]["runtimeOptions"]["graspLoopSeed"] == "285"
+    assert gateway._grasp_loop_resume_params(state, "grasp_20991231_000000") == {
+        "ok": False, "error": "There is no grasp loop run grasp_20991231_000000 on this robot host."
+    }

@@ -984,6 +984,8 @@ export type TrainingRun = {
   logPath: string;
   wandbUrl: string;
   wandbEnabled: boolean;
+  /** Started outside the page and followed through an ssh log relay; "Re-attach" restores it. */
+  adopted?: boolean;
   lastLines: string[];
 };
 
@@ -1304,6 +1306,10 @@ export type GraspLoopProgress = {
   stopRequested: boolean;
   /** The trial in flight has been voided; reset when the next one starts. */
   voidRequested?: boolean;
+  /** Attended end-to-end runs: the insertion servo is trying landings, so an early "out" is
+   *  possible; and whether one has been given. Both reset when the search ends. */
+  insertSearching?: boolean;
+  outEarlyRequested?: boolean;
   done: boolean;
   halted: string;
   haltDetails: string;
@@ -1675,6 +1681,9 @@ export type RolloutRuntimeOptions = {
   graspLoopMaxPolicySteps?: number;
   /** Peg positions and arm B's per-trial draws, as typed (the gateway checks it); the runtime's 0 when absent. */
   graspLoopSeed?: string;
+  /** Finish a halted run (grasp_YYYYmmdd_HHMMSS) instead of starting one: same file, same pegs, from
+   *  the trial after its last finished one. The runtime refuses another seed, arm or checkpoint. */
+  graspLoopResume?: string;
   graspLoopAttended?: boolean;
   /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
   graspLoopArms?: "A" | "B" | "AB";
@@ -1684,6 +1693,8 @@ export type RolloutRuntimeOptions = {
   graspLoopRecord?: boolean;
   /** With graspLoopRecord: whole held trials, the policy's steps too, into the checkpoint's trial_ dataset. */
   graspLoopRecordWholeTrial?: boolean;
+  /** With graspLoopRecordWholeTrial: arm A's empty / no_close trials too, for an offline relabel only. */
+  graspLoopKeepMisses?: boolean;
   /** Arm B: how far above the peg the funnel takes over, "h" or "low,high" mm (drawn per trial). */
   graspLoopFunnelTakeoverDzMm?: string;
   /** Arm B: corrective demonstrations (part of the aim left to the descent; some low takeovers that lift and realign). */
@@ -1705,6 +1716,15 @@ export type RolloutLastParams = {
   runtimeOptions?: RolloutRuntimeOptions;
   /** "" for this machine, else `host:port`; re-checked against the gateway's list on start. */
   policyServer?: string;
+};
+
+/** /api/rollout/grasp-loop-resume: the Start form that finishes a halted grasp loop run.
+ *  `source` is where the page's settings came from: "recorded" / "last" are that run's own Start;
+ *  "rebuilt" only had the run's rows, so recording and the RTC knobs are the last Start's. */
+export type GraspLoopResumeParams = {
+  params: RolloutLastParams;
+  source: "recorded" | "last" | "rebuilt";
+  trialsDone: number;
 };
 
 /** What a policy server reports about itself (tools/fr3/policy_remote.py, `PolicyHost.status`). */

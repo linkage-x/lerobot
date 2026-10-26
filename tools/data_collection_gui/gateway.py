@@ -5004,6 +5004,7 @@ def _follow_training_run(
     process: subprocess.Popen[str] | None = None,
     *,
     from_start: bool,
+    exit_code_is_trainer: bool = True,
 ) -> None:
     """Follow a run by reading the log file it writes, and record how it ended.
 
@@ -5058,6 +5059,10 @@ def _follow_training_run(
                 state.training.message = f"Could not follow training log: {exc}"
 
     return_code = process.wait() if process is not None else None
+    if not exit_code_is_trainer:
+        # An adopted run's process is the `tail` relaying its log, which exits 0 whenever the
+        # trainer does, crashed or not. Only the log can say how the trainer ended.
+        return_code = None
     with state.lock:
         if state.training.pid != pid:
             return
@@ -5074,6 +5079,15 @@ def _follow_training_run(
                 state.training.state = "complete"
                 state.training.message = (
                     f"Training finished; checkpoints under {state.training.outputDir}"
+                )
+            elif state.training.adopted:
+                # The relay ends when the trainer does, but also when its ssh connection drops,
+                # and from here the two look the same.
+                state.training.state = "error"
+                state.training.message = (
+                    f"Lost the log of {state.training.jobName} from {state.training.hostLabel}: either "
+                    "the trainer stopped without finishing, or the connection dropped while it is "
+                    "still running. Press \"Re-attach running job\"; it says which."
                 )
             else:
                 state.training.state = "error"
@@ -5625,6 +5639,211 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
     return {"ok": True, "training": asdict(state.training), "sync": sync_result}
 
 
+def _adopt_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Show and stop a run that was started on a remote host without this page.
+
+    Long runs on Dante are started there as systemd user units (run/train_job.sh), so this
+    gateway never saw them start, and the page kept showing whichever run it had launched last.
+    The caller has already written the trainer's pid to the same pid file a page-started run
+    gets, so Stop reaches it through stop_remote_training. What this adds is the log: an ssh
+    `tail --pid` relays the remote log into a local file, which is then followed, persisted and
+    re-adopted after a gateway restart exactly like a run started here. The tail ends when the
+    trainer does; how it ended is read off the log (`exit_code_is_trainer=False`).
+    """
+    if _training_is_running(state):
+        raise ValueError("A training run is already in progress; stop it before adopting another.")
+    host_id = str(payload.get("hostId") or "").strip()
+    if not host_id:
+        repo_dir = str(payload.get("repoDir") or "").strip()
+        matches = [
+            host
+            for host in training_backend.all_hosts(state.repo_root)
+            if host.kind == "remote" and host.repoDir == repo_dir
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{len(matches)} remote hosts have repo {repo_dir!r}; pass hostId.")
+        host_id = matches[0].id
+    host = training_backend.resolve_host(state.repo_root, host_id)
+    if host.kind != "remote":
+        raise ValueError("Only a run on a remote host can be adopted.")
+    job_name = str(payload.get("jobName") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", job_name):
+        raise ValueError("Job name may only contain letters, digits, '.', '_' and '-'.")
+    remote_log = str(payload.get("logPath") or "").strip()
+    if not remote_log.startswith("/"):
+        raise ValueError("logPath must be the absolute path of the run's log on the host.")
+
+    pid_file = shlex.quote(training_backend.remote_training_pid_file(job_name))
+    # Same identity check as stop_remote_training: the pid must still be this job's trainer.
+    find_trainer = (
+        f"cd {shlex.quote(host.repoDir)} || exit 2; "
+        f"pid=$(cat {pid_file} 2>/dev/null); "
+        'case "$pid" in ""|*[!0-9]*) echo "no pid file for this job" >&2; exit 3;; esac; '
+        f"tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -qF -- {shlex.quote(job_name)} "
+        '|| { echo "pid $pid is not this job" >&2; exit 4; }; '
+        f"test -f {shlex.quote(remote_log)} || {{ echo 'no log at that path' >&2; exit 5; }}; "
+    )
+    try:
+        check = subprocess.run(
+            ["ssh", *training_backend.SSH_OPTS, host.sshTarget, find_trainer + 'echo "$pid"'],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"{host.sshTarget} did not answer within 20 s.") from None
+    if check.returncode != 0:
+        raise ValueError(f"Cannot adopt {job_name}: {(check.stderr or check.stdout).strip()[:200]}")
+    remote_pid = check.stdout.strip()
+
+    log_dir = state.repo_root / "outputs" / "logs" / "training"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"train_{job_name}.log"
+    relay = find_trainer + f'exec tail --pid="$pid" -n +1 -F {shlex.quote(remote_log)}'
+    with log_path.open("wb") as log_file:  # the relay replays the whole log from its first line
+        process = subprocess.Popen(
+            ["ssh", *training_backend.SSH_OPTS, "-o", "ServerAliveInterval=30", host.sshTarget, relay],
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    state.training_process = None  # its exit code is the relay's, not the trainer's
+    total_steps = int(payload.get("totalSteps") or 0)
+    view_name = str(payload.get("viewName") or "").strip()
+    state.training = training_backend.TrainingRunStatus(
+        state="running",
+        hostId=host.id,
+        hostLabel=host.label,
+        viewName=view_name,
+        viewRoot=f"{host.repoDir}/outputs/exports/training_views/{view_name}" if view_name else "",
+        policy=str(payload.get("policy") or "").strip(),
+        jobName=job_name,
+        outputDir=f"outputs/train/{job_name}",
+        totalSteps=total_steps,
+        message=f"Following {job_name} on {host.label} (pid {remote_pid}), started outside this page",
+        pid=process.pid,
+        startedAt=str(payload.get("startedAt") or "")
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        logPath=str(log_path),
+        adopted=True,
+    )
+    state.log("info", f"Adopted training run {job_name} on {host.label} (remote pid {remote_pid})")
+    _persist_training_status(state)
+    Thread(target=process.wait, daemon=True, name=f"training-relay-reap-{process.pid}").start()
+    Thread(
+        target=_follow_training_run,
+        args=(state, log_path, process.pid),
+        kwargs={"from_start": True, "exit_code_is_trainer": False},
+        daemon=True,
+        name=f"training-relay-{process.pid}",
+    ).start()
+    return {"ok": True, "training": asdict(state.training)}
+
+
+# Run on the training host: every live trainer whose cwd is the host's repo, as JSON, with the
+# pid file Stop signals through written for each. Dataloader workers carry the trainer's argv,
+# so only the process-group leader counts. A trainer's log is its stdout, which for a run
+# started as a user unit (run/user_job.sh) is a file; a page-started run's stdout is the ssh
+# pipe, and that run is followed through its ssh client instead.
+_FIND_REMOTE_TRAINERS = r"""
+import json, os, sys
+repo = os.path.realpath(sys.argv[1])  # /proc/<pid>/cwd is resolved
+ticks = os.sysconf("SC_CLK_TCK")
+boot = next(float(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime "))
+found = []
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        if not any(a.endswith("fr3_train_il_policy.py") for a in argv) or os.getpgid(pid) != pid:
+            continue
+        if os.readlink(f"/proc/{pid}/cwd") != repo:
+            continue
+        log = os.readlink(f"/proc/{pid}/fd/1")
+        started = boot + int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19]) / ticks
+    except OSError:
+        continue
+    def opt(key):
+        return argv[argv.index(key) + 1] if key in argv[:-1] else ""
+    job = opt("--job-name")
+    if job:
+        os.makedirs(f"{repo}/outputs/.training_pids", exist_ok=True)
+        with open(f"{repo}/outputs/.training_pids/{job}.pid", "w") as f:
+            f.write(f"{pid}\n")
+    found.append({"pid": pid, "jobName": job, "steps": opt("--steps"), "policy": opt("--policy"),
+                  "viewName": os.path.basename(opt("--view-root").rstrip("/")), "log": log,
+                  "started": started})
+print(json.dumps(found))
+"""
+
+
+def _reattach_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Find the trainer running on a remote host and follow it (the page's "Re-attach").
+
+    For when the page lost a run it was following -- the relay's ssh dropped, the robot host
+    rebooted -- or never knew one, because it was started on the host itself. Nothing has to be
+    known in advance: the host is asked which trainers are running in its repo, and the one found
+    is adopted. The host to ask is the one given, else the last run's, else every remote host
+    (Dante is registered twice, wired and Wi-Fi; an unreachable entry is skipped).
+    """
+    if _training_is_running(state):
+        return {"ok": True, "training": asdict(state.training), "message": "Already following a run."}
+    hosts = [h for h in training_backend.all_hosts(state.repo_root) if h.kind == "remote"]
+    wanted = str(payload.get("hostId") or "").strip() or state.training.hostId
+    hosts.sort(key=lambda h: h.id != wanted)
+    if payload.get("hostId"):
+        hosts = hosts[:1] if hosts and hosts[0].id == wanted else []
+    if not hosts:
+        raise ValueError("There is no remote training machine to look on.")
+
+    unreachable: list[str] = []
+    for host in hosts:
+        command = f"cd {shlex.quote(host.repoDir)} && python3 -c {shlex.quote(_FIND_REMOTE_TRAINERS)} {shlex.quote(host.repoDir)}"
+        try:
+            result = subprocess.run(
+                ["ssh", *training_backend.SSH_OPTS, host.sshTarget, command],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            trainers = json.loads(result.stdout) if result.returncode == 0 else None
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            trainers = None
+        if trainers is None:
+            unreachable.append(host.label)
+            continue
+        if not trainers:
+            raise ValueError(f"No training is running on {host.label}.")
+        if len(trainers) > 1:
+            jobs = ", ".join(t["jobName"] or f"pid {t['pid']}" for t in trainers)
+            raise ValueError(f"{len(trainers)} trainings are running on {host.label} ({jobs}); stop the extra one.")
+        trainer = trainers[0]
+        if not trainer["jobName"]:
+            raise ValueError(f"The trainer on {host.label} (pid {trainer['pid']}) has no --job-name.")
+        if not str(trainer["log"]).startswith("/"):
+            raise ValueError(
+                f"{trainer['jobName']} on {host.label} writes its log to {trainer['log']}, not a file; "
+                "only a run started on the host (run/train_job.sh) can be re-attached."
+            )
+        started = datetime.fromtimestamp(float(trainer["started"]), timezone.utc).isoformat(timespec="seconds")
+        return _adopt_training_run(
+            state,
+            {
+                "hostId": host.id,
+                "jobName": trainer["jobName"],
+                "logPath": trainer["log"],
+                "viewName": trainer["viewName"],
+                "policy": trainer["policy"],
+                "totalSteps": int(trainer["steps"] or 0),
+                "startedAt": started,
+            },
+        )
+    raise ValueError(f"Could not reach {', '.join(unreachable)}.")
+
+
 def _stop_training_run(state: GatewayState) -> dict[str, Any]:
     with state.lock:
         process = state.training_process
@@ -6173,6 +6392,54 @@ def _record_rollout_params(state: GatewayState, params: dict[str, Any]) -> None:
         state.log("warn", f"Could not record rollout parameters: {exc}")
 
 
+def _grasp_loop_starts_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "logs" / "rollout" / "grasp_loop_starts.jsonl"
+
+
+def _record_grasp_loop_start(state: GatewayState, params: dict[str, Any]) -> None:
+    """Keep every grasp loop Start, not just the last, so a halted run's Resume can put the form
+    back the way that run was started however many starts came after it. Best-effort."""
+    path = _grasp_loop_starts_path(state)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"at": time.time(), "params": params}, sort_keys=True) + "\n")
+    except OSError as exc:
+        state.log("warn", f"Could not record the grasp loop start: {exc}")
+
+
+def _grasp_loop_resume_params(state: GatewayState, run: str) -> dict[str, Any]:
+    """/api/rollout/grasp-loop-resume: the Start form that finishes halted run `run`."""
+    starts: list[dict[str, Any]] = []
+    try:
+        lines = _grasp_loop_starts_path(state).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            starts.append(entry)
+    last_path = _rollout_last_params_path(state)
+    try:
+        last_at: float | None = last_path.stat().st_mtime
+    except OSError:
+        last_at = None
+    try:
+        resumed = rollout_backend.grasp_loop_resume_params(
+            state.repo_root,
+            run,
+            starts=starts,
+            last_params=_rollout_last_params(state),
+            last_params_at=last_at,
+        )
+    except (rollout_backend.RolloutError, OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **resumed}
+
+
 def _rollout_last_params(state: GatewayState) -> dict[str, Any]:
     """The previous rollout's settings, or {} when there is no usable record.
 
@@ -6261,21 +6528,21 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
 
     # Recorded before launch, and from the values that were actually validated: a rollout that
     # dies on startup still tells the next one what was tried. The two safety gates are not here.
-    _record_rollout_params(
-        state,
-        {
-            "mode": mode.id,
-            # The validated id, not the raw one: what comes back next session is a checkpoint
-            # this machine was able to resolve, never a string that failed to name one.
-            "checkpointId": checkpoint_id,
-            "maxSteps": int(payload.get("maxSteps") or 0),
-            "moveToStart": bool(payload.get("moveToStart", True)),
-            "runtimeOptions": payload.get("runtimeOptions")
-            if isinstance(payload.get("runtimeOptions"), dict)
-            else {},
-            "policyServer": policy_server,
-        },
-    )
+    started_params = {
+        "mode": mode.id,
+        # The validated id, not the raw one: what comes back next session is a checkpoint
+        # this machine was able to resolve, never a string that failed to name one.
+        "checkpointId": checkpoint_id,
+        "maxSteps": int(payload.get("maxSteps") or 0),
+        "moveToStart": bool(payload.get("moveToStart", True)),
+        "runtimeOptions": payload.get("runtimeOptions")
+        if isinstance(payload.get("runtimeOptions"), dict)
+        else {},
+        "policyServer": policy_server,
+    }
+    _record_rollout_params(state, started_params)
+    if mode.id == "grasp_loop":
+        _record_grasp_loop_start(state, started_params)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     trace_dir = rollout_backend.trace_session_dir(state.repo_root, stamp)
@@ -6492,18 +6759,19 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     """
     allowed = {
         "start", "stop", "home", "quit", "takeover",
-        "grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void",
+        "grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void", "grasp_out_early",
     }
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("No rollout is running.")
-    if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void"):
+    if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void", "grasp_out_early"):
         # The grasp loop is not interactive -- it runs its own trials -- but it does read a few
         # words on the same pipe: stop at the next trial boundary, "the peg is back", in an
         # end-to-end run whether the peg it is still holding at the hole went in, and "the peg
-        # it staged fell over", which voids the trial in flight.
+        # it staged fell over", which voids the trial in flight -- and, while the insertion servo is
+        # still trying landings, "out" ahead of the grade, which ends that search.
         if state.rollout.mode != "grasp_loop":
             raise ValueError("That control only applies to the grasp loop.")
         waiting_for = str(state.rollout.graspLoop.get("needsOperator") or "")
@@ -6513,12 +6781,15 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
             raise ValueError("The grasp loop is not asking for a grade.")
         if command == "grasp_void" and (state.rollout.graspLoop.get("currentTrial") is None or waiting_for):
             raise ValueError("No trial is being staged or grasped, so there is nothing to void.")
+        if command == "grasp_out_early" and (not state.rollout.graspLoop.get("insertSearching") or waiting_for):
+            raise ValueError("The insertion servo is not searching, so there is nothing to call out early.")
         word = {
             "grasp_stop": b"stop\n",
             "grasp_continue": b"continue\n",
             "grasp_in": b"in\n",
             "grasp_out": b"out\n",
             "grasp_void": b"void\n",
+            "grasp_out_early": b"out_early\n",
         }[command]
         try:
             process.stdin.write(word)
@@ -13949,6 +14220,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             tail = _unattended_tail(query.get("tail", [""])[0])
             _json_response(self, HTTPStatus.OK, _unattended_read(self.server.state, run_id, tail))
             return
+        if path == "/api/rollout/grasp-loop-resume":
+            # Outside the lock: it reads a run's rows and the start log, no gateway state.
+            run = (query.get("run", [""])[0] or "").strip()
+            _json_response(self, HTTPStatus.OK, _grasp_loop_resume_params(self.server.state, run))
+            return
         if path == "/api/rollout/last-params":
             with self.server.state.lock:
                 _json_response(
@@ -14420,6 +14696,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     # runs an rsync first, and that can take a minute.
                     result = _start_training_run(state, body)
                     _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/training/adopt":
+                    # Outside the lock: it waits on an ssh round trip to check the trainer.
+                    _json_response(self, HTTPStatus.OK, _adopt_training_run(state, body))
+                    return
+                if path == "/api/training/reattach":
+                    # Outside the lock: up to one ssh round trip per remote host.
+                    _json_response(self, HTTPStatus.OK, _reattach_training_run(state, body))
                     return
                 if path == "/api/training/stop":
                     # Takes the lock itself: a remote stop is an ssh round trip made outside it.

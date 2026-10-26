@@ -101,9 +101,14 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_INSERT_POSE",
     "FR3_GRASP_LOOP_DATASET_ROOT",
     "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL",
+    "FR3_GRASP_LOOP_KEEP_MISSES",
     "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
     "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE",
+    "FR3_GRASP_LOOP_OUT",
 )
+# A grasp loop run's rows, `grasp_<stamp>.jsonl`; a resume names the stamp and appends to it.
+GRASP_LOOP_DIR = Path("outputs/analysis/grasp_loop")
+GRASP_LOOP_RUN_RE = re.compile(r"^grasp_\d{8}_\d{6}$")
 RTC_MODES = {"auto", "enabled", "disabled"}
 ACTION_AGGREGATES = {"medoid", "mean"}
 
@@ -454,6 +459,14 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     # Where the pegs go and arm B's draws. Blank leaves the runtime's 0, which every page run
     # used until 10-20: the 150 trials of 10-19 were 58 positions, the first 42 three times over.
     _set_optional_int_env(options, raw, "graspLoopSeed", "FR3_GRASP_LOOP_SEED", minimum=0)
+    # Finish a halted run instead of starting a new one: the same file, from the trial after its
+    # last finished one, on the same pegs. The runtime refuses a seed, arm or checkpoint that differs.
+    resume = _optional_text(raw.get("graspLoopResume"))
+    if resume:
+        resume = resume.removesuffix(".jsonl").rsplit("/", 1)[-1]
+        if not GRASP_LOOP_RUN_RE.match(resume):
+            raise RolloutError("graspLoopResume names a grasp loop run, e.g. grasp_20261023_093213.")
+        options["FR3_GRASP_LOOP_OUT"] = str(GRASP_LOOP_DIR / f"{resume}.jsonl")
     if _parse_bool_field(raw.get("graspLoopAttended", False), "graspLoopAttended"):
         options["FR3_GRASP_LOOP_ATTENDED"] = "1"
     grasp_arms = _optional_text(raw.get("graspLoopArms"))
@@ -493,6 +506,13 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
             options["FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL"] = "1"
     elif _parse_bool_field(raw.get("graspLoopRecordWholeTrial", False), "graspLoopRecordWholeTrial"):
         raise RolloutError("graspLoopRecordWholeTrial says what to record: turn graspLoopRecord on too.")
+    # Arm A's misses as well, for an offline relabel; only whole trials have the policy's steps.
+    if _parse_bool_field(raw.get("graspLoopKeepMisses", False), "graspLoopKeepMisses"):
+        if options.get("FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL") != "1":
+            raise RolloutError("graspLoopKeepMisses keeps whole trials: turn graspLoopRecordWholeTrial on too.")
+        if (grasp_arms or "A") == "B":
+            raise RolloutError("graspLoopKeepMisses keeps arm A's misses: choose arm A or AB.")
+        options["FR3_GRASP_LOOP_KEEP_MISSES"] = "1"
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
@@ -711,6 +731,10 @@ def build_rollout_command(
             what = "whole trials" if whole_trial else "the funnel"
             raise RolloutError(f"Recording {what} needs a dataset directory for this checkpoint.")
         env["FR3_GRASP_LOOP_DATASET_ROOT"] = str(fallback)
+
+    resume = env.get("FR3_GRASP_LOOP_OUT")
+    if resume and not (repo_root / resume).is_file():
+        raise RolloutError(f"There is no grasp loop run {Path(resume).stem} to resume on this robot host.")
 
     env["FR3_INFER_CHECKPOINT"] = checkpoint_path
     if policy_server:
@@ -1224,6 +1248,134 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
 _GRASP_FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
 
+# How long before a run's first `run_start` row the page's Start may have been pressed: the
+# runtime loads the policy, homes and stages the first peg in between. A start recorded earlier
+# than this belongs to some other run.
+GRASP_LOOP_START_LEAD_S = 1800.0
+# The runtime options a grasp loop's own record decides. Everything else on the form (the RTC
+# knobs, recording, the policy server) is only in what the page sent.
+_GRASP_LOOP_RECORD_OPTIONS = (
+    "graspLoopTrials", "graspLoopMaxPolicySteps", "graspLoopSeed", "graspLoopAttended",
+    "graspLoopArms", "graspLoopInsertPose", "graspLoopFunnelTakeoverDzMm",
+    "graspLoopFunnelCorrective",
+)
+
+
+def _grasp_loop_first_start(path: Path) -> dict[str, Any] | None:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == "run_start":
+            return row
+    return None
+
+
+def _checkpoint_id_from_policy(policy: Any) -> str:
+    """`<job>/<step>` for a `.../<job>/checkpoints/<step>` path, the id the picker lists."""
+
+    parts = Path(str(policy or "")).parts
+    if len(parts) >= 3 and parts[-2] == "checkpoints":
+        return f"{parts[-3]}/{parts[-1]}"
+    return ""
+
+
+def _mm(value: Any) -> str:
+    return f"{float(value):g}"
+
+
+def grasp_loop_resume_params(
+    repo_root: Path,
+    run: str,
+    *,
+    starts: list[dict[str, Any]],
+    last_params: dict[str, Any],
+    last_params_at: float | None,
+) -> dict[str, Any]:
+    """The Start form that finishes halted grasp loop `run`: the page's settings as that run was
+    started with, `graspLoopResume` set to it.
+
+    The settings come from the Start the run came from -- the latest of `starts` (each
+    `{"at", "params"}`, recorded by the gateway) or `last_params` (stamped `last_params_at`) at most
+    `GRASP_LOOP_START_LEAD_S` before the run's first `run_start` row. Whatever was found, the
+    fields that row records (`resume_point` refuses a resume differing in them) are taken from the
+    row itself. With no Start found, the rest of the form is the last one's, and `source` says so:
+    recording in particular is then a guess the operator has to check."""
+
+    run = run.removesuffix(".jsonl").rsplit("/", 1)[-1]
+    if not GRASP_LOOP_RUN_RE.match(run):
+        raise RolloutError("Name a grasp loop run, e.g. grasp_20261023_093213.")
+    path = repo_root / GRASP_LOOP_DIR / f"{run}.jsonl"
+    if not path.is_file():
+        raise RolloutError(f"There is no grasp loop run {run} on this robot host.")
+    first = _grasp_loop_first_start(path)
+    if first is None or not isinstance(first.get("request"), dict):
+        raise RolloutError(f"{run} has no run_start row to take its settings from.")
+    started = float(first.get("at") or 0.0)
+
+    def started_it(at: Any) -> bool:
+        return isinstance(at, (int, float)) and started - GRASP_LOOP_START_LEAD_S <= at <= started
+
+    recorded = [
+        entry for entry in starts
+        if isinstance(entry, dict) and isinstance(entry.get("params"), dict) and started_it(entry.get("at"))
+    ]
+    if recorded:
+        base, source = max(recorded, key=lambda entry: entry["at"])["params"], "recorded"
+    elif last_params and started_it(last_params_at):
+        base, source = last_params, "last"
+    else:
+        base, source = last_params, "rebuilt"
+
+    params = json.loads(json.dumps(base))
+    options = params.get("runtimeOptions") if isinstance(params.get("runtimeOptions"), dict) else {}
+    if source == "rebuilt":
+        for key in _GRASP_LOOP_RECORD_OPTIONS:
+            options.pop(key, None)
+    request = first["request"]
+    options["graspLoopTrials"] = int(request.get("trials", 40))
+    options["graspLoopMaxPolicySteps"] = int(request.get("maxPolicySteps", 450))
+    options["graspLoopSeed"] = str(int(request.get("seed", 0)))
+    options["graspLoopAttended"] = bool(request.get("attended", False))
+    options["graspLoopArms"] = str(request.get("arms") or "A")
+    options["graspLoopFunnelCorrective"] = bool(request.get("funnelCorrective", False))
+    dz = request.get("funnelAlignDzMm")
+    if isinstance(dz, list) and len(dz) == 2:
+        low, high = dz
+        options["graspLoopFunnelTakeoverDzMm"] = _mm(low) if low == high else f"{_mm(low)},{_mm(high)}"
+    servo = request.get("insertServo")
+    if isinstance(servo, dict) and isinstance(servo.get("xyz"), list):
+        options["graspLoopInsertPose"] = ",".join(_mm(value) for value in servo["xyz"])
+        if source == "rebuilt":
+            options["terminalServoHandoffZ"] = servo.get("handoffZ")
+            options["terminalServoSearchRing"] = servo.get("searchRingM")
+    else:
+        options["graspLoopInsertPose"] = ""
+    options["graspLoopResume"] = run
+    params["runtimeOptions"] = options
+    params["mode"] = "grasp_loop"
+    checkpoint_id = _checkpoint_id_from_policy(first.get("policy"))
+    if checkpoint_id:
+        params["checkpointId"] = checkpoint_id
+    return {"params": params, "source": source, "trialsDone": _grasp_loop_trials_done(path)}
+
+
+def _grasp_loop_trials_done(path: Path) -> int:
+    """Trials done towards the planned count, as the page's panel counts them: a voided trial is
+    replaced, so it is not one."""
+
+    done = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == "trial" and row.get("verdict") != "voided":
+            done += 1
+    return done
+
+
 def _grasp_number(value: str | None) -> float | None:
     try:
         number = float(value) if value is not None else None
@@ -1267,6 +1419,10 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
         return {"type": "stop_requested"}
     if "grasp_loop_void=requested" in line:
         return {"type": "void_requested"}
+    if "grasp_loop_out_early=requested" in line:
+        return {"type": "out_early_requested"}
+    if "grasp_loop_insert_search=" in line:
+        return {"type": "insert_search", "searching": fields.get("grasp_loop_insert_search") == "start"}
     if "grasp_loop_operator=" in line:
         return {"type": "operator", "answer": fields.get("grasp_loop_operator", "")}
     if "grasp_loop_trial_start " in line:
@@ -1303,6 +1459,10 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         "stopRequested": False,
         # The trial in flight has been voided; cleared when the next one starts.
         "voidRequested": False,
+        # The insertion servo is trying landings (attended runs), and whether the operator has
+        # already called it out; both cleared when the search ends.
+        "insertSearching": False,
+        "outEarlyRequested": False,
         "done": False,
         "halted": "",
         "haltDetails": "",
@@ -1316,7 +1476,7 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
             arms=event.get("arms", "A"), insert=bool(event.get("insert", False)),
         )
     elif kind == "trial_start":
-        state.update(currentTrial=event["trial"], voidRequested=False)
+        state.update(currentTrial=event["trial"], voidRequested=False, insertSearching=False, outEarlyRequested=False)
     elif kind == "trial":
         row = {key: value for key, value in event.items() if key != "type"}
         state["trials"] = [t for t in state["trials"] if t.get("trial") != row["trial"]] + [row]
@@ -1329,10 +1489,17 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         state["stopRequested"] = True
     elif kind == "void_requested":
         state["voidRequested"] = True
+    elif kind == "insert_search":
+        state.update(insertSearching=bool(event["searching"]), outEarlyRequested=False)
+    elif kind == "out_early_requested":
+        state["outEarlyRequested"] = True
     elif kind == "halted":
         state.update(halted=event["reason"], haltDetails=event["details"])
     elif kind == "done":
-        state.update(done=True, halted=event["halted"] or state["halted"], summary=event["summary"], currentTrial=None, needsOperator="")
+        state.update(
+            done=True, halted=event["halted"] or state["halted"], summary=event["summary"], currentTrial=None,
+            needsOperator="", insertSearching=False, outEarlyRequested=False,
+        )
     graded = [t for t in state["trials"] if t.get("verdict") in ("held", "empty", "no_close", "collision")]
     state["graded"] = len(graded)
     state["held"] = sum(1 for t in graded if t.get("verdict") == "held")

@@ -47,6 +47,7 @@ import type {
   TrainingRun,
   TrainingStartRequest,
   RolloutLastParams,
+  GraspLoopResumeParams,
   PolicyServerListing,
   RolloutLandmarks,
   TableAlignment,
@@ -951,6 +952,16 @@ export class DataCollectionGuiApi {
     return this.trainingPost<{ training?: TrainingRun }>("/api/training/stop", {});
   }
 
+  /** Follow the trainer running on a remote machine: one the page lost (dropped ssh relay,
+   *  rebooted robot host) or never started (run/train_job.sh on the GPU host). The gateway asks
+   *  the machine which trainer is running in its repo; nothing has to be typed. */
+  async reattachTraining(hostId?: string) {
+    return this.trainingPost<{ training?: TrainingRun; message?: string }>(
+      "/api/training/reattach",
+      hostId ? { hostId } : {}
+    );
+  }
+
   /** Whether these datasets can be merged into one policy-ready view, without writing anything.
    *
    *  Its own call rather than a flag on the merge: the answer is a list of refusals the
@@ -1047,6 +1058,16 @@ export class DataCollectionGuiApi {
     return payload?.params ?? {};
   }
 
+  /** The Start form that finishes halted grasp loop run `run`, as that run was started. */
+  async fetchGraspLoopResume(
+    run: string
+  ): Promise<(GraspLoopResumeParams & { ok: true }) | { ok: false; error: string }> {
+    const payload = await this.trainingGet<
+      (GraspLoopResumeParams & { ok: true }) | { ok: false; error: string }
+    >("/api/rollout/grasp-loop-resume", { run });
+    return payload ?? { ok: false, error: "the gateway did not answer (an older build has no resume lookup)" };
+  }
+
   /** This machine and each policy server the gateway was deployed with, probed live. */
   async fetchPolicyServers(): Promise<PolicyServerListing | null> {
     return this.trainingGet<PolicyServerListing>("/api/policy-servers");
@@ -1067,7 +1088,7 @@ export class DataCollectionGuiApi {
    *  pipe, which no keyboard backend can read: the `t` key a terminal operator would press does
    *  not exist here, and without this the browser session has no way to hold the arm still. */
   async controlRollout(
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void"
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early"
   ) {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
   }

@@ -4113,6 +4113,228 @@ def test_a_remote_stop_that_fails_does_not_report_a_free_gpu(tmp_path, monkeypat
     assert "may still be running" in result["error"]
 
 
+def _adoptable_remote_run(tmp_path, monkeypatch, *, relay_output: str, check_rc: int = 0):
+    """A remote host whose trainer passes the identity check, and a relay that replays a log.
+
+    The relay is a local `printf` standing in for `ssh … tail --pid`: it writes the log and exits,
+    as the tail does when the trainer ends.
+    """
+    host = _remote_training_host()
+    state = _training_run_state(tmp_path)
+    monkeypatch.setattr(gateway.training_backend, "all_hosts", lambda root: [host])
+    monkeypatch.setattr(gateway.training_backend, "resolve_host", lambda root, host_id: host)
+    sent: dict[str, list[str]] = {}
+
+    def check(argv, **kwargs):
+        sent["check"] = argv
+        return subprocess.CompletedProcess(argv, check_rc, stdout="777\n", stderr="pid 777 is not this job\n")
+
+    real_popen = subprocess.Popen
+
+    def relay(argv, **kwargs):
+        sent["relay"] = argv
+        return real_popen(["printf", "%s", relay_output], **kwargs)
+
+    monkeypatch.setattr(gateway.subprocess, "run", check)
+    monkeypatch.setattr(gateway.subprocess, "Popen", relay)
+    payload = {
+        "repoDir": host.repoDir,
+        "jobName": "r4__pi05__20261026_134228",
+        "logPath": "/home/hanyu/Codes/lerobot_train/outputs/logs/train_r4.log",
+        "viewName": "r4",
+        "policy": "pi05",
+        "totalSteps": 45000,
+    }
+    return state, payload, sent
+
+
+def _await_training(state, done, timeout_s=10.0):
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with state.lock:
+            if done(state.training):
+                return state.training
+        time.sleep(0.05)
+    pytest.fail(f"training status never settled: {state.training}")
+
+
+def test_an_adopted_remote_run_is_followed_through_a_relayed_log(tmp_path, monkeypatch):
+    """A run started on Dante as a user unit: the page showed the 10-22 run instead (10-26)."""
+    log = (
+        "INFO 2026-10-26 14:40:00 lerobot_train.py:525 step:4K loss:0.081 grdn:0.5\n"
+        "Training:  10%|x | 4500/45000 [52:00<7:48:00, 1.44step/s]\n"
+        "INFO 2026-10-26 23:00:00 lerobot_train.py:600 End of training\n"
+    )
+    state, payload, sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output=log)
+
+    result = gateway._adopt_training_run(state, payload)
+
+    assert result["ok"] is True
+    assert state.training.hostId == _remote_training_host().id
+    assert state.training.outputDir == "outputs/train/r4__pi05__20261026_134228"
+    # The relay checks the trainer again and ends with it.
+    relay = sent["relay"][-1]
+    assert "outputs/.training_pids/r4__pi05__20261026_134228.pid" in relay
+    assert 'exec tail --pid="$pid" -n +1 -F /home/hanyu/Codes/lerobot_train/outputs/logs/train_r4.log' in relay
+    # The relay exited 0; "complete" comes from the trainer's own words in the log.
+    training = _await_training(state, lambda t: t.state != "running")
+    assert training.state == "complete"
+    assert training.step == 4500 and training.loss == pytest.approx(0.081)
+
+
+def test_an_adopted_run_whose_log_does_not_finish_is_an_error_though_the_relay_exited_0(tmp_path, monkeypatch):
+    log = "Training:  10%|x | 4500/45000 [52:00<7:48:00, 1.44step/s]\nTraceback (most recent call last):\n"
+    state, payload, _sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output=log)
+
+    gateway._adopt_training_run(state, payload)
+
+    training = _await_training(state, lambda t: t.state != "running")
+    assert training.state == "error"
+    # A dropped relay looks the same as a dead trainer; the page must not claim either.
+    assert "Re-attach running job" in training.message
+
+
+def test_adopting_a_pid_that_is_not_the_job_is_refused(tmp_path, monkeypatch):
+    state, payload, sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output="", check_rc=4)
+
+    with pytest.raises(ValueError, match="pid 777 is not this job"):
+        gateway._adopt_training_run(state, payload)
+
+    assert "relay" not in sent
+    assert state.training.state == "idle"
+
+
+def test_adopting_is_refused_while_a_run_is_going(tmp_path, monkeypatch):
+    state, payload, sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output="")
+    state.training = gateway.training_backend.TrainingRunStatus(state="running", pid=4242)
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+
+    with pytest.raises(ValueError, match="already in progress"):
+        gateway._adopt_training_run(state, payload)
+    assert sent == {}
+
+
+def _reattach_hosts(tmp_path, monkeypatch, answers):
+    """Two entries for one machine (wired, Wi-Fi), each answering the trainer scan with `answers[label]`.
+
+    An answer is a list of trainers, or None for a host that does not answer.
+    """
+    wired = _remote_training_host()
+    wifi = gateway.training_backend.TrainingHost(
+        id="hanyu@192.168.100.240:/home/hanyu/Codes/lerobot_train",
+        label="dev box Wi-Fi",
+        kind="remote",
+        sshTarget="hanyu@192.168.100.240",
+        repoDir=wired.repoDir,
+        pythonPath=wired.pythonPath,
+    )
+    by_target = {wired.sshTarget: answers.get("wired"), wifi.sshTarget: answers.get("wifi")}
+    state = _training_run_state(tmp_path)
+    monkeypatch.setattr(gateway.training_backend, "all_hosts", lambda root: [wifi, wired])
+    asked: list[str] = []
+
+    def scan(argv, **kwargs):
+        target = argv[-2]
+        asked.append(target)
+        answer = by_target[target]
+        if answer is None:
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="No route to host")
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(answer), stderr="")
+
+    adopted: list[dict] = []
+
+    def adopt(state_, payload):
+        adopted.append(payload)
+        return {"ok": True, "training": {}}
+
+    monkeypatch.setattr(gateway.subprocess, "run", scan)
+    monkeypatch.setattr(gateway, "_adopt_training_run", adopt)
+    return state, wired, wifi, asked, adopted
+
+
+_R4_TRAINER = {
+    "pid": 2446003,
+    "jobName": "r4__pi05__20261026_134228",
+    "steps": "45000",
+    "policy": "pi05",
+    "viewName": "r4",
+    "log": "/home/hanyu/Codes/lerobot_train/outputs/logs/train_r4.log",
+    "started": 1792993348.0,
+}
+
+
+def test_reattach_finds_the_running_trainer_and_adopts_it(tmp_path, monkeypatch):
+    """The page's button: nothing typed, the host says what is running (10-26)."""
+    state, wired, _wifi, asked, adopted = _reattach_hosts(
+        tmp_path, monkeypatch, {"wired": [_R4_TRAINER], "wifi": None}
+    )
+    state.training.hostId = wired.id  # the run the page lost was on the wired entry
+
+    gateway._reattach_training_run(state, {})
+
+    assert asked == [wired.sshTarget]  # the last run's machine first, so Wi-Fi is never tried
+    assert adopted == [
+        {
+            "hostId": wired.id,
+            "jobName": "r4__pi05__20261026_134228",
+            "logPath": "/home/hanyu/Codes/lerobot_train/outputs/logs/train_r4.log",
+            "viewName": "r4",
+            "policy": "pi05",
+            "totalSteps": 45000,
+            "startedAt": "2026-10-26T05:42:28+00:00",
+        }
+    ]
+
+
+def test_reattach_skips_a_machine_entry_that_does_not_answer(tmp_path, monkeypatch):
+    state, wired, wifi, asked, adopted = _reattach_hosts(
+        tmp_path, monkeypatch, {"wired": [_R4_TRAINER], "wifi": None}
+    )
+
+    gateway._reattach_training_run(state, {})
+
+    assert asked == [wifi.sshTarget, wired.sshTarget]
+    assert adopted[0]["hostId"] == wired.id
+
+
+def test_reattach_asks_only_the_machine_the_page_selected(tmp_path, monkeypatch):
+    state, _wired, wifi, asked, adopted = _reattach_hosts(tmp_path, monkeypatch, {"wired": [_R4_TRAINER]})
+
+    with pytest.raises(ValueError, match="Could not reach dev box Wi-Fi"):
+        gateway._reattach_training_run(state, {"hostId": wifi.id})
+
+    assert asked == [wifi.sshTarget] and adopted == []
+
+
+@pytest.mark.parametrize(
+    ("trainers", "match"),
+    [
+        ([], "No training is running"),
+        ([_R4_TRAINER, {**_R4_TRAINER, "pid": 9, "jobName": "other"}], "2 trainings are running"),
+        ([{**_R4_TRAINER, "log": "pipe:[123456]"}], "not a file"),
+    ],
+)
+def test_reattach_refuses_what_it_cannot_follow(tmp_path, monkeypatch, trainers, match):
+    state, wired, _wifi, _asked, adopted = _reattach_hosts(tmp_path, monkeypatch, {"wired": trainers})
+
+    with pytest.raises(ValueError, match=match):
+        gateway._reattach_training_run(state, {"hostId": wired.id})
+    assert adopted == []
+
+
+def test_reattach_while_following_a_run_changes_nothing(tmp_path, monkeypatch):
+    state, _wired, _wifi, asked, adopted = _reattach_hosts(tmp_path, monkeypatch, {"wired": [_R4_TRAINER]})
+    state.training = gateway.training_backend.TrainingRunStatus(state="running", pid=4242, jobName="r4")
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+
+    result = gateway._reattach_training_run(state, {})
+
+    assert result["message"] == "Already following a run."
+    assert asked == [] and adopted == []
+
+
 def test_a_local_stop_does_not_go_over_ssh(tmp_path, monkeypatch):
     state = _training_run_state(tmp_path, state="running", jobName="baseline__act", pid=4242, hostId="local")
     state.training_process = None

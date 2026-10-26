@@ -11,6 +11,7 @@ import { LOCAL_POLICY, defaultPolicyChoice, describeServer, startNote } from "./
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type {
   Checkpoint,
+  RolloutLastParams,
   PolicyServerListing,
   RolloutMode,
   RolloutLandmarks,
@@ -149,12 +150,16 @@ export function RolloutPage() {
   const [graspLoopMaxPolicySteps, setGraspLoopMaxPolicySteps] = useState("600");
   // 10-20: every page run was seed 0 until this box, so recordings repeated the same pegs.
   const [graspLoopSeed, setGraspLoopSeed] = useState("0");
+  // 10-23: a halted run used to cost the whole run -- a new one starts the seed's pegs again.
+  const [graspLoopResume, setGraspLoopResume] = useState("");
+  const graspLoopResumeRef = useRef<HTMLInputElement | null>(null);
   const [graspLoopAttended, setGraspLoopAttended] = useState(true);
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
   const [graspLoopRecord, setGraspLoopRecord] = useState(false);
   const [graspLoopRecordWholeTrial, setGraspLoopRecordWholeTrial] = useState(false);
+  const [graspLoopKeepMisses, setGraspLoopKeepMisses] = useState(false);
   // 09-30: the policy's aim is set well above the funnel's old 60 mm, so recordings draw the
   // takeover from the whole approach by default.
   const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
@@ -285,12 +290,17 @@ export function RolloutPage() {
       // As typed: the gateway refuses what is not a whole number >= 0, rather than this page
       // quietly running seed 0 again.
       graspLoopSeed: modeId === "grasp_loop" ? graspLoopSeed.trim() || undefined : undefined,
+      graspLoopResume: modeId === "grasp_loop" ? graspLoopResume.trim() || undefined : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
       graspLoopRecordWholeTrial:
         modeId === "grasp_loop" && graspLoopRecord ? graspLoopRecordWholeTrial : undefined,
+      graspLoopKeepMisses:
+        modeId === "grasp_loop" && graspLoopRecord && graspLoopRecordWholeTrial && graspLoopArms !== "B"
+          ? graspLoopKeepMisses
+          : undefined,
       graspLoopFunnelTakeoverDzMm:
         modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
       graspLoopFunnelCorrective:
@@ -332,11 +342,13 @@ export function RolloutPage() {
       graspLoopTrials,
       graspLoopMaxPolicySteps,
       graspLoopSeed,
+      graspLoopResume,
       graspLoopAttended,
       graspLoopArms,
       graspLoopInsertPose,
       graspLoopRecord,
       graspLoopRecordWholeTrial,
+      graspLoopKeepMisses,
       graspLoopFunnelTakeoverDzMm,
       graspLoopFunnelCorrective
     ]
@@ -435,83 +447,105 @@ export function RolloutPage() {
   //
   // The gates (`confirmMotion`, `overrideContract`) are absent from the payload by construction
   // and are not seeded here either: they are re-answered for every start.
+  /** Put a recorded Start back on the form. `graspLoop` also restores the grasp loop's own
+   *  settings, which only a resume does. The checkpoint is handed to the caller, which decides
+   *  how it lands. */
+  const applyRolloutParams = (params: RolloutLastParams, graspLoop = false) => {
+    if (params.mode) setModeId(params.mode);
+    if (params.maxSteps !== undefined) setMaxSteps(String(params.maxSteps));
+    if (params.moveToStart !== undefined) setMoveToStart(params.moveToStart);
+    if (params.policyServer !== undefined) setPolicyChoice(params.policyServer);
+    const options = params.runtimeOptions;
+    if (options) {
+      if (options.taskPrompt !== undefined) setTaskPrompt(options.taskPrompt);
+      if (options.rtcMode !== undefined) setRtcMode(options.rtcMode);
+      if (options.rtcExecutionHorizon !== undefined)
+        setRtcExecutionHorizon(String(options.rtcExecutionHorizon));
+      if (options.rtcMaxGuidanceWeight !== undefined)
+        setRtcMaxGuidanceWeight(String(options.rtcMaxGuidanceWeight));
+      if (options.rtcPrefixAttentionSchedule !== undefined)
+        setRtcPrefixAttentionSchedule(options.rtcPrefixAttentionSchedule);
+      if (options.rtcReplanQueueSize !== undefined)
+        setRtcReplanQueueSize(String(options.rtcReplanQueueSize));
+      // null is a real recorded value here -- "let the runtime estimate it" -- and must land
+      // as an empty field rather than the string "null".
+      setRtcInferenceDelaySteps(
+        options.rtcInferenceDelaySteps == null ? "" : String(options.rtcInferenceDelaySteps)
+      );
+      setCommandEmaAlpha(
+        options.commandEmaAlpha == null ? "" : String(options.commandEmaAlpha)
+      );
+      if (options.actionSamples !== undefined) setActionSamples(String(options.actionSamples));
+      if (options.actionAggregate !== undefined) setActionAggregate(options.actionAggregate);
+      // Carried over like the draw count: it changes how the policy runs, not who drives the
+      // arm. The notice names it when it comes back on.
+      setPhaseAlignBelowZ(options.phaseAlignBelowZ == null ? "" : String(options.phaseAlignBelowZ));
+      if (options.phaseAlignReplanQueueSize !== undefined)
+        setPhaseAlignReplanQueueSize(String(options.phaseAlignReplanQueueSize));
+      if (options.phaseAlignExecutionHorizon !== undefined)
+        setPhaseAlignExecutionHorizon(String(options.phaseAlignExecutionHorizon));
+      if (options.phaseAlignActionSamples !== undefined)
+        setPhaseAlignActionSamples(String(options.phaseAlignActionSamples));
+      // Deliberately not carried over. Every other knob here tunes how the policy runs; this
+      // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
+      // an E5 trial that nobody asked for.
+      setTerminalServoPose("");
+      setTerminalServoHandoffZ(
+        options.terminalServoHandoffZ == null ? "" : String(options.terminalServoHandoffZ)
+      );
+      // The ring comes back, unlike the pose: it is only read when a pose is set, so it
+      // cannot turn a plain rollout into anything, and it is the one knob a search session
+      // re-types on every run.
+      setTerminalServoSearchRing(
+        options.terminalServoSearchRing == null ? "" : String(options.terminalServoSearchRing)
+      );
+      // The switch comes back with the destination and the handback. It is not one of the
+      // motion gates -- it opens the SpaceMouse, it does not start the arm -- and a session
+      // spent collecting corrections re-ticks it before every single rollout otherwise. What
+      // it does get is a sentence in the notice, since it is a second action source and the
+      // subcard holding it can sit unscrolled-to.
+      if (options.daggerTakeover !== undefined) setDaggerTakeover(options.daggerTakeover);
+      if (options.graspLoopRecord !== undefined) setGraspLoopRecord(options.graspLoopRecord);
+      if (options.graspLoopRecordWholeTrial !== undefined)
+        setGraspLoopRecordWholeTrial(options.graspLoopRecordWholeTrial);
+      if (options.graspLoopKeepMisses !== undefined) setGraspLoopKeepMisses(options.graspLoopKeepMisses);
+      if (options.graspLoopFunnelCorrective !== undefined)
+        setGraspLoopFunnelCorrective(options.graspLoopFunnelCorrective);
+      if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
+      if (options.daggerDatasetRoot !== undefined)
+        setDaggerDatasetRoot(options.daggerDatasetRoot);
+      setDaggerReleaseAfterS(
+        options.daggerReleaseAfterS == null ? "" : String(options.daggerReleaseAfterS)
+      );
+    }
+    // A resume only: the grasp loop's own settings are what make its trial N the same trial, so
+    // they come back with it. A plain carry-over leaves them to the form, as it always has.
+    if (graspLoop && options) {
+      if (options.graspLoopTrials !== undefined) setGraspLoopTrials(String(options.graspLoopTrials));
+      if (options.graspLoopMaxPolicySteps !== undefined)
+        setGraspLoopMaxPolicySteps(String(options.graspLoopMaxPolicySteps));
+      if (options.graspLoopSeed !== undefined) setGraspLoopSeed(String(options.graspLoopSeed));
+      if (options.graspLoopAttended !== undefined) setGraspLoopAttended(options.graspLoopAttended);
+      if (options.graspLoopArms !== undefined) setGraspLoopArms(options.graspLoopArms);
+      if (options.graspLoopInsertPose !== undefined) setGraspLoopInsertPose(options.graspLoopInsertPose);
+      if (options.graspLoopFunnelTakeoverDzMm !== undefined)
+        setGraspLoopFunnelTakeoverDzMm(options.graspLoopFunnelTakeoverDzMm);
+      setGraspLoopResume(options.graspLoopResume ?? "");
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       const params = await api.fetchRolloutLastParams();
       if (cancelled || !params || Object.keys(params).length === 0) return;
-      if (params.mode) setModeId(params.mode);
       // Handed to the picker rather than applied here: this page has the id, and only the
       // listing has the checkpoint.
       if (params.checkpointId) {
         skipDefaultsForRef.current = params.checkpointId;
         setRestoreCheckpointId(params.checkpointId);
       }
-      if (params.maxSteps !== undefined) setMaxSteps(String(params.maxSteps));
-      if (params.moveToStart !== undefined) setMoveToStart(params.moveToStart);
-      if (params.policyServer !== undefined) setPolicyChoice(params.policyServer);
-      const options = params.runtimeOptions;
-      if (options) {
-        if (options.taskPrompt !== undefined) setTaskPrompt(options.taskPrompt);
-        if (options.rtcMode !== undefined) setRtcMode(options.rtcMode);
-        if (options.rtcExecutionHorizon !== undefined)
-          setRtcExecutionHorizon(String(options.rtcExecutionHorizon));
-        if (options.rtcMaxGuidanceWeight !== undefined)
-          setRtcMaxGuidanceWeight(String(options.rtcMaxGuidanceWeight));
-        if (options.rtcPrefixAttentionSchedule !== undefined)
-          setRtcPrefixAttentionSchedule(options.rtcPrefixAttentionSchedule);
-        if (options.rtcReplanQueueSize !== undefined)
-          setRtcReplanQueueSize(String(options.rtcReplanQueueSize));
-        // null is a real recorded value here -- "let the runtime estimate it" -- and must land
-        // as an empty field rather than the string "null".
-        setRtcInferenceDelaySteps(
-          options.rtcInferenceDelaySteps == null ? "" : String(options.rtcInferenceDelaySteps)
-        );
-        setCommandEmaAlpha(
-          options.commandEmaAlpha == null ? "" : String(options.commandEmaAlpha)
-        );
-        if (options.actionSamples !== undefined) setActionSamples(String(options.actionSamples));
-        if (options.actionAggregate !== undefined) setActionAggregate(options.actionAggregate);
-        // Carried over like the draw count: it changes how the policy runs, not who drives the
-        // arm. The notice names it when it comes back on.
-        setPhaseAlignBelowZ(options.phaseAlignBelowZ == null ? "" : String(options.phaseAlignBelowZ));
-        if (options.phaseAlignReplanQueueSize !== undefined)
-          setPhaseAlignReplanQueueSize(String(options.phaseAlignReplanQueueSize));
-        if (options.phaseAlignExecutionHorizon !== undefined)
-          setPhaseAlignExecutionHorizon(String(options.phaseAlignExecutionHorizon));
-        if (options.phaseAlignActionSamples !== undefined)
-          setPhaseAlignActionSamples(String(options.phaseAlignActionSamples));
-        // Deliberately not carried over. Every other knob here tunes how the policy runs; this
-        // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
-        // an E5 trial that nobody asked for.
-        setTerminalServoPose("");
-        setTerminalServoHandoffZ(
-          options.terminalServoHandoffZ == null ? "" : String(options.terminalServoHandoffZ)
-        );
-        // The ring comes back, unlike the pose: it is only read when a pose is set, so it
-        // cannot turn a plain rollout into anything, and it is the one knob a search session
-        // re-types on every run.
-        setTerminalServoSearchRing(
-          options.terminalServoSearchRing == null ? "" : String(options.terminalServoSearchRing)
-        );
-        // The switch comes back with the destination and the handback. It is not one of the
-        // motion gates -- it opens the SpaceMouse, it does not start the arm -- and a session
-        // spent collecting corrections re-ticks it before every single rollout otherwise. What
-        // it does get is a sentence in the notice, since it is a second action source and the
-        // subcard holding it can sit unscrolled-to.
-        if (options.daggerTakeover !== undefined) setDaggerTakeover(options.daggerTakeover);
-        if (options.graspLoopRecord !== undefined) setGraspLoopRecord(options.graspLoopRecord);
-        if (options.graspLoopRecordWholeTrial !== undefined)
-          setGraspLoopRecordWholeTrial(options.graspLoopRecordWholeTrial);
-        if (options.graspLoopFunnelCorrective !== undefined)
-          setGraspLoopFunnelCorrective(options.graspLoopFunnelCorrective);
-        if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
-        if (options.daggerDatasetRoot !== undefined)
-          setDaggerDatasetRoot(options.daggerDatasetRoot);
-        setDaggerReleaseAfterS(
-          options.daggerReleaseAfterS == null ? "" : String(options.daggerReleaseAfterS)
-        );
-      }
+      applyRolloutParams(params);
       setNotice(carriedOverNotice(params));
     })();
     return () => {
@@ -573,6 +607,43 @@ export function RolloutPage() {
     setPhaseAlignActionSamples("1");
     setShowRolloutAdvanced(false);
   }, [selected?.id]);
+
+  // A resume that had to change the checkpoint: the pick resets the RTC knobs on its way out of
+  // the old one, so the run's settings go on again once its own checkpoint has landed.
+  const [pendingResume, setPendingResume] = useState<RolloutLastParams | null>(null);
+  useEffect(() => {
+    if (pendingResume && selected?.id === pendingResume.checkpointId) {
+      applyRolloutParams(pendingResume, true);
+      setPendingResume(null);
+    }
+  }, [selected?.id, pendingResume]);
+
+  /** Put the form back the way halted grasp loop `name` was started, resume box filled, and say
+   *  what was done -- the click only fills the form, Start is still the operator's. */
+  const resumeGraspLoop = async (name: string): Promise<string> => {
+    const result = await api.fetchGraspLoopResume(name);
+    if (!result.ok) {
+      setModeId("grasp_loop");
+      setGraspLoopResume(name);
+      return `没取到这一轮的配置（${result.error}），只填了续跑框，其余要手动和那一轮对齐。`;
+    }
+    const params = result.params;
+    applyRolloutParams(params, true);
+    const checkpointId = params.checkpointId ?? "";
+    if (checkpointId && checkpointId !== selected?.id) {
+      skipDefaultsForRef.current = checkpointId;
+      setPendingResume(params);
+      setSelected(null);
+      // Through "" so the picker restores it even when it restored this same id before.
+      setRestoreCheckpointId("");
+      window.setTimeout(() => setRestoreCheckpointId(checkpointId), 0);
+    }
+    const checks =
+      result.source === "rebuilt"
+        ? "这一轮开始时的页面设置没有存档，种子、臂、条数、步数上限、插入孔位、checkpoint 按记录文件填好；录数据开关和 RTC 参数是上一次的，请核对。"
+        : "按那一轮开始时的设置填好了（checkpoint、种子、臂、条数、步数上限、插入孔位、录数据开关、RTC 参数）。";
+    return `已完成 ${result.trialsDone} 条。${checks}这一步还不会开始：销插回孔里，勾选动臂确认，在表单底部点开始。`;
+  };
 
   // Polled rather than fetched once: what a server holds changes under the page -- another
   // rollout takes it, its idle timeout drops the weights -- and the note under Start is only
@@ -639,7 +710,7 @@ export function RolloutPage() {
   };
 
   const onControl = async (
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void"
+    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early"
   ) => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
@@ -893,7 +964,21 @@ export function RolloutPage() {
           <p className="hint">{run.message}</p>
 
           {run.mode === "grasp_loop" && (
-            <GraspLoopPanel run={run} busy={busy} onControl={(command) => void onControl(command)} />
+            <GraspLoopPanel
+              run={run}
+              busy={busy}
+              onControl={(command) => void onControl(command)}
+              onResume={async (name) => {
+                const note = await resumeGraspLoop(name);
+                // The box sits far down the form, and filling it out of sight read as a dead
+                // button. Bring it into view once it has rendered (a mode switch renders it).
+                window.setTimeout(() => {
+                  graspLoopResumeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  graspLoopResumeRef.current?.focus({ preventScroll: true });
+                }, 0);
+                return note;
+              }}
+            />
           )}
 
           {/* First thing in the card while a grade is owed, ahead of the instruments below:
@@ -1404,6 +1489,21 @@ export function RolloutPage() {
               同一个种子，第 N 条的销位和 B 臂抽签每次都一样。配对 A/B 两边用同一个种子；录数据每一轮都换一个没用过的，
               否则只是把同样的位置再录一遍（10-19 的 150 条都是 0，只有 58 个不同位置）。评测想看没见过的位置，也要避开录数据用过的种子。
             </p>
+            <label className="field">
+              <span>续跑哪一轮（留空 = 新开一轮）</span>
+              <input
+                ref={graspLoopResumeRef}
+                value={graspLoopResume}
+                onChange={(event) => setGraspLoopResume(event.target.value)}
+                placeholder="grasp_20261023_093213"
+                disabled={isLive}
+              />
+            </label>
+            <p className="hint">
+              循环中途停了，填那一轮的名字（停下时面板上有「续跑这一轮」按钮会自动填好）再开始：接着写进同一个记录文件，
+              从最后一条完成的下一条开始，销位和一口气跑完时一样。条数填总数（比如还是 10）。种子、A/B 臂、步数上限、checkpoint 必须和那一轮相同，不同会被拒绝。
+              开始前先把销插回孔里。
+            </p>
             <label className="checkbox">
               <input
                 type="checkbox"
@@ -1489,11 +1589,20 @@ export function RolloutPage() {
               />
               <span>录整次 trial：从起始位姿的第一步录到合手，策略自己走的那段 is_intervention=0，漏斗接管那段 =1</span>
             </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopKeepMisses}
+                onChange={(event) => setGraspLoopKeepMisses(event.target.checked)}
+                disabled={isLive || !graspLoopRecord || !graspLoopRecordWholeTrial || graspLoopArms === "B"}
+              />
+              <span>A 臂没抓住的也存（empty / no_close）：只给离线重标（funnel_relabel --trial-rows）用，原样不能训练</span>
+            </label>
             <p className="hint">
               {graspLoopRecordWholeTrial
                 ? "写进 outputs/datasets/trial_<checkpoint>（和只录漏斗段的 funnel_ 数据分开存，两种不能混在一个数据集里）。"
                 : "写进 outputs/datasets/funnel_<checkpoint>。"}
-              格式与该 checkpoint 的训练数据相同；没抓住的不存。每条在插完、机械臂停稳后写入，约多几秒。
+              格式与该 checkpoint 的训练数据相同；没抓住的不存（除非勾了上面"A 臂没抓住的也存"；碰撞和 B 臂的失败始终不存）。每条在插完、机械臂停稳后写入，约多几秒。
             </p>
           </div>
         )}

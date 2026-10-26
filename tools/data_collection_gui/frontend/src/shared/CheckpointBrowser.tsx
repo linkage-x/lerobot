@@ -227,7 +227,12 @@ export function CheckpointBrowser({
   // page back to last session's checkpoint every time the operator picked a different one.
   const restoredRef = useRef("");
   useEffect(() => {
-    if (!restoreId || restoredRef.current === restoreId) return;
+    if (!restoreId) {
+      // Cleared: the next id restores even if it is the one restored last time (a resume).
+      restoredRef.current = "";
+      return;
+    }
+    if (restoredRef.current === restoreId) return;
     const picked = checkpointToRestore(listing?.checkpoints ?? [], restoreId, selectedId);
     // Neither a match nor a selection: the listing holding it has not arrived yet, so wait.
     if (!picked && !selectedId) return;

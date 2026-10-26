@@ -658,6 +658,18 @@ export function TrainingPage() {
     if (result.ok) setNotice("Stop signal sent.");
   };
 
+  const onReattach = async () => {
+    // The selected machine when it is a remote one; otherwise the gateway tries the last run's
+    // machine, then every remote one.
+    const target = selectedHost?.kind === "remote" ? selectedHost.id : undefined;
+    const result = await wrap("Re-attach", () => api.reattachTraining(target));
+    if (result.ok) {
+      const reattached = result as { training?: TrainingRun; message?: string };
+      setRun(reattached.training ?? null);
+      setNotice(reattached.message || `Following ${reattached.training?.jobName ?? "the running job"}.`);
+    }
+  };
+
   const onResumeCheckpointSelect = (checkpoint: Checkpoint | null) => {
     setResumeCheckpointId(checkpoint?.id ?? "");
     setResumeCheckpoint(checkpoint?.path ?? "");
@@ -1334,6 +1346,14 @@ export function TrainingPage() {
           </button>
           <button type="button" onClick={() => void onStop()} disabled={busy || !isRunning}>
             Stop
+          </button>
+          <button
+            type="button"
+            onClick={() => void onReattach()}
+            disabled={busy || isRunning}
+            title="Find the training running on the remote machine and follow it again (after a lost connection, or a run started on the GPU host itself)"
+          >
+            Re-attach running job
           </button>
         </div>
       </section>
