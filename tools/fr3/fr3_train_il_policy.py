@@ -346,6 +346,9 @@ def assert_single_source_world(src_roots: list[Path], source_infos: list[dict[st
     current_edge = label_provenance.current_edge_key(_REPO_ROOT, source_infos[0].get("world_frame"))
     for warning in label_provenance.label_warnings(key, current_edge):
         print(f"WARNING: {warning}", flush=True)
+    for root, info in zip(src_roots, source_infos, strict=True):
+        for warning in label_provenance.hand_warnings(info.get("label_provenance")):
+            print(f"WARNING: {root.name}: {warning}", flush=True)
 
 
 def prepare_dataset_view(

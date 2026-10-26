@@ -1174,7 +1174,7 @@ def _session_labels(episodes: list[EpisodeSource]) -> dict[str, dict[str, Any]]:
     for src in episodes:
         metas.setdefault(src.session_dir, {})[src.local_index] = _load_meta(src.ep_dir)
     return {
-        session_dir.name: lp.session_labels(session_dir, _tracking_run_dir(session_dir), episode_metas)
+        session_dir.name: lp.session_labels(session_dir, _tracking_run_dir(session_dir), episode_metas, _REPO_ROOT)
         for session_dir, episode_metas in metas.items()
     }
 
@@ -1383,7 +1383,7 @@ def export_task_to_v3(
             "(--allow-mixed-labels); the dataset records it and training will not combine it"
         )
     label_provenance = lp.provenance_block(output_world_frame, session_labels, mixed_fields)
-    for warning in lp.label_warnings(label_provenance["key"]):
+    for warning in lp.label_warnings(label_provenance["key"]) + lp.hand_warnings(label_provenance):
         _emit(f"WARNING: {warning}")
     if check_only:
         _emit(
@@ -1530,6 +1530,11 @@ def export_task_to_v3(
                 "exported_world_frame_id": wp.world_frame_id_of(output_world_frame),
                 "extrinsics": session_labels[src.session_dir.name].get("extrinsics", ""),
                 "camera_state": session_labels[src.session_dir.name].get("camera_state", lp.UNTRACKED),
+                "unvalidated_hands": sorted(
+                    cube
+                    for cube, check in (session_labels[src.session_dir.name].get("hands") or {}).items()
+                    if check.get("status") == lp.UNVALIDATED
+                ),
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",

@@ -970,6 +970,9 @@ def test_export_records_the_label_chain(tmp_path, monkeypatch):
     assert session["camera_state_px"] == 0.5 and session["tcp_link"] == "corenetic_gripper_ee"
     sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
     assert sources[0]["extrinsics"] == "calib_1014" and sources[0]["camera_state"] == "ok"
+    # the test bundle is not on disk: the left hand exports, marked unvalidated (roadmap A3)
+    assert sources[0]["unvalidated_hands"] == ["left"]
+    assert block["hands"]["left"]["status"] == "unvalidated" and "hands" not in key
 
 
 def test_export_refuses_stale_and_fresh_cameras_together_and_keeps_the_old_export(tmp_path, monkeypatch):

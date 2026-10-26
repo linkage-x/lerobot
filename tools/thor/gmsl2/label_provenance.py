@@ -63,6 +63,11 @@ SIDECAR_CHAIN_KEYS = ("sidecar_schema_version", "sidecar_pose_source", "sidecar_
 
 UNTRACKED = "untracked"
 
+#: Where the per-BOX delay table lives (thor_lerobot_v3.BOX_TIME_DELAYS_PATH), from the repo root.
+BOX_TIME_DELAYS = Path("tools/thor/gmsl2/box_time_delays.json")
+MEASURED = "measured"
+UNVALIDATED = "unvalidated"
+
 
 class MixedLabelsError(RuntimeError):
     """Raised when sessions or datasets about to share a training set come from different chains."""
@@ -104,13 +109,86 @@ def box_pairing(episode_meta: Mapping[str, Any], realignment: Mapping[str, Any] 
     return "raw_sof" if fraction == 0.0 else f"exposure_fraction_{fraction:g}"
 
 
+def _laser_measured(bundle: Mapping[str, Any], cube: str) -> bool:
+    entry = (bundle.get("cubes") or {}).get(cube) or {}
+    method = str(((bundle.get("provenance") or {}).get(cube) or {}).get("method") or "")
+    return "laser" in method or str((entry.get("pivot") or {}).get("source") or "") == "laser_tracker"
+
+
+def hand_validation(
+    cube: str,
+    bundle: Mapping[str, Any] | None,
+    delays: Mapping[str, Any] | None,
+    realigned: Mapping[str, Any],
+) -> dict[str, Any]:
+    """What stands behind one hand's absolute labels, and what does not yet.
+
+    The known unknowns of a hand's chain (roadmap A3), each read from the artefact that would
+    close it, so a hand stops being ``unvalidated`` the day the measurement lands and not the day
+    someone edits a list:
+
+    * marker -> TCP measured by the laser tracker (``provenance.<cube>.method`` / ``pivot.source``
+      of the bundle).  A camera pivot's fit residual is not its accuracy -- seven single-camera
+      solutions of the 08-25 left pivot disagree by 7 mm;
+    * marker -> TCP not flagged stale (an ``open_items`` entry starting ``STALE``);
+    * the hand's BOX has a measured ``d_box`` (the delay table, or an episode's own estimate in
+      the session's ``box_alignment``); without one its BOX columns are read at the raw SOF.
+
+    This does not refuse anything: the labels export as they are, and the reasons travel with
+    them so nobody reads an unvalidated hand's absolute error as execution or registration error.
+    """
+    reasons = []
+    entry = ((bundle or {}).get("cubes") or {}).get(cube)
+    device = str((entry or {}).get("device_id") or "")
+    if bundle is None:
+        reasons.append("marker->TCP bundle not readable here; nothing says what this hand's TCP was measured with")
+    elif not isinstance(entry, Mapping):
+        reasons.append(f"marker->TCP bundle has no entry for {cube!r}")
+    else:
+        if not _laser_measured(bundle, cube):
+            source = str(entry.get("translation_source") or "unrecorded")
+            reasons.append(f"marker->TCP never checked by the laser tracker (translation: {source})")
+        stale = [str(item) for item in entry.get("open_items") or [] if str(item).startswith("STALE")]
+        reasons.extend(f"marker->TCP {item}" for item in stale)
+    own = sorted(
+        str(index)
+        for index, episode in realigned.items()
+        if str((((episode or {}).get("boxes") or {}).get(device) or {}).get("source") or "") == "episode"
+    )
+    in_table = bool(device) and device in ((delays or {}).get("boxes") or {})
+    if not in_table and not own:
+        reasons.append(
+            f"d_box of {device or 'its BOX'} not measured: the BOX columns are read at the raw SOF"
+        )
+    return {
+        "status": UNVALIDATED if reasons else MEASURED,
+        "reasons": reasons,
+        "box_device_id": device,
+        "d_box": "table" if in_table else ("episode" if own else "none"),
+        "marker_to_tcp_laser": bool(bundle is not None and isinstance(entry, Mapping) and _laser_measured(bundle, cube)),
+    }
+
+
+def tracked_hands(session_dir: Path) -> list[str]:
+    """The hands a session has TCP labels for (``state_action.<cube>.csv`` in its sidecar)."""
+    sidecar = session_dir / "derived" / SIDECAR
+    return sorted(p.name[len("state_action.") : -len(".csv")] for p in sidecar.glob("state_action.*.csv"))
+
+
 def session_labels(
-    session_dir: Path, tracking_run_dir: Path, episode_metas: Mapping[int, Mapping[str, Any]]
+    session_dir: Path,
+    tracking_run_dir: Path,
+    episode_metas: Mapping[int, Mapping[str, Any]],
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """The label chain of one recorded session, from its tracking run and its own meta.
 
     ``episode_metas`` are the session's episodes that go into the export, by local index.
+    ``repo_root`` resolves the marker->TCP bundle path the tracking run recorded and the BOX
+    delay table; each hand's validation (:func:`hand_validation`) rides along in ``hands`` and
+    is not part of the key -- it says how far to trust the labels, not which labels they are.
     """
+    repo_root = _REPO_ROOT if repo_root is None else Path(repo_root)
     info = _read_json(session_dir / "meta" / "info.json")
     realigned = ((info.get("box_alignment") or {}).get("episodes")) or {}
     pairing = sorted(
@@ -127,6 +205,14 @@ def session_labels(
     ee = summary.get("ee_from_cube") or {}
     state = derived.get("camera_state") if isinstance(derived.get("camera_state"), Mapping) else None
     state = state or (summary.get("camera_state") if isinstance(summary.get("camera_state"), Mapping) else None)
+    bundle_path = Path(str(ee.get("marker_to_tcp_calibration_path") or ""))
+    bundle_path = bundle_path if bundle_path.is_absolute() else repo_root / bundle_path
+    bundle = _read_json(bundle_path) if bundle_path.is_file() else {}
+    delays = _read_json(repo_root / BOX_TIME_DELAYS)
+    exported = {str(index): realigned.get(str(index)) for index in episode_metas if str(index) in realigned}
+    hands = {
+        cube: hand_validation(cube, bundle or None, delays or None, exported) for cube in tracked_hands(session_dir)
+    }
     return {
         "tracked": True,
         "intrinsics": str(inputs.get("intrinsics_run_name") or ""),
@@ -140,6 +226,7 @@ def session_labels(
         "tcp_link": str(ee.get("target_child_link") or ee.get("target_parent_link") or ""),
         "sidecar_chain": _canonical({k: derived.get(k) for k in SIDECAR_CHAIN_KEYS}),
         "box_pairing": pairing,
+        "hands": hands,
     }
 
 
@@ -242,6 +329,31 @@ def fingerprint(key: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(key).encode("utf-8")).hexdigest()[:16]
 
 
+def dataset_hands(sessions: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each hand's validation over an export: ``unvalidated`` if it is in any session."""
+    hands: dict[str, dict[str, Any]] = {}
+    for name, labels in sorted(sessions.items()):
+        for cube, check in (labels.get("hands") or {}).items():
+            hand = hands.setdefault(cube, {"status": MEASURED, "reasons": [], "sessions": {}})
+            hand["sessions"][name] = check.get("status")
+            if check.get("status") != MEASURED:
+                hand["status"] = UNVALIDATED
+                hand["reasons"].extend(r for r in check.get("reasons") or [] if r not in hand["reasons"])
+    return hands
+
+
+def hand_warnings(block: Mapping[str, Any] | None) -> list[str]:
+    """One line per unvalidated hand of an export's ``label_provenance``."""
+    out = []
+    for cube, hand in sorted(((block or {}).get("hands") or {}).items()):
+        if hand.get("status") == UNVALIDATED:
+            out.append(
+                f"{cube} hand labels are unvalidated ({'; '.join(hand.get('reasons') or [])}): read its "
+                "absolute error as label-chain error first, not as execution or registration error"
+            )
+    return out
+
+
 def provenance_block(
     world_frame: Mapping[str, Any] | None,
     sessions: Mapping[str, Mapping[str, Any]],
@@ -252,6 +364,7 @@ def provenance_block(
     return {
         "fingerprint": fingerprint(key),
         "key": key,
+        "hands": dataset_hands(sessions),
         "mixed_fields": list(mixed_fields),
         "sessions": {name: dict(labels) for name, labels in sessions.items()},
         "note": (
@@ -369,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
         for field in KEY_FIELDS:
             print(f"  {field}: {_canonical(key.get(field))}")
         for warning in label_warnings(key, current_edge_key(args.repo_root, info.get("world_frame"))):
+            print(f"  WARNING: {warning}")
+        for warning in hand_warnings(block):
             print(f"  WARNING: {warning}")
     try:
         assert_compatible_datasets(entries)
