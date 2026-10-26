@@ -64,7 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
     parser.add_argument("--settle-s", type=float, default=1.0)
-    parser.add_argument("--robot-ip", default="192.168.11.102")
+    parser.add_argument("--robot-ip", default=None, help="hardware mode: the FR3 to drive (no default arm)")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT)
     parser.add_argument(
         "--validate-only",
@@ -143,6 +143,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         if not args.close_viewer_on_finish:
             runtime_args.append("--keep-viewer-open")
     if args.mode == "hardware":
+        if not args.robot_ip:
+            raise SystemExit("hardware mode needs --robot-ip: there is no default arm (tools/fr3/fr3_arms.json)")
         runtime_args.append(f"--robot-ip={args.robot_ip}")
         runtime_args.append(f"--gripper-port={args.gripper_port}")
         runtime_args.append(f"--min-z={args.min_z}")

@@ -312,7 +312,7 @@ def test_execute_follows_the_plan_and_writes_a_fittable_run(kin, centre, tmp_pat
     plan = _plan_file(tmp_path, kin, centre)
     out = tmp_path / "20261013_200000_pivot.json"
     try:
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -362,7 +362,7 @@ def test_execute_acts_on_the_ball_force_not_f_ext(kin, centre, tmp_path, monkeyp
     plan = _plan_file(tmp_path, kin, centre)
     out = tmp_path / "20261020_170000_pivot.json"
     try:
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -390,7 +390,7 @@ def test_execute_lets_the_cup_turn_about_the_ball_not_the_plans_centre(kin, cent
     plan = _plan_file(tmp_path, kin, centre, speed_deg_s=5.0)
     out = tmp_path / "20261019_190000_pivot.json"
     try:
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -431,10 +431,10 @@ def test_execute_does_not_wind_up_a_shift_the_arm_does_not_follow(kin, centre, t
     out = tmp_path / "20261020_150000_pivot.json"
     try:
         monkeypatch.setattr(pa, "PRESS_LEAD_MM", 1e3)  # as it was: wound up to the cap, stopped
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 4
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 4
         assert "横向推不开" in capsys.readouterr().out
         monkeypatch.setattr(pa, "PRESS_LEAD_MM", 0.5)
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 0
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -456,7 +456,7 @@ def test_execute_stops_when_the_force_press_cannot_hold(kin, centre, tmp_path, m
     handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
     plan = _plan_file(tmp_path, kin, centre)
     try:
-        assert pa.main(["execute", str(plan), "--out", str(tmp_path / "20261019_180000_pivot.json")]) == 4
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(tmp_path / "20261019_180000_pivot.json")]) == 4
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -512,7 +512,7 @@ def test_execute_refuses_a_plan_pressing_too_far_into_the_ball(kin, centre, tmp_
     module, calls = _fake_panda_module(pa.Kinematics(frame="corenetic_gripper_ee"), centre["q"])
     monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
     plan = _plan_file(tmp_path, kin, centre, press_mm=3.0)  # the soft run's press: kN/m against the ball now
-    assert pa.main(["execute", str(plan)]) == 2
+    assert pa.main(["execute", str(plan), "--arm", "right"]) == 2
     assert calls["started"] == 0
     assert "3.0 mm off the ball" in capsys.readouterr().out
 
@@ -528,7 +528,7 @@ def test_execute_stops_on_force_and_keeps_nothing_to_fit(kin, centre, tmp_path, 
     plan = _plan_file(tmp_path, kin, centre)
     out = tmp_path / "20261013_200000_pivot.json"
     try:
-        assert pa.main(["execute", str(plan), "--out", str(out)]) == 4
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 4
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)
@@ -620,7 +620,7 @@ def test_guide_holds_the_socket_pressed_with_rotation_free_and_writes_a_fittable
     centre_file, calls = _guide_setup(tmp_path, monkeypatch, kin, centre)
     out = tmp_path / "20261013_210100_pivot.json"
     rc = _run_guide(
-        ["guide", str(centre_file), "--duration-s", "30", "--bias-mm", "3", "0", "0", "--out", str(out)]
+        ["guide", str(centre_file), "--arm", "right", "--duration-s", "30", "--bias-mm", "3", "0", "0", "--out", str(out)]
     )
     assert rc == 0
     assert np.allclose(np.diag(calls["impedance"]), [600, 600, 600, 0, 0, 0])  # rotation is the operator's
@@ -648,15 +648,15 @@ def test_guide_refuses_a_socket_that_left_the_centre_and_stops_on_force(
     moved["centre_m"] = (np.asarray(moved["centre_m"]) + [0.005, 0, 0]).tolist()
     far = tmp_path / "20261013_210200_centre.json"
     far.write_text(json.dumps(moved))
-    assert _run_guide(["guide", str(far)]) == 2
+    assert _run_guide(["guide", str(far), "--arm", "right"]) == 2
     assert "离取到的球心 5.0 mm" in capsys.readouterr().out
     assert calls["started"] == 0
 
     out = tmp_path / "20261013_210300_pivot.json"
-    assert _run_guide(["guide", str(centre_file), "--duration-s", "30", "--out", str(out)]) == 4
+    assert _run_guide(["guide", str(centre_file), "--arm", "right", "--duration-s", "30", "--out", str(out)]) == 4
     assert calls["stopped"] == 1 and not out.exists() and out.with_suffix(".aborted.json").exists()
     assert "外力 25.0 N" in capsys.readouterr().out
-    assert _run_guide(["guide", str(centre_file), "--duration-s", "5"]) == 2
+    assert _run_guide(["guide", str(centre_file), "--arm", "right", "--duration-s", "5"]) == 2
 
 
 def test_guide_progress_reads_tilt_and_spin():
@@ -679,7 +679,7 @@ def test_guide_anchored_on_the_fitted_ball_centre_stops_dragging_the_socket_fram
     for anchored in (False, True):
         centre_file, calls = _guide_setup(tmp_path, monkeypatch, kin, centre)
         out = tmp_path / f"20261013_2104{int(anchored)}0_pivot.json"
-        argv = ["guide", str(centre_file), "--duration-s", "30", "--out", str(out)]
+        argv = ["guide", str(centre_file), "--arm", "right", "--duration-s", "30", "--out", str(out)]
         if anchored:
             argv += ["--anchor-mm", *[str(x) for x in true_s], "--anchor-from", "x.fit.json"]
         assert _run_guide(argv) == 0

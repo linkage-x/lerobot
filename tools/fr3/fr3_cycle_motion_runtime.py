@@ -29,17 +29,21 @@ from __future__ import annotations
 import argparse
 import contextlib
 import statistics
+import sys
 import threading
 import time
+from pathlib import Path
 
-DEFAULT_ROBOT_IP = "192.168.11.102"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.fr3 import fr3_arms  # noqa: E402
+
 # Wrist and elbow: visible motion, small swept volume, no risk of hitting the base.
 DEFAULT_JOINTS = "3,5,6"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cycle the FR3 by a small joint offset and report FCI link health.")
-    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="FR3 controller IP address.")
+    fr3_arms.add_arguments(parser)
     parser.add_argument("--cycles", type=int, default=5, help="Number of out-and-back cycles.")
     parser.add_argument("--amplitude", type=float, default=0.15, help="Joint offset in radians (default 0.15 rad ~ 8.6 deg).")
     parser.add_argument("--joints", default=DEFAULT_JOINTS, help="Comma-separated joint indices (0-6) to move.")
@@ -86,6 +90,10 @@ def active_errors(errors) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        fr3_arms.resolve_args(args)
+    except fr3_arms.ArmConfigError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     joints = [int(tok) for tok in args.joints.split(",") if tok.strip()]
     if any(j < 0 or j > 6 for j in joints):
         raise SystemExit(f"joint indices must be in 0..6, got {joints}")

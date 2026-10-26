@@ -283,7 +283,7 @@ def test_plan_cli_writes_a_dwell_plan_execute_accepts(kin, centre, tmp_path, mon
     handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
     run = tmp_path / "20261015_120200_pivot.json"
     try:
-        assert pa.main(["execute", str(out), "--out", str(run)]) == 0
+        assert pa.main(["execute", str(out), "--arm", "right", "--out", str(run)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)

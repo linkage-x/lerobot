@@ -52,8 +52,11 @@ import numpy as np
 from lerobot.robots.franka_research3.tcp_pivot import fit_pivot, fit_pivot_joint
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from tools.fr3 import fr3_arms  # noqa: E402
+
 DEFAULT_URDF = REPO / "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf"
-DEFAULT_ROBOT_IP = "192.168.11.102"
 JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
 # 10-12 end-to-end replay, constant offset in the TCP frame (replay minus recording), mm
 E2E_PREDICTION_MM = (-0.6, -2.9, -10.4)
@@ -154,6 +157,7 @@ def collect(args) -> int:
         json.dumps(
             {
                 "robot_ip": args.robot_ip,
+                "arm": args.arm,
                 "note": args.note,
                 "created": dt.datetime.now().isoformat(),
                 **samples,
@@ -343,7 +347,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("collect", help="real robot, teaching mode (moved by hand)")
-    p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    fr3_arms.add_arguments(p)
     p.add_argument("--duration-s", type=float, default=45.0)
     p.add_argument("--rate-hz", type=float, default=100.0)
     p.add_argument("--damping", type=float, default=0.0, help="teaching-mode joint damping")
@@ -373,6 +377,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if hasattr(args, "robot_ip"):  # drives an arm: which one is never a default (roadmap B2)
+        try:
+            fr3_arms.resolve_args(args)
+        except fr3_arms.ArmConfigError as exc:
+            print(f"ERROR: {exc}")
+            return 2
     return args.func(args)
 
 

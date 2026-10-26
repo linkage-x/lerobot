@@ -78,17 +78,19 @@ def test_build_host_command_uses_workspace_venv_and_runtime_script(tmp_path: Pat
 
 
 def test_main_dry_run_prints_command(capsys):
-    exit_code = fr3_move_to_start.main(["--dry-run"])
+    exit_code = fr3_move_to_start.main(["--arm", "right", "--dry-run"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "docker compose" in captured.out
     assert "tools/fr3/fr3_move_to_start_runtime.py" in captured.out
     assert "lerobot-user" in captured.out
+    assert "--robot-ip=192.168.11.102" in captured.out
+    assert "--start-joints=0.0,-0.7853981633974483," in captured.out  # the right arm's start, fr3_arms.json
 
 
 def test_main_dry_run_host_prints_host_command(capsys):
-    exit_code = fr3_move_to_start.main(["--runtime", "host", "--dry-run"])
+    exit_code = fr3_move_to_start.main(["--arm", "right", "--runtime", "host", "--dry-run"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -106,7 +108,7 @@ def test_main_returns_subprocess_exit_code(monkeypatch):
 
     monkeypatch.setattr(fr3_move_to_start.subprocess, "run", fake_run)
 
-    exit_code = fr3_move_to_start.main([])
+    exit_code = fr3_move_to_start.main(["--arm", "right"])
 
     assert exit_code == 9
     assert calls
@@ -121,7 +123,7 @@ def test_main_host_passes_workspace_env_and_cwd(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(fr3_move_to_start.subprocess, "run", fake_run)
 
-    exit_code = fr3_move_to_start.main(["--runtime", "host", "--workspace", str(tmp_path)])
+    exit_code = fr3_move_to_start.main(["--robot-ip", "192.168.11.102", "--runtime", "host", "--workspace", str(tmp_path)])
 
     assert exit_code == 7
     assert calls
@@ -129,3 +131,13 @@ def test_main_host_passes_workspace_env_and_cwd(monkeypatch, tmp_path: Path):
     assert check is False
     assert cwd == tmp_path.resolve()
     assert isinstance(env, dict)
+
+
+def test_main_refuses_to_pick_an_arm(capsys, monkeypatch):
+    """Roadmap B2: with two FR3s a default arm is the wrong arm moving; neither --arm nor --robot-ip is refused."""
+    monkeypatch.setattr(fr3_move_to_start.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    assert fr3_move_to_start.main(["--dry-run"]) == 2
+    assert "there is no default arm" in capsys.readouterr().err
+    assert fr3_move_to_start.main(["--arm", "left", "--dry-run"]) == 2
+    assert "left arm is not in service" in capsys.readouterr().err
+    assert fr3_move_to_start.main(["--robot-ip", "10.0.0.5", "--dry-run"]) == 2

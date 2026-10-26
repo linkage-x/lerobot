@@ -76,10 +76,13 @@ from lerobot.robots.franka_research3.payload_identification import (
 )
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from tools.fr3 import fr3_arms  # noqa: E402
+
 ASSETS = REPO / "src/lerobot/robots/franka_research3/assets/franka_fr3"
 DEFAULT_XML = ASSETS / "fr3_corenetic_gripper.xml"
 DEFAULT_URDF = ASSETS / "fr3_corenetic_gripper.urdf"
-DEFAULT_ROBOT_IP = "192.168.11.102"
 SMR_BODY = "link_corenetic_smr"
 # Parts weighed on a scale (URDF links); what is left of a fit is the gripper + Part 1 + anything unmodelled.
 WEIGHED_LINKS = ("link_corenetic_smr_cam", SMR_BODY)
@@ -352,6 +355,7 @@ def collect(args) -> int:
     run = {
         "source": "fr3",
         "robot_ip": args.robot_ip,
+        "arm": args.arm,
         "smr_present": args.smr_present,
         "note": args.note,
         "desk_load_at_start": desk_load,
@@ -732,7 +736,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.set_defaults(func=simulate)
 
     p = sub.add_parser("collect", help="real robot run (moves the arm)")
-    p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    fr3_arms.add_arguments(p)
     p.add_argument("--smr-out", dest="smr_present", action="store_false", help="SMR taken out of the nest")
     p.add_argument("--speed-factor", type=float, default=0.1)
     p.add_argument("--settle-s", type=float, default=1.5)
@@ -798,6 +802,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if hasattr(args, "robot_ip"):  # drives an arm: which one is never a default (roadmap B2)
+        try:
+            fr3_arms.resolve_args(args)
+        except fr3_arms.ArmConfigError as exc:
+            print(f"ERROR: {exc}")
+            return 2
     return args.func(args)
 
 

@@ -67,8 +67,8 @@ from typing import Any
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.fr3 import fr3_arms  # noqa: E402
 from tools.fr3.fr3_tcp_pivot import (  # noqa: E402
-    DEFAULT_ROBOT_IP,
     DEFAULT_URDF,
     FR3_JOINT_LIMITS,
     JOINTS,
@@ -681,6 +681,7 @@ def capture(args) -> int:
         "schema": CENTRE_SCHEMA,
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "robot_ip": args.robot_ip,
+        "arm": args.arm,
         "note": args.note,
         "frame": SOCKET_FRAME,
         "q": q.tolist(),
@@ -725,6 +726,7 @@ def plan_cmd(args) -> int:
         "kind": "star",
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "centre": args.centre.name,
+        "arm": centre.get("arm"),
         "centre_m": centre["centre_m"],
         "params": asdict(params),
         **summary,
@@ -806,6 +808,7 @@ def plan_dwells_cmd(args, centre: dict[str, Any]) -> int:
         "kind": "probe" if args.probe else "dwells",
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "centre": args.centre.name,
+        "arm": centre.get("arm"),
         "centre_m": centre["centre_m"],
         "ball_m": np.round(survey.centre_m, 6).tolist(),
         "anchor_from": args.anchor_from,
@@ -1350,7 +1353,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("capture", help="read only: the seated socket's FK is the centre")
-    p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    fr3_arms.add_arguments(p)
     p.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     p.add_argument("--note", default="")
     p.add_argument("--out", type=Path)
@@ -1398,7 +1401,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.set_defaults(func=plan_cmd)
     p = sub.add_parser("guide", help="real robot: socket held on the ball, the operator turns it by hand")
     p.add_argument("centre", type=Path)
-    p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    fr3_arms.add_arguments(p)
     p.add_argument("--duration-s", type=float, default=GUIDE_DEFAULT_DURATION_S)
     p.add_argument("--press-mm", type=float, default=GUIDE_PRESS_MM)
     p.add_argument(
@@ -1419,7 +1422,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.set_defaults(func=guide)
     p = sub.add_parser("execute", help="real robot: follow a passed plan's joint angles")
     p.add_argument("plan", type=Path)
-    p.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    fr3_arms.add_arguments(p)
     p.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     p.add_argument("--note", default="")
     p.add_argument("--out", type=Path)
@@ -1427,8 +1430,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _planned_arm(args) -> str | None:
+    """The arm a centre or plan was captured on (None before 10-26, when it was not recorded)."""
+    source = getattr(args, "plan", None) or getattr(args, "centre", None)
+    try:
+        return json.loads(Path(source).read_text(encoding="utf-8")).get("arm") if source else None
+    except (OSError, ValueError):
+        return None  # the command itself reports an unreadable file
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if hasattr(args, "robot_ip"):  # drives an arm: which one is never a default (roadmap B2)
+        try:
+            fr3_arms.resolve_args(args)
+        except fr3_arms.ArmConfigError as exc:
+            print(f"ERROR: {exc}")
+            return 2
+        planned = _planned_arm(args)
+        if planned not in (None, args.arm):
+            print(f"ERROR: that centre/plan was captured on the {planned} arm; this is the {args.arm} arm")
+            return 2
     return args.func(args)
 
 

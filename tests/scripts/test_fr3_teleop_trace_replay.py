@@ -76,6 +76,8 @@ def test_build_docker_command_passes_wz_trace_profile(tmp_path: Path):
             "wz",
             "--step-wz",
             "0.00025",
+            "--robot-ip",
+            "192.168.11.102",
         ]
     )
 
@@ -106,7 +108,16 @@ def test_main_returns_subprocess_exit_code(monkeypatch):
 
     monkeypatch.setattr(fr3_teleop_trace_replay.subprocess, "run", fake_run)
 
-    exit_code = fr3_teleop_trace_replay.main(["--mode", "hardware"])
+    exit_code = fr3_teleop_trace_replay.main(["--mode", "hardware", "--robot-ip", "192.168.11.102"])
 
     assert exit_code == 7
     assert calls
+
+
+def test_hardware_mode_has_no_default_arm(tmp_path: Path):
+    """Roadmap B2: hardware mode drives the FR3 it is told to, never 192.168.11.102 by default."""
+    import pytest
+
+    args = fr3_teleop_trace_replay.parse_args(["--mode", "hardware", "--workspace", str(tmp_path)])
+    with pytest.raises(SystemExit, match="no default arm"):
+        fr3_teleop_trace_replay.build_docker_command(args)

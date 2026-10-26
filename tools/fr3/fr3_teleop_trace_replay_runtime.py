@@ -25,7 +25,6 @@ from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Conf
 from lerobot.utils.robot_utils import precise_sleep
 
 
-DEFAULT_ROBOT_IP = "192.168.11.102"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT = (0.0, 0.0, 0.0)
 DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = (0.01, 0.01, 0.01)
@@ -67,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
     parser.add_argument("--settle-s", type=float, default=1.0)
-    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    parser.add_argument("--robot-ip", default=None, help="hardware mode: the FR3 to drive (no default arm)")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT)
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--episode", type=int, default=None)
@@ -1171,6 +1170,8 @@ def _resolve_output_path(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.mode == "hardware" and not args.robot_ip:
+        raise SystemExit("hardware mode needs --robot-ip: there is no default arm (tools/fr3/fr3_arms.json)")
     if args.fps is None:
         args.fps = _load_dataset_fps(args.dataset.resolve()) if args.dataset is not None else 60
     if args.fps is None:
