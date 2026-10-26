@@ -4196,6 +4196,50 @@ def test_an_adopted_run_whose_log_does_not_finish_is_an_error_though_the_relay_e
     assert "Re-attach running job" in training.message
 
 
+def test_an_adopted_run_gets_a_history_entry_from_its_remote_train_config(tmp_path, monkeypatch):
+    """The form took its host from the run's history entry, which an adopted run lacked: the page
+    showed the NUC as R4's machine while it trained on Dante (10-26)."""
+    state, payload, sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output="")
+    config = {
+        "job_name": payload["jobName"],
+        "steps": 45000,
+        "batch_size": 32,
+        "dataset": {"root": "/home/hanyu/Codes/lerobot_train/outputs/exports/training_views/r4"},
+        "policy": {"type": "pi05", "pretrained_path": "/models/pi05_base"},
+        "peft": {"method_type": "LORA", "r": 32, "alpha": 32},
+    }
+
+    def ssh(argv, **kwargs):
+        if "train_config.json" in argv[-1]:
+            sent["config"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(config), stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="777\n", stderr="")
+
+    monkeypatch.setattr(gateway.subprocess, "run", ssh)
+
+    gateway._adopt_training_run(state, payload)
+    _await_training(state, lambda t: t.state != "running")
+    gateway._record_adopted_training_history(state, _remote_training_host(), payload["jobName"], "")
+
+    assert "outputs/train/r4__pi05__20261026_134228/checkpoints" in sent["config"][-1]
+    stored = gateway._load_training_history(state)
+    # Recorded once, though adopted (re-attached) twice.
+    assert [entry["jobName"] for entry in stored] == [payload["jobName"]]
+    assert stored[0]["hostId"] == _remote_training_host().id
+    [entry] = gateway._training_history_entries(state)
+    assert entry["viewName"] == "r4"
+    assert entry["startedAt"] == "2026-10-26T13:42:28+00:00"
+    assert entry["params"]["batchSize"] == 32 and entry["params"]["loraAlpha"] == 32
+
+
+def test_an_adopted_run_before_its_first_checkpoint_records_no_history(tmp_path, monkeypatch):
+    state, payload, _sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output="")
+
+    gateway._adopt_training_run(state, payload)  # the fake ssh answers "777", not a config
+
+    assert gateway._load_training_history(state) == []
+
+
 def test_adopting_a_pid_that_is_not_the_job_is_refused(tmp_path, monkeypatch):
     state, payload, sent = _adoptable_remote_run(tmp_path, monkeypatch, relay_output="", check_rc=4)
 

@@ -621,26 +621,33 @@ export function TrainingPage() {
   // The running job's own settings, where it ran and on what, rather than this page's defaults
   // (see runJobToAdopt). Its parameters come from the history record the gateway writes at start;
   // a run started after this page loaded is not in the list fetched on mount, so that is fetched
-  // again, once for that job.
+  // again, once for that job. The host and view come from the run itself, entry or not: a run
+  // started outside the page and adopted before its first checkpoint has no entry, and waiting
+  // for one left the form on this machine beside a run on Dante.
   const adoptedRunJob = useRef("");
   const historyFetchedForJob = useRef("");
   useEffect(() => {
     const job = runJobToAdopt(run, adoptedRunJob.current);
     if (!job || !run) return;
     const entry = history.find((item) => item.jobName === job);
-    if (!entry) {
-      if (historyFetchedForJob.current !== job) {
-        historyFetchedForJob.current = job;
-        void api.fetchTrainingHistory().then(setHistory);
-      }
+    if (!entry && historyFetchedForJob.current !== job) {
+      historyFetchedForJob.current = job;
+      void api
+        .fetchTrainingHistory()
+        .then(setHistory)
+        .catch(() => setHistory((current) => [...current]));
       return;
     }
     adoptedRunJob.current = job;
     setHostId(run.hostId);
     setViewName(run.viewName);
     setJobNameEdited(false);
-    copyRunParams(entry);
-    setNotice(`The form shows the settings of the running job ${job}.`);
+    if (entry) {
+      copyRunParams(entry);
+      setNotice(`The form shows the settings of the running job ${job}.`);
+    } else {
+      setNotice(`The form shows where ${job} runs; its parameters were not recorded, so the rest are this page's.`);
+    }
   }, [run, history]);
 
   const onPolicyChange = (nextPolicy: string) => {

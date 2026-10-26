@@ -27,4 +27,13 @@ describe("the Training form while a job runs", () => {
       "The running job's parameters no longer come from its history record."
     ).toBe(true);
   });
+
+  it("takes the host from the run even when the job has no history record", () => {
+    // R4 was started on Dante outside the page and adopted before any record existed; waiting
+    // for one kept the Machine field on the NUC (10-26).
+    const hostTaken = pageSource.indexOf("setHostId(run.hostId);");
+    const paramsGated = pageSource.indexOf("if (entry) {\n      copyRunParams(entry);");
+    expect(hostTaken, "setHostId(run.hostId) is gone").toBeGreaterThan(0);
+    expect(paramsGated, "only the parameters may wait for the history record").toBeGreaterThan(hostTaken);
+  });
 });

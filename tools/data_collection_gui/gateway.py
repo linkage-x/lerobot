@@ -5202,6 +5202,18 @@ def _training_history_from_train_config(run_dir: Path) -> dict[str, Any] | None:
     config = _load_json_file(config_path)
     if not isinstance(config, dict):
         return None
+    # The trailing __YYYYmmdd_HHMMSS a start stamps on. Runs from before that convention keep
+    # their directory mtime, which is still the right ordering key.
+    fallback_started_at = datetime.fromtimestamp(run_dir.stat().st_mtime, timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    return _training_history_from_config(config, run_dir.name, fallback_started_at)
+
+
+def _training_history_from_config(
+    config: dict[str, Any], run_name: str, fallback_started_at: str
+) -> dict[str, Any]:
+    """A history entry from a parsed train_config.json; the host is left for the caller."""
     policy = config.get("policy") if isinstance(config.get("policy"), dict) else {}
     peft = config.get("peft") if isinstance(config.get("peft"), dict) else {}
     wandb = config.get("wandb") if isinstance(config.get("wandb"), dict) else {}
@@ -5234,20 +5246,16 @@ def _training_history_from_train_config(run_dir: Path) -> dict[str, Any] | None:
         "wandbEntity": str(wandb.get("entity") or ""),
     }
     view_root = str(dataset.get("root") or "")
-    # The trailing __YYYYmmdd_HHMMSS a start stamps on. Runs from before that convention keep
-    # their directory mtime, which is still the right ordering key.
-    stamp = re.search(r"__(\d{8})_(\d{6})$", run_dir.name)
+    stamp = re.search(r"__(\d{8})_(\d{6})$", run_name)
     if stamp:
         started_at = (
             f"{stamp.group(1)[:4]}-{stamp.group(1)[4:6]}-{stamp.group(1)[6:]}"
             f"T{stamp.group(2)[:2]}:{stamp.group(2)[2:4]}:{stamp.group(2)[4:]}+00:00"
         )
     else:
-        started_at = datetime.fromtimestamp(
-            run_dir.stat().st_mtime, timezone.utc
-        ).isoformat(timespec="seconds")
+        started_at = fallback_started_at
     return {
-        "jobName": str(config.get("job_name") or run_dir.name),
+        "jobName": str(config.get("job_name") or run_name),
         "startedAt": started_at,
         "viewName": Path(view_root).name if view_root else "",
         "hostId": "",
@@ -5730,6 +5738,7 @@ def _adopt_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
     )
     state.log("info", f"Adopted training run {job_name} on {host.label} (remote pid {remote_pid})")
     _persist_training_status(state)
+    _record_adopted_training_history(state, host, job_name, state.training.startedAt)
     Thread(target=process.wait, daemon=True, name=f"training-relay-reap-{process.pid}").start()
     Thread(
         target=_follow_training_run,
@@ -5739,6 +5748,43 @@ def _adopt_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         name=f"training-relay-{process.pid}",
     ).start()
     return {"ok": True, "training": asdict(state.training)}
+
+
+def _record_adopted_training_history(
+    state: GatewayState, host: Any, job_name: str, started_at: str
+) -> None:
+    """Give an adopted run the history entry a page-started run gets at start.
+
+    The page fills its locked form from the running job's history entry -- host, view and every
+    parameter. A run started outside the page has none, and the outputs/train scan only sees this
+    machine, so the form showed this machine and its own defaults beside a run on Dante. The entry
+    is rebuilt from the train_config.json of the run's newest checkpoint on the host; before the
+    first checkpoint there is none yet and the page still takes the host and view from the run.
+    Best-effort, like _record_training_history: a missing entry must not fail the adoption.
+    """
+    if any(entry.get("jobName") == job_name for entry in _load_training_history(state)):
+        return
+    checkpoints = shlex.quote(f"outputs/train/{job_name}/checkpoints")
+    read_config = (
+        f"cd {shlex.quote(host.repoDir)} && "
+        f'cat "$(ls -d {checkpoints}/*/pretrained_model/train_config.json 2>/dev/null | tail -n 1)"'
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *training_backend.SSH_OPTS, host.sshTarget, read_config],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        config = json.loads(result.stdout) if result.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        config = None
+    if not isinstance(config, dict):
+        state.log("info", f"No train_config.json for {job_name} on {host.label} yet; history not recorded")
+        return
+    entry = _training_history_from_config(config, job_name, started_at)
+    entry.update(jobName=job_name, hostId=host.id, hostLabel=host.label)
+    _record_training_history(state, entry)
 
 
 # Run on the training host: every live trainer whose cwd is the host's repo, as JSON, with the
