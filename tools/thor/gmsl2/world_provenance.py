@@ -310,46 +310,257 @@ def _checked_rigid(value: Any, label: str) -> list[list[float]]:
     return T
 
 
+#: Where two routes are compared: the corners of an FR3's working volume in its own base (x forward, y
+#: left, z up, metres), the frame and the place the edges are used in. Compared at the camera world's origin
+#: instead -- 1.4 m from the arm -- a half-degree that no replay sees reads as 12 mm (G3, 10-23).
+CLOSURE_WORKSPACE_M = tuple(
+    (x, y, z) for x in (0.3, 0.7) for y in (-0.4, 0.4) for z in (0.0, 0.4)
+)
+#: Lever for an edge whose sigma comes as a rotation (laser station): the workspace's distance from a base.
+SIGMA_LEVER_M = 0.6
+#: Two routes between the same pair of worlds may disagree by this many of their combined 1-sigmas. G3's
+#: synthetic loops (dual_fr3_registration_sim, 10-23): with ball-check edges the 99th percentile of
+#: disagreement / sigma is 3.2-3.4 (5-6 balls over 0.3 m; 7.5 over 0.15 m, where a leave-one-out cannot see
+#: the edge's rotation). At this K a 2.6 mm world edge loop allows ~13 mm: it catches a moved base, not 5 mm.
+CLOSURE_K = 3.5
+#: ... but never less than this: an edge whose leave-one-out came out near zero is lucky, not exact.
+CLOSURE_MIN_THRESHOLD_MM = 1.0
+#: The 1-sigma taken for an edge that states none and has no quality figure to derive one from: the
+#: 5-6 mm the laser edges could be certified to, i.e. "not known to be better than the worst we use".
+UNKNOWN_EDGE_SIGMA_MM = 6.0
+#: Longest route enumerated; the graph has a handful of nodes.
+MAX_ROUTE_HOPS = 8
+
+#: ``method`` prefixes written by the registration tools, and the kind each one is.
+_METHOD_KINDS = (
+    ("fr3_ball_pivot_check", "same_ball"),
+    ("fr3_single_tag_hand_eye", "hand_eye"),
+    ("fr3_laser_station_fk", "laser_station"),
+    ("fr3_arm_arm_ball", "arm_arm_ball"),
+    ("platform_marker", "platform"),
+)
+
+
+class WorldGraphClosureError(RuntimeError):
+    """Raised when two routes between the same worlds disagree by more than their edges' sigmas allow."""
+
+
+def edge_method_kind(edge: Mapping[str, Any]) -> str:
+    """``edge["method_kind"]`` if written, else the kind its ``method`` prefix names, else ``""``."""
+    explicit = str(edge.get("method_kind") or "")
+    if explicit:
+        return explicit
+    method = str(edge.get("method") or "")
+    return next((kind for prefix, kind in _METHOD_KINDS if method.startswith(prefix)), "")
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def edge_sigma_mm(edge: Mapping[str, Any]) -> float | None:
+    """The edge's 1-sigma in mm at the workspace, or ``None`` when it neither states one nor carries the
+    quality figure its method reports.
+
+    ``sigma_mm`` written on the edge wins. Otherwise: a ball edge's leave-one-out rms (the out-of-sample
+    error at the balls); a laser edge's station sigmas, rotation read out at the lever; a hand-eye edge's
+    out-of-sample tag-centre p95 halved. These are each method's own claim -- the 10-09 hand-eye edge
+    claimed a few mm and was 10.7 mm off -- which is what a closure check is for.
+    """
+    explicit = _number(edge.get("sigma_mm"))
+    if explicit is not None:
+        return explicit
+    quality = edge.get("quality") if isinstance(edge.get("quality"), Mapping) else {}
+    kind = edge_method_kind(edge)
+    if kind == "same_ball":
+        return _number(quality.get("leave_one_out_rms_mm"))
+    if kind == "laser_station":
+        station = quality.get("station") if isinstance(quality.get("station"), Mapping) else {}
+        t = _number(station.get("translation_sigma_mm"))
+        r = _number(station.get("rotation_sigma_deg"))
+        if t is None or r is None:
+            return None
+        return math.hypot(t, math.radians(r) * SIGMA_LEVER_M * 1e3)
+    if kind == "hand_eye":
+        p95 = _number(quality.get("out_of_sample_tag_centre_p95_mm"))
+        return None if p95 is None else p95 / 2.0
+    return None
+
+
+def _routes(edges: list[dict[str, Any]], from_world: str, to_world: str) -> list[list[tuple[int, bool]]]:
+    """Every simple route (no world twice) as ``[(edge index, walked backwards), ...]``, shortest first."""
+    routes: list[list[tuple[int, bool]]] = []
+
+    def walk(world: str, visited: set[str], route: list[tuple[int, bool]]) -> None:
+        if len(route) >= MAX_ROUTE_HOPS:
+            return
+        for index, edge in enumerate(edges):
+            src = str(edge.get("from_world_frame_id") or "")
+            dst = str(edge.get("to_world_frame_id") or "")
+            for a, b, reversed_ in ((src, dst, False), (dst, src, True)):
+                if a != world or b in visited:
+                    continue
+                step = [*route, (index, reversed_)]
+                if b == to_world:
+                    routes.append(step)
+                else:
+                    walk(b, visited | {b}, step)
+
+    walk(from_world, {from_world}, [])
+    return sorted(routes, key=len)  # stable: equal lengths keep the order the edges are listed in
+
+
+def _compose(matrices: list[list[list[float]]], route: list[tuple[int, bool]]) -> list[list[float]]:
+    T = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+    for index, reversed_ in route:
+        step = _rigid_inverse(matrices[index]) if reversed_ else matrices[index]
+        T = _matmul4(step, T)
+    return T
+
+
+def _route_sigma_mm(edges: list[dict[str, Any]], indices: Iterable[int]) -> float:
+    total = 0.0
+    for index in indices:
+        sigma = edge_sigma_mm(edges[index])
+        total += (UNKNOWN_EDGE_SIGMA_MM if sigma is None else sigma) ** 2
+    return math.sqrt(total)
+
+
+def route_disagreement_mm(
+    T_a: list[list[float]], T_b: list[list[float]], *, read_in: str = "to", points=CLOSURE_WORKSPACE_M
+) -> float:
+    """How far apart two estimates of one ``T_to_from`` put the same point, at most over ``points``, in mm.
+
+    ``points`` are in the frame named by ``read_in`` (``"to"`` or ``"from"``) -- the robot base's end of the
+    route, where the workspace is.
+    """
+    D = _matmul4(T_a, _rigid_inverse(T_b)) if read_in == "to" else _matmul4(_rigid_inverse(T_a), T_b)
+    worst = 0.0
+    for x in points:
+        moved = [sum(D[r][k] * x[k] for k in range(3)) + D[r][3] for r in range(3)]
+        worst = max(worst, math.sqrt(sum((moved[r] - x[r]) ** 2 for r in range(3))))
+    return worst * 1e3
+
+
+def _robot_bases(graph: Mapping[str, Any]) -> set[str]:
+    return {
+        str(node.get("world_frame_id") or "")
+        for node in graph.get("nodes") or []
+        if isinstance(node, Mapping) and node.get("reason") == "robot_base"
+    }
+
+
+def _hop(edge: Mapping[str, Any], reversed_: bool) -> dict[str, Any]:
+    return {
+        "from_world_frame_id": str(edge.get("from_world_frame_id") or ""),
+        "to_world_frame_id": str(edge.get("to_world_frame_id") or ""),
+        "traversed_reversed": reversed_,
+        "method": str(edge.get("method") or ""),
+        "created_utc": str(edge.get("created_utc") or ""),
+    }
+
+
+def _route_label(edges: list[dict[str, Any]], from_world: str, route: list[tuple[int, bool]]) -> str:
+    worlds = [from_world]
+    for index, reversed_ in route:
+        edge = edges[index]
+        worlds.append(str(edge.get("from_world_frame_id") if reversed_ else edge.get("to_world_frame_id")))
+    return " -> ".join(worlds)
+
+
+def world_closures(graph: Mapping[str, Any], from_world: str, to_world: str) -> list[dict[str, Any]]:
+    """Each other route between the two worlds against the one :func:`world_transform` takes.
+
+    Empty when there is at most one route. Each row: the route, its disagreement with the chosen one
+    (:func:`route_disagreement_mm`), the threshold (CLOSURE_K x the 1-sigma of the edges the two routes do
+    not share, at least CLOSURE_MIN_THRESHOLD_MM) and ``ok``. A loop of independently measured edges is
+    the one place the graph can check itself without another ground truth (roadmap G2 / B4b).
+    """
+    return _resolve(graph, from_world, to_world)[2]
+
+
+def _resolve(
+    graph: Mapping[str, Any], from_world: str, to_world: str
+) -> tuple[list[list[float]] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    edges = list(graph.get("edges") or [])
+    matrices = [
+        _checked_rigid(
+            edge.get("T_to_from"),
+            f"world_graph edge {index} ({edge.get('from_world_frame_id') or ''} -> {edge.get('to_world_frame_id') or ''})",
+        )
+        for index, edge in enumerate(edges)
+    ]
+    routes = _routes(edges, from_world, to_world)
+    if not routes:
+        return None, [], []
+    # the route whose edges claim the least error; among equals the shortest, then the first listed
+    chosen = min(routes, key=lambda route: (round(_route_sigma_mm(edges, (i for i, _ in route)), 6), len(route)))
+    T = _compose(matrices, chosen)
+    # read where the workspace is: the robot base's end (the target, unless only the source is a base)
+    bases = _robot_bases(graph)
+    read_in = "from" if from_world in bases and to_world not in bases else "to"
+    closures = []
+    for route in routes:
+        if route is chosen:
+            continue
+        own = {i for i, _ in chosen} ^ {i for i, _ in route}
+        sigma = _route_sigma_mm(edges, own)
+        threshold = max(CLOSURE_MIN_THRESHOLD_MM, CLOSURE_K * sigma)
+        disagreement = route_disagreement_mm(T, _compose(matrices, route), read_in=read_in)
+        closures.append(
+            {
+                "route": _route_label(edges, from_world, route),
+                "against": _route_label(edges, from_world, chosen),
+                "read_in": to_world if read_in == "to" else from_world,
+                "disagreement_mm": round(disagreement, 3),
+                "sigma_mm": round(sigma, 3),
+                "threshold_mm": round(threshold, 3),
+                "ok": disagreement <= threshold,
+            }
+        )
+    return T, [_hop(edges[i], r) for i, r in chosen], closures
+
+
 def world_transform(
     graph: Mapping[str, Any], from_world: str, to_world: str
 ) -> tuple[list[list[float]], list[dict[str, Any]]] | None:
     """``(T_to_from, edges_used)``, or ``None`` when the worlds are not connected.
 
-    Breadth-first over the edges in both directions, as
-    ``metrology.world_frame.WorldGraph.transform``.  ``None`` is the honest
-    answer for two islands; a caller must refuse rather than substitute an
-    identity.  ``edges_used`` is each traversed edge's provenance (endpoints,
-    method, created_utc, and whether it was walked backwards), for the record a
-    re-expressed dataset carries about itself.
+    Over the edges in both directions, as ``metrology.world_frame.WorldGraph.transform``.  ``None`` is
+    the honest answer for two islands; a caller must refuse rather than substitute an identity.
+    ``edges_used`` is each traversed edge's provenance (endpoints, method, created_utc, and whether it was
+    walked backwards), for the record a re-expressed dataset carries about itself.
+
+    With one route this is that route. With several -- a loop, e.g. world -> right base -> left base
+    against world -> left base -- it is the route whose edges claim the least error
+    (:func:`edge_sigma_mm`), and every other route must agree with it within CLOSURE_K sigmas
+    (:func:`world_closures`); otherwise :class:`WorldGraphClosureError`, because one of the edges is wrong
+    and the graph cannot say which.
     """
     identity = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
     if from_world == to_world:
         return identity, []
-    edges = list(graph.get("edges") or [])
-    frontier: list[tuple[str, list[list[float]], list[dict[str, Any]]]] = [(from_world, identity, [])]
-    seen = {from_world}
-    while frontier:
-        world, accumulated, path = frontier.pop(0)
-        for index, edge in enumerate(edges):
-            src = str(edge.get("from_world_frame_id") or "")
-            dst = str(edge.get("to_world_frame_id") or "")
-            T = _checked_rigid(edge.get("T_to_from"), f"world_graph edge {index} ({src} -> {dst})")
-            for a, b, step, reversed_ in ((src, dst, T, False), (dst, src, _rigid_inverse(T), True)):
-                if a != world or b in seen:
-                    continue
-                combined = _matmul4(step, accumulated)
-                hop = {
-                    "from_world_frame_id": src,
-                    "to_world_frame_id": dst,
-                    "traversed_reversed": reversed_,
-                    "method": str(edge.get("method") or ""),
-                    "created_utc": str(edge.get("created_utc") or ""),
-                }
-                if b == to_world:
-                    return combined, [*path, hop]
-                seen.add(b)
-                frontier.append((b, combined, [*path, hop]))
-    return None
+    T, hops, closures = _resolve(graph, from_world, to_world)
+    if T is None:
+        return None
+    failed = [row for row in closures if not row["ok"]]
+    if failed:
+        detail = "\n".join(
+            f"  {row['route']} disagrees with {row['against']} by {row['disagreement_mm']:.2f} mm "
+            f"over {row['read_in']}'s workspace (allowed {row['threshold_mm']:.2f} mm)"
+            for row in failed
+        )
+        raise WorldGraphClosureError(
+            f"the world graph's routes from {from_world} to {to_world} do not close:\n{detail}\n"
+            "One of these edges is wrong (a base moved, a camera moved, or a bad registration). Re-measure "
+            "the edge you trust least, or remove it from world_graph.json; nothing is exported or replayed "
+            "through an inconsistent graph."
+        )
+    return T, hops
 
 
 def _quat_from_matrix(Rm: list[list[float]]) -> tuple[float, float, float, float]:
@@ -549,6 +760,7 @@ __all__ = [
     "STATUS_UNREADABLE",
     "STATUS_INCOMPLETE",
     "MixedWorldError",
+    "WorldGraphClosureError",
     "read_world_provenance",
     "describe",
     "world_frame_id_of",

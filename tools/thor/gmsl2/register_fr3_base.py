@@ -639,12 +639,17 @@ def _is_direct(edge: dict[str, Any], a: str, b: str) -> bool:
     return {str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id"))} == {a, b}
 
 
-def apply_report(report: dict[str, Any], graph: dict[str, Any], *, replace: bool = False) -> dict[str, Any]:
+def apply_report(
+    report: dict[str, Any], graph: dict[str, Any], *, replace: bool = False, close_loop: bool = False
+) -> dict[str, Any]:
     """Return ``graph`` with the report's edge and target node added (stdlib).
 
     With ``replace``, a direct edge between the same two worlds moves into the
     new edge's ``supersedes``. Worlds joined only through other edges are still
-    refused: which hop to drop is not this tool's call.
+    refused: which hop to drop is not this tool's call -- unless ``close_loop``,
+    which adds the edge as a second, independent route (e.g. world -> left base
+    beside world -> right base -> left base) provided the loop closes within the
+    edges' sigmas (``world_provenance.world_closures``).
     """
     if report.get("schema") != REPORT_SCHEMA:
         raise ValueError(f"not a {REPORT_SCHEMA} report")
@@ -663,9 +668,12 @@ def apply_report(report: dict[str, Any], graph: dict[str, Any], *, replace: bool
     if replace:
         superseded = [{**old, "superseded_utc": now} for old in edges if _is_direct(old, source, target)]
         edges = [old for old in edges if not _is_direct(old, source, target)]
-    if wp.world_transform({"edges": edges}, source, target) is not None:
+    if not close_loop and wp.world_transform({"edges": edges}, source, target) is not None:
         how = "through other edges" if replace else "already"
-        raise ValueError(f"{source} and {target} are {how} connected; remove the old edge first")
+        raise ValueError(
+            f"{source} and {target} are {how} connected; remove the old edge first, or pass --close-loop "
+            "to add this one as an independent route checked against the others"
+        )
     if target not in known:
         node = dict(report["target_node"])
         node.setdefault("created_utc", now)
@@ -674,6 +682,11 @@ def apply_report(report: dict[str, Any], graph: dict[str, Any], *, replace: bool
     if superseded:
         edge["supersedes"] = superseded
     edges.append(edge)
+    if close_loop:
+        try:
+            wp.world_transform({"edges": edges}, source, target)
+        except wp.WorldGraphClosureError as exc:
+            raise ValueError(str(exc)) from exc
     return {**graph, "version": graph.get("version", 1), "nodes": nodes, "edges": edges}
 
 
@@ -714,7 +727,7 @@ def _apply(args: argparse.Namespace) -> int:
     graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.is_file() else {"version": 1}
     try:
         check_reference(report, world_dir)
-        updated = apply_report(report, graph, replace=args.replace)
+        updated = apply_report(report, graph, replace=args.replace, close_loop=args.close_loop)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -757,6 +770,12 @@ def main(argv: list[str] | None = None) -> int:
         "--replace",
         action="store_true",
         help="swap out an existing direct edge between the same worlds (kept in the new edge's supersedes)",
+    )
+    apply.add_argument(
+        "--close-loop",
+        action="store_true",
+        help="add the edge although its worlds are already connected: a second, independent route that must "
+        "agree with the others within the edges' sigmas (roadmap B4b)",
     )
     args = parser.parse_args(argv)
     return {"solve": _solve, "laser": _laser, "apply": _apply}[args.command](args)

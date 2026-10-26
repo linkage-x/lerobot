@@ -52,6 +52,57 @@ def test_apply_refuses_a_second_edge_between_connected_worlds() -> None:
         reg.apply_report(_report(), graph)
 
 
+def _loop_graph() -> dict:
+    """world_a -> fr3_base (0.5 m along x) -> fr3_base_left (0.8 m along -y), each edge 1 mm."""
+    graph = reg.apply_report(
+        _report(edge={**_report()["edge"], "sigma_mm": 1.0}), {"nodes": [{"world_frame_id": "world_a"}], "edges": []}
+    )
+    arm_arm = _report(
+        edge={
+            "from_world_frame_id": "fr3_base",
+            "to_world_frame_id": "fr3_base_left",
+            "T_to_from": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, -0.8], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            "method": "fr3_arm_arm_ball: test",
+            "sigma_mm": 1.0,
+        },
+        target_node={"world_frame_id": "fr3_base_left", "reason": "robot_base"},
+    )
+    return reg.apply_report(arm_arm, graph)
+
+
+def _world_to_left(error_mm: float) -> dict:
+    return _report(
+        edge={
+            "from_world_frame_id": "world_a",
+            "to_world_frame_id": "fr3_base_left",
+            "T_to_from": [
+                [1.0, 0.0, 0.0, 0.5 + error_mm * 1e-3],
+                [0.0, 1.0, 0.0, -0.8],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "method": "fr3_laser_station_fk: test",
+            "sigma_mm": 1.0,
+        },
+        target_node={"world_frame_id": "fr3_base_left", "reason": "robot_base"},
+    )
+
+
+def test_close_loop_adds_an_independent_route_that_agrees() -> None:
+    graph = _loop_graph()
+    with pytest.raises(ValueError, match="--close-loop"):
+        reg.apply_report(_world_to_left(2.0), graph)
+    updated = reg.apply_report(_world_to_left(2.0), graph, close_loop=True)
+    (closure,) = wp.world_closures(updated, "world_a", "fr3_base_left")
+    assert closure["ok"] and closure["disagreement_mm"] == pytest.approx(2.0)
+
+
+def test_close_loop_refuses_an_edge_the_loop_does_not_close_on() -> None:
+    # three 1 mm edges allow 3.5 * sqrt(3) = 6.1 mm
+    with pytest.raises(ValueError, match="do not close"):
+        reg.apply_report(_world_to_left(8.0), _loop_graph(), close_loop=True)
+
+
 def test_solve_recovers_a_known_edge_from_a_synthetic_p0_run(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     cv2 = pytest.importorskip("cv2")

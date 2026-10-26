@@ -339,6 +339,82 @@ def test_a_non_rigid_edge_is_refused() -> None:
         wp.world_transform({"edges": [_edge("a", "b", bad)]}, "a", "b")
 
 
+def _loop(world_to_left_error_mm: float = 0.0) -> dict:
+    """world -> right base (ball edge) -> left base (arm-arm, explicit sigma), and world -> left base."""
+    np = pytest.importorskip("numpy")
+    w_to_r = np.asarray(_rz(90, (1.2, 0.0, 0.7)))
+    r_to_l = np.asarray(_rz(0, (0.0, -0.8, 0.0)))
+    w_to_l = r_to_l @ w_to_r
+    w_to_l[0, 3] += world_to_left_error_mm * 1e-3
+    ball = _edge("world", "fr3_base", w_to_r.tolist())
+    ball["method"] = "fr3_ball_pivot_check: five balls"
+    ball["quality"] = {"leave_one_out_rms_mm": 1.0}
+    arm_arm = _edge("fr3_base", "fr3_base_left", r_to_l.tolist())
+    arm_arm["sigma_mm"] = 0.5
+    laser = _edge("world", "fr3_base_left", w_to_l.tolist())
+    laser["method"] = "fr3_laser_station_fk: station x FK"
+    laser["quality"] = {"station": {"translation_sigma_mm": 1.0, "rotation_sigma_deg": 0.0}}
+    return {"edges": [laser, ball, arm_arm]}
+
+
+def test_edge_sigma_is_read_from_what_each_method_reports() -> None:
+    graph = _loop()
+    laser, ball, arm_arm = graph["edges"]
+    assert wp.edge_method_kind(ball) == "same_ball" and wp.edge_sigma_mm(ball) == 1.0
+    assert wp.edge_method_kind(laser) == "laser_station" and wp.edge_sigma_mm(laser) == pytest.approx(1.0)
+    assert wp.edge_sigma_mm(arm_arm) == 0.5
+    assert wp.edge_sigma_mm(_edge("a", "b", _rz(0))) is None
+    hand_eye = {"method": "fr3_single_tag_hand_eye: tag 6", "quality": {"out_of_sample_tag_centre_p95_mm": 4.0}}
+    assert wp.edge_method_kind(hand_eye) == "hand_eye" and wp.edge_sigma_mm(hand_eye) == 2.0
+
+
+def test_a_consistent_loop_takes_the_route_whose_edges_claim_least_error() -> None:
+    np = pytest.importorskip("numpy")
+    graph = _loop(world_to_left_error_mm=1.0)
+    T, hops = wp.world_transform(graph, "world", "fr3_base_left")
+    # direct laser edge: sigma 1.0; through the right base: sqrt(1.0^2 + 0.5^2) -- the laser edge wins
+    assert [h["to_world_frame_id"] for h in hops] == ["fr3_base_left"]
+    assert np.allclose(T, graph["edges"][0]["T_to_from"])
+    (closure,) = wp.world_closures(graph, "world", "fr3_base_left")
+    assert closure["ok"] and closure["disagreement_mm"] == pytest.approx(1.0, abs=1e-6)
+    assert closure["threshold_mm"] == pytest.approx(wp.CLOSURE_K * math.sqrt(1.0 + 1.0 + 0.25))
+
+
+def test_an_edge_off_by_more_than_the_loop_allows_is_refused_on_every_route() -> None:
+    # 3.5 x sqrt(1 + 1 + 0.25) = 5.25 mm allowed
+    graph = _loop(world_to_left_error_mm=8.0)
+    for a, b in (("world", "fr3_base_left"), ("fr3_base", "fr3_base_left"), ("world", "fr3_base")):
+        with pytest.raises(wp.WorldGraphClosureError, match="do not close"):
+            wp.world_transform(graph, a, b)
+    # a pair the loop does not join is not held hostage by it
+    assert wp.world_transform(graph, "fr3_base", "fr3_base") is not None
+
+
+def test_one_route_is_taken_as_before_and_has_no_closures() -> None:
+    graph = _loop()
+    graph["edges"] = graph["edges"][1:]
+    assert wp.world_closures(graph, "world", "fr3_base_left") == []
+    _, hops = wp.world_transform(graph, "world", "fr3_base_left")
+    assert [h["to_world_frame_id"] for h in hops] == ["fr3_base", "fr3_base_left"]
+
+
+def test_route_disagreement_is_read_over_the_workspace_at_the_robot_end() -> None:
+    assert wp.route_disagreement_mm(_rz(0), _rz(0)) == 0.0
+    assert wp.route_disagreement_mm(_rz(0, (0.002, 0, 0)), _rz(0)) == pytest.approx(2.0)
+    # a turn about z moves the workspace corner farthest from the axis: (0.7, +-0.4)
+    assert wp.route_disagreement_mm(_rz(0.1), _rz(0)) == pytest.approx(math.radians(0.1) * math.hypot(0.7, 0.4) * 1e3)
+    # the same pair read in the source frame: a shift there is the turned shift
+    turned = wp.route_disagreement_mm(_rz(90, (0.002, 0, 0)), _rz(90), read_in="from")
+    assert turned == pytest.approx(2.0)
+
+
+def test_a_loop_through_a_far_camera_world_is_read_at_the_base_not_at_the_world_origin() -> None:
+    graph = _loop(world_to_left_error_mm=0.0)
+    graph["nodes"] = [{"world_frame_id": "fr3_base_left", "reason": "robot_base"}]
+    (row,) = wp.world_closures(graph, "fr3_base_left", "world")
+    assert row["read_in"] == "fr3_base_left"
+
+
 def test_transform_pose7_matches_the_matrix_product() -> None:
     np = pytest.importorskip("numpy")
 
