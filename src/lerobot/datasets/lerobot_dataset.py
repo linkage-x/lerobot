@@ -1165,6 +1165,43 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_frames
 
+    # Per-frame action chunks that replace the recorded future for those frames (fr3
+    # `tools/fr3/funnel_relabel.py`): arrays `index` (sorted absolute frame indices), `action`
+    # (N, chunk, action_dim) and `action_is_pad` (N, chunk). Absent file = upstream behaviour.
+    ACTION_OVERRIDES_RELATIVE_PATH = Path("meta") / "action_overrides.npz"
+
+    def _action_overrides(self) -> dict[str, np.ndarray] | None:
+        if not hasattr(self, "_action_overrides_cache"):
+            path = self.root / self.ACTION_OVERRIDES_RELATIVE_PATH
+            cache = None
+            if path.is_file():
+                with np.load(path) as data:
+                    cache = {key: data[key] for key in ("index", "action", "action_is_pad")}
+                chunk = len(self.delta_indices["action"]) if self.delta_indices and "action" in self.delta_indices else None
+                if chunk is not None and cache["action"].shape[1] != chunk:
+                    raise ValueError(
+                        f"{path} holds {cache['action'].shape[1]}-step chunks, but this dataset "
+                        f"queries {chunk} action steps."
+                    )
+            self._action_overrides_cache = cache
+        return self._action_overrides_cache
+
+    def _apply_action_override(self, item: dict, abs_idx: int) -> dict:
+        if "action" not in (self.delta_indices or {}):
+            return item
+        overrides = self._action_overrides()
+        if overrides is None:
+            return item
+        pos = int(np.searchsorted(overrides["index"], abs_idx))
+        if pos >= len(overrides["index"]) or overrides["index"][pos] != abs_idx:
+            return item
+        action = torch.from_numpy(overrides["action"][pos]).to(dtype=item["action"].dtype)
+        return {
+            **item,
+            "action": action,
+            "action_is_pad": torch.from_numpy(overrides["action_is_pad"][pos].copy()),
+        }
+
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
@@ -1180,6 +1217,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+
+            item = self._apply_action_override(item, abs_idx)
 
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()

@@ -253,6 +253,35 @@ def assert_every_shard_opens(root: Path) -> None:
     )
 
 
+def assert_videos_present(root: Path, info: dict[str, Any]) -> None:
+    """Refuse a source whose episodes point at video files it does not have.
+
+    10-26: three sources had been copied to the training host as data/ and meta/ only. The merge
+    skipped their missing videos without a word, the merged view checked and relabelled fine, and
+    training died at the dataset load ("Cached dataset doesn't contain all requested episodes").
+    """
+    features = info.get("features") if isinstance(info.get("features"), dict) else {}
+    template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
+    episodes = load_episodes(root)
+    missing: list[str] = []
+    for key, feature in features.items():
+        if not (isinstance(feature, dict) and feature.get("dtype") == "video"):
+            continue
+        chunk_col, file_col = f"videos/{key}/chunk_index", f"videos/{key}/file_index"
+        if chunk_col not in episodes or file_col not in episodes:
+            continue
+        for chunk, file in sorted(set(zip(episodes[chunk_col].astype(int), episodes[file_col].astype(int)))):
+            path = chunk_file_path(template, video_key=key, chunk_index=chunk, file_index=file)
+            if not (root / path).is_file():
+                missing.append(str(path))
+    if missing:
+        names = ", ".join(missing[:3]) + (f" (+{len(missing) - 3} more)" if len(missing) > 3 else "")
+        raise MergeError(
+            f"{root.name} has no {names}; its episodes' frames would be missing from the view. "
+            "Copy the dataset with its videos/ (rsync --copy-links)."
+        )
+
+
 def load_episodes(root: Path) -> pd.DataFrame:
     files = dataset_episode_files(root)
     if not files:
@@ -385,6 +414,8 @@ def validate_policy_ready_merge(
         )
 
     assert_every_shard_opens(base_view)
+    if not no_base_episodes:
+        assert_videos_present(base_view, base_info)
     base_episode_rows = load_episodes(base_view)
     base_episode_filter = sorted({int(episode) for episode in (base_episodes or [])})
     if no_base_episodes and base_episode_filter:
@@ -448,6 +479,7 @@ def validate_policy_ready_merge(
         if not dataset_data_files(dagger_root) or not dataset_episode_files(dagger_root):
             raise MergeError(f"{dagger_root.name} is not a finalized LeRobot v3 dataset")
         assert_every_shard_opens(dagger_root)
+        assert_videos_present(dagger_root, info)
         sources.append(
             SourceSummary(
                 role="dagger",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -405,6 +406,26 @@ def test_policy_ready_merge_refuses_a_dagger_root_that_is_still_being_written(tm
 
     with pytest.raises(MergeError, match=r"cannot be opened.*" + shard.name):
         validate_policy_ready_merge(base, [dagger])
+
+
+def test_policy_ready_merge_refuses_a_dataset_copied_without_its_videos(tmp_path):
+    """10-26: sources copied as data/ + meta/ merged into a view training could not open."""
+    base = tmp_path / "base"
+    dagger = tmp_path / "dagger"
+    _write_dataset(base, episodes=1)
+    _write_dataset(dagger, episodes=1, include_intervention=True)
+    _write_qc(dagger, "pass")
+    shutil.rmtree(dagger / "videos")
+
+    with pytest.raises(MergeError, match=r"dagger has no videos/observation\.images\.ee/chunk-000/file-000\.mp4"):
+        validate_policy_ready_merge(base, [dagger])
+    # A schema-only base is never read for frames, so its videos are not asked for: the refusal
+    # that follows is the start-pose one, past the video check.
+    shutil.rmtree(base / "videos")
+    _write_dataset(dagger, episodes=1, include_intervention=True)
+    _write_qc(dagger, "pass")
+    with pytest.raises(MergeError, match="starts at the start pose"):
+        validate_policy_ready_merge(base, [dagger], no_base_episodes=True)
 
 
 def test_policy_ready_merge_refuses_a_base_view_with_an_unopenable_shard(tmp_path):

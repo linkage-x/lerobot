@@ -1760,6 +1760,28 @@ def adopt_existing_view(args: argparse.Namespace, view_root: Path) -> dict[str, 
     return manifest
 
 
+def report_action_overrides(view_root: Path) -> int:
+    """Frames whose action chunk the view replaces (`tools/fr3/funnel_relabel.py`), 0 if none.
+
+    The swap happens inside `LeRobotDataset`, an upstream file: after a re-sync that drops it, the
+    view would train on the recorded chunks it was built to replace, and nothing would say so.
+    """
+    path = view_root / "meta" / "action_overrides.npz"
+    if not path.is_file():
+        return 0
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    if getattr(LeRobotDataset, "ACTION_OVERRIDES_RELATIVE_PATH", None) != Path("meta") / "action_overrides.npz":
+        raise RuntimeError(
+            f"{view_root.name} replaces action chunks ({path}), but this LeRobotDataset does not "
+            "read that file; re-apply the action-override hook (deferred upstream changes)."
+        )
+    with np.load(path) as data:
+        count = int(len(data["index"]))
+    print(f"[prepare] action overrides: {count} frames take their chunk from {path.name}")
+    return count
+
+
 def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, config_path: Path) -> None:
     image_resize_shape = parse_hw(args.image_resize_shape)
     policy = build_policy_section(
@@ -2439,6 +2461,7 @@ def main() -> None:
 
     if args.skip_prepare:
         manifest = adopt_existing_view(args, view_root)
+        report_action_overrides(view_root)
         # Regenerated rather than reused: the run's policy, step count, batch size and W&B
         # settings live in this file, and the one left behind by --prepare-only describes
         # whatever was asked for at export time. The *data* keys all come from the manifest,
