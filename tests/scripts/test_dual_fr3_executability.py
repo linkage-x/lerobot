@@ -137,4 +137,4 @@ def test_the_real_backend_says_what_it_still_waits_for() -> None:
     assert rt.real_backend_refusal(registry).startswith("the left arm is not in service: B1")
     both = copy.deepcopy(registry)
     both["arms"]["left"].update(in_service=True, robot_ip="192.168.11.103")
-    assert "real-arm driver is not written yet" in rt.real_backend_refusal(both)
+    assert rt.real_backend_refusal(both, panda_py_module="tests.scripts.fake_panda_py") == ""

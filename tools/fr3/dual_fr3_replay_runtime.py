@@ -41,21 +41,17 @@ two arms need:
 Shared state is a small memory-mapped file (``ArmSync``): stdlib, attachable from any process that knows the
 path, which is what the real arms need (each is its own process with its own 1 kHz libfranka loop).
 
-What is not here yet: the real-arm driver. The fake (``FakeFr3Driver``) has the driver's calls --
-``move_to_start``, ``observe``, ``stamp``, ``command``, ``hold`` -- and the real one is those on the single-arm
-replay's robot (``_move_robot_to_initial_target``, ``_get_robot_observation``, ``_send_pose_command``), with
-``ArmSync`` checked where that script checks ``abort_reason`` and read where it waits for "go". That waits
-for the second FR3 (B1); the coordination it plugs into is what the tests here exercise, faults included.
-
-The two arms' clocks (D2, ``dual_fr3_clock``): every ``observe`` reads the robot's own clock and the host
-time the state arrived; ``stamp`` returns that pair, the report fits the two arms' clocks and says how far
-apart their starts are and what that costs T_LR.
+Two drivers have the same calls -- ``move_to_start``, ``observe``, ``stamp``, ``command``, ``hold``. The fake
+(``FakeFr3Driver``) is what the coordination, the gates and D2 are tested on, faults included. The real one
+(``RealFr3Driver``, D1) is panda_py's joint position control: it takes only C3's joint paths (``--retarget``),
+starts at the plan's joints, and is refused until both arms are in service in fr3_arms.json (B1/B2).
 """
 
 # ruff: noqa: N802, N803, N806  (matrix names: R, T, J follow the maths)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import mmap
@@ -420,9 +416,175 @@ class FakeFr3Driver:
         pass
 
 
-def make_driver(spec: Mapping[str, Any]) -> FakeFr3Driver:
-    if spec.get("kind") != "fake":
-        raise ValueError(f"driver kind {spec.get('kind')!r}: only 'fake' exists until the second FR3 (B1)")
+# ------------------------------------------------------------------ real arm ---
+
+#: Moving to frame 0: panda_py's move_to_joint_position at this fraction of its speed (its default is 0.2).
+REAL_START_SPEED_FACTOR = 0.1
+#: The joint controller's set-point filter time constant, in periods: each frame's command is approached
+#: over about a third of a period, so 20-50 Hz commands reach the 1 kHz torque loop as ramps, not steps.
+REAL_FILTER_TAU_PERIODS = 1.0 / 3.0
+#: After the last command, or a stop: the measured joints are held this long before the controller stops.
+REAL_HOLD_S = 0.3
+#: A state whose robot time has not moved for this long comes from a dead control loop: panda_py's
+#: get_state is a cache, frozen whenever no controller runs (10-12).
+REAL_STALE_STATE_S = 0.1
+
+
+class RealFr3Driver:
+    """One FR3 through panda_py: the fake's calls (``move_to_start``, ``observe``, ``stamp``, ``command``,
+    ``hold``) on joint position control.
+
+    ``move_to_start`` takes the plan's start joints -- a real arm never starts from an IK of its own -- with
+    panda_py's ``move_to_joint_position``, then starts a ``JointPosition`` controller (panda_py's default
+    gains, as fr3_pivot_auto's) that holds them. Each ``command`` sets the controller's target to the plan's
+    joints for the frame, with the step from the previous frame as velocity feed-forward. Cartesian-only
+    plans are refused: two arms kept apart by their elbows stay apart only if the elbows are commanded
+    (``ArmPlan.joints``). ``observe`` reads the state the controller's 1 kHz loop last received and raises
+    libfranka's error once that loop has died (a reflex), or when the state stops moving. ``hold`` holds the
+    measured joints and stops the controller; it never raises, being what runs on the way out.
+
+    ``stamp`` is ``(state.time, monotonic ns when get_state returned)``: the state is panda_py's copy of the
+    last 1 kHz packet, so its arrival reads up to a millisecond late -- latency above the minimum, which
+    D2's lower envelope leaves out.
+
+    ``payload`` is the arm's fr3_arms.json declaration; when declared, Desk has to hold it
+    (``fr3_arms.payload_check``) or the arm does not move. ``panda_py_module`` names what provides ``Panda``
+    and ``controllers``: ``panda_py`` on the arm, a stand-in in the tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        robot_ip: str,
+        tool: list[list[float]],
+        period_s: float,
+        arm: str = "",
+        payload: Mapping[str, Any] | None = None,
+        panda_py_module: str = "panda_py",
+    ):
+        import importlib
+
+        module = importlib.import_module(panda_py_module)
+        self._controllers = getattr(module, "controllers", None) or importlib.import_module(
+            f"{panda_py_module}.controllers"
+        )
+        self.arm, self.robot_ip, self.payload = arm, robot_ip, payload
+        self._T_tool = np.asarray(tool, dtype=np.float64)
+        self._period_s = float(period_s)
+        self._panda = module.Panda(robot_ip)
+        self._ctrl = None
+        self._last_ref: np.ndarray | None = None
+        self._stamp: tuple[float, int] | None = None
+        self._moved: tuple[float, int] | None = None  # (robot time, host ns) when it last advanced
+
+    def _start_problems(self, q_now: np.ndarray, joints: np.ndarray, state: Any) -> list[str]:
+        problems = []
+        beyond = np.flatnonzero((q_now < kin._WALL_LOWER) | (q_now > kin._WALL_UPPER))
+        if len(beyond):
+            problems.append(
+                f"joints {', '.join(f'j{j + 1}' for j in beyond)} are past panda_py's walls now; "
+                "a controller started there aborts -- move the arm back in teaching mode"
+            )
+        outside = np.flatnonzero((joints < kin.Q_LOWER) | (joints > kin.Q_UPPER))
+        if len(outside):
+            problems.append(f"the start joints put {', '.join(f'j{j + 1}' for j in outside)} past the walls")
+        if self.payload:
+            ok, line = fr3_arms.payload_check(
+                {"arm": self.arm, "payload": self.payload}, float(state.m_ee), list(state.F_x_Cee)
+            )
+            if not ok:
+                problems.append(line)
+        return problems
+
+    def move_to_start(self, T_tcp: np.ndarray, joints: list[float] | None = None) -> dict[str, Any]:
+        if joints is None:
+            raise ArmFaultError("a real arm starts at the plan's joints, and this plan has none")
+        target = np.asarray(joints, dtype=np.float64)
+        state = self._panda.get_robot().read_once()
+        q_now = np.asarray(state.q, dtype=np.float64)
+        record: dict[str, Any] = {
+            "robot_ip": self.robot_ip,
+            "q_before": q_now.tolist(),
+            "desk_m_ee_kg": float(state.m_ee),
+            "desk_F_x_Cee_m": [float(v) for v in state.F_x_Cee],
+        }
+        problems = self._start_problems(q_now, target, state)
+        if problems:
+            raise ArmFaultError("not moving to frame 0: " + "; ".join(problems))
+        moved = bool(self._panda.move_to_joint_position(target, speed_factor=REAL_START_SPEED_FACTOR))
+        alpha = 1.0 - math.exp(-1e-3 / (REAL_FILTER_TAU_PERIODS * self._period_s))
+        self._ctrl = self._controllers.JointPosition(filter_coeff=alpha)
+        self._panda.start_controller(self._ctrl)  # holds where it is; the loop now refreshes get_state
+        T, q = self.observe()
+        self._ctrl.set_control(q, np.zeros(7))
+        dp, dr = pose_error(T, np.asarray(T_tcp))
+        record.update(
+            reached=moved and dp <= START_POSITION_TOLERANCE_M and dr <= START_ORIENTATION_TOLERANCE_DEG,
+            move_to_joint_position=moved,
+            position_error_mm=dp * 1e3,
+            orientation_error_deg=dr,
+            joints=q.tolist(),
+            filter_coeff=alpha,
+        )
+        return record
+
+    def observe(self) -> tuple[np.ndarray, np.ndarray]:
+        self._panda.raise_error()  # libfranka's exception, once the control loop has died on it
+        state = self._panda.get_state()
+        arrived = now_ns()
+        robot_s = float(state.time.to_sec())
+        if self._moved is None or robot_s != self._moved[0]:
+            self._moved = (robot_s, arrived)
+        elif self._ctrl is not None and arrived - self._moved[1] > REAL_STALE_STATE_S * 1e9:
+            raise ArmFaultError(
+                f"the robot state has not moved for {(arrived - self._moved[1]) / 1e6:.0f} ms: no control loop"
+            )
+        self._stamp = (robot_s, arrived)
+        q = np.asarray(state.q, dtype=np.float64)
+        return kin.NOMINAL.fk(q)[0] @ self._T_tool, q
+
+    def stamp(self) -> tuple[float, int] | None:
+        return self._stamp
+
+    def command(self, T_tcp: np.ndarray, frame: int, q_ref: np.ndarray | None = None) -> None:
+        del T_tcp, frame
+        if q_ref is None:
+            raise ArmFaultError("a real arm takes the plan's joints (C3's joint path), not TCP poses")
+        if self._ctrl is None:
+            raise ArmFaultError("command before move_to_start")
+        q_ref = np.asarray(q_ref, dtype=np.float64)
+        outside = np.flatnonzero((q_ref < kin.Q_LOWER) | (q_ref > kin.Q_UPPER))
+        if len(outside):
+            raise ArmFaultError(f"commanded {', '.join(f'j{j + 1}' for j in outside)} past the walls")
+        dq = np.zeros(7) if self._last_ref is None else (q_ref - self._last_ref) / self._period_s
+        self._ctrl.set_control(q_ref, dq)
+        self._last_ref = q_ref
+
+    def hold(self) -> None:
+        if self._ctrl is None:
+            return
+        # the way out must not raise: the controller is stopped whatever the hold did
+        with contextlib.suppress(Exception):
+            self._ctrl.set_control(np.asarray(self._panda.get_state().q, dtype=np.float64), np.zeros(7))
+            time.sleep(REAL_HOLD_S)
+        with contextlib.suppress(Exception):
+            self._panda.stop_controller()
+        self._ctrl = None
+
+
+def make_driver(spec: Mapping[str, Any]) -> FakeFr3Driver | RealFr3Driver:
+    kind = spec.get("kind")
+    if kind == "real":
+        return RealFr3Driver(
+            robot_ip=str(spec["robot_ip"]),
+            tool=spec["tool"],
+            period_s=float(spec["period_s"]),
+            arm=str(spec.get("arm") or ""),
+            payload=spec.get("payload"),
+            panda_py_module=str(spec.get("panda_py_module") or "panda_py"),
+        )
+    if kind != "fake":
+        raise ValueError(f"driver kind {kind!r}: 'fake' or 'real'")
     return FakeFr3Driver(
         tool=spec["tool"], gain=float(spec.get("gain", 0.6)), fault=spec.get("fault"), clock=spec.get("clock")
     )
@@ -496,7 +658,7 @@ def arm_main(
     }
     driver = None
     try:
-        driver = make_driver(driver_spec)
+        driver = make_driver({**driver_spec, "period_s": period_ns / 1e9})
         start = driver.move_to_start(targets[0], driver_spec.get("start_joints"))
         log["start"] = start
         if not start["reached"]:
@@ -572,9 +734,10 @@ def arm_main(
         sync.request_stop(index + 1)
         log["outcome"], log["reason"] = "fault", f"{type(exc).__name__}: {exc}"
     finally:
+        # done streaming before the hold: a real arm's hold settles for REAL_HOLD_S, which would read as a hang
+        sync.set_state(index, FAULTED if log["outcome"] == "fault" else DONE)
         if driver is not None:
             driver.hold()
-        sync.set_state(index, FAULTED if log["outcome"] == "fault" else DONE)
         Path(out_path).write_text(json.dumps(log), encoding="utf-8")
         sync.close()
 
@@ -947,11 +1110,17 @@ def fake_plans_from_session(
 
 
 def plans_from_retarget(
-    session_dir: Path, episode: int, mode: str, *, faults: Mapping[str, dict[str, Any]] | None = None
+    session_dir: Path,
+    episode: int,
+    mode: str,
+    *,
+    faults: Mapping[str, dict[str, Any]] | None = None,
+    arms: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[ArmPlan], np.ndarray, float, dict[str, Any], dict[str, Any]]:
     """Plans that stream C3's reference path for ``episode`` (``dual_fr3_executability``): per arm the TCP
     of the retargeted joints on the command clock, started at their first joints. Refused when C4 says the
-    episode is not executable -- the reasons are in the error."""
+    episode is not executable -- the reasons are in the error. ``arms`` (each arm's ``fr3_arms.resolve``)
+    makes them plans for the real arms; without it they drive the fake ones."""
     from tools.fr3 import dual_fr3_executability as ex
 
     reference = ex.plans_from_retarget(session_dir, episode, mode)
@@ -962,12 +1131,12 @@ def plans_from_retarget(
         )
     plans = []
     for arm in ARMS:
-        spec = {
-            "kind": "fake",
-            "tool": reference["tool"].tolist(),
-            "fault": (faults or {}).get(arm),
-            "start_joints": reference["q"][arm][0].tolist(),
-        }
+        spec = {"tool": reference["tool"].tolist(), "start_joints": reference["q"][arm][0].tolist()}
+        if arms is None:
+            spec.update(kind="fake", fault=(faults or {}).get(arm))
+        else:
+            entry = arms[arm]
+            spec.update(kind="real", arm=arm, robot_ip=str(entry["robot_ip"]), payload=entry.get("payload"))
         plans.append(ArmPlan(arm, reference["targets"][arm], spec, joints=reference["q"][arm]))
     timelines = {"t_raw": reference["t_raw"], "t_ref": reference["t_ref"]}
     record = {
@@ -979,21 +1148,59 @@ def plans_from_retarget(
     return plans, reference["T_right_left"], reference["fps"], timelines, record
 
 
-def real_backend_refusal(registry: Mapping[str, Any] | None = None) -> str:
-    """Why the two real FR3s cannot be driven yet; "" once they can.
+def real_arm_entries(registry: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """Both arms as fr3_arms.json names them (B2: IP, payload; nothing falls back to a default arm);
+    ``fr3_arms.ArmConfigError`` while one is not in service (B1) or both name one IP."""
+    registry = registry or fr3_arms.load()
+    entries = {arm: fr3_arms.resolve(registry, arm) for arm in ARMS}
+    if entries["right"]["robot_ip"] == entries["left"]["robot_ip"]:
+        raise fr3_arms.ArmConfigError(f"both arms are {entries['right']['robot_ip']} in fr3_arms.json")
+    return entries
 
-    Both arms must be in service in fr3_arms.json (B1), each named there -- IP, gripper BOX, start --
-    so nothing here falls back to a default arm (B2). Then the four driver calls of the module docstring
-    have to be written against panda_py's joint position control (D1: two arms are kept apart by their
-    elbows, which only joint commands hold).
-    """
+
+def real_backend_refusal(registry: Mapping[str, Any] | None = None, *, panda_py_module: str = "panda_py") -> str:
+    """Why the two real FR3s cannot be driven; "" once they can: both in service in fr3_arms.json, and
+    panda_py importable here (on Thor it is in ~/Code/infer/.venv-fr3, which the gateway runs this with)."""
+    import importlib
+
     try:
-        registry = registry or fr3_arms.load()
-        for arm in ARMS:
-            fr3_arms.resolve(registry, arm)
+        real_arm_entries(registry)
     except fr3_arms.ArmConfigError as exc:
         return str(exc)
-    return "the real-arm driver is not written yet (roadmap D1: joint position control on both FR3s, after B1)"
+    try:
+        importlib.import_module(panda_py_module)
+    except ImportError as exc:
+        return f"{panda_py_module} does not import in {sys.executable} ({exc}); run with the FR3 venv"
+    return ""
+
+
+#: What a real plan may ask of a joint: the retarget's own velocity_scale of the FR3 limits, and a little.
+REAL_VELOCITY_TOLERANCE = 1.05
+
+
+def real_plan_problems(plans: list[ArmPlan], fps: float) -> list[str]:
+    """Why these plans may not go to the real arms: a plan without joints (they take C3's joint path), or a
+    joint faster between two frames than the retarget allows (``dual_fr3_retarget``: ``velocity_scale`` of
+    the FR3 limits) -- a plan made for another rate, or stale."""
+    from tools.fr3 import dual_fr3_retarget as rg
+
+    limit = rg.FR3_VELOCITY_LIMITS * rg.Settings().velocity_scale * REAL_VELOCITY_TOLERANCE
+    problems = []
+    for plan in plans:
+        if plan.joints is None:
+            problems.append(f"{plan.name}: no joint path (the real arms replay C3's retarget: --retarget)")
+            continue
+        speed = np.abs(np.diff(np.asarray(plan.joints), axis=0)) * fps
+        if len(speed):
+            ratio = speed.max(axis=0) / limit
+            j = int(ratio.argmax())
+            if ratio[j] > 1.0:
+                frame = int(speed[:, j].argmax())
+                problems.append(
+                    f"{plan.name}: j{j + 1} moves {speed[frame, j]:.2f} rad/s at frame {frame} at {fps:g} Hz "
+                    f"(the retarget allows {limit[j] / REAL_VELOCITY_TOLERANCE:.2f})"
+                )
+    return problems
 
 
 def _parse_fault(text: str) -> tuple[str, dict[str, Any]]:
@@ -1005,7 +1212,7 @@ def _parse_fault(text: str) -> tuple[str, dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Dual-FR3 replay of a two-hand session on fake arms (D1/D3)")
+    parser = argparse.ArgumentParser(description="Dual-FR3 replay of a two-hand session (D1/D3)")
     parser.add_argument("session", type=Path, help="a session directory with left and right sidecars")
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--spacing", type=float, default=0.8, help="assumed left base offset along +y, m")
@@ -1030,20 +1237,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, default=REPO / "outputs" / "fr3" / "dual_fr3_replay")
     args = parser.parse_args(argv)
+    arms = None
     if args.backend == "real":
+        if not args.retarget:
+            print("refused: the real arms replay C3's joint path; give --retarget absolute|relative")
+            return 2
+        if args.fault:
+            print("refused: --fault is for the fake arms")
+            return 2
         refusal = real_backend_refusal()
         if refusal:
             print(f"refused: {refusal}")
             return 2
+        arms = real_arm_entries()
     timelines, record, feasibility, edges = None, {}, None, []
     if args.retarget:
         try:
             plans, T_right_left, fps, timelines, record = plans_from_retarget(
-                args.session, args.episode, args.retarget, faults=dict(args.fault)
+                args.session, args.episode, args.retarget, faults=dict(args.fault), arms=arms
             )
         except (OSError, ValueError) as exc:
             print(f"refused: {exc}")
             return 2
+        if arms is not None:
+            problems = real_plan_problems(plans, fps)
+            if problems:
+                print("refused: " + "; ".join(problems))
+                return 2
         sigma = record["placement_sigma_mm"]
     else:
         plans, T_right_left, _, edges, feasibility = fake_plans_from_session(
@@ -1057,7 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     gate = derive_gate(sigma)
     d_gate = args.d_safe if args.d_safe is not None else gate["d_gate_m"]
-    run_dir = args.out / datetime.now(UTC).strftime("fake_%Y%m%dT%H%M%SZ")
+    run_dir = args.out / datetime.now(UTC).strftime(f"{args.backend}_%Y%m%dT%H%M%SZ")
     report = run(
         plans,
         fps=fps,

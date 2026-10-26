@@ -17077,8 +17077,8 @@ def _dual_fr3_executability_payload(dataset_root: Path, episode: int) -> dict[st
 # C3 reference path (one mode), it moves both arms to frame 0 and waits; Execute says "go" on its stdin;
 # Abort says "abort" there while it waits, or SIGTERMs it once the arms run (one stop word for both, the
 # runtime's own fault path). Only an episode C4 called executable in that mode is started. "fake" drives
-# the runtime's fake arms -- the coordination, gates and timelines, on this machine; "real" is refused
-# until both FR3s are in service and the real driver exists (the runtime says which).
+# the runtime's fake arms -- the coordination, gates and timelines, on this machine; "real" drives the two
+# FR3s of fr3_arms.json by joint position control, refused until both are in service (the runtime says why).
 
 _DUAL_REPLAY_SCRIPT = Path("tools") / "fr3" / "dual_fr3_replay_runtime.py"
 _DUAL_REPLAY_SUBDIR = Path("outputs") / "fr3" / "dual_fr3_replay"
