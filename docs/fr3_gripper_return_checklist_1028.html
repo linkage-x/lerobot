@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>夹爪回来当天复核清单</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 60px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:20px;padding:28px 32px;box-shadow:var(--shadow);margin-bottom:20px}
+  .hero h1{margin:0 0 8px;font-size:26px}
+  .hero p{margin:4px 0;color:#d1d5db}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:20px}
+  h3{margin:16px 0 8px;font-size:16px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:12px 16px;border-radius:10px;margin:10px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;white-space:nowrap}
+  td.id{font-weight:700;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .done{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+  .now{color:var(--accent);background:var(--accent-soft)}
+  .small{font-size:13px;color:var(--muted)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:1px 5px;font-size:.92em}
+  ul,ol{margin:6px 0;padding-left:22px} li{margin:3px 0}
+  pre{background:#f3f4f6;border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  input[type=checkbox]{margin-right:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>夹爪回来当天复核清单（F 线 · 10-28）</h1>
+  <p>2026-10-26 写 · 对应 <code>docs/dual_fr3_bimanual_replay_roadmap.html</code> 的 F 线（F1–F7）</p>
+  <p>夹爪返修后，先确认它不再在腕部转动时掉电，再按「负载 → 夹持 → socket 常量 → 激光」逐层复核。每一步都写了判据和对比的旧数据：不过就停在那一步，别往后跑。</p>
+</div>
+
+<div class="card">
+  <h2>范围</h2>
+  <ul>
+    <li><b>只涉及 right 臂</b>（192.168.11.102，夹爪 BOX 596523097）。第二台 FR3 还没装（B1），所以「left 的第一次 pivot」、left 同球检验（F5）、双臂 Phase 12（F7）都不在这一天。</li>
+    <li><b>手持侧</b>：手持 BOX 和 cube 也一起送修了。它们如果同一天回来，做第 7 步；没回来就跳过。</li>
+    <li><b>不需要</b>：配重盘（Q4 不加工）；E 线直接在带夹爪的构型下做。</li>
+    <li>Connect、Execute、示教拖动都由操作者按或操作，工作半径内有人时不跑自动轨迹。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>前一天（10-27）要准备好</h2>
+  <ol>
+    <li><input type="checkbox"/><b>Thor 部署到包含 B2 的版本</b>。10-26 起所有驱动 FR3 的入口都要选臂；Thor 上如果还是旧网关，GUI 不会有选臂框。部署前先 <code>-n</code> dry-run，看有没有 <code>*deleting</code>（多人共用 Thor 会互相覆盖）；只从主工作区部署；部署会杀掉 recorder，之后要重新 Connect。</li>
+    <li><input type="checkbox"/>确认 Thor 上有 <code>tools/fr3/fr3_arms.json</code>，网关 <code>GET /api/robot/arms</code> 能返回 right（在役）和 left（不在役，B1）。</li>
+    <li><input type="checkbox"/>两份 10-12 定稿的 Desk 末端配置在手边：<code>~/文档/fr3+corenetic+cam_20261012b.json</code>（无 SMR，0.9755 kg）和 <code>fr3+corenetic+cam+smr_20261012b.json</code>（有 SMR，1.1108 kg）。不带 <code>b</code> 的两份已作废。</li>
+    <li><input type="checkbox"/>第 5 步要用激光跟踪仪：确认采集 PC 上<b>没开 RadianCAL-Pro</b>（它会把实时流挤到每 5 s 只剩约 1 s）。跟踪仪断过电的话，Connect 时会依次报 13→43→22，这是冷启动流程，要等预热完成。</li>
+  </ol>
+</div>
+
+<div class="card">
+  <h2>第 0 步 · 到货确认（5 分钟）</h2>
+  <ul>
+    <li><input type="checkbox"/><b>问清厂家修了什么</b>，特别是腕部转动时 BOX 重启（见第 1 步的历史）。有没有换线缆或接头？固件版本变了没有？</li>
+    <li><input type="checkbox"/><b>BOX 的 device id 有没有变</b>。用 <code>tools/thor/box_sdk/demo.py</code> 做 discover，它会打印 <code>fw</code> 和 <code>uptime</code>。
+      <ul>
+        <li>id 仍是 596523097：什么都不用改。</li>
+        <li>换了 BOX（id 变了）：<code>fr3_arms.json</code> 的 <code>corenetic_device_id</code> 和 replay YAML 的 <code>robot.corenetic_device_id</code> 要<b>一起</b>改。<code>fr3_arms.validate</code> 会拒绝两边不一致的登记，录制器也会把未登记的 BOX 当作手持 BOX。</li>
+      </ul></li>
+    <li><input type="checkbox"/><b>指尖型号</b>：10-13 确认装的是「夹爪V2.1适配传感器指尖」。如果换了，第 3 步的尺量结果和 <code>corenetic_socket_ee</code> 常量都要重新确认。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>第 1 步 · 腕部转动通断测试（F1，约 15 分钟）<span class="badge bad">不过就停</span></h2>
+  <div class="callout bad"><b>为什么排第一</b>：返修前同一个症状出现了 6 次，每次都发生在腕部转动时。BOX 掉电重启，约 2.2 s 后夹爪张开，插件就掉了。
+    <ul>
+      <li>10-10：腕部掉电。</li>
+      <li>10-13 16:35：pivot 中 j6 摆了 123°（89°/s）。</li>
+      <li>10-13 18:10：引导 pivot 进行约 10 s、腕部正在转动时。</li>
+      <li>10-20 14:03、14:40、14:45：都在 j7 以 2–3°/s 转动时。分别在 execute 开始后 5.0 s 和 42.1 s 开机；第三次在静止驻点，力只有 2.2 N。</li>
+    </ul>
+    开机瞬间的力是 2–3 N，比跑完全程的两次试探（最大 4.6–4.8 N）还小，所以<b>不是力太大</b>，而是腕部走线的问题。</div>
+  <ol>
+    <li>装上夹爪，Desk 导入「无 SMR」配置。在 GUI 打开 ⓪ 夹爪遥控（打开期间 <code>outputs/fr3_gripper_teleop*/box_sdk.log</code> 会逐行记录设备时间戳，单位 µs、从开机算起），夹住插件。</li>
+    <li>记录开始时 discover 读到的 <code>uptime_ms</code> 和墙钟时间。</li>
+    <li>用 Desk 的示教/手拖模式，按下面顺序转腕部：
+      <ul>
+        <li>j7 全程来回 5 次：先慢（约 2–3°/s，就是出事时的速度），再快（约 30°/s）；</li>
+        <li>j6 大幅摆动 5 次（包括约 120° 的快摆）；</li>
+        <li>再在 10-13 照片里的 pivot 姿态附近（j6 约 190–213°）转 j7。</li>
+      </ul>
+      合计至少 10 分钟。注意：panda_py 的示教模式用 Panda 限位当虚拟墙（j2 ±101°、j6 ≤215°），越墙会直接 abort，所以用 Desk 自己的手拖。</li>
+    <li>结束时再 discover 一次。</li>
+  </ol>
+  <p><b>判据</b>：以下三条同时满足才算通过。</p>
+  <ul>
+    <li><code>uptime_ms</code> 的增量 ≈ 墙钟经过的时间（差 &lt; 1 s）；</li>
+    <li><code>box_sdk.log</code> 的设备时间戳单调连续，没有归零；</li>
+    <li>夹爪宽度全程稳定在 ±3 mm 内（10-13 夹插件时是 34.8 mm）。</li>
+  </ul>
+  <p>返修前每次腕部转动都在几秒到一分钟内掉电，所以连续 10 分钟不掉电是有意义的通过。</p>
+  <p><b>不过</b>：停止所有 pivot 和 replay，把时间戳和姿态交给厂家。<b>规则不变</b>：任何一次 BOX 重启之后，都要先重新进入 ⓪ 遥控（mode 1）再放插件。重启后夹爪处于 mode 0，插件夹在指间时会反复开合。</p>
+</div>
+
+<div class="card">
+  <h2>第 2 步 · 夹爪模式会不会自己掉（约 5 分钟）</h2>
+  <p>这是一个从来没验证过的问题：主机停止通信后，mode 1 和夹持目标会不会保持？数据流约 16 s 后就会老化。pivot 和遥控都依赖这一点。</p>
+  <ol>
+    <li>⓪ 遥控夹住插件，然后停止遥控（脚本发 SIGINT，只补发最后一条命令，不设 mode 0）。</li>
+    <li>等 60 s，再 discover 看 mode，并量夹爪宽度。</li>
+  </ol>
+  <p><b>判据</b>：mode 仍是 1，宽度变化 &lt; 1 mm。不满足就要记下来：pivot 和 execute 期间必须一直开着遥控，或者等 pivot 前检（BOX mode 和爪宽检查，10-13 提过、还没做）补上。</p>
+  <p class="small">已知行为（不是 bug）：真机 replay 的 <code>release_mode_on_disconnect=True</code>，每次回放结束夹爪都会张开。</p>
+</div>
+
+<div class="card">
+  <h2>第 3 步 · 负载辨识与 Desk 配置（F2，约 40 分钟）</h2>
+  <p>10-12 的两份配置是在返修前的夹爪上辨识的。返修可能换了零件，所以要重测。</p>
+  <ol>
+    <li>先 <code>fr3_move_to_start --arm right</code>（collect 会检查 j1–j4）。</li>
+    <li>在 Thor 上用 <code>.venv-fr3</code>、<code>PYTHONPATH=src</code> 跑 <code>fr3_payload_identification_runtime.py collect --arm right</code>：32 个姿态，<b>双向逼近</b>（单向采集受关节静摩擦迟滞影响，结果作废，<code>desk-config</code> 也会拒绝）。无 SMR、有 SMR 各一次。</li>
+    <li><code>fit</code>，再用 <code>desk-config</code> 生成配置：<b>不带零偏</b>的拟合。机器人不扣关节零偏，带零偏的值会设得偏重——10-12 下午实测推翻过。</li>
+  </ol>
+  <div class="scroll"><table>
+    <tr><th>对比项</th><th>10-12 定稿（返修前）</th><th>判据</th></tr>
+    <tr><td>无 SMR</td><td>0.9755 kg，质心 (12.8, −19.0, 56.9) mm；三次重复性 ±2 g</td><td rowspan="2">|Δm| ≤ 50 g 且 |Δ质心| ≤ 10 mm（就是 <code>fr3_arms.PAYLOAD_TOL_*</code>）：沿用旧配置。否则导入新配置。</td></tr>
+    <tr><td>有 SMR</td><td>1.1108 kg，质心 (16.8, −22.2, 60.9) mm；与无 SMR 的差分 140 g</td></tr>
+    <tr><td>闭环（导入后再跑一次 collect）</td><td>Fz −0.17 N（预测 −0.18），|F| 最大 1.22 N；残余 Fx ≈ −0.76、Fy ≈ −0.36 N 是传感器零偏，改负载消不掉</td><td>Fz 在 ±0.5 N 内</td></tr>
+  </table></div>
+  <ol start="4">
+    <li><input type="checkbox"/>把采用的值写进 <code>tools/fr3/fr3_arms.json</code> 里 right 的 <code>payload</code>（现在是 <code>null</code>）：<code>{"mass_kg": …, "com_m": [x, y, z], "source": "F2 10-28 collect …"}</code>。从此 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 right） 会在 Desk 配置不符时（比如设成了另一种 SMR 状态）拒绝起跑。一次登记只能对应一种 SMR 状态；第 5 步装 SMR 时，记得同时切换 Desk 配置和这里的登记。</li>
+    <li><input type="checkbox"/>改了 <code>fr3_arms.json</code> 以后跑一次 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 right），确认负载那一行显示 <code>matches</code>。</li>
+  </ol>
+  <p class="small">背景：10-10 回放下沉的 5.5 mm 几乎全部是 Desk 负载设轻了（0.7496 kg 对实际 1.1108 kg）。负载错，后面的误差就全是假的。E 线还没在配重构型下做过，所以不需要按新旧差值重新解读任何结论。</p>
+</div>
+
+<div class="card">
+  <h2>第 4 步 · socket 常量：逐夹持试探（F3，约 1 小时）</h2>
+  <p>要回答的问题：<b>每重新夹一次插件，socket 中心在工具系里移动多少？</b>答案决定两件事：生产里的 <code>corenetic_socket_ee</code> 常量（= <code>corenetic_gripper_ee</code> + (0, 0, −10.3) mm，10-13 由端到端测得）能不能继续当常数用，还是每次夹持都必须先试探。</p>
+  <div class="callout warn">返修前的证据是互相矛盾的：
+    <ul>
+      <li>同一夹持内拟合很好（rms 0.78–1.11 mm）；</li>
+      <li>但 10-20 一天七次拟合，<code>s_socket</code> 的 z 从 −0.56 变到 8.77 mm；</li>
+      <li>15:03 → 15:42 之间插件在夹爪里挪了约 5.6 mm；</li>
+      <li>10-19 18:16 一次是 |s| = 8.7 mm。</li>
+    </ul>
+    此外，10-20 的 s 和 10-12 端到端之间的 14.1 mm z 差从来没分析过。</div>
+  <ol>
+    <li><input type="checkbox"/><b>尺量</b>：夹爪闭合时，量法兰面到传感器鼻尖的距离（10-13 实测约 175 mm，CAD 是 184 mm；URDF 指尖链沿轴比实物长约 9 mm）；再量夹住插件时的距离（端到端预测 173.9 mm）。这一步只要一把尺子，就能判断「连杆张开时指尖后退多少」（CAD 算 4.55 mm，端到端隐含约 1.1 mm）。</li>
+    <li><input type="checkbox"/>在 GUI 的标定中心 → FR3 球窝 pivot：⓪ 夹插件 → ① 取球心 → 「规划试探」（<code>plan --probe</code>：≤20°、6 个驻点、3°/s）→ 执行 → 网关自动拟合。试探完<b>不要重新取球心</b>，直接用同一个球心规划完整 pivot（自动勾选 anchor），再执行。</li>
+    <li><input type="checkbox"/>松开插件、重新夹，从「试探」开始重复，<b>至少 3 次夹持</b>。每次记录：夹爪宽度、<code>s_socket</code>、rms、转角跨度。</li>
+  </ol>
+  <div class="scroll"><table>
+    <tr><th>看什么</th><th>返修前的参照</th><th>判据 / 结论怎么下</th></tr>
+    <tr><td>同一夹持内的拟合</td><td>rms 0.78–1.11 mm；10-20 17:27 完整规划 rms 0.95 / p95 1.59、跨度 43.8°</td><td>rms ≤ 1.2 mm，且接触 100%（F_ball 压力从不为负）</td></tr>
+    <tr><td>跨夹持的 <code>s_socket</code> 散布</td><td>10-20：z 方向 −0.56…8.77 mm</td><td>散布 ≤ 1 mm：常量可用（再拿激光核一次，第 5 步）。散布 &gt; 2 mm：<b>每次夹持都必须先试探</b>，回放和标签都要记录本次夹持的 s。</td></tr>
+    <tr><td>执行时的力</td><td>10-20 17:27：F_ball 最大 4.53 N（F_ext 读到 11.2 N 是 6D 分解假象）</td><td>按 F_ball 看；7 N 停机</td></tr>
+  </table></div>
+  <p class="small">不要再做的事（返修前已经证伪）：</p>
+  <ul class="small">
+    <li>用加大旋转刚度来解决跟随滞后（K_rot 150 时腕部起振）；</li>
+    <li>从 F_ext 的压力负号推断「杯子在拽球」；</li>
+    <li>把压入上限设成 3 mm（指垫会变形，试探实际需要 3.6–5.2 mm）。</li>
+  </ul>
+  <p class="small">另外：15:26 那次换成 j6 190° / j7 76° 的起始姿态后，一起步就刚性受阻，原因未查。从跑通过的姿态范围（j6 约 130–165°、j7 约 105–150°）开始。</p>
+</div>
+
+<div class="card">
+  <h2>第 5 步 · 激光核一次（F3 / E2，约 1 小时）</h2>
+  <p>SMR 装到夹爪上，Desk 和 <code>fr3_arms.json</code> 的负载登记一起切到「有 SMR」。起始姿态时让 SMR 开口正对跟踪仪：10-10 三次丢光都发生在接收锥边缘。</p>
+  <ol>
+    <li><input type="checkbox"/>同一条 episode 用 lead 3 做真机回放两次，再用 Episode Replay 页的「Laser vs FR3 Replay Error」面板分析。</li>
+    <li><input type="checkbox"/>如果有带激光的录制段（参照 10-13 的 <code>thor_gmsl2_10ch_v1_20261013_110115</code> ep0），再做一次端到端对比。</li>
+  </ol>
+  <div class="scroll"><table>
+    <tr><th>指标</th><th>返修前参照</th><th>判据</th></tr>
+    <tr><td>激光 vs FK</td><td>0.25–0.51 mm（10-10 / 10-12 / 10-13）</td><td>≤ 0.6 mm。这一项与夹爪无关，变大说明标定或站位出了问题。</td></tr>
+    <tr><td>激光 vs 指令（lead 3）</td><td>10-12：2.80 / 2.68 mm rms；10-13：2.36 / p95 3.76 mm</td><td>rms ≤ 3 mm；两次之间差 ≤ 0.9 mm rms（10-12 是 0.62 mm）</td></tr>
+    <tr><td>固定偏置（下沉）</td><td>负载设对之后是 (0.0, 0.2, 0.7) mm</td><td>|偏置| ≤ 1.5 mm。偏大就回第 3 步。</td></tr>
+    <tr><td>端到端：TCP 系沿轴的残差</td><td>10-13 换成 socket 系之后 z 残差 0.6 mm；跟踪仪系 rms 5.35 / p95 7.74 mm</td><td>z 残差 ≤ 1.5 mm 说明 −10.3 mm 常量仍然成立。z 变了，就说明返修改了夹持几何，用第 4 步实测的 s 更新 <code>corenetic_socket_ee</code>（改 URDF 会变模型指纹，MuJoCo 校验要重跑）。</td></tr>
+  </table></div>
+  <p class="small">口径：7.74 mm 衡量的是「FR3 复现这条演示」的能力，不是 UMI 标签的精度。剩下约 4.6 mm 的常量来自 world→fr3_base 注册边。</p>
+</div>
+
+<div class="card">
+  <h2>第 6 步 · 收尾：记录与回写</h2>
+  <ul>
+    <li><input type="checkbox"/><code>fr3_arms.json</code>：right 的 <code>payload</code> 和 <code>payload_note</code> 填上 10-28 的实测值，去掉「夹爪送修」的说明。</li>
+    <li><input type="checkbox"/>roadmap F 线逐项写结果，特别是：第 1 步过没过、跨夹持散布、z 残差。</li>
+    <li><input type="checkbox"/>如果 <code>corenetic_socket_ee</code> 改了：URDF/MJCF 一起改（<code>~/cad/corenetic_smr_cam</code> 的 rebuild 脚本不幂等，只能从旧文件开始跑），跑 <code>tests/robots/test_fr3_socket_frame.py</code>，重跑 MuJoCo 校验。</li>
+    <li><input type="checkbox"/>如果第 1 步没过：pivot 前检（BOX mode 和爪宽）和运行中「BOX 重启即停」要提前做，否则 pivot 数据一直不可信。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>第 7 步 · 手持侧（如果手持 BOX 和 cube 同一天回来）</h2>
+  <ul>
+    <li><input type="checkbox"/><b>BOX 身份</b>：left 是 box1672693301，right 是 box1819152274。marker→TCP bundle 和 d_box 表都按 box id 索引；BOX 换过的话，那只手的标签链就对不上了（A3 会把它标成未验证，但要先知道发生了这件事）。</li>
+    <li><input type="checkbox"/><b>A4 静止可见性检查</b>：左右 cube 各在相机区静止 10 s，确认每台相机的检测率与返修前一致（cam_12 和 cam_14 本来就只有 7–9% 的帧看得到 cube）。</li>
+    <li><input type="checkbox"/>标定中心里的 BOX 校准三个按钮（6D 软件零点、6D origin、touch）各做一次。扳机读数是 0–100 的百分比（SDK 文档写的「cm」是错的）。</li>
+    <li><input type="checkbox"/><b>F4 左手标签链</b>：这一天能开始做的是 left marker→TCP 的跟踪仪 pivot（替换 0825 的声明值）和 left 的 d_box。做完之后，A3 的 unvalidated 标记会<b>自动</b>摘掉，因为它是从 bundle 的激光状态和 d_box 表读出来的，不需要人改。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>这一天不做的事</h2>
+  <ul>
+    <li>第 1 步没过之前，不跑任何长轨迹，也不跑 pivot execute。</li>
+    <li>left 臂相关的 F4 后半段、F5 同球检验、F7 双臂 benchmark：要等第二台 FR3（B1）。</li>
+    <li>E 线基准矩阵（E1）：要等法兰或夹爪上的 SMR 转接件（Q4 暂不加工）。</li>
+    <li>ILC：10-12 已经决定先不做，只有 &lt;3 mm 公差的接触任务回放失败时才考虑。</li>
+  </ul>
+</div>
+
+</div>
+</body>
+</html>
