@@ -485,6 +485,15 @@ class RealFr3Driver:
                 f"joints {', '.join(f'j{j + 1}' for j in beyond)} are past panda_py's walls now; "
                 "a controller started there aborts -- move the arm back in teaching mode"
             )
+        # inside the walls but past the arm's own limits: the transport pose (j4 -3.050 on 10-26's new arm),
+        # where the robot refuses motion; only Desk's guiding brings it in
+        past_limits = np.flatnonzero((q_now < kin._FR3_LOWER) | (q_now > kin._FR3_UPPER))
+        past_limits = [j for j in past_limits if j not in beyond]
+        if past_limits:
+            problems.append(
+                f"joints {', '.join(f'j{j + 1}' for j in past_limits)} are past the FR3 joint limits now "
+                "(the transport pose?); guide the arm in with Desk first"
+            )
         outside = np.flatnonzero((joints < kin.Q_LOWER) | (joints > kin.Q_UPPER))
         if len(outside):
             problems.append(f"the start joints put {', '.join(f'j{j + 1}' for j in outside)} past the walls")
@@ -1039,20 +1048,28 @@ def hand_targets(track: Mapping[int, Mapping[str, Any]], stride: int = 1) -> np.
 ASSUMED_PLACEMENT_SIGMA_MM = 20.0
 
 
-def assumed_placement_graph(graph: Mapping[str, Any], T_right_left: np.ndarray, note: str) -> dict[str, Any]:
-    """``graph`` plus an edge placing ``fr3_base_left`` where it is assumed to be -- for fake runs only; the
-    edge's method says so, and no real replay can be fed a graph that was not read from disk."""
-    from tools.thor.gmsl2 import world_provenance as wp
-
+def assumed_placement_graph(
+    graph: Mapping[str, Any], T_right_left: np.ndarray, note: str, description: Mapping[str, Any]
+) -> dict[str, Any]:
+    """``graph`` plus an edge placing the base that is not the dataset's (``description``'s other root) where
+    it is assumed to be -- for fake runs and offline checks only; the edge's method says so, and no real replay
+    can be fed a graph that was not read from disk."""
+    roots = {arm: str(description["arms"][arm]["root"]) for arm in ARMS}
+    reference = str(description["dataset_frame"])
+    if sorted(roots.values()).count(reference) != 1:
+        raise ValueError(f"one arm's base must be the dataset's {reference}, not {roots}")
+    placed = next(arm for arm in ARMS if roots[arm] != reference)
+    # the edge maps the placed base into the reference: T_right_left when the left is placed, else its inverse
+    T_ref_placed = np.asarray(T_right_left) if placed == "left" else np.linalg.inv(T_right_left)
     out = json.loads(json.dumps(graph))
     out.setdefault("nodes", []).append(
-        {"world_frame_id": "fr3_base_left", "reason": "robot_base", "parent_world_frame_id": None}
+        {"world_frame_id": roots[placed], "reason": "robot_base", "parent_world_frame_id": None}
     )
     out.setdefault("edges", []).append(
         {
-            "from_world_frame_id": "fr3_base_left",
-            "to_world_frame_id": wp.FR3_BASE_WORLD_ID,
-            "T_to_from": np.asarray(T_right_left).tolist(),
+            "from_world_frame_id": roots[placed],
+            "to_world_frame_id": reference,
+            "T_to_from": T_ref_placed.tolist(),
             "method": f"assumed_placement: {note}; not measured",
             "sigma_mm": ASSUMED_PLACEMENT_SIGMA_MM,
             "created_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1078,7 +1095,10 @@ def fake_plans_from_session(
     T_right_left = np.eye(4)
     T_right_left[1, 3] = spacing_m
     graph = assumed_placement_graph(
-        wp.read_world_graph(REPO), T_right_left, f"left base {spacing_m} m along +y of the right, parallel"
+        wp.read_world_graph(REPO),
+        T_right_left,
+        f"left base {spacing_m} m along +y of the right, parallel",
+        description,
     )
     tool = kin.urdf_fixed_transform(description["arms"]["right"]["tcp_frame"])
     plans, edges = [], []

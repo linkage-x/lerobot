@@ -88,10 +88,14 @@ def test_what_a_real_arm_refuses_before_it_moves() -> None:
         _driver().move_to_start(T0, None)
     with pytest.raises(rt.ArmFaultError, match="j1 are past panda_py's walls now"):
         _driver("10.0.0.1#q=1:2.95").move_to_start(T0, q0)
+    with pytest.raises(rt.ArmFaultError, match="j4 are past the FR3 joint limits now"):
+        _driver("10.0.0.1#q=4:-3.0504").move_to_start(T0, q0)  # the new arm's transport pose, 10-26
     declared = {"mass_kg": 0.0, "com_m": [0.0, 0.0, 0.0], "source": "bare flange"}
     with pytest.raises(rt.ArmFaultError, match="does NOT match"):
         _driver("10.0.0.1#m_ee=1.111", payload=declared).move_to_start(T0, q0)
-    assert _driver(payload=declared).move_to_start(T0, q0)["reached"]
+    matching = _driver(payload=declared)
+    assert matching.move_to_start(T0, q0)["reached"]
+    matching.hold()  # a controller left running outlives the test and ticks whatever clock the next one fakes
     driver = _driver()
     with pytest.raises(rt.ArmFaultError, match="before move_to_start"):
         driver.command(None, 0, kin.Q_READY)
@@ -156,19 +160,17 @@ def test_real_plans_must_be_joint_paths_within_the_retarget_s_speed() -> None:
 def test_the_real_backend_needs_both_arms_and_panda_py() -> None:
     from tools.fr3 import fr3_arms
 
-    registry = fr3_arms.load()
-    assert rt.real_backend_refusal(registry, panda_py_module=STUB).startswith(
-        "the left arm is not in service"
-    )
-    both = copy.deepcopy(registry)
-    both["arms"]["left"].update(in_service=True, robot_ip="192.168.11.103")
+    both = fr3_arms.load()  # both in service since 10-26 (B1)
+    one = copy.deepcopy(both)
+    one["arms"]["right"].update(in_service=False, why_not="B1: not cabled")
+    assert rt.real_backend_refusal(one, panda_py_module=STUB).startswith("the right arm is not in service")
     assert rt.real_backend_refusal(both, panda_py_module=STUB) == ""
     assert "does not import" in rt.real_backend_refusal(both, panda_py_module="no_such_panda_py")
     same = copy.deepcopy(both)
     same["arms"]["left"]["robot_ip"] = same["arms"]["right"]["robot_ip"]
     assert "both arms are" in rt.real_backend_refusal(same, panda_py_module=STUB)
     entries = rt.real_arm_entries(both)
-    assert entries["left"]["robot_ip"] == "192.168.11.103" and entries["right"]["arm"] == "right"
+    assert entries["left"]["robot_ip"] == "192.168.11.102" and entries["right"]["robot_ip"] == "192.168.1.210"
 
 
 def test_the_cli_takes_real_arms_only_on_a_retarget(capsys, tmp_path) -> None:

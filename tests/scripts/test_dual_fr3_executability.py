@@ -13,7 +13,7 @@ from tests.scripts.test_dual_fr3_replay_modes import (
     TOOL,
     description,
     graph,
-    hands_in_right_base,
+    hands_in_left_base,
     write_session,
 )
 from tools.fr3 import (
@@ -43,7 +43,7 @@ def _evaluate(session: Path, mode: str = "absolute", g: dict | None = None) -> d
 
 
 def test_every_episode_gets_a_verdict_and_the_labels_stay_as_they_were(tmp_path: Path) -> None:
-    session = write_session(tmp_path, "s", [hands_in_right_base(40), hands_in_right_base(36, phase=1.0)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(40), hands_in_left_base(36, phase=1.0)])
     before = _digest(session)
     out = _evaluate(session)
     assert _digest(session) == before  # info.json and the sidecars untouched
@@ -60,7 +60,7 @@ def test_every_episode_gets_a_verdict_and_the_labels_stay_as_they_were(tmp_path:
 
 
 def test_a_refused_mode_is_a_verdict_too_and_modes_are_kept_apart(tmp_path: Path) -> None:
-    session = write_session(tmp_path, "s", [hands_in_right_base(30)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(30)])
     moved = copy.deepcopy(EXPORT_EDGE)
     moved["created_utc"] = "2026-11-01T00:00:00Z"
     _evaluate(session, "relative", graph(export_edge=moved))
@@ -71,15 +71,16 @@ def test_a_refused_mode_is_a_verdict_too_and_modes_are_kept_apart(tmp_path: Path
 
 
 def test_the_replay_streams_the_reference_path_and_keeps_three_time_axes(tmp_path: Path) -> None:
-    session = write_session(tmp_path, "s", [hands_in_right_base(40)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(40)])
     _evaluate(session)
     reference = ex.plans_from_retarget(session, 0, "absolute")
     assert reference["fps"] == ex.DEFAULT_REPLAY_FPS
-    labels = hands_in_right_base(40)
+    labels = hands_in_left_base(40)
     # 60 fps labels at 20 Hz, three times slower: one command per label
-    assert len(reference["targets"]["right"]) == 40
-    assert np.abs(reference["targets"]["right"][:, :3, 3] - labels["right"][:, :3, 3]).max() < 5e-4
-    assert np.allclose(reference["targets"]["left"], kin.NOMINAL.fk(reference["q"]["left"]) @ TOOL)
+    assert len(reference["targets"]["left"]) == 40
+    # the left arm's base is the labels' (fr3_base); the right arm's targets are in its own base
+    assert np.abs(reference["targets"]["left"][:, :3, 3] - labels["left"][:, :3, 3]).max() < 5e-4
+    assert np.allclose(reference["targets"]["right"], kin.NOMINAL.fk(reference["q"]["right"]) @ TOOL)
 
     plans, T_right_left, fps, timelines, record = rt.plans_from_retarget(session, 0, "absolute")
     assert plans[0].joints is not None and record["scene_fingerprint"]
@@ -95,7 +96,7 @@ def test_the_replay_streams_the_reference_path_and_keeps_three_time_axes(tmp_pat
 
 
 def test_a_replay_of_an_episode_c4_rejected_is_refused(tmp_path: Path) -> None:
-    session = write_session(tmp_path, "s", [hands_in_right_base(30)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(30)])
     _evaluate(session)
     path, _ = ex.retarget_paths(session, 0, "absolute")
     report = json.loads(path.read_text())
@@ -111,7 +112,7 @@ def test_the_operator_s_abort_stops_both_arms_together(tmp_path: Path) -> None:
     import signal
     import threading
 
-    session = write_session(tmp_path, "s", [hands_in_right_base(40)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(40)])
     _evaluate(session)
     plans, T_right_left, _, timelines, _ = rt.plans_from_retarget(session, 0, "absolute")
 
@@ -133,8 +134,8 @@ def test_the_operator_s_abort_stops_both_arms_together(tmp_path: Path) -> None:
 def test_the_real_backend_says_what_it_still_waits_for() -> None:
     from tools.fr3 import fr3_arms
 
-    registry = fr3_arms.load()
-    assert rt.real_backend_refusal(registry).startswith("the left arm is not in service: B1")
-    both = copy.deepcopy(registry)
-    both["arms"]["left"].update(in_service=True, robot_ip="192.168.11.103")
-    assert rt.real_backend_refusal(both, panda_py_module="tests.scripts.fake_panda_py") == ""
+    registry = fr3_arms.load()  # both in service since 10-26 (B1)
+    assert rt.real_backend_refusal(registry, panda_py_module="tests.scripts.fake_panda_py") == ""
+    one = copy.deepcopy(registry)
+    one["arms"]["right"].update(in_service=False, why_not="B1: not cabled")
+    assert rt.real_backend_refusal(one).startswith("the right arm is not in service: B1")

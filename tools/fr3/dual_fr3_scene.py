@@ -80,12 +80,14 @@ def table_obstacle(height_m: float = 0.0) -> dict[str, Any]:
 
 
 def camera_obstacles(
-    repo_root: Path | str = REPO, graph: Mapping[str, Any] | None = None
+    repo_root: Path | str = REPO, graph: Mapping[str, Any] | None = None, frame: str = wp.FR3_BASE_WORLD_ID
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Each registered camera as a ball at its optical centre in the right base, and where that came from.
+    """Each registered camera as a ball at its optical centre in ``frame``, and where that came from.
 
-    Positions come from ``world_registration.json`` (``camera_poses_in_world``, T_world_cam) through the
-    world graph's edge into ``fr3_base``; nothing when either is missing, with the reason in the source.
+    ``frame`` is the right arm's base, the frame the collision checks work in -- since 10-26 that is not
+    ``fr3_base`` (the left arm's) but the embodiment's right root. Positions come from
+    ``world_registration.json`` (``camera_poses_in_world``, T_world_cam) through the world graph into
+    ``frame``; nothing when either is missing, with the reason in the source.
     """
     repo_root = Path(repo_root)
     path = repo_root / wp.WORLD_SUBDIR / wp.WORLD_REGISTRATION_FILE
@@ -95,11 +97,9 @@ def camera_obstacles(
         return [], {"cameras": f"not placed: {path} unreadable ({exc})"}
     graph = graph if graph is not None else wp.read_world_graph(repo_root)
     world = str(registration.get("world_frame_id") or "")
-    found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID) if world else None
+    found = wp.world_transform(graph, world, frame) if world else None
     if found is None:
-        return [], {
-            "cameras": f"not placed: no edge from {world or '(no world id)'} to {wp.FR3_BASE_WORLD_ID}"
-        }
+        return [], {"cameras": f"not placed: no edge from {world or '(no world id)'} to {frame}"}
     T_base_world = np.asarray(found[0], dtype=np.float64)
     obstacles = []
     for name, pose in sorted((registration.get("camera_poses_in_world") or {}).items()):
@@ -118,6 +118,7 @@ def camera_obstacles(
         "cameras": str(path.relative_to(repo_root)),
         "calibration_id": registration.get("calibration_id"),
         "world_frame_id": world,
+        "frame": frame,
         "edges": found[1],
     }
     return obstacles, source

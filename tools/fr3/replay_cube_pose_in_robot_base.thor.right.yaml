@@ -1,0 +1,137 @@
+# The right FR3 (192.168.1.210, in since 10-26; roadmap B1). A copy of the left arm's
+# third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml with
+# only the robot block changed: the flange is bare, so there is no BOX to pin and the gripper is a mock
+# (an unpinned corenetic backend would discover and drive whichever BOX answers, 10-09). The TCP stays
+# corenetic_socket_ee -- the virtual point D5 drives on a bare flange, the same point as on the left arm.
+robot:
+  type: franka_research3
+  robot_ip: 192.168.1.210
+  gripper_backend: mock
+  corenetic_device_id: null
+  allow_mock_gripper: true
+  urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
+  # The pivot insert's socket centre, (1.45, -0.78, -5.06) mm in corenetic_gripper_ee (FR3 pivot, 10-14):
+  # the point the camera EE trajectories label (see the URDF). Real replay, MuJoCo preview and IK QC agree.
+  target_frame_name: corenetic_socket_ee
+  ik_solver: hirol_gaussian_newton
+  use_otg: false
+
+end_effector:
+  mode: robot_config
+  franka_hand_tcp_frame_name: fr3_hand_tcp
+  fr3_ee_frame_name: fr3_ee
+
+input:
+  # Use the AprilTag tracking sidecar produced by run_april_cube_tracking_on_thor.sh.
+  # state_action.<cube>.csv stores robot-base poses for robot.target_frame_name
+  # above: the socket centre, on fr3_corenetic_gripper.urdf::corenetic_gripper_ee axes.
+  # Select the cube by changing the final CSV name:
+  #   state_action.left.csv
+  #   state_action.right.csv
+  #   state_action.head.csv
+  source: csv
+  csv_path: /home/nvidia/lerobot/outputs/datasets/<thor_dataset_name>/derived/april_cube_tracking_in_robot_base/state_action.right.csv
+  pose_prefix: state
+  dataset_pose_name: right
+  skip_invalid_rows: true
+  # The handheld BOX was squeezed on a tube with the trigger pressed home: its jaw stopped at
+  # the tube (32.3 mm, flat while the trigger read 96-100 %). Replaying that width parks the
+  # arm's gripper at contact with no grip, so frames with the trigger >= 90 % command it shut
+  # and the tube stops it, as it stopped the handheld.
+  grasp_trigger_close_pct: 90
+  grasp_closed_width_m: 0.0
+
+episode_length:
+  mode: source
+  fixed_length: 1000
+  truncate_if_longer: true
+  pad_with_last_pose: true
+
+replay:
+  # Conservative hardware profile: replay slower than the recorded 60 fps stream.
+  replay_fps: 20
+  # Fallback opening for frames without a recorded one.
+  gripper_pos: 1.0
+  # Replay the recorded jaw opening (the sidecar's gripper_width_m, filled from
+  # box_gripper.distance_m) -- the corenetic gripper takes the same metres.
+  use_dataset_gripper_for_replay: true
+  use_observed_gripper_for_replay: false
+  enable_gripper_hotkeys: true
+  gripper_open_key: o
+  gripper_close_key: c
+  gripper_increase_key: ']'
+  gripper_decrease_key: '['
+  gripper_step_delta: 0.05
+  gripper_open_pos: 1.0
+  gripper_close_pos: 0.0
+  keyboard_poll_timeout_s: 0.1
+  start_key: s
+  quit_key: q
+  initial_pose_mode: current
+  move_to_start_before_initial_pose: null
+  home_settle_time_s: 0.2
+  initial_joint_pose_timeout_s: 8.0
+  initial_joint_pose_tolerance_rad: 0.02
+  initial_joint_pose_poll_interval_s: 0.02
+  settle_time_after_initial_pose_s: 0.2
+  # Stream the recorded absolute pose. Incremental commands derived from the
+  # current pose can remain only a few millimetres ahead and never catch a
+  # faster recorded segment when OTG is enabled.
+  use_incremental_planning: false
+  pose_command_lead_frames: 0
+  target_position_offset_m: [0.0, 0.0, 0.0]
+  max_translation_step_m: 0.005
+  max_rotation_step_deg: 1.0
+  initial_max_translation_step_m: 0.01
+  initial_max_rotation_step_deg: 2.0
+  initial_command_interval_s: 0.05
+  max_command_steps_for_initial_pose: 180
+  command_interval_s: 0.05
+  position_tolerance_m: 0.012
+  orientation_tolerance_deg: 6.0
+  fail_on_unreached_initial_pose: true
+  # Stop instead of continuing to stream targets after a controller/user stop.
+  abort_on_tracking_error: true
+  max_target_position_error_m: 0.05
+  max_target_orientation_error_deg: 15.0
+  max_command_position_error_m: 0.03
+  max_command_orientation_error_deg: 8.0
+  tracking_error_grace_frames: 10
+  tracking_error_consecutive_frames: 5
+  print_every_n_frames: 30
+  pose_trace_enable: true
+  pose_trace_plot_enable: true
+  pose_trace_output_dir: null
+  pose_trace_max_plot_points: 2500
+  report_json_path: null
+
+controller:
+  use_otg: true
+  # Softer gains already used by the Thor FR3 calibration motion profile.
+  stiffness: [300, 300, 300, 300, 120, 80, 30]
+  damping: [25, 25, 25, 25, 10, 8, 5]
+  otg_control_frequency: 800.0
+  otg_async_control_frequency: 1000.0
+  otg_synchronization: true
+  otg_sync_mode: time
+  # Moderate limits: below the robot defaults, matching the acceleration and
+  # jerk profile already used for Thor calibration motion.
+  otg_max_velocity: [1.0, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5]
+  otg_max_acceleration: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+  otg_max_jerk: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+
+joint_jump_guard:
+  enable: true
+  max_abs_delta_rad: 0.35
+  max_l2_delta_rad: 0.70
+  max_shrink_steps: 4
+  shrink_factor: 0.5
+  violation_policy: hold_current_pose
+
+base_relocalization:
+  mode: fixed
+  calibration_root: /home/nvidia/lerobot/outputs/calibration
+  fixed_camera_run_name: hikon_fixed_camera_in_base_from_moving_charuco
+  auxiliary_marker_run_name: hikon_auxiliary_aruco_markers_in_base
+  use_joint_solution: true
+  abort_replay_on_failure: true

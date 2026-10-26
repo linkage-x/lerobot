@@ -15,9 +15,9 @@ that in exactly the things this file names:
   holds its controller settings (IP, gripper BOX, URDF). The config file stays the one place for those;
   this file only points at it, so the two cannot disagree.
 
-A dataset is exported in one frame (``dataset_frame``; the right arm's base, as today), both hands
-together, so ``T_LR = inv(T_L) T_R`` stays a product of two columns of one file. Getting the left hand's
-target into the left arm's base is the replay's job, through the graph (:func:`arm_transform`), and the
+A dataset is exported in one frame (``dataset_frame``: ``fr3_base``, the registered arm's base -- the left
+arm's since 10-26), both hands together, so ``T_LR = inv(T_L) T_R`` stays a product of two columns of one
+file. Getting the other hand's target into the other arm's base is the replay's job, through the graph (:func:`arm_transform`), and the
 edges it used go into the replay report. That is the C0 decision: the bases are split in the robot's
 description, not in the dataset.
 

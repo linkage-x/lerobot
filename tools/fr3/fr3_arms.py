@@ -5,7 +5,8 @@ Roadmap docs/dual_fr3_bimanual_replay_roadmap.html, B2. Until 10-26 every tool t
 that was a convenience; with two it is the way the wrong arm moves. So:
 
 * ``fr3_arms.json`` holds each arm's identity and mounting: ``robot_ip``, the gripper BOX
-  (``corenetic_device_id`` -- 10-09 an unpinned BOX discovery picked the handheld), the end-effector
+  (``corenetic_device_id`` -- 10-09 an unpinned BOX discovery picked the handheld; null, with
+  ``no_gripper_why``, for an arm with a bare flange, whose replay YAML then drives a mock gripper), the end-effector
   ``payload`` Desk should hold, ``start_joints_rad`` and its ``replay_config``. The replay YAML still holds the
   controller settings; :func:`validate` refuses a registry whose IP or BOX disagrees with it.
 * :func:`resolve` is what every entry point calls. It takes an arm name or an IP and returns the arm; given
@@ -81,7 +82,10 @@ def validate(registry: Mapping[str, Any], *, repo_root: Path | str = _REPO_ROOT)
             continue
         if not _ipv4(arm.get("robot_ip")):
             problems.append(f"arm {name}: robot_ip {arm.get('robot_ip')!r} is not an IPv4 address")
-        if not isinstance(arm.get("corenetic_device_id"), int):
+        if arm.get("corenetic_device_id") is None:
+            if not str(arm.get("no_gripper_why") or "").strip():
+                problems.append(f"arm {name}: no gripper BOX (corenetic_device_id null) needs no_gripper_why")
+        elif not isinstance(arm.get("corenetic_device_id"), int):
             problems.append(f"arm {name}: corenetic_device_id must be the arm's gripper BOX id")
         start = arm.get("start_joints_rad")
         if not (isinstance(start, Sequence) and len(start) == 7 and all(math.isfinite(float(v)) for v in start)):
@@ -105,7 +109,7 @@ def validate(registry: Mapping[str, Any], *, repo_root: Path | str = _REPO_ROOT)
                 problems.append(f"arm {name}: {key} {arm.get(key)!r} but {config} says {robot.get(key)!r}")
     serving = {n: a for n, a in arms.items() if a.get("in_service")}
     for key in ("robot_ip", "corenetic_device_id"):
-        values = [str(a.get(key)) for a in serving.values()]
+        values = [str(a.get(key)) for a in serving.values() if a.get(key) is not None]
         if len(values) != len(set(values)):
             problems.append(f"two arms share {key}: {values}")
     return problems

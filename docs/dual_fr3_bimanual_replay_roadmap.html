@@ -39,8 +39,15 @@
 
 <div class="hero">
   <h1>双手轨迹与双 FR3 Replay Roadmap</h1>
-  <p>v1.7 · 2026-10-26（v1.7：A3、B2、D4 完成并提交；D2 的估计器和报告在假机器人上落地；夹爪回来当天的复核清单见 <code>docs/fr3_gripper_return_checklist_1028.html</code>；v1.6：C1–C4 落地——双臂 MuJoCo 场景、两种回放模式、整段双臂联合 retarget、可执行性写进数据集并在 replay 页显示；D3 换成 C3 的碰撞模型；三个新发现：「0–18 % 帧够不着」是逐帧 IK 的种子假象、双臂回放必须流关节而不是 TCP、MuJoCo 的网格距离在部分网格对上会返回 0；v1.5：A5① 拼对生成器、D1/D3 双臂 runtime（假机器人）落地；A1 的 T_LR 台阶改在 base 系读；夹爪 10-28 回来，Q4 暂不加工；v1.4：Q3 已答——手持 cube 也送修，A4 改为等 cube；加 A5「cube 回来之前的替代双手轨迹」，调整下一批；v1.3 · 10-23 第一批开工：G1 / G2 / G3 / A1 代码落地，并据此改了四个前提——已有数据里没有双手、C0 不拆数据集、B3 只能到约 3 mm、闭环只抓粗差；v1.1 加「注册：单 FR3 → 双 FR3 → 人形」与「拿到真实数据之前」两节、G 线；v1.2 按 Q1/Q2/Q7 的回答改：第二台放左边、两台定位后不动、人形是轮式可移动，加 H 线）· 从 <code>docs/box_umi_trajectory_gt_replay_roadmap.html</code> 的 Phase 8–12 拆出，专管「双手轨迹 → 双 FR3 回放」这一条线</p>
+  <p>v1.8 · 2026-10-26 晚（v1.8：B1 开始——第二台接上，<b>左右对调</b>：192.168.11.102 = left、新的 192.168.1.210 = right，两台 base 都挪过、还不是最终位置，fr3_base 的注册边失效，见下方「10-26 晚」；v1.7：A3、B2、D4 完成并提交；D2 的估计器和报告在假机器人上落地；夹爪回来当天的复核清单见 <code>docs/fr3_gripper_return_checklist_1028.html</code>；v1.6：C1–C4 落地——双臂 MuJoCo 场景、两种回放模式、整段双臂联合 retarget、可执行性写进数据集并在 replay 页显示；D3 换成 C3 的碰撞模型；三个新发现：「0–18 % 帧够不着」是逐帧 IK 的种子假象、双臂回放必须流关节而不是 TCP、MuJoCo 的网格距离在部分网格对上会返回 0；v1.5：A5① 拼对生成器、D1/D3 双臂 runtime（假机器人）落地；A1 的 T_LR 台阶改在 base 系读；夹爪 10-28 回来，Q4 暂不加工；v1.4：Q3 已答——手持 cube 也送修，A4 改为等 cube；加 A5「cube 回来之前的替代双手轨迹」，调整下一批；v1.3 · 10-23 第一批开工：G1 / G2 / G3 / A1 代码落地，并据此改了四个前提——已有数据里没有双手、C0 不拆数据集、B3 只能到约 3 mm、闭环只抓粗差；v1.1 加「注册：单 FR3 → 双 FR3 → 人形」与「拿到真实数据之前」两节、G 线；v1.2 按 Q1/Q2/Q7 的回答改：第二台放左边、两台定位后不动、人形是轮式可移动，加 H 线）· 从 <code>docs/box_umi_trajectory_gt_replay_roadmap.html</code> 的 Phase 8–12 拆出，专管「双手轨迹 → 双 FR3 回放」这一条线</p>
   <p>前提：采集端（手持 BOX）和执行端（FR3 上的 Corenetic 夹爪）的夹爪<b>全部返厂维修</b>，回来时间未定。</p>
+  <div class="callout warn"><b>10-26 晚：第二台上线（B1），左右对调，两台都挪过。</b>
+    <ul>
+      <li><b>命名按机器人自己的左右</b>（站在 base 后面、和臂朝同一方向）。原计划新臂放左边，临时改放右边：<b>192.168.11.102 = left</b>（原来叫 right 的那台，注册过的就是它），<b>192.168.1.210 = right</b>（新臂，空法兰，没有夹爪 BOX）。代码已跟着改：<code>fr3_arms.json</code> 两台都在役；<code>fr3_base</code> 仍是 11.102 的系、现在是 left 的根，新臂的根是 <code>fr3_base_right</code>（<code>embodiments/fr3_dual.json</code>）；碰撞检查仍在 right 的 base 里，所以相机障碍物改为经图放进 right 的根；拼对生成器的镜像改到 −y 一侧（原录制段留在 left，镜像给 right）；单臂 GUI 回放只允许 left（数据集所在的 base）。<code>T_right_left</code> 的含义不变：left 在 right 的 +y。</li>
+      <li><b>两台 base 都挪过、都不是最终位置。</b>world → fr3_base 的球位边 <code>ball_check_20261015T030840Z</code> 已经失效（Thor 上的图里还在，重新注册时被 supersede）。在那之前：绝对模式回放、相机障碍物、经注册边导出到 fr3_base 的新标签都不可信；旧数据重导时，标签链防混用会拦住新旧混用。<b>最终摆放定了再做 B3/B4 和 fr3_base 重注册</b>，现在做的注册挪了还得重做。</li>
+      <li><b>只读探测（Thor）：</b>两台都只在 Thor 的 enP2p1s0 上可达（工作站不可达），这个千兆口同时走办公网；变包长 ping 8000 B rtt 0.40–0.45 ms，全程千兆（Q5 原来的 100 Mbps 问题这次不存在）。libfranka server_version 都是 9，FCI 已激活。Desk 负载原来都不对（11.102 是 Franka Hand 默认 0.73 kg，实际空法兰，静止时读到 −7.1 N 假外力；新臂 0.23 kg），10-26 已改空法兰，<code>fr3_arms.json</code> 两台都声明为空法兰，D1/预检会核。新臂到货时停在运输姿态（j4 −3.050，超 FR3 限位 −3.042，但在 panda_py 墙内），已用 Desk 拉出；D1 补了「当前关节超 FR3 限位就拒绝」。</li>
+    </ul>
+  </div>
   <p class="small" style="color:#9ca3af">主 roadmap 仍是误差预算和 3 mm 口径的唯一出处；本页只排双臂这条线的待办和顺序。激光细节见 <code>docs/box_umi_laser_tracker_gt_roadmap.html</code>。</p>
 </div>
 
@@ -53,12 +60,13 @@
     <li><b>10-23 第一批开工后，四个前提要改：</b>
       <ol>
         <li><b>已有数据里没有双手。</b>A1 在 Thor 上全部 37 个 v2/v3 session 里跑了一遍：<b>左手 cube（marker 0–4）在任何相机、任何一帧都没被检测到</b>（10-03 起每段 left sidecar 都是 0 帧解出）。唯一有左手的是 6 月的 <code>dadada</code> 两段 v1 数据，测量链不同，不能用。所以 A2 选集、B0 摆放、C3 retarget 都没有双手轨迹可用。<b>A4（手持 cube 录无夹爪的双手轨迹）从「可选」变成前置</b>。<b>10-26：</b>Q3 已答，手持 cube 也送修了，A4 要等 cube 回来。在那之前用 A5 的替代轨迹开发 C / D 线，但 A2 选集和 B0 摆放的最终结论仍要等 A4。</li>
-        <li><b>C0 不拆数据集的坐标系。</b>一个数据集只放在一个系里（仍是 <code>fr3_base</code> = right 的 base），两只手一起导出，T_LR 还是同一个文件里两列的乘积。左臂需要的 <code>fr3_base → fr3_base_left</code> 由回放时按本体描述（G1）在图上查，用到的边写进回放报告。<code>export_v3</code> 一行不改，旧导出天然逐字节不变。</li>
+        <li><b>C0 不拆数据集的坐标系。</b>一个数据集只放在一个系里（仍是 <code>fr3_base</code>；10-26 起它是 left 的 base，见上方「10-26 晚」），两只手一起导出，T_LR 还是同一个文件里两列的乘积。左臂需要的 <code>fr3_base → fr3_base_left</code> 由回放时按本体描述（G1）在图上查，用到的边写进回放报告。<code>export_v3</code> 一行不改，旧导出天然逐字节不变。</li>
         <li><b>B3 只能到约 3 mm，不是 1 mm 级。</b>G3 的合成实验显示：臂-臂同球和激光站位两种方法打平（共享工作区内 T_LR 的 p95 约 3.0 mm），瓶颈是每台 FR3 自身的运动学误差（FK 对激光 0.47 mm）。球位数量和 pivot 落座噪声影响都很小。经两条 world 边绕过去约 4.8 mm，所以 relative 模式仍然更好。要再往下，得做单臂运动学标定，多摆几个球没用。</li>
         <li><b>闭环检查只能抓粗差。</b>按现在 world 边的水平（留一 2.6 mm），闭环阈值约 15 mm，1% 误报下，10 mm 的错边只能抓到约 1/4。它能发现「base 被碰了」「错用了手眼边」这类错误，但证明不了一条边到毫米级。G2 原来写的退出条件「注入 5 mm 能抓到」在这个精度下做不到，已改。</li>
       </ol>
     </li>
-    <li><b>已定（10-23）：</b>第二台 FR3 放在现有这台的左边（新的 = left，192.168.11.102 = right）；两台 base 重新定位后不再挪。人形是轮式的，可以移动，见 H 线。<b>如果现有这台也要挪，它现役的球位边（<code>ball_check_20261015T030840Z</code>）随之作废</b>，已导出到 fr3_base 的数据都要用新边重导（标签链防混用会拦住新旧混用）。</li>
+    <li><b>10-26 改：</b>新臂实际放在现有这台的<b>右边</b>，11.102 改叫 left、新的 192.168.1.210 叫 right；两台都挪过，最终位置未定。下面这条是 10-23 的原计划。</li>
+    <li><s><b>已定（10-23）：</b>第二台 FR3 放在现有这台的左边（新的 = left，192.168.11.102 = right）；两台 base 重新定位后不再挪。人形是轮式的，可以移动，见 H 线。<b>如果现有这台也要挪，它现役的球位边（<code>ball_check_20261015T030840Z</code>）随之作废</b>，已导出到 fr3_base 的数据都要用新边重导（标签链防混用会拦住新旧混用）。</s>（10-26 它确实挪了，这条生效。）</li>
   </ul>
 </div>
 
@@ -166,10 +174,10 @@
   <h2>现状盘点（截至 10-23）</h2>
   <div class="scroll"><table>
     <tr><th>项</th><th>现状</th><th>出处</th></tr>
-    <tr><td>FR3 台数（代码里）</td><td><span class="badge bad">只有 1 台</span> 所有配置只有 <code>192.168.11.102</code>；replay YAML、preflight、gateway 的 <code>_real_robot_ip</code> 都是单值。</td><td class="small"><code>replay_cube_pose_in_robot_base.thor.yaml</code>、<code>gateway.py</code></td></tr>
+    <tr><td>FR3 台数（代码里）</td><td><span class="badge done">10-26 两台</span> <code>fr3_arms.json</code>：left = 192.168.11.102，right = 192.168.1.210（新，空法兰，<code>tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml</code>，mock 夹爪）。<s>所有配置只有 <code>192.168.11.102</code></s></td><td class="small"><code>replay_cube_pose_in_robot_base.thor.yaml</code>、<code>gateway.py</code></td></tr>
     <tr><td>base 坐标系</td><td><span class="badge warn">按 C0 新方案保持单值</span> 数据集仍只在 <code>fr3_base</code>（right）里；left 的 base 走本体描述 + 图（G1、C0）。图已能装下第二个 base 节点和闭环（G2）。</td><td class="small"><code>embodiment.py</code>、<code>world_provenance.py</code></td></tr>
     <tr><td>双手数据</td><td><span class="badge bad">没有</span> Thor 上 37 个 v2/v3 session 里左手 cube 0 帧被检测到（marker 0–4 从未出现）；只有 6 月两段 v1 的 <code>dadada</code>。</td><td class="small">A1，10-23</td></tr>
-    <tr><td>world → fr3_base 注册边</td><td><span class="badge done">right 已上线</span> 5 球位刚体边 <code>ball_check_20261015T030840Z</code>，留一 rms 2.63 mm；激光独立验收只能证到 5–6 mm（站位精度所限）。left 没有。</td><td class="small">主 roadmap Phase 9</td></tr>
+    <tr><td>world → fr3_base 注册边</td><td><span class="badge bad">10-26 失效</span> 11.102（现 left）的 base 10-26 挪过，5 球位刚体边 <code>ball_check_20261015T030840Z</code>（留一 rms 2.63 mm）不再成立；最终摆放后重注册。新臂（right）没有边。</td><td class="small">主 roadmap Phase 9</td></tr>
     <tr><td>MuJoCo「both」</td><td><span class="badge warn">仅显示</span> 两条轨迹都在同一个原生 FR3 base 里解 IK，只是画面上左右各挪 0.45 m。不查两臂碰撞，不代表真实摆放。</td><td class="small"><code>replay_cube_pose_in_robot_base_mujoco.py</code> <code>--robot-spacing-m</code></td></tr>
     <tr><td>retarget</td><td><span class="badge warn">单臂</span> 逐帧 IK + 整段规划起点关节（避开 panda_py 的 j6 墙）。没有双臂联合优化、没有 clearance。</td><td class="small">同上</td></tr>
     <tr><td>真机 replay</td><td><span class="badge done">单臂可用</span> 两步（停在第 0 帧，Execute 再走）、指令提前 3 帧、夹爪按录制开度回放、可选激光记录。</td><td class="small"><code>_real_replay_command</code></td></tr>
@@ -200,7 +208,7 @@
     <tr><td class="id">Q2</td><td><span class="badge done">已答</span> 两台 base 重新定位后不动。</td><td>B5（平台 ArUco）对双 FR3 不做，改为 B5′ 的定期复核；平台 ArUco 的方法转给人形（H2）</td></tr>
     <tr><td class="id">Q3</td><td><span class="badge done">10-26 已答</span> 手持 cube 也随夹爪送修了。A4 等 cube 回来；之前用 A5 替代。<br/><span class="small">原问题：手持 BOX 本体和 marker cube 是否也随夹爪一起送修？左手 cube 还在吗？</span></td><td>已有数据里没有双手（A1 实测），A2 / B0 / C3 全靠 A4 现录。cube 在的话可以手持 cube 录「无夹爪」的双手轨迹（只能当轨迹，不能当操作 demo）</td></tr>
     <tr><td class="id">Q4</td><td>能否加工两件小东西：① FR3 法兰上装 SMR 的转接件（ISO 9409-1-50-4-M6）；② 和 Corenetic 夹爪等质量、质心在同一处的配重盘</td><td>B3、E 线的前置；没有 ① 就只能用 FK 自证，等于没测<br/><span class="badge done">10-26 已答</span> 夹爪 10-28 回来，<b>暂不设计、不加工</b>。B3 的臂-臂同球改用夹爪夹 pivot 插件（和 10-20 单臂 pivot 同一套，<code>fr3_pivot_auto</code>）；E 线直接在带夹爪的构型下做，不需要配重盘。激光互检仍要法兰或夹爪上的 SMR 转接件，到时再定。</td></tr>
-    <tr><td class="id">Q5</td><td>Thor 到两台 FR3 的网络：第二台走同一个交换机吗？</td><td>09-03 查过 11.102 那段只协商到 100 Mbps，导致 30% 周期掉线；第二台上线前要先核</td></tr>
+    <tr><td class="id">Q5</td><td><span class="badge done">10-26 已答</span> 两台都接在 Thor 的同一个千兆口（enP2p1s0，和办公网共用），8000 B ping rtt 0.40–0.45 ms，全程千兆。<br/><span class="small">原问题：第二台走同一个交换机吗？</span></td><td>09-03 查过 11.102 那段只协商到 100 Mbps，导致 30% 周期掉线；1 kHz 下能不能稳，还要 cycle motion 的 success_rate 说话</td></tr>
     <tr><td class="id">Q6</td><td>首批双手 benchmark 用哪类任务（已有数据里挑）？</td><td>A2 选集；有接触的段落要单独标出，等夹爪回来才能真做</td></tr>
     <tr><td class="id">Q7</td><td><span class="badge done">部分已答</span> 轮式、可以走动。末端是夹爪。还缺：哪一款、什么时候到、有没有升降/腰部关节、停稳后底盘能否锁死、夹爪型号（能否夹住 pivot 插件）？</td><td>G1 的根注册方式（静态 vs 逐帧跟踪）、是否需要躯干 marker rig、retarget 的手部部分</td></tr>
   </table></div>
@@ -222,11 +230,11 @@
   <h2>B 线 · 第二台 FR3 与双 base 注册（需要机器人，不需要夹爪）</h2>
   <div class="scroll"><table>
     <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
-    <tr><td class="id">B0</td><td>先在仿真里定摆放</td><td>用 A2 的双手轨迹，在 MuJoCo 里扫左臂 base（在 right 左侧）的位置/朝向；如果 right 也要重摆，两台一起扫：两手全程可达、关节离 panda_py 墙有余量、两臂最小间距最大。装之前做，免得装完才发现够不着。</td><td>推荐摆放 + 每个候选的可达率/余量</td><td><span class="badge now">现在做</span></td></tr>
-    <tr><td class="id">B1</td><td>第二台上线</td><td>网络先用变包长 ping 核千兆（小包测不出问题）；<code>fr3_cycle_motion_runtime.py</code> 跑 success_rate；Desk 负载按「法兰 + 转接件 + 配重」实测设置（用已有负载辨识）；panda_py 关节墙；独立急停。</td><td>success_rate 稳态 ≥ 0.99；负载辨识残差合格</td><td><span class="badge warn">看 Q1/Q5</span></td></tr>
+    <tr><td class="id">B0</td><td>先在仿真里定摆放</td><td>用 A2 的双手轨迹，在 MuJoCo 里扫两台 base 的位置/朝向（10-26 起两台都挪过、都没定，所以两台一起扫）：两手全程可达、关节离 panda_py 墙有余量、两臂最小间距最大。装之前做，免得装完才发现够不着。</td><td>推荐摆放 + 每个候选的可达率/余量</td><td><span class="badge now">现在做</span></td></tr>
+    <tr><td class="id">B1</td><td>第二台上线</td><td>网络先用变包长 ping 核千兆（小包测不出问题）；<code>fr3_cycle_motion_runtime.py</code> 跑 success_rate；Desk 负载按「法兰 + 转接件 + 配重」实测设置（用已有负载辨识）；panda_py 关节墙；独立急停。</td><td>success_rate 稳态 ≥ 0.99；负载辨识残差合格</td><td><span class="badge now">10-26 开始</span><br/><span class="small">网络、版本、Desk 空法兰、运输姿态已处理（见上方「10-26 晚」）。还差：两台各自、再同时跑 <code>fr3_cycle_motion_runtime.py</code> 看 success_rate；墙；两台各自的急停。空法兰时负载就是 0，不用辨识。</span></td></tr>
     <tr><td class="id">B2</td><td>配置从单臂改成按臂</td><td><code>robot_ip</code>、<code>corenetic_device_id</code>、负载、关节起点都改成 left / right 两份；GUI preflight 两台各跑一遍。</td><td>任何入口都必须显式选臂，不能默认</td><td><span class="badge done">10-26 完成</span><br/><span class="small"><code>tools/fr3/fr3_arms.json</code> 按臂登记 IP、夹爪 BOX、Desk 负载、起点、replay 配置；<code>fr3_arms.validate</code> 拒绝和 YAML 不一致的登记。move_to_start、pivot、负载辨识、cycle motion、遥操作回放、预检都要 <code>--arm</code> 或 <code>--robot-ip</code>，否则拒绝；写出的产物记录所用的臂。预检核 Desk 负载是否和声明一致。GUI 的选臂框默认为空，Thor 上不选臂的请求一律拒绝。left 暂登记为不在役（B1）。</span></td></tr>
     <tr><td class="id">B3</td><td>两台 base 之间的关系 T_BL_BR（两种方法互检）</td><td>① 臂-臂同球：两臂法兰装同款杯，绕同一组 ≥ 4 个球位（含高度差、留一个做留出）各做 pivot（现成的 <code>fr3_pivot_auto</code>），拟合刚体变换。② 激光：法兰装 SMR，站位不动，两台各拟合「站位 × FK」→ T_BL_BR。两者都不经过相机，误差只有 FK + pivot / 激光。协议按 G3 定。</td><td>两种方法的 T_BL_BR 及其差；留出点残差；同一天重复一次</td><td><span class="badge warn">看 Q4</span></td></tr>
-    <tr><td class="id">B4</td><td>world → fr3_base_left 注册边</td><td>现在只能走激光边（站位 × FK），受站位精度限制只能证到约 5–6 mm。同球检验（精度更高）要手持 UMI 那一侧，等夹爪。先上激光边，写明口径，夹爪回来后用同球检验替换。</td><td>world_graph 里有 left 边，标注来源与精度上限</td><td><span class="badge warn">看 Q4</span></td></tr>
+    <tr><td class="id">B4</td><td>world → 两台 base 的注册边（10-26 起：fr3_base 重注册 + 新的 fr3_base_right）</td><td>现在只能走激光边（站位 × FK），受站位精度限制只能证到约 5–6 mm。同球检验（精度更高）要手持 UMI 那一侧，等夹爪。先上激光边，写明口径，夹爪回来后用同球检验替换。</td><td>world_graph 里有 left 边，标注来源与精度上限</td><td><span class="badge warn">看 Q4</span></td></tr>
     <tr><td class="id">B4b</td><td>闭环检查</td><td>B3 + 两条 world 边构成闭环，残差进 G2 的检查；超阈值时不允许 absolute 回放。</td><td>闭环残差有数，并写进每次回放报告</td><td><span class="badge warn">看 B3/B4</span></td></tr>
     <tr><td class="id">B5′</td><td>base 没动的复核（取代平台 ArUco）</td><td>两台定位后不动，所以不做平台 ArUco。但「不动」要有证据：每个底座上贴一两个固定 marker 由相机常驻监测（同 Phase 2.4 的环境固定 marker 思路），或每周用一个球位做一次快速 pivot 复核；超阈值就把这台的边标失效。被碰了没人知道是最常见的失效方式。</td><td>每次回放报告里有「base 自上次注册以来位移」</td><td><span class="badge now">现在设计</span></td></tr>
   </table></div>

@@ -1,26 +1,27 @@
 {
   "schema": "fr3_arms/v1",
-  "note": "One entry per FR3 (roadmap B2). Every entry point that drives an arm names the arm (or its IP) explicitly; nothing falls back to a default arm. robot_ip and corenetic_device_id must equal the arm's replay_config (checked by fr3_arms.validate). payload is the end-effector load Desk should hold for the arm as it is mounted now; null = not declared, and preflight then only reports what Desk holds. start_joints_rad is where move_to_start takes the arm.",
+  "note": "One entry per FR3 (roadmap B2). Every entry point that drives an arm names the arm (or its IP) explicitly; nothing falls back to a default arm. robot_ip and corenetic_device_id must equal the arm's replay_config (checked by fr3_arms.validate); corenetic_device_id is null, with no_gripper_why, for a bare flange. payload is the end-effector load Desk should hold for the arm as it is mounted now; null = not declared, and preflight then only reports what Desk holds. start_joints_rad is where move_to_start takes the arm. Left and right are the arms' own: stand behind the bases facing where they face. 10-26: the arm that was 'right' until then (192.168.11.102, the registered one) is the left; the new arm went in to its right.",
   "arms": {
     "right": {
+      "in_service": true,
+      "robot_ip": "192.168.1.210",
+      "corenetic_device_id": null,
+      "no_gripper_why": "B1 10-26: the new FR3 came with a bare flange; no gripper or BOX is planned for it yet.",
+      "replay_config": "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml",
+      "start_joints_rad": [0.0, -0.7853981633974483, 0.0, -2.356194490192345, 0.0, 1.5707963267948966, 0.7853981633974483],
+      "start_source": "panda_py constants.JOINT_POSITION_START, as the left arm",
+      "payload": {"mass_kg": 0.0, "com_m": [0.0, 0.0, 0.0], "source": "bare flange, Desk end effector cleared 10-26"},
+      "payload_note": "Out of its transport pose 10-26 (j4 had been past the FR3 limit). Placement not final: no base edge yet (B0/B3)."
+    },
+    "left": {
       "in_service": true,
       "robot_ip": "192.168.11.102",
       "corenetic_device_id": 596523097,
       "replay_config": "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml",
       "start_joints_rad": [0.0, -0.7853981633974483, 0.0, -2.356194490192345, 0.0, 1.5707963267948966, 0.7853981633974483],
       "start_source": "panda_py constants.JOINT_POSITION_START (what Panda.move_to_start() used before B2)",
-      "payload": null,
-      "payload_note": "Gripper away for repair since 10-23. 10-12 Desk held m_ee 1.111 kg, F_x_Cee (16.8, -22.2, 60.9) mm with gripper + SMR (outputs/fr3_payload/20261012_154421_fr3_smr_in.json on Thor); declare the value F2 identifies once the gripper is back."
-    },
-    "left": {
-      "in_service": false,
-      "why_not": "B1: the second FR3 is not installed yet (Q1: IP, FCI activation, network Q5 still open). It will stand to the left of the right arm.",
-      "robot_ip": "",
-      "corenetic_device_id": null,
-      "replay_config": "",
-      "start_joints_rad": null,
-      "start_source": "decided by B0 (placement scan) / B1",
-      "payload": null
+      "payload": {"mass_kg": 0.0, "com_m": [0.0, 0.0, 0.0], "source": "bare flange, Desk end effector cleared 10-26 (it had held the Franka Hand default, 0.73 kg)"},
+      "payload_note": "Gripper away for repair since 10-23; when it is back (10-28) on this arm, declare the value F2 identifies. 10-12 Desk held m_ee 1.111 kg, F_x_Cee (16.8, -22.2, 60.9) mm with gripper + SMR (outputs/fr3_payload/20261012_154421_fr3_smr_in.json on Thor). The base was moved 10-26 and is not in its final place: the world -> fr3_base edge on Thor is stale until it is registered again."
     }
   }
 }

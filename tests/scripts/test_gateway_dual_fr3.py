@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -87,9 +88,9 @@ def _replay_state(tmp_path: Path, monkeypatch, frames: int = 30):
     import sys
 
     from tests.scripts.test_dual_fr3_executability import _evaluate
-    from tests.scripts.test_dual_fr3_replay_modes import hands_in_right_base, write_session
+    from tests.scripts.test_dual_fr3_replay_modes import hands_in_left_base, write_session
 
-    session = write_session(tmp_path, "s", [hands_in_right_base(frames)])
+    session = write_session(tmp_path, "s", [hands_in_left_base(frames)])
     _evaluate(session)
     state = gateway.GatewayState(
         repo_root=tmp_path,
@@ -125,7 +126,7 @@ def test_connect_waits_at_frame_0_and_execute_runs_both_arms(tmp_path: Path, mon
     assert "Connect first" in gateway._dual_replay_execute(state, {})["error"]
     started = gateway._dual_replay_connect(state, {"mode": "absolute", "backend": "fake"})
     assert started["ok"], started["error"]
-    assert started["job"]["edges"]["right"] == [] and started["job"]["edges"]["left"]
+    assert started["job"]["edges"]["left"] == [] and started["job"]["edges"]["right"]  # left in fr3_base
     assert "already running" in gateway._dual_replay_connect(state, {"mode": "absolute", "backend": "fake"})["error"]
     _await_job(state, lambda j: j.get("state") == "at_start")
     assert gateway._dual_replay_execute(state, {})["ok"]
@@ -148,8 +149,15 @@ def test_abort_at_frame_0_starts_nothing(tmp_path: Path, monkeypatch) -> None:
     assert all(row["framesCommanded"] == 0 for row in job["report"]["arms"].values())
 
 
-def test_connect_refuses_what_c4_did_not_clear_and_the_real_arms_until_they_exist(tmp_path: Path, monkeypatch) -> None:
+def test_connect_refuses_what_c4_did_not_clear_and_the_real_arms_without_panda_py(tmp_path: Path, monkeypatch) -> None:
     state = _replay_state(tmp_path, monkeypatch)
+    # both arms are registered since 10-26: a panda_py that will not import keeps the runtime off the network
+    blocked = tmp_path / "no_panda_py"
+    (blocked / "panda_py").mkdir(parents=True)
+    (blocked / "panda_py" / "__init__.py").write_text("raise ImportError('not in tests')\n")
+    env = gateway._real_preflight_env(state)
+    env = {**env, "PYTHONPATH": f"{blocked}{os.pathsep}{env['PYTHONPATH']}"}
+    monkeypatch.setattr(gateway, "_real_preflight_env", lambda _s: env)
     assert "has no relative verdict" in gateway._dual_replay_connect(state, {"mode": "relative", "backend": "fake"})["error"]
     assert "backend must be" in gateway._dual_replay_connect(state, {"mode": "absolute"})["error"]
     path = state.selected_replay_root / gateway.DUAL_FR3_EXECUTABLE_FILE
@@ -162,4 +170,4 @@ def test_connect_refuses_what_c4_did_not_clear_and_the_real_arms_until_they_exis
     path.write_text(json.dumps(verdicts))
     assert gateway._dual_replay_connect(state, {"mode": "absolute", "backend": "real"})["ok"]
     job = _await_job(state, lambda j: j.get("state") in ("finished", "stopped", "error"))
-    assert job["state"] == "error" and job["error"].startswith("the left arm is not in service: B1")
+    assert job["state"] == "error" and "panda_py does not import" in job["error"], job

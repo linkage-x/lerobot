@@ -47,7 +47,8 @@
 <div class="card">
   <h2>范围</h2>
   <ul>
-    <li><b>只涉及 right 臂</b>（192.168.11.102，夹爪 BOX 596523097）。第二台 FR3 还没装（B1），所以「left 的第一次 pivot」、left 同球检验（F5）、双臂 Phase 12（F7）都不在这一天。</li>
+    <li><b>10-26 改名：只涉及 left 臂</b>（192.168.11.102，夹爪 BOX 596523097——就是原来叫 right 的那台；新臂 192.168.1.210 站在它右边，叫 right，空法兰）。夹爪装回 11.102。新臂的 pivot、同球检验（F5）、双臂 Phase 12（F7）都不在这一天。下文的 <code>--arm left</code> 在 10-26 之前写作 <code>--arm right</code>，Thor 要先部署 10-26 的改名，否则 Thor 上的 <code>left</code> 还是「不在役」。</li>
+    <li><b>11.102 的 base 10-26 挪过，还不是最终位置。</b>world → fr3_base 的注册边因此失效：凡是要经过它的对比（第 5 步的「端到端」）这一天不做，只做 base 系里的（pivot、激光 vs FK / 指令）。</li>
     <li><b>手持侧</b>：手持 BOX 和 cube 也一起送修了。它们如果同一天回来，做第 7 步；没回来就跳过。</li>
     <li><b>不需要</b>：配重盘（Q4 不加工）；E 线直接在带夹爪的构型下做。</li>
     <li>Connect、Execute、示教拖动都由操作者按或操作，工作半径内有人时不跑自动轨迹。</li>
@@ -58,7 +59,7 @@
   <h2>前一天（10-27）要准备好</h2>
   <ol>
     <li><input type="checkbox"/><b>Thor 部署到包含 B2 的版本</b>。10-26 起所有驱动 FR3 的入口都要选臂；Thor 上如果还是旧网关，GUI 不会有选臂框。部署前先 <code>-n</code> dry-run，看有没有 <code>*deleting</code>（多人共用 Thor 会互相覆盖）；只从主工作区部署；部署会杀掉 recorder，之后要重新 Connect。</li>
-    <li><input type="checkbox"/>确认 Thor 上有 <code>tools/fr3/fr3_arms.json</code>，网关 <code>GET /api/robot/arms</code> 能返回 right（在役）和 left（不在役，B1）。</li>
+    <li><input type="checkbox"/>确认 Thor 上有 <code>tools/fr3/fr3_arms.json</code>，网关 <code>GET /api/robot/arms</code> 能返回 left（在役，192.168.11.102，BOX 596523097）和 right（在役，192.168.1.210，无夹爪）。</li>
     <li><input type="checkbox"/>两份 10-12 定稿的 Desk 末端配置在手边：<code>~/文档/fr3+corenetic+cam_20261012b.json</code>（无 SMR，0.9755 kg）和 <code>fr3+corenetic+cam+smr_20261012b.json</code>（有 SMR，1.1108 kg）。不带 <code>b</code> 的两份已作废。</li>
     <li><input type="checkbox"/>第 5 步要用激光跟踪仪：确认采集 PC 上<b>没开 RadianCAL-Pro</b>（它会把实时流挤到每 5 s 只剩约 1 s）。跟踪仪断过电的话，Connect 时会依次报 13→43→22，这是冷启动流程，要等预热完成。</li>
   </ol>
@@ -124,8 +125,8 @@
   <h2>第 3 步 · 负载辨识与 Desk 配置（F2，约 40 分钟）</h2>
   <p>10-12 的两份配置是在返修前的夹爪上辨识的。返修可能换了零件，所以要重测。</p>
   <ol>
-    <li>先 <code>fr3_move_to_start --arm right</code>（collect 会检查 j1–j4）。</li>
-    <li>在 Thor 上用 <code>.venv-fr3</code>、<code>PYTHONPATH=src</code> 跑 <code>fr3_payload_identification_runtime.py collect --arm right</code>：32 个姿态，<b>双向逼近</b>（单向采集受关节静摩擦迟滞影响，结果作废，<code>desk-config</code> 也会拒绝）。无 SMR、有 SMR 各一次。</li>
+    <li>先 <code>fr3_move_to_start --arm left</code>（collect 会检查 j1–j4）。</li>
+    <li>在 Thor 上用 <code>.venv-fr3</code>、<code>PYTHONPATH=src</code> 跑 <code>fr3_payload_identification_runtime.py collect --arm left</code>：32 个姿态，<b>双向逼近</b>（单向采集受关节静摩擦迟滞影响，结果作废，<code>desk-config</code> 也会拒绝）。无 SMR、有 SMR 各一次。</li>
     <li><code>fit</code>，再用 <code>desk-config</code> 生成配置：<b>不带零偏</b>的拟合。机器人不扣关节零偏，带零偏的值会设得偏重——10-12 下午实测推翻过。</li>
   </ol>
   <div class="scroll"><table>
@@ -135,8 +136,8 @@
     <tr><td>闭环（导入后再跑一次 collect）</td><td>Fz −0.17 N（预测 −0.18），|F| 最大 1.22 N；残余 Fx ≈ −0.76、Fy ≈ −0.36 N 是传感器零偏，改负载消不掉</td><td>Fz 在 ±0.5 N 内</td></tr>
   </table></div>
   <ol start="4">
-    <li><input type="checkbox"/>把采用的值写进 <code>tools/fr3/fr3_arms.json</code> 里 right 的 <code>payload</code>（现在是 <code>null</code>）：<code>{"mass_kg": …, "com_m": [x, y, z], "source": "F2 10-28 collect …"}</code>。从此 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 right） 会在 Desk 配置不符时（比如设成了另一种 SMR 状态）拒绝起跑。一次登记只能对应一种 SMR 状态；第 5 步装 SMR 时，记得同时切换 Desk 配置和这里的登记。</li>
-    <li><input type="checkbox"/>改了 <code>fr3_arms.json</code> 以后跑一次 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 right），确认负载那一行显示 <code>matches</code>。</li>
+    <li><input type="checkbox"/>把采用的值写进 <code>tools/fr3/fr3_arms.json</code> 里 left 的 <code>payload</code>（10-26 起声明的是空法兰 0 kg，<b>夹爪一装上、Desk 一改，预检和双臂 runtime 就会因不一致拒绝起跑，直到这里改掉</b>）：<code>{"mass_kg": …, "com_m": [x, y, z], "source": "F2 10-28 collect …"}</code>。从此 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 right） 会在 Desk 配置不符时（比如设成了另一种 SMR 状态）拒绝起跑。一次登记只能对应一种 SMR 状态；第 5 步装 SMR 时，记得同时切换 Desk 配置和这里的登记。</li>
+    <li><input type="checkbox"/>改了 <code>fr3_arms.json</code> 以后跑一次 <code>fr3_record_preflight --robot-ip 192.168.11.102</code>（或 GUI 预检里选 left），确认负载那一行显示 <code>matches</code>。</li>
   </ol>
   <p class="small">背景：10-10 回放下沉的 5.5 mm 几乎全部是 Desk 负载设轻了（0.7496 kg 对实际 1.1108 kg）。负载错，后面的误差就全是假的。E 线还没在配重构型下做过，所以不需要按新旧差值重新解读任何结论。</p>
 </div>
@@ -177,14 +178,14 @@
   <p>SMR 装到夹爪上，Desk 和 <code>fr3_arms.json</code> 的负载登记一起切到「有 SMR」。起始姿态时让 SMR 开口正对跟踪仪：10-10 三次丢光都发生在接收锥边缘。</p>
   <ol>
     <li><input type="checkbox"/>同一条 episode 用 lead 3 做真机回放两次，再用 Episode Replay 页的「Laser vs FR3 Replay Error」面板分析。</li>
-    <li><input type="checkbox"/>如果有带激光的录制段（参照 10-13 的 <code>thor_gmsl2_10ch_v1_20261013_110115</code> ep0），再做一次端到端对比。</li>
+    <li><s><input type="checkbox"/>如果有带激光的录制段（参照 10-13 的 <code>thor_gmsl2_10ch_v1_20261013_110115</code> ep0），再做一次端到端对比。</s> <b>10-26 起不做</b>：端到端要经过 world → fr3_base 的注册边，而 11.102 的 base 已经挪过；等最终摆放并重注册之后再做。</li>
   </ol>
   <div class="scroll"><table>
     <tr><th>指标</th><th>返修前参照</th><th>判据</th></tr>
     <tr><td>激光 vs FK</td><td>0.25–0.51 mm（10-10 / 10-12 / 10-13）</td><td>≤ 0.6 mm。这一项与夹爪无关，变大说明标定或站位出了问题。</td></tr>
     <tr><td>激光 vs 指令（lead 3）</td><td>10-12：2.80 / 2.68 mm rms；10-13：2.36 / p95 3.76 mm</td><td>rms ≤ 3 mm；两次之间差 ≤ 0.9 mm rms（10-12 是 0.62 mm）</td></tr>
     <tr><td>固定偏置（下沉）</td><td>负载设对之后是 (0.0, 0.2, 0.7) mm</td><td>|偏置| ≤ 1.5 mm。偏大就回第 3 步。</td></tr>
-    <tr><td>端到端：TCP 系沿轴的残差</td><td>10-13 换成 socket 系之后 z 残差 0.6 mm；跟踪仪系 rms 5.35 / p95 7.74 mm</td><td>z 残差 ≤ 1.5 mm 说明 −10.3 mm 常量仍然成立。z 变了，就说明返修改了夹持几何，用第 4 步实测的 s 更新 <code>corenetic_socket_ee</code>（改 URDF 会变模型指纹，MuJoCo 校验要重跑）。</td></tr>
+    <tr><td>端到端：TCP 系沿轴的残差<br/><span class="small">（10-26 起等重注册；这一天的 z 只看第 4 步的 <code>s_socket</code>）</span></td><td>10-13 换成 socket 系之后 z 残差 0.6 mm；跟踪仪系 rms 5.35 / p95 7.74 mm</td><td>z 残差 ≤ 1.5 mm 说明 −10.3 mm 常量仍然成立。z 变了，就说明返修改了夹持几何，用第 4 步实测的 s 更新 <code>corenetic_socket_ee</code>（改 URDF 会变模型指纹，MuJoCo 校验要重跑）。</td></tr>
   </table></div>
   <p class="small">口径：7.74 mm 衡量的是「FR3 复现这条演示」的能力，不是 UMI 标签的精度。剩下约 4.6 mm 的常量来自 world→fr3_base 注册边。</p>
 </div>
@@ -192,7 +193,7 @@
 <div class="card">
   <h2>第 6 步 · 收尾：记录与回写</h2>
   <ul>
-    <li><input type="checkbox"/><code>fr3_arms.json</code>：right 的 <code>payload</code> 和 <code>payload_note</code> 填上 10-28 的实测值，去掉「夹爪送修」的说明。</li>
+    <li><input type="checkbox"/><code>fr3_arms.json</code>：left 的 <code>payload</code> 和 <code>payload_note</code> 填上 10-28 的实测值，去掉「夹爪送修」的说明。</li>
     <li><input type="checkbox"/>roadmap F 线逐项写结果，特别是：第 1 步过没过、跨夹持散布、z 残差。</li>
     <li><input type="checkbox"/>如果 <code>corenetic_socket_ee</code> 改了：URDF/MJCF 一起改（<code>~/cad/corenetic_smr_cam</code> 的 rebuild 脚本不幂等，只能从旧文件开始跑），跑 <code>tests/robots/test_fr3_socket_frame.py</code>，重跑 MuJoCo 校验。</li>
     <li><input type="checkbox"/>如果第 1 步没过：pivot 前检（BOX mode 和爪宽）和运行中「BOX 重启即停」要提前做，否则 pivot 数据一直不可信。</li>

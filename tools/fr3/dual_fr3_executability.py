@@ -212,7 +212,10 @@ def evaluate_session(
     """Every episode's verdict for ``mode``, merged into the session's meta file (other modes kept)."""
     session_dir = Path(session_dir)
     if obstacles is None:
-        cameras, obstacle_source = sc.camera_obstacles(repo_root, graph)
+        # the collision checks work in the right arm's base
+        cameras, obstacle_source = sc.camera_obstacles(
+            repo_root, graph, frame=str(description["arms"]["right"]["root"])
+        )
         obstacles = [sc.table_obstacle(), *cameras]
     settings = settings or rg.Settings()
     rows = {}
@@ -323,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         T = np.eye(4)
         T[1, 3] = args.assume_spacing
         graph = rt.assumed_placement_graph(
-            graph, T, f"left base {args.assume_spacing} m along +y of the right, parallel"
+            graph, T, f"left base {args.assume_spacing} m along +y of the right, parallel", description
         )
         description = json.loads(json.dumps(description))
         for arm in description["arms"].values():

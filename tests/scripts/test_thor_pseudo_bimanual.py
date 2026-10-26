@@ -118,14 +118,34 @@ def test_a_built_pair_is_a_session_that_qc_reads_and_says_what_it_is(tmp_path: P
     assert report["episodes"]["0"]["frames"] == 330  # the shorter half
     assert report["episodes"]["0"]["bimanual_pass"]
 
-    # the left hand is the other take, in fr3_base, mirrored at the flange
-    left_src = pairs[0][1]
+    # the left arm stands in fr3_base (10-26), so the right hand is the other take, mirrored at the flange
+    # through the plane halfway to the right base, at -y
+    assert pb.in_place_arm() == "left" and info["pseudo_bimanual"]["in_place_arm"] == "left"
+    assert info["pseudo_bimanual"]["mirror_plane_y_m"] == pytest.approx(-pb.DEFAULT_SPACING_M / 2)
+    mirror_src = pairs[0][1]
     source = _tcp_path(
-        360 if left_src["session"] == "take_a" else 330, phase=0.0 if left_src["session"] == "take_a" else 1.0
+        360 if mirror_src["session"] == "take_a" else 330,
+        phase=0.0 if mirror_src["session"] == "take_a" else 1.0,
+    )
+    right = bq.read_hand(session / "derived" / bq.SIDECAR / "state_action.right.csv")[0]
+    expected = pb.mirror_pose7(_pose7(source[7]), -pb.DEFAULT_SPACING_M / 2, TOOL)
+    assert np.allclose(right[7]["p"], expected[:3], atol=1e-9)
+    assert info["pseudo_bimanual"]["pairs"][0]["right_mirrored_from"]["session"] == mirror_src["session"]
+
+
+def test_with_the_right_arm_in_place_the_left_hand_is_the_mirror_at_plus_y(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    _write_session(root, "take_a", _tcp_path(320))
+    _write_session(root, "take_b", _tcp_path(320, phase=1.0))
+    pair = ({"session": "take_a", "episode": 0}, {"session": "take_b", "episode": 0})
+    session = pb.build(
+        root, [pair], tmp_path / "out", graph=_graph(), name="pseudo_bimanual_r", in_place="right"
     )
     left = bq.read_hand(session / "derived" / bq.SIDECAR / "state_action.left.csv")[0]
-    expected = pb.mirror_pose7(_pose7(source[7]), pb.DEFAULT_SPACING_M / 2, TOOL)
-    assert np.allclose(left[7]["p"], expected[:3], atol=1e-9)
+    right = bq.read_hand(session / "derived" / bq.SIDECAR / "state_action.right.csv")[0]
+    expected = pb.mirror_pose7(_pose7(_tcp_path(320, phase=1.0)[5]), pb.DEFAULT_SPACING_M / 2, TOOL)
+    assert np.allclose(left[5]["p"], expected[:3], atol=1e-9)
+    assert np.allclose(right[5]["p"], _tcp_path(320)[5][:3, 3], atol=1e-9)
 
 
 def test_a_stand_in_session_must_say_so_in_its_name(tmp_path: Path) -> None:

@@ -6,10 +6,14 @@ never detected after 10-03) and the cubes went for repair with the grippers, so 
 dual-arm work that only needs *a* pair of hand tracks -- the scene, the replay modes, the runtime and its
 gates (C1-C4, D1/D3) -- takes a pair built here:
 
-* the right hand is a recorded right-hand episode, as it is;
-* the left hand is another recorded right-hand episode, mirrored through the plane halfway between the two
-  bases (``y = spacing / 2`` in ``fr3_base``; the left base is assumed at ``+y`` of the right, parallel), so
-  that it sits in front of the left arm as the original sat in front of the right one.
+* one hand is a recorded right-hand episode, as it is, on the arm whose base is ``fr3_base`` -- the arm the
+  episode was recorded in front of (``in_place``; the left since 10-26, embodiments/fr3_dual.json);
+* the other hand is another recorded right-hand episode, mirrored through the plane halfway between the two
+  bases (the left base is assumed at ``+y`` of the right, parallel: ``y = -spacing / 2`` in ``fr3_base``
+  when the left arm is in place, ``+spacing / 2`` when the right is), so that it sits in front of the other
+  arm as the original sat in front of its own.
+
+Which hand a half is called follows the arm it stands in front of; both halves were recorded right hands.
 
 Both are re-expressed from their camera world into ``fr3_base`` through ``world_graph.json`` (the mirror
 needs a frame that knows where the bases are) and paired frame by frame, on the right episode's clock.
@@ -54,7 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.fr3 import fr3_kinematics as kin  # noqa: E402
-from tools.thor.gmsl2 import bimanual_qc, world_provenance as wp  # noqa: E402
+from tools.thor.gmsl2 import bimanual_qc, embodiment as em, world_provenance as wp  # noqa: E402
 
 SCHEMA = "pseudo_bimanual/v1"
 NAME_PREFIX = "pseudo_bimanual_"
@@ -83,6 +87,17 @@ SHOULDER_M = (0.0, 0.0, 0.333)
 #: tests the reach, not the runtime, so the default asks for all of them.
 MIN_IK_REACHABLE = 1.0
 DATASET_WORLD = wp.FR3_BASE_WORLD_ID
+ARMS = ("right", "left")
+
+
+def in_place_arm(embodiment_path: Path = _REPO_ROOT / em.EMBODIMENT_DIR / "fr3_dual.json") -> str:
+    """The arm whose base is the dataset's: the one the recorded episodes stand in front of."""
+    arms = em.load(embodiment_path)["arms"]
+    found = [arm for arm in ARMS if str(arms[arm]["root"]) == DATASET_WORLD]
+    if len(found) != 1:
+        raise ValueError(f"{embodiment_path}: not exactly one arm in {DATASET_WORLD} ({found})")
+    return found[0]
+
 
 # Pose columns come in two spellings: ``state_x_m .. state_qw`` and ``ee.x .. ee.qw``.
 _SUFFIXES = (
@@ -277,7 +292,7 @@ def candidates(
 def auto_pairs(
     found: list[dict[str, Any]], count: int, seed: int
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """``count`` (right, left-source) pairs, deterministic in ``seed``; the two halves come from different
+    """``count`` (as-recorded, to-mirror) pairs, deterministic in ``seed``; the two halves come from different
     sessions where there are any, so a pair is never one take against itself."""
     pool = list(found)
     random.Random(seed).shuffle(pool)
@@ -298,11 +313,17 @@ def build(
     spacing_m: float = DEFAULT_SPACING_M,
     tool_frame: str | None = DEFAULT_TOOL_FRAME,
     name: str | None = None,
+    in_place: str | None = None,
 ) -> Path:
-    """Write the pairs as one stand-in session under ``out_root`` and return its directory."""
+    """Write the pairs (as-recorded, to-mirror) as one stand-in session under ``out_root`` and return its
+    directory. ``in_place``: the arm in ``fr3_base`` (default: the embodiment's)."""
     if not pairs:
         raise ValueError("no pairs to build")
-    plane_y = spacing_m / 2.0
+    in_place = in_place or in_place_arm()
+    if in_place not in ARMS:
+        raise ValueError(f"in_place must be one of {ARMS}, not {in_place!r}")
+    mirrored = next(arm for arm in ARMS if arm != in_place)
+    plane_y = (spacing_m if in_place == "right" else -spacing_m) / 2.0
     tool = None if tool_frame is None else kin.urdf_fixed_transform(tool_frame)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     session = out_root / (name or f"{NAME_PREFIX}{stamp}")
@@ -311,9 +332,9 @@ def build(
     out_rows: dict[str, list[dict[str, str]]] = {"left": [], "right": []}
     fieldnames: list[str] | None = None
     records, edges_by_world, fps_seen = [], {}, set()
-    for episode, (right_src, left_src) in enumerate(pairs):
+    for episode, (kept_src, mirror_src) in enumerate(pairs):
         tracks = {}
-        for hand, src in (("right", right_src), ("left", left_src)):
+        for hand, src in ((in_place, kept_src), (mirrored, mirror_src)):
             session_dir = sessions_root / src["session"]
             names, episodes = read_episodes(_sidecar_path(session_dir))
             if fieldnames is None:
@@ -331,12 +352,12 @@ def build(
             groups = pose_groups(names)
             for row in rows:
                 _map_poses(row, groups, lambda pose, T=T: wp.transform_pose7(T, pose))
-                if hand == "left":
+                if hand == mirrored:
                     _map_poses(row, groups, lambda pose: mirror_pose7(pose, plane_y, tool))
             tracks[hand] = rows
         n = min(len(tracks["right"]), len(tracks["left"]))
         for k in range(n):
-            clock = tracks["right"][k]
+            clock = tracks[in_place][k]
             for hand in ("right", "left"):
                 row = dict(tracks[hand][k])
                 row["episode_index"] = str(episode)
@@ -348,8 +369,11 @@ def build(
             {
                 "episode": episode,
                 "frames": n,
-                "right": {"session": right_src["session"], "episode": int(right_src["episode"])},
-                "left_mirrored_from": {"session": left_src["session"], "episode": int(left_src["episode"])},
+                in_place: {"session": kept_src["session"], "episode": int(kept_src["episode"])},
+                f"{mirrored}_mirrored_from": {
+                    "session": mirror_src["session"],
+                    "episode": int(mirror_src["episode"]),
+                },
             }
         )
     if len(fps_seen) != 1:
@@ -372,9 +396,10 @@ def build(
             "schema": SCHEMA,
             "created_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "what": (
-                "two recorded right-hand episodes per pair: the right as recorded, the other mirrored through "
-                f"y = {plane_y:.3f} m of {DATASET_WORLD} to stand in for the left hand"
+                f"two recorded right-hand episodes per pair: the {in_place} as recorded, the other mirrored "
+                f"through y = {plane_y:.3f} m of {DATASET_WORLD} to stand in for the {mirrored} hand"
             ),
+            "in_place_arm": in_place,
             "assumed_spacing_m": spacing_m,
             "mirror_plane_y_m": plane_y,
             "mirrored_at": "tcp"
@@ -406,13 +431,13 @@ def is_pseudo(session_dir: Path) -> bool:
 
 def _parse_pair(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        right, left = text.split(",")
-        rs, re_ = right.rsplit(":", 1)
-        ls, le = left.rsplit(":", 1)
-        return {"session": rs, "episode": int(re_)}, {"session": ls, "episode": int(le)}
+        kept, mirror = text.split(",")
+        ks, ke = kept.rsplit(":", 1)
+        ms, me = mirror.rsplit(":", 1)
+        return {"session": ks, "episode": int(ke)}, {"session": ms, "episode": int(me)}
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"--pair takes RIGHT_SESSION:EP,LEFT_SESSION:EP, not {text!r}"
+            f"--pair takes KEPT_SESSION:EP,MIRRORED_SESSION:EP, not {text!r}"
         ) from exc
 
 
@@ -423,7 +448,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, default=_REPO_ROOT / "outputs" / "pseudo_bimanual")
     parser.add_argument(
-        "--pair", type=_parse_pair, action="append", default=[], help="RIGHT_SESSION:EP,LEFT_SESSION:EP"
+        "--pair",
+        type=_parse_pair,
+        action="append",
+        default=[],
+        help="KEPT_SESSION:EP,MIRRORED_SESSION:EP: the first as recorded on the arm in fr3_base, the second "
+        "mirrored onto the other arm",
     )
     parser.add_argument(
         "--auto", type=int, default=0, help="pick this many pairs from the good right-hand episodes"

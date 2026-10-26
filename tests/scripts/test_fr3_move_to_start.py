@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
+from pathlib import Path
+
+import pytest
 
 from tools.fr3 import fr3_move_to_start
 
@@ -78,15 +80,15 @@ def test_build_host_command_uses_workspace_venv_and_runtime_script(tmp_path: Pat
 
 
 def test_main_dry_run_prints_command(capsys):
-    exit_code = fr3_move_to_start.main(["--arm", "right", "--dry-run"])
+    exit_code = fr3_move_to_start.main(["--arm", "left", "--dry-run"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "docker compose" in captured.out
     assert "tools/fr3/fr3_move_to_start_runtime.py" in captured.out
     assert "lerobot-user" in captured.out
-    assert "--robot-ip=192.168.11.102" in captured.out
-    assert "--start-joints=0.0,-0.7853981633974483," in captured.out  # the right arm's start, fr3_arms.json
+    assert "--robot-ip=192.168.11.102" in captured.out  # the left arm since 10-26 (B1)
+    assert "--start-joints=0.0,-0.7853981633974483," in captured.out  # the left arm's start, fr3_arms.json
 
 
 def test_main_dry_run_host_prints_host_command(capsys):
@@ -138,6 +140,7 @@ def test_main_refuses_to_pick_an_arm(capsys, monkeypatch):
     monkeypatch.setattr(fr3_move_to_start.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
     assert fr3_move_to_start.main(["--dry-run"]) == 2
     assert "there is no default arm" in capsys.readouterr().err
-    assert fr3_move_to_start.main(["--arm", "left", "--dry-run"]) == 2
-    assert "left arm is not in service" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        fr3_move_to_start.main(["--arm", "middle", "--dry-run"])
+    assert "invalid choice: 'middle'" in capsys.readouterr().err
     assert fr3_move_to_start.main(["--robot-ip", "10.0.0.5", "--dry-run"]) == 2

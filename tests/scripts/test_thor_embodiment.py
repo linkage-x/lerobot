@@ -21,9 +21,10 @@ def _edge(a: str, b: str, T, **extra) -> dict:
     return {"from_world_frame_id": a, "to_world_frame_id": b, "T_to_from": T, "method": f"{a}->{b}", **extra}
 
 
-def _dual(left_config: str = "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml") -> dict:
+def _dual(right_config: str = "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml") -> dict:
+    """The tracked two-arm description: since 10-26 the left arm is in fr3_base, the right one is placed."""
     description = json.loads((REPO / em.EMBODIMENT_DIR / "fr3_dual.json").read_text(encoding="utf-8"))
-    description["arms"]["left"]["replay_config"] = left_config
+    description["arms"]["right"]["replay_config"] = right_config
     return description
 
 
@@ -44,7 +45,7 @@ def test_the_single_fr3_points_at_the_replay_config_in_service() -> None:
 def test_validate_names_what_does_not_hold_together(tmp_path: Path) -> None:
     description = _dual()
     description["arms"]["left"]["hands"] = ["right"]
-    description["roots"]["fr3_base_left"]["kind"] = "mobile"
+    description["roots"]["fr3_base_right"]["kind"] = "mobile"
     description["arms"]["left"]["replay_config"] = "no/such.yaml"
     problems = " | ".join(em.validate(description, repo_root=REPO))
     assert "hand right is already replayed by arm right" in problems
@@ -66,17 +67,18 @@ def test_bimanual_replay_needs_the_base_to_base_edge_for_relative_and_world_edge
     assert not modes["relative"]["ok"] and "B3" in modes["relative"]["reason"]
     assert not modes["absolute"]["ok"]
 
-    graph["edges"].append(_edge("fr3_base", "fr3_base_left", _rz(0, (0, -0.8, 0)), sigma_mm=0.5))
+    # the right base 0.8 m along -y of the left: fr3_base's origin is 0.8 m along +y in it
+    graph["edges"].append(_edge("fr3_base", "fr3_base_right", _rz(0, (0, 0.8, 0)), sigma_mm=0.5))
     modes = em.replay_modes(description, graph, "fr3_base", ["left", "right"])
-    assert modes["relative"]["ok"] and [e["to_world_frame_id"] for e in modes["relative"]["edges"]] == ["fr3_base_left"]
-    # the dataset is in the right base, so absolute needs only the base-to-base edge too
+    assert modes["relative"]["ok"] and [e["to_world_frame_id"] for e in modes["relative"]["edges"]] == ["fr3_base_right"]
+    # the dataset is in the left base, so absolute needs only the base-to-base edge too
     assert modes["absolute"]["ok"]
-    T, edges, _ = em.arm_transform(description, graph, "fr3_base", "left")
-    assert T[1][3] == pytest.approx(-0.8) and len(edges) == 1
+    T, edges, _ = em.arm_transform(description, graph, "fr3_base", "right")
+    assert T[1][3] == pytest.approx(0.8) and len(edges) == 1
 
 
 def test_an_arm_not_in_service_or_one_arm_for_two_hands_is_refused() -> None:
-    modes = em.replay_modes(_dual(left_config=""), {"edges": []}, "fr3_base", ["left", "right"])
+    modes = em.replay_modes(_dual(right_config=""), {"edges": []}, "fr3_base", ["left", "right"])
     assert "not in service" in modes["absolute"]["reason"]
     single = em.load(em.EMBODIMENT_DIR / "fr3_single.json", repo_root=REPO)
     assert em.replay_modes(single, {"edges": []}, "fr3_base", ["left"])["absolute"]["ok"]
@@ -85,7 +87,7 @@ def test_an_arm_not_in_service_or_one_arm_for_two_hands_is_refused() -> None:
 
 def test_a_mobile_root_has_no_edge_to_read() -> None:
     description = _dual()
-    description["roots"]["fr3_base_left"].update(kind="mobile", registration="session_edge")
-    graph = {"edges": [_edge("fr3_base", "fr3_base_left", _rz(0, (0, -0.8, 0)))]}
-    T, _, reason = em.arm_transform(description, graph, "fr3_base", "left")
+    description["roots"]["fr3_base_right"].update(kind="mobile", registration="session_edge")
+    graph = {"edges": [_edge("fr3_base", "fr3_base_right", _rz(0, (0, 0.8, 0)))]}
+    T, _, reason = em.arm_transform(description, graph, "fr3_base", "right")
     assert T is None and "per session_edge" in reason

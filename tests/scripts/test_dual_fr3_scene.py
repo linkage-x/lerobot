@@ -34,6 +34,35 @@ def test_the_registered_cameras_stand_in_front_of_the_base() -> None:
     assert source["edges"]
 
 
+def test_the_cameras_are_placed_in_the_frame_the_collision_checks_use(tmp_path) -> None:
+    """Since 10-26 fr3_base is the left arm's; the checks work in the right arm's base, 0.8 m along -y."""
+    import json
+
+    from tools.thor.gmsl2 import world_provenance as wp
+
+    world = tmp_path / wp.WORLD_SUBDIR
+    world.mkdir(parents=True)
+    cam = np.eye(4)
+    cam[:3, 3] = [1.0, 0.2, 0.6]
+    (world / wp.WORLD_REGISTRATION_FILE).write_text(
+        json.dumps({"world_frame_id": "w", "camera_poses_in_world": {"cam_06": cam.tolist()}})
+    )
+    edge = {"T_to_from": np.eye(4).tolist(), "method": "test"}
+    right_in_left = _placed(-0.8)
+    graph = {
+        "edges": [
+            {**edge, "from_world_frame_id": "w", "to_world_frame_id": "fr3_base"},
+            {**edge, "from_world_frame_id": "fr3_base_right", "to_world_frame_id": "fr3_base",
+             "T_to_from": right_in_left.tolist()},
+        ]
+    }  # fmt: skip
+    (left,), _ = sc.camera_obstacles(tmp_path, graph)
+    (right,), source = sc.camera_obstacles(tmp_path, graph, frame="fr3_base_right")
+    assert np.allclose(left["centre"], [1.0, 0.2, 0.6]) and np.allclose(right["centre"], [1.0, 1.0, 0.6])
+    assert source["frame"] == "fr3_base_right"
+    assert "no edge from w to fr3_base_left" in sc.camera_obstacles(tmp_path, graph, frame="fr3_base_left")[1]["cameras"]
+
+
 def test_one_scene_holds_both_arms_where_the_placement_puts_them() -> None:
     pytest.importorskip("mujoco")
     T = _placed(0.6)

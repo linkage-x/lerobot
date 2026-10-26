@@ -8574,7 +8574,7 @@ def _await_pivot(state, states=("done", "error", "stopped"), timeout_s=10.0):
 def test_fr3_pivot_collect_runs_the_tool_then_fits_what_it_wrote(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
 
-    started = gateway._start_fr3_pivot(state, {"arm": "right", "robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
+    started = gateway._start_fr3_pivot(state, {"arm": "left", "robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
 
     assert started["ok"], started["error"]
     assert started["job"]["state"] in ("collecting", "fitting", "done")
@@ -8592,8 +8592,8 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
     start = gateway._start_fr3_pivot
     assert "IP" in start(state, {"robotIp": "not-an-ip"})["error"]
     assert "there is no default arm" in start(state, {"durationS": 30})["error"]  # roadmap B2
-    assert "left arm is not in service" in start(state, {"arm": "left"})["error"]
-    assert "15–180" in start(state, {"arm": "right", "durationS": 5})["error"]
+    assert "no arm 'middle'" in start(state, {"arm": "middle"})["error"]
+    assert "15–180" in start(state, {"arm": "left", "durationS": 5})["error"]
 
     class Alive:
         pid = 1
@@ -8602,17 +8602,17 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in start(state, {"arm": "right"})["error"]
+    assert "真机 replay" in start(state, {"arm": "left"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in start(state, {"arm": "right"})["error"]
+    assert "遥操作" in start(state, {"arm": "left"})["error"]
     assert gateway._fr3_pivot_job_view(state) == {"log": []}
 
 
 def test_fr3_pivot_stop_interrupts_the_collect_and_a_second_start_is_refused(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
-    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "slow"})["ok"]
-    assert "已有一次" in gateway._start_fr3_pivot(state, {"arm": "right"})["error"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "slow"})["ok"]
+    assert "已有一次" in gateway._start_fr3_pivot(state, {"arm": "left"})["error"]
 
     assert gateway._stop_fr3_pivot(state, {})["ok"]
 
@@ -8647,7 +8647,7 @@ def test_fr3_pivot_ball_check_scores_the_live_edge_and_every_candidate(tmp_path,
     (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py").symlink_to(real_script)
     monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
     monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
-    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "位置 1"})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "位置 1"})["ok"]
     run = _await_pivot(state)["run"]
 
     # The handheld episode about the same ball: the live edge maps c_base (600, 0, 50) mm to the world.
@@ -8764,7 +8764,7 @@ def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypat
     try:
         request = urllib.request.Request(
             f"{base}/api/calibration/fr3-pivot/collect",
-            data=json.dumps({"arm": "right", "durationS": 20, "note": "http"}).encode(),
+            data=json.dumps({"arm": "left", "durationS": 20, "note": "http"}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -8824,12 +8824,12 @@ def _await_gripper_teleop(state, predicate, timeout_s=10.0):
 
 def test_gripper_teleop_follows_until_exit_and_exit_keeps_the_grip(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch)
-    started = gateway._start_gripper_teleop(state, {"arm": "right"})
+    started = gateway._start_gripper_teleop(state, {"arm": "left"})
     assert started["ok"], started["error"]
     assert started["armDeviceId"] == 596523097 and started["graspTriggerClosePct"] == 90
     job = _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
     assert "--arm-device-id 596523097" in job["log"][0] and "--grasp-trigger-close-pct 90" in job["log"][0]
-    assert "已经在遥控" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
+    assert "已经在遥控" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
 
     # It holds the BOX port: the recorder and a real replay must wait for it.
     with pytest.raises(ValueError, match="FR3 夹爪遥控正在运行"):
@@ -8855,15 +8855,15 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
             return None
 
     state.process = Alive()
-    assert "录制器已连接" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
+    assert "录制器已连接" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
     state.process = None
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
+    assert "真机 replay" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
     state.replay_process = None
 
     # A pivot collect holds the FCI (teaching mode), not the BOX: both run at once.
-    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "slow"})["ok"]
-    assert gateway._start_gripper_teleop(state, {"arm": "right"})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "slow"})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "left"})["ok"]
     assert gateway._fr3_pivot_job_view(state)["state"] == "collecting"
     gateway._stop_gripper_teleop(state, {})
     gateway._stop_fr3_pivot(state, {})
@@ -8872,12 +8872,12 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
 
 def test_gripper_teleop_reports_why_it_could_not_start(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="13")
-    assert gateway._start_gripper_teleop(state, {"arm": "right"})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "left"})["ok"]
     job = _await_gripper_teleop(state, lambda j: j.get("state") == "error")
     assert job["returncode"] == 2 and "没发现 FR3 夹爪 BOX 13" in job["error"]
 
     (tmp_path / gateway.FR3_REPLAY_THOR_CONFIG).write_text("robot: {}\n")
-    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
+    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
 
 
 def test_gripper_teleop_over_http(tmp_path, monkeypatch):
@@ -8898,7 +8898,7 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
             return json.loads(response.read())
 
     try:
-        started = post("/api/fr3/gripper-teleop/start", json.dumps({"arm": "right"}).encode())
+        started = post("/api/fr3/gripper-teleop/start", json.dumps({"arm": "left"}).encode())
         _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
         with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop", timeout=10) as response:
             running = json.loads(response.read())
@@ -8942,7 +8942,7 @@ def test_fr3_move_to_start_runs_the_runtime_and_reports_its_failure(tmp_path, mo
 
     assert "there is no default arm" in move(state, {})["error"]  # roadmap B2
     assert "is no FR3" in move(state, {"robotIp": "192.168.11.9"})["error"]
-    done = move(state, {"arm": "right"})
+    done = move(state, {"arm": "left"})
     assert done["ok"], done["error"]
     assert done["robotIp"] == "192.168.11.102" and "robot_ip=192.168.11.102" in done["output"]
     assert "--start-joints=0.0,-0.7853981633974483,0.0,-2.356194490192345" in done["output"]
@@ -8964,13 +8964,13 @@ def test_fr3_move_to_start_refuses_while_the_fci_is_taken(tmp_path, monkeypatch)
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in move(state, {"arm": "right"})["error"]
+    assert "真机 replay" in move(state, {"arm": "left"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in move(state, {"arm": "right"})["error"]
+    assert "遥操作" in move(state, {"arm": "left"})["error"]
     state.teleop_process = None
     state.fr3_pivot_job = {"state": "collecting"}
-    assert "pivot" in move(state, {"arm": "right"})["error"]
+    assert "pivot" in move(state, {"arm": "left"})["error"]
 
 
 _FAKE_PIVOT_AUTO_TOOL = '''

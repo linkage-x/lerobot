@@ -18203,8 +18203,8 @@ def _start_real_replay(
 
     target = _drive_target(state, arm, robot_ip)
     if not workstation:
-        # One arm replays a recording in its own base, and the dataset is in fr3_base (the right arm's,
-        # roadmap C0). Another arm's targets go through the world graph -- the two-arm replay's job.
+        # One arm replays a recording in its own base, and the dataset is in fr3_base (the left arm's
+        # since 10-26, roadmap C0). Another arm's targets go through the world graph -- the two-arm replay's job.
         root = _arm_root(state, target["arm"])
         if root != wp.FR3_BASE_WORLD_ID:
             raise ValueError(
