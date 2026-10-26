@@ -276,7 +276,7 @@ function App() {
       <EpisodeReplayPage
         snapshot={snapshot}
         busy={busy}
-        onPreflight={() => run(() => api.preflightReplay())}
+        onPreflight={(arm) => run(() => api.preflightReplay(arm))}
         onMujocoReplay={(mode) => run(() => api.startMujocoReplay(mode))}
         onApproveMujoco={(mode) => run(() => api.approveMujocoReplay(mode))}
         onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker, commandLeadFrames) =>

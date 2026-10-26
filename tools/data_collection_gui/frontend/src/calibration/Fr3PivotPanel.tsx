@@ -8,6 +8,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import type { BallCheckReport, Fr3PivotResponse } from "../types";
+import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
+import { armIp } from "../shared/robotArms";
 import { Modal } from "./ConfirmModal";
 import { Fr3PivotAutoSteps } from "./Fr3PivotAutoSteps";
 import { GripperTeleopBox } from "./GripperTeleopBox";
@@ -43,6 +45,9 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
   const [robotIp, setRobotIp] = useState("");
+  const arms = useRobotArms();
+  // Thor: the arm from fr3_arms.json, chosen here every time (roadmap B2; B3 pivots both arms).
+  const [arm, setArm] = useState("");
   const [durationS, setDurationS] = useState("");
   const [note, setNote] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -95,7 +100,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const togglePicked = (name: string, on: boolean) =>
     setPicked((names) => (on ? [...names.filter((n) => n !== name), name] : names.filter((n) => n !== name)));
   const episodes = payload?.episodes ?? [];
-  const ip = robotIp || payload?.robotIp || "";
+  const ip = arms?.required ? armIp(arms, arm) : robotIp || payload?.robotIp || "";
   const duration = Number(durationS || payload?.defaultDurationS || 45);
   const [lo, hi] = payload?.durationRangeS ?? [15, 180];
   const disabled = busy || running !== "";
@@ -134,7 +139,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
         两边都各自拟合杠杆臂，所以和 TCP 定义、跟踪仪站位、激光都无关。
       </p>
 
-      <GripperTeleopBox api={api} busy={busy} />
+      <GripperTeleopBox api={api} busy={busy} armRequired={Boolean(arms?.required)} arm={arm} robotIp={ip} />
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
@@ -151,9 +156,13 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
           <button className={mode === "teach" ? "cali-btn-primary" : "cali-mini-btn"} disabled={active} onClick={() => setMode("teach")}>
             示教（手扶）
           </button>
-          <label className="cali-muted">
-            FR3 IP <input value={ip} disabled={disabled || active} onChange={(e) => setRobotIp(e.target.value)} size={14} />
-          </label>
+          {arms?.required ? (
+            <ArmPicker arms={arms} value={arm} onChange={setArm} disabled={disabled || active} label="FR3" />
+          ) : (
+            <label className="cali-muted">
+              FR3 IP <input value={ip} disabled={disabled || active} onChange={(e) => setRobotIp(e.target.value)} size={14} />
+            </label>
+          )}
           <label className="cali-muted">
             备注 <input value={note} disabled={disabled || active} onChange={(e) => setNote(e.target.value)} placeholder="球 A" size={12} />
           </label>

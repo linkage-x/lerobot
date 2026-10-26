@@ -36,6 +36,7 @@ import type {
   MujocoPreview,
   LaserReplayReport,
   DualFr3Executability,
+  RobotArms,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -344,8 +345,10 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async preflightReplay(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/replay/preflight");
+  // arm: right, left or both (every arm in service); Thor refuses a preflight that names none (roadmap B2).
+  async preflightReplay(arm = ""): Promise<GuiSnapshot> {
+    const query = arm ? `?${new URLSearchParams({ arm }).toString()}` : "";
+    const remote = await this.postRemoteSnapshot(`/api/replay/preflight${query}`);
     if (remote) {
       return remote;
     }
@@ -510,6 +513,15 @@ export class DataCollectionGuiApi {
   }
 
   // null when the dataset has no two-arm verdicts yet (tools/fr3/dual_fr3_executability.py writes them).
+  async fetchRobotArms(): Promise<RobotArms | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/arms`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as RobotArms) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async fetchDualFr3Executability(datasetPath: string, episode: number): Promise<DualFr3Executability | null> {
     try {
       const response = await fetch(
@@ -1473,20 +1485,21 @@ export class DataCollectionGuiApi {
   }
 
   // The FR3's gripper follows the handheld BOX; exit leaves it holding (no release).
-  async startGripperTeleop(): Promise<GripperTeleopResponse | null> {
-    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start");
+  // robotIp: whose gripper (roadmap B2: the gateway refuses none on Thor).
+  async startGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start", { robotIp });
   }
 
   async stopGripperTeleop(): Promise<GripperTeleopResponse | null> {
     return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop");
   }
 
-  private async gripperTeleopPost(path: string): Promise<GripperTeleopResponse | null> {
+  private async gripperTeleopPost(path: string, body: Record<string, unknown> = {}): Promise<GripperTeleopResponse | null> {
     try {
       const response = await fetch(`${this.apiBase}${path}`, {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: "{}"
+        body: JSON.stringify(body)
       });
       const payload = (await response.json()) as Partial<GripperTeleopResponse>;
       if (!response.ok && !payload.job) return null;

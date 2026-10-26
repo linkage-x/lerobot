@@ -395,6 +395,26 @@ export type DualFr3EpisodeVerdict = {
   scene_fingerprint?: string;
 };
 
+// GET /api/robot/arms: tools/fr3/fr3_arms.json (roadmap B2). `required`: every request that drives an
+// arm must name one (Thor); the workstation drives its own FR3 by IP and gets false.
+export type RobotArm = {
+  arm: "right" | "left";
+  inService: boolean;
+  whyNot: string;
+  robotIp: string;
+  gripperBox: number | null;
+  payload: { mass_kg: number; com_m: number[]; source: string } | null;
+  startJointsRad: number[] | null;
+  replayConfig: string;
+};
+
+export type RobotArms = {
+  ok: boolean;
+  required: boolean;
+  arms: RobotArm[];
+  error: string;
+};
+
 export type DualFr3Executability = {
   datasetRoot: string;
   episode: number;

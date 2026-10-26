@@ -22,6 +22,13 @@ import yaml
 from tools.data_collection_gui import gateway
 
 
+@pytest.fixture(autouse=True)
+def _repo_arm_registry(monkeypatch):
+    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2)."""
+    registry = gateway.fr3_arms.load()
+    monkeypatch.setattr(gateway.fr3_arms, "load", lambda path=None, repo_root=None: registry)
+
+
 def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -2732,7 +2739,7 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
 
     gateway._select_replay_dataset(state, str(dataset_root))
-    gateway._preflight_replay(state)
+    gateway._preflight_replay(state, "right")
     gateway._start_dry_run_replay(state)
     assert "strongly recommended" in state.replay.message
     assert state.replay.state == "dry_run"
@@ -2757,7 +2764,7 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
         "avg_pos_mm=2.0 max_pos_mm=4.0 avg_rot_deg=1.0 max_rot_deg=3.0",
     )
     gateway._finish_mujoco_validation(state, 0)
-    gateway._preflight_replay(state)
+    gateway._preflight_replay(state, "right")
     planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
     report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3107,7 +3114,7 @@ def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path)
     )
 
     with pytest.raises(RuntimeError, match="connection refused"):
-        gateway._run_real_preflight(state, ["192.168.1.99"])
+        gateway._run_real_preflight(state, [{"arm": "", "robot_ip": "192.168.1.99"}])
 
     joined = "\n".join(state.replay.realReplayLog)
     assert "replay_cube_pose_in_robot_base.thor.yaml" in joined
@@ -8567,7 +8574,7 @@ def _await_pivot(state, states=("done", "error", "stopped"), timeout_s=10.0):
 def test_fr3_pivot_collect_runs_the_tool_then_fits_what_it_wrote(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
 
-    started = gateway._start_fr3_pivot(state, {"robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
+    started = gateway._start_fr3_pivot(state, {"arm": "right", "robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
 
     assert started["ok"], started["error"]
     assert started["job"]["state"] in ("collecting", "fitting", "done")
@@ -8584,7 +8591,9 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
     start = gateway._start_fr3_pivot
     assert "IP" in start(state, {"robotIp": "not-an-ip"})["error"]
-    assert "15–180" in start(state, {"durationS": 5})["error"]
+    assert "there is no default arm" in start(state, {"durationS": 30})["error"]  # roadmap B2
+    assert "left arm is not in service" in start(state, {"arm": "left"})["error"]
+    assert "15–180" in start(state, {"arm": "right", "durationS": 5})["error"]
 
     class Alive:
         pid = 1
@@ -8593,17 +8602,17 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in start(state, {})["error"]
+    assert "真机 replay" in start(state, {"arm": "right"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in start(state, {})["error"]
+    assert "遥操作" in start(state, {"arm": "right"})["error"]
     assert gateway._fr3_pivot_job_view(state) == {"log": []}
 
 
 def test_fr3_pivot_stop_interrupts_the_collect_and_a_second_start_is_refused(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
-    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
-    assert "已有一次" in gateway._start_fr3_pivot(state, {})["error"]
+    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "slow"})["ok"]
+    assert "已有一次" in gateway._start_fr3_pivot(state, {"arm": "right"})["error"]
 
     assert gateway._stop_fr3_pivot(state, {})["ok"]
 
@@ -8638,7 +8647,7 @@ def test_fr3_pivot_ball_check_scores_the_live_edge_and_every_candidate(tmp_path,
     (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py").symlink_to(real_script)
     monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
     monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
-    assert gateway._start_fr3_pivot(state, {"note": "位置 1"})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "位置 1"})["ok"]
     run = _await_pivot(state)["run"]
 
     # The handheld episode about the same ball: the live edge maps c_base (600, 0, 50) mm to the world.
@@ -8755,7 +8764,7 @@ def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypat
     try:
         request = urllib.request.Request(
             f"{base}/api/calibration/fr3-pivot/collect",
-            data=json.dumps({"durationS": 20, "note": "http"}).encode(),
+            data=json.dumps({"arm": "right", "durationS": 20, "note": "http"}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -8815,12 +8824,12 @@ def _await_gripper_teleop(state, predicate, timeout_s=10.0):
 
 def test_gripper_teleop_follows_until_exit_and_exit_keeps_the_grip(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch)
-    started = gateway._start_gripper_teleop(state, {})
+    started = gateway._start_gripper_teleop(state, {"arm": "right"})
     assert started["ok"], started["error"]
     assert started["armDeviceId"] == 596523097 and started["graspTriggerClosePct"] == 90
     job = _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
     assert "--arm-device-id 596523097" in job["log"][0] and "--grasp-trigger-close-pct 90" in job["log"][0]
-    assert "已经在遥控" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "已经在遥控" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
 
     # It holds the BOX port: the recorder and a real replay must wait for it.
     with pytest.raises(ValueError, match="FR3 夹爪遥控正在运行"):
@@ -8846,15 +8855,15 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
             return None
 
     state.process = Alive()
-    assert "录制器已连接" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "录制器已连接" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
     state.process = None
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "真机 replay" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
     state.replay_process = None
 
     # A pivot collect holds the FCI (teaching mode), not the BOX: both run at once.
-    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
-    assert gateway._start_gripper_teleop(state, {})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "right", "note": "slow"})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "right"})["ok"]
     assert gateway._fr3_pivot_job_view(state)["state"] == "collecting"
     gateway._stop_gripper_teleop(state, {})
     gateway._stop_fr3_pivot(state, {})
@@ -8863,12 +8872,12 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
 
 def test_gripper_teleop_reports_why_it_could_not_start(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="13")
-    assert gateway._start_gripper_teleop(state, {})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "right"})["ok"]
     job = _await_gripper_teleop(state, lambda j: j.get("state") == "error")
     assert job["returncode"] == 2 and "没发现 FR3 夹爪 BOX 13" in job["error"]
 
     (tmp_path / gateway.FR3_REPLAY_THOR_CONFIG).write_text("robot: {}\n")
-    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {"arm": "right"})["error"]
 
 
 def test_gripper_teleop_over_http(tmp_path, monkeypatch):
@@ -8880,16 +8889,16 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
 
-    def post(route):
+    def post(route, body=b"{}"):
         request = urllib.request.Request(
-            f"{base}{route}", data=b"{}", headers={"Content-Type": "application/json"}, method="POST"
+            f"{base}{route}", data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
         # the BOX-holder check and the log take state.lock: routed inside the locked block this would hang
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
 
     try:
-        started = post("/api/fr3/gripper-teleop/start")
+        started = post("/api/fr3/gripper-teleop/start", json.dumps({"arm": "right"}).encode())
         _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
         with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop", timeout=10) as response:
             running = json.loads(response.read())
@@ -8906,12 +8915,13 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
 # --- FR3 move to start ------------------------------------------------------------
 
 _FAKE_MOVE_TO_START_TOOL = '''
+import os
 import sys
 ip = sys.argv[1].split("=", 1)[1]
-if ip == "192.168.11.9":
+if os.environ.get("FAKE_MOVE_TO_START_FAIL"):
     print(f"fr3_move_to_start=FAIL details=Failed to connect to FR3 at {ip}.", file=sys.stderr)
     raise SystemExit(1)
-print(f"fr3_move_to_start=CONNECT robot_ip={ip}")
+print(f"fr3_move_to_start=CONNECT robot_ip={ip} {' '.join(sys.argv[2:])}")
 print("fr3_move_to_start=PASS")
 '''
 
@@ -8930,12 +8940,16 @@ def test_fr3_move_to_start_runs_the_runtime_and_reports_its_failure(tmp_path, mo
     state = _fr3_move_to_start_state(tmp_path, monkeypatch)
     move = gateway._FR3_MOVE_TO_START_ROUTES["/api/robot/move-to-start"]
 
-    done = move(state, {})
+    assert "there is no default arm" in move(state, {})["error"]  # roadmap B2
+    assert "is no FR3" in move(state, {"robotIp": "192.168.11.9"})["error"]
+    done = move(state, {"arm": "right"})
     assert done["ok"], done["error"]
     assert done["robotIp"] == "192.168.11.102" and "robot_ip=192.168.11.102" in done["output"]
+    assert "--start-joints=0.0,-0.7853981633974483,0.0,-2.356194490192345" in done["output"]
 
-    failed = move(state, {"robotIp": "192.168.11.9"})
-    assert not failed["ok"] and "Failed to connect to FR3 at 192.168.11.9" in failed["error"]
+    monkeypatch.setenv("FAKE_MOVE_TO_START_FAIL", "1")
+    failed = move(state, {"robotIp": "192.168.11.102"})
+    assert not failed["ok"] and "Failed to connect to FR3 at 192.168.11.102" in failed["error"]
     assert "IP" in move(state, {"robotIp": "not-an-ip"})["error"]
 
 
@@ -8950,13 +8964,13 @@ def test_fr3_move_to_start_refuses_while_the_fci_is_taken(tmp_path, monkeypatch)
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in move(state, {})["error"]
+    assert "真机 replay" in move(state, {"arm": "right"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in move(state, {})["error"]
+    assert "遥操作" in move(state, {"arm": "right"})["error"]
     state.teleop_process = None
     state.fr3_pivot_job = {"state": "collecting"}
-    assert "pivot" in move(state, {})["error"]
+    assert "pivot" in move(state, {"arm": "right"})["error"]
 
 
 _FAKE_PIVOT_AUTO_TOOL = '''
@@ -9020,7 +9034,7 @@ def _pivot_auto_state(tmp_path, monkeypatch):
 def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
 
-    captured = gateway._capture_fr3_pivot_centre(state, {"note": "球 A"})
+    captured = gateway._capture_fr3_pivot_centre(state, {"arm": "right", "note": "球 A"})
     assert captured["ok"], captured["error"]
     (centre,) = captured["centres"]
     assert centre["name"] == captured["captured"] and centre["centreMm"] == [550.0, 0.0, 100.0]
@@ -9035,7 +9049,7 @@ def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypa
     assert plan["socketStandMm"] == 1.7 and plan["gripperStandBody"] == "link_gripper_tip_right"
     assert plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
 
-    started = gateway._execute_fr3_pivot(state, {"plan": plan["name"]})
+    started = gateway._execute_fr3_pivot(state, {"arm": "right", "plan": plan["name"]})
     assert started["ok"], started["error"]
     assert started["job"]["mode"] == "auto" and started["job"]["biasMm"] == [3.0, 0.0, 0.0]
     job = _await_pivot(state)
@@ -9047,13 +9061,13 @@ def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypa
 def test_fr3_pivot_auto_refuses_failed_plans_bad_input_and_a_busy_fci(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
     assert "先取球心" in gateway._plan_fr3_pivot(state, {"centre": "../x_centre.json"})["error"]
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     assert "±5 mm" in gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [9, 0, 0]})["error"]
 
     failed = gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [5, 0, 0]})
     assert failed["ok"] and not failed["plans"][0]["passed"]  # written, shown, not runnable
-    assert "没通过演算" in gateway._execute_fr3_pivot(state, {"plan": failed["planned"]})["error"]
-    assert "找不到规划" in gateway._execute_fr3_pivot(state, {"plan": "nope_plan.json"})["error"]
+    assert "没通过演算" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": failed["planned"]})["error"]
+    assert "找不到规划" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": "nope_plan.json"})["error"]
 
     good = gateway._plan_fr3_pivot(state, {"centre": centre})["planned"]
 
@@ -9064,29 +9078,29 @@ def test_fr3_pivot_auto_refuses_failed_plans_bad_input_and_a_busy_fci(tmp_path, 
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
-    assert "真机 replay" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    assert "真机 replay" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good})["error"]
+    assert "真机 replay" in gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["error"]
     state.replay_process = None
 
-    assert gateway._execute_fr3_pivot(state, {"plan": good, "note": "slow"})["ok"]
-    assert "已有一次" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
-    assert "还在进行" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    assert gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good, "note": "slow"})["ok"]
+    assert "已有一次" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good})["error"]
+    assert "还在进行" in gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["error"]
     gateway._stop_fr3_pivot(state, {})
     assert _await_pivot(state)["state"] == "stopped"
 
 
 def test_fr3_pivot_guide_runs_until_finish_then_fits(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    assert "找不到球心" in gateway._guide_fr3_pivot(state, {"centre": "x"})["error"]
-    assert "20–180" in gateway._guide_fr3_pivot(state, {"centre": centre, "durationS": 5})["error"]
-    assert "±5 mm" in gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [0, 7, 0]})["error"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    assert "找不到球心" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": "x"})["error"]
+    assert "20–180" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "durationS": 5})["error"]
+    assert "±5 mm" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "biasMm": [0, 7, 0]})["error"]
     assert "没有正在进行的引导" in gateway._finish_fr3_pivot(state, {})["error"]
 
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [-3, 0, 0], "durationS": 90, "note": "slow"})
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "biasMm": [-3, 0, 0], "durationS": 90, "note": "slow"})
     assert started["ok"], started["error"]
     assert started["job"]["mode"] == "guided" and started["job"]["biasMm"] == [-3.0, 0.0, 0.0]
-    assert "已有一次" in gateway._guide_fr3_pivot(state, {"centre": centre})["error"]
+    assert "已有一次" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre})["error"]
     deadline = time.monotonic() + 5
     while not any("guide: up to 90 s, bias -3 0 0" in line for line in gateway._fr3_pivot_job_view(state)["log"]):
         assert time.monotonic() < deadline
@@ -9114,34 +9128,34 @@ def _guided_fit(state, name, *, rms=1.2, span=22.8, weak=0.12, s=(0.4, -1.5, 6.5
 
 def test_fr3_pivot_guide_anchors_on_the_latest_good_fit_of_the_same_grip(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    assert "先跑一轮不挂球心" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    assert "先跑一轮不挂球心" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})["error"]
 
     _guided_fit(state, "20261013_180847")
     _guided_fit(state, "20261013_181013", span=16.3, weak=0.03)  # newer, barely turned: not used, and says why
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert not anchor["available"] and anchor["run"] == "20261013_181013_pivot.json" and "转得不够" in anchor["reason"]
-    assert "转得不够" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+    assert "转得不够" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})["error"]
 
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and anchor["sMm"] == [0.13, -0.53, 7.87]
     assert anchor["fitName"] == "20261013_181645_pivot.fit.json"
 
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})
     assert started["ok"], started["error"]
     assert started["job"]["anchorMm"] == [0.13, -0.53, 7.87]
     job = _await_pivot(state)
     assert any("anchor 0.13 -0.53 7.87 from 20261013_181645_pivot.fit.json" in line for line in job["log"]), job["log"]
     # without the box ticked nothing changes: no --anchor-mm, the frame's origin held as before
-    plain = gateway._guide_fr3_pivot(state, {"centre": centre})
+    plain = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre})
     assert plain["job"]["anchorMm"] == [0.0, 0.0, 0.0]
     assert not any(line.startswith("anchor") for line in _await_pivot(state)["log"])
 
 
 def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     assert "先跑一轮不挂球心" in gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     planned = gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
@@ -9153,7 +9167,7 @@ def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, 
 def test_fr3_pivot_probe_plans_without_an_anchor(tmp_path, monkeypatch):
     # the probe is what finds the ball centre: asked with anchorFromFit too, it still turns about the origin
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     planned = gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "anchorFromFit": True})
     assert planned["ok"], planned["error"]
@@ -9194,8 +9208,8 @@ def test_fr3_pivot_anchor_warns_but_stays_usable_once_the_gripper_teleop_ran_aft
     os.utime(hold, (after, after))  # 10-13: the BOX reboot dropped the insert, teleop re-clamped it
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and "夹持可能变了" in anchor["warning"] and "仍可沿用" in anchor["warning"]
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})
     assert started["ok"], started["error"]
     assert started["job"]["anchorMm"] == [0.4, -1.5, 6.5]
     _await_pivot(state)

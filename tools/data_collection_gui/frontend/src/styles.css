@@ -4542,3 +4542,33 @@ button.danger {
   color: #b91c1c;
   font-weight: 600;
 }
+
+/* Which FR3 (roadmap B2): radio buttons, empty until chosen; an arm out of service stays visible, greyed. */
+.arm-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.arm-picker > span {
+  color: #52616d;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.arm-picker label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.arm-picker .arm-picker-off {
+  color: #9aa5ae;
+}
+
+.arm-picker-prompt {
+  color: #a1560f;
+  font-size: 12px;
+}

@@ -9,7 +9,20 @@ import { isTeleopRunning, teleopStatusText, teleopWarnings } from "./gripperTele
 const POLL_MS = 400;
 const LOG_TAIL = 6;
 
-export function GripperTeleopBox({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
+export function GripperTeleopBox({
+  api,
+  busy,
+  armRequired = false,
+  arm = "",
+  robotIp = ""
+}: {
+  api: DataCollectionGuiApi;
+  busy: boolean;
+  // Thor: whose gripper is the arm chosen in the pivot panel (roadmap B2); none chosen, no teleop.
+  armRequired?: boolean;
+  arm?: string;
+  robotIp?: string;
+}) {
   const [payload, setPayload] = useState<GripperTeleopResponse | null>(null);
   const [running, setRunning] = useState("");
   const [error, setError] = useState("");
@@ -66,8 +79,13 @@ export function GripperTeleopBox({ api, busy }: { api: DataCollectionGuiApi; bus
             {running === "stop" ? "退出中…" : "退出遥控（保持夹紧）"}
           </button>
         ) : (
-          <button className="cali-btn-primary" disabled={disabled || payload?.armDeviceId == null} onClick={() => setConfirming(true)}>
-            进入遥控
+          <button
+            className="cali-btn-primary"
+            disabled={disabled || payload?.armDeviceId == null || (armRequired && !robotIp)}
+            onClick={() => setConfirming(true)}
+            title={armRequired && !robotIp ? "先在下面选 FR3（没有默认臂）" : undefined}
+          >
+            {armRequired && arm ? `进入遥控（${arm}）` : "进入遥控"}
           </button>
         )}
         {payload?.armDeviceId != null ? <span className="cali-muted">FR3 夹爪 BOX {payload.armDeviceId}</span> : null}
@@ -91,7 +109,7 @@ export function GripperTeleopBox({ api, busy }: { api: DataCollectionGuiApi; bus
                 className="cali-btn-primary"
                 onClick={() => {
                   setConfirming(false);
-                  void act("start", () => api.startGripperTeleop());
+                  void act("start", () => api.startGripperTeleop(robotIp));
                 }}
               >
                 进入遥控

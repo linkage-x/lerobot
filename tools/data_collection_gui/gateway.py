@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
 from tools.thor.gmsl2 import register_fr3_base
@@ -246,6 +247,8 @@ class ReplayStatus:
     mujocoValidation: dict[str, Any] = field(default_factory=dict)
     realCubeMode: str = "right"
     realRobotIp: str = ""
+    # Thor: the arm (tools/fr3/fr3_arms.json) the last real replay or preflight was explicitly given.
+    realArm: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
     # Frames each pose command runs ahead of the trajectory (replay.pose_command_lead_frames) in
     # the last real replay started; the panel starts from it.
@@ -4313,7 +4316,8 @@ def _fr3_pivot_payload(state: GatewayState) -> dict[str, Any]:
         "centres": _fr3_pivot_centres(state),
         "plans": _fr3_pivot_plans(state),
         "joints": _fr3_pivot_joints(state),
-        "robotIp": _real_robot_ip(state),
+        "robotIp": _real_robot_ip(state) if state.profile == "workstation" else "",
+        "arms": _robot_arms_payload(state)["arms"],
         "defaultDurationS": _FR3_PIVOT_DEFAULT_DURATION_S,
         "guideDefaultS": _FR3_PIVOT_GUIDE_DEFAULT_S,
         "guideRangeS": list(_FR3_PIVOT_GUIDE_RANGE_S),
@@ -4414,7 +4418,7 @@ def _watch_fr3_pivot(state: GatewayState, process: subprocess.Popen[str], run: P
 def _start_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Teaching mode for ``durationS``, the arm moved about the ball by hand; then fit."""
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
         duration = float(body.get("durationS") or _FR3_PIVOT_DEFAULT_DURATION_S)
     except (TypeError, ValueError) as exc:
         return _fr3_pivot_refusal(state, str(exc))
@@ -4516,7 +4520,7 @@ def _run_fr3_pivot_tool(state: GatewayState, command: list[str], timeout_s: floa
 def _capture_fr3_pivot_centre(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Read only: the socket seated on the ball, its FK is the centre the plan pivots about."""
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except ValueError as exc:
         return _fr3_pivot_refusal(state, str(exc))
     busy = _fr3_pivot_busy(state) or _fr3_pivot_fci_holder(state)
@@ -4575,7 +4579,7 @@ def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, A
     if not summary.get("passed"):
         return _fr3_pivot_refusal(state, "这个规划没通过演算，不能执行")
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except ValueError as exc:
         return _fr3_pivot_refusal(state, str(exc))
     holder = _fr3_pivot_fci_holder(state)
@@ -4707,7 +4711,7 @@ def _guide_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any
         return _fr3_pivot_refusal(state, bias)
     try:
         duration = float(body.get("durationS") or _FR3_PIVOT_GUIDE_DEFAULT_S)
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except (TypeError, ValueError) as exc:
         return _fr3_pivot_refusal(state, str(exc))
     lo, hi = _FR3_PIVOT_GUIDE_RANGE_S
@@ -4992,10 +4996,10 @@ def _gripper_teleop_running(state: GatewayState) -> bool:
     return process is not None and process.poll() is None
 
 
-def _gripper_teleop_settings(state: GatewayState) -> dict[str, Any]:
-    """Arm BOX id and the grasp rule, from the real replay YAML (the same gripper, the same rule)."""
+def _gripper_teleop_settings(state: GatewayState, replay_config: str | None = None) -> dict[str, Any]:
+    """Arm BOX id and the grasp rule, from the arm's real replay YAML (the same gripper, the same rule)."""
     try:
-        config = _load_yaml(state.repo_root / FR3_REPLAY_THOR_CONFIG)
+        config = _load_yaml(state.repo_root / (replay_config or FR3_REPLAY_THOR_CONFIG))
     except (OSError, RuntimeError, ValueError):
         config = {}
     robot = config.get("robot") if isinstance(config.get("robot"), dict) else {}
@@ -5078,10 +5082,14 @@ def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -
 
 
 def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
-    del body
-    settings = _gripper_teleop_settings(state)
+    try:  # whose gripper: never a default (roadmap B2)
+        target = _drive_target(state, body.get("arm"), body.get("robotIp"))
+    except ValueError as exc:
+        return _gripper_teleop_refusal(state, str(exc))
+    config = target.get("replay_config") or FR3_REPLAY_THOR_CONFIG
+    settings = _gripper_teleop_settings(state, config)
     if settings["armDeviceId"] is None:
-        return _gripper_teleop_refusal(state, f"{FR3_REPLAY_THOR_CONFIG} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）")
+        return _gripper_teleop_refusal(state, f"{config} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）")
     holder = _gripper_teleop_box_holder(state)
     if holder:
         return _gripper_teleop_refusal(state, holder)
@@ -5174,9 +5182,11 @@ _FR3_MOVE_TO_START_LOCK = Lock()
 
 def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        target = _drive_target(state, body.get("arm"), body.get("robotIp"))
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "robotIp": "", "output": ""}
+    robot_ip = target["robot_ip"]
+    start = target.get("start_joints_rad")
     refusal = {"ok": False, "robotIp": robot_ip, "output": ""}
     holder = _fr3_pivot_fci_holder(state)
     if not holder:
@@ -5194,6 +5204,7 @@ def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, A
             str(_mujoco_replay_python(state)),
             str(state.repo_root / _FR3_MOVE_TO_START_SCRIPT),
             f"--robot-ip={robot_ip}",
+            *([f"--start-joints={','.join(repr(float(v)) for v in start)}"] if start else []),
         ]
         try:
             proc = subprocess.run(
@@ -11104,13 +11115,19 @@ def _fr3_replay_robot_config(repo_root: Path) -> dict[str, Any]:
 
 
 def _fr3_arm_box_ids(repo_root: Path) -> set[str]:
-    """Column prefixes (``box<device id>``) of the BOX mounted on the FR3, per the real replay YAML.
+    """Column prefixes (``box<device id>``) of the BOXes mounted on the FR3s (fr3_arms.json, every arm
+    that names one, plus the real replay YAML's).
 
-    The recorder discovers every BOX on the network, so a session recorded with the arm's BOX
+    The recorder discovers every BOX on the network, so a session recorded with an arm's BOX
     powered also carries that BOX's (idle) jaw and trigger; it is never the operator's.
     """
-    device_id = _fr3_replay_robot_config(repo_root).get("corenetic_device_id")
-    return {f"box{device_id}"} if device_id not in (None, "") else set()
+    device_ids = {_fr3_replay_robot_config(repo_root).get("corenetic_device_id")}
+    try:
+        registry = json.loads((repo_root / fr3_arms.REGISTRY).read_text(encoding="utf-8"))
+        device_ids |= {arm.get("corenetic_device_id") for arm in (registry.get("arms") or {}).values()}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {f"box{device_id}" for device_id in device_ids if device_id not in (None, "")}
 
 
 def _fr3_replay_target_frame(repo_root: Path) -> str:
@@ -17024,6 +17041,8 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
 
 
 DUAL_FR3_EXECUTABLE_FILE = Path("meta") / "dual_fr3_executable.json"
+#: Both FR3s as one robot (roadmap G1): each arm's base, hands and TCP.
+_DUAL_FR3_EMBODIMENT = Path("tools") / "thor" / "gmsl2" / "embodiments" / "fr3_dual.json"
 
 
 def _dual_fr3_executability_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
@@ -17398,6 +17417,51 @@ def _real_replay_command(
     return command
 
 
+def _robot_arms_payload(state: GatewayState) -> dict[str, Any]:
+    """``/api/robot/arms``: every FR3 of tools/fr3/fr3_arms.json, and whether a request must name one.
+
+    The workstation drives its own FR3, which is not in the registry; it keeps its IP box.
+    """
+    required = state.profile != "workstation"
+    try:
+        arms = fr3_arms.summary(fr3_arms.load(repo_root=state.repo_root))
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "required": required, "arms": [], "error": str(exc)}
+    return {"ok": True, "required": required, "arms": arms, "error": ""}
+
+
+def _drive_target(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    """The FR3 a request drives, as ``{"arm", "robot_ip", ...its fr3_arms.json entry}``.
+
+    Thor (roadmap B2): the request names the arm, or an IP that is a registered arm's; neither is refused
+    (fr3_arms.ArmConfigError, a ValueError) -- with two FR3s a default is the wrong one moving. The
+    workstation's FR3 is not in the registry and keeps the IP it was given or configured.
+    """
+    if state.profile == "workstation":
+        return {"arm": "", "robot_ip": _validated_robot_ip(str(robot_ip or _real_robot_ip(state)), "Robot IP")}
+    if str(robot_ip or "").strip():
+        _validated_robot_ip(str(robot_ip), "Robot IP")
+    registry = fr3_arms.load(repo_root=state.repo_root)
+    return fr3_arms.resolve(registry, str(arm or "") or None, str(robot_ip or "") or None)
+
+
+def _drive_targets(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> list[dict[str, Any]]:
+    """:func:`_drive_target`, with ``arm=both`` meaning every arm in service (the preflight checks each)."""
+    if str(arm or "").strip().lower() == "both" and state.profile != "workstation":
+        registry = fr3_arms.load(repo_root=state.repo_root)
+        return [fr3_arms.resolve(registry, name) for name in fr3_arms.in_service(registry)]
+    return [_drive_target(state, arm, robot_ip)]
+
+
+def _arm_root(state: GatewayState, arm: str) -> str:
+    """The base an arm commands in (embodiments/fr3_dual.json); "" when it has none."""
+    try:
+        description = json.loads((state.repo_root / _DUAL_FR3_EMBODIMENT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(((description.get("arms") or {}).get(arm) or {}).get("root") or "")
+
+
 def _real_robot_ip(state: GatewayState) -> str:
     replay = _replay_config(state.config)
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
@@ -17410,16 +17474,14 @@ def _real_robot_ip(state: GatewayState) -> str:
     )
 
 
-def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
+def _real_preflight_command(
+    state: GatewayState, robot_ip: str | None = None, replay_config: str | None = None
+) -> list[str]:
     replay = _replay_config(state.config)
     config_path = (
         state.config_path
         if state.profile == "workstation"
-        else state.repo_root
-        / "third_party"
-        / "opencv_kalibr"
-        / "fr3_data_collection_replay"
-        / "replay_cube_pose_in_robot_base.thor.yaml"
+        else state.repo_root / (replay_config or FR3_REPLAY_THOR_CONFIG)
     )
     command = [
         str(
@@ -17465,15 +17527,19 @@ def _real_preflight_env(state: GatewayState) -> dict[str, str]:
     return env
 
 
-def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = None) -> None:
+def _run_real_preflight(state: GatewayState, targets: Iterable[dict[str, Any]] | None = None) -> None:
+    """Hardware checks of each target (``_drive_target`` results); on Thor there is no default arm to check."""
     replay = _replay_config(state.config)
     if not _bool_config(replay, "real_preflight_enabled", True):
         state.log("warn", "Real-robot preflight skipped by replay.real_preflight_enabled=false")
         return
     timeout_s = _float_config(replay, "real_preflight_timeout_s", DEFAULT_REAL_PREFLIGHT_TIMEOUT_S)
-    targets = list(dict.fromkeys(robot_ips or [_real_robot_ip(state)]))
-    for robot_ip in targets:
-        command = _real_preflight_command(state, robot_ip)
+    targets = list(targets) if targets is not None else _drive_targets(state)
+    for target in targets:
+        robot_ip = str(target["robot_ip"])
+        command = _real_preflight_command(state, robot_ip, target.get("replay_config"))
+        if target.get("arm"):
+            _append_real_replay_log(state, "preflight", f"{target['arm']} arm")
         state.replay.message = f"Running real-robot preflight checks for {robot_ip}"
         _append_real_replay_log(state, "preflight", f"checking robot {robot_ip}")
         _append_real_replay_log(state, "preflight", f"config={next(arg.split('=', 1)[1] for arg in command if arg.startswith('--config-path='))}")
@@ -17562,9 +17628,14 @@ def _mujoco_recommendation_suffix(state: GatewayState, dataset_root: Path) -> st
     return "MuJoCo replay is strongly recommended before Preflight and still required before Real Robot"
 
 
-def _preflight_replay(state: GatewayState) -> None:
+def _preflight_replay(state: GatewayState, arm: str = "", robot_ip: str = "") -> None:
+    """``arm`` is right, left, or both (every arm in service); on Thor a preflight that names none is refused."""
     dataset_root = _require_replay_dataset(state)
-    _run_real_preflight(state)
+    targets = _drive_targets(state, arm, robot_ip)
+    _run_real_preflight(state, targets)
+    if len(targets) == 1:
+        state.replay.realArm = str(targets[0].get("arm") or "")
+        state.replay.realRobotIp = str(targets[0]["robot_ip"])
     state.replay.state = "armed"
     state.replay.safety = "ready"
     state.replay.message = (
@@ -17811,6 +17882,7 @@ def _start_real_replay(
     override_mujoco_failure: bool = False,
     record_tracker: bool = False,
     command_lead_frames: Any = None,
+    arm: str = "",
 ) -> None:
     """Thor: step 1 of a real replay -- move the arm to the trajectory start and hold there.
 
@@ -17876,7 +17948,17 @@ def _start_real_replay(
                 f"{expected_link}; select the end effector that matches the tracked gripper."
             )
 
-    selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
+    target = _drive_target(state, arm, robot_ip)
+    if not workstation:
+        # One arm replays a recording in its own base, and the dataset is in fr3_base (the right arm's,
+        # roadmap C0). Another arm's targets go through the world graph -- the two-arm replay's job.
+        root = _arm_root(state, target["arm"])
+        if root != wp.FR3_BASE_WORLD_ID:
+            raise ValueError(
+                f"the {target['arm']} arm commands in {root or '?'}, the dataset is in {wp.FR3_BASE_WORLD_ID}; "
+                "replay it from the two-arm panel, which moves its targets through the world graph"
+            )
+    selected_ip = target["robot_ip"]
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
 
     # Re-run hardware checks against the exact IP selected in this panel;
@@ -17884,13 +17966,14 @@ def _start_real_replay(
     _start_realsense_preview(state, dataset_root)
     _append_real_replay_log(state, "camera", "RealSense monitor requested")
     try:
-        _run_real_preflight(state, [selected_ip])
+        _run_real_preflight(state, [target])
     except Exception:
         _stop_realsense_preview(state)
         raise
     state.replay.safety = "ready"
     state.replay.realCubeMode = cube_mode
     state.replay.realRobotIp = selected_ip
+    state.replay.realArm = str(target.get("arm") or "")
     state.replay.realEndEffectorMode = end_effector_mode
     state.replay.realCommandLeadFrames = command_lead_frames
     state.replay.mujocoOverrideAccepted = bool(
@@ -18647,6 +18730,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 _json_response(self, HTTPStatus.OK, timeline)
                 return
+            if path == "/api/robot/arms":
+                _json_response(self, HTTPStatus.OK, _robot_arms_payload(self.server.state))
+                return
             if path == "/api/replay/dual-fr3":
                 try:
                     episode = int(query.get("episode", ["0"])[0])
@@ -18946,10 +19032,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/preflight":
-                    preflight_ip = query.get("robot_ip", [""])[0].strip()
-                    if preflight_ip:
-                        self.server.state.replay.realRobotIp = _validated_robot_ip(preflight_ip, "Robot IP")
-                    _preflight_replay(self.server.state)
+                    _preflight_replay(
+                        self.server.state, query.get("arm", [""])[0].strip(), query.get("robot_ip", [""])[0].strip()
+                    )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/select-dataset":
@@ -18989,6 +19074,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         record_tracker=str(query.get("record_tracker", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
                         command_lead_frames=query.get("lead_frames", [None])[0],
+                        arm=query.get("arm", [""])[0],
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return

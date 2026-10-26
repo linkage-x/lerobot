@@ -6,6 +6,9 @@ import { ReplayInspector } from "../ReplayInspector";
 import { DualFr3ExecutabilityPanel } from "../DualFr3ExecutabilityPanel";
 import { LaserReplayAnalysisPanel } from "../LaserReplayAnalysisPanel";
 import { api } from "../apiClient";
+import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
+import { armIp } from "../shared/robotArms";
+import type { RobotArms } from "../types";
 
 // The replay FR3 on Thor; the IP field overrides it.
 const DEFAULT_HOME_ROBOT_IP = "192.168.11.102";
@@ -49,14 +52,19 @@ export function ReplayPanel({
   onPreflight,
   mujocoMode,
   cubeSelection = true,
-  onAbort
+  onAbort,
+  armRequired = false,
+  arm = ""
 }: {
   status: ReplayStatus;
   busy: boolean;
-  onPreflight: () => void;
+  // "" on the workstation; on Thor the arm picked in Real Robot Replay, or "both" (roadmap B2).
+  onPreflight: (arm: string) => void;
   mujocoMode: MujocoCubeMode;
   cubeSelection?: boolean;
   onAbort: () => void;
+  armRequired?: boolean;
+  arm?: string;
 }) {
   const isActive = status.state === "sim_replay" || status.state === "replaying";
   const canReplayData = status.dataStatus === "loaded" && (status.recordedFrames ?? status.totalFrames) > 0;
@@ -102,7 +110,18 @@ export function ReplayPanel({
         </span>
       </div>
       <div className="control-row">
-        <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
+        <button
+          disabled={busy || isActive || !canReplayData || (armRequired && !arm)}
+          onClick={() => onPreflight(armRequired ? arm : "")}
+          title={armRequired && !arm ? "Choose the arm in Real Robot Replay first" : undefined}
+        >
+          {armRequired && arm ? `Preflight ${arm}` : "Preflight"}
+        </button>
+        {armRequired ? (
+          <button disabled={busy || isActive || !canReplayData} onClick={() => onPreflight("both")}>
+            Preflight all arms
+          </button>
+        ) : null}
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
@@ -137,10 +156,17 @@ export function RealRobotReplayPanel({
   busy,
   commandLeadAvailable = true,
   onStart,
-  onExecute
+  onExecute,
+  arms = null,
+  arm = "",
+  onArmChange = () => undefined
 }: {
   status: ReplayStatus;
   busy: boolean;
+  // Thor (arms.required): the FR3 comes from fr3_arms.json, never a typed or pre-filled IP (roadmap B2).
+  arms?: RobotArms | null;
+  arm?: string;
+  onArmChange?: (arm: string) => void;
   // Thor cube replay only; the workstation replay has no such setting.
   commandLeadAvailable?: boolean;
   onStart: (
@@ -160,7 +186,9 @@ export function RealRobotReplayPanel({
   // that does not match the tracked trajectory's link; this page only shows and forwards it.
   const endEffectorMode: RealEndEffectorMode = status.realEndEffectorMode ?? "corenetic_gripper_ee";
   const targetFrame = REAL_REPLAY_TARGET_FRAMES[endEffectorMode];
-  const [robotIp, setRobotIp] = useState(status.realRobotIp || "");
+  const armRequired = Boolean(arms?.required);
+  const [typedIp, setRobotIp] = useState(status.realRobotIp || "");
+  const robotIp = armRequired ? armIp(arms, arm) : typedIp;
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [homePromptOpen, setHomePromptOpen] = useState(false);
@@ -248,7 +276,7 @@ export function RealRobotReplayPanel({
     });
   }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
 
-  const homeIp = robotIp.trim() || DEFAULT_HOME_ROBOT_IP;
+  const homeIp = armRequired ? robotIp : robotIp.trim() || DEFAULT_HOME_ROBOT_IP;
   const homeDisabled = busy || active || homing || !validIpv4(homeIp);
   const homeConfirmed = async () => {
     setHomePromptOpen(false);
@@ -291,12 +319,16 @@ export function RealRobotReplayPanel({
             <div><span>Robot</span><strong>Franka Research 3</strong></div>
             <div><span>End effector</span><strong>{REAL_REPLAY_GRIPPER_LABELS[endEffectorMode]} · {targetFrame}</strong></div>
           </div>
-          <label className="real-robot-ip-field">
-            <span>Robot IP</span>
-            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder={DEFAULT_HOME_ROBOT_IP} />
-          </label>
+          {armRequired ? (
+            <ArmPicker arms={arms} value={arm} onChange={onArmChange} disabled={busy || active} />
+          ) : (
+            <label className="real-robot-ip-field">
+              <span>Robot IP</span>
+              <input value={typedIp} onChange={(event) => setRobotIp(event.target.value)} placeholder={DEFAULT_HOME_ROBOT_IP} />
+            </label>
+          )}
           <button className="real-robot-home" disabled={homeDisabled} onClick={() => setHomePromptOpen(true)} type="button">
-            {homing ? `Moving ${homeIp} to start…` : "Move to start (home)"}
+            {homing ? `Moving ${arm || homeIp} to start…` : armRequired && !arm ? "Move to start (choose the arm)" : "Move to start (home)"}
           </button>
           {homeResult ? (
             <p className={`panel-note ${homeResult.ok ? "" : "real-robot-home-error"}`}>{homeResult.message}</p>
@@ -1085,7 +1117,7 @@ export function EpisodeReplayPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onPreflight: () => void;
+  onPreflight: (arm: string) => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
   onRealReplay: (
@@ -1115,6 +1147,9 @@ export function EpisodeReplayPage({
   // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
   // pick between, and the gateway ignores the cube mode on that profile entirely.
   const cubeSelection = (snapshot.deployment?.profile ?? "thor") !== "workstation";
+  const arms = useRobotArms();
+  // Starts empty, and stays a choice of this page: Preflight, home and Real Robot Replay drive this arm.
+  const [arm, setArm] = useState("");
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
     snapshot.processing.find((item) => item.path === activePath) ?? null;
@@ -1142,6 +1177,8 @@ export function EpisodeReplayPage({
           mujocoMode={mujocoMode}
           cubeSelection={cubeSelection}
           onAbort={onAbort}
+          armRequired={Boolean(arms?.required)}
+          arm={arm}
         />
       </div>
       <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} onDeleteEpisode={onDeleteEpisode} />
@@ -1166,6 +1203,9 @@ export function EpisodeReplayPage({
         commandLeadAvailable={cubeSelection}
         onStart={onRealReplay}
         onExecute={onExecuteRealReplay}
+        arms={arms}
+        arm={arm}
+        onArmChange={setArm}
       />
       {cubeSelection ? (
         <LaserReplayAnalysisPanel status={snapshot.replay} busy={busy} onAnalyze={onAnalyzeLaser} />
