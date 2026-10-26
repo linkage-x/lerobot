@@ -109,9 +109,14 @@ def test_wait_for_rerun_server_restart_waits_for_outage_then_ready(monkeypatch):
 
 def test_restart_rerun_viewer_stops_old_process_before_starting_new(monkeypatch):
     events = []
+    # A bare MagicMock's pid indexes as 1, and killpg(1) is kill(-1): every process of the
+    # user (it logged out the whole desktop on 09-23 and twice on 10-26). Mock killpg too.
     old_process = MagicMock()
+    old_process.pid = 1234
     old_process.poll.return_value = None
     old_process.wait.return_value = None
+    killpg = MagicMock()
+    monkeypatch.setattr("lerobot.scripts.dataset_viz_client.os.killpg", killpg)
 
     monkeypatch.setattr(
         "lerobot.scripts.dataset_viz_client.start_rerun_viewer",
@@ -130,6 +135,7 @@ def test_restart_rerun_viewer_stops_old_process_before_starting_new(monkeypatch)
         restart_delay_s=0.2,
     )
 
+    killpg.assert_called_once_with(1234, signal.SIGTERM)
     old_process.wait.assert_called_once()
     assert events == [
         ("sleep", 0.2),
