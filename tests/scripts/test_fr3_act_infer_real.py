@@ -2697,6 +2697,13 @@ def test_recording_whole_trials_is_off_unless_asked(tmp_path: Path):
     assert _grasp_loop_dataset_args(tmp_path, '--grasp-loop-record-whole-trial').grasp_loop_record_whole_trial
 
 
+def test_keeping_misses_is_off_unless_asked(tmp_path: Path):
+    assert _grasp_loop_dataset_args(tmp_path).grasp_loop_keep_misses is False
+    assert _grasp_loop_dataset_args(
+        tmp_path, '--grasp-loop-record-whole-trial', '--grasp-loop-keep-misses'
+    ).grasp_loop_keep_misses
+
+
 @pytest.mark.parametrize('recorded_whole, run_whole', [(False, True), (True, False)])
 def test_a_dataset_of_one_kind_of_episode_refuses_the_other(tmp_path: Path, monkeypatch, recorded_whole, run_whole):
     """Funnel episodes start mid-air, whole trials at the start pose: one dataset of both would put

@@ -19,6 +19,7 @@
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
 #     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
 #     FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL=1 (with the root: whole held trials, policy steps included)
+#     FR3_GRASP_LOOP_KEEP_MISSES=1 (with whole trials: arm A's empty / no_close trials too, for relabelling)
 #     FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM ("h" or "low,high" mm above the peg; blank = 60)
 #     FR3_GRASP_LOOP_FUNNEL_CORRECTIVE (1 = arm B records corrective demonstrations)
 #     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
@@ -497,6 +498,8 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_DATASET_ROOT-}" ]]; then grasp_loop_args+=(--grasp-loop-dataset-root "${FR3_GRASP_LOOP_DATASET_ROOT}"); fi
     # ... from each trial's first step, the policy's own steps as is_intervention=0 (unset = funnel only).
     if [[ "${FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-record-whole-trial); fi
+    # ... and arm A's misses too, as states for funnel_relabel.py (unset = held trials only).
+    if [[ "${FR3_GRASP_LOOP_KEEP_MISSES-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-keep-misses); fi
     announce
     echo "[INFO] grasp_loop out=${grasp_loop_out} stop_at_trial_boundary=\`touch ${grasp_loop_out%.jsonl}.STOP\`"
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi

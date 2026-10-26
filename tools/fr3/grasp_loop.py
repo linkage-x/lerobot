@@ -76,7 +76,6 @@ every rate, and not one of `request.trials` -- with the peg handed to the person
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import itertools
 import json
 import math
 from pathlib import Path
@@ -290,7 +289,11 @@ GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M = 0.012
 # one landing in eight on the face, was harmless; here 5-8 face landings a trial all hit it (35
 # caps in 5 trials, peaks -20 N) and the operator watched the peg lean further with each one.
 # Contact is still read off the lag, so a lower cap costs nothing but the press.
-GRASP_LOOP_INSERT_PRESS_CAP_N = 10.0
+# 6 N since the descent tares after the lift lets go (terminal_servo.TERMINAL_SERVO_TARE_FROM_M):
+# before that a first landing capped at ~11 N true (peaks ~15 N) and a retry, its tare inflated
+# ~5 N by the lift, at ~5.4 N (peaks ~10 N). Retries were 855 of the 1048 caps of 10-16..10-23,
+# so 6 N keeps the press those numbers were taken at; 69 of 72 seats peaked under 6 N anyway.
+GRASP_LOOP_INSERT_PRESS_CAP_N = 6.0
 # The order the insertion search lands in, as ring indices (0 the aim, 1-8 the 3.5 mm ring from
 # 22.5 deg in 45 deg steps, 9-16 the 7 mm ring from 0 deg); the rest follow in index order. With
 # the aim fixed on the hole (09-29 173506 + 09-30 084706, 53 pegs) the seats fell unevenly: idx
@@ -301,6 +304,13 @@ GRASP_LOOP_INSERT_PRESS_CAP_N = 10.0
 # and scored on the other, <= 5.4 and <= 4.7. Assumes a landing's outcome does not depend on the
 # presses before it; first landings off the hole seated too (152430 x4, 163333 x3).
 GRASP_LOOP_INSERT_SEARCH_ORDER: tuple[int, ...] = (8, 7, 6, 0, 1, 9, 5, 14)
+# The last landing whose "seated" is believed. Of 58 seated verdicts graded 10-16..10-23, all 53 on
+# landings 1-8 were in and all 5 on landings 11-16 out (105703 t2/t8, 091639 t6, 085523 t8,
+# 093213 t6); depth separated nothing -- closes from +12 to -29 mm on both sides. A dozen face
+# presses lean the peg in the fingers, and a leaning peg on the face reads as deep as a seated
+# one. Eight is also the length of the default search order. A later seat is not believed:
+# unattended it is not let go of and counts as out; attended the question says so.
+GRASP_LOOP_INSERT_MAX_TRUSTED_LANDING = 8
 
 
 @dataclass(frozen=True)
@@ -832,6 +842,7 @@ def insert_held_peg(
     aim_xy: tuple[float, float] | None = None,
     snapshot_dir: Path | None = None,
     level_rotvec: tuple[float, float, float] | None = None,
+    out_early: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
 
@@ -860,7 +871,15 @@ def insert_held_peg(
     reads as not in. A lower grip keeps the target, and the servo stops over the floor.
 
     Answers the descent, whether the fingers let go (only for "in", or for the servo's seated
-    verdict when nobody grades), and the grade. A peg not let go of is still held, above the hole.
+    verdict when nobody grades and it came within GRASP_LOOP_INSERT_MAX_TRUSTED_LANDING), and the
+    grade. A peg not let go of is still held, above the hole.
+
+    `out_early` is a person's "out" given while the servo is still trying landings: a peg held
+    crooked enough shows it on the first one or two, and the rest of the ring is time spent on a
+    known miss. Checked between landings; once it has answered True the search ends, and unless
+    the last landing seated (then the person is asked as usual) the grade is "out" with
+    `gradeEarly` set, without asking again. `grasp_loop_insert_search=start/end` frame the window
+    in which the page offers it.
     """
 
     assert request.insertServo is not None
@@ -895,6 +914,7 @@ def insert_held_peg(
     grade: dict[str, Any] = {}
 
     def release_gate(descent: dict[str, Any]) -> bool | str:
+        log_search("end")
         above_mm = float(descent["seatedDepthErrorMm"])
         grade["auto"] = classify_stop(
             above_mm,
@@ -903,18 +923,44 @@ def insert_held_peg(
             slip_mm=servo.searchSlipM * 1000.0,
             standing_mm=TERMINAL_TRIAL_STANDING_MM,
         )
+        landing = int(descent.get("searchTried") or 1)
+        seated = descent["searchStoppedOn"] == "seated"
+        grade["trusted"] = not seated or landing <= GRASP_LOOP_INSERT_MAX_TRUSTED_LANDING
         if ask_grade is None:
             grade["answer"] = None
-            return "open" if descent["searchStoppedOn"] == "seated" else False
+            return "open" if seated and grade["trusted"] else False
+        if not seated and out_early is not None and out_early():
+            grade["answer"] = "out"
+            grade["early"] = True
+            print(f"[INFO] grasp_loop_grade_early=out trial={trial} landing={landing}", flush=True)
+            return False
+        untrusted = "" if grade["trusted"] else " (late seat: usually out)"
         grade["answer"] = ask_grade(
-            f"grade: trial {trial + 1} auto={grade['auto']} above_target_mm={above_mm:+.1f} "
+            f"grade: trial {trial + 1} auto={grade['auto']}{untrusted} above_target_mm={above_mm:+.1f} "
             f"search_index={int(descent.get('searchIndex') or 0)} "
-            f"landing={int(descent.get('searchTried') or 1)} -- is the peg in the hole? (in / out)"
+            f"landing={landing} -- is the peg in the hole? (in / out)"
         )
         # "open": let go with no re-grip in place; the next staging fetches it from the fixture.
         return "open" if grade["answer"] == "in" else False
 
-    result = execute_terminal_servo(robot, servo, release_gate=release_gate, commanded_rotvec=rotvec)
+    searching = False
+
+    def log_search(edge: str) -> None:
+        # Only an attended run has anyone to give an early "out", so only it opens the window.
+        nonlocal searching
+        if ask_grade is None or out_early is None or searching == (edge == "start"):
+            return
+        searching = edge == "start"
+        print(f"[INFO] grasp_loop_insert_search={edge} trial={trial}", flush=True)
+
+    log_search("start")
+    try:
+        result = execute_terminal_servo(
+            robot, servo, release_gate=release_gate, commanded_rotvec=rotvec,
+            abort_search=None if ask_grade is None else out_early,
+        )
+    finally:
+        log_search("end")
     if result.get("controlLoopDied"):
         raise ControlLoopDiedError(str(result.get("error")))
     if not result.get("ok"):
@@ -933,7 +979,9 @@ def insert_held_peg(
         "inserted": inserted,
         "released": released,
         "grade": grade.get("answer"),
+        "gradeEarly": bool(grade.get("early", False)),
         "autoVerdict": grade.get("auto"),
+        "autoTrusted": grade.get("trusted"),
         "aimXyz": [round(v, 5) for v in servo.xyz],
         "raisedMm": round(raised_m * 1000.0, 1),
         "toolTiltDeg": round(tilt_deg, 2),
@@ -1071,6 +1119,13 @@ def reflex_cause(errors: Iterable[str]) -> str:
         return "user_stop"
     return "collision"
 GRASP_LOOP_HOLD_PROMPT = "hold: the run stopped with the peg still in the fingers"
+# A scripted step failed with the control loop still up (a step timeout, a staging check). Its own
+# prefix, so the GUI can offer "redo this trial" rather than "put the peg back".
+GRASP_LOOP_FAULT_PROMPT = "fault: a scripted step failed"
+# How often one trial is run again after a fault or reflex before the policy's segment. A fault
+# that comes back every time is the setup or the code, not bad luck: 10-23 a test policy that
+# raised IndexError was redone on the same peg until the test host ran out of memory.
+GRASP_LOOP_MAX_REDOS = 2
 
 
 def holds_peg(width: float, request: GraspLoopRequest) -> bool:
@@ -1132,6 +1187,45 @@ def recover_from_reflex(
         return False
     recover()
     release_and_clear(robot, request, request_id=request_id)
+    return True
+
+
+def recover_from_fault(
+    robot: Any,
+    request: GraspLoopRequest,
+    wait_for_operator: OperatorWait | None,
+    *,
+    request_id: str,
+    trial: int,
+    cleared: bool,
+    error: str,
+    redo: bool,
+) -> bool:
+    """After a motion fault, with a person's say-so: the arm opens, backs straight up and homes
+    (already done when a held peg was handed over, `cleared`), and the run goes on -- with the same
+    trial on the same peg when the fault came before the policy's segment (`redo`), with the next
+    one otherwise.
+
+    10-23 run 093213 halted at trial 7 of 10 on an insertion align that parked 4.1 mm off against a
+    4.0 mm tolerance. A halt cost the run: a new one started the seed's pegs from the first, so a
+    paired A/B had to be rerun whole. False -- nothing moved -- when nobody is there to ask, they
+    stopped instead, or clearing the arm failed itself; the caller halts as before.
+    """
+
+    if wait_for_operator is None:
+        return False
+    first = "" if cleared else "check nothing is trapped under the fingers, then "
+    moves = "" if cleared else "the fingers open, the arm backs straight up and homes, and "
+    then = "this trial runs again on the same peg" if redo else "the run goes on with the next trial (this one is kept)"
+    if not wait_for_operator(f"{GRASP_LOOP_FAULT_PROMPT} in trial {trial + 1} ({error[:200]}): {first}continue -- {moves}{then}"):
+        return False
+    if cleared:
+        return True
+    try:
+        release_and_clear(robot, request, request_id=request_id)
+    except Exception as exc:  # noqa: BLE001 - the caller halts on the fault it already has
+        print(f"[WARN] grasp_loop=fault_recovery_failed details={exc}", flush=True)
+        return False
     return True
 
 
@@ -1247,6 +1341,19 @@ def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, flo
 # A failure of the policy's segment counts against it: missed, never closed, or drove the arm
 # into something hard enough to trip the reflex.
 GRADED_VERDICTS = ("held", "empty", "no_close", "collision")
+# The misses whose whole-trial recording is kept on request, on arm A only: the policy's own
+# states where it goes wrong, every step of them, for funnel_relabel.py to label with the expert --
+# never trained on as recorded. Not a collision (the reflex cut the recording where the arm met
+# something), and not arm B's misses (the funnel's own steps into an empty close).
+KEEPABLE_MISS_VERDICTS = ("empty", "no_close")
+
+
+def keeps_trial_recording(row: dict[str, Any], *, keep_misses: bool) -> bool:
+    """Whether a finished trial's recording becomes episodes: held, or a keepable arm-A miss."""
+
+    if row.get("verdict") == "held":
+        return True
+    return keep_misses and row.get("arm") == "A" and row.get("verdict") in KEEPABLE_MISS_VERDICTS
 
 
 def summarize_grasp_loop(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -1380,6 +1487,72 @@ def completed_trials(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+# What a resumed run must share with the rows it appends to, or its trials are not the same
+# trials: where the pegs go (seed, mask, table height), which arm, how long the policy gets, and
+# which policy (`run_start.policy`, compared when both runs recorded one).
+RESUME_MUST_MATCH = ("seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo")
+
+
+def resume_point(path: Path, request: GraspLoopRequest, policy: str | None) -> int:
+    """The trial number a run appending to `path` starts at: the one after the last trial that
+    finished (a graded row, or a staging that found nothing to pick). A trial that halted wrote
+    no such row, so it is run again, on the same peg (`TargetSequence`).
+
+    Refuses a request or policy that differs from the file's first run in what makes trial N the
+    same trial: a resume is how a halted paired run is finished, not a way to mix two runs."""
+
+    if not path.exists():
+        return 0
+    starts, finished = [], []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("kind") == "run_start":
+            starts.append(row)
+        elif row.get("kind") in ("trial", "pick_empty"):
+            finished.append(int(row["trial"]))
+    if starts:
+        # Through JSON, as the file's copy was: a tuple (insertServo's xyz) reads back as a list,
+        # and a list never equals a tuple -- every insertServo run refused its own resume.
+        first, now = starts[0], json.loads(json.dumps(_request_record(request)))
+        differs = [k for k in RESUME_MUST_MATCH if k in first.get("request", {}) and first["request"][k] != now[k]]
+        if first.get("policy") and policy and first["policy"] != policy:
+            differs.append(f"policy ({first['policy']} vs {policy})")
+        if differs:
+            raise SceneResetError(
+                f"{path.name} was started with a different {', '.join(differs)}; a resume must match "
+                "the run it continues -- start a new run instead."
+            )
+    return max(finished) + 1 if finished else 0
+
+
+class TargetSequence:
+    """Trial N's peg target: the N-th draw from `Random(request.seed)`, however the run got there.
+
+    That is what an uninterrupted run always drew -- one target per trial number, at the top of
+    each trial -- so a resumed run (or a trial run again after a fault) puts the peg where the
+    uninterrupted run would have. Until 10-23 a resume reseeded with `seed + trials done`, which
+    drew other pegs, and a halted paired A/B could not be finished, only restarted.
+    """
+
+    def __init__(self, request: GraspLoopRequest, workspace_min: Any, workspace_max: Any) -> None:
+        self._request = request
+        self._rng = random.Random(request.seed)
+        self._bounds = (workspace_min, workspace_max)
+        self._drawn: list[tuple[float, float, float]] = []
+
+    def __getitem__(self, trial: int) -> tuple[float, float, float]:
+        while len(self._drawn) <= trial:
+            self._drawn.append(
+                sample_target_xyz(self._request, self._rng, workspace_min=self._bounds[0], workspace_max=self._bounds[1])
+            )
+        return self._drawn[trial]
+
+
 class GraspLoopControl:
     """The loop's control channel: one word per line on a stream, normally the process's stdin.
 
@@ -1391,6 +1564,9 @@ class GraspLoopControl:
                       escalates to a signal after its grace, which is the immediate brake)
         continue / "" the peg is back in the fixture; the loop may go on
         in / out      the answer to an insertion grade (`ask_grade`); nothing else answers one
+        out_early     "out", given while the insertion servo is still trying landings: the search
+                      stops after the landing in flight (see `insert_held_peg`). Cleared before
+                      each insertion, so it applies to the one in flight only.
         void          the staged peg fell over: end this trial's policy segment and record it
                       "voided". Cleared at each trial's start, so it applies to the trial in
                       flight only, and ignored once the segment is over.
@@ -1404,6 +1580,7 @@ class GraspLoopControl:
         self._log = log
         self._stop = threading.Event()
         self._void = threading.Event()
+        self._out_early = threading.Event()
         self._continue = threading.Event()
         self._closed = threading.Event()
         self._answer: str | None = None
@@ -1429,6 +1606,10 @@ class GraspLoopControl:
                     if not self._void.is_set():
                         self._log("[INFO] grasp_loop_void=requested")
                     self._void.set()
+                elif word == "out_early":
+                    if not self._out_early.is_set():
+                        self._log("[INFO] grasp_loop_out_early=requested")
+                    self._out_early.set()
         except (OSError, ValueError):
             pass
         self._closed.set()
@@ -1442,6 +1623,12 @@ class GraspLoopControl:
 
     def clear_void(self) -> None:
         self._void.clear()
+
+    def out_early_requested(self) -> bool:
+        return self._out_early.is_set()
+
+    def clear_out_early(self) -> None:
+        self._out_early.clear()
 
     def wait_for_operator(self, message: str) -> bool:
         self._continue.clear()
@@ -1497,14 +1684,25 @@ def run_grasp_loop(
     ask_grade: OperatorGrade | None = None,
     void_requested: Callable[[], bool] | None = None,
     clear_void: Callable[[], None] = lambda: None,
+    out_early_requested: Callable[[], bool] | None = None,
+    clear_out_early: Callable[[], None] = lambda: None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
     notify: Callable[[str], None] = lambda message: None,
     keep_policy_segment: Callable[[int, dict[str, Any]], dict[str, Any] | None] | None = None,
+    policy: str | None = None,
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
     A resumed run starts from the peg in the fixture, whatever the last run left: the only state
     the file records is outcomes, and the peg's position after an interrupt is not one of them.
+    It goes on from the trial after the last finished one, on the pegs the uninterrupted run would
+    have had (`resume_point`, `TargetSequence`); `policy` (the checkpoint) is recorded so a resume
+    with another one is refused.
+
+    A motion fault in an attended run asks the operator to clear the arm and runs the same trial
+    again on the same peg (`recover_from_fault`); unattended, or when they stop, it halts the run.
+    A reflex in a scripted step before the policy's segment is run again the same way. One trial
+    is run again at most `GRASP_LOOP_MAX_REDOS` times; the next fault halts (`redo_limit`).
 
     With `request.insertServo`, a held grasp is carried on into the hole (`insert_held_peg`), and
     `ask_grade`, when given, is asked "in" or "out" before the fingers open; without it the
@@ -1512,6 +1710,9 @@ def run_grasp_loop(
 
     `void_requested` is the operator's void (see the module docstring); `clear_void` resets it at
     each trial's start. A voided trial does not use up one of `request.trials`.
+
+    `out_early_requested` is the operator's early "out" during an insertion search (see
+    `insert_held_peg`); `clear_out_early` resets it before each insertion.
 
     `notify` is told whenever the run needs a person -- each wait for the operator, and the run's
     end with why it ended -- for someone who is not watching the page (`command_notifier`).
@@ -1531,8 +1732,9 @@ def run_grasp_loop(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = completed_trials(out_path)
-    rng = random.Random(request.seed + len(done))
+    start = resume_point(out_path, request, policy)
     workspace_min, workspace_max = _robot_workspace_bounds(robot)
+    targets = TargetSequence(request, workspace_min, workspace_max)
     peg: str = "at_pick"
     peg_xyz: tuple[float, float, float] | None = None
     held_place_z: float | None = None
@@ -1557,25 +1759,38 @@ def run_grasp_loop(
 
     force_trace = force_trace_path(out_path)
     set_force_trace_path(force_trace)
-    write({"kind": "run_start", "at": time.time(), "request": _request_record(request), "resumedAfter": len(done)})
+    write({
+        "kind": "run_start", "at": time.time(), "request": _request_record(request), "resumedAfter": len(done),
+        "startTrial": start, "policy": policy,
+    })
     log(
-        f"[INFO] grasp_loop=start trials={request.trials} resumed_after={len(done)} out={out_path} "
-        f"force_trace={force_trace}"
+        f"[INFO] grasp_loop=start trials={request.trials} resumed_after={len(done)} start_trial={start} "
+        f"out={out_path} force_trace={force_trace}"
     )
-    voided = sum(1 for r in done if r.get("verdict") == "voided")
-    # Trial numbers a staging used up without a policy segment (an empty pick from the fixture).
-    skipped = 0
     snapshot_dir = out_path.with_name(f"{out_path.stem}_peg")
-    for trial in itertools.count(len(done)):
-        if trial - voided - skipped >= request.trials:
+    # Set by a recovered fault or reflex before the policy ran: the trial number to run again
+    # instead of the next one. `redos` counts how often the current one has been.
+    redo: int | None = None
+    redos = 0
+    trial = start - 1
+    while True:
+        if redo is None:
+            trial, redos = trial + 1, 0
+        else:
+            trial, redos = redo, redos + 1
+        redo = None
+        # Voided trials are replaced, so they do not count towards the plan.
+        if sum(1 for r in done if r.get("verdict") != "voided") >= request.trials:
             break
         if stop_requested():
             halted = "stop_requested"
             break
         clear_void()
         request_id = f"grasp_loop_{trial:03d}_{time.time_ns()}"
+        # Set once the policy's segment has run: from then on the trial has an outcome to keep.
+        row: dict[str, Any] | None = None
         try:
-            target = sample_target_xyz(request, rng, workspace_min=workspace_min, workspace_max=workspace_max)
+            target = targets[trial]
             started = time.perf_counter()
             log(f"[INFO] grasp_loop_trial_start trial={trial} target={target[0]:.4f},{target[1]:.4f}")
 
@@ -1635,7 +1850,6 @@ def run_grasp_loop(
                     log(f"[WARN] grasp_loop_pick_empty trial={trial} width={reset.get('pickWidth')}")
                     release_and_clear(robot, request, request_id=request_id)
                     peg = "lost"
-                    skipped += 1
                     continue
                 if not reset.get("ok"):
                     write({"kind": "halt", "trial": trial, "reason": "scene_reset_failed", "error": reset.get("error")})
@@ -1676,7 +1890,7 @@ def run_grasp_loop(
                 )
             )
             status = run_policy_trial(trial, handover)
-            row: dict[str, Any] = {
+            row = {
                 "kind": "trial",
                 "trial": trial,
                 "arm": arm,
@@ -1741,10 +1955,12 @@ def run_grasp_loop(
                 regrip = check["held"]
                 if check["held"] and request.insertServo is not None:
                     assert handover.closeXyz is not None
+                    clear_out_early()
                     insert = insert_held_peg(
                         robot, request, trial=trial, close_z=handover.closeXyz[2],
                         request_id=request_id, ask_grade=ask_grade, aim_xy=insert_aim,
                         snapshot_dir=snapshot_dir, level_rotvec=level_rotvec,
+                        out_early=out_early_requested,
                     )
                     insert_rotvec = insert.pop("rotvec")
                     row["insert"] = insert
@@ -1787,7 +2003,6 @@ def run_grasp_loop(
                 # lying wherever it fell, is the person's to put back in the fixture.
                 row["verdict"] = "voided"
                 release_and_clear(robot, request, request_id=request_id)
-                voided += 1
                 peg = "lost"
             else:
                 # Ran out of steps without a settled close, or was stopped. Either way nothing is
@@ -1811,9 +2026,29 @@ def run_grasp_loop(
                 + (f" inserted={_flag(row['inserted'])}" if "inserted" in row else "")
             )
         except Exception as exc:  # noqa: BLE001 - a motion fault ends the run, it must not end it silently
+
+            def keep_faulted(row: dict[str, Any], error: str, trial: int, started: float) -> None:
+                # The policy has had its go at this peg: keep what it did (the grasp verdict, or
+                # not_graded when the fault came before one) rather than give it a second try --
+                # the other side of a paired A/B got one. An insertion the fault cut short is no
+                # end-to-end outcome. Finished, so neither a redo nor a resume runs it again.
+                row.setdefault("verdict", "not_graded")
+                if "inserted" in row and "insert" not in row:
+                    row["inserted"] = None
+                row["scriptFault"] = error
+                row["trialS"] = round(time.perf_counter() - started, 1)
+                write(row)
+                done.append(row)
+                log(f"[WARN] grasp_loop_trial trial={trial} verdict={row['verdict']} script_fault={error}")
+
             if isinstance(exc, ControlLoopDiedError) or not control_loop_alive(robot):
-                # A reflex in a scripted step: not the policy's, so no trial row. Recovered with a
-                # person's say-so like any other, and the peg handed to them.
+                # A reflex in a scripted step: not the policy's, so no trial row of its own -- but
+                # a grasp the policy already made is kept. Recovered with a person's say-so like
+                # any other, and the peg handed to them. Before the policy ran, the same trial is
+                # run again on the same peg, as after a fault: moving on to the next trial number
+                # would skip a peg the other side of a paired A/B gets.
+                if row is not None:
+                    keep_faulted(row, f"{type(exc).__name__}: {exc}", trial, started)
                 errors = reflex_errors(robot)
                 cause = reflex_cause(errors)
                 write({
@@ -1822,10 +2057,21 @@ def run_grasp_loop(
                     "error": f"{type(exc).__name__}: {exc}",
                 })
                 log(f"[WARN] grasp_loop=reflex trial={trial} cause={cause} details={exc}")
-                if recover_from_reflex(robot, request, wait_for_operator, request_id=request_id, cause=cause):
-                    peg = "lost"
+                if not recover_from_reflex(robot, request, wait_for_operator, request_id=request_id, cause=cause):
+                    halted, peg = "control_loop_died", "unknown"
+                    break
+                peg = "lost"
+                if row is not None:
                     continue
-                halted, peg = "control_loop_died", "unknown"
+                if redos < GRASP_LOOP_MAX_REDOS:
+                    redo = trial
+                    continue
+                write({
+                    "kind": "halt", "trial": trial, "reason": "redo_limit", "redos": redos,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                log(f"[WARN] grasp_loop=halted trial={trial} reason=redo_limit redos={redos} details={exc}")
+                halted = "redo_limit"
                 break
             # Held still rather than homed: the fingers may have the peg, and a fault is the
             # worst moment to decide that on the loop's behalf. A held peg is held on the closed
@@ -1838,11 +2084,28 @@ def run_grasp_loop(
                 _hold_where_it_is(robot, request.closedGripper if held_at_fault else gripper_now)
             except Exception:  # noqa: BLE001 - the fault being reported is the one worth reading
                 pass
-            write({"kind": "halt", "trial": trial, "reason": "motion_fault", "error": f"{type(exc).__name__}: {exc}"})
-            log(f"[WARN] grasp_loop=halted trial={trial} reason=motion_fault details={exc}")
-            halted, peg = "motion_fault", "unknown"
-            if held_at_fault:
-                hand_over_held_peg(robot, request, wait_for_operator, request_id=request_id)
+            error = f"{type(exc).__name__}: {exc}"
+            if row is not None:
+                keep_faulted(row, error, trial, started)
+            # A held peg goes to a person first, as on any halt: the fingers must not open on their
+            # own, and a stop pressed at the next question must not leave it in them.
+            handed = held_at_fault and hand_over_held_peg(robot, request, wait_for_operator, request_id=request_id)
+            # Past the limit the arm is left where the fault held it, as on any halt.
+            over_limit = row is None and redos >= GRASP_LOOP_MAX_REDOS
+            if not over_limit and (handed or not held_at_fault) and recover_from_fault(
+                robot, request, wait_for_operator, request_id=request_id, trial=trial, cleared=handed,
+                error=error, redo=row is None,
+            ):
+                write({"kind": "fault", "trial": trial, "reason": "motion_fault", "error": error, "redo": row is None})
+                log(f"[WARN] grasp_loop=fault_recovered trial={trial} redo={_flag(row is None)} details={exc}")
+                # In the operator's hand or wherever the fault left it: they put it back next.
+                peg = "lost"
+                redo = trial if row is None else None
+                continue
+            reason = "redo_limit" if over_limit else "motion_fault"
+            write({"kind": "halt", "trial": trial, "reason": reason, "redos": redos, "error": error})
+            log(f"[WARN] grasp_loop=halted trial={trial} reason={reason} redos={redos} details={exc}")
+            halted, peg = reason, "unknown"
             break
         if status in ("quit", "stopped"):
             halted = status

@@ -26,6 +26,7 @@ from tools.fr3.grasp_loop import (
     GraspLoopRequest,
     completed_trials,
     grasp_handover_due,
+    keeps_trial_recording,
     load_mask_strokes,
     run_grasp_loop,
     summarize_grasp_loop,
@@ -38,6 +39,26 @@ from tests.scripts.test_fr3_scene_reset import FakeRobot
 
 
 PICK = (0.3640, -0.1370, 0.0550)
+
+
+@pytest.mark.parametrize(
+    "arm, verdict, keep_misses, kept",
+    [
+        ("A", "held", False, True),
+        ("B", "held", False, True),
+        ("A", "empty", False, False),
+        ("A", "empty", True, True),
+        ("A", "no_close", True, True),
+        # The funnel's steps into a miss, a reflex, a fallen peg, a stop: never.
+        ("B", "empty", True, False),
+        ("A", "collision", True, False),
+        ("A", "comm_loss", True, False),
+        ("A", "voided", True, False),
+        ("A", "not_graded", True, False),
+    ],
+)
+def test_only_arm_a_misses_are_kept_and_only_when_asked(arm, verdict, keep_misses, kept):
+    assert keeps_trial_recording({"arm": arm, "verdict": verdict}, keep_misses=keep_misses) is kept
 TARGET_Z = 0.058
 
 
@@ -538,7 +559,9 @@ def test_a_motion_fault_is_written_down_and_ends_the_run(tmp_path, monkeypatch):
     rows = [json.loads(line) for line in out.read_text().splitlines()]
     assert result["halted"] == "motion_fault"
     assert any(r["kind"] == "halt" and "timed out" in r["error"] for r in rows)
-    assert _trials(out) == []
+    # The policy had closed before the lift faulted: its trial is kept, ungraded, not dropped.
+    (row,) = _trials(out)
+    assert row["trial"] == 0 and row["verdict"] == "not_graded" and "timed out" in row["scriptFault"]
 
 
 # ---------------------------------------------------------------------------- summary ---
@@ -798,9 +821,38 @@ def test_a_reflex_in_a_scripted_step_is_recovered_and_is_not_charged_to_the_poli
         wait_for_operator=_put_back(robot, asked),
     )
     lines = [json.loads(line) for line in out.read_text().splitlines()]
-    assert [line["kind"] for line in lines if line["kind"] in ("reflex", "trial")] == ["reflex", "trial"]
+    # The staging died before the policy ran: the same trial again, on the same peg.
+    assert [line["kind"] for line in lines if line["kind"] in ("reflex", "trial")] == ["reflex", "trial", "trial"]
+    assert [r["trial"] for r in _trials(out)] == [0, 1]
     assert robot.recoveries == 1 and asked[0].startswith(grasp_loop.GRASP_LOOP_REFLEX_PROMPT)
     assert result["halted"] == ""
+
+
+def test_a_reflex_before_the_policy_every_time_halts_after_the_redo_limit(tmp_path):
+    class DiesOnEverySetDown(ReflexRig):
+        def send_action(self, action):
+            # Closed fingers only: the recovery's own release (open, up, home) must get through.
+            if self.held and action["ee.z"] < 0.07 and action["gripper.pos"] < 0.5:
+                self.control_loop_alive = False
+                return dict(action)
+            return super().send_action(action)
+
+    robot = DiesOnEverySetDown()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["trial"] for r in rows if r["kind"] == "reflex"] == [0] * (grasp_loop.GRASP_LOOP_MAX_REDOS + 1)
+    assert robot.recoveries == grasp_loop.GRASP_LOOP_MAX_REDOS + 1
+    halt = [r for r in rows if r["kind"] == "halt"]
+    assert len(halt) == 1 and halt[0]["reason"] == "redo_limit" and halt[0]["trial"] == 0
+    assert result["halted"] == "redo_limit" and _trials(out) == []
 
 
 class CommLossRig(ReflexRig):
@@ -1246,7 +1298,45 @@ def test_nobody_grading_lets_the_servos_seated_verdict_decide(tmp_path, _fast_se
     )
     row = _trials(out)[0]
     assert row["inserted"] is True and row["insert"]["grade"] is None
+    assert row["insert"]["autoTrusted"] is True
     assert not robot.held and robot.peg_xyz == PICK
+
+
+_LAST_LANDING_XY = (PICK[0] + 0.007 * math.cos(-math.pi / 4), PICK[1] + 0.007 * math.sin(-math.pi / 4))
+
+
+def test_nobody_grading_does_not_believe_a_seat_found_late_in_the_search(tmp_path, _fast_servo):
+    # Under the last point of the 7 mm ring (315 deg), 5.4 mm from its neighbours: the ninth landing.
+    robot = _insert_rig(hole_xy=_LAST_LANDING_XY)
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+    )
+    insert = _trials(out)[0]["insert"]
+    assert insert["searchStoppedOn"] == "seated" and insert["searchTried"] > 8
+    assert insert["autoVerdict"] == "seated" and insert["autoTrusted"] is False
+    # Not let go of, and a miss of the whole task.
+    assert insert["released"] is False and _trials(out)[0]["inserted"] is False
+    assert result["summary"]["endToEnd"]["inserted"] == 0
+
+
+def test_a_late_seat_is_flagged_in_the_operators_question_and_the_grade_still_decides(tmp_path, _fast_servo):
+    robot = _insert_rig(hole_xy=_LAST_LANDING_XY)
+    out = tmp_path / "e2e.jsonl"
+    asked = []
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in"], asked),
+    )
+    assert "auto=seated (late seat" in asked[0][0]
+    row = _trials(out)[0]
+    assert row["inserted"] is True and row["insert"]["autoTrusted"] is False
 
 
 def test_a_first_landing_on_the_face_is_found_by_the_search(tmp_path, _fast_servo):
@@ -1262,6 +1352,68 @@ def test_a_first_landing_on_the_face_is_found_by_the_search(tmp_path, _fast_serv
     )
     insert = _trials(out)[0]["insert"]
     assert insert["inserted"] is True and insert["searchIndex"] > 0
+
+
+def test_an_early_out_ends_the_search_and_grades_out_without_asking(tmp_path, _fast_servo, capsys):
+    # The hole 7 mm off the aim: the ring would find it, but the operator has seen enough.
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    asked = []
+    cleared = []
+    result = run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, [], asked),
+        out_early_requested=lambda: True,
+        clear_out_early=lambda: cleared.append(1),
+        wait_for_operator=_put_back(robot, []),
+    )
+    row = _trials(out)[0]
+    insert = row["insert"]
+    assert asked == [] and cleared == [1]
+    assert row["inserted"] is False and insert["grade"] == "out" and insert["gradeEarly"] is True
+    assert insert["searchStoppedOn"] == "operator_out" and insert["searchTried"] == 1
+    assert insert["released"] is False
+    assert result["summary"]["endToEnd"]["inserted"] == 0 and result["summary"]["endToEnd"]["graded"] == 1
+    printed = capsys.readouterr().out
+    # The page offers the button between these two, and the end comes before anything else.
+    assert printed.count("grasp_loop_insert_search=start trial=0") == 1
+    assert printed.count("grasp_loop_insert_search=end trial=0") == 1
+    assert "grasp_loop_grade_early=out trial=0 landing=1" in printed
+
+
+def test_a_landing_that_seats_after_an_early_out_is_still_put_to_the_operator(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    asked = []
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in"], asked),
+        out_early_requested=lambda: True,
+    )
+    insert = _trials(out)[0]["insert"]
+    assert len(asked) == 1
+    assert insert["inserted"] is True and insert["grade"] == "in" and insert["gradeEarly"] is False
+
+
+def test_an_unattended_insertion_has_no_early_out_to_offer(tmp_path, _fast_servo, capsys):
+    robot = _insert_rig(hole_xy=(PICK[0] + 0.007, PICK[1]))
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        out_early_requested=lambda: True,
+    )
+    insert = _trials(out)[0]["insert"]
+    assert insert["inserted"] is True and insert["searchStoppedOn"] == "seated" and insert["searchIndex"] > 0
+    assert "grasp_loop_insert_search=" not in capsys.readouterr().out
 
 
 def test_a_missed_grasp_is_a_miss_of_the_whole_task_and_is_never_carried_to_the_hole(tmp_path, _fast_servo):
@@ -1345,6 +1497,45 @@ def test_only_in_or_out_answers_a_grade_and_a_stop_answers_nobody():
     words.put(None)
 
 
+def test_out_early_is_its_own_word_and_is_cleared_per_insertion():
+    import queue
+    import threading
+
+    from tools.fr3.grasp_loop import GraspLoopControl
+
+    lines: list[str] = []
+    words: "queue.Queue[str | None]" = queue.Queue()
+
+    def stream():
+        while (word := words.get()) is not None:
+            yield word
+
+    control = GraspLoopControl(stream(), log=lines.append)
+    control.start()
+    words.put("out\n")
+    words.put("out_early\n")
+    words.put("out_early\n")
+    deadline = time.monotonic() + 2
+    while not control.out_early_requested() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert control.out_early_requested()
+    # "out" alone never stops a search, and a second click logs nothing new.
+    time.sleep(0.05)
+    assert lines.count("[INFO] grasp_loop_out_early=requested") == 1
+    control.clear_out_early()
+    assert not control.out_early_requested()
+    # Nor does an early out answer a grade that is asked later.
+    answers = []
+    asker = threading.Thread(target=lambda: answers.append(control.ask_grade("grade: trial 1")))
+    asker.start()
+    asker.join(timeout=0.3)
+    assert asker.is_alive()
+    words.put("in\n")
+    asker.join(timeout=2)
+    assert answers == ["in"]
+    words.put(None)
+
+
 class StickyRig(InsertRig):
     """An arm with step 3's dead-band: positioning steps park 2.2 mm short of where they aim."""
 
@@ -1381,7 +1572,8 @@ def test_a_fault_with_the_peg_held_keeps_it_closed_and_asks_before_letting_go(tm
 
     def operator(message):
         asked.append((message, robot.held, robot.gripper))
-        return True
+        # Takes the peg, then stops rather than going on.
+        return message.startswith("hold:")
 
     out = tmp_path / "e2e.jsonl"
     result = run_grasp_loop(
@@ -1393,6 +1585,8 @@ def test_a_fault_with_the_peg_held_keeps_it_closed_and_asks_before_letting_go(tm
         ask_grade=_grades(robot, [], []),
     )
     assert result["halted"] == "motion_fault"
+    assert asked[1][0].startswith("fault:")
+    asked = asked[:1]
     # Still clamped when the person was asked -- the hold did not re-send the measured width --
     # and let go only after they said they had it.
     assert len(asked) == 1 and asked[0][0].startswith("hold:") and asked[0][1] is True
@@ -1927,3 +2121,127 @@ def test_corrective_demonstrations_without_arm_b_are_refused():
     with pytest.raises(scene_reset.SceneResetError, match="funnelCorrective"):
         grasp_loop.validate_grasp_loop_request(_request(arms="A", funnelCorrective=True))
     grasp_loop.validate_grasp_loop_request(_request(arms="AB", funnelCorrective=True))
+
+
+# ------------------------------------------------------------------ resume and fault redo ---
+
+
+def _targets(path):
+    return [r["targetXyz"] for r in _trials(path)]
+
+
+def test_a_resumed_run_puts_the_pegs_where_an_uninterrupted_run_would(tmp_path):
+    # 10-23: a resume reseeded with seed + trials done, so a halted paired A/B could only restart.
+    whole = tmp_path / "whole.jsonl"
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=3), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 3), out_path=whole)
+    split = tmp_path / "split.jsonl"
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 3), out_path=split)
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=3), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 3), out_path=split)
+    assert [r["trial"] for r in _trials(split)] == [0, 1, 2]
+    assert _targets(split) == _targets(whole)
+
+
+def test_a_resume_with_another_seed_or_checkpoint_is_refused_before_anything_moves(tmp_path):
+    out = tmp_path / "g.jsonl"
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=1), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+                   policy="ckpt/035000")
+    lines = out.read_text().splitlines()
+    for request, policy in ((_request(trials=2, seed=8), "ckpt/035000"), (_request(trials=2), "ckpt/045000")):
+        robot = GraspRig()
+        with pytest.raises(SceneResetError, match="resume must match"):
+            run_grasp_loop(robot, request, run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+                           policy=policy)
+        assert robot.actions == [] and out.read_text().splitlines() == lines
+
+
+def test_an_attended_fault_before_the_policy_runs_the_same_trial_again_on_the_same_peg(tmp_path, monkeypatch):
+    whole = tmp_path / "whole.jsonl"
+    robot = GraspRig()
+    run_grasp_loop(robot, _request(trials=2), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=whole)
+
+    real = grasp_loop.save_camera_frames
+    calls = []
+
+    def staged_then_faulted(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise TimeoutError("scene reset step settle_above_place timed out")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(grasp_loop, "save_camera_frames", staged_then_faulted)
+    out = tmp_path / "g.jsonl"
+    robot = GraspRig()
+    asked = []
+    result = run_grasp_loop(
+        robot, _request(trials=2), run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert result["halted"] == ""
+    assert [r for r in rows if r["kind"] == "fault"][0]["redo"] is True
+    assert asked[0].startswith("fault:") and "runs again on the same peg" in asked[0]
+    assert [r["trial"] for r in _trials(out)] == [0, 1]
+    assert _targets(out) == _targets(whole)
+
+
+def test_a_fault_before_the_policy_every_time_halts_after_the_redo_limit(tmp_path):
+    # 10-23: a policy that raised on every call was redone on the same peg, forever.
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+
+    def broken_policy(trial, handover):
+        raise IndexError("list index out of range")
+
+    result = run_grasp_loop(
+        robot, _request(trials=2), run_policy_trial=broken_policy, out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    faults = [r for r in rows if r["kind"] == "fault"]
+    assert len(faults) == grasp_loop.GRASP_LOOP_MAX_REDOS and all(r["redo"] and r["trial"] == 0 for r in faults)
+    assert sum(message.startswith("fault:") for message in asked) == grasp_loop.GRASP_LOOP_MAX_REDOS
+    halt = [r for r in rows if r["kind"] == "halt"]
+    assert len(halt) == 1 and halt[0]["reason"] == "redo_limit" and "IndexError" in halt[0]["error"]
+    assert result["halted"] == "redo_limit" and _trials(out) == []
+
+
+def test_an_attended_fault_in_the_insertion_keeps_the_grasp_and_goes_on_to_the_next_peg(
+    tmp_path, _fast_servo, monkeypatch
+):
+    # 10-23 run 093213 trial 7: held, then the insertion's align timed out. The policy had its go
+    # at that peg; a second one would give it a try the other side of the A/B never had.
+    robot = _insert_rig()
+    real = grasp_loop.insert_held_peg
+    calls = []
+
+    def first_insert_faults(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise SceneResetError("insertion failed: scene reset step align_above_target timed out")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(grasp_loop, "insert_held_peg", first_insert_faults)
+    asked = []
+    out = tmp_path / "e2e.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo()),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    rows = _trials(out)
+    assert result["halted"] == ""
+    assert [r["trial"] for r in rows] == [0, 1]
+    assert rows[0]["verdict"] == "held" and rows[0]["inserted"] is None and "align_above_target" in rows[0]["scriptFault"]
+    assert rows[1]["inserted"] is True
+    # The peg went to a person before anything opened, then the run went on.
+    assert asked[0].startswith("hold:") and asked[1].startswith("fault:") and "next trial" in asked[1]
+    summary = summarize_grasp_loop(rows)
+    assert summary["held"] == 2 and summary["endToEnd"]["graded"] == 1

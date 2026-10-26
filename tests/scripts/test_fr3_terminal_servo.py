@@ -563,6 +563,36 @@ def test_a_hole_no_landing_can_reach_reports_exhausted_rather_than_seated():
     assert all(attempt["aboveTargetMm"] > 3.0 for attempt in result["searchAttempts"])
 
 
+def test_a_person_can_end_the_search_between_landings():
+    """A peg held too crooked to go in shows it early; the rest of the ring is a known miss."""
+
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + 0.030, SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+    asked: list[int] = []
+
+    def abort() -> bool:
+        asked.append(len(asked) + 1)
+        return len(asked) >= 2
+
+    result = execute_terminal_servo(robot, _searching(), abort_search=abort)
+    assert result["ok"]
+    assert result["searchStoppedOn"] == "operator_out"
+    assert result["searchTried"] == 2
+    assert len(result["searchAttempts"]) == 2
+
+
+def test_a_search_that_ran_out_is_exhausted_even_if_a_person_asked_to_stop_on_its_last_landing():
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + 0.030, SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+    asked: list[int] = []
+    result = execute_terminal_servo(robot, _searching(), abort_search=lambda: asked.append(1) or False)
+    # Asked after every landing but the last, which has nothing after it to save.
+    assert len(asked) == 8
+    assert result["searchStoppedOn"] == "exhausted"
+
+
 def test_creep_ends_the_search_because_the_ruler_changed_length():
     """A peg sliding in the fingers invalidates every landing computed from the tool pose."""
 
@@ -899,6 +929,69 @@ def test_below_the_cap_or_with_it_off_the_settle_still_presses():
     assert uncapped.commanded_z[-1] == SEATED[2]
 
 
+class LiftedPressedRobot(PressedFixtureRobot):
+    """A press on a descent that follows a lift: the wrench reads 5 N high until the setpoint has
+    come down 3 mm, the way 529 search retries of 10-16..10-23 read (friction held by the lift)."""
+
+    def __init__(self, floor_z, start_z):
+        super().__init__(floor_z)
+        self.start_z = float(start_z)
+
+    @property
+    def external_wrench(self):
+        fx, fy, fz, tx, ty, tz = super().external_wrench
+        held = not self.commanded_z or self.start_z - self.commanded_z[-1] < 0.003
+        return (fx, fy, fz + (5.0 if held else 0.0), tx, ty, tz)
+
+
+def test_the_tare_is_taken_once_the_descent_has_let_go_of_the_lift():
+    floor = SEATED[2] + 0.0025
+    robot = LiftedPressedRobot(floor, start_z=floor + 0.020)
+    robot.xyz = (SEATED[0], SEATED[1], floor + 0.020)
+    result = terminal_servo.descend_until_refused(
+        robot, _request(settleS=0.02, pressCapN=10.0), SEATED, (0.0, 0.0, 0.0), 0.0
+    )
+    assert result["fzTareFirstN"] == pytest.approx(11.0)
+    assert result["fzTareN"] == pytest.approx(6.0)
+    # A 10 N cap is a 10 N press, 1.0 mm below the floor -- not the 0.5 mm, 5 N one the first
+    # reading as the tare made of it.
+    assert result["pressCapped"] is True
+    assert robot.commanded_z[-1] == pytest.approx(floor)
+    assert min(robot.commanded_z) <= floor - 0.0010 + 1e-9
+    # Nor is the friction letting go counted as part of the peak.
+    assert -12.0 <= result["dfzPeakN"] <= -10.0
+
+
+def test_the_grasp_loops_cap_presses_a_retry_as_hard_as_before_the_tare_moved():
+    """A retry used to tare 5 N high and cap a 10 N reading at ~5 N true; its 6 N cap, read off
+    the tare after the lift, is that press again rather than the full 10 N."""
+    from tools.fr3.grasp_loop import GRASP_LOOP_INSERT_PRESS_CAP_N
+
+    floor = SEATED[2] + 0.0025
+    robot = LiftedPressedRobot(floor, start_z=floor + 0.020)
+    robot.xyz = (SEATED[0], SEATED[1], floor + 0.020)
+    result = terminal_servo.descend_until_refused(
+        robot, _request(settleS=0.02, pressCapN=GRASP_LOOP_INSERT_PRESS_CAP_N), SEATED, (0.0, 0.0, 0.0), 0.0
+    )
+    assert result["pressCapped"] is True
+    assert floor - 0.0007 - 1e-9 <= min(robot.commanded_z) <= floor - 0.0006 + 1e-9
+    assert -7.0 <= result["dfzPeakN"] <= -6.0
+
+
+def test_a_descent_too_short_to_tare_keeps_its_first_reading():
+    robot = PressedFixtureRobot(SEATED[2] - 0.01)
+    robot.xyz = (SEATED[0], SEATED[1], SEATED[2] + 0.003)
+    result = terminal_servo.descend_until_refused(robot, _request(settleS=0.02), SEATED, (0.0, 0.0, 0.0), 0.0)
+    assert result["stoppedOn"] == "target"
+    assert result["fzTareN"] == result["fzTareFirstN"] == pytest.approx(6.0)
+
+
+def test_a_lift_inside_the_tare_travel_is_refused():
+    request = _searching(searchLiftM=0.005, contactWarmupM=0.002, contactWindowM=0.002)
+    with pytest.raises(TerminalServoError, match="force tare"):
+        validate_terminal_servo_trajectory(request)
+
+
 def test_a_reflex_mid_descent_ends_the_servo_without_another_command():
     class Reflexing(FakeRobot):
         sends = 0
@@ -934,3 +1027,24 @@ def test_a_seated_peg_is_let_go_of_and_retaken_where_the_tool_is_not_where_it_wa
     retreat = next(line for line in lines if "name=retreat_after_release" in line)
     assert f"xyz={stopped[0]:+.4f},{stopped[1]:+.4f}" in regrip
     assert f"xyz={stopped[0]:+.4f},{stopped[1]:+.4f}" in retreat
+
+
+class FakeSaggingRobot(FakeRobot):
+    """At the handoff height the tool parks about where 10-23 run 093213's did with a peg in the
+    fingers (logged -2.5, +1.7, -2.6 mm, 4.1 in all): 3.2 mm off sideways and 2.7 mm low, 4.2 in all."""
+
+    def send_action(self, action):
+        if abs(float(action["ee.z"]) - 0.12) < 1e-9:
+            action = {**action, "ee.x": float(action["ee.x"]) - 0.0026, "ee.y": float(action["ee.y"]) + 0.0018,
+                      "ee.z": 0.12 - 0.0027}
+        return super().send_action(action)
+
+
+def test_the_align_above_the_hole_asks_for_the_xy_not_the_sag_of_a_held_peg():
+    # 10-23 run 093213 halted on this align: 4.1 mm in 3-D against a 4.0 mm tolerance, 3.0 of it in xy.
+    robot = FakeSaggingRobot()
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.118)
+    robot.gripper = 0.25
+    result = execute_terminal_servo(robot, _request(stepToleranceM=0.004))
+    assert "align_above_target" not in str(result.get("error") or "")
+    assert result["ok"]

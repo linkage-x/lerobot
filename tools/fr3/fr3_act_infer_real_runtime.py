@@ -138,6 +138,7 @@ from tools.fr3.grasp_loop import (
     GraspLoopRequest,
     command_notifier,
     grasp_loop_notify_command,
+    keeps_trial_recording,
     load_mask_strokes,
     run_grasp_loop,
     grasp_is_held,
@@ -576,7 +577,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Write arm B's funnel steps (align, descend, close) to this LeRobot dataset, one "
             'episode per held grasp, in the imitated dataset\'s own schema with is_intervention=1: '
             'the scripted expert\'s corrections, for DAgger. Created if absent, extended if not. '
-            'Trials graded anything but held are discarded.'
+            'Trials graded anything but held are discarded (see --grasp-loop-keep-misses).'
         ),
     )
     parser.add_argument(
@@ -587,6 +588,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "policy's own steps (is_intervention=0) ahead of the funnel's (1), instead of the "
             'funnel steps alone -- the approach a policy trained on it has to drive too. Its own '
             'dataset: a root holding funnel-only episodes is refused, and the other way round.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-keep-misses',
+        action='store_true',
+        help=(
+            'With --grasp-loop-record-whole-trial: arm A trials graded empty or no_close are kept '
+            "too, the policy's own miss from its first step, with the dataset root in the row so "
+            'funnel_relabel.py can match them. Raw, their labels are the miss: train on them only '
+            'relabelled. Collisions and arm B misses are still discarded.'
         ),
     )
     parser.add_argument(
@@ -5769,6 +5780,11 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         raise SystemExit('--grasp-loop-dataset-root records the grasp loop: it needs --grasp-loop-trials.')
     if args.grasp_loop_record_whole_trial and args.grasp_loop_dataset_root is None:
         raise SystemExit('--grasp-loop-record-whole-trial says what to record: it needs --grasp-loop-dataset-root.')
+    if args.grasp_loop_keep_misses and not args.grasp_loop_record_whole_trial:
+        raise SystemExit(
+            '--grasp-loop-keep-misses keeps whole trials: it needs --grasp-loop-record-whole-trial '
+            "(a miss's funnel steps alone are no demonstration of anything)."
+        )
     if int(args.grasp_loop_trials) > 0:
         if args.interactive_rollouts or args.dagger_takeover or terminal_servo_request is not None:
             raise SystemExit(
@@ -7171,16 +7187,18 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
 
             def keep_grasp_segment(trial: int, row: dict[str, Any]) -> dict[str, Any] | None:
                 # Only a held grasp is a demonstration of grasping: the funnel's steps into an
-                # empty close are steps a policy should not learn. Handed to the background
-                # writer here, after the loop has graded the lift; it runs beside the next
-                # staging (see run_grasp_trial), never beside the policy.
+                # empty close are steps a policy should not learn. With --grasp-loop-keep-misses
+                # an arm-A miss is kept too, as states for an offline relabel (see
+                # keeps_trial_recording). Handed to the background writer here, after the loop
+                # has graded the lift; it runs beside the next staging (see run_grasp_trial),
+                # never beside the policy.
                 buffer, grasp_segment['buffer'] = grasp_segment['buffer'], None
                 if grasp_writer is None or buffer is None:
                     return None
                 finish_grasp_write()
                 previous, grasp_segment['lastWrite'] = grasp_segment['lastWrite'], None
                 kept: dict[str, Any] = {} if previous is None else {'previousWrite': previous}
-                if row.get('verdict') != 'held':
+                if not keeps_trial_recording(row, keep_misses=bool(args.grasp_loop_keep_misses)):
                     print(
                         f"[INFO] grasp_loop_dataset=discarded trial={trial} verdict={row.get('verdict')} "
                         f'frames={buffer.frame_count}'
@@ -7189,7 +7207,12 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 # Nothing is in flight here, so the count is the index this trial's episode gets.
                 first_episode = int(dagger_dataset_handle.meta.total_episodes)
                 grasp_writer.submit(buffer, rollout_index=trial)
-                return {'kept': True, 'firstEpisode': first_episode, 'frames': buffer.frame_count, **kept}
+                # The root, so that a miss -- no close to match on -- can be told apart from the
+                # same trial and episode number in another dataset (funnel_relabel.match_trial_row).
+                return {
+                    'kept': True, 'firstEpisode': first_episode, 'frames': buffer.frame_count,
+                    'root': str(args.grasp_loop_dataset_root), **kept,
+                }
 
             run_grasp_loop(
                 robot,
@@ -7201,8 +7224,11 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 ask_grade=control.ask_grade if args.grasp_loop_attended else None,
                 void_requested=control.void_requested,
                 clear_void=control.clear_void,
+                out_early_requested=control.out_early_requested,
+                clear_out_early=control.clear_out_early,
                 notify=command_notifier(grasp_loop_notify_command(args.grasp_loop_notify_cmd)),
                 keep_policy_segment=keep_grasp_segment,
+                policy=str(args.checkpoint),
             )
             finish_grasp_write()
         else:

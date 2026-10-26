@@ -41,6 +41,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass
 import math
+import statistics
 import time
 from typing import Any, Callable, Iterable
 
@@ -104,6 +105,23 @@ TERMINAL_SERVO_CONTACT_STALL_M = 0.015
 # this rig that is the grip: the two runs graded as misses took 8.1 s and 18.1 s to close their
 # last millimetres, which is a peg sliding up between the fingers, not an arm settling.
 TERMINAL_SERVO_SETTLE_S = 0.5
+# The align above the hole is reached when the tool is within `stepToleranceM` of it in xy and
+# has stopped sideways for this long; its height is not checked. With a peg in the fingers the arm
+# parks 2-3 mm low (sag) on top of ~2-3 mm of sideways dead-band, so a 3-D test at 4 mm was met
+# at 3.5-4.0 mm on most insertions of 10-20..10-23, and 10-23 run 093213 timed out at 4.1
+# (xy 3.0, z -2.6) and halted. The descent that follows starts from wherever the tool is.
+TERMINAL_SERVO_ALIGN_STILL_S = 0.3
+# The force tare of a descent: the median z force while the commanded travel is between these two
+# depths, in metres, replacing the first reading of the descent. After an upward move the wrench
+# estimate reads high and stays high until the tool moves down again: 529 search retries of
+# 10-16..10-23 started their descent 4.5 N (median) above where the same descent read 0.2 s later
+# in free air, through a lift, a transfer and the 0.3 s align alike, so it is friction held by the
+# last direction of travel and waiting in place does not clear it. It was gone 4 mm into the
+# descent. A tare of the first reading made a 10 N cap fire on a 5 N press after any lift. Both
+# depths sit well inside the 14 mm run-up `searchLiftM` is held to, so no landing can touch the
+# face before its tare is taken.
+TERMINAL_SERVO_TARE_FROM_M = 0.004
+TERMINAL_SERVO_TARE_TO_M = 0.006
 # E7-C. How far off the nominal pose the search ring sits, in metres, and how many landings on
 # it. Zero disables the search entirely and the module behaves exactly as E5 measured it, which
 # is the point: the search is one variable added to a control arm that has a number on it.
@@ -507,6 +525,12 @@ def validate_terminal_servo_trajectory(
                 "test needs to arm, so every landing after the first would descend with no "
                 "contact detection and stop by leaning on the peg until settleS."
             )
+        if request.searchLiftM <= TERMINAL_SERVO_TARE_TO_M:
+            raise TerminalServoError(
+                f"searchLiftM {request.searchLiftM:.4f} does not clear the "
+                f"{TERMINAL_SERVO_TARE_TO_M:.4f} of descent the force tare is taken over, so a "
+                "landing after the first could press on the face before its tare is known."
+            )
     if not 0.0 <= request.openGripper <= 1.0:
         raise TerminalServoError("openGripper must be normalized in [0, 1].")
     if request.retreatM <= 0.0:
@@ -585,9 +609,13 @@ def descend_until_refused(
     # Read-only, and nothing below decides on it. Recorded because the position verdict has
     # called a peg standing on the rim "seated" (09-11: four re-grips came up empty after one,
     # the peg having fallen), and the force is the other candidate for telling the two apart.
-    # The tare is the first reading of the descent, taken while the peg is still in free air.
+    # The tare starts as the first reading of the descent and is replaced by the median over
+    # TERMINAL_SERVO_TARE_FROM_M..TO_M of travel, still in free air; see there for why.
     trace = _ForceTrace(robot, request.requestId, "terminal_descent")
     fz_tare = read_fz(robot)
+    fz_tare_first = fz_tare
+    tare_readings: list[float] = []
+    tare_settled = False
     fz_peak_drop = 0.0
 
     def stopped(reason: str) -> dict[str, Any]:
@@ -604,6 +632,8 @@ def descend_until_refused(
         return {
             # Change from the tare, N; negative is the tool pushed on. None without a reading.
             "fzTareN": fz_tare,
+            # The first reading, which the tare was before 10-26; kept to compare the two.
+            "fzTareFirstN": fz_tare_first,
             "dfzEndN": None if fz_tare is None or fz_end is None else fz_end - fz_tare,
             "dfzPeakN": None if fz_tare is None else fz_peak_drop,
             "pressCapped": unload_z is not None,
@@ -645,8 +675,19 @@ def descend_until_refused(
         trace.sample(float(sent[2]), current_xyz)
         if fz_tare is None:
             fz_tare = read_fz(robot)
+            fz_tare_first = fz_tare
         else:
             fz_now = read_fz(robot)
+            travel_m = start_z - float(commanded[2])
+            if not tare_settled and travel_m >= TERMINAL_SERVO_TARE_TO_M:
+                tare_settled = True
+                # Not once the cap has fired: that is a press already, and no free-air reading.
+                if tare_readings and unload_z is None:
+                    fz_tare = statistics.median(tare_readings)
+                    # What the old tare saw before here was the friction letting go, not a press.
+                    fz_peak_drop = 0.0
+            elif not tare_settled and fz_now is not None and travel_m >= TERMINAL_SERVO_TARE_FROM_M:
+                tare_readings.append(fz_now)
             if fz_now is not None:
                 fz_peak_drop = min(fz_peak_drop, fz_now - fz_tare)
                 if (
@@ -708,6 +749,8 @@ def search_for_seat(
     request: TerminalServoRequest,
     rotvec: tuple[float, float, float],
     gripper: float,
+    *,
+    abort_search: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Descend at the nominal pose; if the peg did not go in, lift, step sideways, try again.
 
@@ -728,6 +771,10 @@ def search_for_seat(
     The lift and the traverse run at the reset's speed, not this module's. The slow cap exists
     for the one leg that drives a gripped peg down at a fixture; these two climb and then cross
     a lifted plane, which is what `align_above_target` already does.
+
+    `abort_search` is asked after each landing that leaves more to try: True ends the search
+    there (`operator_out`), for a person who can see the peg is too crooked in the fingers for
+    any landing to take it. Never mid-descent, so the arm is never left pressing.
     """
 
     x, y, z = request.xyz
@@ -798,6 +845,14 @@ def search_for_seat(
         if reading in ("slip", "seated"):
             verdict = reading
             break
+        if tried < len(sequence) and abort_search is not None and abort_search():
+            verdict = "operator_out"
+            print(
+                f"[INFO] terminal_servo_search=abandoned request_id={request.requestId} "
+                f"landing={tried}/{len(sequence)}",
+                flush=True,
+            )
+            break
         previous = landing
     return {
         **descent,
@@ -824,6 +879,7 @@ def execute_terminal_servo(
     *,
     release_gate: Callable[[dict[str, Any]], bool] | None = None,
     commanded_rotvec: tuple[float, float, float] | None = None,
+    abort_search: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Take the arm off the policy and drive the last centimetres to the fixed pose.
 
@@ -849,6 +905,8 @@ def execute_terminal_servo(
     under the wrist's unmodelled load, so a loop that hands each call back the last one's
     reading re-commands the sag and adds another on top (09-28: four runs whose landing side
     force grew every trial until trial 11-13 jammed). `handoffRotvec` stays the reading.
+
+    `abort_search` is `search_for_seat`'s: a person ending the landing ring early.
     """
 
     current_xyz, measured_rotvec, gripper = _observation_xyz_rotvec_gripper(robot)
@@ -882,8 +940,8 @@ def execute_terminal_servo(
     waypoints = dict(terminal_servo_waypoints(request, current_xyz))
     try:
         _run_step(robot, request, "align_above_target", waypoints["align_above_target"], rotvec, gripper,
-                  tolerance_m=request.stepToleranceM)
-        descent = search_for_seat(robot, request, rotvec, gripper)
+                  tolerance_m=request.stepToleranceM, still_window_s=TERMINAL_SERVO_ALIGN_STILL_S)
+        descent = search_for_seat(robot, request, rotvec, gripper, abort_search=abort_search)
         stopped_at = tuple(float(value) for value in descent["stoppedAtXyz"])
         landing = tuple(float(value) for value in descent["searchLandingXyz"])
         # Let go where the descent stopped, not at the target: on a contact stop the target is a
