@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +29,7 @@ if TYPE_CHECKING or _transformers_available:
     from transformers.masking_utils import create_causal_mask
     from transformers.modeling_layers import GradientCheckpointingLayer
     from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import (
         GemmaAttention,
         GemmaConfig,
@@ -34,6 +37,7 @@ if TYPE_CHECKING or _transformers_available:
         GemmaMLP,
         GemmaModel,
     )
+    from transformers.models.paligemma import modeling_paligemma
     from transformers.models.paligemma.modeling_paligemma import (
         PaliGemmaForConditionalGeneration,
         PaliGemmaModel,
@@ -45,6 +49,8 @@ if TYPE_CHECKING or _transformers_available:
         for parameter in _CREATE_CAUSAL_MASK_PARAMETERS.values()
     )
 else:
+    modeling_gemma = None
+    modeling_paligemma = None
     GemmaAttention = None
     GemmaConfig = None
     GemmaForCausalLM = None
@@ -231,13 +237,56 @@ def _get_pi_gemma_decoder_layer_base():
     return _PiGemmaDecoderLayerBase
 
 
+@contextmanager
+def _builds_on_meta(namespace, name: str) -> Iterator[None]:
+    """While open, `namespace.<name>(...)` builds its module on the meta device, which holds no memory.
+
+    For the parts a transformers parent class builds in its `__init__` and the subclass below throws
+    away right after. Built for real they were two more fp32 copies of the language model on the
+    CPU, and a pi0.5 load peaked at ~39 GB anon for a ~14.5 GB model. Not thread-safe: it swaps a
+    module global for the duration. If transformers stops building through `name`, this only stops
+    saving memory; `_assert_nothing_on_meta` refuses a model left with a meta tensor.
+    """
+    real = getattr(namespace, name)
+
+    def build(*args, **kwargs):
+        with torch.device("meta"):
+            return real(*args, **kwargs)
+
+    setattr(namespace, name, build)
+    try:
+        yield
+    finally:
+        setattr(namespace, name, real)
+
+
+def _untie_lm_head(lm_head: nn.Linear, embed_tokens: nn.Embedding) -> None:
+    """Give `lm_head` a weight of its own after its parent's `post_init` tied it to a meta-built embedding.
+
+    Built for real, the head kept the discarded embedding's weight, so it was never tied to the
+    embedding the model uses; a copy of the new one's keeps that, and checkpoints load both keys.
+    """
+    if lm_head.weight.is_meta:
+        lm_head.weight = nn.Parameter(embed_tokens.weight.detach().clone())
+
+
+def _assert_nothing_on_meta(module: nn.Module) -> None:
+    left = [name for name, t in (*module.named_parameters(), *module.named_buffers()) if t.is_meta]
+    if left:
+        raise RuntimeError(
+            f"{type(module).__name__} kept {len(left)} meta tensors from a parent class it builds on meta "
+            f"(e.g. {left[:3]}); transformers now builds something there that is not replaced"
+        )
+
+
 class PiGemmaModel(GemmaModel):  # type: ignore[misc]
     """
     GemmaModel extended with AdaRMS (adaptive RMSNorm) and gated residuals when config.use_adarms is True.
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
+        with _builds_on_meta(modeling_gemma, "GemmaDecoderLayer"):  # replaced below
+            super().__init__(config, **kwargs)
         # if not getattr(config, "use_adarms", False):
         #     return
         cond_dim = getattr(config, "adarms_cond_dim", None)
@@ -246,6 +295,7 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
             [pi_gemma_decoder_layer_base(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = PiGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+        _assert_nothing_on_meta(self)
 
     def forward(
         self,
@@ -368,24 +418,34 @@ class PiGemmaForCausalLM(GemmaForCausalLM):  # type: ignore[misc]
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
+        with _builds_on_meta(modeling_gemma, "GemmaModel"):  # replaced below
+            super().__init__(config, **kwargs)
         self.model = PiGemmaModel(config)
+        _untie_lm_head(self.lm_head, self.model.embed_tokens)
+        _assert_nothing_on_meta(self)
 
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
     """PaliGemmaModel whose language_model is PiGemmaModel (custom decoder with PiGemmaRMSNorm and gated residuals)."""
 
     def __init__(self, config):
-        super().__init__(config)
+        # The language model the parent builds is replaced below. Its embedding is still built for
+        # real (it comes through AutoModel, with the vision tower's): ~2 GB, freed right after.
+        with _builds_on_meta(modeling_gemma, "GemmaDecoderLayer"):
+            super().__init__(config)
         self.language_model = PiGemmaModel(config.text_config)
+        _assert_nothing_on_meta(self)
 
 
 class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGeneration):
     """PaliGemmaForConditionalGeneration using PiGemma decoder for the language model."""
 
     def __init__(self, config):
-        super().__init__(config)
+        with _builds_on_meta(modeling_paligemma, "PaliGemmaModel"):  # replaced below
+            super().__init__(config)
         self.model = PaliGemmaModelWithPiGemma(config)
+        _untie_lm_head(self.lm_head, self.model.language_model.embed_tokens)
+        _assert_nothing_on_meta(self)
 
     # Make modules available through conditional class for BC
     @property
