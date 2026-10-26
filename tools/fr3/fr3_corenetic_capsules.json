@@ -1,0 +1,299 @@
+{
+  "schema": "fr3_capsules/v1",
+  "model": {
+    "xml": "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml",
+    "sha256": "76dacc7e58204dff579c1223d1175ea6819de0f5d1a7eead1a6481adeefa8a0f",
+    "files": {
+      "fr3_corenetic_gripper.xml": "27e28ee25c29c03033eab368d67d4bf556464a9305f92d21a926c5d3556ca165",
+      "assets/link0_0.obj": "28bb76a006bb9d2c44db0d820fdccec3e65c81f3b56733c9caa22a1da76f6bd5",
+      "assets/link0_1.obj": "43ffda3294d0a83e32c99cf708b19ce2bbca179fa5a86e0b25da8611c7a4f362",
+      "assets/link0_2.obj": "b0d62fb962194aada53ee5446868a96a4f89139668b7df9676a25695d4bef557",
+      "assets/link0_3.obj": "b1841889fe70a3a6a1fc99bbeae447c77e19cf7df014bf0e2f3dd6e7d2a287bb",
+      "assets/link0_4.obj": "c1571d509f019fa6a75893a6c2b5f81980c0f9cb73eb0e1a10ddedab996e009d",
+      "assets/link0_5.obj": "aae746ba3d2dbca7ac15bf639475029d062a919871d810404ac49455d2b36c0a",
+      "assets/link0_6.obj": "410f5ca13739f30616f866217fe5a2b8a02ff1769d1cb8ff917f4bffaffd69e8",
+      "assets/link1.obj": "a9e73987b774f3fb76ec640c2f6e172b128736363792f1697a13d7795f745663",
+      "assets/link2.obj": "1818f1eed57552d006a3e9353a670a39c271ac67833274efcee2403db7e4fa92",
+      "assets/link3_0.obj": "031bf65faf13ff31c01089d2d5989b3b5f8a06c43997066e49fdec1b5dce3c0a",
+      "assets/link3_1.obj": "b626ac25b916d70a4f5463ed9f92dcdfc33d72391d766841b160b87dbd607875",
+      "assets/link4_0.obj": "f0462a58ecff7f27ce9aa66a762ca6a67c9ba02bf8c388f08eeed1b098e86d11",
+      "assets/link4_1.obj": "08c585de5637f51815081d27c941f5b0119788522c58da294f7c97bcece7cf59",
+      "assets/link5_0.obj": "becf83239adc72e34312c9aff6af01e20beace624c79d8061b25e91d7a384af9",
+      "assets/link5_1.obj": "50fb459f57a759637080b32034342dda9b9fc8bb809eafce575094ede0dac738",
+      "assets/link5_2.obj": "5c0a033553c9b1026e083d1154f75302f985e92de3b4d2d10ad6d2acffe08f64",
+      "assets/link6_0.obj": "c61c431d7d730baa3255b74a9645b625553621c594cd1d3bcae01c72b523d167",
+      "assets/link6_1.obj": "f82ef38bf84b0ebd6ac614fa47a5bb234faceee75e64b09b56059c9d07c4743b",
+      "assets/link6_2.obj": "28ca84c6c6b5fc343914ec63e8f4a87dab1e586e09cdde3c7626c5290c764bc5",
+      "assets/link6_3.obj": "6137f1d15d689c3af3e5e86166f10bb9be49f305006885e2e63647ac0dd380a5",
+      "assets/link6_4.obj": "2a556a5863de9bcf8c139ffccff52c0c3a030a8bc694f1e4a29649ff01c07533",
+      "assets/link6_5.obj": "89ae90d302ec4e3ffd04b6aaa0d9aeda6d6c33a034e597f1a34c4cd15c7f8443",
+      "assets/link6_6.obj": "3018977e0461ff756e19e530ee672e2b2bee45e1b2acfaffc1b6811566a9278e",
+      "assets/link6_7.obj": "5acf5906a258d28b844c116bcec82fc070aaeca7de67acac8832b6bfd755a6da",
+      "assets/link7_0.obj": "e979db2cf609e3d7fc3224b4eae7215c7c79e32b3373b5c14ccc49525c494e77",
+      "assets/link7_1.obj": "84b43a1659b89fca9fc4500bcbf0121d9ec479bf0b77de4f4a7ac8c459c74b76",
+      "assets/link7_2.obj": "7cf65dd223c729cc0a8c16340f3bb25bdcf9bb1d26eadb2cb1db9f3fad23688f",
+      "assets/link7_3.obj": "b0eb7434aa8b1ad81afc626e2a9303cedd4f262fbabb98ecb516b1fbc60a7578",
+      "corenetic_smr_cam/meshes/mount.STL": "08d7b7065d28ee9e643abbdb9d534b78b17208f6c13f3cd8fc27624a8a40c646",
+      "corenetic_smr_cam/meshes/smr_cam_base.STL": "455689c25c29b1ae01fed547104bb713b9328e1e1123231d47a1757efaf1c114",
+      "corenetic_smr_cam/meshes/smr_cam_case.STL": "2223fc13d760b2dcb5786692648981cc4112763debdfe857da79070e1b268a4b",
+      "corenetic_smr_cam/meshes/smr_cam_steel_plate.STL": "0d6c3fc7bfaa7c0060c9ba2187371e99dc7ceb70999f9b0b40762756f4081fb8",
+      "corenetic_smr_cam/meshes/smr_cam_smr_nest.STL": "999d93ef9ba32332d52d251c9e47bf654a4b483188e2dff00bce02fb398d06e7",
+      "corenetic_smr_cam/meshes/smr_cam_camera.STL": "490b19905fa8e631ce021f65d7ba94ab9a62d7ef4500f8daf140f43d2fdfd60b",
+      "gripper_w_v2_franka_description/meshes/base_link.STL": "f424f69cfebe730688b02de10ead2046b92d9e98aa287ae20a405cbf7b4a4226",
+      "gripper_w_v2_franka_description/meshes/link_franka_corenetic_gripper_1.STL": "a0860eebc6cdb924b484b2b15a51c221546277dc259886beccdd2afb5426f8fc",
+      "gripper_w_v2_franka_description/meshes/link_sensor_ft.STL": "f299e1b2bdfb61be1644f1481df37e00792e4abc1a86778cadb7c99ad2655ac2",
+      "gripper_w_v2_franka_description/meshes/link_gripper_base.STL": "3ee3998d6b88058f84219f157e5bb2f5fefe8d0b1b44e7e92887b94a741f50fe",
+      "gripper_w_v2_franka_description/meshes/link_gripper_knuckle_left_outer.STL": "6fb50daae41286367144a5431028c88fa28de5f69530a65e8239f05a30cbd5c3",
+      "gripper_w_v2_franka_description/meshes/link_gripper_finger_left.STL": "4e21dc82abc40172c72f066ef729fee93b84dc0c5d442c210b6b966370cb8d7d",
+      "gripper_w_v2_franka_description/meshes/link_gripper_tip_left.STL": "0b141a6bb8d063e82566bafc706f8585cb12a4b0c1346710161dc863e37aeb70",
+      "gripper_w_v2_franka_description/meshes/link_gripper_knuckle_left_inner.STL": "b275f1280d70de2c792a394510c005ecd0f10f0803349199ec8e9f789581861f",
+      "gripper_w_v2_franka_description/meshes/link_gripper_knuckle_right_outer.STL": "44b8dde613b38b6b804e46289b5ad8e656df01cede28c02f81be703b095641b9",
+      "gripper_w_v2_franka_description/meshes/link_gripper_finger_right.STL": "bf5d6ba4c7d12c3c013ff6bdf1e900ac7a54f7ec65cf7d4d018b340a6046d5f9",
+      "gripper_w_v2_franka_description/meshes/link_gripper_tip_right.STL": "8efa6d0f2a8947677be6277644275ba256ebcd5658bfb9a5b2a9651a82ff229f",
+      "gripper_w_v2_franka_description/meshes/link_gripper_knuckle_right_inner.STL": "37c45524712072ff427aa3dd66b854323689bca8230c1e619a852b16aa3fc6ca"
+    }
+  },
+  "note": "Each part's capsules enclose every vertex of its meshes (the flange's parts at the gripper fully open and fully closed). Frames: link0 = base, linkN = DH frame N, hand = flange.",
+  "capsules": [
+    {
+      "name": "link0.0",
+      "part": "link0",
+      "frame": "link0",
+      "a": [
+        -0.08733821668721967,
+        -0.04209060758131231,
+        0.01856013472843395
+      ],
+      "b": [
+        -0.0899495975830762,
+        0.0670632176463771,
+        0.014588549517982144
+      ],
+      "r": 0.06786253627273559
+    },
+    {
+      "name": "link0.1",
+      "part": "link0",
+      "frame": "link0",
+      "a": [
+        0.007569207068763732,
+        -0.0023697318781013103,
+        0.045043405785761395
+      ],
+      "b": [
+        -0.005809980149821783,
+        0.01598628660657288,
+        0.06749719044955374
+      ],
+      "r": 0.1036494917605806
+    },
+    {
+      "name": "link1.0",
+      "part": "link1",
+      "frame": "link1",
+      "a": [
+        -0.0001338980202286334,
+        -0.05456032156629789,
+        0.006159797319272103
+      ],
+      "b": [
+        0.00387877927320558,
+        -0.011675814342146679,
+        -0.15696518548924543
+      ],
+      "r": 0.07587646670657212
+    },
+    {
+      "name": "link2.0",
+      "part": "link2",
+      "frame": "link2",
+      "a": [
+        0.006749971167325323,
+        -0.15740506038427243,
+        0.009882664970958702
+      ],
+      "b": [
+        -0.00029509801569500165,
+        0.005972714093949614,
+        0.054823233817729335
+      ],
+      "r": 0.07583383732853519
+    },
+    {
+      "name": "link3.0",
+      "part": "link3",
+      "frame": "link3",
+      "a": [
+        0.08059722217551103,
+        0.04259314940608447,
+        0.0069969522952158525
+      ],
+      "b": [
+        0.004474189485384798,
+        0.005059444682488996,
+        -0.08325812860143669
+      ],
+      "r": 0.07236456511892818
+    },
+    {
+      "name": "link4.0",
+      "part": "link4",
+      "frame": "link4",
+      "a": [
+        -0.006932296446704565,
+        0.005434325520629231,
+        0.04142528989485343
+      ],
+      "b": [
+        0.0003605441432927908,
+        -0.00029376052528545067,
+        0.04278831009633264
+      ],
+      "r": 0.069220007508254
+    },
+    {
+      "name": "link4.1",
+      "part": "link4",
+      "frame": "link4",
+      "a": [
+        -0.06940862100310352,
+        0.06741561726787985,
+        0.0008521141909082499
+      ],
+      "b": [
+        -0.08254183173447702,
+        0.08739810494880955,
+        -1.4032869064270828e-06
+      ],
+      "r": 0.06552427772213441
+    },
+    {
+      "name": "link5.0",
+      "part": "link5",
+      "frame": "link5",
+      "a": [
+        0.00280761186203427,
+        0.0737459289011919,
+        -0.07238897639388439
+      ],
+      "b": [
+        -0.00013716088031772027,
+        0.06354821595923689,
+        0.0038385582795042146
+      ],
+      "r": 0.06787446019794771
+    },
+    {
+      "name": "link5.1",
+      "part": "link5",
+      "frame": "link5",
+      "a": [
+        0.0017313019310491952,
+        0.059139379771426734,
+        -0.1698963834784138
+      ],
+      "b": [
+        1.3082093249646917e-06,
+        -4.075134415022774e-05,
+        -0.2360287766313091
+      ],
+      "r": 0.059653480225002706
+    },
+    {
+      "name": "link6.0",
+      "part": "link6",
+      "frame": "link6",
+      "a": [
+        0.07674581492985519,
+        0.05377162976645168,
+        -0.00328548612747721
+      ],
+      "b": [
+        0.1000782005319508,
+        -0.040914267527442344,
+        -0.00011798167070074805
+      ],
+      "r": 0.04963891202334654
+    },
+    {
+      "name": "link6.1",
+      "part": "link6",
+      "frame": "link6",
+      "a": [
+        0.004371280999100893,
+        0.009619640937564079,
+        0.006702672797198921
+      ],
+      "b": [
+        0.053175795957036684,
+        -0.02301361236345692,
+        0.009019876033643117
+      ],
+      "r": 0.061996657618801285
+    },
+    {
+      "name": "link7.0",
+      "part": "link7",
+      "frame": "link7",
+      "a": [
+        -0.0051743072928022455,
+        -0.005346221585684158,
+        0.07279156646349613
+      ],
+      "b": [
+        0.0327958026255554,
+        0.03343397016831569,
+        0.08404503293629002
+      ],
+      "r": 0.049203406473367295
+    },
+    {
+      "name": "gripper.0",
+      "part": "gripper",
+      "frame": "hand",
+      "a": [
+        -0.0044559559244996315,
+        -0.005982849863664999,
+        0.019299124952896856
+      ],
+      "b": [
+        -0.011434835991865084,
+        -0.00841258495623775,
+        0.04645941524208615
+      ],
+      "r": 0.0769252056392924
+    },
+    {
+      "name": "fingers.0",
+      "part": "fingers",
+      "frame": "hand",
+      "a": [
+        -0.039325877958324554,
+        -0.03972411598283103,
+        0.13254256994763702
+      ],
+      "b": [
+        0.040533759539709106,
+        0.03993706656459113,
+        0.13280781694001606
+      ],
+      "r": 0.05012537073533159
+    },
+    {
+      "name": "smr_mount.0",
+      "part": "smr_mount",
+      "frame": "hand",
+      "a": [
+        0.0024416485487300044,
+        -0.0017013366392528873,
+        0.07209257041906678
+      ],
+      "b": [
+        0.09837895920651861,
+        -0.09974991572234267,
+        0.07105977283866531
+      ],
+      "r": 0.05121823645379156
+    }
+  ]
+}

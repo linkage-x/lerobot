@@ -1,0 +1,32 @@
+{
+  "schema": "embodiment/v1",
+  "name": "fr3_dual",
+  "description": "Two FR3s side by side, the new one to the left of 192.168.11.102 (10-23), both bolted down once placed. Datasets stay in the right arm's base (fr3_base, unchanged); the left arm's targets reach its base through fr3_base -> fr3_base_left (B3, arm-arm ball) and, for absolute replay, the world edges (B4). Until the left arm is in service it has no replay_config and the graph no fr3_base_left node, so everything left is refused with that reason.",
+  "dataset_frame": "fr3_base",
+  "roots": {
+    "fr3_base": {
+      "kind": "fixed",
+      "registration": "static_edge",
+      "definition": "libfranka O frame of the right FR3 (192.168.11.102) at its current mount"
+    },
+    "fr3_base_left": {
+      "kind": "fixed",
+      "registration": "static_edge",
+      "definition": "libfranka O frame of the left FR3 at its mount"
+    }
+  },
+  "arms": {
+    "right": {
+      "root": "fr3_base",
+      "hands": ["right"],
+      "tcp_frame": "corenetic_socket_ee",
+      "replay_config": "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"
+    },
+    "left": {
+      "root": "fr3_base_left",
+      "hands": ["left"],
+      "tcp_frame": "corenetic_socket_ee",
+      "replay_config": ""
+    }
+  }
+}

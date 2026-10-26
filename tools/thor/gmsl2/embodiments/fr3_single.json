@@ -1,0 +1,21 @@
+{
+  "schema": "embodiment/v1",
+  "name": "fr3_single",
+  "description": "The one FR3 in service (192.168.11.102) as it is today: one base, registered by the world_20260928_063531 -> fr3_base ball edge; replays either hand of a recording.",
+  "dataset_frame": "fr3_base",
+  "roots": {
+    "fr3_base": {
+      "kind": "fixed",
+      "registration": "static_edge",
+      "definition": "libfranka O frame of the FR3 at its current mount"
+    }
+  },
+  "arms": {
+    "right": {
+      "root": "fr3_base",
+      "hands": ["right", "left"],
+      "tcp_frame": "corenetic_socket_ee",
+      "replay_config": "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"
+    }
+  }
+}
