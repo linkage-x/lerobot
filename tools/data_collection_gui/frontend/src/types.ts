@@ -428,6 +428,8 @@ export type DualReplayJob = {
     stoppedTogether?: boolean;
     stop?: string[];
     arms?: Record<string, { outcome?: string; framesCommanded?: number; framesPlanned?: number }>;
+    /** D2: the arms' clocks fitted; an estimate, not laser-certified. */
+    clock?: { status?: string | null; verdict?: string | null; startSkewMs?: number | null; tLrFromSkewMmP95?: number | null };
   };
 };
 

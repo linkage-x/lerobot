@@ -17126,6 +17126,13 @@ def _dual_replay_report_summary(path: Path) -> dict[str, Any]:
         "minGapMm": report.get("min_gap_mm"),
         "stoppedTogether": report.get("stopped_together"),
         "stop": [str(e.get("reason") or "") for e in stop.get("events") or []],
+        # D2 (dual_fr3_clock): the arms' clocks fitted, the execution skew, and its cost on T_LR -- estimates
+        "clock": {
+            "status": (report.get("clock") or {}).get("status"),
+            "verdict": (report.get("clock") or {}).get("verdict"),
+            "startSkewMs": (report.get("clock") or {}).get("start_skew_ms"),
+            "tLrFromSkewMmP95": ((report.get("clock") or {}).get("t_lr_error_mm") or {}).get("from_skew_p95"),
+        },
         "arms": {
             name: {
                 "outcome": row.get("outcome"),

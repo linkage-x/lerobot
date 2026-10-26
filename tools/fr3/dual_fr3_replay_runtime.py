@@ -41,11 +41,15 @@ two arms need:
 Shared state is a small memory-mapped file (``ArmSync``): stdlib, attachable from any process that knows the
 path, which is what the real arms need (each is its own process with its own 1 kHz libfranka loop).
 
-What is not here yet: the real-arm driver. The fake (``FakeFr3Driver``) has the driver's four calls --
-``move_to_start``, ``observe``, ``command``, ``hold`` -- and the real one is those four on the single-arm
+What is not here yet: the real-arm driver. The fake (``FakeFr3Driver``) has the driver's calls --
+``move_to_start``, ``observe``, ``stamp``, ``command``, ``hold`` -- and the real one is those on the single-arm
 replay's robot (``_move_robot_to_initial_target``, ``_get_robot_observation``, ``_send_pose_command``), with
 ``ArmSync`` checked where that script checks ``abort_reason`` and read where it waits for "go". That waits
 for the second FR3 (B1); the coordination it plugs into is what the tests here exercise, faults included.
+
+The two arms' clocks (D2, ``dual_fr3_clock``): every ``observe`` reads the robot's own clock and the host
+time the state arrived; ``stamp`` returns that pair, the report fits the two arms' clocks and says how far
+apart their starts are and what that costs T_LR.
 """
 
 # ruff: noqa: N802, N803, N806  (matrix names: R, T, J follow the maths)
@@ -74,7 +78,12 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from tools.fr3 import dual_fr3_collision as col, fr3_arms, fr3_kinematics as kin  # noqa: E402
+from tools.fr3 import (  # noqa: E402
+    dual_fr3_clock as clock,
+    dual_fr3_collision as col,
+    fr3_arms,
+    fr3_kinematics as kin,
+)
 
 SCHEMA = "dual_fr3_replay/v1"
 ARMS = ("right", "left")
@@ -293,6 +302,16 @@ def arm_separation(
 
 
 #: ReplayRuntimeConfig.position_tolerance_m / orientation_tolerance_deg: frame 0 counts as reached within these.
+#: the fake controller clock: a booted-a-while-ago offset, no drift, a LAN's latency, libfranka's 1 ms
+DEFAULT_FAKE_CLOCK: dict[str, Any] = {
+    "offset_s": 1000.0,
+    "drift_ppm": 0.0,
+    "latency_ms": [0.2, 0.1],
+    "resolution_s": 0.001,
+    "seed": 0,
+    "delay_frames": 0,
+}
+
 START_POSITION_TOLERANCE_M = 0.004
 START_ORIENTATION_TOLERANCE_DEG = 3.0
 
@@ -311,17 +330,30 @@ class FakeFr3Driver:
     target as the real arm does. ``fault`` = ``{"kind", "at_frame"}``:
     ``raise`` (the driver throws, as libfranka on a reflex), ``exit`` (the process dies), ``hang`` (the call
     never returns), ``freeze`` (the arm stops following; its own tracking gate has to notice).
+
+    It keeps a controller clock as libfranka's ``RobotState.time`` (D2): ``clock`` = ``{"offset_s",
+    "drift_ppm", "latency_ms": [min, mean extra], "resolution_s", "seed", "delay_frames"}``; each ``observe``
+    samples it one network latency (the minimum plus an exponential extra) before the state arrives, and
+    ``stamp`` returns ``(robot time, arrival ns)`` of that state. ``delay_frames`` applies each command that
+    many frames late: an arm that moves behind the shared schedule, the skew D2 has to find.
     """
 
     tool: list[list[float]]
     gain: float = 0.6
     fault: dict[str, Any] | None = None
+    clock: dict[str, Any] | None = None
     q: np.ndarray = field(default_factory=lambda: kin.Q_READY.copy())
     frame: int = -1
 
     def __post_init__(self) -> None:
         self._T_tool = np.asarray(self.tool, dtype=np.float64)
         self._T_tool_inv = np.linalg.inv(self._T_tool)
+        clock = {**DEFAULT_FAKE_CLOCK, **(self.clock or {})}
+        self._clock = clock
+        self._boot_ns = now_ns()
+        self._rng = np.random.default_rng(clock["seed"])
+        self._pending: list[tuple[np.ndarray, np.ndarray | None]] = []
+        self._stamp: tuple[float, int] | None = None
 
     def move_to_start(self, T_tcp: np.ndarray, joints: list[float] | None = None) -> dict[str, Any]:
         """To the planned start joints when given (the single-arm replay's ``joint_start``), else by IK;
@@ -342,7 +374,18 @@ class FakeFr3Driver:
         }
 
     def observe(self) -> tuple[np.ndarray, np.ndarray]:
+        c = self._clock
+        lat_min, lat_extra = (x * 1e6 for x in c["latency_ms"])
+        latency_ns = lat_min + (self._rng.exponential(lat_extra) if lat_extra > 0 else 0.0)
+        arrived = now_ns()
+        robot = c["offset_s"] + (arrived - latency_ns - self._boot_ns) / 1e9 * (1.0 + c["drift_ppm"] * 1e-6)
+        self._stamp = (math.floor(robot / c["resolution_s"]) * c["resolution_s"], arrived)
         return kin.NOMINAL.fk(self.q)[0] @ self._T_tool, self.q.copy()
+
+    def stamp(self) -> tuple[float, int] | None:
+        """``(robot clock s, host arrival ns)`` of the last ``observe`` -- the real driver's is
+        ``(state.time.toSec(), time.monotonic_ns() on its return)``."""
+        return self._stamp
 
     def command(self, T_tcp: np.ndarray, frame: int, q_ref: np.ndarray | None = None) -> None:
         self.frame = frame
@@ -357,6 +400,12 @@ class FakeFr3Driver:
                 time.sleep(3600.0)
             if kind == "freeze":
                 return
+        delay = int(self._clock["delay_frames"])
+        if delay:
+            self._pending.append((np.asarray(T_tcp), None if q_ref is None else np.asarray(q_ref)))
+            if len(self._pending) <= delay:
+                return
+            T_tcp, q_ref = self._pending.pop(0)
         if q_ref is not None:
             self.q = np.clip(self.q + self.gain * (np.asarray(q_ref) - self.q), kin.Q_LOWER, kin.Q_UPPER)
             return
@@ -374,7 +423,9 @@ class FakeFr3Driver:
 def make_driver(spec: Mapping[str, Any]) -> FakeFr3Driver:
     if spec.get("kind") != "fake":
         raise ValueError(f"driver kind {spec.get('kind')!r}: only 'fake' exists until the second FR3 (B1)")
-    return FakeFr3Driver(tool=spec["tool"], gain=float(spec.get("gain", 0.6)), fault=spec.get("fault"))
+    return FakeFr3Driver(
+        tool=spec["tool"], gain=float(spec.get("gain", 0.6)), fault=spec.get("fault"), clock=spec.get("clock")
+    )
 
 
 def joint_path(targets: np.ndarray, tool: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -433,7 +484,16 @@ def arm_main(
     targets = plan["targets"]
     joints = plan["joints"] if "joints" in plan.files else None
     period_ns = sync.period_ns
-    log: dict[str, Any] = {"arm_index": index, "command_ns": [], "frames": [], "outcome": "", "reason": ""}
+    log: dict[str, Any] = {
+        "arm_index": index,
+        "command_ns": [],
+        "frames": [],
+        # D2: per command, the state read after it -- its robot clock, its arrival, its joints
+        "state_clock": [],
+        "state_q": [],
+        "outcome": "",
+        "reason": "",
+    }
     driver = None
     try:
         driver = make_driver(driver_spec)
@@ -481,6 +541,10 @@ def arm_main(
             T_act, q = driver.observe()
             sync.publish_joints(index, q)
             sync.beat(index)
+            stamp = driver.stamp()
+            if stamp is not None:
+                log["state_clock"].append([stamp[0], stamp[1]])
+                log["state_q"].append(q.tolist())
             e_target = pose_error(T_act, targets[k])
             e_command = pose_error(T_act, T_cmd)
             log["frames"].append([k, *e_target, *e_command])
@@ -685,6 +749,7 @@ def run(
         )
         arms[plan.name] = log
     report = _report(sync, plans, arms, events, period_ns, start_gap, min_gap, min_pair, gates)
+    report["clock"] = _clock_report(plans, arms, period_ns, T_right_left, run_dir)
     if timelines is not None:
         t0 = sync.t0_ns
         executed = {
@@ -701,6 +766,30 @@ def run(
     (run_dir / "dual_replay_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     sync.close()
     return report
+
+
+def _clock_report(
+    plans: list[ArmPlan], arms: Mapping[str, Any], period_ns: int, T_right_left: np.ndarray, run_dir: Path
+) -> dict[str, Any]:
+    """D2 (``dual_fr3_clock``) on the arms' state stamps; the stamps themselves go to clock_samples.npz."""
+    samples, inputs = {}, {}
+    for plan in plans:
+        log = arms[plan.name]
+        stamps = np.asarray(log.get("state_clock") or np.zeros((0, 2)), dtype=np.float64).reshape(-1, 2)
+        receive_ns = np.asarray([int(s[1]) for s in log.get("state_clock") or []], dtype=np.int64)
+        q = np.asarray(log.get("state_q") or np.zeros((0, 7)), dtype=np.float64).reshape(-1, 7)
+        samples.update({f"robot_s_{plan.name}": stamps[:, 0], f"receive_ns_{plan.name}": receive_ns,
+                        f"q_{plan.name}": q})  # fmt: skip
+        inputs[plan.name] = {
+            "command_ns": log.get("command_ns") or [],
+            "targets": plan.targets,
+            "tool": plan.driver["tool"],
+            "robot_s": stamps[:, 0].tolist(),
+            "receive_ns": receive_ns,
+            "q": q,
+        }
+    np.savez(run_dir / "clock_samples.npz", **samples)
+    return clock.analyse(inputs, period_ns=period_ns, T_right_left=T_right_left)
 
 
 def _report(sync, plans, arms, events, period_ns, start_gap, min_gap, min_pair, gates) -> dict[str, Any]:

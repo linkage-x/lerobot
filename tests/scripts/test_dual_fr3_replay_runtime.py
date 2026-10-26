@@ -25,7 +25,7 @@ def _path(amplitude: float = 0.15) -> np.ndarray:
     return q
 
 
-def _plans(spacing: float = 0.8, faults=None, amplitude: float = 0.15):
+def _plans(spacing: float = 0.8, faults=None, amplitude: float = 0.15, clocks=None):
     """Right arm on the path, left arm on its mirror image -- the pseudo_bimanual geometry."""
     q_r = _path(amplitude)
     q_l = q_r * MIRROR
@@ -37,6 +37,7 @@ def _plans(spacing: float = 0.8, faults=None, amplitude: float = 0.15):
             "kind": "fake",
             "tool": TOOL.tolist(),
             "fault": (faults or {}).get(name),
+            "clock": (clocks or {}).get(name),
             "start_joints": q[0].tolist(),
         }
         plans.append(rt.ArmPlan(name, kin.NOMINAL.fk(q) @ TOOL, spec))

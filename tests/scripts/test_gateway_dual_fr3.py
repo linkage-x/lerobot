@@ -135,6 +135,7 @@ def test_connect_waits_at_frame_0_and_execute_runs_both_arms(tmp_path: Path, mon
     assert report["backend"] == "fake" and report["stop"] == []
     assert {arm: row["outcome"] for arm, row in report["arms"].items()} == {"right": "completed", "left": "completed"}
     assert Path(report["path"]).is_file()
+    assert report["clock"]["status"] in ("passed", "failed") and "one period" in report["clock"]["verdict"]  # D2
 
 
 def test_abort_at_frame_0_starts_nothing(tmp_path: Path, monkeypatch) -> None:

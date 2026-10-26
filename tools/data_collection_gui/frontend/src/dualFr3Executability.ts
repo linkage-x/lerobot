@@ -131,6 +131,14 @@ export function dualReplayControls(
   };
 }
 
+/** D2's line: the execution skew from the fitted robot clocks, and what it costs T_LR (an estimate). */
+function clockText(clock: NonNullable<DualReplayJob["report"]>["clock"]): string {
+  if (!clock?.status) return "";
+  if (clock.status !== "passed" && clock.status !== "failed") return `; clocks: ${clock.status}`;
+  return `; clocks ${clock.status === "passed" ? "OK" : "FAILED"}: ${clock.verdict ?? ""}` +
+    (clock.tLrFromSkewMmP95 != null ? `, T_LR ≈ ${clock.tLrFromSkewMmP95.toFixed(1)} mm p95 (estimate)` : "");
+}
+
 export function dualReplayStatus(job: DualReplayJob | null | undefined): string {
   if (!job?.state) return "idle";
   const what = `${job.backend ?? "?"} arms, ${job.mode ?? "?"}, episode ${job.episode ?? "?"}`;
@@ -143,7 +151,8 @@ export function dualReplayStatus(job: DualReplayJob | null | undefined): string 
     case "executing":
       return `executing (${what})`;
     case "finished":
-      return `finished (${what}): min gap ${report?.minGapMm ?? "?"} mm, start skew ${report?.startSkewMs ?? "?"} ms`;
+      return `finished (${what}): min gap ${report?.minGapMm ?? "?"} mm, send skew ${report?.startSkewMs ?? "?"} ms` +
+        clockText(report?.clock);
     case "stopped":
       return `stopped (${what}): ${(report?.stop ?? []).join("; ") || "?"}` +
         (report?.stoppedTogether === false ? " — the arms did NOT stop together" : "");

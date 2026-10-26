@@ -103,4 +103,13 @@ describe("two-arm replay controls (roadmap D4)", () => {
       .toBe("stopped (fake arms, absolute, episode 2): operator abort (SIGTERM) — the arms did NOT stop together");
     expect(dualReplayStatus(null)).toBe("idle");
   });
+
+  it("adds D2's clock verdict to a finished run, as an estimate", () => {
+    const finished = (clock: object) =>
+      dualReplayStatus({ state: "finished", backend: "fake", mode: "absolute", episode: 2, report: { minGapMm: 74, startSkewMs: 0.1, clock } });
+    expect(finished({ status: "failed", verdict: "start skew +40.52 ms >= one period (20.00 ms); drift +0.11 ms over 0.8 s", tLrFromSkewMmP95: 16.76 }))
+      .toBe("finished (fake arms, absolute, episode 2): min gap 74 mm, send skew 0.1 ms; clocks FAILED: " +
+        "start skew +40.52 ms >= one period (20.00 ms); drift +0.11 ms over 0.8 s, T_LR ≈ 16.8 mm p95 (estimate)");
+    expect(finished({ status: "no robot clock from left" })).toMatch(/; clocks: no robot clock from left$/);
+  });
 });
