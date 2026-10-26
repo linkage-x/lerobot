@@ -2742,7 +2742,12 @@ class RolloutGeometryTrace:
     def __init__(self, rollout_index: int, *, trace_dir: Path | None = None):
         self.rollout_index = int(rollout_index)
         self.trace_dir = Path(trace_dir) if trace_dir else None
-        self._rows: list[tuple[int, float, float, float, float, float, str, str]] = []
+        # The first eight fields are the original columns and are read by position below; the
+        # rest were added later and are only ever written out.
+        self._rows: list[tuple[Any, ...]] = []
+        # Every chunk the policy produced, as `advance_rtc_queue` merged it. The run loop hands
+        # over its live list, so the trace sees chunks as they arrive. Empty without RTC.
+        self.chunks: list[dict[str, Any]] = []
 
     def sample(
         self,
@@ -2753,6 +2758,12 @@ class RolloutGeometryTrace:
         gripper_raw: float,
         command_status: str,
         source: str = 'policy',
+        wall_time_s: float | None = None,
+        policy_xyz: Any = None,
+        sent_xyz: Any = None,
+        rtc_phase: str = '',
+        chunk: int = -1,
+        chunk_pos: int = -1,
     ) -> None:
         try:
             position = np.asarray(position_xyz, dtype=np.float64).reshape(3)
@@ -2760,6 +2771,14 @@ class RolloutGeometryTrace:
             return
         if not np.all(np.isfinite(position)):
             return
+
+        def xyz(value: Any) -> tuple[float, float, float]:
+            try:
+                point = np.asarray(value, dtype=np.float64).reshape(3)
+            except (ValueError, TypeError):
+                return (math.nan, math.nan, math.nan)
+            return (float(point[0]), float(point[1]), float(point[2]))
+
         self._rows.append(
             (
                 int(step_idx),
@@ -2770,6 +2789,16 @@ class RolloutGeometryTrace:
                 float(gripper_raw),
                 str(command_status),
                 str(source),
+                math.nan if wall_time_s is None else float(wall_time_s),
+                # What the policy asked for, before the assists, the funnel, the smoothing and
+                # the clamp; and what was sent after all of them. x/y/z above is where the arm
+                # was. Three different things, and only the last two tell a clamp from a policy
+                # that never asked to go further.
+                *xyz(policy_xyz),
+                *xyz(sent_xyz),
+                str(rtc_phase),
+                int(chunk),
+                int(chunk_pos),
             )
         )
 
@@ -2961,16 +2990,48 @@ class RolloutGeometryTrace:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
             path = self.trace_dir / f'rollout_{self.rollout_index:03d}.csv'
             with open(path, 'w', encoding='utf-8') as handle:
-                handle.write('step,x,y,z,gripper_cmd,gripper_raw,status,source\n')
-                for step_idx, x, y, z, gripper_cmd, gripper_raw, status, source in self._rows:
+                handle.write(
+                    'step,x,y,z,gripper_cmd,gripper_raw,status,source,'
+                    't,policy_x,policy_y,policy_z,sent_x,sent_y,sent_z,rtc_phase,chunk,chunk_pos\n'
+                )
+                for (
+                    step_idx, x, y, z, gripper_cmd, gripper_raw, status, source,
+                    wall_t, px, py, pz, sx, sy, sz, rtc_phase, chunk, chunk_pos,
+                ) in self._rows:
                     handle.write(
                         f'{step_idx},{x:.6f},{y:.6f},{z:.6f},{gripper_cmd:.4f},{gripper_raw:.4f},'
-                        f'{status},{source}\n'
+                        f'{status},{source},{wall_t:.3f},{px:.6f},{py:.6f},{pz:.6f},'
+                        f'{sx:.6f},{sy:.6f},{sz:.6f},{rtc_phase},{chunk},{chunk_pos}\n'
                     )
         except OSError as exc:  # noqa: BLE001 - a trace must never end a rollout
             print(f'[WARN] rollout_trace_write_failed index={self.rollout_index}: {exc}')
             return
         print(f'[INFO] rollout_trace_written index={self.rollout_index} path={path} rows={len(self._rows)}')
+        self._write_chunks()
+
+    def _write_chunks(self) -> None:
+        """Every predicted chunk beside the trace: `rollout_NNN_chunks.npz`.
+
+        Which steps of a chunk ran is in the trace (`chunk`, `chunk_pos`), not here: a chunk is
+        replaced when the next one merges, and only the step loop knows when that was.
+        """
+        if self.trace_dir is None or not self.chunks:
+            return
+        path = self.trace_dir / f'rollout_{self.rollout_index:03d}_chunks.npz'
+        try:
+            chunks = list(self.chunks)
+            arrays: dict[str, np.ndarray] = {
+                'processed': np.stack([np.asarray(c['processed'], dtype=np.float32) for c in chunks]),
+                'original': np.stack([np.asarray(c['original'], dtype=np.float32) for c in chunks]),
+            }
+            for key in RTC_CHUNK_SCALAR_FIELDS:
+                values = [c[key] for c in chunks]
+                arrays[key] = np.asarray(values, dtype=str if isinstance(values[0], str) else None)
+            np.savez_compressed(path, **arrays)
+        except (OSError, ValueError, KeyError) as exc:  # noqa: BLE001 - same rule as the trace
+            print(f'[WARN] rollout_chunks_write_failed index={self.rollout_index}: {exc}')
+            return
+        print(f'[INFO] rollout_chunks_written index={self.rollout_index} path={path} chunks={len(chunks)}')
 
 
 def close_camera_preview_window(window_name: str = 'FR3 policy camera inputs') -> None:
@@ -5047,6 +5108,59 @@ def _rtc_guidance_delay_steps(
     return max(int(math.ceil(float(tracked_latency) / time_per_step_s)), 0)
 
 
+# Per-chunk scalars in `rollout_NNN_chunks.npz`, beside the `original` and `processed` arrays.
+RTC_CHUNK_SCALAR_FIELDS = (
+    'chunk',
+    'merge_step',
+    'observation_step',
+    'merge_delay_steps',
+    'guidance_delay_steps',
+    'latency_s',
+    'status',
+    'phase',
+    'execution_horizon',
+    'action_samples',
+)
+
+
+def _record_rtc_chunk(
+    rtc_state: dict[str, Any],
+    *,
+    original_actions: torch.Tensor,
+    processed_actions: torch.Tensor,
+    merge_step: int,
+    observation_step: int,
+    phase: RolloutPhase,
+    debug: dict[str, Any],
+) -> None:
+    """Keep the whole chunk the policy predicted, and remember where the queue now starts in it.
+
+    The queue holds `chunk[merge_delay:]`, so the step popped next is chunk position
+    `merge_delay`; `advance_rtc_queue` stamps every step with `(chunk, chunk_pos)` from this.
+    """
+    chunk_id = int(rtc_state.get('chunk_seq', 0))
+    rtc_state['chunk_seq'] = chunk_id + 1
+    rtc_state['chunk_offset'] = int(debug.get('merge_delay_steps', 0))
+    rtc_state.setdefault('chunks', []).append(
+        {
+            'chunk': chunk_id,
+            'merge_step': int(merge_step),
+            'observation_step': int(observation_step),
+            'merge_delay_steps': int(debug.get('merge_delay_steps', 0)),
+            'guidance_delay_steps': int(debug.get('guidance_delay_steps', 0)),
+            'latency_s': float(debug.get('latency_s', 0.0)),
+            'status': str(debug.get('status', '')),
+            # The phase when it merged. An async plan is started in one step's phase and merged
+            # a few steps later, which across the align line can be the other one.
+            'phase': phase.name,
+            'execution_horizon': int(phase.execution_horizon),
+            'action_samples': int(phase.action_samples),
+            'original': original_actions.detach().float().cpu().numpy(),
+            'processed': processed_actions.detach().float().cpu().numpy(),
+        }
+    )
+
+
 def advance_rtc_queue(
     rtc_state: dict[str, Any],
     planner: AsyncActionChunkPlanner,
@@ -5068,6 +5182,17 @@ def advance_rtc_queue(
     if not isinstance(action_queue, ActionQueue):
         raise RuntimeError('RTC is enabled but the rollout action queue was not initialized.')
 
+    def record(plan: AsyncActionChunkPlanResult) -> None:
+        _record_rtc_chunk(
+            rtc_state,
+            original_actions=plan.original_actions,
+            processed_actions=plan.processed_actions,
+            merge_step=step_idx,
+            observation_step=plan.observation_step,
+            phase=phase,
+            debug=rtc_state['last_debug'],
+        )
+
     completed_plan = planner.pop_completed()
     if completed_plan is not None:
         rtc_state['last_debug'] = merge_completed_rtc_plan(
@@ -5075,6 +5200,7 @@ def advance_rtc_queue(
             completed_plan,
             _rtc_latency_tracker(rtc_state, rtc_state['planning_samples']),
         )
+        record(completed_plan)
 
     if action_queue.empty():
         if planner.running():
@@ -5093,6 +5219,7 @@ def advance_rtc_queue(
                 completed_plan,
                 _rtc_latency_tracker(rtc_state, rtc_state['planning_samples']),
             )
+            record(completed_plan)
 
         if action_queue.empty():
             prev_chunk_left_over = action_queue.get_left_over()
@@ -5138,6 +5265,15 @@ def advance_rtc_queue(
                 'queue_size': action_queue.qsize(),
                 'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
             }
+            _record_rtc_chunk(
+                rtc_state,
+                original_actions=original_actions,
+                processed_actions=processed_actions,
+                merge_step=step_idx,
+                observation_step=step_idx,
+                phase=phase,
+                debug=rtc_state['last_debug'],
+            )
 
     elif action_queue.qsize() <= phase.replan_queue_size:
         if planner.running():
@@ -5193,6 +5329,8 @@ def advance_rtc_queue(
     action_tensor = action_queue.get()
     if action_tensor is None:
         raise RuntimeError('RTC action queue is empty after chunk prediction.')
+    rtc_state['last_debug']['chunk'] = int(rtc_state.get('chunk_seq', 0)) - 1
+    rtc_state['last_debug']['chunk_pos'] = int(rtc_state.get('chunk_offset', 0)) + action_queue.get_action_index() - 1
     return action_tensor
 
 
@@ -6066,6 +6204,11 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             rtc_state['latency_trackers'] = {}
             rtc_state['planning_samples'] = 1
             rtc_state['last_debug'] = {'status': 'reset'}
+        # A new list per rollout, not a clear(): the previous rollout's trace still holds the
+        # old one and may not have written it yet.
+        rtc_state['chunks'] = []
+        rtc_state['chunk_seq'] = 0
+        rtc_state['chunk_offset'] = 0
         rollout_phases.reset()
 
     def run_policy_rollout(
@@ -6076,6 +6219,8 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         grasp_handover: GraspHandover | None = None,
     ) -> str:
         reset_policy_runtime_state()
+        if trace is not None:
+            trace.chunks = rtc_state['chunks']
         T_B_Ws: np.ndarray | None = None
         start_alignment_stats: dict[str, Any] | None = None
         previous_dataset_quaternion_xyzw: np.ndarray | None = None
@@ -6412,6 +6557,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             )
             base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
             robot_command = convert_base_command_from_I_to_E(base_robot_command_i)
+            policy_command_xyz = [float(robot_command[key]) for key in EE_POSITION_KEYS]
             temporal_offset_debug = update_temporal_offset_on_stuck(
                 temporal_offset_state,
                 base_offset=int(args.act_temporal_action_offset),
@@ -6568,6 +6714,12 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     gripper_raw=float(model_gripper_raw),
                     command_status=str(command_status),
                     source=command_source,
+                    wall_time_s=time.time(),
+                    policy_xyz=policy_command_xyz,
+                    sent_xyz=[float(command_to_send[key]) for key in EE_POSITION_KEYS],
+                    rtc_phase=str(rtc_state['last_debug'].get('phase', '')) if rtc_enabled else '',
+                    chunk=int(rtc_state['last_debug'].get('chunk', -1)) if rtc_enabled else -1,
+                    chunk_pos=int(rtc_state['last_debug'].get('chunk_pos', -1)) if rtc_enabled else -1,
                 )
 
             if dagger_buffer is not None:
@@ -6637,6 +6789,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                         # and what the arm was actually told -- so the buffer's "did this step
                         # go anywhere" is asked of the same motion the dataset will teach.
                         sent_command=command_to_send,
+                        step=step_idx,
                     )
                 else:
                     dagger_buffer.append({}, is_expert=False)

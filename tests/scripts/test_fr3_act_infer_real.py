@@ -2062,12 +2062,55 @@ def test_rollout_trace_writes_a_replayable_csv(tmp_path: Path):
     trace.write()
 
     rows = (tmp_path / "rollout_001.csv").read_text(encoding="utf-8").strip().splitlines()
-    assert rows[0] == "step,x,y,z,gripper_cmd,gripper_raw,status,source"
+    # The original eight columns stay first and in order, so readers of older files still work.
+    assert rows[0].startswith("step,x,y,z,gripper_cmd,gripper_raw,status,source,")
     assert len(rows) == 4
     assert rows[2].startswith("1,0.310000,-0.220000,0.050000,0.0000")
     # Every row says who was driving, including the ordinary case. A column that only appears
     # on intervened rollouts would make "no takeover" and "an older file" the same reading.
-    assert rows[1].endswith(",pass,policy")
+    assert rows[1].split(",")[6:8] == ["pass", "policy"]
+    # Nothing passed for the later columns: written as absent, not as zeros.
+    assert rows[1].split(",")[8:] == ["nan"] * 7 + ["", "-1", "-1"]
+    # And no chunk file for a rollout that recorded no chunks.
+    assert not (tmp_path / "rollout_001_chunks.npz").exists()
+
+
+def test_rollout_trace_keeps_what_the_policy_asked_for_beside_what_was_sent(tmp_path: Path):
+    """A clamped step: the policy asked for 12 mm, the guard sent 5. Both land in the CSV, and
+    the chunks the trace was handed land beside it."""
+    trace = fr3_act_infer_real_runtime.RolloutGeometryTrace(3, trace_dir=tmp_path)
+    trace.chunks = [
+        {
+            "chunk": 0, "merge_step": 0, "observation_step": 0, "merge_delay_steps": 0,
+            "guidance_delay_steps": 0, "latency_s": 0.2, "status": "replan_sync_bootstrap",
+            "phase": "approach", "execution_horizon": 16, "action_samples": 1,
+            "original": np.zeros((50, 5)), "processed": np.ones((50, 5)),
+        }
+    ]
+    trace.sample(
+        step_idx=0,
+        position_xyz=np.asarray([0.30, -0.10, 0.20]),
+        gripper_command=1.0,
+        gripper_raw=0.9,
+        command_status="clamped",
+        wall_time_s=1792739824.25,
+        policy_xyz=[0.312, -0.10, 0.20],
+        sent_xyz=[0.305, -0.10, 0.20],
+        rtc_phase="approach",
+        chunk=0,
+        chunk_pos=0,
+    )
+    trace.write()
+
+    header, row = (tmp_path / "rollout_003.csv").read_text(encoding="utf-8").strip().splitlines()
+    fields = dict(zip(header.split(","), row.split(","), strict=True))
+    assert fields["t"] == "1792739824.250"
+    assert (fields["policy_x"], fields["sent_x"]) == ("0.312000", "0.305000")
+    assert (fields["rtc_phase"], fields["chunk"], fields["chunk_pos"]) == ("approach", "0", "0")
+    chunks = np.load(tmp_path / "rollout_003_chunks.npz")
+    assert chunks["processed"].shape == (1, 50, 5)
+    assert chunks["status"].tolist() == ["replan_sync_bootstrap"]
+    assert set(fr3_act_infer_real_runtime.RTC_CHUNK_SCALAR_FIELDS) <= set(chunks.files)
 
 
 def test_rollout_trace_summary_fields_are_readable_off_the_end_marker():
@@ -2861,3 +2904,57 @@ def test_a_fake_robot_descending_through_the_line_replans_twice_as_often_below_i
         assert prediction['task'] == 'insert the peg'
     # The robot really followed the queue: 70 steps of 2 mm.
     assert math.isclose(robot.z, 0.201 - 70 * 0.002, abs_tol=1e-6)
+
+
+def test_every_executed_step_is_stamped_with_the_chunk_and_position_it_came_from(monkeypatch):
+    """The chunk log's contract: `chunks[chunk]['processed'][chunk_pos]` is the action that ran.
+
+    Each chunk's values encode (chunk number, position), so a wrong offset -- forgetting that an
+    async merge drops the steps consumed during inference -- shows up as a different number.
+    """
+    rt = fr3_act_infer_real_runtime
+    calls: list[int] = []
+
+    def fake_predict(observation, **kwargs):
+        n = len(calls)
+        calls.append(int(observation['step'][0]))
+        chunk = (1000.0 * n + torch.arange(50, dtype=torch.float32)).unsqueeze(1)
+        return chunk - 0.5, chunk
+
+    monkeypatch.setattr(rt, 'predict_action_chunk_for_rollout', fake_predict)
+    phase = _phase(replan_queue_size=34)
+    rtc_state = {
+        'queue': rt.ActionQueue(rt.RTCConfig(enabled=True)),
+        'latency_trackers': {},
+        'planning_samples': 1,
+        'last_debug': {'status': 'reset'},
+    }
+    planner = rt.AsyncActionChunkPlanner()
+    executed = []
+    for step_idx in range(60):
+        action = rt.advance_rtc_queue(
+            rtc_state,
+            planner,
+            {'step': np.array([step_idx], dtype=np.float32)},
+            phase=phase,
+            step_idx=step_idx,
+            time_per_step_s=1.0 / 30.0,
+            inference_delay_steps=None,
+            predict_kwargs={},
+        )
+        executed.append((float(action[0]), rtc_state['last_debug']['chunk'], rtc_state['last_debug']['chunk_pos']))
+        assert planner.join(timeout_s=2.0)
+
+    chunks = rtc_state['chunks']
+    assert [c['chunk'] for c in chunks] == list(range(len(chunks)))
+    # Every prediction that merged is logged, with the step its observation came from.
+    assert [c['observation_step'] for c in chunks] == calls[: len(chunks)]
+    assert chunks[0]['status'] == 'replan_sync_bootstrap' and chunks[0]['merge_delay_steps'] == 0
+    # An async plan joined before the next step merges one step later, one action consumed.
+    assert all(c['merge_delay_steps'] == 1 and c['merge_step'] == c['observation_step'] + 1 for c in chunks[1:])
+    for value, chunk, pos in executed:
+        assert value == float(chunks[chunk]['processed'][pos, 0])
+        assert float(chunks[chunk]['original'][pos, 0]) == value - 0.5
+    # Bootstrap runs positions 0..15, then each async chunk from position 1.
+    assert [pos for _, chunk, pos in executed if chunk == 0] == list(range(17))
+    assert [pos for _, chunk, pos in executed if chunk == 1][:3] == [1, 2, 3]

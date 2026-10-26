@@ -310,6 +310,9 @@ class DaggerFrameBuffer:
             None if max_still_frames is None or int(max_still_frames) < 0 else int(max_still_frames)
         )
         self._spans: list[list[dict[str, Any]]] = []
+        # The control step of each kept frame, parallel to `_spans`: the join key from an episode
+        # frame back to the rollout trace and its chunk log. None where the caller gave none.
+        self._span_steps: list[list[int | None]] = []
         self._open = False
         self._frames = 0
         self._dropped = 0
@@ -348,6 +351,7 @@ class DaggerFrameBuffer:
         *,
         is_expert: bool,
         sent_command: dict[str, float] | None = None,
+        step: int | None = None,
     ) -> None:
         """Offer one control step. Only the expert's are kept; the rest close the open span.
 
@@ -388,16 +392,23 @@ class DaggerFrameBuffer:
             return
         if not self._open:
             self._spans.append([])
+            self._span_steps.append([])
             self._open = True
         self._spans[-1].append(frame)
+        self._span_steps[-1].append(None if step is None else int(step))
         self._frames += 1
 
     def spans(self) -> Iterator[list[dict[str, Any]]]:
         """Each span's frames, oldest first. Empty spans cannot occur: one is opened by a frame."""
         yield from self._spans
 
+    def span_steps(self) -> Iterator[list[int | None]]:
+        """Each span's control steps, parallel to `spans()`."""
+        yield from self._span_steps
+
     def clear(self) -> None:
         self._spans = []
+        self._span_steps = []
         self._open = False
         self._frames = 0
         self._dropped = 0
@@ -556,7 +567,7 @@ class DaggerEpisodeWriter:
         written = 0
         skipped = 0
         frames_written = 0
-        for span in buffer.spans():
+        for span, steps in zip(buffer.spans(), buffer.span_steps(), strict=True):
             if len(span) < self._min_span_frames:
                 skipped += 1
                 continue
@@ -567,7 +578,13 @@ class DaggerEpisodeWriter:
             # encoding on.
             self._dataset.save_episode(parallel_encoding=False)
             if buffer.frame is not None:
-                self._record_frame(buffer.frame, rollout_index=rollout_index)
+                self._record_frame(
+                    buffer.frame,
+                    rollout_index=rollout_index,
+                    # Frame i of the episode was trace step steps[i]. Not implied by the frame
+                    # index: seam steps and still frames are left out of an episode, not the trace.
+                    steps=steps if all(step is not None for step in steps) else None,
+                )
             written += 1
             frames_written += len(span)
         summary = {
@@ -591,8 +608,10 @@ class DaggerEpisodeWriter:
         return summary
 
 
-    def _record_frame(self, frame: dict[str, Any], *, rollout_index: int) -> None:
+    def _record_frame(self, frame: dict[str, Any], *, rollout_index: int, steps: list[int] | None = None) -> None:
         row = {'episode_index': int(self._dataset.meta.total_episodes) - 1, 'rollout': int(rollout_index), **frame}
+        if steps is not None:
+            row['steps'] = [int(step) for step in steps]
         path = Path(self._dataset.root) / EPISODE_FRAMES_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('a', encoding='utf-8') as handle:

@@ -1020,3 +1020,36 @@ def test_each_episode_records_the_frame_its_poses_were_written_in(tmp_path):
         plain.append({}, is_expert=True, sent_command=command(x=x))
     DaggerEpisodeWriter(dataset, emit=lambda _: None).write(plain, rollout_index=10)
     assert len((tmp_path / EPISODE_FRAMES_PATH).read_text().splitlines()) == 2
+    # Offered without steps, a row carries none rather than a guessed 0..n-1.
+    assert all('steps' not in row for row in rows)
+
+
+def test_an_episode_row_maps_each_frame_back_to_its_control_step(tmp_path):
+    """Frame index is not the step: a still run dropped from the episode stays in the trace. The
+    row's `steps` is what joins an episode frame to the trace and to the chunk it executed."""
+    import json
+    from types import SimpleNamespace
+
+    from tools.fr3.dagger_dataset import EPISODE_FRAMES_PATH, rollout_frame_record
+
+    class FramedDataset(FakeDataset):
+        def __init__(self, root):
+            super().__init__()
+            self.root = root
+            self.meta = SimpleNamespace(total_episodes=0)
+
+        def save_episode(self, **kwargs):
+            super().save_episode(**kwargs)
+            self.meta.total_episodes += 1
+
+    dataset = FramedDataset(tmp_path)
+    buffer = DaggerFrameBuffer(max_still_frames=1, keep_policy_frames=True)
+    buffer.frame = rollout_frame_record(np.eye(4), start_contract_xyzquat=[0.381, -0.135, 0.097, 1, 0, 0, 0], view_root='v')
+    # Steps 2 and 3 repeat step 1's pose: one still frame is allowed, the second is dropped.
+    for step, x in enumerate((0.40, 0.41, 0.41, 0.41, 0.42)):
+        buffer.append({'n': step}, is_expert=False, sent_command=command(x=x), step=step + 100)
+    DaggerEpisodeWriter(dataset, emit=lambda _: None).write(buffer, rollout_index=1)
+
+    (row,) = [json.loads(line) for line in (tmp_path / EPISODE_FRAMES_PATH).read_text().splitlines()]
+    assert row['steps'] == [100, 101, 102, 104]
+    assert [frame['n'] for span in buffer.spans() for frame in span] == [0, 1, 2, 4]
