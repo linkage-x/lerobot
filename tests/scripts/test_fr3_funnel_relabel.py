@@ -362,6 +362,30 @@ def test_a_row_from_another_run_is_not_taken_for_the_episode(tmp_path):
         relabel_source(root, 50, trial_rows=rows + [rows[1]])
 
 
+def test_the_row_matches_a_reclose_after_a_short_close_pulse(tmp_path):
+    """R6 (10-27): R4 045000 closes for a few steps, lifts and closes again; the row's close is the
+    one that settled, tens of mm from the first onset. The episode is still its row's, and its
+    frames from the first pulse on stay unsupervised."""
+
+    import pandas as pd
+
+    root, rows, _peg, close_a = _source(tmp_path)
+    path = root / "data" / "chunk-000" / "file-000.parquet"
+    frames = pd.read_parquet(path)
+    pulse = close_a - 20
+    at = frames.index[(frames.episode_index == 1) & frames.frame_index.between(pulse, pulse + 3)]
+    for i in at:
+        action = frames.at[i, "action"].copy()
+        action[4] = 0.0
+        frames.at[i, "action"] = action
+    frames.to_parquet(path)
+    out, summary = relabel_source(root, 50, trial_rows=rows)
+    assert summary["trial_row_matched_episodes"] == 2
+    rec = out[1]
+    after = rec["frames"] >= pulse
+    assert rec["masked"][after].all() and not rec["masked"][~after].any()
+
+
 def test_trial_rows_load_only_kept_trials(tmp_path):
     path = tmp_path / "grasp_x.jsonl"
     kept = {"kind": "trial", "trial": 0, "closeXyz": [0, 0, 0], "pegXyz": [0, 0, 0],

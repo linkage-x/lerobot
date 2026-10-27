@@ -36,6 +36,8 @@ The loop keeps track of where the peg is, because that decides how the next tria
     untouched after a miss whose tool path never came  -> the script picks it up where it stands
               low near the peg                             and carries it to the next target
                                                            ("repick"); an empty pick makes it lost
+    unclosed  after a no_close: the tool came low near  -> the same re-pick: an empty pick makes it
+              the peg but never closed on it               lost
     lost      after any other miss, or a re-grip or     -> a person puts it back in the fixture,
               re-pick that came up empty, or a reflex      or the run halts if nobody is there
 
@@ -52,7 +54,10 @@ re-picked: the peg a policy closed on air beside has usually been knocked over, 
 up empty 9 times in 13, each one costing a reset before the person was asked anyway. Only a miss
 whose whole tool path stayed clear of the peg is (GraspHandover.peg_untouched): the pure policy
 misses mostly in mid-air, several cm off, and 8 of its 13 misses in the 09-23/09-24 runs were
-that kind.
+that kind. Nor is a no_close handed to a person outright: fingers that never closed rarely knock
+the peg over. On 10-27 (R4 045000, grasp-only, near pegs) 13 trials ended no_close, every one low
+near the peg; of the 11 whose peg was standing at the start, about 7 still stood at the end and 3
+lay on the table. As "lost", each of the 11 waited for a person -- 100 of the run's 151 minutes.
 
 Where the peg stands is the tool position *measured* as the fingers open (read just before, since
 the tool can spring sideways once they have), not the commanded target: a place step converges to
@@ -1796,7 +1801,7 @@ def run_grasp_loop(
 
             # ---- stage the peg at `target`, arm homed ------------------------------------------
             repicked = False
-            if peg == "untouched":
+            if peg in ("untouched", "unclosed"):
                 assert peg_xyz is not None
                 width = verified_pick(robot, request, (peg_xyz[0], peg_xyz[1], request.regripZ), request_id=request_id)
                 repicked = grasp_is_held(width, request.closedGripper, held_width=request.heldWidth, blocked_margin=request.blockedMargin)
@@ -2010,11 +2015,14 @@ def run_grasp_loop(
                 row["verdict"] = "no_close" if status == "grasp_timeout" else "not_graded"
                 release_and_clear(robot, request, request_id=request_id)
             if peg == "at_target":
-                # Missed. Standing where it was put if the tool never came low near it; otherwise
-                # it may be anywhere, and the next staging hands it to a person.
+                # Missed. Standing where it was put if the tool never came low near it, and
+                # usually still if the fingers never closed: the script tries to pick it up there.
+                # After any other miss it may be anywhere, and the next staging hands it to a person.
                 row["pegUntouched"] = handover.peg_untouched()
                 if row["pegUntouched"]:
                     peg = "untouched"
+                elif row["verdict"] == "no_close":
+                    peg = "unclosed"
             keep_segment(trial, row)
             row["trialS"] = round(time.perf_counter() - started, 1)
             write(row)

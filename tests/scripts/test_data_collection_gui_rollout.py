@@ -2312,6 +2312,24 @@ def test_a_demonstration_that_starts_with_the_gripper_shut_grasps_on_the_falling
     assert point["graspXyz"] == [0.31, -0.22, 0.05]
 
 
+def test_an_opening_without_a_carry_is_a_regrasp_not_a_release(tmp_path: Path):
+    """A policy that half-closes, opens and closes again at the peg released nothing.
+
+    R4's view held three such episodes and nothing else that opened, so their mean became the
+    "hole" -- 60 mm from the fixture and 12 mm low -- and the scene reset's pick followed it.
+    """
+    regrasp = ([0.20, 0.05, 0.05, 0.05, 0.05, 0.05, 0.06], [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+    open_only = ([0.20, 0.05, 0.05, 0.05], [1.0, 0.0, 1.0, 1.0])
+    root = _write_demo_dataset(tmp_path / "view", {0: regrasp, 1: open_only})
+
+    landmarks = checkpoint_backend.demo_landing_points(root)
+
+    assert [point["released"] for point in landmarks["points"]] == [False, False]
+    assert landmarks["points"][0]["graspXyz"][2] == pytest.approx(0.05)
+    assert landmarks["holeSource"] == "fixture"
+    assert landmarks["placeXyz"] == pytest.approx(list(checkpoint_backend.FIXTURE_HOLE_XYZ))
+
+
 def test_demo_landing_points_are_memoised_per_dataset(tmp_path: Path):
     """The scan is a full pass over the dataset's parquet; the page asks for it on every mount."""
     heights = [0.20, 0.05, 0.12, 0.06, 0.14]

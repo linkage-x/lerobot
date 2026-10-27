@@ -537,6 +537,32 @@ def test_the_loader_refuses_while_this_machine_trains(tmp_path):
         load({'checkpoint': 'outputs/train/x/checkpoints/last/pretrained_model'})
 
 
+def test_the_loader_aligns_use_amp_before_reading_the_config(monkeypatch, tmp_path):
+    import json
+
+    from tools.fr3 import fr3_policy_server as server
+
+    pretrained = tmp_path / 'outputs/train/x/checkpoints/045000/pretrained_model'
+    pretrained.mkdir(parents=True)
+    (pretrained / 'config.json').write_text(json.dumps({'type': 'pi05', 'dtype': 'bfloat16', 'use_amp': False}))
+    (pretrained / 'train_config.json').write_text(json.dumps({'policy': {'use_amp': False}}))
+    seen: list[bool] = []
+
+    def stop_at_train_config(path):
+        seen.append(json.loads((path / 'config.json').read_text())['use_amp'])
+        raise RuntimeError('stop here')
+
+    monkeypatch.setattr(rt, 'load_train_config', stop_at_train_config)
+    lines: list[str] = []
+    load = server.make_loader(tmp_path, torch.device('cpu'), log=lines.append)
+    with pytest.raises(RuntimeError, match='stop here'):
+        load({'checkpoint': 'outputs/train/x/checkpoints/045000/pretrained_model'})
+    assert seen == [True]
+    assert json.loads((pretrained / 'train_config.json').read_text())['policy']['use_amp'] is True
+    assert (pretrained / 'use_amp_alignment.json').is_file()
+    assert any('aligned use_amp' in line for line in lines)
+
+
 def test_warm_last_is_skipped_while_this_machine_trains(monkeypatch, tmp_path):
     from tools.fr3 import fr3_policy_server as server
 

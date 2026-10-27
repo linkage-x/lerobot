@@ -44,6 +44,7 @@ import torch
 from lerobot.configs.types import FeatureType
 
 from tools.fr3 import fr3_act_infer_real_runtime as rt
+from tools.fr3 import fr3_align_checkpoint_use_amp as use_amp_alignment
 from tools.fr3.policy_remote import (
     DEFAULT_POLICY_SERVER_PORT,
     LOAD_SPEC_OVERRIDES,
@@ -240,6 +241,16 @@ def make_loader(repo_root: Path, device: torch.device, *, log=print, on_loaded=N
                 'Run the policy server on the machine that trained it, or copy the checkpoint there.'
             )
         pretrained_dir = rt.resolve_pretrained_model_dir(checkpoint)
+        # The NUC gateway aligns its own copy of the checkpoint before every rollout; this copy has
+        # to get the same, or the hello's fingerprints differ on use_amp (R4, 10-27). Warned, not
+        # refused, as the gateway does: the fingerprint check still stops a real mismatch.
+        try:
+            alignment = use_amp_alignment.align_checkpoint_use_amp(pretrained_dir)
+        except use_amp_alignment.AlignmentError as exc:
+            log(f'[WARN] policy_server could not align use_amp: {exc}')
+        else:
+            if alignment.changed:
+                log(f'[WARN] policy_server aligned use_amp before loading -- {alignment.summary}')
         train_cfg = rt.load_train_config(pretrained_dir)
         explicit_root = None
         if spec.get('dataset_root'):

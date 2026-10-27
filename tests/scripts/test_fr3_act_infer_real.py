@@ -1029,6 +1029,52 @@ def test_load_camera_crop_specs_recurses_through_a_cropped_source_view(tmp_path:
     assert source_hw == {'observation.images.side': (480, 640)}
 
 
+def _write_merged_view(tmp_path: Path, source_roots: list[str]) -> Path:
+    dagger_root = tmp_path / 'outputs' / 'datasets' / 'dagger'
+    (dagger_root / 'meta').mkdir(parents=True)
+    (dagger_root / 'meta' / 'info.json').write_text(
+        json.dumps({'features': {'observation.images.side': {'shape': [382, 444, 3]}}}),
+        encoding='utf-8',
+    )
+    merged_view = tmp_path / 'merged_view'
+    (merged_view / 'meta').mkdir(parents=True)
+    (merged_view / 'meta' / 'il_view_manifest.json').write_text(
+        json.dumps(
+            {
+                'source_dataset_roots': [*source_roots, str(dagger_root)],
+                'camera_crop_specs': {'observation.images.side': [108, 58, 444, 382]},
+                'image_resize_shape': None,
+            }
+        ),
+        encoding='utf-8',
+    )
+    return merged_view
+
+
+def test_load_camera_crop_specs_never_takes_an_already_cropped_source(tmp_path: Path):
+    # The base view is gone, so only the DAgger root is left, and its 444x382 frames are the
+    # crop itself -- not a frame the crop could have been drawn on.
+    merged_view = _write_merged_view(tmp_path, [str(tmp_path / 'missing_base_view')])
+
+    crops, source_hw = fr3_act_infer_real_runtime.load_camera_crop_specs(merged_view)
+
+    assert crops == {'observation.images.side': [108, 58, 444, 382]}
+    assert source_hw == {}
+
+
+def test_load_camera_crop_specs_finds_a_source_named_by_another_machines_path(tmp_path: Path, monkeypatch):
+    base_view = _write_cropped_view(
+        tmp_path / 'outputs' / 'exports' / 'training_views', crop=[108, 58, 444, 382], source_shape=[480, 640, 3]
+    )
+    monkeypatch.setattr(fr3_act_infer_real_runtime, '_REPO_ROOT', tmp_path)
+    elsewhere = '/home/someone/Codes/other_repo/' + str(base_view.relative_to(tmp_path))
+    merged_view = _write_merged_view(tmp_path, [elsewhere])
+
+    _crops, source_hw = fr3_act_infer_real_runtime.load_camera_crop_specs(merged_view)
+
+    assert source_hw == {'observation.images.side': (480, 640)}
+
+
 def test_load_camera_crop_specs_is_empty_for_a_full_frame_view(tmp_path: Path):
     view_root = tmp_path / 'view'
     (view_root / 'meta').mkdir(parents=True)

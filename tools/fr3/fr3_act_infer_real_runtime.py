@@ -1278,6 +1278,15 @@ def _resolve_existing_dataset_root(path_value: str | Path) -> Path:
     if candidate.exists():
         return candidate
 
+    # An absolute path written on another machine (a view built in the training repo from one in
+    # this repo names it absolutely): the same path from `outputs/` on, under this repo.
+    parts = Path(path_value).parts
+    if 'outputs' in parts:
+        rebased = _REPO_ROOT.joinpath(*parts[len(parts) - 1 - parts[::-1].index('outputs'):])
+        if rebased.exists():
+            print(f'[WARN] alignment_dataset_root_path_remapped=from={candidate} to={rebased}')
+            return rebased
+
     basename = Path(path_value).name
     for root in (
         _REPO_ROOT / 'outputs' / 'datasets',
@@ -1350,11 +1359,16 @@ def resolve_alignment_dataset_root_and_state_key(dataset_root: Path) -> tuple[Pa
 def _load_crop_source_frame_shapes(
     manifest: dict[str, Any],
     manifest_path: Path,
-    feature_keys: list[str],
+    crops: dict[str, list[int]],
     *,
     _visited_roots: set[Path] | None = None,
 ) -> dict[str, tuple[int, int]]:
-    """The (H, W) each crop was drawn on, read off the recording the view was built from."""
+    """The (H, W) each crop was drawn on, read off the recording the view was built from.
+
+    A source whose frames cannot hold the crop is skipped: a DAgger or trial root stores the
+    already-cropped pixels, and taking its shape as the source refuses every live frame (R4, 10-27).
+    """
+    feature_keys = sorted(crops)
     roots = manifest.get('source_dataset_roots') or []
     if not roots and manifest.get('source_dataset_root'):
         roots = [manifest['source_dataset_root']]
@@ -1378,7 +1392,7 @@ def _load_crop_source_frame_shapes(
                 nested_shapes = _load_crop_source_frame_shapes(
                     nested_manifest,
                     nested_manifest_path,
-                    feature_keys,
+                    crops,
                     _visited_roots=visited_roots,
                 )
                 if len(nested_shapes) == len(feature_keys):
@@ -1394,7 +1408,10 @@ def _load_crop_source_frame_shapes(
             shape = (features.get(feature_key) or {}).get('shape')
             if isinstance(shape, (list, tuple)) and len(shape) == 3:
                 shapes[feature_key] = (int(shape[0]), int(shape[1]))
-        if len(shapes) == len(feature_keys):
+        if len(shapes) == len(feature_keys) and all(
+            crops[key][0] + crops[key][2] <= width and crops[key][1] + crops[key][3] <= height
+            for key, (height, width) in shapes.items()
+        ):
             return shapes
     # Not fatal: the bounds check in `apply_camera_crop` still rejects a crop that cannot fit the
     # live frame. It only stops catching a camera opened *larger* than the recording, where the
@@ -1448,7 +1465,7 @@ def load_camera_crop_specs(dataset_root: Path) -> tuple[dict[str, list[int]], di
         crops[str(feature_key)] = [x, y, w, h]
     if not crops:
         return {}, {}
-    return crops, _load_crop_source_frame_shapes(manifest, manifest_path, sorted(crops))
+    return crops, _load_crop_source_frame_shapes(manifest, manifest_path, crops)
 
 
 def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:

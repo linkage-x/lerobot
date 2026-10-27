@@ -201,7 +201,7 @@ def match_trial_row(
     root_name: str,
     episode: int,
     record: dict[str, Any],
-    close_state_xyz: np.ndarray | None,
+    close_states_xyz: np.ndarray | None,
     rows: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     """The row that recorded `episode` of dataset `root_name`: same trial, same first episode, and
@@ -211,6 +211,11 @@ def match_trial_row(
     across datasets; the close position does not, and neither does the dataset (one root is
     appended to, so its episode indices never repeat). Rows written before the root was recorded
     are matched on the close alone.
+
+    `close_states_xyz` is the measured pose at the onset of each closed run of the episode. The
+    row's close is the one that settled, which is not always the first: R4 045000 closes for 1-9
+    steps, lifts and comes back (10-27 R6: 5 of 90 episodes, the row's close 5-31 mm from the
+    first onset and within 0.5 mm of a later one).
     """
 
     def same(row: dict[str, Any]) -> bool:
@@ -219,10 +224,10 @@ def match_trial_row(
         root = row["dataset"].get("root")
         if root is not None and Path(root).name != root_name:
             return False
-        if row.get("closeXyz") is None or close_state_xyz is None:
-            return row.get("closeXyz") is None and close_state_xyz is None and root is not None
-        offset = _to_dataset_frame(record["T_B_Ws"], row["closeXyz"]) - close_state_xyz
-        return bool(np.linalg.norm(offset) * 1000.0 <= TRIAL_ROW_MATCH_MM)
+        if row.get("closeXyz") is None or close_states_xyz is None:
+            return row.get("closeXyz") is None and close_states_xyz is None and root is not None
+        offsets = _to_dataset_frame(record["T_B_Ws"], row["closeXyz"]) - np.atleast_2d(close_states_xyz)
+        return bool(np.linalg.norm(offsets, axis=1).min() * 1000.0 <= TRIAL_ROW_MATCH_MM)
 
     found = [row for row in rows if same(row)]
     if len(found) > 1:
@@ -233,6 +238,11 @@ def match_trial_row(
 def _close_index(actions: np.ndarray, closed_below: float = 0.5) -> int | None:
     closed = np.flatnonzero(actions[:, 4] < closed_below)
     return int(closed[0]) if len(closed) else None
+
+
+def _close_onsets(actions: np.ndarray, closed_below: float = 0.5) -> np.ndarray:
+    closed = (actions[:, 4] < closed_below).astype(np.int8)
+    return np.flatnonzero(np.diff(np.r_[0, closed]) == 1)
 
 
 class NoFunnelCloseError(ValueError):
@@ -305,7 +315,9 @@ def relabel_source(
                 "prev_cmd": command_path(action, np.asarray(record["start_contract_xyzquat"][:3], dtype=np.float64)),
                 "row": None
                 if not trial_rows
-                else match_trial_row(root.name, int(ep), record, None if close is None else state[close, :3], trial_rows),
+                else match_trial_row(
+                    root.name, int(ep), record, None if close is None else state[_close_onsets(action), :3], trial_rows
+                ),
             }
         )
     funnel_closed = [ep for ep in episodes if not ep["policy_only"]]

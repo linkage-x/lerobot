@@ -123,8 +123,9 @@ def _policy(robot, plan):
     """A stand-in policy: per trial, either reach the peg (with an XY miss) and close, or wander.
 
     `plan` items: ("grasp", miss_m), ("knock", None) -- closes on air after shoving the peg away --
-    ("air", (sideways_m, above_m)) -- closes on air clear of the peg -- or ("wander", None) --
-    never closes.
+    ("air", (sideways_m, above_m)) -- closes on air clear of the peg -- ("wander", None) -- never
+    closes -- or ("hover", (sideways_m, shove_m)) -- comes down beside the peg and never closes,
+    having shoved the peg `shove_m` away first.
     """
 
     plan = list(plan)
@@ -135,6 +136,18 @@ def _policy(robot, plan):
         if kind == "knock":
             robot.peg_xyz = (robot.peg_xyz[0] + 0.05, robot.peg_xyz[1], robot.peg_xyz[2])
             kind, miss = "grasp", 0.02
+        if kind == "hover":
+            sideways, shove = miss
+            px, py, pz = robot.peg_xyz
+            robot.peg_xyz = (px + shove, py, pz)
+            at = (px + sideways, py, pz)
+            robot.send_action({
+                "ee.x": at[0], "ee.y": at[1], "ee.z": at[2],
+                "ee.wx": rotvec[0], "ee.wy": rotvec[1], "ee.wz": rotvec[2], "gripper.pos": 1.0,
+            })
+            for step in range(handover.maxPolicySteps):
+                handover.observe(step, robot.xyz, 1.0)
+            return "grasp_timeout"
         if kind == "wander":
             for step in range(handover.maxPolicySteps + 1):
                 if step >= handover.maxPolicySteps:
@@ -696,6 +709,44 @@ def test_a_miss_that_never_came_low_near_the_peg_is_picked_up_by_the_script(tmp_
     assert rows[0]["pegUntouched"] is True and rows[0]["lowestNearPegMm"] is None
     assert [r["staging"] for r in rows] == ["fixture", "repick", "regrip"]
     assert asked == []
+
+
+def test_a_no_close_that_came_low_near_the_peg_is_picked_up_by_the_script(tmp_path):
+    """10-27 R6: 11 no_close trials, every one low near the peg, were each handed to a person
+    (100 of 151 minutes waiting), though about 7 of the pegs still stood where they were put."""
+
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=3),
+        run_policy_trial=_policy(robot, [("hover", (0.012, 0.0)), ("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["no_close", "held", "held"]
+    assert rows[0]["pegUntouched"] is False
+    assert [r["staging"] for r in rows] == ["fixture", "repick", "regrip"]
+    assert asked == []
+
+
+def test_a_no_close_that_shoved_the_peg_away_goes_to_the_operator_after_an_empty_repick(tmp_path):
+    robot = GraspRig()
+    asked = []
+    out = tmp_path / "g.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=2),
+        run_policy_trial=_policy(robot, [("hover", (0.012, 0.05)), ("grasp", 0.0)]),
+        out_path=out,
+        wait_for_operator=_put_back(robot, asked),
+    )
+    rows = _trials(out)
+    assert rows[0]["verdict"] == "no_close" and rows[0]["pegUntouched"] is False
+    assert rows[1]["staging"] == "fixture" and len(asked) == 1
+    assert not robot.held
 
 
 def test_a_miss_that_came_low_near_the_peg_still_goes_to_the_operator(tmp_path):

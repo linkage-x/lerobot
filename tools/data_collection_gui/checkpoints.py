@@ -874,6 +874,9 @@ def load_rollout_outcomes(repo_root: Path, limit: int = 500) -> list[dict[str, A
 # in this dataset the observed width reads 0 on nearly half the frames while the command holds a
 # clean 1.0.
 _DEMO_GRIPPER_CLOSED_BELOW = 0.5
+# A release is the peg let go after being carried: an opening less than this above the close
+# point is a regrasp in place. Demonstrations lift 60-80 mm before they release into the hole.
+_DEMO_CARRY_MIN_M = 0.02
 
 _demo_landmark_cache: dict[tuple[str, float, str], dict[str, Any]] = {}
 
@@ -1085,10 +1088,23 @@ def demo_landing_points(dataset_root: Path, repo_root: Path | None = None) -> di
         if not closed_steps.size:
             continue
         close_idx = int(closed_steps[0])
-        reopened = np.flatnonzero(gripper[close_idx:] >= _DEMO_GRIPPER_CLOSED_BELOW)
-        released = bool(reopened.size)
-        release_idx = int(close_idx + reopened[0]) if released else len(gripper) - 1
-        apex_z = float(position[close_idx : release_idx + 1, 2].max())
+        while True:
+            reopened = np.flatnonzero(gripper[close_idx:] >= _DEMO_GRIPPER_CLOSED_BELOW)
+            released = bool(reopened.size)
+            release_idx = int(close_idx + reopened[0]) if released else len(gripper) - 1
+            apex_z = float(position[close_idx : release_idx + 1, 2].max())
+            if not released or apex_z - float(position[close_idx, 2]) >= _DEMO_CARRY_MIN_M:
+                break
+            # Opened where it closed: a policy regrasping at the peg, not a release into the
+            # hole. Three of these in R4's view made their mean the "hole", 60 mm off (10-27).
+            # The grasp is the next close, if the episode has one.
+            closed_again = np.flatnonzero(gripper[release_idx:] < _DEMO_GRIPPER_CLOSED_BELOW)
+            if not closed_again.size:
+                released = False
+                release_idx = len(gripper) - 1
+                apex_z = float(position[close_idx : release_idx + 1, 2].max())
+                break
+            close_idx = int(release_idx + closed_again[0])
         points.append(
             {
                 "episode": int(episode),
