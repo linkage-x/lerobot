@@ -4061,6 +4061,89 @@ def test_freeze_then_register_keeps_the_same_world_across_a_gauge_change(tmp_pat
     assert registration["consensus"]["moved_cameras"] == ["cam_03"]
 
 
+def _write_table_anchor(bundle: Path, *, shift_m: float, table_moved_m: float = 0.0) -> Path:
+    """What cart_redock_check.py anchor leaves next to a bundle: the table's frame in W and in its gauge."""
+    T_world_anchor = [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    seen = [row[:] for row in T_world_anchor]
+    for axis in range(3):
+        seen[axis][3] -= shift_m  # in the bundle's gauge everything sits shift_m lower on every axis
+    seen[0][3] += table_moved_m
+    path = bundle.parent / gateway._TABLE_ANCHOR_FILE
+    path.write_text(
+        json.dumps(
+            {
+                "status": "measured",
+                "bundle": {"sha256": hashlib.sha256(bundle.read_bytes()).hexdigest()},
+                "T_world_anchor": T_world_anchor,
+                "T_session_anchor": seen,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_registration_uses_the_table_anchor_of_exactly_this_bundle(tmp_path, monkeypatch):
+    """The table sees the one motion camera consensus cannot; an anchor left by an earlier solve is not it."""
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    first = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(first.parent)
+    assert gateway._freeze_world_reference(state)["ok"] is True
+
+    second = _write_bundle_report(
+        tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0
+    )
+    state.calibration.outputPath = str(second.parent)
+    blind = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    assert blind["registration"]["common_mode"]["observable"] is False
+
+    _write_table_anchor(second, shift_m=3.0, table_moved_m=0.02)
+    seen = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    common = seen["registration"]["common_mode"]
+    assert common["observable"] is True and common["drifted"] is True
+    assert common["translation_mm"] == pytest.approx(20.0, abs=1e-6)
+
+    # Re-solved into the same directory: the old anchor no longer belongs to it.
+    _write_bundle_report(second, shift_m=3.0, moved="cam_03")
+    again = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    assert again["registration"]["common_mode"]["observable"] is False
+
+
+def test_the_table_anchor_runs_on_the_capture_and_never_fails_the_solve(tmp_path, monkeypatch):
+    state = _world_gateway_state(tmp_path)
+    bundle = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run" / "extrinsics_report.json")
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_x" / "extrinsics"
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) is None  # no datum yet
+
+    datum = tmp_path / gateway._WORLD_SUBDIR / gateway._TABLE_DATUM_FILE
+    datum.parent.mkdir(parents=True, exist_ok=True)
+    datum.write_text("{}", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        _write_table_anchor(bundle, shift_m=0.0)
+        return subprocess.CompletedProcess(command, 0, "table anchor measured: tags [45, 46, 48]\nwrote x\n", "")
+
+    monkeypatch.setenv("PYTHONPATH", "/opt/ros/somewhere")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) == (
+        bundle.parent / gateway._TABLE_ANCHOR_FILE
+    )
+    command, kwargs = calls[-1]
+    assert command[2:4] == ["anchor", str(capture)] and command[command.index("--datum") + 1] == str(datum)
+    assert kwargs["stdin"] is subprocess.DEVNULL and "PYTHONPATH" not in kwargs["env"]
+
+    def failing_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "Traceback ...\nKeyError: 'camera_pixels'")
+
+    monkeypatch.setattr(gateway.subprocess, "run", failing_run)
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) is None
+    assert not (bundle.parent / gateway._TABLE_ANCHOR_FILE).exists()  # the last one does not linger
+    assert "KeyError" in state.events[0].message and state.events[0].level == "warn"
+
+
 def test_freezing_twice_is_refused_because_it_would_be_a_different_world(tmp_path, monkeypatch):
     state = _world_gateway_state(tmp_path)
     monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))

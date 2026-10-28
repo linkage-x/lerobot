@@ -3528,6 +3528,9 @@ def _register_world(
     args = ["register", "--current", str(bundle), "--calibration-id", state.calibration.extrinsicsRun or ""]
     if assume_stable:
         args += ["--assume-stable", *assume_stable]
+    anchor = _table_anchor_for(bundle)
+    if anchor is not None:
+        args += ["--anchor", str(anchor)]
     if apply_result:
         island = _exported_island(state, bundle)
         if island:
@@ -3573,6 +3576,94 @@ def _world_registration_for_export(state: GatewayState, bundle: Path) -> dict[st
     if not result.get("ok"):
         return None
     return result.get("registration")
+
+
+# --- Table anchor (roadmap B5', 10-28) -------------------------------------------
+#
+# Camera consensus carries the world across a recalibration, and is blind to the
+# one motion that matters most: the whole rig moving as one. The table tags 45-49
+# are fixed since 10-27 and mechanically independent of the rig, so each new
+# bundle is also placed in the world by them alone (cart_redock_check.py anchor,
+# against the frozen table_datum.json). world_registration then reports how far
+# the two placements disagree (common_mode), and can reconnect a solve whose
+# cameras all moved. Advisory by construction: a failed or missing anchor only
+# means that motion stays unobserved, as it was before.
+#
+# The same file keeps where every camera saw the table during the capture. It is
+# copied into the exported run, and episodes recorded on that run are checked
+# against it (cart_redock_check.py session, run by export_v3).
+_TABLE_ANCHOR_SCRIPT = Path("tools") / "thor" / "gmsl2" / "cart_redock_check.py"
+_TABLE_DATUM_FILE = "table_datum.json"
+_TABLE_ANCHOR_FILE = "table_anchor.json"
+# 10-27 185829 (8 cameras x 5402 frames, 120 read each): 22 s on the workstation
+_TABLE_ANCHOR_TIMEOUT_S = 900
+
+
+def _table_anchor_for(bundle: Path, *, measured_only: bool = True) -> Path | None:
+    """The table anchor measured for exactly this bundle, if there is one.
+
+    Matched by the bundle's hash, not by sitting in the same directory: a
+    re-solve into the same run directory must not inherit the last anchor.
+    """
+    path = bundle.parent / _TABLE_ANCHOR_FILE
+    data = _read_json_file(path)
+    if not data or (measured_only and data.get("status") != "measured"):
+        return None
+    try:
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return path if (data.get("bundle") or {}).get("sha256") == digest else None
+
+
+def _measure_table_anchor(state: GatewayState, python: Path, capture: Path, bundle: Path) -> Path | None:
+    """Place a fresh bundle in the world by the table tags; never fails the solve."""
+    out = bundle.parent / _TABLE_ANCHOR_FILE
+    out.unlink(missing_ok=True)
+    datum = _world_root(state) / _TABLE_DATUM_FILE
+    if not datum.is_file():
+        state.log("info", f"Table anchor: no {_TABLE_DATUM_FILE}, whole-rig motion stays unobserved")
+        return None
+    command = [
+        str(python), str(state.repo_root / _TABLE_ANCHOR_SCRIPT), "anchor", str(capture),
+        "--bundle", str(bundle), "--datum", str(datum), "--out", str(out),
+    ]
+    # numpy + cv2 only; an inherited PYTHONPATH could put another numpy first
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    state.calibration.message = "桌面锚点…"
+    try:
+        proc = subprocess.run(
+            command, cwd=str(state.repo_root), env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=_TABLE_ANCHOR_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        state.log("warn", f"Table anchor failed: {exc}")
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    summary = next((line for line in lines if line.startswith("table anchor")), "")
+    if proc.returncode not in (0, 2) or not summary:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        state.log("warn", f"Table anchor failed: {tail[-1] if tail else proc.returncode}")
+        return None
+    state.log("info" if proc.returncode == 0 else "warn", f"Table anchor: {summary.removeprefix('table anchor ')}")
+    return _table_anchor_for(bundle)
+
+
+def _log_common_mode(state: GatewayState, summary_path: Path) -> None:
+    """Say what the exported registration found about the whole rig, warning when it moved."""
+    world = (_read_json_file(summary_path) or {}).get("world") or {}
+    common = world.get("common_mode") or {}
+    if not common.get("observable") or "translation_mm" not in common:
+        state.log("info", "World registration: no table anchor, whole-rig motion not observable")
+        return
+    line = (
+        f"table anchor {common['translation_mm']:.2f} mm / {common['rotation_deg']:.3f} deg "
+        f"from the camera consensus ({world.get('world_continuity_state', '?')})"
+    )
+    if common.get("drifted"):
+        state.log("warn", f"World registration: {line} -- the rig (or the table) moved as a whole")
+    else:
+        state.log("info", f"World registration: {line}")
 
 
 # --- FR3 base registration edge (world -> fr3_base) ----------------------------
@@ -9913,6 +10004,8 @@ def _run_extrinsics_calibration(
     ]
     if not _run("多相机联合 BA…", bundle_args, 3600):
         return
+    # Before the registration, so it and the export both see it.
+    _measure_table_anchor(state, python, dataset, work / "extrinsics_report.json")
 
     # Experiment mode stops here: the numbers are the deliverable and the
     # production pointers are left exactly as they were. Skipping the export
@@ -9961,6 +10054,9 @@ def _run_extrinsics_calibration(
             # run re-inherits its error every time (7.9 mm RMS / 2.17 deg for the
             # 0720 legacy frame); registering onto W does not.
             export_args += ["--world-reference", str(world_reference)]
+            anchor = _table_anchor_for(work / "extrinsics_report.json")
+            if anchor is not None:
+                export_args += ["--anchor", str(anchor)]
             if str(registration.get("world_continuity_state")) not in {"CONTINUOUS", "RECONNECTED"}:
                 # A new island is the *safe* direction: the old world_frame_id keeps
                 # meaning what it meant, and this run says plainly that it is not in
@@ -10001,6 +10097,15 @@ def _run_extrinsics_calibration(
             _repoint_intrinsics_json(target)
         if port_serials:
             _write_calibration_identity(calib_root / f"{run_name}_extrinsics", run_name, port_serials)
+        # Measured or not, the capture's table pixels are what this run's episodes are checked against.
+        capture_pixels = _table_anchor_for(work / "extrinsics_report.json", measured_only=False)
+        if capture_pixels is not None:
+            try:
+                shutil.copy2(capture_pixels, calib_root / f"{run_name}_extrinsics" / _TABLE_ANCHOR_FILE)
+            except OSError as exc:
+                state.log("warn", f"Could not keep the table pixels with {run_name}: {exc}")
+        if world_reference.is_file() and registration is not None:
+            _log_common_mode(state, calib_root / f"{run_name}_extrinsics" / "summary.json")
 
     report_path = work / "extrinsics_report.json"
     try:

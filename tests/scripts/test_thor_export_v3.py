@@ -1054,3 +1054,73 @@ def test_untracked_sessions_do_not_count_as_a_different_chain(tmp_path, monkeypa
     block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
     assert block["sessions"]["pick_and_place_20261014_160000"]["tracked"] is False
     assert block["key"]["extrinsics"] == ["calib_1014"]
+
+
+def test_export_records_each_episode_against_the_table_but_keeps_it_out_of_the_key(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261014_150515": ("calib_1014", "ok")}
+    )
+    monkeypatch.setattr(export_v3, "_TABLE_CHECK_PYTHON", Path("no/such/python3"))
+    clean = json.loads((_export(datasets, exports, overwrite=True) / "meta" / "info.json").read_text())
+    check = clean["label_provenance"]["sessions"]["pick_and_place_20261014_150515"]["table_check"]
+    assert check["verdict"] == "unchecked" and "no/such/python3" in check["why"]
+    moved = {
+        "verdict": "cameras_moved",
+        "episodes": 1,
+        "episodes_checked": 1,
+        "episode_verdicts": {"episode_000000": "cameras_moved"},
+        "cameras_moved": ["cam_09"],
+        "worst_shift_px": {"cam_09": 1.4},
+        "file": "derived/table_check.json",
+    }
+    monkeypatch.setattr(export_v3, "_table_check", lambda _session: dict(moved))
+    lines = []
+    monkeypatch.setattr(export_v3, "_emit", lines.append)
+
+    out = _export(datasets, exports, overwrite=True)  # a warning, not a refusal
+
+    block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
+    assert block["sessions"]["pick_and_place_20261014_150515"]["table_check"]["cameras_moved"] == ["cam_09"]
+    assert block["fingerprint"] == clean["label_provenance"]["fingerprint"]
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
+    assert sources[0]["table_check"] == "cameras_moved"
+    assert any(line.startswith("WARNING: pick_and_place_20261014_150515: cameras_moved") for line in lines)
+
+
+def test_the_table_check_runs_in_the_tracker_venv_and_reads_back_what_it_wrote(tmp_path, monkeypatch):
+    import subprocess
+
+    session = tmp_path / "thor_gmsl2_11ch_v1_20261028_090000"
+    session.mkdir()
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", tmp_path)
+    monkeypatch.setenv("PYTHONPATH", "/usr/lib/python3/dist-packages")
+    assert export_v3._table_check(session)["verdict"] == "unchecked"  # no venv
+
+    python = tmp_path / export_v3._TABLE_CHECK_PYTHON
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        out = session / export_v3._TABLE_CHECK_FILE
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"verdict": "ok", "episodes": 2, "episodes_checked": 2, "episodes_detail": {}}))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(export_v3.subprocess, "run", fake_run)
+    check = export_v3._table_check(session)
+    (command, kwargs), = calls
+    assert command[:4] == [str(python), str(tmp_path / export_v3._TABLE_CHECK_SCRIPT), "session", str(session)]
+    # each episode is held against the run it was recorded on, which lives under the repo, not the cwd
+    assert command[command.index("--calibration-root") + 1] == str(tmp_path / "outputs" / "calibration")
+    assert kwargs["stdin"] is subprocess.DEVNULL  # an inherited stdin has ended a recorder session before
+    assert "PYTHONPATH" not in kwargs["env"] and kwargs["env"]["PYTHONNOUSERSITE"] == "1"
+    assert check["verdict"] == "ok" and check["episodes_checked"] == 2 and "episodes_detail" not in check
+
+    monkeypatch.setattr(
+        export_v3.subprocess, "run", lambda c, **k: subprocess.CompletedProcess(c, 2, "", "Traceback\nKeyError: 'x'")
+    )
+    (session / export_v3._TABLE_CHECK_FILE).unlink()
+    assert export_v3._table_check(session) == {"verdict": "unchecked", "why": "KeyError: 'x'"}

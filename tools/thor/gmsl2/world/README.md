@@ -114,6 +114,73 @@ FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
 `register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between
 worlds that are already connected.
 
+### The table datum (`table_datum.json`, 2026-10-27)
+
+Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are
+fixed from 2026-10-27 on. `table_datum.json` is one capture of them in
+`world_20260928_063531`: the corners each tag triangulated to with
+`calib_20261027_173815`, each camera's pixel corners of every table tag it
+saw, and that calibration's K, D and pose for those cameras (`anchor_cameras`).
+Written by `cart_redock_check.py freeze-datum` from
+`thor_gmsl2_11ch_v1_20261027_165415` (45/46/47/48 triangulated; 49 is seen by
+cam_12 only; cam_06/08/14 see none). That episode has since been deleted on
+Thor; the file holds everything the checks use.
+
+It is what the camera-only mechanisms above cannot provide: a reference that is
+mechanically independent of the camera rig.
+
+- **Camera pixels** say which camera moved since the capture, without any
+  calibration: `cart_redock_check.py cameras <measurement>`. Two captures 2.5 h
+  apart moved no table tag by more than 0.44 px in any camera.
+- **Every recorded episode** is checked against the table pixels of the
+  calibration it was recorded on: the run's own `table_anchor.json` (see below)
+  or, for `calib_20261027_173815`, the datum.
+  `cart_redock_check.py session <dataset…> --write` reads the first ~0.5 s of
+  each camera that sees a table tag and writes `derived/table_check.json`
+  (incremental: only episodes whose videos changed are decoded again).
+  `export_v3` runs it for each session it exports (in the opencv_kalibr venv)
+  and records the session summary under `label_provenance.sessions.<name>.table_check`
+  and each episode's verdict in `export_sources.json`. A moved camera is a
+  warning, not a refusal, and the result is not part of the label key: the
+  0.6 px limit (~0.035°, against ~0.2° for the corner-BA `camera_state`) is
+  provisional, and a key field would part every export from the earlier ones.
+  `other_calibration` means the episode was recorded on extrinsics that have no
+  table pixels of their own (older than 2026-10-28, other than the datum's), so
+  steady pixels do not say its labels fit. cam_06/08/14 are not covered;
+  `camera_state` still is their only check.
+- **Every new calibration is anchored to the table** (2026-10-28). After the
+  bundle adjustment the gateway runs `cart_redock_check.py anchor <capture>
+  --bundle <extrinsics_report.json>`: the table tags in the calibration sweep
+  (120 frames per camera across it) are triangulated with the bundle, the
+  datum's pixels with `anchor_cameras`, from the same cameras on both sides, and
+  fitted rigidly. That is `T_world_session` from the table alone, written next
+  to the bundle as `table_anchor.json` and passed to `world_registration
+  register` and `export_production_calibration --anchor`. The registration then
+  reports `common_mode` (how far the table puts the solve from where camera
+  consensus does; `drifted` past 10 mm / 0.75°) instead of "not observable", and
+  a solve whose cameras all moved is reconnected (`RECONNECTED`) instead of
+  becoming a new island. Advisory: a missing or failed anchor only leaves that
+  motion unobserved. The file also keeps where every camera saw the table
+  during the sweep; the gateway copies it into the exported extrinsics run, and
+  that is what the episodes recorded on the run are checked against, so a
+  camera that moved before the recalibration is not flagged forever after.
+  Validated on `calib_20261027_185829` (a sweep that was never exported, solved
+  on the workstation): anchor and consensus agree to 0.36 mm / 0.13° at the
+  table centre (0.08–0.17° over other tag and camera choices; two solves of the
+  rig differ per camera by 0.01–0.17°). The same sweep shows cam_09 1.0–1.8 px
+  off the datum two hours after it was frozen (all others ≤ 0.46 px): its slow
+  nod is still going on.
+
+It does not redefine the world: the id stays, and the corners are measured
+values in it, not the printed geometry (the triangulated edges read 74.3–74.9
+mm against 76 mm on the calipers, a detector bias that only cancels in
+differences). Tracked for the same reason as the reference: the capture it came
+from lives under `outputs/`. Replacing it (a tag re-stuck, the table moved)
+needs `--replace` and records what it replaced. The table itself must stay put,
+and the carts dock with a spacer pressed against its edge: if docking shifts
+the table, every camera sees every table tag move and the check refuses. The
+5x push-away/push-back repeats will show whether it does.
+
 ## Correcting a stamp that is wrong
 
 The stamp records what this file said at record time. If the rig moved and the

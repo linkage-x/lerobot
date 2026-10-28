@@ -48,6 +48,7 @@ import csv
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -1179,6 +1180,95 @@ def _session_labels(episodes: list[EpisodeSource]) -> dict[str, dict[str, Any]]:
     }
 
 
+_TABLE_CHECK_SCRIPT = Path("tools/thor/gmsl2/cart_redock_check.py")
+# numpy + cv2: the tracker's venv on Thor; this exporter runs in the system python, which has neither.
+_TABLE_CHECK_PYTHON = Path("third_party/opencv_kalibr/.venv/bin/python3")
+_TABLE_CHECK_FILE = Path("derived") / "table_check.json"
+_TABLE_CHECK_TIMEOUT_S = 1800
+_TABLE_CHECK_FLAGGED = ("table_or_all_cameras_moved", "cameras_moved")
+_TABLE_CHECK_KEPT = (
+    "verdict",
+    "episodes",
+    "episodes_checked",
+    "episode_verdicts",
+    "cameras_moved",
+    "tags_bumped",
+    "worst_shift_px",
+    "cameras_without_a_table_tag",
+    "extrinsics_runs",
+    "extrinsics_runs_unreferenced",
+    "references",
+    "datum",
+    "settings",
+)
+
+
+def _table_check(session_dir: Path) -> dict[str, Any]:
+    """The session's cameras against the fixed table tags 45-49 (``cart_redock_check.py session``).
+
+    Per episode and camera: are the table tags still where the camera saw them when the extrinsics
+    the episode was recorded on were captured (the run's own ``table_anchor.json``; for the datum's
+    run, the table datum), in pixels (0.6 px ~ 0.035 deg; the tracker's corner-BA camera_state
+    resolves ~0.2 deg and needs a cube in view).  Recorded and warned about, never refused on and never part of the
+    label key: the limit is provisional, a moved table leaves the labels alone, and a field added to
+    the key would part every export from the ones made before it.  The episodes already read are
+    kept in ``derived/table_check.json``, so only new ones are decoded.
+    """
+    python = _REPO_ROOT / _TABLE_CHECK_PYTHON
+    if not python.is_file():
+        return {"verdict": "unchecked", "why": f"no {_TABLE_CHECK_PYTHON} (numpy + cv2) here"}
+    command = [
+        str(python),
+        str(_REPO_ROOT / _TABLE_CHECK_SCRIPT),
+        "session",
+        str(session_dir),
+        "--write",
+        "--calibration-root",
+        str(_REPO_ROOT / "outputs" / "calibration"),
+    ]
+    # The venv's own numpy/cv2 only: an inherited PYTHONPATH (the gateway adds the repo and passes on its
+    # own) could put another numpy ahead of the venv's C extensions.  The script imports nothing else.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    env["PYTHONNOUSERSITE"] = "1"
+    try:
+        proc = subprocess.run(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_TABLE_CHECK_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"verdict": "unchecked", "why": f"table check did not run: {exc}"}
+    path = session_dir / _TABLE_CHECK_FILE
+    if proc.returncode not in (0, 1) or not path.is_file():
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"verdict": "unchecked", "why": tail[-1] if tail else f"table check exited {proc.returncode}"}
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"verdict": "unchecked", "why": f"{path}: {exc}"}
+    return {**{k: result.get(k) for k in _TABLE_CHECK_KEPT}, "file": str(path)}
+
+
+def _describe_table_check(check: dict[str, Any]) -> str:
+    if check.get("why"):
+        return f"{check['verdict']} ({check['why']})"
+    line = f"{check['verdict']} ({check.get('episodes_checked')}/{check.get('episodes')} episodes)"
+    if check.get("cameras_moved"):
+        line += f", moved {','.join(check['cameras_moved'])}"
+    if check.get("tags_bumped"):
+        line += f", bumped tags {check['tags_bumped']}"
+    worst = check.get("worst_shift_px") or {}
+    if worst:
+        line += ", worst " + " ".join(f"{n.removeprefix('cam_')}:{v:.2f}" for n, v in worst.items()) + " px"
+    if check.get("extrinsics_runs_unreferenced"):
+        line += f" (no table pixels for {','.join(check['extrinsics_runs_unreferenced'])})"
+    return line
+
+
 def _describe_labels(labels: dict[str, Any]) -> str:
     pairing = "/".join(labels.get("box_pairing") or []) or "?"
     if not labels.get("tracked"):
@@ -1376,6 +1466,16 @@ def export_task_to_v3(
     session_labels = _session_labels(episodes)
     for session, labels in session_labels.items():
         _emit(f"Labels: {session}: {_describe_labels(labels)}")
+    for session_dir in sorted({src.session_dir for src in episodes}):
+        check = _table_check(session_dir)
+        session_labels[session_dir.name]["table_check"] = check
+        _emit(f"Cameras vs table datum: {session_dir.name}: {_describe_table_check(check)}")
+        if check["verdict"] in _TABLE_CHECK_FLAGGED:
+            _emit(
+                f"WARNING: {session_dir.name}: {check['verdict']} since the table datum was frozen; "
+                "labels from a moved camera are off by what its extrinsics no longer describe "
+                f"(details: {check.get('file')})"
+            )
     mixed_fields = lp.assert_single_session_chain(session_labels, allow_mixed=allow_mixed_labels)
     if mixed_fields:
         _emit(
@@ -1530,6 +1630,11 @@ def export_task_to_v3(
                 "exported_world_frame_id": wp.world_frame_id_of(output_world_frame),
                 "extrinsics": session_labels[src.session_dir.name].get("extrinsics", ""),
                 "camera_state": session_labels[src.session_dir.name].get("camera_state", lp.UNTRACKED),
+                "table_check": (
+                    (session_labels[src.session_dir.name]["table_check"].get("episode_verdicts") or {}).get(
+                        src.ep_dir.name, "unchecked"
+                    )
+                ),
                 "unvalidated_hands": sorted(
                     cube
                     for cube, check in (session_labels[src.session_dir.name].get("hands") or {}).items()
