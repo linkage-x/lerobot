@@ -4,6 +4,8 @@ Each run spawns two arm processes, as the real runtime will; the trajectories ar
 50 Hz) so a run takes about a second.
 """
 
+import json
+
 import numpy as np
 import pytest
 
@@ -157,3 +159,76 @@ def test_incremental_command_clips_one_step() -> None:
     T1[:3, 3] += [0.05, 0.0, 0.0]
     T = rt.incremental_command(T0, T1, 0.01, 2.0)
     assert rt.pose_error(T0, T)[0] == pytest.approx(0.01)
+
+
+# ------------------------------------------------------------------ D6: one object in both hands ---
+
+
+def _held(plans, a: int = 10, b: int = 30):
+    held = np.zeros(N, bool)
+    held[a:b] = True
+    for plan in plans:
+        plan.held = held
+    return held
+
+
+def test_a_held_plan_goes_soft_through_its_held_frames(tmp_path) -> None:
+    plans, T_right_left, _ = _plans()
+    held = _held(plans)
+    report = _run(tmp_path, plans, T_right_left, held_stiffness_scale=0.5, compliance_ramp_frames=3)
+    assert report["stop"] is None
+    log = json.loads((tmp_path / "run" / "arm_left.json").read_text())
+    assert log["compliance"] == pytest.approx(rt.cc.compliance_profile(held, 0.5, 3).tolist())
+    assert len(log["state_force"]) == N
+    chain = report["closed_chain"]
+    assert chain["held_segments"] == [[10, 30]] and chain["held_stiffness_scale"] == 0.5
+    assert chain["internal_force_max_n"] == {"0": 0.0}  # the fakes feel nothing
+    # the mirrored pair is no rigid object, but it is what the fakes followed: the read-back is measured
+    assert chain["measured"]["held_frames"] == 20 and len(chain["measured"]["segments"]) == 1
+
+
+def test_a_squeeze_inside_the_held_object_stops_both(tmp_path) -> None:
+    plans, T_right_left, _ = _plans(
+        faults={"left": {"kind": "squeeze", "at_frame": 20, "force": [0.0, 40.0, 0.0]}}
+    )
+    _held(plans)
+    report = _run(tmp_path, plans, T_right_left)
+    assert report["stop"]["by"] == rt.STOP_BY_GATE
+    assert "inside the held object" in report["stop"]["events"][0]["reason"]
+    assert all(row["outcome"] == "stopped" for row in report["arms"].values()) and report["stopped_together"]
+    assert report["closed_chain"]["internal_force_max_n"]["0"] == pytest.approx(20.0)
+
+
+def test_a_push_outside_the_held_frames_is_not_the_object_s(tmp_path) -> None:
+    # the same push from frame 32 on: no object in the hands any more, nothing to guard
+    plans, T_right_left, _ = _plans(
+        faults={"left": {"kind": "squeeze", "at_frame": 32, "force": [0.0, 40.0, 0.0]}}
+    )
+    _held(plans)
+    report = _run(tmp_path, plans, T_right_left)
+    assert report["stop"] is None
+
+
+def test_both_hands_hold_the_object_on_the_same_frames_or_it_is_refused(tmp_path) -> None:
+    plans, T_right_left, _ = _plans()
+    _held(plans)
+    plans[1].held = np.zeros(N, bool)
+    with pytest.raises(ValueError, match="different frames"):
+        _run(tmp_path, plans, T_right_left)
+
+
+def test_a_held_plan_file_drives_the_fakes(tmp_path) -> None:
+    _, _, (q_r, q_l) = _plans()
+    T_right_left = np.eye(4)
+    T_right_left[1, 3] = 0.8
+    held = np.zeros(N, bool)
+    held[5:15] = True
+    path = tmp_path / "plan.npz"
+    np.savez(path, q_right=q_r, q_left=q_l, held=held, T_right_left=T_right_left, tool=TOOL, fps=FPS)
+    plans, T_rl, fps, record = rt.plans_from_held_plan(path)
+    assert fps == FPS and np.allclose(T_rl, T_right_left) and record["held_frames"] == 10
+    assert all(p.driver["kind"] == "fake" and np.array_equal(p.held, held) for p in plans)
+    assert np.allclose(plans[1].joints, q_l) and np.allclose(plans[0].targets, kin.NOMINAL.fk(q_r) @ TOOL)
+    assert rt.main(["--plan", str(path), "--yes", "--out", str(tmp_path / "out"), "--held-scale", "0.7"]) == 0
+    assert rt.main(["--plan", str(path), "--held-scale", "0.05"]) == 2
+    assert rt.main([str(tmp_path), "--plan", str(path)]) == 2

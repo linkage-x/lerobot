@@ -37,6 +37,13 @@ two arms need:
   retarget planned against; the distance is the placement's uncertainty alone (``derive_gate``), the arms'
   tracking error being in the measured joints already.
 * **coordinator lost** -- the coordinator beats a heartbeat too; an arm that sees it stale stops itself.
+* **one object in both hands (D6)** -- a plan may mark the frames both hands hold one object
+  (``ArmPlan.held``; ``--plan``, a held plan such as ``dual_fr3_coop_carry``'s). Through them the arms run at
+  ``held_stiffness_scale`` of their joint stiffness (ramped on either side, ``dual_fr3_closed_chain``'s budget
+  says how soft), each arm publishes the TCP force its external torques explain, and the coordinator stops
+  both when the force *inside* the object -- half the difference of the two, each against its reading when
+  the fingers seated -- passes ``internal_force_stop_n``. The report's ``closed_chain`` has what the guard
+  read and what the read-back joints would have squeezed into a rigid object.
 
 Shared state is a small memory-mapped file (``ArmSync``): stdlib, attachable from any process that knows the
 path, which is what the real arms need (each is its own process with its own 1 kHz libfranka loop).
@@ -76,6 +83,7 @@ if str(REPO) not in sys.path:
 
 from tools.fr3 import (  # noqa: E402
     dual_fr3_clock as clock,
+    dual_fr3_closed_chain as cc,
     dual_fr3_collision as col,
     fr3_arms,
     fr3_kinematics as kin,
@@ -108,7 +116,8 @@ class ArmSync:
     """The shared word block: start time, stop word, and per arm its state, heartbeat, commands and joints.
 
     Header: magic, n_arms, period_ns, t0_ns, stop_ns, stop_by, coordinator heartbeat, spare.
-    Per arm: state, heartbeat_ns, frame, last_command_ns, commands, joints_ns, joints[7], spare.
+    Per arm: state, heartbeat_ns, frame, last_command_ns, commands, joints_ns, joints[7], force[3] (the TCP
+    force from the arm's external torques, base axes; published with the joints, under one joints_ns).
     Every slot is an aligned 8-byte word written whole, and the stop word only ever goes from 0 to a time,
     so a reader never mistakes a half-written stop for no stop.
     """
@@ -211,6 +220,16 @@ class ArmSync:
         base = 8 * self._arm(arm, 6)
         q = np.array([_DSLOT.unpack_from(self._mm, base + 8 * i)[0] for i in range(7)])
         return self._get(self._arm(arm, 5)), q
+
+    def publish_force(self, arm: int, f: np.ndarray) -> None:
+        """Before ``publish_joints``, whose stamp then covers both."""
+        base = 8 * self._arm(arm, 13)
+        for i, value in enumerate(np.asarray(f, dtype=np.float64)[:3]):
+            _DSLOT.pack_into(self._mm, base + 8 * i, float(value))
+
+    def force(self, arm: int) -> np.ndarray:
+        base = 8 * self._arm(arm, 13)
+        return np.array([_DSLOT.unpack_from(self._mm, base + 8 * i)[0] for i in range(3)])
 
 
 # ------------------------------------------------------------------ geometry ---
@@ -325,7 +344,9 @@ class FakeFr3Driver:
     single-arm replay's Cartesian streaming, the null space left to the IK); either way it trails a moving
     target as the real arm does. ``fault`` = ``{"kind", "at_frame"}``:
     ``raise`` (the driver throws, as libfranka on a reflex), ``exit`` (the process dies), ``hang`` (the call
-    never returns), ``freeze`` (the arm stops following; its own tracking gate has to notice).
+    never returns), ``freeze`` (the arm stops following; its own tracking gate has to notice), ``squeeze``
+    (from then on its TCP force reads ``fault["force"]``, N in its base: a held object pushing back, for the
+    internal-force guard). Otherwise it feels nothing: ``tcp_force`` is zero, ``set_compliance`` is recorded.
 
     It keeps a controller clock as libfranka's ``RobotState.time`` (D2): ``clock`` = ``{"offset_s",
     "drift_ppm", "latency_ms": [min, mean extra], "resolution_s", "seed", "delay_frames"}``; each ``observe``
@@ -350,6 +371,8 @@ class FakeFr3Driver:
         self._rng = np.random.default_rng(clock["seed"])
         self._pending: list[tuple[np.ndarray, np.ndarray | None]] = []
         self._stamp: tuple[float, int] | None = None
+        self._force = np.zeros(3)
+        self.compliance: list[tuple[int, float]] = []  # (frame, scale) as set
 
     def move_to_start(self, T_tcp: np.ndarray, joints: list[float] | None = None) -> dict[str, Any]:
         """To the planned start joints when given (the single-arm replay's ``joint_start``), else by IK;
@@ -396,6 +419,8 @@ class FakeFr3Driver:
                 time.sleep(3600.0)
             if kind == "freeze":
                 return
+            if kind == "squeeze":
+                self._force = np.asarray(fault.get("force", (0.0, 40.0, 0.0)), dtype=np.float64)
         delay = int(self._clock["delay_frames"])
         if delay:
             self._pending.append((np.asarray(T_tcp), None if q_ref is None else np.asarray(q_ref)))
@@ -412,6 +437,12 @@ class FakeFr3Driver:
         dq = Jt @ np.linalg.solve(J[0] @ Jt + 1e-4 * np.eye(6), e)
         self.q = np.clip(self.q + self.gain * dq, kin.Q_LOWER, kin.Q_UPPER)
 
+    def set_compliance(self, scale: float) -> None:
+        self.compliance.append((self.frame, float(scale)))
+
+    def tcp_force(self) -> np.ndarray:
+        return self._force.copy()
+
     def hold(self) -> None:
         pass
 
@@ -425,6 +456,9 @@ REAL_START_SPEED_FACTOR = 0.1
 REAL_FILTER_TAU_PERIODS = 1.0 / 3.0
 #: After the last command, or a stop: the measured joints are held this long before the controller stops.
 REAL_HOLD_S = 0.3
+#: The softest the joint controller may be made (D6): at x0.1 a joint's 1 Nm of friction is 10x the angle,
+#: and the j7 spring 5 Nm/rad -- the arm no longer goes where it is sent.
+MIN_STIFFNESS_SCALE = 0.1
 #: A state whose robot time has not moved for this long comes from a dead control loop: panda_py's
 #: get_state is a cache, frozen whenever no controller runs (10-12).
 REAL_STALE_STATE_S = 0.1
@@ -446,6 +480,11 @@ class RealFr3Driver:
     ``stamp`` is ``(state.time, monotonic ns when get_state returned)``: the state is panda_py's copy of the
     last 1 kHz packet, so its arrival reads up to a millisecond late -- latency above the minimum, which
     D2's lower envelope leaves out.
+
+    ``set_compliance`` scales the controller's joint stiffness (its damping by the square root, the damping
+    ratio kept) for D6's held frames; panda_py filters the gains as it filters the set point. ``tcp_force`` is
+    the force at the TCP (base axes) that best explains the state's external joint torques -- a force only, as
+    fr3_pivot_auto learnt on 10-20: the 6D split of O_F_ext_hat_K trades model error between force and moment.
 
     ``payload`` is the arm's fr3_arms.json declaration; when declared, Desk has to hold it
     (``fr3_arms.payload_check``) or the arm does not move. ``panda_py_module`` names what provides ``Panda``
@@ -475,6 +514,8 @@ class RealFr3Driver:
         self._ctrl = None
         self._last_ref: np.ndarray | None = None
         self._stamp: tuple[float, int] | None = None
+        self._state: Any = None
+        self._scale = 1.0
         self._moved: tuple[float, int] | None = None  # (robot time, host ns) when it last advanced
 
     def _start_problems(self, q_now: np.ndarray, joints: np.ndarray, state: Any) -> list[str]:
@@ -522,7 +563,9 @@ class RealFr3Driver:
             raise ArmFaultError("not moving to frame 0: " + "; ".join(problems))
         moved = bool(self._panda.move_to_joint_position(target, speed_factor=REAL_START_SPEED_FACTOR))
         alpha = 1.0 - math.exp(-1e-3 / (REAL_FILTER_TAU_PERIODS * self._period_s))
-        self._ctrl = self._controllers.JointPosition(filter_coeff=alpha)
+        self._ctrl = self._controllers.JointPosition(
+            stiffness=cc.JOINT_STIFFNESS, damping=cc.JOINT_DAMPING, filter_coeff=alpha
+        )  # panda_py's defaults, spelled out: set_compliance scales these
         self._panda.start_controller(self._ctrl)  # holds where it is; the loop now refreshes get_state
         T, q = self.observe()
         self._ctrl.set_control(q, np.zeros(7))
@@ -549,8 +592,28 @@ class RealFr3Driver:
                 f"the robot state has not moved for {(arrived - self._moved[1]) / 1e6:.0f} ms: no control loop"
             )
         self._stamp = (robot_s, arrived)
+        self._state = state
         q = np.asarray(state.q, dtype=np.float64)
         return kin.NOMINAL.fk(q)[0] @ self._T_tool, q
+
+    def set_compliance(self, scale: float) -> None:
+        if self._ctrl is None:
+            raise ArmFaultError("set_compliance before move_to_start")
+        if not MIN_STIFFNESS_SCALE <= scale <= 1.0:
+            raise ArmFaultError(f"joint stiffness x{scale:g} is outside [{MIN_STIFFNESS_SCALE:g}, 1]")
+        if scale == self._scale:
+            return
+        self._ctrl.set_stiffness(cc.JOINT_STIFFNESS * scale)
+        self._ctrl.set_damping(cc.JOINT_DAMPING * math.sqrt(scale))
+        self._scale = scale
+
+    def tcp_force(self) -> np.ndarray:
+        if self._state is None:
+            return np.zeros(3)
+        q = np.asarray(self._state.q, dtype=np.float64)
+        _, J = kin.NOMINAL.kinematics(q, point=self._T_tool[:3, 3])
+        tau = np.asarray(self._state.tau_ext_hat_filtered, dtype=np.float64)
+        return np.linalg.lstsq(J[0, :3].T, tau, rcond=None)[0]
 
     def stamp(self) -> tuple[float, int] | None:
         return self._stamp
@@ -630,6 +693,14 @@ class Settings:
     stale_periods: float = 3.0
     #: an arm stops itself when the coordinator's heartbeat is this old
     coordinator_stale_s: float = 0.5
+    #: D6, a plan whose hands hold one object (``ArmPlan.held``): the joint stiffness factor through the held
+    #: frames (``dual_fr3_closed_chain``'s budget says which), ramped over this many frames on each side
+    held_stiffness_scale: float = 1.0
+    compliance_ramp_frames: int = 10
+    #: D6: both arms stop when the force inside the held object -- half the difference of the two TCP forces,
+    #: each against its own reading on the segment's first held frame (the fingers just seated, the object
+    #: still on the table) -- passes this. Above the 2-2.5 N the pivot runs read as noise; below a grip's slip.
+    internal_force_stop_n: float = 15.0
 
 
 def _sleep_until(t_ns: int) -> None:
@@ -654,6 +725,10 @@ def arm_main(
     plan = np.load(plan_path)
     targets = plan["targets"]
     joints = plan["joints"] if "joints" in plan.files else None
+    held = plan["held"].astype(bool) if "held" in plan.files else None
+    profile = (
+        None if held is None else cc.compliance_profile(held, g.held_stiffness_scale, g.compliance_ramp_frames)
+    )
     period_ns = sync.period_ns
     log: dict[str, Any] = {
         "arm_index": index,
@@ -662,6 +737,9 @@ def arm_main(
         # D2: per command, the state read after it -- its robot clock, its arrival, its joints
         "state_clock": [],
         "state_q": [],
+        # D6: the TCP force read with each state, and the stiffness factor each command went out with
+        "state_force": [],
+        "compliance": [],
         "outcome": "",
         "reason": "",
     }
@@ -704,14 +782,20 @@ def arm_main(
                 if g.use_incremental_planning
                 else targets[k]
             )
+            if profile is not None:
+                driver.set_compliance(float(profile[k]))
+                log["compliance"].append(float(profile[k]))
             driver.command(T_cmd, k, None if joints is None else joints[k])
             t_cmd = now_ns()
             sync.record_command(index, k, t_cmd)
             log["command_ns"].append(t_cmd)
             _sleep_until(t0 + (k + 1) * period_ns)
             T_act, q = driver.observe()
+            force = driver.tcp_force()
+            sync.publish_force(index, force)
             sync.publish_joints(index, q)
             sync.beat(index)
+            log["state_force"].append(force.tolist())
             stamp = driver.stamp()
             if stamp is not None:
                 log["state_clock"].append([stamp[0], stamp[1]])
@@ -766,6 +850,9 @@ class ArmPlan:
     #: Cartesian streaming leaves the null space to the arm's IK, and on 10-26's fake run that walked the
     #: arms from the planned 75 mm to 54 mm.
     joints: np.ndarray | None = None
+    #: (n,) the frames both hands hold one object (D6, the same in both arms' plans): the arms go soft through
+    #: them (``Settings.held_stiffness_scale``) and the coordinator watches the force inside the object
+    held: np.ndarray | None = None
 
 
 def _stdin_go() -> bool:
@@ -797,6 +884,11 @@ def run(
         raise ValueError(f"plans must be {ARMS}, in that order")
     if len({len(p.targets) for p in plans}) != 1:
         raise ValueError("the arms' plans have different lengths; a dual replay streams one frame clock")
+    held = None if plans[0].held is None else np.asarray(plans[0].held, dtype=bool)
+    if (plans[1].held is None) != (held is None) or (
+        held is not None and not np.array_equal(held, np.asarray(plans[1].held, dtype=bool))
+    ):
+        raise ValueError("the arms' plans hold the object on different frames; both hands hold it or neither")
     run_dir.mkdir(parents=True, exist_ok=True)
     period_ns = int(round(1e9 / fps))
     sync = ArmSync(run_dir / "arm_sync.bin", create=True, n_arms=len(plans), period_ns=period_ns)
@@ -808,6 +900,8 @@ def run(
         arrays = {"targets": np.asarray(plan.targets, dtype=np.float64)}
         if plan.joints is not None:
             arrays["joints"] = np.asarray(plan.joints, dtype=np.float64)
+        if plan.held is not None:
+            arrays["held"] = np.asarray(plan.held, dtype=bool)
         np.savez(plan_path, **arrays)
         out = run_dir / f"arm_{plan.name}.json"
         outs.append(out)
@@ -877,6 +971,15 @@ def run(
     beater.join()
     # 3. watch
     min_gap, min_pair, last_seen = math.inf, (-1, -1), (0, 0)
+    # D6: which held segment each frame is in (-1: none), each segment's seated readings, and its peak
+    segment_of = None
+    if held is not None:
+        segment_of = np.full(len(held), -1)
+        for s, (a, b) in enumerate(cc.held_segments(held)):
+            segment_of[a:b] = s
+    R_right_left = np.asarray(T_right_left)[:3, :3]
+    seated: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    internal_max: dict[int, float] = {}
     stale_ns = gates.stale_periods * period_ns
     while any(p.is_alive() for p in procs):
         sync.beat_coordinator()
@@ -902,6 +1005,20 @@ def run(
                     STOP_BY_GATE,
                     f"arms {gap * 1e3:.0f} mm apart (capsules {pair}, d_safe {gates.d_safe_m * 1e3:.0f} mm)",
                 )
+            if segment_of is not None:
+                last = len(segment_of) - 1
+                seg = segment_of[min(sync.frame(0), last)]
+                if seg >= 0 and seg == segment_of[min(sync.frame(1), last)]:
+                    f_r, f_l = sync.force(0), R_right_left @ sync.force(1)
+                    b_r, b_l = seated.setdefault(int(seg), (f_r, f_l))
+                    internal = 0.5 * float(np.linalg.norm((f_r - b_r) - (f_l - b_l)))
+                    internal_max[int(seg)] = max(internal_max.get(int(seg), 0.0), internal)
+                    if internal > gates.internal_force_stop_n:
+                        stop(
+                            STOP_BY_GATE,
+                            f"{internal:.1f} N inside the held object (segment {int(seg)}, "
+                            f"limit {gates.internal_force_stop_n:g} N)",
+                        )
         if sync.stopped() and t - sync.stop_ns > 1e9:
             for p in procs:  # a hung arm never returns; its robot holds its last command
                 if p.is_alive():
@@ -922,6 +1039,8 @@ def run(
         arms[plan.name] = log
     report = _report(sync, plans, arms, events, period_ns, start_gap, min_gap, min_pair, gates)
     report["clock"] = _clock_report(plans, arms, period_ns, T_right_left, run_dir)
+    if held is not None:
+        report["closed_chain"] = _closed_chain_report(plans, arms, held, T_right_left, gates, internal_max)
     if timelines is not None:
         t0 = sync.t0_ns
         executed = {
@@ -962,6 +1081,35 @@ def _clock_report(
         }
     np.savez(run_dir / "clock_samples.npz", **samples)
     return clock.analyse(inputs, period_ns=period_ns, T_right_left=T_right_left)
+
+
+def _closed_chain_report(
+    plans: list[ArmPlan],
+    arms: Mapping[str, Any],
+    held: np.ndarray,
+    T_right_left: np.ndarray,
+    gates: Settings,
+    internal_max: Mapping[int, float],
+) -> dict[str, Any]:
+    """D6: what the guard read inside the object, and what the two arms' read-back joints would have squeezed
+    into a rigid one (``dual_fr3_closed_chain.from_run``)."""
+    q = {
+        p.name: np.asarray(arms[p.name].get("state_q") or np.zeros((0, 7)), dtype=np.float64).reshape(-1, 7)
+        for p in plans
+    }
+    return {
+        "held_frames": int(held.sum()),
+        "held_segments": [list(s) for s in cc.held_segments(held)],
+        "held_stiffness_scale": gates.held_stiffness_scale,
+        "internal_force_stop_n": gates.internal_force_stop_n,
+        "internal_force_max_n": {str(s): round(v, 2) for s, v in sorted(internal_max.items())},
+        "measured": cc.from_run(
+            q["right"], q["left"], held, T_right_left, np.asarray(plans[0].driver["tool"]),
+            scale=gates.held_stiffness_scale,
+        ),  # fmt: skip
+        "measured_note": "the read-back joints in the planned placement: the execution's share of the squeeze, "
+        "measured; the placement's share is not in it (dual_fr3_closed_chain budget)",
+    }
 
 
 def _report(sync, plans, arms, events, period_ns, start_gap, min_gap, min_pair, gates) -> dict[str, Any]:
@@ -1168,6 +1316,32 @@ def plans_from_retarget(
     return plans, reference["T_right_left"], reference["fps"], timelines, record
 
 
+def plans_from_held_plan(
+    path: Path,
+    *,
+    faults: Mapping[str, dict[str, Any]] | None = None,
+    arms: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[list[ArmPlan], np.ndarray, float, dict[str, Any]]:
+    """Plans that stream a held plan (D6: ``dual_fr3_closed_chain.read_plan``, e.g. ``dual_fr3_coop_carry``'s):
+    each arm's joints and their TCP, its held frames, in the placement it was planned in. ``arms`` as for
+    ``plans_from_retarget``. On the real arms without grippers the held frames hold nothing: the run measures
+    how far the execution alone bends T_LR (the report's ``closed_chain.measured``)."""
+    plan = cc.read_plan(path)
+    tool = np.asarray(plan["tool"], dtype=np.float64)
+    plans = []
+    for arm in ARMS:
+        q = np.asarray(plan[f"q_{arm}"], dtype=np.float64)
+        spec: dict[str, Any] = {"tool": tool.tolist(), "start_joints": q[0].tolist()}
+        if arms is None:
+            spec.update(kind="fake", fault=(faults or {}).get(arm))
+        else:
+            entry = arms[arm]
+            spec.update(kind="real", arm=arm, robot_ip=str(entry["robot_ip"]), payload=entry.get("payload"))
+        plans.append(ArmPlan(arm, kin.NOMINAL.fk(q) @ tool, spec, joints=q, held=plan["held"]))
+    record = {"held_plan": str(path), "held_frames": int(plan["held"].sum())}
+    return plans, np.asarray(plan["T_right_left"], dtype=np.float64), plan["fps"], record
+
+
 def real_arm_entries(registry: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     """Both arms as fr3_arms.json names them (B2: IP, payload; nothing falls back to a default arm);
     ``fr3_arms.ArmConfigError`` while one is not in service (B1) or both name one IP."""
@@ -1226,14 +1400,28 @@ def real_plan_problems(plans: list[ArmPlan], fps: float) -> list[str]:
 def _parse_fault(text: str) -> tuple[str, dict[str, Any]]:
     arm, rest = text.split(":", 1)
     kind, at = rest.split("@", 1)
-    if arm not in ARMS or kind not in ("raise", "exit", "hang", "freeze"):
-        raise argparse.ArgumentTypeError(f"--fault takes ARM:raise|exit|hang|freeze@FRAME, not {text!r}")
+    if arm not in ARMS or kind not in ("raise", "exit", "hang", "freeze", "squeeze"):
+        raise argparse.ArgumentTypeError(f"--fault takes ARM:raise|exit|hang|freeze|squeeze@FRAME, not {text!r}")
     return arm, {"kind": kind, "at_frame": int(at)}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Dual-FR3 replay of a two-hand session (D1/D3)")
-    parser.add_argument("session", type=Path, help="a session directory with left and right sidecars")
+    parser.add_argument(
+        "session", type=Path, nargs="?", default=None, help="a session directory with left and right sidecars"
+    )
+    parser.add_argument(
+        "--plan", type=Path, default=None, help="a held plan npz (D6, dual_fr3_coop_carry) instead of a session"
+    )
+    parser.add_argument(
+        "--held-scale",
+        type=float,
+        default=1.0,
+        help="D6: joint stiffness factor through a held plan's held frames (dual_fr3_closed_chain says which)",
+    )
+    parser.add_argument(
+        "--internal-force-stop", type=float, default=Settings.internal_force_stop_n, help="D6 guard, N"
+    )
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--spacing", type=float, default=0.8, help="assumed left base offset along +y, m")
     parser.add_argument("--stride", type=int, default=1, help="take every n-th frame")
@@ -1257,10 +1445,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, default=REPO / "outputs" / "fr3" / "dual_fr3_replay")
     args = parser.parse_args(argv)
+    if (args.session is None) == (args.plan is None):
+        print("refused: give a session, or --plan, not both")
+        return 2
+    if not MIN_STIFFNESS_SCALE <= args.held_scale <= 1.0:
+        print(f"refused: --held-scale {args.held_scale:g} is outside [{MIN_STIFFNESS_SCALE:g}, 1]")
+        return 2
     arms = None
     if args.backend == "real":
-        if not args.retarget:
-            print("refused: the real arms replay C3's joint path; give --retarget absolute|relative")
+        if not args.retarget and args.plan is None:
+            print("refused: the real arms replay C3's joint path; give --retarget absolute|relative or --plan")
             return 2
         if args.fault:
             print("refused: --fault is for the fake arms")
@@ -1271,7 +1465,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         arms = real_arm_entries()
     timelines, record, feasibility, edges = None, {}, None, []
-    if args.retarget:
+    if args.plan is not None:
+        try:
+            plans, T_right_left, fps, record = plans_from_held_plan(args.plan, faults=dict(args.fault), arms=arms)
+        except (OSError, ValueError) as exc:
+            print(f"refused: {exc}")
+            return 2
+        if arms is not None:
+            problems = real_plan_problems(plans, fps)
+            if problems:
+                print("refused: " + "; ".join(problems))
+                return 2
+        sigma = ASSUMED_PLACEMENT_SIGMA_MM
+    elif args.retarget:
         try:
             plans, T_right_left, fps, timelines, record = plans_from_retarget(
                 args.session, args.episode, args.retarget, faults=dict(args.fault), arms=arms
@@ -1303,21 +1509,26 @@ def main(argv: list[str] | None = None) -> int:
         fps=fps,
         T_right_left=T_right_left,
         run_dir=run_dir,
-        settings=Settings(d_safe_m=d_gate),
+        settings=Settings(
+            d_safe_m=d_gate, held_stiffness_scale=args.held_scale, internal_force_stop_n=args.internal_force_stop
+        ),
         go=(lambda: True) if args.yes else _stdin_go,
         timelines=timelines,
     )
     report["gate"] = gate if args.d_safe is None else {"d_gate_m": d_gate, "given": True}
     report["edges"] = edges
     report["ik_precheck"] = feasibility
-    report["retarget"] = record or None
+    report["retarget"] = (record or None) if args.retarget and args.plan is None else None
+    report["held_plan"] = record if args.plan is not None else None
     report["backend"] = args.backend
     (run_dir / "dual_replay_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(
         json.dumps(
             {
                 k: report[k]
-                for k in ("start_skew_ms", "start_gap_mm", "min_gap_mm", "stop", "stopped_together", "arms")
+                for k in ("start_skew_ms", "start_gap_mm", "min_gap_mm", "stop", "stopped_together", "arms",
+                          "closed_chain")
+                if k in report
             },
             indent=2,
         )

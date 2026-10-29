@@ -181,3 +181,31 @@ def test_the_cli_takes_real_arms_only_on_a_retarget(capsys, tmp_path) -> None:
         == 2
     )
     assert "--fault is for the fake arms" in capsys.readouterr().out
+
+
+def test_the_real_driver_goes_soft_on_request_and_reads_its_tcp_force() -> None:
+    q = _path(0.3)
+    driver = _driver()
+    with pytest.raises(rt.ArmFaultError, match="before move_to_start"):
+        driver.set_compliance(0.5)
+    driver.move_to_start(kin.NOMINAL.fk(q[:1])[0] @ TOOL, q[0].tolist())
+    ctrl = driver._ctrl
+    assert np.allclose(ctrl.stiffness, rt.cc.JOINT_STIFFNESS) and np.allclose(
+        ctrl.damping, rt.cc.JOINT_DAMPING
+    )
+    driver.set_compliance(1.0)
+    assert ctrl.gains == []  # unchanged, not resent
+    driver.set_compliance(0.25)
+    assert np.allclose(ctrl.stiffness, rt.cc.JOINT_STIFFNESS * 0.25)
+    assert np.allclose(ctrl.damping, rt.cc.JOINT_DAMPING * 0.5)  # the damping ratio kept
+    driver.set_compliance(0.25)
+    assert len(ctrl.gains) == 2
+    with pytest.raises(rt.ArmFaultError, match="outside"):
+        driver.set_compliance(0.05)
+    driver.observe()
+    assert np.allclose(driver.tcp_force(), 0.0)  # the stand-in's arm is touched by nothing
+    driver._state.tau_ext_hat_filtered = list(
+        kin.NOMINAL.kinematics(driver._state.q, point=TOOL[:3, 3])[1][0, :3].T @ np.array([0.0, 5.0, 0.0])
+    )
+    assert np.allclose(driver.tcp_force(), [0.0, 5.0, 0.0])  # J^T f back to f
+    driver.hold()

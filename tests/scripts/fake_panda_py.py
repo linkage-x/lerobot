@@ -3,7 +3,8 @@
 What ``RealFr3Driver`` uses of panda_py, and no more: ``Panda(hostname)`` with ``get_robot().read_once()``,
 ``get_state()`` (a copy the control loop refreshes, frozen while no controller runs, as panda_py's),
 ``move_to_joint_position``, ``start_controller`` / ``stop_controller``, ``raise_error``; and
-``controllers.JointPosition`` with panda_py's per-millisecond set-point filter.
+``controllers.JointPosition`` with panda_py's per-millisecond set-point filter and its gain setters (recorded,
+not simulated); the state's external torques are zero.
 
 The hostname's suffix sets the arm's behaviour: ``"10.0.0.1"`` is a healthy arm; ``#reflex@S`` makes the
 control loop die on libfranka's error S seconds after the controller started, ``#stall@S`` makes it stop
@@ -38,11 +39,14 @@ class RobotState:
     time: Duration
     m_ee: float = 0.0
     F_x_Cee: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # noqa: N815
+    tau_ext_hat_filtered: list[float] = field(default_factory=lambda: [0.0] * 7)
 
 
 class JointPosition:
     def __init__(self, stiffness=None, damping=None, filter_coeff: float = 1.0):
-        del stiffness, damping
+        self.stiffness = None if stiffness is None else np.asarray(stiffness, dtype=float).copy()
+        self.damping = None if damping is None else np.asarray(damping, dtype=float).copy()
+        self.gains: list[tuple[str, np.ndarray]] = []  # set_stiffness / set_damping, in order
         self.filter_coeff = float(filter_coeff)
         self.lock = threading.Lock()
         self.target: np.ndarray | None = None
@@ -54,6 +58,14 @@ class JointPosition:
             self.target = np.asarray(position, dtype=float).copy()
             self.velocity = np.zeros(7) if velocity is None else np.asarray(velocity, dtype=float).copy()
             self.calls += 1
+
+    def set_stiffness(self, stiffness) -> None:
+        self.stiffness = np.asarray(stiffness, dtype=float).copy()
+        self.gains.append(("stiffness", self.stiffness))
+
+    def set_damping(self, damping) -> None:
+        self.damping = np.asarray(damping, dtype=float).copy()
+        self.gains.append(("damping", self.damping))
 
 
 controllers = SimpleNamespace(JointPosition=JointPosition)
