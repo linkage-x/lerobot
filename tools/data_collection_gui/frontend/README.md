@@ -74,6 +74,8 @@ If the proxy cannot reach the gateway, the frontend falls back to a mock adapter
 | Dataset Processing | `#/dataset-processing` | Partial | datasets root selector, dataset scan, Run QC, processing log; Generate EE Trajectory currently shows `待实现` |
 | Episode Replay | `#/episode-replay` | Integrated for review and gated replay | recorded dataset/episode selector, synchronized inspector, embedded native cube MuJoCo, annotation, and single-cube hardware replay |
 | Dataset Export | `#/dataset-export` | UI scaffold only | export planning surface for LeRobot v3 / MCAP / Parquet; backend export endpoints are not implemented yet |
+| Rollout | `#/rollout` | Integrated (FR3) | interactive rollouts, grasp loop, scene reset, landing map, checkpoint picker. The **Table alignment — side camera** panel is hidden since 2026-10-28 (see Notes) |
+| Unattended Runs | `#/unattended` | Integrated, idle since 2026-09-29 | terminal_trials / grasp_envelope / auto_collect runs; the grasp loop runs from Rollout instead |
 | Deferred pages | dashboard, QC report, model evaluation, device manager, task library, annotation audit | UI placeholders | not part of the current production path |
 
 ## Episode Replay Flow
@@ -197,3 +199,4 @@ PYTHONPATH=src:tools/fr3:. python tools/fr3/fr3_sim_replay_validate_joint_target
 - Host DISPLAY/X11 is used for MuJoCo viewer paths inside the Docker launcher.
 - Real Robot replay is intentionally stricter than Preflight/Dry Run: MuJoCo is recommended for the latter two, but required for Real Robot.
 - Connect on the 11-camera GMSL2 rig takes ~10 seconds because `spawn_stagger_s: 1.0` — this is required to avoid Argus ISP NVMM buffer allocation races that corrupt MKV output.
+- Rollout page, **Table alignment — side camera** panel: hidden on 2026-10-28 (`SHOW_TABLE_ALIGNMENT_PANEL = false` in `src/pages/RolloutPage.tsx`). It ties side-camera pixels to base x/y with four robot probe points, only so that the landing map and the scene-reset map can show a warped camera still behind them. Both maps plot in base x/y without it and no grading or reset logic reads it. The page still loads any alignment already stored, so a calibrated backdrop stays; the panel component, the `/api/rollout/table-alignment` endpoints and the stored points are all kept. Set the flag to `true` to probe points again.

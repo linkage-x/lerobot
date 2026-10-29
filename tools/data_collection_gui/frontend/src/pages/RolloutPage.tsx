@@ -31,6 +31,11 @@ import { RolloutLiveViewer } from "./RolloutLiveViewer";
 import { SceneResetPanel } from "./SceneResetPanel";
 import { TableAlignmentPanel } from "./TableAlignmentPanel";
 
+// Hidden 10-28: the side-camera table alignment is only a backdrop for the two maps, and the
+// maps are read in base x/y without it. The panel, its endpoints and any stored alignment are
+// kept; set this to true to probe points again.
+const SHOW_TABLE_ALIGNMENT_PANEL = false;
+
 /**
  * Running a trained checkpoint on the real FR3.
  *
@@ -256,6 +261,18 @@ export function RolloutPage() {
   const tablePlaneZ = landmarks.placeXyz?.[2] ?? 0.035;
   const tableCentre: [number, number] = landmarks.hole ??
     (landmarks.placeXyz ? [landmarks.placeXyz[0], landmarks.placeXyz[1]] : [0.45, 0.0]);
+  // With the panel hidden nothing else reads the stored alignment, and the backdrops above
+  // still need it.
+  useEffect(() => {
+    if (SHOW_TABLE_ALIGNMENT_PANEL) return;
+    let cancelled = false;
+    void api.fetchTableAlignment(sceneResetCameraKey).then((next) => {
+      if (!cancelled) setTableAlignment(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sceneResetCameraKey]);
   const blocking = useMemo(
     () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
     [selected]
@@ -1361,7 +1378,7 @@ export function RolloutPage() {
         backgroundHint={
           tableAlignment?.calibrated
             ? ""
-            : `no ${sceneResetCameraKey} backdrop until the camera is aligned to the table below;`
+            : `no ${sceneResetCameraKey} backdrop: the camera is not aligned to the table (alignment panel hidden);`
         }
         busy={busy}
         disabled={!sceneResetPanelUsable}
@@ -1394,6 +1411,7 @@ export function RolloutPage() {
         />
       </section>
 
+      {SHOW_TABLE_ALIGNMENT_PANEL && (
       <TableAlignmentPanel
         cameraKey={sceneResetCameraKey}
         planeZDefault={tablePlaneZ}
@@ -1408,6 +1426,7 @@ export function RolloutPage() {
         }
         onAlignmentChange={setTableAlignment}
       />
+      )}
 
       {/* ------------------------------------------------------ checkpoint --- */}
       <section className="card">
