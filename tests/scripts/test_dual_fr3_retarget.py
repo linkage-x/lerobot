@@ -144,3 +144,20 @@ def test_d_safe_is_built_from_the_placement_and_the_execution_tails() -> None:
     assert rg.derive_d_safe(0.0, execution_tail_mm=(1.0, 1.0))["d_safe_m"] == pytest.approx(
         rg.D_SAFE_FLOOR_MM / 1e3
     )
+
+
+def test_a_quarterspace_moved_into_the_left_base_keeps_its_distances() -> None:
+    from tools.fr3 import dual_fr3_scene as sc
+
+    T = _placed(0.6)
+    T[:3, :3] = kin._rpy_matrix(0.0, 0.0, 0.4)
+    T[2, 3] = 0.03
+    table = sc.table_obstacle()
+    moved = rg._obstacle_in(table, np.linalg.inv(T))
+    rng = np.random.default_rng(5)
+    A, B = rng.uniform(-0.5, 1.0, (2, 50, 3))
+    in_left = lambda p: (np.linalg.inv(T)[:3, :3] @ p.T).T + np.linalg.inv(T)[:3, 3]  # noqa: E731
+    assert np.allclose(
+        col.quarterspace_distance(A, B, table), col.quarterspace_distance(in_left(A), in_left(B), moved)
+    )
+    assert not col.check_obstacles([moved])

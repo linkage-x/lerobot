@@ -65,18 +65,47 @@ UNMODELLED = (
 )
 
 
-def table_obstacle(height_m: float = 0.0) -> dict[str, Any]:
-    """The table top as a half-space below ``z = height_m`` of the right base. Assumed: the bases are bolted
-    to the table top, so its surface is each base's z = 0."""
+#: The table, in the right base, from the 10-27 placement (roadmap B0, scheme (b) carts; user's tape
+#: measure): each base 0.36 m behind its cart's front edge, a 5 cm gap from that edge to the table, the table
+#: top 0.10 m above the cart top the base stands on. Both carts face the same table edge, side by side.
+TABLE_EDGE_M = 0.41
+TABLE_TOP_M = 0.10
+
+
+def table_obstacle(top_m: float = TABLE_TOP_M, edge_m: float = TABLE_EDGE_M) -> dict[str, Any]:
+    """The table as a quarter-space of the right base: below its top ``z = top_m`` and beyond its front edge
+    ``x = edge_m``. Assumed (tape-measured, the carts not final); its far and side edges are not modelled."""
     return {
         "name": "table",
-        "kind": "halfspace",
+        "kind": "quarterspace",
         "normal": [0.0, 0.0, 1.0],
-        "offset": float(height_m),
+        "offset": float(top_m),
+        "edge_normal": [-1.0, 0.0, 0.0],
+        "edge_offset": -float(edge_m),
         "pose": "assumed",
         "size": "assumed",
-        "note": "the arms stand on the table top (z = 0 of the right base); its edges are not modelled",
+        "note": f"the table top {top_m:.2f} m above the cart top, its front edge {edge_m:.2f} m in front of the "
+        "bases; far and side edges not modelled",
     }
+
+
+def cart_obstacle() -> dict[str, Any]:
+    """The cart top the bases stand on: a half-space below z = 0 of the right base (the left cart taken as
+    level with it). Below the table's edge the floor is lower still, so this only errs safe."""
+    return {
+        "name": "cart",
+        "kind": "halfspace",
+        "normal": [0.0, 0.0, 1.0],
+        "offset": 0.0,
+        "pose": "assumed",
+        "size": "assumed",
+        "note": "each base on its cart top, z = 0 of the right base; the carts' edges are not modelled",
+    }
+
+
+def environment_obstacles() -> list[dict[str, Any]]:
+    """The fixed part of the environment: the carts and the table."""
+    return [cart_obstacle(), table_obstacle()]
 
 
 def camera_obstacles(
@@ -193,10 +222,23 @@ def build_spec(
     for geom in world.geoms:
         if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
             geom.contype, geom.conaffinity = 1, 1
+    world.visual.headlight.ambient = [0.35, 0.35, 0.35]
+    world.visual.headlight.diffuse = [0.5, 0.5, 0.5]
     world.worldbody.add_light(pos=[0.4, 0.4, 2.5], dir=[0.0, 0.0, -1.0], diffuse=[0.8, 0.8, 0.8])
     for ob in record["obstacles"]:
-        rgba = [0.55, 0.45, 0.35, 0.35] if ob["kind"] == "halfspace" else [0.9, 0.6, 0.1, 0.6]
-        if ob["kind"] == "halfspace":
+        rgba = {"halfspace": [0.45, 0.5, 0.58, 0.5], "quarterspace": [0.72, 0.56, 0.38, 0.9]}.get(
+            ob["kind"], [0.9, 0.6, 0.1, 0.45]
+        )
+        if ob["kind"] == "quarterspace":
+            # drawn as a slab 1.5 m deep behind the edge, 3 m wide, 5 cm thick
+            up, out = col._unit(ob["normal"]), col._unit(ob["edge_normal"])
+            corner = up * float(ob["offset"]) + out * float(ob["edge_offset"])
+            R = np.column_stack([-out, np.cross(up, -out), up])
+            world.worldbody.add_geom(
+                name=f"env/{ob['name']}", type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.75, 1.5, 0.025],
+                pos=(corner - out * 0.75 - up * 0.025).tolist(), quat=_quat_wxyz(R), rgba=rgba, group=3,
+            )  # fmt: skip
+        elif ob["kind"] == "halfspace":
             normal = np.asarray(ob["normal"], dtype=np.float64)
             normal /= np.linalg.norm(normal)
             z = np.array([0.0, 0.0, 1.0])
@@ -339,10 +381,10 @@ class DualScene:
         camera = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(camera)
         mid = np.asarray(self.record["T_right_left"])[:3, 3] / 2.0
-        camera.lookat[:] = [0.35 + mid[0], mid[1], 0.35]
-        camera.distance = 2.2
-        camera.azimuth = 180.0
-        camera.elevation = -25.0
+        camera.lookat[:] = [0.35 + mid[0], mid[1], 0.3]
+        camera.distance = 2.4
+        camera.azimuth = 215.0
+        camera.elevation = -28.0
         options = mujoco.MjvOption()
         options.geomgroup[:] = [1, 1, 1, 1, 1, 0]
         ffmpeg = subprocess.Popen(

@@ -29,8 +29,9 @@ Enclosing makes a capsule gap a lower bound on the mesh gap (also tested, agains
 ``d_safe`` on top of it is margin for what the model does not know -- the placement of the bases and the arms'
 tracking error -- not for the model's shape.
 
-The environment is a list of primitives in the right arm's base: half-spaces (the table), spheres and capsules
-(cameras at their registered poses), each saying whether its pose and its size are measured or assumed.
+The environment is a list of primitives in the right arm's base: half-spaces (the cart top the bases stand on),
+quarter-spaces (a table top with its front edge: below one plane and behind a perpendicular one), spheres and
+capsules (cameras at their registered poses), each saying whether its pose and its size are measured or assumed.
 """
 
 # ruff: noqa: N802, N803, N806  (matrix names: R, T, J follow the maths)
@@ -85,10 +86,10 @@ PARTS = {
     ),
     "smr_mount": ("hand", 1, ("link_corenetic_mount",)),
 }
-#: Parts kept off the table only by not being planned against it: the base and shoulder are bolted to it, and
-#: the fingers are meant to reach it -- a grasp from the table top is in the demonstrations, and keeping the
-#: fingers a margin above an assumed table would lift every grasp. They still count against the other arm and
-#: the cameras.
+#: Parts kept off the table and the cart top (the half- and quarter-spaces) only by not being planned against
+#: them: the base and shoulder are bolted to the cart, and the fingers are meant to reach the table -- a grasp
+#: from the table top is in the demonstrations, and keeping the fingers a margin above an assumed table would
+#: lift every grasp. They still count against the other arm and the cameras.
 TABLE_EXEMPT = ("link0", "link1", "fingers")
 _FRAME_BODY = {name: f"fr3_{name}" for name in FRAMES[:-1]} | {"hand": "fr3_link8"}
 
@@ -420,7 +421,14 @@ def load(path: Path | str = CAPSULE_FILE) -> CapsuleModel:
 
 # ------------------------------------------------------------------ environment ---
 
-OBSTACLE_KINDS = ("halfspace", "sphere", "capsule")
+OBSTACLE_KINDS = ("halfspace", "quarterspace", "sphere", "capsule")
+#: The kinds TABLE_EXEMPT parts are not checked against.
+TABLE_KINDS = ("halfspace", "quarterspace")
+
+
+def _unit(v: Any) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    return v / np.linalg.norm(v)
 
 
 def check_obstacles(obstacles: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -429,6 +437,10 @@ def check_obstacles(obstacles: Sequence[Mapping[str, Any]]) -> list[str]:
         label = ob.get("name") or f"#{i}"
         if ob.get("kind") not in OBSTACLE_KINDS:
             problems.append(f"obstacle {label}: kind {ob.get('kind')!r} not one of {OBSTACLE_KINDS}")
+        elif (
+            ob["kind"] == "quarterspace" and abs(float(_unit(ob["normal"]) @ _unit(ob["edge_normal"]))) > 1e-6
+        ):
+            problems.append(f"obstacle {label}: a quarter-space's two normals must be perpendicular")
         for key in ("pose", "size"):
             if ob.get(key) not in ("measured", "assumed"):
                 problems.append(f"obstacle {label}: {key} must say measured or assumed")
@@ -443,15 +455,17 @@ def obstacle_gaps(
     table_mask: np.ndarray,
 ) -> np.ndarray:
     """(n, K, M) surface gap of each capsule to each obstacle, metres. Capsules exempt from the table get
-    +inf against half-spaces."""
+    +inf against half- and quarter-spaces."""
     gaps = []
     for ob in obstacles:
         kind = ob["kind"]
         if kind == "halfspace":
-            normal = np.asarray(ob["normal"], dtype=np.float64)
-            normal = normal / np.linalg.norm(normal)
+            normal = _unit(ob["normal"])
             offset = float(ob["offset"])
             g = np.minimum(A @ normal, B @ normal) - offset - r
+            g = np.where(table_mask, g, np.inf)
+        elif kind == "quarterspace":
+            g = quarterspace_distance(A, B, ob) - r
             g = np.where(table_mask, g, np.inf)
         else:
             a = np.asarray(ob["a"] if kind == "capsule" else ob["centre"], dtype=np.float64)
@@ -461,6 +475,43 @@ def obstacle_gaps(
     if not gaps:
         return np.full((*A.shape[:2], 0), np.inf)
     return np.stack(gaps, axis=-1)
+
+
+def quarterspace_distance(A: np.ndarray, B: np.ndarray, ob: Mapping[str, Any]) -> np.ndarray:
+    """Signed distance from segments A-B to the quarter-space ``n.p <= offset and e.p <= edge_offset``
+    (``n`` and ``e`` perpendicular): positive outside, the depth (negative) inside.
+
+    In the plane of the two normals the region is a quadrant, its signed distance at a point is
+    ``|max(a, 0), max(b, 0)|`` outside and ``max(a, b)`` inside, with ``a``, ``b`` the point's heights over
+    the two planes -- convex, and along a segment piecewise linear or (round the corner) quadratic in the
+    segment parameter. Its minimum is at an end, where a plane is crossed, where ``a = b`` (the kink inside),
+    or at the closest approach to the corner line; evaluating at those six parameters is exact, and smooth
+    enough to difference.
+    """
+    n, e = _unit(ob["normal"]), _unit(ob["edge_normal"])
+    a0, b0 = A @ n - float(ob["offset"]), A @ e - float(ob["edge_offset"])
+    da, db = B @ n - float(ob["offset"]) - a0, B @ e - float(ob["edge_offset"]) - b0
+
+    def ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+        ok = np.abs(den) > 1e-12
+        return np.where(ok, num / np.where(ok, den, 1.0), 0.0)
+
+    ts = [
+        np.zeros_like(a0),
+        np.ones_like(a0),
+        ratio(-a0, da),
+        ratio(-b0, db),
+        ratio(a0 - b0, db - da),
+        ratio(-(a0 * da + b0 * db), da * da + db * db),
+    ]
+    best = None
+    for t in ts:
+        t = np.clip(t, 0.0, 1.0)
+        a, b = a0 + t * da, b0 + t * db
+        outside = np.hypot(np.maximum(a, 0.0), np.maximum(b, 0.0))
+        d = np.where((a > 0.0) | (b > 0.0), outside, np.maximum(a, b))
+        best = d if best is None else np.minimum(best, d)
+    return best
 
 
 # ------------------------------------------------------------------ two arms ---

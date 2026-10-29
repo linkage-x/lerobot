@@ -79,6 +79,18 @@ def test_one_scene_holds_both_arms_where_the_placement_puts_them() -> None:
     assert scene.env_geoms and len(scene.arm_geoms["right"]) == len(scene.arm_geoms["left"]) > 10
 
 
+def test_the_table_is_drawn_where_the_collision_model_puts_it() -> None:
+    pytest.importorskip("mujoco")
+    scene = sc.DualScene(sc.scene_record(_placed(0.6), {"source": "assumed"}, sc.environment_obstacles()))
+    scene.set(kin.Q_READY, kin.Q_READY)
+    table = scene.model.geom("env/table")
+    top_corner = scene.data.geom_xpos[table.id] + scene.data.geom_xmat[table.id].reshape(3, 3) @ (
+        np.array([-1.0, 0.0, 1.0]) * table.size
+    )
+    assert np.allclose(top_corner, [sc.TABLE_EDGE_M, 0.0, sc.TABLE_TOP_M], atol=1e-9)
+    assert {ob["kind"] for ob in sc.environment_obstacles()} == {"halfspace", "quarterspace"}
+
+
 def test_the_capsule_gap_never_exceeds_the_mesh_gap() -> None:
     pytest.importorskip("mujoco")
     T = _placed(0.6)

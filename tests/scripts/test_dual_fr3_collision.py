@@ -86,3 +86,56 @@ def test_the_table_keeps_the_arm_and_lets_the_fingers_reach_it() -> None:
     lifted = [dict(table[0], offset=-0.5)]
     assert np.isfinite(col.obstacle_gaps(lifted, A, B, model.r, model.table_mask())).sum() > 0
     assert col.check_obstacles([{"name": "x", "kind": "box", "pose": "measured"}])
+
+
+def _table(top: float = 0.10, edge: float = 0.41) -> dict:
+    return {
+        "name": "table",
+        "kind": "quarterspace",
+        "normal": [0, 0, 1],
+        "offset": top,
+        "edge_normal": [-1, 0, 0],
+        "edge_offset": -edge,
+        "pose": "assumed",
+        "size": "assumed",
+    }
+
+
+def _box_sdf(points: np.ndarray, top: float, edge: float) -> np.ndarray:
+    a, b = points[..., 2] - top, edge - points[..., 0]
+    outside = np.hypot(np.maximum(a, 0.0), np.maximum(b, 0.0))
+    return np.where((a > 0) | (b > 0), outside, np.maximum(a, b))
+
+
+def test_the_quarterspace_distance_is_the_closest_approach_of_the_segment() -> None:
+    rng = np.random.default_rng(2)
+    s = np.linspace(0.0, 1.0, 4001)
+    A = rng.uniform([0.0, -0.5, -0.2], [0.8, 0.5, 0.4], (300, 3))
+    B = rng.uniform([0.0, -0.5, -0.2], [0.8, 0.5, 0.4], (300, 3))
+    exact = col.quarterspace_distance(A, B, _table())
+    brute = _box_sdf(A[:, None] + s[None, :, None] * (B - A)[:, None], 0.10, 0.41).min(axis=1)
+    assert np.all(exact <= brute + 1e-12) and np.all(brute - exact < 1e-3)
+    assert (exact < 0).any() and (exact > 0).any()
+    # round the corner, above the table, at the edge
+    assert float(
+        col.quarterspace_distance(np.array([0.31, 0, 0.20]), np.array([0.31, 0, 0.20]), _table())
+    ) == (pytest.approx(np.hypot(0.1, 0.1)))
+    assert float(
+        col.quarterspace_distance(np.array([0.6, -1, 0.15]), np.array([0.6, 1, 0.15]), _table())
+    ) == (pytest.approx(0.05))
+    assert float(col.quarterspace_distance(np.array([0.3, 0, 0.0]), np.array([0.5, 0, 0.0]), _table())) == (
+        pytest.approx(-0.09)
+    )
+
+
+def test_a_table_beyond_the_reach_of_the_low_arm_leaves_it_and_a_hand_above_it_is_kept_off() -> None:
+    model = col.load()
+    A, B = model.place(kin.NOMINAL, kin.Q_READY)
+    mask = model.table_mask()
+    far = col.obstacle_gaps([_table(edge=2.0)], A, B, model.r, mask)[0, :, 0]
+    assert np.all(far[mask] > 1.0) and np.isinf(far[~mask]).all()
+    # Q_READY holds the flange ~0.5 m above the base about 0.3 m out: a table top just under it is near
+    near = col.obstacle_gaps([_table(top=0.35, edge=0.2)], A, B, model.r, mask)[0, :, 0]
+    assert np.nanmin(near[mask]) < 0.2
+    assert col.check_obstacles([dict(_table(), edge_normal=[-1, 0, 1])])
+    assert not col.check_obstacles([_table()])

@@ -340,12 +340,16 @@ class Problem:
 def _obstacle_in(ob: Mapping[str, Any], T: np.ndarray) -> dict[str, Any]:
     """``ob`` re-expressed by ``T`` (new <- old)."""
     out = dict(ob)
-    if ob["kind"] == "halfspace":
-        normal = T[:3, :3] @ np.asarray(ob["normal"], dtype=np.float64)
-        normal_old = np.asarray(ob["normal"], dtype=np.float64)
-        point_old = normal_old / np.linalg.norm(normal_old) * float(ob["offset"])
-        out["normal"] = normal.tolist()
-        out["offset"] = float((T[:3, :3] @ point_old + T[:3, 3]) @ (normal / np.linalg.norm(normal)))
+    if ob["kind"] in ("halfspace", "quarterspace"):
+        planes = [("normal", "offset")] + (
+            [("edge_normal", "edge_offset")] if ob["kind"] == "quarterspace" else []
+        )
+        for normal_key, offset_key in planes:
+            normal = T[:3, :3] @ np.asarray(ob[normal_key], dtype=np.float64)
+            normal_old = np.asarray(ob[normal_key], dtype=np.float64)
+            point_old = normal_old / np.linalg.norm(normal_old) * float(ob[offset_key])
+            out[normal_key] = normal.tolist()
+            out[offset_key] = float((T[:3, :3] @ point_old + T[:3, 3]) @ (normal / np.linalg.norm(normal)))
     elif ob["kind"] == "sphere":
         out["centre"] = (T[:3, :3] @ np.asarray(ob["centre"]) + T[:3, 3]).tolist()
     else:

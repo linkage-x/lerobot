@@ -216,7 +216,7 @@ def evaluate_session(
         cameras, obstacle_source = sc.camera_obstacles(
             repo_root, graph, frame=str(description["arms"]["right"]["root"])
         )
-        obstacles = [sc.table_obstacle(), *cameras]
+        obstacles = [*sc.environment_obstacles(), *cameras]
     settings = settings or rg.Settings()
     rows = {}
     for episode in episodes if episodes is not None else episodes_of(session_dir):
