@@ -15596,9 +15596,71 @@ def _ensure_log_dir(path: Path) -> Path:
     return path
 
 
+# BOX_LIVE is the recorder's 10 Hz telemetry feed to this gateway, not a message
+# for a person: on 2026-10-25 it was 2.15 of a 2.27 GB day's log and, with the
+# rest of the directory, filled Thor's disk. The log keeps one a minute, and
+# every change of validity, so a box dropping out still shows in it.
+_BOX_LIVE_LOG_INTERVAL_S = 60.0
+# A session past this rotates to ``<log>.1``, replacing the previous part: a
+# crash leaves its evidence at the end, so the tail is the part worth keeping.
+_RECORDER_LOG_MAX_BYTES = 256 * 1024 * 1024
+# Each Connect deletes the oldest recorder logs (plain, rotated or gzipped)
+# beyond this, so the directory has a ceiling whatever the recorder prints.
+_RECORDER_LOG_DIR_BUDGET_BYTES = 10 * 1024**3
+
+
+def _prune_recorder_logs(log_dir: Path, budget_bytes: int = _RECORDER_LOG_DIR_BUDGET_BYTES) -> list[Path]:
+    entries: list[tuple[float, int, Path]] = []
+    for path in log_dir.glob("recorder_*"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            entries.append((stat.st_mtime, stat.st_size, path))
+    total = sum(size for _, size, _ in entries)
+    removed: list[Path] = []
+    for _, size, path in sorted(entries):
+        if total <= budget_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed.append(path)
+    return removed
+
+
 def _new_recorder_log_path(state: GatewayState) -> Path:
     log_dir = _ensure_log_dir(state.log_dir or _default_log_dir(state.repo_root))
+    removed = _prune_recorder_logs(log_dir)
+    if removed:
+        state.log(
+            "info",
+            f"Deleted {len(removed)} oldest recorder logs to keep {log_dir} under "
+            f"{_RECORDER_LOG_DIR_BUDGET_BYTES // 1024**3} GiB",
+        )
     return log_dir / f"recorder_{_timestamp_for_log()}.log"
+
+
+def _append_recorder_log(path: Path | None, line: str) -> None:
+    if path is None:
+        return
+    try:
+        if path.stat().st_size >= _RECORDER_LOG_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+            _append_line(path, f"# rotated past {_RECORDER_LOG_MAX_BYTES} bytes; the part before is {path.name}.1")
+    except OSError:
+        pass
+    _append_line(path, line)
+
+
+def _box_live_validity(raw: str) -> bool | None:
+    try:
+        return bool(json.loads(raw.removeprefix("BOX_LIVE ")).get("valid"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _append_line(path: Path | None, line: str) -> None:
@@ -16383,9 +16445,18 @@ def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) ->
     # writes — freezing preview production and the stale-preview watchdog.
     # Now the reader only appends to the log file and hands the line to a queue
     # that a dedicated consumer applies under the lock.
+    box_live_logged_s = float("-inf")
+    box_live_valid: bool | None = None
     for line in process.stdout:
         raw = line.rstrip("\n")
-        _append_line(state.recorder_log_path, raw)
+        if not raw.startswith("BOX_LIVE "):
+            _append_recorder_log(state.recorder_log_path, raw)
+        else:
+            now = time.monotonic()
+            valid = _box_live_validity(raw)
+            if valid != box_live_valid or now - box_live_logged_s >= _BOX_LIVE_LOG_INTERVAL_S:
+                _append_recorder_log(state.recorder_log_path, raw)
+                box_live_logged_s, box_live_valid = now, valid
         output = raw.strip()
         if not output:
             continue

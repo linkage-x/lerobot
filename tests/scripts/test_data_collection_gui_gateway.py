@@ -1508,6 +1508,56 @@ def test_box_live_output_updates_preview_without_log_noise(tmp_path):
     assert state.events == []
 
 
+def test_recorder_log_samples_box_live_but_the_gateway_still_sees_every_line(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    state.recorder_log_path = tmp_path / "recorder.log"
+    lines = [
+        'BOX_LIVE {"valid":false,"sensors":{}}',
+        'BOX_LIVE {"valid":false,"sensors":{}}',
+        "Recording started",
+        'BOX_LIVE {"valid":true,"sensors":{}}',
+        'BOX_LIVE {"valid":true,"sensors":{}}',
+    ]
+    process = types.SimpleNamespace(stdout=[line + "\n" for line in lines])
+
+    gateway._read_process_output(state, process)
+
+    # Within a minute, only the first BOX_LIVE and the one where validity flipped are kept.
+    assert state.recorder_log_path.read_text().splitlines() == [lines[0], lines[2], lines[3]]
+    queued = [state.recorder_output_queue.get_nowait()[1] for _ in lines]
+    assert queued == lines
+
+
+def test_recorder_log_rotates_and_keeps_the_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway, "_RECORDER_LOG_MAX_BYTES", 10)
+    path = tmp_path / "recorder_x.log"
+
+    for line in ["first-line", "second-line", "third-line"]:
+        gateway._append_recorder_log(path, line)
+
+    assert (tmp_path / "recorder_x.log.1").read_text().splitlines()[-1] == "second-line"
+    assert path.read_text().splitlines()[-1] == "third-line"
+
+
+def test_recorder_logs_are_pruned_oldest_first_to_the_budget(tmp_path):
+    for age, name in enumerate(["recorder_c.log", "recorder_b.log.gz", "recorder_a.log.1"]):
+        path = tmp_path / name
+        path.write_bytes(b"x" * 100)
+        os.utime(path, (1000 - age, 1000 - age))
+    (tmp_path / "gateway_old.log").write_bytes(b"x" * 1000)
+
+    removed = gateway._prune_recorder_logs(tmp_path, budget_bytes=150)
+
+    assert [p.name for p in removed] == ["recorder_a.log.1", "recorder_b.log.gz"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway_old.log", "recorder_c.log"]
+
+
 def test_recorder_tlv_ignored_output_is_noise(tmp_path):
     state = gateway.GatewayState(
         repo_root=Path.cwd(),
