@@ -976,6 +976,77 @@ def test_lora_without_a_base_model_is_refused_before_the_run_starts():
     )
 
 
+def _adapter_dir(tmp_path, r=64, alpha=64, base="/models/pi05_base"):
+    root = tmp_path / "045000" / "pretrained_model"
+    root.mkdir(parents=True)
+    (root / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": base, "r": r, "lora_alpha": alpha}), encoding="utf-8"
+    )
+    (root / "adapter_model.safetensors").write_bytes(b"")
+    return root
+
+
+def test_an_init_adapter_must_match_the_lora_it_continues(tmp_path):
+    """The loaded adapter keeps its own shape, so a peft block that disagrees would be a false record."""
+    adapter = _adapter_dir(tmp_path)
+
+    fr3_train_il_policy.validate_finetune_args(
+        _args(policy="pi05", lora=True, lora_r=64, init_adapter=adapter)
+    )
+    with pytest.raises(ValueError, match="pass --lora"):
+        fr3_train_il_policy.validate_finetune_args(_args(policy="pi05", init_adapter=adapter))
+    with pytest.raises(ValueError, match="r=64 alpha=64"):
+        fr3_train_il_policy.validate_finetune_args(
+            _args(policy="pi05", lora=True, lora_r=32, init_adapter=adapter)
+        )
+    with pytest.raises(ValueError, match="Pick one"):
+        fr3_train_il_policy.validate_finetune_args(
+            _args(policy="pi05", lora=True, lora_r=64, init_adapter=adapter, resume=True)
+        )
+    with pytest.raises(ValueError, match="drop the flag"):
+        fr3_train_il_policy.validate_finetune_args(
+            _args(policy="pi05", lora=True, lora_r=64, init_adapter=adapter, pretrained_path="lerobot/pi05_base")
+        )
+    with pytest.raises(ValueError, match="no adapter_config.json"):
+        fr3_train_il_policy.validate_finetune_args(
+            _args(policy="pi05", lora=True, lora_r=64, init_adapter=tmp_path)
+        )
+
+
+def test_an_init_adapter_run_loads_the_adapter_instead_of_wrapping_a_fresh_one(tmp_path, monkeypatch):
+    """`use_peft` with the adapter as pretrained_path is what make_policy loads an adapter from, and
+    the peft block is what sends lerobot_train into the branch that keeps it."""
+    view_root = _view_with_manifest(tmp_path)
+    adapter = _adapter_dir(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "fr3_train_il_policy.py",
+            "--skip-prepare",
+            "--view-root", str(view_root),
+            "--job-name", "cube__pi05_ft",
+            "--output-dir", str(tmp_path / "train" / "cube__pi05_ft"),
+            "--policy", "pi05",
+            "--init-adapter", str(adapter),
+            "--lora",
+            "--lora-r", "64",
+            "--steps", "1",
+        ],
+    )
+    monkeypatch.setattr(fr3_train_il_policy, "assert_pretrained_weights_resolve", lambda path: path)
+    monkeypatch.setattr(fr3_train_il_policy.subprocess, "run", lambda *a, **k: None)
+    fr3_train_il_policy.main()
+
+    config = json.loads(
+        (view_root / "runs" / "cube__pi05_ft" / "train_config.generated.json").read_text(encoding="utf-8")
+    )
+    assert config["policy"]["pretrained_path"] == str(adapter)
+    assert config["policy"]["use_peft"] is True
+    assert config["peft"] == {"method_type": "LORA", "r": 64, "alpha": 64}
+    assert not config.get("resume", False)
+
+
 def test_a_pi05_lora_run_writes_a_config_lerobot_train_can_parse(tmp_path, monkeypatch):
     view_root = _view_with_manifest(tmp_path)
     monkeypatch.chdir(tmp_path)

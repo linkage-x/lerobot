@@ -1553,7 +1553,15 @@ def build_policy_section(
         "use_amp": args.use_amp,
         "push_to_hub": False,
     }
-    if args.pretrained_path:
+    if args.init_adapter:
+        # A trained adapter's weights with a fresh optimizer and schedule: a finetune of that
+        # checkpoint, not a resume of its run (`--resume` restores both, and a finished cosine
+        # schedule resumes at its floor). `use_peft` makes make_policy load the base named in the
+        # adapter's config and the adapter on top; lerobot_train then keeps it instead of wrapping
+        # a fresh one.
+        policy["pretrained_path"] = str(args.init_adapter)
+        policy["use_peft"] = True
+    elif args.pretrained_path:
         # Weights only. `make_policy` passes this config into `from_pretrained`, so the
         # checkpoint supplies parameters and everything here supplies shape and hyperparameters
         # -- which is what lets a pi0.5 base trained on someone else's robot finetune onto this
@@ -1686,6 +1694,21 @@ def assert_pretrained_weights_resolve(pretrained_path: str, download: Callable[.
         ) from exc
 
 
+def read_init_adapter(path: Path | str) -> dict[str, Any]:
+    """The adapter config of an `--init-adapter` checkpoint, or a refusal before the run starts."""
+
+    root = Path(path).expanduser()
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        if not (root / name).is_file():
+            raise ValueError(
+                f"--init-adapter {root} has no {name}; pass a LoRA checkpoint's pretrained_model directory."
+            )
+    config = json.loads((root / "adapter_config.json").read_text(encoding="utf-8"))
+    if not config.get("base_model_name_or_path"):
+        raise ValueError(f"--init-adapter {root}: adapter_config.json names no base model.")
+    return config
+
+
 def validate_finetune_args(args: argparse.Namespace) -> None:
     """Refuse LoRA without a base model, here rather than 300 seconds into a training run.
 
@@ -1693,7 +1716,29 @@ def validate_finetune_args(args: argparse.Namespace) -> None:
     dataset has been scanned, the dataloader built and the policy constructed -- and on a
     remote training host that failure arrives as a line in a log file nobody is watching yet.
     """
-    if args.lora and not args.pretrained_path:
+    if args.init_adapter:
+        if args.resume:
+            raise ValueError("--init-adapter starts a new run from an adapter; --resume continues an old one. Pick one.")
+        if not args.lora:
+            raise ValueError(
+                "--init-adapter continues training a LoRA adapter; pass --lora with the adapter's own "
+                "--lora-r/--lora-alpha so lerobot_train keeps it."
+            )
+        adapter = read_init_adapter(args.init_adapter)
+        alpha = args.lora_r if args.lora_alpha is None else args.lora_alpha
+        # The loaded adapter keeps its own shape whatever the peft block says, so a block that
+        # disagrees would only make the run's record lie about what was trained.
+        if (adapter.get("r"), adapter.get("lora_alpha")) != (args.lora_r, alpha):
+            raise ValueError(
+                f"--init-adapter {args.init_adapter} is r={adapter.get('r')} alpha={adapter.get('lora_alpha')}, "
+                f"not --lora-r {args.lora_r} alpha {alpha}."
+            )
+        if args.pretrained_path and str(args.pretrained_path) != adapter["base_model_name_or_path"]:
+            raise ValueError(
+                f"--init-adapter {args.init_adapter} was trained on {adapter['base_model_name_or_path']}, "
+                f"not --pretrained-path {args.pretrained_path}; the base comes from the adapter, drop the flag."
+            )
+    elif args.lora and not args.pretrained_path:
         raise ValueError(
             "--lora adapts a pretrained model and there is nothing here to adapt. Pass "
             "--pretrained-path (for example --pretrained-path lerobot/pi05_base), or drop "
@@ -1930,6 +1975,7 @@ def make_inference_config(
             "action_append_names": action_append_names,
             "action_append_shift": args.action_append_shift,
             "pretrained_path": str(args.pretrained_path) if args.pretrained_path else None,
+            "init_adapter": str(args.init_adapter) if args.init_adapter else None,
             "peft": build_peft_section(args),
             "task_prompts": task_prompts,
         },
@@ -2157,6 +2203,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the weights come from there while every hyperparameter still comes from this "
             "script's generated config. Required by --lora, which has nothing to adapt without "
             "a pretrained model."
+        ),
+    )
+    parser.add_argument(
+        "--init-adapter",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Finetune a trained LoRA checkpoint: its pretrained_model directory. Loads the base it "
+            "names and the adapter's weights, with a fresh optimizer and --lr-scheduler (unlike "
+            "--resume, which restores both). Needs --lora with the adapter's own rank and alpha."
         ),
     )
     parser.add_argument(
@@ -2575,7 +2632,11 @@ def main() -> None:
         if not steps_supplied:
             print("[resume] --steps was not supplied; using total steps saved in the checkpoint config.")
     else:
-        if args.pretrained_path:
+        if args.init_adapter:
+            base = read_init_adapter(args.init_adapter)["base_model_name_or_path"]
+            print(f"[train] adapter: {args.init_adapter}")
+            print(f"[train] base weights: {assert_pretrained_weights_resolve(base)}")
+        elif args.pretrained_path:
             print(f"[train] base weights: {assert_pretrained_weights_resolve(str(args.pretrained_path))}")
         cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train", f"--config_path={config_path}"]
     print("[train] " + " ".join(cmd))

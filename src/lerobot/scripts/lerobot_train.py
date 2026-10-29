@@ -307,12 +307,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     if cfg.peft is not None:
-        if cfg.resume and cfg.policy.use_peft:
-            # make_policy already loaded the checkpoint adapter for inference.
-            # Re-wrapping would initialize it again and discard the learned weights.
+        if cfg.policy.use_peft:
+            # make_policy already loaded an adapter for inference: the checkpoint's own on a
+            # resume, or the one a finetune starts from (a fresh optimizer and schedule on
+            # trained weights). Re-wrapping would initialize it again and discard the learned weights.
             policy.set_adapter(policy.active_adapter)
             policy.peft_config[policy.active_adapter].inference_mode = False
-            logging.info("Resuming PEFT: keeping the loaded adapter and enabling its gradients.")
+            logging.info("Keeping the loaded PEFT adapter and enabling its gradients.")
         else:
             logging.info("Using PEFT! Wrapping model.")
             # Convert CLI peft config to dict for overrides
