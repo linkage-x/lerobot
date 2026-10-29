@@ -14,7 +14,8 @@ here, against a reference capture taken right after that registration:
   what the arm's workspace saw, rotation included (``|t_c| + |ω|·r``, with ``t_c`` the motion of the tags'
   centroid).
 * The table tags (``kind: static``, 45-49, fixed since 10-27) check the cameras first, in the image: each camera's
-  pixel corners of each table tag, reference against current.  A camera whose table tags shifted moved and is
+  pixel corners of each table tag, reference against current, as the tag's median corner shift (a camera moves
+  all four corners together; one corner pulled by something beside the tag is reported, not taken for it).  A camera whose table tags shifted moved and is
   left out of the carts; a tag that shifted in every camera that is otherwise steady was bumped and is left out of
   the check; when every camera that sees the table shifted, the table (or the whole rig) moved and no cart result
   is trusted.  A camera that sees no table tag cannot be checked and is left out of the carts too.  Pixels, not a
@@ -23,11 +24,12 @@ here, against a reference capture taken right after that registration:
 * ``freeze-datum`` keeps one table measurement as the table datum (``world/table_datum.json``): the corners in
   the world and each camera's pixel fingerprint.  ``cameras`` checks a later capture against it -- no reference
   capture, no calibration needed.
-* ``session`` does that for every episode of recorded datasets (the first ~0.5 s of each camera that has table
+* ``session`` does that for every episode of recorded datasets (keyframes spread over each camera that has table
   pixels in the datum) and keeps it in ``<dataset>/derived/table_check.json``; ``export_v3`` runs it for each
   session it exports and records the verdicts.  Each episode is held against the table pixels of the calibration
-  it was recorded on (that run's ``table_anchor.json``, or the datum for the datum's run): matching pixels on
-  other extrinsics only say the camera sat where some other calibration puts it.
+  its labels are on -- the run the session was tracked with, else the one production loaded when it was recorded
+  (that run's ``table_anchor.json``, or the datum for the datum's run): matching pixels on other extrinsics only
+  say the camera sat where some other calibration puts it.
 * ``anchor`` places a new calibration's bundle in the world by the table tags alone (``T_world_session``, from
   the sweep it was solved from and the datum's own calibration, ``anchor_cameras``): the independent datum
   ``world_registration``/``export_production_calibration --anchor`` take, which sees the whole rig moving as one.
@@ -84,13 +86,19 @@ CAMERA_OUTLIER_SHARE = 0.5
 #: 1/TAG_DROP_FACTOR of it, moved on its cart (re-stuck, peeled) and is not taken for the cart
 TAG_DROP_MM = 1.0
 TAG_DROP_FACTOR = 3.0
-SESSION_CHECK_SCHEMA = "table_session_check/v2"
+SESSION_CHECK_SCHEMA = "table_session_check/v3"
 #: where ``session`` writes, under the dataset root (beside the tracker's sidecar; a Replay delete drops both)
 SESSION_CHECK_PATH = Path("derived") / "table_check.json"
-#: frames read per camera and episode: every SESSION_STRIDE-th of the first ones, ~0.5 s at 60 fps.  10-27
-#: 15 frames at stride 2 held every table tag within 0.31 px of the datum's 60-frame mean
+#: frames read per camera and episode, at keyframes spread over the whole episode.  10-28 144417 against the
+#: datum: the first ~0.5 s (15 frames, stride 2) read the steady cameras' tags 0.25-0.77 px off (cam_12's 46
+#: over the limit), 15 keyframes across the episode 0.09-0.34 px -- the start of a recording is not settled
 SESSION_SAMPLES = 15
-SESSION_STRIDE = 2
+#: the recorder writes a keyframe every second (HEVC at 60 fps, ffprobe 10-28): seeking to one decodes one frame
+KEYFRAME_EVERY = 60
+#: a camera moves all four corners of a tag together; a corner further than this from the tag's median shift
+#: was pulled by something beside the tag and is reported, not taken for the camera.  10-28 cam_09: a clear
+#: plastic box against 46's corner 0 read it 1.8-3.0 px off while the other three corners moved <= 0.9 px
+CORNER_SPREAD_PX = 0.75
 #: per-episode verdicts, the first that applies wins when a session is summed up.  ``other_calibration``: the
 #: episode was recorded on extrinsics that have no table pixels of their own (no ``table_anchor.json`` in the
 #: run, and not the datum's run), so pixels matching the datum do not say the extrinsics it was labelled with
@@ -100,6 +108,8 @@ ANCHOR_SCHEMA = "table_anchor/v1"
 #: written next to the bundle by ``anchor``, and copied into the exported extrinsics run by the gateway: the
 #: table pixels a calibration was captured with are what its episodes are checked against
 ANCHOR_FILE = "table_anchor.json"
+#: the gateway's log of every calibration promotion, under the calibration root
+PROMOTION_LOG = "promotions.jsonl"
 #: frames read per camera, spread over the whole calibration sweep: the board and whoever carries it hide
 #: different table tags at different times.  10-27 185829 (5402 frames): 120 frames kept 45/46/48 in 74-120 of them
 ANCHOR_SAMPLES = 120
@@ -379,10 +389,55 @@ def _detector(dictionary: str):
     return cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary)), params)
 
 
+def _strided(cap: Any, stride: int, max_samples: int) -> Any:
+    sampled = 0
+    index = -1
+    while sampled < max_samples:
+        if not cap.grab():
+            return
+        index += 1
+        if index % stride:
+            continue
+        ok, image = cap.retrieve()
+        if not ok:
+            return
+        sampled += 1
+        yield image
+
+
+def _at(cap: Any, positions: list[int]) -> Any:
+    import cv2
+
+    for position in positions:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, position)
+        ok, image = cap.read()
+        if not ok:
+            return
+        yield image
+
+
+def spread_positions(frames: int, samples: int) -> list[int]:
+    """``samples`` frame indices spread over a video of ``frames``: keyframes when it has enough of them."""
+    keyframes = np.arange(0, frames, KEYFRAME_EVERY)
+    pool = keyframes if len(keyframes) >= samples else np.arange(frames)
+    if not len(pool):
+        return []
+    return sorted({int(pool[i]) for i in np.linspace(0, len(pool) - 1, samples).round().astype(int)})
+
+
 def detect_video(
-    path: Path, dictionary: str, ids: set[int], stride: int = 5, max_samples: int = 60
+    path: Path,
+    dictionary: str,
+    ids: set[int],
+    stride: int = 5,
+    max_samples: int = 60,
+    *,
+    positions: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Per tag: the robust mean of its corners over the sampled frames, and how steady they were."""
+    """Per tag: the robust mean of its corners over the sampled frames, and how steady they were.
+
+    The frames are every ``stride``-th from the start, at most ``max_samples``; or the frames at ``positions``.
+    """
     import cv2
 
     detector = _detector(dictionary)
@@ -390,16 +445,7 @@ def detect_video(
     corners: dict[int, list[np.ndarray]] = {}
     sampled = 0
     size = None
-    index = -1
-    while sampled < max_samples:
-        if not cap.grab():
-            break
-        index += 1
-        if index % stride:
-            continue
-        ok, image = cap.retrieve()
-        if not ok:
-            break
+    for image in _at(cap, positions) if positions is not None else _strided(cap, stride, max_samples):
         sampled += 1
         size = (image.shape[1], image.shape[0])
         gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -525,18 +571,73 @@ def _triangulate_tags(
     return {"tags": tags, "cameras": cameras}
 
 
-def _episode_calibration(episode: Path) -> str | None:
+def _utc(stamp: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)  # noqa: UP017
+
+
+def load_promotions(path: Path) -> list[tuple[datetime, str, str]]:
+    """``(when, from, to)`` of every extrinsics promotion in the gateway's ``promotions.jsonl``, oldest first."""
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        when = _utc(record.get("at") or "")
+        for change in record.get("changes") or []:
+            if when is not None and change.get("kind") == "extrinsics":
+                out.append((when, str(change.get("from") or ""), str(change.get("to") or "")))
+    return sorted(out)
+
+
+def _production_at(promotions: list[tuple[datetime, str, str]], moment: datetime) -> str | None:
+    """The extrinsics production pointed at, at ``moment``, as far as the promotion log knows (hand edits of the
+    tracking config are not in it)."""
+    before = [to for when, _, to in promotions if when <= moment]
+    if before:
+        return before[-1] or None
+    after = [frm for when, frm, _ in promotions if when > moment]
+    return after[0] if after and after[0] else None
+
+
+def _episode_calibration(
+    episode: Path, promotions: list[tuple[datetime, str, str]] | None = None
+) -> tuple[str | None, str]:
+    """The extrinsics run production loaded when the episode was recorded, and where that came from.
+
+    In order: the recorder's ``production_calibration`` stamp (10-28 on); the promotion log at the episode's start;
+    ``world_frame.last_registration`` -- which only names what the last continuity check ran on, and so went on
+    naming calib_20261014_180431 for every episode after 1027 was promoted without one.
+    """
     meta = episode / "meta.json"
     if not meta.exists():
-        return None
-    world = json.loads(meta.read_text(encoding="utf-8")).get("world_frame") or {}
-    return (world.get("last_registration") or {}).get("calibration_id") or world.get("calibration_id")
+        return None, "no_meta"
+    payload = json.loads(meta.read_text(encoding="utf-8"))
+    stamped = payload.get("production_calibration") or {}
+    if stamped.get("status") == "ok" and stamped.get("extrinsics_run"):
+        return str(stamped["extrinsics_run"]), "recorder_stamp"
+    start = _utc(payload.get("wallclock_start_utc") or "")
+    logged = _production_at(promotions or [], start) if start is not None else None
+    if logged:
+        return logged, "promotion_log"
+    world = payload.get("world_frame") or {}
+    run = (world.get("last_registration") or {}).get("calibration_id") or world.get("calibration_id")
+    return run, "world_registration"
 
 
 def _measure(args: argparse.Namespace) -> int:
     episode = args.episode.resolve()
     layout = load_layout(args.layout)
-    run = args.calibration_run or _episode_calibration(episode)
+    run = (
+        args.calibration_run
+        or _episode_calibration(episode, load_promotions(args.calibration_root / PROMOTION_LOG))[0]
+    )
     if not run:
         print(f"{episode}: no meta.json naming the calibration it was recorded with; give --calibration-run")
         return 2
@@ -765,16 +866,24 @@ def static_check(
     limit_px: float,
     cameras: list[str],
 ) -> dict[str, Any]:
-    """Which cameras kept their view of the fixed tags: per camera and tag, the largest corner shift in pixels.
+    """Which cameras kept their view of the fixed tags: per camera and tag, the median shift of its corners in
+    pixels.  A corner that strays from that median by more than CORNER_SPREAD_PX was mislocated (something
+    beside the tag) and is reported under ``corners_off``: the median moves only when two corners agree, where
+    the largest corner shift (until 10-28) followed any single one.
 
     A camera moved when most of its tags shifted; a tag was bumped when it shifted in every camera that did not.
     ``cameras``: every camera to report on -- one with no fixed tag in both captures is ``unverified``.
     """
-    shift = {
-        n: {t: float(np.linalg.norm(cur_px[n][t] - ref_px[n][t], axis=1).max()) for t in ids
-            if t in ref_px.get(n, {}) and t in cur_px.get(n, {})}
+    moves = {
+        n: {t: cur_px[n][t] - ref_px[n][t] for t in ids if t in ref_px.get(n, {}) and t in cur_px.get(n, {})}
         for n in cameras
-    }  # fmt: skip
+    }
+    median = {n: {t: np.median(d, axis=0) for t, d in v.items()} for n, v in moves.items()}
+    shift = {n: {t: float(np.linalg.norm(m)) for t, m in v.items()} for n, v in median.items()}
+    spread = {
+        n: {t: float(np.linalg.norm(d - median[n][t], axis=1).max()) for t, d in v.items()}
+        for n, v in moves.items()
+    }
     over = {n: {t for t, s in v.items() if s > limit_px} for n, v in shift.items()}
 
     def moved_cameras(bumped: set[int]) -> set[str]:
@@ -794,6 +903,9 @@ def static_check(
         per_cam[n] = {
             "status": "unverified" if not tags else "moved" if n in moved else "ok",
             "shift_px": {str(t): round(s, 3) for t, s in sorted(v.items())},
+            "corners_off_px": {
+                str(t): round(x, 3) for t, x in sorted(spread[n].items()) if x > CORNER_SPREAD_PX
+            },
         }
     ok = sorted(n for n, v in per_cam.items() if v["status"] == "ok")
     moved_list = sorted(moved)
@@ -807,10 +919,14 @@ def static_check(
         "status": status,
         "why": why,
         "limit_px": limit_px,
+        "corner_spread_px": CORNER_SPREAD_PX,
         "cameras_ok": ok,
         "cameras_moved": moved_list,
         "cameras_unverified": sorted(n for n, v in per_cam.items() if v["status"] == "unverified"),
         "tags_bumped": sorted(bumped),
+        "corners_off": {
+            n: sorted(int(t) for t in v["corners_off_px"]) for n, v in per_cam.items() if v["corners_off_px"]
+        },
         "cameras": per_cam,
     }
 
@@ -891,6 +1007,10 @@ def compare(
     }
 
 
+def _corners_off(off: dict[str, list[int]]) -> str:
+    return " ".join(f"{n.removeprefix('cam_')}:{','.join(map(str, tags))}" for n, tags in sorted(off.items()))
+
+
 def _static_summary(s: dict[str, Any]) -> list[str]:
     def cams(names):
         return ",".join(n.removeprefix("cam_") for n in names) or "-"
@@ -901,6 +1021,7 @@ def _static_summary(s: dict[str, Any]) -> list[str]:
         + f"  ok {cams(s['cameras_ok'])}  moved {cams(s['cameras_moved'])}"
         + f"  unverified {cams(s['cameras_unverified'])}"
         + (f"  bumped tags {s['tags_bumped']}" if s["tags_bumped"] else "")
+        + (f"  corners off {_corners_off(s['corners_off'])}" if s.get("corners_off") else "")
     ]
     for n, v in s["cameras"].items():
         if v["shift_px"]:
@@ -1337,16 +1458,19 @@ def _video_fingerprint(episode: Path) -> dict[str, list[int]]:
 
 
 def detect_episode(
-    episode: Path, cameras: list[str], dictionary: str, ids: set[int], *, stride: int, max_samples: int
+    episode: Path, cameras: list[str], dictionary: str, ids: set[int], *, max_samples: int
 ) -> dict[str, dict[str, Any]]:
-    """``detect_video`` on each of ``cameras`` the episode recorded, one thread per camera (decoding and
-    detection release the GIL)."""
+    """``detect_video`` on each of ``cameras`` the episode recorded, ``max_samples`` frames spread over it, one
+    thread per camera (decoding and detection release the GIL)."""
     videos = [episode / f"{n}.mkv" for n in cameras if (episode / f"{n}.mkv").exists()]
     if not videos:
         return {}
     with ThreadPoolExecutor(max_workers=len(videos)) as pool:
         found = pool.map(
-            lambda v: detect_video(v, dictionary, ids, stride=stride, max_samples=max_samples), videos
+            lambda v: detect_video(
+                v, dictionary, ids, positions=spread_positions(_frame_count(v), max_samples)
+            ),
+            videos,
         )
         return {v.stem: d for v, d in zip(videos, found, strict=True)}
 
@@ -1380,7 +1504,15 @@ def episode_table_check(
         "verdict": verdict,
         **{
             k: r[k]
-            for k in ("status", "why", "cameras_ok", "cameras_moved", "cameras_unverified", "tags_bumped")
+            for k in (
+                "status",
+                "why",
+                "cameras_ok",
+                "cameras_moved",
+                "cameras_unverified",
+                "tags_bumped",
+                "corners_off",
+            )
         },
         "cameras_not_recorded": sorted(set(ref_px) - set(detections)),
         "cameras": r["cameras"],
@@ -1425,6 +1557,10 @@ def _summarise_session(episodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "episode_verdicts": verdicts,
         "cameras_moved": sorted({n for e in episodes.values() for n in e["cameras_moved"]}),
         "tags_bumped": sorted({t for e in episodes.values() for t in e["tags_bumped"]}),
+        "corners_off": {
+            n: sorted({t for e in episodes.values() for t in e.get("corners_off", {}).get(n, [])})
+            for n in sorted({n for e in episodes.values() for n in e.get("corners_off", {})})
+        },
         "worst_shift_px": {n: round(s, 3) for n, s in sorted(worst.items())},
         "references": sorted(
             {json.dumps(e["reference"], sort_keys=True) for e in episodes.values() if e["reference"]}
@@ -1442,10 +1578,13 @@ def check_session(
     previous: dict[str, Any] | None = None,
     *,
     calibration_root: Path | None = None,
-    stride: int = SESSION_STRIDE,
+    extrinsics_run: str | None = None,
     max_samples: int = SESSION_SAMPLES,
 ) -> dict[str, Any]:
-    """Every episode of a recorded dataset against the table pixels of the calibration it was recorded on.
+    """Every episode of a recorded dataset against the table pixels of the calibration its labels are on.
+
+    That is ``extrinsics_run`` when given (export_v3 passes the run the session was tracked with), else the
+    run production loaded when the episode was recorded (:func:`_episode_calibration`).
 
     That is the run's own calibration capture (``<calibration_root>/<run>_extrinsics/table_anchor.json``, which
     the gateway leaves there since 10-28) or, for the datum's run, the datum.  An episode on a run with neither is
@@ -1460,7 +1599,8 @@ def check_session(
     settings = {
         "datum_sha256": _sha256(datum_path),
         "limit_px": limit_px,
-        "stride": stride,
+        "corner_spread_px": CORNER_SPREAD_PX,
+        "sampling": "keyframes spread over the episode",
         "max_samples": max_samples,
     }
     datum_run = str(datum["calibration"]["extrinsics_run"]).removesuffix("_extrinsics")
@@ -1483,9 +1623,12 @@ def check_session(
         return references[run]
 
     reuse = (previous or {}).get("episodes_detail", {})
+    promotions = load_promotions(calibration_root / PROMOTION_LOG) if calibration_root is not None else []
     episodes: dict[str, dict[str, Any]] = {}
     for episode in sorted(p for p in (dataset / "episodes").glob("episode_*") if p.is_dir()):
-        run = _episode_calibration(episode)
+        run, source = (
+            (extrinsics_run, "tracking_run") if extrinsics_run else _episode_calibration(episode, promotions)
+        )
         run = run.removesuffix("_extrinsics") if run else None
         ref = reference(run)
         ref_meta, ref_pixels = ref or (None, datum["camera_pixels"])
@@ -1494,7 +1637,7 @@ def check_session(
             "videos": _video_fingerprint(episode),
             "cameras": sorted(with_pixels),
             "ids": sorted({int(t) for v in with_pixels.values() for t in v}),
-            "stride": stride,
+            "sampling": "keyframes",
             "max_samples": max_samples,
         }
         before = reuse.get(episode.name) or {}
@@ -1509,7 +1652,6 @@ def check_session(
                 decoded["cameras"],
                 datum["dictionary"],
                 set(decoded["ids"]),
-                stride=stride,
                 max_samples=max_samples,
             )
         check = episode_table_check(with_pixels, detections, limit_px)
@@ -1520,6 +1662,7 @@ def check_session(
             "verdict": verdict,
             "pixel_verdict": pixels,
             "extrinsics_run": run,
+            "extrinsics_run_source": source,
             "reference": ref_meta,
             "decoded": decoded,
             "detections": {
@@ -1544,7 +1687,8 @@ def check_session(
         "settings": settings,
         "meaning": (
             "whether each calibrated camera still sees the fixed table tags where it saw them when the extrinsics "
-            "the episode was recorded on were captured (pixels, no calibration involved: the run's own "
+            "its labels are on were captured (the tracking run's, else the run production loaded at record time: "
+            "extrinsics_run_source) (pixels, no calibration involved: the run's own "
             "table_anchor.json, or the datum for the datum's run); a moved camera's labels are off by what its "
             "extrinsics no longer describe. Cameras with no table tag in view are not covered (datum "
             "cameras_without_a_table_tag)."
@@ -1567,6 +1711,8 @@ def describe_session(s: dict[str, Any]) -> str:
         head += " moved: " + ", ".join(f"{n} in {len(eps)}" for n, eps in moved.items())
     if s["tags_bumped"]:
         head += f" bumped tags {s['tags_bumped']}"
+    if s.get("corners_off"):
+        head += f" corners off (something beside the tag) {_corners_off(s['corners_off'])}"
     if s["worst_shift_px"]:
         head += " worst " + " ".join(
             f"{n.removeprefix('cam_')}:{v:.2f}" for n, v in s["worst_shift_px"].items()
@@ -1593,7 +1739,12 @@ def _session(args: argparse.Namespace) -> int:
         if previous is not None and previous.get("schema") != SESSION_CHECK_SCHEMA:
             previous = None
         s = check_session(
-            dataset, args.datum, layout, previous, calibration_root=args.calibration_root.resolve()
+            dataset,
+            args.datum,
+            layout,
+            previous,
+            calibration_root=args.calibration_root.resolve(),
+            extrinsics_run=args.extrinsics_run,
         )
         print(f"{dataset.name}: {describe_session(s)}")
         flagged += s["verdict"] in {"cameras_moved", "table_or_all_cameras_moved"}
@@ -1651,7 +1802,13 @@ def main(argv: list[str] | None = None) -> int:
         "--calibration-root",
         type=Path,
         default=Path("outputs/calibration"),
-        help=f"where each episode's extrinsics run (and its {ANCHOR_FILE}) is",
+        help=f"where each episode's extrinsics run (and its {ANCHOR_FILE}, and {PROMOTION_LOG}) is",
+    )
+    s.add_argument(
+        "--extrinsics-run",
+        default=None,
+        help="hold every episode against this run (the one the session was tracked with); "
+        "default: the run production loaded when each episode was recorded",
     )
     a = sub.add_parser("anchor", help="a calibration's bundle placed in the world by the table tags (cv2)")
     a.add_argument(

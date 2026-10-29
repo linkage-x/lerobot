@@ -6,7 +6,7 @@
     "Only differences are used: a reference capture right after registration against a capture after each re-dock, same cameras, same calibration. Tag sizes do not enter the triangulation; black_edge_mm is only checked against the triangulated edges.",
     "left_cart 20-29 is one 2x5 printed strip along the cart's table side (it was called the static scene markers until 10-27). 33/34 are spares for the left cart, not stuck yet.",
     "The table group (45-49) is fixed since 10-27 and checks the cameras, in pixels: each camera's corners of each table tag, reference against current (static_px). A camera that shifted is left out of the carts; when every camera shifted, the table moved and no cart result is trusted. static_reach_m only scales the table's 3D motion, which is shown, not used.",
-    "static_px 0.6: 10-27 two captures 2.5 h apart, nothing touched, held every table tag within 0.44 px (largest corner shift; 0.01 deg of camera drift) in every camera. 0.6 px is ~0.035 deg of camera rotation at f ~1000 px. Provisional, like the rest.",
+    "static_px 0.6: 10-27 two captures 2.5 h apart, nothing touched, held every table tag within 0.44 px (largest corner shift; 0.01 deg of camera drift) in every camera. 0.6 px is ~0.035 deg of camera rotation at f ~1000 px. Since 10-28 it applies to a tag's median corner shift: one corner pulled by something beside the tag (cam_09's 46, a plastic box) no longer moves a camera. Provisional, like the rest.",
     "Printed 10-27 on a printer that fit the page to 95 %: 33/34/40-49 have a 76 mm black edge (calipers, both directions); 20-29 are 80 mm."
   ],
   "groups": {

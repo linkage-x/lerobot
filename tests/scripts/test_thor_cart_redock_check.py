@@ -209,6 +209,22 @@ def test_a_bumped_table_tag_is_told_from_a_moved_camera(tmp_path) -> None:
     assert static["status"] == "ok"
 
 
+def test_one_corner_pulled_by_something_beside_the_tag_does_not_move_the_camera(tmp_path) -> None:
+    # 10-28 cam_09: a clear plastic box against table tag 46 dragged its corner 0 by 3 px, the other three held
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _capture(cams, layout, _detections(cams, _corners(), seed=1))
+    seen = _detections(cams, _corners(), seed=2)
+    seen["cam_09"]["tags"][46]["corners_px"][0] += [3.0, -1.5]
+    static = rc.compare(cams, ref, _capture(cams, layout, seen), layout)["static_check"]
+    assert static["status"] == "ok" and static["cameras_moved"] == [] and static["tags_bumped"] == []
+    assert static["cameras"]["cam_09"]["shift_px"]["46"] < 0.1
+    assert static["corners_off"] == {"cam_09": [46]}
+    assert static["cameras"]["cam_09"]["corners_off_px"]["46"] > 3.0
+    assert "corners off 09:46" in rc._report_summary(
+        rc.compare(cams, ref, _capture(cams, layout, seen), layout)
+    )
+
+
 def test_a_camera_that_sees_no_table_tag_cannot_vouch_and_is_left_out(tmp_path) -> None:
     cams, layout = _cameras(), _layout(tmp_path)
     hidden = {("cam_14", t) for t in (45, 46, 47)}
@@ -383,6 +399,38 @@ def test_detection_averages_the_frames_and_keeps_only_layout_tags(tmp_path) -> N
     assert list(det["tags"]) == [40]
     assert det["tags"][40]["frames"] == 10
     assert np.abs(det["tags"][40]["corners_px"] - placed[40]).max() < 1.0
+    det = rc.detect_video(video, "DICT_6X6_50", {40, 41}, positions=[0, 7, 19])
+    assert det["sampled"] == 3 and det["tags"][40]["frames"] == 3
+
+
+def test_a_session_samples_keyframes_over_the_whole_episode() -> None:
+    # 10-28 144417: the first ~0.5 s read steady cameras up to 0.77 px off the datum, the whole episode <= 0.34
+    every = rc.KEYFRAME_EVERY
+    positions = rc.spread_positions(60 * every + 7, 15)
+    assert len(positions) == 15 and all(p % every == 0 for p in positions)
+    assert positions[0] == 0 and positions[-1] == 60 * every
+    assert rc.spread_positions(5 * every, 15) == sorted(
+        set(np.linspace(0, 5 * every - 1, 15).round().astype(int))
+    )
+    assert rc.spread_positions(0, 15) == []
+
+
+def test_an_episode_is_decoded_at_spread_positions(tmp_path, monkeypatch) -> None:
+    episode = tmp_path / "episode_000000"
+    episode.mkdir()
+    for cam in ("cam_07", "cam_09"):
+        (episode / f"{cam}.mkv").write_bytes(b"0")
+    monkeypatch.setattr(rc, "_frame_count", lambda path: 3000)
+    asked = {}
+
+    def fake_video(path, dictionary, ids, stride=5, max_samples=60, *, positions=None):
+        asked[path.stem] = positions
+        return {"sampled": len(positions), "size": (1920, 1080), "tags": {}}
+
+    monkeypatch.setattr(rc, "detect_video", fake_video)
+    rc.detect_episode(episode, ["cam_07", "cam_09", "cam_14"], "DICT_6X6_50", {45}, max_samples=15)
+    assert sorted(asked) == ["cam_07", "cam_09"]
+    assert asked["cam_09"] == rc.spread_positions(3000, 15) and asked["cam_09"][-1] > 2900
 
 
 def _frozen_datum(tmp_path, cams, layout) -> Path:
@@ -415,7 +463,7 @@ def test_a_session_is_checked_episode_by_episode_and_only_new_videos_are_read(tm
     }
     reads = []
 
-    def fake_detect(episode, cameras, dictionary, ids, *, stride, max_samples):
+    def fake_detect(episode, cameras, dictionary, ids, *, max_samples):
         reads.append(episode.name)
         return {n: d for n, d in seen[episode.name].items() if n in cameras}
 
@@ -453,6 +501,63 @@ def test_a_session_is_checked_episode_by_episode_and_only_new_videos_are_read(tm
     assert rc.main(argv) == 0 and reads[-1] == "episode_000001" and len(reads) == 3
     s = json.loads((dataset / rc.SESSION_CHECK_PATH).read_text())
     assert s["verdict"] == "other_calibration" and s["cameras_moved"] == []
+
+
+def test_an_episode_is_held_against_the_run_production_loaded_not_the_last_registration(
+    tmp_path, monkeypatch
+):
+    # 10-28: 1027 was promoted with no continuity check, so world_registration.json went on naming 1014 and
+    # every later episode was held against 1014 (no table pixels: other_calibration, i.e. no answer).
+    cams, layout = _cameras(), _layout(tmp_path)
+    datum = _frozen_datum(tmp_path, cams, layout)  # its run is calib_x
+    monkeypatch.setattr(rc, "detect_episode", lambda e, c, *a, **k: _detections(cams, _corners(), seed=2))
+    dataset = _recorded_session(
+        tmp_path,
+        dict.fromkeys(("episode_000000", "episode_000001", "episode_000002", "episode_000003"), "calib_old"),
+    )
+
+    def meta(name: str, **fields) -> None:
+        path = dataset / "episodes" / name / "meta.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), **fields}))
+
+    stale = {"last_registration": {"calibration_id": "calib_old_extrinsics"}}
+    meta("episode_000000", world_frame=stale, wallclock_start_utc="2026-10-28T06:44:48.022266+00:00",
+         production_calibration={"status": "ok", "extrinsics_run": "calib_x_extrinsics"})  # fmt: skip
+    meta("episode_000001", world_frame=stale, wallclock_start_utc="2026-10-28T06:44:48+00:00")
+    meta("episode_000002", world_frame=stale, wallclock_start_utc="2026-10-20T01:00:00+00:00")
+    meta("episode_000003", world_frame=stale, wallclock_start_utc="2026-09-01T01:00:00+00:00")
+    root = tmp_path / "calibration"
+    root.mkdir()
+    (root / rc.PROMOTION_LOG).write_text(
+        "\n".join(
+            json.dumps({"at": at, "changes": [{"kind": "extrinsics", "from": frm, "to": to},
+                                              {"kind": "intrinsics", "from": "i", "to": "j"}]})
+            for at, frm, to in (("2026-10-15T02:27:51Z", "calib_0928_extrinsics", "calib_old_extrinsics"),
+                                ("2026-10-27T09:39:11Z", "calib_old_extrinsics", "calib_x_extrinsics"))
+        ) + "\nnot json\n"
+    )  # fmt: skip
+
+    s = rc.check_session(dataset, datum, layout, calibration_root=root)
+
+    detail = s["episodes_detail"]
+    assert {n: (d["extrinsics_run"], d["extrinsics_run_source"]) for n, d in detail.items()} == {
+        "episode_000000": ("calib_x", "recorder_stamp"),
+        "episode_000001": ("calib_x", "promotion_log"),
+        "episode_000002": ("calib_old", "promotion_log"),
+        "episode_000003": ("calib_0928", "promotion_log"),  # before the first promotion: what it replaced
+    }
+    assert s["episode_verdicts"]["episode_000000"] == s["episode_verdicts"]["episode_000001"] == "ok"
+    assert s["episode_verdicts"]["episode_000002"] == "other_calibration"
+
+    # No log: the last registration, as before.  And a tracked session's run overrides every stamp.
+    (root / rc.PROMOTION_LOG).unlink()
+    s = rc.check_session(dataset, datum, layout, calibration_root=root)
+    assert detail["episode_000000"]["extrinsics_run_source"] == "recorder_stamp"
+    assert s["episodes_detail"]["episode_000001"]["extrinsics_run_source"] == "world_registration"
+    assert s["episode_verdicts"]["episode_000001"] == "other_calibration"
+    s = rc.check_session(dataset, datum, layout, calibration_root=root, extrinsics_run="calib_x_extrinsics")
+    assert set(s["episode_verdicts"].values()) == {"ok"}
+    assert {d["extrinsics_run_source"] for d in s["episodes_detail"].values()} == {"tracking_run"}
 
 
 def test_a_session_whose_cameras_see_no_table_tag_is_unchecked_not_ok(tmp_path, monkeypatch) -> None:

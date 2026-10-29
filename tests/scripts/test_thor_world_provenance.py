@@ -152,6 +152,51 @@ def test_repo_reference_is_readable() -> None:
     assert block["world_frame_id"] in {node["world_frame_id"] for node in graph["nodes"]}
 
 
+def _write_tracking_config(root: Path, text: str) -> Path:
+    path = root / wp.PRODUCTION_TRACKING_CONFIG
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_production_calibration_is_read_from_the_pointers_not_the_last_registration(tmp_path: Path) -> None:
+    assert wp.read_production_calibration(tmp_path)["status"] == wp.STATUS_MISSING
+    _write_tracking_config(
+        tmp_path,
+        "calibration:\n"
+        "  # the reasoning stays in comments\n"
+        "  intrinsics_run_name: calib_20261027_173815_intrinsics\n"
+        "  fixed_camera_run_name: 'calib_20261027_173815_extrinsics'  # promoted 10-27\n"
+        "  auxiliary_marker_run_name: \"\"\n",
+    )
+
+    block = wp.read_production_calibration(tmp_path)
+
+    assert block["status"] == wp.STATUS_OK
+    assert block["extrinsics_run"] == "calib_20261027_173815_extrinsics"
+    assert block["intrinsics_run"] == "calib_20261027_173815_intrinsics"
+    assert block["config_path"] == str(wp.PRODUCTION_TRACKING_CONFIG) and len(block["config_sha256"]) == 64
+
+
+def test_production_calibration_with_a_doubled_pointer_is_incomplete_not_guessed(tmp_path: Path) -> None:
+    _write_tracking_config(
+        tmp_path,
+        "intrinsics_run_name: a_intrinsics\nfixed_camera_run_name: a_extrinsics\nfixed_camera_run_name: b_extrinsics\n",
+    )
+
+    block = wp.read_production_calibration(tmp_path)
+
+    assert block["status"] == wp.STATUS_INCOMPLETE and "extrinsics_run" not in block
+
+
+def test_repo_production_calibration_is_readable() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    if not (repo_root / wp.PRODUCTION_TRACKING_CONFIG).is_file():
+        pytest.skip("opencv_kalibr submodule not checked out")
+    block = wp.read_production_calibration(repo_root)
+    assert block["status"] == wp.STATUS_OK and block["extrinsics_run"].endswith("_extrinsics")
+
+
 def test_lr3_writer_stamps_info_json(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     from tools.thor.gmsl2 import thor_lerobot_v3 as lr3

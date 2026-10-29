@@ -854,6 +854,7 @@ def _write_episode_meta(
     world_frame: dict[str, Any],
     capture_intent: dict[str, Any] | None = None,
     camera_identity: dict[str, Any] | None = None,
+    production_calibration: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -899,6 +900,10 @@ def _write_episode_meta(
         # frozen reference on disk at record time (see world_provenance.py); it
         # is the one field here that cannot be reconstructed afterwards.
         "world_frame": world_frame,
+        # The calibration production loaded when the session connected (world_provenance.
+        # read_production_calibration) -- not world_frame.last_registration, which only says what the
+        # last continuity check ran on.  Tracking may later use another run; its summary says which.
+        "production_calibration": production_calibration or {},
         "video": {
             "recorder_backend": cfg.cameras.recorder_backend,
             "fps": cfg.cameras.fps,
@@ -1515,6 +1520,14 @@ def main(argv: list[str] | None = None) -> int:
     # dataset across two worlds without the dataset saying so.
     world_frame = wp.read_world_provenance(repo_root)
     _emit(wp.describe(world_frame))
+    production_calibration = wp.read_production_calibration(repo_root)
+    _emit(
+        f"Production calibration: {production_calibration.get('extrinsics_run')} / "
+        f"{production_calibration.get('intrinsics_run')}"
+        if production_calibration["status"] == wp.STATUS_OK
+        else f"WARNING: Production calibration {production_calibration['status']} "
+        f"({production_calibration['config_path']})"
+    )
 
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
@@ -2330,6 +2343,7 @@ def main(argv: list[str] | None = None) -> int:
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
                     world_frame, capture_intent, camera_identity,
+                    production_calibration=production_calibration,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for

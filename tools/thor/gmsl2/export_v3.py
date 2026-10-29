@@ -1193,6 +1193,7 @@ _TABLE_CHECK_KEPT = (
     "episode_verdicts",
     "cameras_moved",
     "tags_bumped",
+    "corners_off",
     "worst_shift_px",
     "cameras_without_a_table_tag",
     "extrinsics_runs",
@@ -1203,7 +1204,7 @@ _TABLE_CHECK_KEPT = (
 )
 
 
-def _table_check(session_dir: Path) -> dict[str, Any]:
+def _table_check(session_dir: Path, extrinsics_run: str = "") -> dict[str, Any]:
     """The session's cameras against the fixed table tags 45-49 (``cart_redock_check.py session``).
 
     Per episode and camera: are the table tags still where the camera saw them when the extrinsics
@@ -1212,7 +1213,9 @@ def _table_check(session_dir: Path) -> dict[str, Any]:
     resolves ~0.2 deg and needs a cube in view).  Recorded and warned about, never refused on and never part of the
     label key: the limit is provisional, a moved table leaves the labels alone, and a field added to
     the key would part every export from the ones made before it.  The episodes already read are
-    kept in ``derived/table_check.json``, so only new ones are decoded.
+    kept in ``derived/table_check.json``, so only new ones are decoded.  ``extrinsics_run`` is the run the
+    session was tracked with, when it was: the labels' extrinsics, which need not be the run production loaded
+    while recording.
     """
     python = _REPO_ROOT / _TABLE_CHECK_PYTHON
     if not python.is_file():
@@ -1226,6 +1229,8 @@ def _table_check(session_dir: Path) -> dict[str, Any]:
         "--calibration-root",
         str(_REPO_ROOT / "outputs" / "calibration"),
     ]
+    if extrinsics_run:
+        command += ["--extrinsics-run", extrinsics_run]
     # The venv's own numpy/cv2 only: an inherited PYTHONPATH (the gateway adds the repo and passes on its
     # own) could put another numpy ahead of the venv's C extensions.  The script imports nothing else.
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
@@ -1261,6 +1266,9 @@ def _describe_table_check(check: dict[str, Any]) -> str:
         line += f", moved {','.join(check['cameras_moved'])}"
     if check.get("tags_bumped"):
         line += f", bumped tags {check['tags_bumped']}"
+    if check.get("corners_off"):
+        off = (f"{n.removeprefix('cam_')}:{','.join(map(str, t))}" for n, t in check["corners_off"].items())
+        line += f", corners off {' '.join(off)}"
     worst = check.get("worst_shift_px") or {}
     if worst:
         line += ", worst " + " ".join(f"{n.removeprefix('cam_')}:{v:.2f}" for n, v in worst.items()) + " px"
@@ -1467,8 +1475,10 @@ def export_task_to_v3(
     for session, labels in session_labels.items():
         _emit(f"Labels: {session}: {_describe_labels(labels)}")
     for session_dir in sorted({src.session_dir for src in episodes}):
-        check = _table_check(session_dir)
-        session_labels[session_dir.name]["table_check"] = check
+        labels = session_labels[session_dir.name]
+        tracked_run = str(labels.get("extrinsics") or "") if labels.get("tracked") else ""
+        check = _table_check(session_dir, tracked_run)
+        labels["table_check"] = check
         _emit(f"Cameras vs table datum: {session_dir.name}: {_describe_table_check(check)}")
         if check["verdict"] in _TABLE_CHECK_FLAGGED:
             _emit(

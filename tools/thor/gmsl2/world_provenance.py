@@ -50,6 +50,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -181,6 +182,42 @@ def read_world_provenance(repo_root: Path | str) -> dict[str, Any]:
     if registration is not None:
         block["last_registration"] = registration
     return block
+
+
+#: The tracking config whose two pointers are the production calibration (the gateway's promote is
+#: their only writer).  Read here as text, not YAML: this module stays stdlib-only.
+PRODUCTION_TRACKING_CONFIG = (
+    Path("third_party")
+    / "opencv_kalibr"
+    / "hikon_cube_tracking_offline"
+    / "config_thor"
+    / "april_cube_tracking_in_robot_base_thor.yaml"
+)
+_PRODUCTION_POINTERS = {"intrinsics_run": "intrinsics_run_name", "extrinsics_run": "fixed_camera_run_name"}
+
+
+def read_production_calibration(repo_root: Path | str) -> dict[str, Any]:
+    """The ``production_calibration`` block to stamp into an episode: the runs production loads now.
+
+    ``world_frame.last_registration.calibration_id`` is not this.  It is whatever the last continuity
+    check was run on, and a calibration promoted without one (10-27: calib_20261027_173815, exported by
+    hand) leaves it on the run before -- every episode recorded after that named the old run.  This reads
+    the pointers themselves.  Like the world stamp, absence says so (``status``) instead of guessing.
+    """
+    root = Path(repo_root)
+    path = root / PRODUCTION_TRACKING_CONFIG
+    block: dict[str, Any] = {"config_path": str(PRODUCTION_TRACKING_CONFIG)}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return {**block, "status": STATUS_MISSING if not path.exists() else f"{STATUS_UNREADABLE}: {exc}"}
+    for field, key in _PRODUCTION_POINTERS.items():
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*?)\s*(?:#.*)?$")
+        values = [m.group(1).strip("'\"") for line in lines if (m := pattern.match(line))]
+        if len(values) != 1 or not values[0]:
+            return {**block, "status": STATUS_INCOMPLETE, "note": f"{key} appears {len(values)} times"}
+        block[field] = values[0]
+    return {**block, "status": STATUS_OK, "config_sha256": _sha256(path)}
 
 
 def describe(block: Mapping[str, Any] | None) -> str:

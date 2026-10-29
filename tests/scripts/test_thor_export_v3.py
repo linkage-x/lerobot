@@ -1074,7 +1074,8 @@ def test_export_records_each_episode_against_the_table_but_keeps_it_out_of_the_k
         "worst_shift_px": {"cam_09": 1.4},
         "file": "derived/table_check.json",
     }
-    monkeypatch.setattr(export_v3, "_table_check", lambda _session: dict(moved))
+    runs = []
+    monkeypatch.setattr(export_v3, "_table_check", lambda _session, run="": runs.append(run) or dict(moved))
     lines = []
     monkeypatch.setattr(export_v3, "_emit", lines.append)
 
@@ -1086,6 +1087,8 @@ def test_export_records_each_episode_against_the_table_but_keeps_it_out_of_the_k
     sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
     assert sources[0]["table_check"] == "cameras_moved"
     assert any(line.startswith("WARNING: pick_and_place_20261014_150515: cameras_moved") for line in lines)
+    # held against the run the session was tracked with: what its labels are on
+    assert runs == [block["sessions"]["pick_and_place_20261014_150515"]["extrinsics"]] and runs[0]
 
 
 def test_the_table_check_runs_in_the_tracker_venv_and_reads_back_what_it_wrote(tmp_path, monkeypatch):
@@ -1118,6 +1121,9 @@ def test_the_table_check_runs_in_the_tracker_venv_and_reads_back_what_it_wrote(t
     assert kwargs["stdin"] is subprocess.DEVNULL  # an inherited stdin has ended a recorder session before
     assert "PYTHONPATH" not in kwargs["env"] and kwargs["env"]["PYTHONNOUSERSITE"] == "1"
     assert check["verdict"] == "ok" and check["episodes_checked"] == 2 and "episodes_detail" not in check
+    assert "--extrinsics-run" not in command  # untracked: each episode's own record of production
+    export_v3._table_check(session, "calib_1014_extrinsics")
+    assert calls[-1][0][-2:] == ["--extrinsics-run", "calib_1014_extrinsics"]
 
     monkeypatch.setattr(
         export_v3.subprocess, "run", lambda c, **k: subprocess.CompletedProcess(c, 2, "", "Traceback\nKeyError: 'x'")
