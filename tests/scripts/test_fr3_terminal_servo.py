@@ -933,15 +933,16 @@ class LiftedPressedRobot(PressedFixtureRobot):
     """A press on a descent that follows a lift: the wrench reads 5 N high until the setpoint has
     come down 3 mm, the way 529 search retries of 10-16..10-23 read (friction held by the lift)."""
 
-    def __init__(self, floor_z, start_z):
+    def __init__(self, floor_z, start_z, held_n=5.0):
         super().__init__(floor_z)
         self.start_z = float(start_z)
+        self.held_n = float(held_n)
 
     @property
     def external_wrench(self):
         fx, fy, fz, tx, ty, tz = super().external_wrench
         held = not self.commanded_z or self.start_z - self.commanded_z[-1] < 0.003
-        return (fx, fy, fz + (5.0 if held else 0.0), tx, ty, tz)
+        return (fx, fy, fz + (self.held_n if held else 0.0), tx, ty, tz)
 
 
 def test_the_tare_is_taken_once_the_descent_has_let_go_of_the_lift():
@@ -976,6 +977,27 @@ def test_the_grasp_loops_cap_presses_a_retry_as_hard_as_before_the_tare_moved():
     assert result["pressCapped"] is True
     assert floor - 0.0007 - 1e-9 <= min(robot.commanded_z) <= floor - 0.0006 + 1e-9
     assert -7.0 <= result["dfzPeakN"] <= -6.0
+
+
+def test_the_friction_letting_go_in_free_air_is_not_a_press():
+    """10-26..10-28: a lift held the wrench 7-8 N high, the 6 N cap read its release 5 mm into the
+    descent as a press, parked the setpoint in the air and the stall test called it contact --
+    12% of search landings, never touching the face. The cap waits for the tare."""
+    from tools.fr3.grasp_loop import GRASP_LOOP_INSERT_PRESS_CAP_N
+
+    floor = SEATED[2] + 0.0025
+    robot = LiftedPressedRobot(floor, start_z=floor + 0.020, held_n=8.0)
+    robot.xyz = (SEATED[0], SEATED[1], floor + 0.020)
+    result = terminal_servo.descend_until_refused(
+        robot, _request(settleS=0.02, pressCapN=GRASP_LOOP_INSERT_PRESS_CAP_N), SEATED, (0.0, 0.0, 0.0), 0.0
+    )
+    assert result["fzTareFirstN"] == pytest.approx(14.0)
+    assert result["fzTareN"] == pytest.approx(6.0)
+    # It reached the floor and was capped there, a 6 N press off the settled tare.
+    assert result["pressCapped"] is True
+    assert robot.commanded_z[-1] == pytest.approx(floor)
+    assert floor - 0.0007 - 1e-9 <= min(robot.commanded_z) <= floor - 0.0006 + 1e-9
+    assert result["descentMm"] >= 17.0
 
 
 def test_a_descent_too_short_to_tare_keeps_its_first_reading():

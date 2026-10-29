@@ -120,6 +120,13 @@ TERMINAL_SERVO_ALIGN_STILL_S = 0.3
 # descent. A tare of the first reading made a 10 N cap fire on a 5 N press after any lift. Both
 # depths sit well inside the 14 mm run-up `searchLiftM` is held to, so no landing can touch the
 # face before its tare is taken.
+# The press cap waits for this tare too. Until 10-28 it was checked from the first sample against
+# the first reading, and the friction letting go is itself a drop: 4.5 N median, -7.0 N at p95 and
+# -9.6 N at worst over 820 descents of 10-23. The 6 N cap of 10-26 fired on it in free air 5 mm
+# into the descent, the setpoint parked there, the 15 mm stall test then called it contact, and
+# the search moved on: 30/253 landings of run 112716 and 10/78 of 101952, always the same ring
+# points (the transfer direction sets the friction), so a failing trial never tried them. A
+# descent too short to reach the window keeps the first reading as its tare, cap included.
 TERMINAL_SERVO_TARE_FROM_M = 0.004
 TERMINAL_SERVO_TARE_TO_M = 0.006
 # E7-C. How far off the nominal pose the search ring sits, in metres, and how many landings on
@@ -615,7 +622,7 @@ def descend_until_refused(
     fz_tare = read_fz(robot)
     fz_tare_first = fz_tare
     tare_readings: list[float] = []
-    tare_settled = False
+    tare_settled = start_z - float(target_xyz[2]) < TERMINAL_SERVO_TARE_TO_M
     fz_peak_drop = 0.0
 
     def stopped(reason: str) -> dict[str, Any]:
@@ -681,8 +688,7 @@ def descend_until_refused(
             travel_m = start_z - float(commanded[2])
             if not tare_settled and travel_m >= TERMINAL_SERVO_TARE_TO_M:
                 tare_settled = True
-                # Not once the cap has fired: that is a press already, and no free-air reading.
-                if tare_readings and unload_z is None:
+                if tare_readings:
                     fz_tare = statistics.median(tare_readings)
                     # What the old tare saw before here was the friction letting go, not a press.
                     fz_peak_drop = 0.0
@@ -691,7 +697,8 @@ def descend_until_refused(
             if fz_now is not None:
                 fz_peak_drop = min(fz_peak_drop, fz_now - fz_tare)
                 if (
-                    unload_z is None
+                    tare_settled
+                    and unload_z is None
                     and request.pressCapN is not None
                     and fz_now - fz_tare <= -request.pressCapN
                 ):
