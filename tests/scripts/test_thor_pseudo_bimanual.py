@@ -143,9 +143,39 @@ def test_with_the_right_arm_in_place_the_left_hand_is_the_mirror_at_plus_y(tmp_p
     )
     left = bq.read_hand(session / "derived" / bq.SIDECAR / "state_action.left.csv")[0]
     right = bq.read_hand(session / "derived" / bq.SIDECAR / "state_action.right.csv")[0]
-    expected = pb.mirror_pose7(_pose7(_tcp_path(320, phase=1.0)[5]), pb.DEFAULT_SPACING_M / 2, TOOL)
-    assert np.allclose(left[5]["p"], expected[:3], atol=1e-9)
-    assert np.allclose(right[5]["p"], _tcp_path(320)[5][:3, 3], atol=1e-9)
+    # in the right base: the recorded take as is, the other mirrored through +spacing/2 ...
+    s = pb.DEFAULT_SPACING_M
+    expected = pb.mirror_pose7(_pose7(_tcp_path(320, phase=1.0)[5]), s / 2, TOOL)
+    # ... and the whole session in fr3_base, the left arm's, where the right base is at -spacing
+    shift = np.array([0.0, -s, 0.0])
+    assert np.allclose(left[5]["p"], np.array(expected[:3]) + shift, atol=1e-9)
+    assert np.allclose(right[5]["p"], _tcp_path(320)[5][:3, 3] + shift, atol=1e-9)
+    meta = json.loads((session / "meta" / "info.json").read_text())["pseudo_bimanual"]
+    assert meta["mirror_plane_y_m"] == pytest.approx(-s / 2) and meta["in_place_base_y_m"] == pytest.approx(
+        -s
+    )
+
+
+def test_a_hand_that_reaches_the_middle_is_not_paired(tmp_path: Path) -> None:
+    """With the left arm in fr3_base the middle is at -spacing/2; a hand that gets within MIDDLE_CLEARANCE_M of
+    it would meet its own mirror image (10-29: every 10-21 pair did, at -0.37 m against -0.30 m)."""
+    root = tmp_path / "sessions"
+    _write_session(root, "take_a", _tcp_path(320))
+    _write_session(root, "take_b", _tcp_path(320, phase=1.0))
+    _write_session(root, "toward_right", _tcp_path(320, offset=(0.0, -0.12, 0.0)))
+    found, _ = pb.candidates(root, _graph())
+    by_name = {c["session"]: c for c in found}
+    assert by_name["toward_right"]["y_m"][0] == pytest.approx(-0.196, abs=1e-3)
+    pairs = pb.auto_pairs(found, 5, seed=0, spacing_m=0.6, in_place="left")
+    assert len(pairs) == 1 and "toward_right" not in {pairs[0][0]["session"], pairs[0][1]["session"]}
+    assert len(pb.auto_pairs(found, 5, seed=0, spacing_m=0.8, in_place="left")) == 1
+    assert len(pb.auto_pairs(found, 5, seed=0)) == 1  # no spacing: the old behaviour, all three in the pool
+
+    pair = ({"session": "take_a", "episode": 0}, {"session": "toward_right", "episode": 0})
+    with pytest.raises(ValueError, match="toward_right ep0: the hand reaches y -0.20"):
+        pb.build(root, [pair], tmp_path / "out", graph=_graph(), name="pseudo_bimanual_x", spacing_m=0.6)
+    # 0.8 m apart the middle is at -0.40 m: 0.20 m off, enough
+    pb.build(root, [pair], tmp_path / "out", graph=_graph(), name="pseudo_bimanual_y", spacing_m=0.8)
 
 
 def test_a_stand_in_session_must_say_so_in_its_name(tmp_path: Path) -> None:

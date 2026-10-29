@@ -7,7 +7,10 @@ dual-arm work that only needs *a* pair of hand tracks -- the scene, the replay m
 gates (C1-C4, D1/D3) -- takes a pair built here:
 
 * one hand is a recorded right-hand episode, as it is, on the arm whose base is ``fr3_base`` -- the arm the
-  episode was recorded in front of (``in_place``; the left since 10-26, embodiments/fr3_dual.json);
+  episode was recorded in front of (``in_place``; the left since 10-26, embodiments/fr3_dual.json) -- or, with
+  ``in_place`` set to the other arm, in that arm's base as it was recorded in its own, the whole session then
+  moved into ``fr3_base`` by the assumed spacing (10-29: the recorded demos reach toward -y, where the right
+  arm now stands, so only the right arm can keep them clear of the middle; see MIDDLE_CLEARANCE_M);
 * the other hand is another recorded right-hand episode, mirrored through the plane halfway between the two
   bases (the left base is assumed at ``+y`` of the right, parallel: ``y = -spacing / 2`` in ``fr3_base``
   when the left arm is in place, ``+spacing / 2`` when the right is), so that it sits in front of the other
@@ -46,7 +49,7 @@ import json
 import math
 import random
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,8 +65,9 @@ from tools.thor.gmsl2 import bimanual_qc, embodiment as em, world_provenance as 
 
 SCHEMA = "pseudo_bimanual/v1"
 NAME_PREFIX = "pseudo_bimanual_"
-#: G3's arm spacing. The real one is B0's; this only decides where the mirrored hand lands.
-DEFAULT_SPACING_M = 0.8
+#: B0's arm spacing since 10-27 (two carts side by side; G3 had assumed 0.8 m). It decides where the mirror
+#: plane is, and with it which recorded episodes can be paired (MIDDLE_CLEARANCE_M).
+DEFAULT_SPACING_M = 0.6
 #: The TCP the sidecars label (replay_cube_pose_in_robot_base.thor.yaml target_frame_name).
 DEFAULT_TOOL_FRAME = "corenetic_socket_ee"
 NOT_FOR = (
@@ -86,6 +90,12 @@ SHOULDER_M = (0.0, 0.0, 0.333)
 #: j6) and the 10-13/14 pivot and ball-check takes 0-92 %. A pair whose halves are not fully reachable
 #: tests the reach, not the runtime, so the default asks for all of them.
 MIN_IK_REACHABLE = 1.0
+#: Each half of a pair keeps its TCP this far on its own side of the mirror plane. A hand that crosses the
+#: middle meets its mirror image there: after 10-26 made fr3_base the left arm, the 10-21 demos (y down to
+#: -0.37 m) against a plane at -0.30 m put the two grippers into each other at every spacing, and C3 could
+#: only pull them apart by 50-100 mm off the labels (10-29). 0.15 m keeps the TCPs 0.3 m apart, past the
+#: grippers' reach (two capsules round gripper and SMR mount) plus C3's d_safe.
+MIDDLE_CLEARANCE_M = 0.15
 DATASET_WORLD = wp.FR3_BASE_WORLD_ID
 ARMS = ("right", "left")
 
@@ -201,6 +211,30 @@ def reach_fraction(rows: list[dict[str, str]], T: list[list[float]]) -> float:
     return inside / total if total else 0.0
 
 
+def y_extent(rows: list[dict[str, str]], T: list[list[float]]) -> tuple[float, float]:
+    """Smallest and largest y of the solved frames' TCP, moved by ``T`` into fr3_base."""
+    ys = []
+    for row in rows:
+        pose = [_float(row.get(f"state_{k}")) for k in ("x_m", "y_m", "z_m", "qx", "qy", "qz", "qw")]
+        if all(math.isfinite(v) for v in pose):
+            ys.append(wp.transform_pose7(T, pose)[1])
+    return (min(ys), max(ys)) if ys else (math.nan, math.nan)
+
+
+def mirror_plane_y(spacing_m: float, in_place: str) -> float:
+    """The plane midway between the bases, in fr3_base: the other arm is at -y of the left one."""
+    return (spacing_m if in_place == "right" else -spacing_m) / 2.0
+
+
+def stays_on_its_side(y_range: Sequence[float], plane_y: float, in_place: str) -> bool:
+    """Whether a hand recorded in fr3_base keeps MIDDLE_CLEARANCE_M on the in-place arm's side of the plane
+    (its mirror image then keeps it on the other side)."""
+    low, high = y_range
+    if in_place == "left":
+        return low >= plane_y + MIDDLE_CLEARANCE_M
+    return high <= plane_y - MIDDLE_CLEARANCE_M
+
+
 def session_world(session_dir: Path) -> str:
     info = json.loads((session_dir / "meta" / "info.json").read_text(encoding="utf-8"))
     return wp.world_frame_id_of(info.get("world_frame"))
@@ -284,17 +318,28 @@ def candidates(
                     "frames": len(rows),
                     "good": fraction,
                     "ik_reachable": ik,
+                    "y_m": y_extent(rows, to_base[0]),
                 }
             )
     return found, skipped
 
 
 def auto_pairs(
-    found: list[dict[str, Any]], count: int, seed: int
+    found: list[dict[str, Any]],
+    count: int,
+    seed: int,
+    *,
+    spacing_m: float | None = None,
+    in_place: str | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """``count`` (as-recorded, to-mirror) pairs, deterministic in ``seed``; the two halves come from different
-    sessions where there are any, so a pair is never one take against itself."""
+    sessions where there are any, so a pair is never one take against itself. With ``spacing_m``, only
+    episodes that stay on their side of the middle (``stays_on_its_side``) are paired."""
     pool = list(found)
+    if spacing_m is not None:
+        in_place = in_place or in_place_arm()
+        plane_y = mirror_plane_y(spacing_m, in_place)
+        pool = [c for c in pool if stays_on_its_side(c["y_m"], plane_y, in_place)]
     random.Random(seed).shuffle(pool)
     pairs = []
     while len(pairs) < count and len(pool) >= 2:
@@ -316,14 +361,19 @@ def build(
     in_place: str | None = None,
 ) -> Path:
     """Write the pairs (as-recorded, to-mirror) as one stand-in session under ``out_root`` and return its
-    directory. ``in_place``: the arm in ``fr3_base`` (default: the embodiment's)."""
+    directory. ``in_place``: the arm that gets the recorded episodes as recorded, in its own base (default:
+    the one in ``fr3_base``); when it is the other arm, every pose is moved by the assumed placement into
+    ``fr3_base``, where a session's labels are."""
     if not pairs:
         raise ValueError("no pairs to build")
     in_place = in_place or in_place_arm()
     if in_place not in ARMS:
         raise ValueError(f"in_place must be one of {ARMS}, not {in_place!r}")
     mirrored = next(arm for arm in ARMS if arm != in_place)
-    plane_y = (spacing_m if in_place == "right" else -spacing_m) / 2.0
+    plane_y = mirror_plane_y(spacing_m, in_place)
+    # the in-place arm's base in fr3_base: the right base at -y of the left, parallel (assumed)
+    dataset_arm = in_place_arm()
+    shift_y = 0.0 if in_place == dataset_arm else (-spacing_m if in_place == "right" else spacing_m)
     tool = None if tool_frame is None else kin.urdf_fixed_transform(tool_frame)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     session = out_root / (name or f"{NAME_PREFIX}{stamp}")
@@ -349,11 +399,20 @@ def build(
             edges_by_world[world] = edges
             fps_seen.add(session_fps(session_dir))
             rows = [dict(row) for row in episodes[int(src["episode"])]]
+            y_range = y_extent(rows, T)
+            if not stays_on_its_side(y_range, plane_y, in_place):
+                raise ValueError(
+                    f"{src['session']} ep{src['episode']}: the hand reaches y {y_range[0]:+.2f}..{y_range[1]:+.2f} m "
+                    f"of {DATASET_WORLD}, within {MIDDLE_CLEARANCE_M} m of (or past) the middle at {plane_y:+.2f} m; "
+                    "its pair would meet its mirror image there"
+                )
             groups = pose_groups(names)
             for row in rows:
                 _map_poses(row, groups, lambda pose, T=T: wp.transform_pose7(T, pose))
                 if hand == mirrored:
                     _map_poses(row, groups, lambda pose: mirror_pose7(pose, plane_y, tool))
+                if shift_y:
+                    _map_poses(row, groups, lambda pose: [pose[0], pose[1] + shift_y, *pose[2:]])
             tracks[hand] = rows
         n = min(len(tracks["right"]), len(tracks["left"]))
         for k in range(n):
@@ -397,11 +456,12 @@ def build(
             "created_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "what": (
                 f"two recorded right-hand episodes per pair: the {in_place} as recorded, the other mirrored "
-                f"through y = {plane_y:.3f} m of {DATASET_WORLD} to stand in for the {mirrored} hand"
+                f"through y = {plane_y + shift_y:.3f} m of {DATASET_WORLD} to stand in for the {mirrored} hand"
             ),
             "in_place_arm": in_place,
             "assumed_spacing_m": spacing_m,
-            "mirror_plane_y_m": plane_y,
+            "mirror_plane_y_m": plane_y + shift_y,
+            "in_place_base_y_m": shift_y,
             "mirrored_at": "tcp"
             if tool is None
             else f"flange ({kin.FLANGE_LINK}), tool {tool_frame} re-attached",
@@ -463,6 +523,12 @@ def main(argv: list[str] | None = None) -> int:
         "--spacing", type=float, default=DEFAULT_SPACING_M, help="assumed base spacing along y, m"
     )
     parser.add_argument("--name", default=None)
+    parser.add_argument(
+        "--in-place",
+        choices=ARMS,
+        default=None,
+        help="the arm that keeps the recorded episodes as recorded (default: the one in fr3_base)",
+    )
     parser.add_argument("--repo-root", type=Path, default=_REPO_ROOT)
     args = parser.parse_args(argv)
     graph = wp.read_world_graph(args.repo_root)
@@ -470,12 +536,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.auto:
         found, skipped = candidates(args.sessions_root, graph)
         print(f"{len(found)} candidate right-hand episodes, {len(skipped)} skipped")
-        pairs += auto_pairs(found, args.auto, args.seed)
+        pairs += auto_pairs(found, args.auto, args.seed, spacing_m=args.spacing, in_place=args.in_place)
         if len(pairs) < args.auto + len(args.pair):
             print(f"only {len(pairs)} pairs available")
     if not pairs:
         parser.error("give --pair or --auto")
-    session = build(args.sessions_root, pairs, args.out, graph=graph, spacing_m=args.spacing, name=args.name)
+    session = build(
+        args.sessions_root,
+        pairs,
+        args.out,
+        graph=graph,
+        spacing_m=args.spacing,
+        name=args.name,
+        in_place=args.in_place,
+    )
     report = bimanual_qc.session_qc(session)
     for line in bimanual_qc.describe(report):
         print(line)
