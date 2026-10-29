@@ -672,3 +672,31 @@ def test_a_merged_base_views_own_start_list_is_carried_through(tmp_path):
 
     manifest = json.loads((out / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
     assert manifest["start_pose_episodes"] == [1, 3]
+
+
+def test_a_camera_file_past_the_last_data_file_is_carried_over(tmp_path):
+    """10-28: ee rolled to file-004 while data stopped at file-003; the merge had one map for both."""
+    base = tmp_path / "base"
+    dagger = tmp_path / "dagger"
+    out = tmp_path / "out"
+    _write_dataset(base, episodes=1)
+    _write_dataset(dagger, episodes=2, include_intervention=True)
+    _write_qc(dagger, "pass")
+    ep_path = dagger / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episodes = pq.read_table(ep_path).to_pandas()
+    episodes.loc[1, "videos/observation.images.ee/file_index"] = 1
+    pq.write_table(pa.Table.from_pandas(episodes, preserve_index=False), ep_path)
+    (dagger / "videos" / "observation.images.ee" / "chunk-000" / "file-001.mp4").write_bytes(b"second" * 512)
+
+    merge_policy_ready_datasets(base_view=base, dagger_roots=[dagger], output_root=out, repo_id="local/out")
+
+    merged = pq.read_table(out / "meta" / "episodes" / "chunk-000" / "file-000.parquet").to_pandas()
+    files = [
+        out / "videos" / "observation.images.ee" / f"chunk-{chunk:03d}" / f"file-{file:03d}.mp4"
+        for chunk, file in zip(
+            merged["videos/observation.images.ee/chunk_index"],
+            merged["videos/observation.images.ee/file_index"],
+            strict=True,
+        )
+    ]
+    assert [path.read_bytes()[:6] for path in files] == [b"videov", b"videov", b"second"]

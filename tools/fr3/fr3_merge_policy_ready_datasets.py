@@ -690,6 +690,18 @@ def merge_policy_ready_datasets(
             old_pair = chunk_file_from_path(src_file.relative_to(root))
             file_map[old_pair] = chunk_file_for_index(next_file_index, chunks_size)
             next_file_index += 1
+        # A camera rolls to a new file on its own size limit, so its files need not line up with
+        # the data files (10-28: ee had file-004 where data stopped at file-003).
+        all_episodes = load_episodes(root)
+        for cam in camera_keys:
+            chunk_col, file_col = f"videos/{cam}/chunk_index", f"videos/{cam}/file_index"
+            if chunk_col not in all_episodes or file_col not in all_episodes:
+                continue
+            pairs = zip(all_episodes[chunk_col].astype(int), all_episodes[file_col].astype(int), strict=True)
+            for old_pair in sorted(set(pairs)):
+                if old_pair not in file_map:
+                    file_map[old_pair] = chunk_file_for_index(next_file_index, chunks_size)
+                    next_file_index += 1
         source_file_maps.append(file_map)
         total_rows += int(episodes["length"].sum())
         total_episodes += len(episodes)
