@@ -1789,6 +1789,60 @@ export type Fr3PivotPlan = {
   notes?: string[];
 };
 
+// Both FR3s home (tools/fr3/dual_fr3_move_to_start.py): Check reads both arms and plans their straight joint
+// paths home against each other and the table; Execute runs the plan; Cancel drops it (or, moving, both FCIs).
+export type DualHomeArmPlan = {
+  moving: boolean;
+  q_now: number[];
+  q_goal: number[];
+  max_joint_move_deg: number;
+  joint: number;
+  min_env_gap_mm: number | null;
+  min_env_with: [string, string] | null;
+};
+
+export type DualHomeOption = { min_gap_mm: number; pair: string[]; where: string };
+
+export type DualHomePlan = {
+  arms: Record<"right" | "left", DualHomeArmPlan>;
+  start_gap_mm: number;
+  d_gate_mm: number;
+  /** what the paths are held to: d_gate, or "never closer than now" when the arms already are */
+  gate_mm: number;
+  d_env_mm: number;
+  options: Record<string, DualHomeOption>;
+  /** arms that move together, stage by stage; [] both at start; null refused */
+  stages: string[][] | null;
+  chosen: string | null;
+  reasons: string[];
+  placement?: { sigma_mm: number; source: string; T_right_left: number[][] };
+  payload?: Record<string, string>;
+  speed_factor?: number;
+  ip?: Record<string, string>;
+};
+
+export type DualHomeArmResult = { ok: boolean; q?: number[]; max_error_deg?: number; error?: string };
+
+export type DualHomeResult = { ok: boolean; chosen?: string; stages: Array<Record<string, DualHomeArmResult>> };
+
+export type DualHomeState = "checking" | "ready" | "moving" | "done" | "cancelled" | "refused" | "failed";
+
+export type DualHomeJob = {
+  state?: DualHomeState;
+  plan?: DualHomePlan | null;
+  result?: DualHomeResult | null;
+  log?: string[];
+  error?: string;
+  startedUnixS?: number;
+  readyUnixS?: number;
+  waitS?: number;
+  endedUnixS?: number;
+  exitCode?: number;
+  cancelRequested?: boolean;
+};
+
+export type DualHomeResponse = { ok: boolean; error: string; job: DualHomeJob };
+
 /** POST /api/robot/move-to-start: panda_py move_to_start() on one FR3, run to completion. */
 export type Fr3MoveToStartResponse = {
   ok: boolean;

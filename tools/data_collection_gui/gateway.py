@@ -526,6 +526,10 @@ class GatewayState:
     dual_replay_process: subprocess.Popen[str] | None = None
     dual_replay_job: dict[str, Any] = field(default_factory=dict)
     dual_replay_lock: Lock = field(default_factory=Lock)
+    # Both FR3s home (tools/fr3/dual_fr3_move_to_start.py): Check -> the plan -> Execute.
+    dual_home_process: subprocess.Popen[str] | None = None
+    dual_home_job: dict[str, Any] = field(default_factory=dict)
+    dual_home_lock: Lock = field(default_factory=Lock)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -5288,6 +5292,8 @@ def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, A
         with state.fr3_pivot_lock:
             if state.fr3_pivot_job.get("state") == "collecting":
                 holder = "FR3 pivot 采集正在进行"
+    if not holder and _dual_home_live(state):
+        holder = "双臂归位正在进行"
     if holder:
         return {**refusal, "error": f"{holder}，它占着 FR3 的 FCI；先停掉再归位"}
     if not _FR3_MOVE_TO_START_LOCK.acquire(blocking=False):
@@ -17390,7 +17396,7 @@ def _dual_replay_connect(state: GatewayState, body: dict[str, Any]) -> dict[str,
             state, f"episode {episode} is not executable in {mode}: " + "; ".join(row.get("reasons") or [])
         )
     if backend == "real":
-        holder = _fr3_pivot_fci_holder(state)
+        holder = _fr3_pivot_fci_holder(state) or ("双臂归位正在进行" if _dual_home_live(state) else "")
         if holder:
             return _dual_replay_payload(state, f"{holder}，它占着 FCI")
     out = state.repo_root / _DUAL_REPLAY_SUBDIR
@@ -17493,6 +17499,199 @@ _DUAL_REPLAY_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str
     "/api/replay/dual-fr3/connect": _dual_replay_connect,
     "/api/replay/dual-fr3/execute": _dual_replay_execute,
     "/api/replay/dual-fr3/abort": _dual_replay_abort,
+}
+
+
+# --- Both FR3s home ----------------------------------------------------------
+#
+# The operator's half of tools/fr3/dual_fr3_move_to_start.py. Check starts it: both arms are read (each held by
+# its own FCI session from then on), their straight joint paths home are checked against each other and the
+# table, and the plan -- together, one after the other, or refused -- comes back for the operator to read.
+# Execute says "go" on its stdin (the runtime re-reads both arms and refuses if either moved); Cancel says
+# "abort" while it waits, and while the arms move it ends the process group, which drops both FCI sessions --
+# the arms then stop on libfranka's reflex, the user stop is quicker. A plan nobody answers lapses after the
+# runtime's WAIT_FOR_GO_S.
+
+_DUAL_HOME_SCRIPT = Path("tools") / "fr3" / "dual_fr3_move_to_start.py"
+_DUAL_HOME_PLAN = "DUAL_HOME_PLAN "
+_DUAL_HOME_READY = "DUAL_HOME_READY"
+_DUAL_HOME_RESULT = "DUAL_HOME_RESULT "
+_DUAL_HOME_LOG_LINES = 200
+_DUAL_HOME_STOP_WAIT_S = 5.0
+#: how long the runtime waits for Execute after the plan (dual_fr3_move_to_start.WAIT_FOR_GO_S); the page counts it down
+_DUAL_HOME_WAIT_S = 120.0
+
+
+def _dual_home_live(state: GatewayState) -> bool:
+    process = state.dual_home_process
+    return process is not None and process.poll() is None
+
+
+def _dual_home_payload(state: GatewayState, error: str = "") -> dict[str, Any]:
+    with state.dual_home_lock:
+        job = dict(state.dual_home_job)
+        job["log"] = list(job.get("log") or [])[-40:]
+    return {"ok": not error, "error": error, "job": job}
+
+
+def _dual_home_fci_holder(state: GatewayState) -> str:
+    """Whatever else would want an arm's FCI while both are homed, or ""."""
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return holder
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") == "collecting":
+            return "FR3 pivot 采集正在进行"
+    with state.dual_replay_lock:
+        if _dual_replay_live(state):
+            return "双臂 replay 正在运行"
+    if _FR3_MOVE_TO_START_LOCK.locked():
+        return "单臂 move to start 正在进行"
+    return ""
+
+
+def _watch_dual_home(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip()
+        with state.dual_home_lock:
+            job = state.dual_home_job
+            if line.startswith(_DUAL_HOME_PLAN):
+                with suppress(json.JSONDecodeError):
+                    job["plan"] = json.loads(line.removeprefix(_DUAL_HOME_PLAN))
+                continue
+            if line.startswith(_DUAL_HOME_RESULT):
+                with suppress(json.JSONDecodeError):
+                    job["result"] = json.loads(line.removeprefix(_DUAL_HOME_RESULT))
+                continue
+            job.setdefault("log", []).append(line)
+            del job["log"][:-_DUAL_HOME_LOG_LINES]
+            if line.startswith(_DUAL_HOME_READY) and job.get("state") == "checking":
+                job["state"] = "ready"
+                job["readyUnixS"] = time.time()
+                job["waitS"] = _DUAL_HOME_WAIT_S
+            elif line.startswith("refused:"):
+                job["error"] = line.removeprefix("refused:").strip()
+    code = process.wait()
+    with state.dual_home_lock:
+        job = state.dual_home_job
+        job["exitCode"] = code
+        result = job.get("result") or {}
+        if code == 0 and (result.get("ok") or job.get("state") == "checking"):
+            # checking -> exit 0 without a prompt: both arms were already at their start joints
+            job["state"] = "done"
+        elif code == 3 or job.get("cancelRequested"):
+            job["state"] = "cancelled"
+        elif code == 2:
+            job["state"] = "refused"
+        else:
+            job["state"] = "failed"
+            job["error"] = job.get("error") or f"exit {code}"
+        job["endedUnixS"] = time.time()
+        if state.dual_home_process is process:
+            state.dual_home_process = None
+        final = job["state"]
+    with state.lock:
+        state.log("info" if final == "done" else "warn", f"both FR3s home: {final} {job.get('error') or ''}".strip())
+
+
+def _dual_home_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Check: read both arms and plan; the runtime then waits for Execute."""
+    del body
+    holder = _dual_home_fci_holder(state)
+    if holder:
+        return _dual_home_payload(state, f"{holder}，它占着 FCI；先停掉再归位")
+    command = [str(_mujoco_replay_python(state)), str(state.repo_root / _DUAL_HOME_SCRIPT)]
+    refusal, process = "", None
+    with state.dual_home_lock:
+        if _dual_home_live(state):
+            refusal = "双臂归位已在进行"
+        else:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(state.repo_root),
+                    env=_real_preflight_env(state),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,  # a cancel signals the runtime and its arms, never the gateway
+                )
+            except OSError as exc:
+                refusal = str(exc)
+            else:
+                state.dual_home_process = process
+                state.dual_home_job = {
+                    "state": "checking",
+                    "startedUnixS": time.time(),
+                    "pid": process.pid,
+                    "plan": None,
+                    "result": None,
+                    "log": [],
+                    "error": "",
+                }
+    if refusal or process is None:
+        return _dual_home_payload(state, refusal)
+    with state.lock:
+        state.log("warn", "both FR3s home: checking")
+    Thread(target=_watch_dual_home, args=(state, process), daemon=True, name=f"dual-home-{process.pid}").start()
+    return _dual_home_payload(state)
+
+
+def _dual_home_execute(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Execute: the plan the operator read; the runtime re-reads both arms before either moves."""
+    del body
+    with state.dual_home_lock:
+        process = state.dual_home_process
+        plan = state.dual_home_job.get("plan") or {}
+        if not _dual_home_live(state) or state.dual_home_job.get("state") != "ready":
+            error = "先 Check，等计划出来再执行"
+        elif not plan.get("stages"):
+            error = "计划不让动"
+        else:
+            error = ""
+            try:
+                assert process is not None and process.stdin is not None
+                process.stdin.write("go\n")
+                process.stdin.flush()
+                state.dual_home_job["state"] = "moving"
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+    if not error:
+        with state.lock:
+            state.log("warn", f"both FR3s home: moving ({plan.get('chosen')})")
+    return _dual_home_payload(state, error)
+
+
+def _dual_home_cancel(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Cancel: "abort" while the plan waits; while the arms move, end the process group (both FCIs drop)."""
+    del body
+    with state.dual_home_lock:
+        process = state.dual_home_process
+        if not _dual_home_live(state) or process is None:
+            return _dual_home_payload(state, "没有在归位")
+        state.dual_home_job["cancelRequested"] = True
+        waiting = state.dual_home_job.get("state") in ("checking", "ready")
+        try:
+            if waiting and process.stdin is not None:
+                process.stdin.write("abort\n")
+                process.stdin.flush()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_DUAL_HOME_STOP_WAIT_S)
+    return _dual_home_payload(state)
+
+
+_DUAL_HOME_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/robot/dual-home/check": _dual_home_check,
+    "/api/robot/dual-home/execute": _dual_home_execute,
+    "/api/robot/dual-home/cancel": _dual_home_cancel,
 }
 
 
@@ -19165,6 +19364,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             if path == "/api/replay/dual-fr3/job":
                 _json_response(self, HTTPStatus.OK, _dual_replay_payload(self.server.state))
                 return
+            if path == "/api/robot/dual-home":
+                _json_response(self, HTTPStatus.OK, _dual_home_payload(self.server.state))
+                return
             if path == "/api/replay/dual-fr3":
                 try:
                     episode = int(query.get("episode", ["0"])[0])
@@ -19404,6 +19606,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             or _GRIPPER_TELEOP_ROUTES.get(path)
             or _FR3_MOVE_TO_START_ROUTES.get(path)
             or _DUAL_REPLAY_ROUTES.get(path)
+            or _DUAL_HOME_ROUTES.get(path)
         )
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the

@@ -37,6 +37,7 @@ import type {
   LaserReplayReport,
   DualFr3Executability,
   RobotArms,
+  DualHomeResponse,
   DualReplayResponse,
   RealSensePreviewStatus,
   TrajectoryPoint,
@@ -544,6 +545,29 @@ export class DataCollectionGuiApi {
         body: JSON.stringify(body)
       });
       return response.ok ? ((await response.json()) as DualReplayResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchDualHome(): Promise<DualHomeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/dual-home`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as DualHomeResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Both FR3s home: check (read both, plan) -> execute; cancel at any time.
+  async dualHome(action: "check" | "execute" | "cancel"): Promise<DualHomeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/dual-home/${action}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      });
+      return response.ok ? ((await response.json()) as DualHomeResponse) : null;
     } catch {
       return null;
     }

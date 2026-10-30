@@ -4,6 +4,7 @@ import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, Con
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { DualFr3ExecutabilityPanel } from "../DualFr3ExecutabilityPanel";
+import { DualFr3HomePanel } from "../DualFr3HomePanel";
 import { LaserReplayAnalysisPanel } from "../LaserReplayAnalysisPanel";
 import { api } from "../apiClient";
 import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
@@ -1207,6 +1208,7 @@ export function EpisodeReplayPage({
         arm={arm}
         onArmChange={setArm}
       />
+      {arms?.required ? <DualFr3HomePanel arms={arms} /> : null}
       {cubeSelection ? (
         <LaserReplayAnalysisPanel status={snapshot.replay} busy={busy} onAnalyze={onAnalyzeLaser} />
       ) : null}

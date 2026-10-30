@@ -1,6 +1,12 @@
 {
   "schema": "fr3_arms/v1",
   "note": "One entry per FR3 (roadmap B2). Every entry point that drives an arm names the arm (or its IP) explicitly; nothing falls back to a default arm. robot_ip and corenetic_device_id must equal the arm's replay_config (checked by fr3_arms.validate); corenetic_device_id is null, with no_gripper_why, for a bare flange. payload is the end-effector load Desk should hold for the arm as it is mounted now; null = not declared, and preflight then only reports what Desk holds. start_joints_rad is where move_to_start takes the arm. Left and right are the arms' own: stand behind the bases facing where they face. 10-26: the arm that was 'right' until then (192.168.11.102, the registered one) is the left; the new arm went in to its right.",
+  "placement": {
+    "left_in_right_m": [0.0, 0.66, 0.0],
+    "left_yaw_deg": 0.0,
+    "sigma_mm": 20.0,
+    "source": "tape 10-30: base centres 0.66 m apart, parallel, no fore-aft offset; carts 5 cm off the table edge, table top 10 cm above them. Not B3: sigma stays the unknown-placement 20 mm until the arm-arm ball edge exists."
+  },
   "arms": {
     "right": {
       "in_service": true,

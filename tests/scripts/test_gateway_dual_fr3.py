@@ -171,3 +171,89 @@ def test_connect_refuses_what_c4_did_not_clear_and_the_real_arms_without_panda_p
     assert gateway._dual_replay_connect(state, {"mode": "absolute", "backend": "real"})["ok"]
     job = _await_job(state, lambda j: j.get("state") in ("finished", "stopped", "error"))
     assert job["state"] == "error" and "panda_py does not import" in job["error"], job
+
+
+# ------------------------------------------------------------------ both arms home ---
+
+
+def _home_state(tmp_path: Path, monkeypatch, right_away: str = "#q=1:0.5"):
+    """The real runtime and the real registry, on the stand-in panda_py: a ``panda_py`` shim first on the
+    path, which puts the right arm ``right_away`` (fake_panda_py's host suffix) from its start."""
+    import sys
+
+    shim = tmp_path / "shim" / "panda_py"
+    shim.mkdir(parents=True)
+    (shim / "__init__.py").write_text(
+        "from tests.scripts import fake_panda_py as _fake\n"
+        "class Panda(_fake.Panda):\n"
+        "    def __init__(self, hostname, name='panda'):\n"
+        f"        super().__init__(hostname + ({right_away!r} if hostname == '192.168.1.210' else ''), name)\n"
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(episode=0),
+    )
+    (tmp_path / "tools" / "fr3").mkdir(parents=True)
+    (tmp_path / gateway._DUAL_HOME_SCRIPT).symlink_to(Path.cwd() / gateway._DUAL_HOME_SCRIPT)
+    # the registry and the replay configs it names, for the gateway's own arm lookups
+    for name in ("tools/fr3/fr3_arms.json", "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml",
+                 "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).symlink_to(Path.cwd() / name)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(shim.parent), str(Path.cwd() / "src"), str(Path.cwd())]))
+    monkeypatch.setattr(gateway, "_mujoco_replay_python", lambda _s: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_real_preflight_env", lambda _s: env)
+    return state
+
+
+def _await_home(state, done, timeout_s=60.0):
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        job = gateway._dual_home_payload(state)["job"]
+        if done(job):
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"both-arm homing stuck in {gateway._dual_home_payload(state)['job']}")
+
+
+def test_check_shows_the_plan_and_execute_brings_the_arm_home(tmp_path: Path, monkeypatch) -> None:
+    state = _home_state(tmp_path, monkeypatch)
+    assert "先 Check" in gateway._dual_home_execute(state, {})["error"]
+    assert gateway._dual_home_check(state, {})["ok"]
+    assert "已在进行" in gateway._dual_home_check(state, {})["error"]
+    # the single-arm button and a real two-arm replay keep off the arms meanwhile
+    assert "双臂归位正在进行" in gateway._fr3_move_to_start(state, {"arm": "left"})["error"]
+    job = _await_home(state, lambda j: j.get("state") != "checking")
+    assert job["state"] == "ready", job
+    plan = job["plan"]
+    assert plan["stages"] == [["right"]] and plan["chosen"] == "together"
+    assert plan["placement"]["T_right_left"][1][3] == 0.66 and plan["gate_mm"] == 60.0
+    assert gateway._dual_home_execute(state, {})["ok"]
+    job = _await_home(state, lambda j: j.get("state") not in ("ready", "moving"))
+    assert job["state"] == "done" and job["result"]["ok"], job
+
+
+def test_cancel_moves_nothing_and_arms_at_home_need_no_answer(tmp_path: Path, monkeypatch) -> None:
+    state = _home_state(tmp_path, monkeypatch)
+    assert gateway._dual_home_check(state, {})["ok"]
+    _await_home(state, lambda j: j.get("state") == "ready")
+    gateway._dual_home_cancel(state, {})
+    job = _await_home(state, lambda j: j.get("state") not in ("ready", "checking"))
+    assert job["state"] == "cancelled" and job["result"] is None
+    home = _home_state(tmp_path / "home", monkeypatch, right_away="")
+    assert gateway._dual_home_check(home, {})["ok"]
+    job = _await_home(home, lambda j: j.get("state") != "checking")
+    assert job["state"] == "done" and job["plan"]["stages"] == [] and job["result"] is None
+
+
+def test_check_refuses_while_another_fr3_job_holds_an_arm(tmp_path: Path, monkeypatch) -> None:
+    state = _home_state(tmp_path, monkeypatch)
+    with gateway._FR3_MOVE_TO_START_LOCK:
+        assert "单臂 move to start" in gateway._dual_home_check(state, {})["error"]
+    state.fr3_pivot_job = {"state": "collecting"}
+    assert "pivot" in gateway._dual_home_check(state, {})["error"]

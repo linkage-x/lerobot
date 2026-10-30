@@ -107,12 +107,48 @@ def validate(registry: Mapping[str, Any], *, repo_root: Path | str = _REPO_ROOT)
         for key in ("robot_ip", "corenetic_device_id"):
             if str(robot.get(key)) != str(arm.get(key)):
                 problems.append(f"arm {name}: {key} {arm.get(key)!r} but {config} says {robot.get(key)!r}")
+    problems += _placement_problems(registry.get("placement"))
     serving = {n: a for n, a in arms.items() if a.get("in_service")}
     for key in ("robot_ip", "corenetic_device_id"):
         values = [str(a.get(key)) for a in serving.values() if a.get(key) is not None]
         if len(values) != len(set(values)):
             problems.append(f"two arms share {key}: {values}")
     return problems
+
+
+def _placement_problems(placement: Any) -> list[str]:
+    if placement is None:
+        return []
+    if not isinstance(placement, Mapping):
+        return ["placement must be an object"]
+    problems = []
+    offset = placement.get("left_in_right_m")
+    if not (isinstance(offset, Sequence) and len(offset) == 3 and all(math.isfinite(float(v)) for v in offset)):
+        problems.append("placement: left_in_right_m must be [x, y, z] in metres")
+    for key in ("left_yaw_deg", "sigma_mm"):
+        if not isinstance(placement.get(key), (int, float)) or not math.isfinite(float(placement[key])):
+            problems.append(f"placement: {key} must be a number")
+    if isinstance(placement.get("sigma_mm"), (int, float)) and float(placement["sigma_mm"]) <= 0.0:
+        problems.append("placement: sigma_mm must be positive")
+    if not str(placement.get("source") or "").strip():
+        problems.append("placement: needs its source (how it was measured)")
+    return problems
+
+
+def placement(registry: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Where the left base is in the right one, as the registry declares it (a tape measure until B3):
+    ``{"T_right_left": 4x4 nested lists, "sigma_mm", "source"}``; None when nothing is declared."""
+    declared = registry.get("placement")
+    if not declared:
+        return None
+    yaw = math.radians(float(declared["left_yaw_deg"]))
+    x, y, z = (float(v) for v in declared["left_in_right_m"])
+    c, s = math.cos(yaw), math.sin(yaw)
+    return {
+        "T_right_left": [[c, -s, 0.0, x], [s, c, 0.0, y], [0.0, 0.0, 1.0, z], [0.0, 0.0, 0.0, 1.0]],
+        "sigma_mm": float(declared["sigma_mm"]),
+        "source": str(declared["source"]),
+    }
 
 
 def load(path: Path | str | None = None, *, repo_root: Path | str = _REPO_ROOT) -> dict[str, Any]:
