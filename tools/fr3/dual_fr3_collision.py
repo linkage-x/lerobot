@@ -63,7 +63,9 @@ FRAMES = ("link0", "link1", "link2", "link3", "link4", "link5", "link6", "link7"
 #: meshes it holds -- each with its subtree, down to a body another part names). Two capsules where one would
 #: swallow a corner (the base's cable plate, the elbows); the flange carries three parts, the gripper's body,
 #: its fingers and the SMR camera mount sticking out at 45 deg, because one capsule round all of them is 80 mm
-#: fat and reaches 20 mm past the finger tips.
+#: fat and reaches 20 mm past the finger tips. The gripper's body in two: as one it is a 77 mm ball round a
+#: 115 x 97 mm box, and two hands working side by side (D7, a tube into a rack the other holds) met 13 mm
+#: apart in the model with 62 mm between the meshes; in two, 49 mm.
 PARTS = {
     "link0": ("link0", 2, ("fr3_link0",)),
     "link1": ("link1", 1, ("fr3_link1",)),
@@ -73,7 +75,7 @@ PARTS = {
     "link5": ("link5", 2, ("fr3_link5",)),
     "link6": ("link6", 2, ("fr3_link6",)),
     "link7": ("link7", 1, ("fr3_link7",)),
-    "gripper": ("hand", 1, ("fr3_link8",)),
+    "gripper": ("hand", 2, ("fr3_link8",)),
     "fingers": (
         "hand",
         1,
