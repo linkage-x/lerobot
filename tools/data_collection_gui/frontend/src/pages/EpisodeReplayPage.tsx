@@ -218,8 +218,9 @@ export function RealRobotReplayPanel({
   const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
   const active = status.state === "replaying" || status.state === "sim_replay";
+  const twoArmOnly = status.datasetKind === "pseudo_bimanual";
   const disabled =
-    busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+    busy || active || status.datasetKind === "exported" || twoArmOnly || !validationDecisionAvailable || !ipValid;
   const phase = status.realPhase ?? "";
   const trackerState = status.realTrackerState ?? "";
   const trackerBlocksExecute = Boolean(status.realRecordTracker) && trackerState !== "ready";
@@ -250,7 +251,7 @@ export function RealRobotReplayPanel({
   }, [monitorRequested, status.state]);
 
   useEffect(() => {
-    if (!datasetPath || status.datasetKind === "exported") {
+    if (!datasetPath || status.datasetKind === "exported" || status.datasetKind === "pseudo_bimanual") {
       setTimeline(null);
       return;
     }
@@ -399,6 +400,8 @@ export function RealRobotReplayPanel({
           <p className="panel-note">
             {status.datasetKind === "exported"
               ? "Real robot replay is disabled for exported datasets."
+              : twoArmOnly
+                ? "A pseudo_bimanual pair replays on two arms only: use the Two-Arm Executability panel below."
               : !validationDecisionAvailable
                 ? "Run MuJoCo validation to completion for this dataset and episode first. A run " +
                   "that finishes and fails can still be overridden below, with its errors in front " +
@@ -601,6 +604,7 @@ export function RecordedDatasetList({
                   <StatusDot state={dataset.dataStatus === "loaded" ? "running" : "warning"} />
                   <strong>{dataset.name}</strong>
                   {dataset.datasetKind === "exported" ? <em>exported</em> : null}
+                  {dataset.datasetKind === "pseudo_bimanual" ? <em>two-arm pairs</em> : null}
                   {/* A view replays its own derived action contract -- which is the point of
                       replaying one -- so name the contract rather than just the dataset. */}
                   {dataset.datasetKind === "training_view" ? (

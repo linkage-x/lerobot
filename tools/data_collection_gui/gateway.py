@@ -1558,6 +1558,10 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
         return "calibration"
     except (OSError, ValueError):
         pass
+    # Two recorded right hands, one mirrored: for the two-arm panels only, never a capture, an export
+    # or training data.
+    if _pseudo_bimanual_pairs(_load_dataset_info(dataset_root)):
+        return "pseudo_bimanual"
     try:
         resolved.relative_to(_task_exports_root(state).resolve())
     except (OSError, ValueError):
@@ -1570,7 +1574,7 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
 # recording, and a calibration sweep is instrument data with no demonstration in
 # it at all. Both would otherwise take the slot the moment they are written --
 # the sweep on every single wizard run.
-_NOT_A_FRESH_CAPTURE_KINDS = frozenset({"training_view", "calibration"})
+_NOT_A_FRESH_CAPTURE_KINDS = frozenset({"training_view", "calibration", "pseudo_bimanual"})
 
 
 def _can_claim_latest_capture(dataset_kind: str) -> bool:
@@ -1987,6 +1991,16 @@ def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
     return info if isinstance(info, dict) else {}
 
 
+def _pseudo_bimanual_pairs(info: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pairs of a pseudo_bimanual session (tools/fr3/pseudo_bimanual.py): two recorded right-hand
+    episodes standing in for two hands. It holds no parquet and no videos -- only the pairs, their hand
+    trajectories and two-arm verdicts -- so it is listed for the two-arm panels by its pairs."""
+    block = info.get("pseudo_bimanual")
+    if not isinstance(block, dict):
+        return []
+    return [pair for pair in block.get("pairs") or [] if isinstance(pair, dict) and "episode" in pair]
+
+
 def _feature_names(info: dict[str, Any], column: str) -> list[str]:
     feature = (info.get("features") or {}).get(column) or {}
     names = feature.get("names") if isinstance(feature, dict) else None
@@ -2111,6 +2125,9 @@ def _dataset_replay_meta(state: GatewayState, dataset_root: Path, info: dict[str
 
 
 def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = None) -> list[int]:
+    pairs = _pseudo_bimanual_pairs(info or _load_dataset_info(dataset_root))
+    if pairs:
+        return sorted(int(pair["episode"]) for pair in pairs)
     if _has_gmsl2_episodes(dataset_root):
         indices = []
         for d in _gmsl2_episode_dirs(dataset_root):
@@ -2590,6 +2607,8 @@ def _dataset_is_complete(dataset_root: Path) -> bool:
     info = _load_dataset_info(dataset_root)
     if not info:
         return False
+    if _pseudo_bimanual_pairs(info):
+        return True
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
         return False
@@ -12360,8 +12379,11 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
         is_gmsl2 = _has_gmsl2_episodes(dataset_root)
+        pairs = _pseudo_bimanual_pairs(info)
         if is_gmsl2:
             total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+        elif pairs:
+            total_episodes, total_frames = len(pairs), sum(int(pair.get("frames") or 0) for pair in pairs)
         else:
             total_episodes = int(info.get("total_episodes") or 0)
             total_frames = int(info.get("total_frames") or 0)
@@ -12375,7 +12397,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
                 "totalFrames": total_frames,
-                "dataStatus": _recorded_dataset_status(dataset_root),
+                "dataStatus": "loaded" if pairs else _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
                 **_training_view_item_fields(dataset_root, dataset_kind),
@@ -18232,6 +18254,8 @@ def _require_mujoco_validation(
         raise RuntimeError(
             "Real-robot replay is disabled for exported datasets because exported action is next-frame observation.state, not a verified robot command stream."
         )
+    if _dataset_kind(state, dataset_root) == "pseudo_bimanual":
+        raise RuntimeError("A pseudo_bimanual pair replays on two arms only: use the Two-Arm Executability panel.")
     selected_cube = str(cube_mode or state.replay.mujocoCubeMode)
     if not _mujoco_validation_is_for_active_episode(state, dataset_root) and not (
         allow_failed_override

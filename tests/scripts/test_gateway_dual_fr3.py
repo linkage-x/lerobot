@@ -257,3 +257,38 @@ def test_check_refuses_while_another_fr3_job_holds_an_arm(tmp_path: Path, monkey
         assert "单臂 move to start" in gateway._dual_home_check(state, {})["error"]
     state.fr3_pivot_job = {"state": "collecting"}
     assert "pivot" in gateway._dual_home_check(state, {})["error"]
+
+
+# --- a pseudo_bimanual pair set on the replay page ------------------------------------------------
+
+
+def test_a_pseudo_bimanual_set_is_listed_and_selected_for_the_two_arm_panels_only(tmp_path: Path) -> None:
+    # no parquet, no videos: the pairs and their two-arm verdicts are all it holds
+    datasets = tmp_path / "outputs" / "datasets"
+    pairs = datasets / "pseudo_bimanual_a5_s066"
+    (pairs / "meta").mkdir(parents=True)
+    info = {"fps": 60.0, "pseudo_bimanual": {"pairs": [{"episode": 1, "frames": 300}, {"episode": 0, "frames": 706}]}}
+    (pairs / "meta" / "info.json").write_text(json.dumps(info))
+    (pairs / gateway.DUAL_FR3_EXECUTABLE_FILE).write_text(json.dumps(VERDICTS))
+    (datasets / "unfinished" / "meta").mkdir(parents=True)
+    (datasets / "unfinished" / "meta" / "info.json").write_text("{}")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(episode=0),
+        datasets_root=datasets,
+    )
+    (item,) = gateway._recorded_dataset_items(state)
+    assert item["name"] == pairs.name and item["datasetKind"] == "pseudo_bimanual"
+    assert (item["totalEpisodes"], item["totalFrames"], item["dataStatus"]) == (2, 1006, "loaded")
+    assert not item["isLatest"]  # never "the capture that just happened"
+
+    gateway._select_replay_dataset(state, str(pairs))
+    assert state.replay.episodeOptions == [0, 1] and state.replay.datasetKind == "pseudo_bimanual"
+    gateway._select_replay_episode(state, "1")
+    assert gateway._dual_fr3_executability_payload(pairs, 1)["modes"]["absolute"]["episode"]["reasons"]
+    gateway._snapshot(state)  # the page's poll holds up on a set with no frames of its own
+    with pytest.raises(RuntimeError, match="two arms only"):
+        gateway._require_mujoco_validation(state)

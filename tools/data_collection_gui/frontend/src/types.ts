@@ -586,7 +586,9 @@ export type CollectionTask = {
 // "calibration" is a board sweep recorded by the guided wizard, not a
 // demonstration: it never counts towards a task's episode budget and is never
 // merged into a v3 export.
-export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration";
+// "pseudo_bimanual" pairs two recorded right hands (one mirrored) for the two-arm panels; it has no
+// parquet or video of its own and is never a capture, an export source or training data.
+export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration" | "pseudo_bimanual";
 
 export type RecordedDataset = {
   path: string;

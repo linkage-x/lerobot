@@ -48,7 +48,10 @@ function TrainingViewPage({
   // Calibration sweeps arrive in that list too and are not a build source at all: there is no
   // demonstration in them to re-express into an action contract.
   const datasets = allDatasets.filter(
-    (dataset) => dataset.datasetKind !== "training_view" && dataset.datasetKind !== "calibration"
+    (dataset) =>
+      dataset.datasetKind !== "training_view" &&
+      dataset.datasetKind !== "calibration" &&
+      dataset.datasetKind !== "pseudo_bimanual"
   );
   const viewsFor = (dataset: RecordedDataset) =>
     allDatasets.filter(
