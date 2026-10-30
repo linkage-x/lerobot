@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>抓取算法专项训练</title>
+<style>
+:root {
+  --bg: #fbfaf7; --surface: #ffffff; --surface-2: #f3f1ec; --text: #1d1d1b; --muted: #66645e;
+  --border: #e2dfd7; --accent: #2f5d8a; --accent-soft: #e6eef6; --p1: #b4462f; --p2: #a0731c; --p3: #4f7a4a;
+  --code-bg: #f4f2ee; --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --surface: #1f1f1d; --surface-2: #272724; --text: #ebe9e4; --muted: #a19e96;
+    --border: #36352f; --accent: #8db6dd; --accent-soft: #233243; --p1: #e0826c; --p2: #d6ad5c; --p3: #8fbf88;
+    --code-bg: #262622;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161615; --surface: #1f1f1d; --surface-2: #272724; --text: #ebe9e4; --muted: #a19e96;
+  --border: #36352f; --accent: #8db6dd; --accent-soft: #233243; --p1: #e0826c; --p2: #d6ad5c; --p3: #8fbf88;
+  --code-bg: #262622;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.7 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+main { max-width: 920px; margin: 0 auto; padding: 32px 16px 80px; }
+h1 { font-size: 1.9rem; line-height: 1.3; margin: 0 0 8px; }
+h2 { font-size: 1.35rem; margin: 48px 0 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+h3 { font-size: 1.05rem; margin: 22px 0 6px; }
+p, li { color: var(--text); }
+.muted { color: var(--muted); }
+a { color: var(--accent); }
+code { font-family: var(--mono); font-size: .88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { font-family: var(--mono); font-size: .85rem; background: var(--code-bg); padding: 12px 14px; border-radius: 8px;
+  overflow-x: auto; line-height: 1.5; border: 1px solid var(--border); }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; margin: 10px 0; }
+th, td { border-bottom: 1px solid var(--border); padding: 7px 8px; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.table-wrap { overflow-x: auto; }
+.lede { font-size: 1.05rem; color: var(--muted); margin: 0 0 20px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin: 16px 0; }
+.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.toc a { text-decoration: none; font-size: .88rem; padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+.toc a.done { background: var(--accent-soft); border-color: var(--accent); }
+.pipe { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 12px 0; }
+.pipe a { flex: 1 1 140px; text-decoration: none; color: var(--text); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; font-size: .86rem; line-height: 1.45; }
+.pipe a b { display: block; font-size: .92rem; margin-bottom: 2px; }
+.pipe a span { color: var(--muted); }
+.pipe a:hover { border-color: var(--accent); }
+.mod-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.mod-head h2 { flex: 1 1 auto; border: none; margin: 0; padding: 0; }
+.mod { border-top: 1px solid var(--border); margin-top: 48px; padding-top: 18px; }
+.tag { font-size: .78rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.p1 { color: var(--p1); } .p2 { color: var(--p2); } .p3 { color: var(--p3); }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: .88rem; color: var(--muted); cursor: pointer; user-select: none; }
+.why { border-left: 3px solid var(--accent); padding: 4px 0 4px 14px; margin: 12px 0; }
+details { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+details summary { cursor: pointer; font-weight: 600; }
+details[open] summary { margin-bottom: 6px; }
+.prompt { position: relative; }
+.prompt pre { white-space: pre-wrap; font-family: inherit; font-size: .9rem; line-height: 1.6; padding-right: 64px; }
+.copy { position: absolute; top: 8px; right: 8px; font: inherit; font-size: .8rem; padding: 3px 9px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+.copy:hover { border-color: var(--accent); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+footer { margin-top: 56px; font-size: .88rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>抓取算法专项训练</h1>
+<p class="lede">适用于 FR3 peg 抓取基线（pi0.5 + LoRA + funnel 重标），2026-10-29 编写。目标是能独立判断“这个改动为什么会、或为什么不会让成功率变好”，并能读懂、改动训练和推理代码。</p>
+
+<div class="card">
+  <h3 style="margin-top:0">怎么用这份材料</h3>
+  <ul>
+    <li><b>每个模块的结构都一样：</b>为什么跟你有关（对应仓库里真实发生过的事）→ 必会概念 → 对应代码 → 自测题（答案折叠）→ 不动机器人的动手练习 → 可直接贴给 ChatGPT 的提示词。</li>
+    <li><b>先贴“通用背景”，再贴模块提示词。</b>这样 ChatGPT 的回答会落到你的系统上，而不是泛泛而谈。</li>
+    <li><b>优先级：</b><span class="tag p1">P1</span> 直接影响每天的决策；<span class="tag p2">P2</span> 用于读代码、调参；<span class="tag p3">P3</span> 选修。</li>
+    <li>每个模块大约 2–4 小时。勾选“已完成”会保存在这台浏览器里。</li>
+    <li>练习只读数据和代码。要用 GPU 的练习，请等 Dante 上没有训练、也没有机器人在跑时再做。</li>
+  </ul>
+  <nav class="toc" id="toc"></nav>
+</div>
+
+<h2 id="map">全景：一次抓取经过哪些算法环节</h2>
+<p class="muted">点击任意一环可跳到对应模块。</p>
+<div class="pipe">
+  <a href="#m7"><b>① 数据来源</b><span>arm A 策略自己跑 / arm B funnel 纠正 / SpaceMouse 示教</span></a>
+  <a href="#m2"><b>② 动作表示</b><span>delta_ee_from_prev_cmd，30 Hz，分位数归一化</span></a>
+  <a href="#m1"><b>③ 标签</b><span>funnel_relabel：离线 DAgger，重标策略自己的步骤</span></a>
+  <a href="#m3"><b>④ 模型</b><span>PaliGemma 前缀 + action expert 后缀</span></a>
+  <a href="#m4"><b>⑤ 训练目标</b><span>flow matching，50 步动作块</span></a>
+  <a href="#m5"><b>⑥ 参数效率</b><span>LoRA r64，只训 action expert；--init-adapter 微调</span></a>
+  <a href="#m6"><b>⑦ 推理执行</b><span>10 步 Euler 去噪 + RTC 衔接，Dante ↔ NUC</span></a>
+  <a href="#m8"><b>⑧ 离线诊断</b><span>gain、线性探针、交换探针、bootstrap</span></a>
+  <a href="#m9"><b>⑨ 实机评估</b><span>配对 A/B，McNemar，一次只变一个量</span></a>
+</div>
+
+<h2 id="plan">建议节奏（约两周，每天 1.5–2 小时）</h2>
+<div class="table-wrap"><table>
+  <tr><th>阶段</th><th>模块</th><th>学完能做到</th></tr>
+  <tr><td>第 1–3 天</td><td><a href="#m1">M1 分布偏移与 DAgger</a>、<a href="#m2">M2 动作表示</a></td><td>说清楚为什么要重标、为什么 R6 会“多抬起”</td></tr>
+  <tr><td>第 4–6 天</td><td><a href="#m4">M4 Flow matching</a>、<a href="#m3">M3 pi0.5 架构</a></td><td>读懂 <code>modeling_pi05.py</code> 的训练和采样两条路径</td></tr>
+  <tr><td>第 7–9 天</td><td><a href="#m7">M7 专家与数据配方</a>、<a href="#m8">M8 离线诊断</a></td><td>自己重算 gain，判断该多录数据还是该改标签</td></tr>
+  <tr><td>第 10–12 天</td><td><a href="#m5">M5 LoRA 与微调</a>、<a href="#m6">M6 推理时序</a>、<a href="#m9">M9 实验统计</a></td><td>设计一次 A/B，并预先算出需要跑多少次</td></tr>
+  <tr><td>第 13–14 天</td><td><a href="#capstone">结业作业</a>，按兴趣读 <a href="#m10">M10</a></td><td>独立写出下一轮实验方案</td></tr>
+</table></div>
+
+<h2 id="ctx">通用背景（每次先贴给 ChatGPT）</h2>
+<div class="prompt"><button class="copy">复制</button><pre>背景：我在一台 Franka FR3 机械臂上做抓取任务：夹起桌上的一根 peg，再插进孔里。孔和 peg 之间的间隙只有约 2.5 mm，没有倒角。
+策略模型是 LeRobot 里的 pi0.5：PaliGemma（SigLIP 视觉塔 + Gemma 2B）编码图像、文本和状态，作为前缀；一个 Gemma 300M 的 action expert 用 flow matching 生成 50 步的动作块，推理时去噪 10 步。
+训练方式：只在 action expert 上训 LoRA（r=64，alpha=64），SigLIP 和 PaliGemma 都冻结。
+动作和观测：
+- 动作是世界坐标系下、相对上一条命令的末端位移（delta_ee_from_prev_cmd），加上夹爪，频率 30 Hz。
+- 状态和动作都用分位数归一化。状态被离散成 256 档，写进文本提示。
+- 有两个相机：腕部（ee）相机和侧面相机。
+训练数据有三类：
+- 人用 SpaceMouse 示教；
+- 策略自己跑的轨迹；
+- 一个脚本专家（grasp funnel，状态机：搜索→对准→下降→合爪）的纠正。
+策略自己走过的步骤，用这个专家程序离线重标，相当于离线 DAgger。
+实机推理在一台 5090 上跑，机器人侧在另一台装实时内核的 NUC 上，块与块之间用 Real-Time Chunking 衔接。
+我会 Python 和 PyTorch 基础，想补算法细节。请用中文回答：先讲直觉，再给公式，最后给一个能在 CPU 上跑的小例子。不确定的地方请直说。</pre></div>
+
+<!-- ================= M1 ================= -->
+<section class="mod" id="m1" data-mod="m1">
+<div class="mod-head"><h2>M1 · 模仿学习的分布偏移与 DAgger</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b></p>
+  <ul>
+    <li>10-22 发现，corrective-153 视图里 43% 的训练帧是旧策略自己没纠正过的步骤。模型因此学会了“直接往下走”：它看得到 peg 的方向，但只横移约 1 mm，而标签要求横移约 13 mm。</li>
+    <li><code>funnel_relabel</code> 就是针对这个问题的离线 DAgger。</li>
+    <li>R6 的教训是另一面：标签规则本身（偏离超过约 8 mm 先抬起），也会被模型忠实地学走。</li>
+  </ul>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>行为克隆就是监督学习，但测试分布由模型自己决定。</b>只要错了一步，模型就会走到训练里没见过的状态，误差会累积。经典结论：误差上界从 O(Tε) 恶化到 O(T²ε)。</li>
+  <li><b>DAgger：</b>状态取自学习者实际走到的地方，标签由专家给出。成立的前提是：在学习者走到的每个状态上，专家都能给出正确动作。</li>
+  <li><b>为什么能离线重标：</b>funnel 是“状态 + peg 位置”的程序，所以可以对录下的任意一帧，模拟出“专家此刻会怎么做”。人类专家做不到这一点。</li>
+  <li><b>HG-DAgger / 人类接管：</b>没被人控制的维度不能当专家标签。比如接管时夹爪保持策略最后一次的输出，这个维度上记录的仍是学习者自己的动作，所以要用 <code>intervention_unsupervised_action_dims</code> 把它从损失里去掉。</li>
+  <li><b>多模态动作：</b>同一个状态下有好几种合理动作时，MSE 回归会把它们平均成一个“中间值”。这是选用生成式动作头的原因，见 M4。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>tools/fr3/funnel_relabel.py</code>：开头的 docstring 写清了重标的全部理由，是最好的教材。</li>
+  <li><code>tools/fr3/grasp_funnel.py</code>：专家状态机。</li>
+  <li><code>src/lerobot/policies/pi05/configuration_pi05.py</code>：<code>intervention_unsupervised_action_dims</code> 的注释。</li>
+  <li><code>tools/fr3/dagger_takeover.py</code>：人类接管的实现。</li>
+</ul>
+<h3>自测题</h3>
+<details><summary>重标时，为什么用“funnel 从这一帧模拟出的动作块”，而不是录下来的未来动作？</summary>
+<p>录下来的未来是策略自己走的，本来就没有纠正。另一种做法是每一步都标成“朝 peg 移动”，但动作块仍取自录下的未来，那么同一个动作块里每一步都朝同一个 peg 修正，修正量会被重复叠加。所以要用专家从这一帧的命令出发、按运动学模拟出完整的动作块。</p></details>
+<details><summary>R6 补了一批“低位、偏心”的数据，为什么反而在实机上更爱抬起、反复重试、最后超时？</summary>
+<p>funnel 的规则是：偏离超过约 8 mm 就先抬起，再对准。新增的低位帧里，抬起标签在成功的录制中约占 67%，在没合手的录制中约占 77%，偏离超过 10 mm 的帧 100% 是抬起。模型忠实地学会了这个规则。数据越多，这个行为越强。这就是“标签规则的问题”，而不是“数据太少”。</p></details>
+<details><summary>什么样的专家无法做离线 DAgger？</summary>
+<p>两类：一是专家的决策依赖录制时拿不到的信息（例如人眼看到、但没被记录的东西）；二是专家本身不是状态的确定函数（例如人类示教）。这两种情况只能在线采集：让人在机器人上实时接管。</p></details>
+<h3>动手练习（不动机器人）</h3>
+<ol>
+  <li>打开 R4 的训练视图（<code>/home/hph/Codes/lerobot_train/outputs/exports/training_views/</code> 下以 <code>…armA72_from030000__funnel_relabel300</code> 结尾的目录），读取 <code>meta/action_overrides.npz</code>，其中的键是 <code>index</code> 和 <code>action</code>。</li>
+  <li>任选一个有重标的 episode，逐帧画出两条曲线：原动作块 x 方向的累计位移，和重标后的累计位移。重标帧在哪个高度段最多？</li>
+  <li>统计全部帧里被重标的比例，再和 docstring 里的 43% 对照。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请讲清楚行为克隆的复合误差（Ross & Bagnell 的 O(T²ε) 论证），以及 DAgger 为什么能把它降到 O(Tε)。
+然后讨论三个问题：
+1. 当专家是一个“状态 + 物体位置”的程序时，离线重标策略自己走过的状态，需要满足哪些前提？
+2. 人类接管时只接管部分维度（比如不控制夹爪），为什么这些维度不能当作专家标签？
+3. 如果专家规则本身是“偏离超过 8 mm 先抬起再对准”，模型学到后在实机上会出现什么行为？怎么在离线数据上提前发现？</pre></div>
+</section>
+
+<!-- ================= M2 ================= -->
+<section class="mod" id="m2" data-mod="m2">
+<div class="mod-head"><h2>M2 · 动作与观测的表示</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b></p>
+  <ul>
+    <li>录制时如果按 200 Hz 控制节拍取增量，会让策略慢 6.7 倍。</li>
+    <li>合爪时，实测位姿相对命令有一个固定偏移，约 (+3.8, −1.8, −3.2) mm。所有 gain 都要以它为中心计算。</li>
+    <li>R6c 必须沿用 R4 的 <code>stats.json</code>。</li>
+    <li>拷贝视图后，裁剪源尺寸在 NUC 上被解析错过，导致试验出错。</li>
+  </ul>
+  <p>这些都属于“表示”的问题。</p>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>三种动作表示：</b>绝对位姿、相对当前实测位姿的增量、相对上一条命令的增量（本仓库用最后一种）。它们在积分漂移、跟踪误差和延迟下的表现各不相同。</li>
+  <li><b>增量的时间尺度必须等于策略查询的间隔</b>，也就是一个数据帧（30 Hz）。所以增量在离线处理时由相邻帧做差得到。</li>
+  <li><b>动作块（chunk）：</b>50 步 × 1/30 s ≈ 1.67 s。模型一次输出整块，执行时只用一部分，见 M6。</li>
+  <li><b>分位数归一化：</b>把 q01–q99 映射到 [−1, 1]。和 mean/std 相比，它不受少数大动作的影响。代价是超出范围的值会被压缩，各维度在损失里的权重也随之改变（见 <code>configuration_pi05.py</code> 的注释）。</li>
+  <li><b>状态怎么进入 pi0.5：</b>先归一化到 [−1, 1]，再离散成 256 档，写进文本提示 <code>State: …</code>。由此可以推出状态的有效分辨率。</li>
+  <li><b><code>action_loss_weights</code>：</b>本仓库用的是 [1, 1, 1, 0.2, 2]，意思是按维度给 flow matching 的损失加权。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>tools/fr3/fr3_delta_action_transform.py</code>：docstring 解释了为什么增量要离线计算。</li>
+  <li><code>src/lerobot/policies/pi05/processor_pi05.py</code>：状态离散化，大约在第 60–85 行。</li>
+  <li><code>src/lerobot/policies/pi05/configuration_pi05.py</code>：<code>normalization_mapping</code> 和 <code>action_loss_weights</code>。</li>
+  <li><code>docs/fr3_chunk_action_quantile_normalization_design_20260327.md</code></li>
+</ul>
+<h3>自测题</h3>
+<details><summary>finetune 时，如果用新数据重新算了 stats.json，会出什么问题？</summary>
+<p>同一个物理动作（比如向 +x 移动 1 mm）会对应另一个归一化数值。从旧 LoRA 继承下来的“特征 → 归一化动作”映射整体错位，开头几千步都在纠正这个错位，而不是在学新数据。所以 R6c 复制了 R4 的视图，沿用 R4 的 stats。</p></details>
+<details><summary>为什么 gain 要用 cx = ox + 3.8、cy = oy − 1.8，而不是直接用 ox、oy？</summary>
+<p>合爪时，手臂会稳定在离命令一个固定偏移的位置。“正好对准 peg”对应的实测偏移不是 0，而是约 (−3.8, +1.8) mm。不先减掉这个偏移，就会把一个系统性常量当成模型的误差。</p></details>
+<details><summary>状态离散成 256 档，对“读位置”意味着什么？</summary>
+<p>如果某个轴的 q01–q99 范围是 R mm，那么每档约为 2R/256 mm 以上，因为 [−1, 1] 被分成了 256 份。这个精度足以粗定位，但无法分辨毫米级的对准，所以毫米级信息只能来自图像。这和 10-29 交换探针的结论一致：模型读的是腕部图像，没有走“位置捷径”。</p></details>
+<h3>动手练习</h3>
+<ol>
+  <li>打开 R4 视图的 <code>meta/stats.json</code>，找到 action 和 observation.state 的 q01/q99。算两个数：x 方向一个归一化单位对应多少毫米；状态每一档对应多少毫米。</li>
+  <li>在 <code>meta/info.json</code> 里找到动作各维的名字，确认 [1, 1, 1, 0.2, 2] 的第 4 维和第 5 维分别是什么，并想一想为什么这样加权。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请完成以下几件事：
+1. 对比三种动作表示：绝对位姿、相对当前测量位姿的增量、相对上一条命令的增量。分别说明它们在积分漂移、控制延迟和跟踪误差下的表现，并给出数值例子。
+2. 解释分位数归一化（q01/q99 映射到 ±1）和 mean/std 归一化的区别，以及它们对多维动作损失中“各维度梯度份额”的影响。
+3. 说明为什么在已训练的模型上微调时，不能更换归一化统计。
+4. pi0.5 把归一化后的状态离散成 256 档文本 token。这对状态的有效精度意味着什么？模型会因此更依赖图像吗？</pre></div>
+</section>
+
+<!-- ================= M3 ================= -->
+<section class="mod" id="m3" data-mod="m3">
+<div class="mod-head"><h2>M3 · pi0.5 的模型结构</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b>你冻结了 SigLIP 和 PaliGemma，只训 action expert，所以训练只能改变“冻结特征 → 动作”的映射。10-29 的分诊就是按这个结构来分的，先后回答了两个问题：</p>
+  <ul>
+    <li>冻结的特征里有没有 x 信息？有，线性读出误差约 1.8 mm。</li>
+    <li>映射能不能泛化到新场景？这才是缺口所在。</li>
+  </ul>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>前缀：</b>每个相机的图像经 SigLIP 变成 16×16 = 256 个 patch token，再经 <code>multi_modal_projector</code> 投影到 Gemma 的宽度。之后接上文本和离散状态 token。前缀内部是双向注意力。</li>
+  <li><b>后缀：</b>action expert 处理 50 个带噪声的动作 token。它可以看前缀，前缀看不到它（块状因果 / prefix-LM 掩码）。两个 Transformer 逐层共享注意力，但权重彼此独立。</li>
+  <li><b>时间步注入：</b>pi0.5 用 adaRMSNorm，把 flow 的时间 t 作为条件，调制 action expert 每一层的归一化。pi0 的做法不同：把 t 拼进动作 token。</li>
+  <li><b>KV cache：</b>前缀只计算一次，10 步去噪都只跑 action expert，所以推理很便宜。</li>
+  <li><b>pi0 与 pi0.5 的差别：</b>状态的表示方式（连续 token 还是离散文本）、时间步的注入方式，以及训练配方（知识隔离 / 离散动作的联合训练）。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>src/lerobot/policies/pi05/modeling_pi05.py</code>：<code>embed_prefix</code>、<code>embed_suffix</code>（约第 684 行，其中有 adaRMS 的条件）、<code>forward</code>、<code>sample_actions</code>。</li>
+  <li><code>src/lerobot/policies/pi_gemma.py</code>：双 Transformer 共享注意力的实现。</li>
+  <li><code>tools/fr3/fr3_train_il_policy.py</code>：<code>--lora</code> 的 target-modules 正则决定了哪些层可训练。</li>
+</ul>
+<h3>自测题</h3>
+<details><summary>在“冻结视觉、只训 action expert 的 LoRA”的设定下，哪类错误是加再多数据也修不好的？</summary>
+<p>特征里根本不存在的信息。比如裁剪把 peg 切掉了、分辨率不足以分辨 2 mm、某种光照下特征崩了。所以第一步永远是在冻结特征上做线性探针（M8）。读得出来，说明问题在映射或数据；读不出来，说明需要改视觉端或改相机。</p></details>
+<details><summary>为什么同一张图，推理时前缀只算一次就够了？</summary>
+<p>注意力掩码保证前缀看不到后缀。不管去噪进行到哪一步，前缀的 K/V 都不变，所以可以缓存起来，每步只算 action expert。</p></details>
+<h3>动手练习（等 GPU 空闲时）</h3>
+<ol>
+  <li>加载 R4 045000，按模块前缀统计 <code>requires_grad=True</code> 的参数量。确认总数是 27,856,896，而且全都在 action expert 里。</li>
+  <li>在 <code>embed_prefix</code> 里打印 token 数，看看两个相机、文本和状态各占多少。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请逐层讲解 pi0.5 的前向计算：
+1. 图像怎么变成 token（SigLIP、16×16 patch、multi_modal_projector）。
+2. 文本和离散状态 token 怎么拼接。
+3. action expert 怎么和 PaliGemma 共享注意力：前缀双向，后缀能看前缀，前缀看不到后缀。请画出注意力掩码。
+4. adaRMSNorm 怎么注入 flow 的时间步。
+5. KV cache 为什么能让 10 步去噪只跑 expert。
+然后对比 pi0 和 pi0.5 在状态表示、时间注入和训练配方上的差异。
+最后回答：视觉塔冻结、只在 action expert 上训 LoRA 时，哪类错误是训练修不好的？应该怎么诊断？</pre></div>
+</section>
+
+<!-- ================= M4 ================= -->
+<section class="mod" id="m4" data-mod="m4">
+<div class="mod-head"><h2>M4 · Flow matching：动作是怎么“生成”出来的</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why"><p><b>为什么跟你有关：</b>训练 loss（比如 R6c 第 50 步的 0.055）看起来“很小”，但它几乎不能用来比较策略的好坏。离线探针每帧要采样两次再取平均，也是因为模型的输出本来就带随机性。这两点都来自 flow matching 本身。</p></div>
+<h3>必会概念（本仓库的约定：t = 1 是纯噪声，t = 0 是动作）</h3>
+<pre><code>训练:  ε ~ N(0, I),  t ~ 0.999·Beta(1.5, 1) + 0.001
+       x_t = t·ε + (1 − t)·a              # 噪声和真实动作块的线性插值
+       u   = ε − a                        # 目标速度（沿直线从 a 指向 ε）
+       loss = ‖v_θ(x_t, t, obs) − u‖²     # 按维度乘 action_loss_weights
+推理:  x_1 = ε;  dt = −0.1
+       重复 10 次: x ← x + dt · v_θ(x, t, obs)   # Euler 积分到 t = 0</code></pre>
+<ul>
+  <li><b>和扩散模型（DDPM）的关系：</b>两者是同一族方法。flow matching 的路径是直线，目标更简单，需要的步数更少。</li>
+  <li><b>Beta(1.5, 1) 的用意：</b>密度朝 t → 1 增大，也就是把训练重点放在高噪声端。在高噪声时，动作主要由观测决定，这一段最难学。</li>
+  <li><b>能表示多模态：</b>不同的噪声样本会走到不同的“模式”，而不是被平均到中间。</li>
+  <li><b>loss 有不可约部分：</b>u 里含有随机的 ε，所以就算模型完美，loss 也不会是 0。比较两个模型时，要看下游指标。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>modeling_pi05.py</code>：<code>sample_beta</code>（约第 101 行）、<code>sample_time</code>、<code>forward</code>（约第 739–784 行：x_t、u_t、MSE）、<code>sample_actions</code>（约第 828–860 行：Euler 循环和 RTC 钩子）、<code>apply_action_loss_weights</code>。</li>
+</ul>
+<h3>自测题</h3>
+<details><summary>如果把推理步数从 10 改成 1，会发生什么？</summary>
+<p>一步 Euler 相当于直接用 x_1 − v 估计动作，结果会接近条件均值，多模态被抹平。轨迹会更“平均”，在需要二选一时（比如从左边还是右边绕）就容易出问题。路径越直，单步的误差越小。这正是 rectified flow 和一致性模型改进的方向。</p></details>
+<details><summary>为什么离线探针每帧要用不同的随机种子采样两次再取平均？</summary>
+<p>输出依赖初始噪声 ε。单次采样里，噪声带来的方差会混进 gain 估计。取平均能降低方差，两次之间的差异还可以顺带估计这部分噪声有多大。</p></details>
+<h3>动手练习（CPU，约 40 行代码）</h3>
+<ol>
+  <li>构造一个二维“双峰”数据集：条件 c 相同，动作要么是 (−1, 0)，要么是 (+1, 0)。</li>
+  <li>分别训练一个 MSE 回归 MLP 和一个 flow matching MLP，用上面的公式。</li>
+  <li>采样 1000 个点画散点图。MSE 会塌到 (0, 0)，flow matching 会给出两簇。</li>
+  <li>再把推理步数改成 1、2、10，比较结果。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请完成以下几件事：
+1. 从零推导条件 flow matching：线性插值路径 x_t = t·ε + (1−t)·a，目标速度 u = ε − a，MSE 损失；推理时从 t=1 到 0 做 Euler 积分（10 步）。
+2. 解释它和 DDPM、rectified flow 的关系。
+3. 解释为什么时间采样用 0.999·Beta(1.5,1)+0.001。
+4. 用一个二维双峰玩具数据，对比 MSE 回归和 flow matching 的输出，给出完整的 PyTorch 代码（CPU 可跑），并展示推理步数 1/2/10 的差别。
+5. 说明为什么训练 loss 的数值（比如 0.055）几乎不能用来比较两个策略的好坏，以及应该看什么。</pre></div>
+</section>
+
+<!-- ================= M5 ================= -->
+<section class="mod" id="m5" data-mod="m5">
+<div class="mod-head"><h2>M5 · LoRA 与微调策略</h2><span class="tag p2">P2</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b>这几轮里有两种做法：</p>
+  <ul>
+    <li>从基础模型重训：R4、R6。</li>
+    <li>从 R4 用小学习率继续微调：R7b、R6c。</li>
+  </ul>
+  <p>R6c 想检验的问题是：微调能不能在学到新数据的同时，保住 R4 合手的行为。理解遗忘和可塑性的权衡，才能读懂结果。</p>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>LoRA：</b>W' = W + (α/r)·B·A。B 初始化为 0，所以训练开始时模型和原模型完全一致。r = α = 64，缩放系数为 1。</li>
+  <li><b>可训练参数：</b>27.9M，只占全模型的约 1%。容量够不够，看的是数据覆盖，而不是参数量。</li>
+  <li><b><code>--init-adapter</code> 微调：</b>
+    <ul>
+      <li>使用新的优化器，Adam 的一阶、二阶矩都清零；</li>
+      <li>学习率 1e-5，warmup 100 步；</li>
+      <li>余弦衰减到 1e-6，共 15k 步。</li>
+    </ul>
+    学习率小、步数少会遗忘得少，但新数据也可能学不进去。</li>
+  <li><b>数据比例：</b>R6c 有 556 条 episode，其中新数据 49 条。均匀采样时，新数据只占约 9% 的梯度。上采样（重复或加权）是一个独立的旋钮。</li>
+  <li><b>epoch 估算：</b>步数 × batch size ÷ 训练帧数。数值远大于 1 时，要警惕记住具体位置（seed 0 的 4/10 就是这个原因）。</li>
+  <li><b>选 checkpoint：</b>每 2.5k 步存一次。用离线指标挑，不用 loss。<code>train_gate.py</code> 会在训练过程中自动探测每个 checkpoint。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>tools/fr3/fr3_train_il_policy.py</code>：<code>--lora*</code>、<code>--init-adapter</code>、<code>view_training_episodes</code>。</li>
+  <li>commit <code>224d8f8c</code>：<code>--init-adapter</code> 的实现。</li>
+  <li><code>tools/fr3/train_gate.py</code></li>
+</ul>
+<h3>自测题</h3>
+<details><summary>R7b（从 R4 微调）没有变好，能推出“微调这条路不行”吗？</summary>
+<p>不能。R7b 和 R6c 用的数据不同：R7b 用 arm B 的第二轮纠正数据，R6c 用干净的 arm A 低位数据。按“一次只变一个量”的原则，R7b 只说明“那批数据加上微调”不行。R6c 和 R6 的数据几乎相同，只是训练方式不同，所以能单独回答“重训还是微调”这个问题。</p></details>
+<details><summary>为什么 B 初始化为 0，而 A 是随机的？</summary>
+<p>B = 0 保证开始时 ΔW = 0，模型和原模型完全一样。A 随机是为了让 B 一开始就有非零梯度。如果两个都是 0，梯度也恒为 0，就学不动了。</p></details>
+<h3>动手练习</h3>
+<ol>
+  <li>从 r6nearclean 视图的 <code>meta/info.json</code> 和 <code>gui_annotations.json</code> 算出训练帧数，再算 R6c 一共看了多少个 epoch，其中新的 49 条各被看了多少遍。</li>
+  <li>在训练日志里画出 lr 曲线，确认 warmup 和余弦衰减符合预期。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请完成以下几件事：
+1. 讲 LoRA 的数学：ΔW = (α/r)BA，以及为什么 B 初始化为 0。说明 r 和 α 怎么影响有效学习率。
+2. 对比两种做法：
+   (a) 在“旧数据 + 新数据”上从基础模型重新训练；
+   (b) 从已经训好的 LoRA 用小学习率继续微调（新优化器、warmup 100、余弦衰减 1e-5 → 1e-6、15k 步）。
+   分别分析遗忘风险、对新数据的拟合程度，以及新旧数据比例（49 条新 vs 507 条旧）的影响。
+3. 什么时候该上采样新数据？
+4. 给一个不看训练 loss、而用下游离线指标选 checkpoint 的方法。</pre></div>
+</section>
+
+<!-- ================= M6 ================= -->
+<section class="mod" id="m6" data-mod="m6">
+<div class="mod-head"><h2>M6 · 推理与执行时序：动作块与 RTC</h2><span class="tag p2">P2</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why"><p><b>为什么跟你有关：</b>离线探针用的是 <code>inference_delay=0</code>，也不带上一个动作块。实机上则有网络和推理延迟，还有 RTC 引导。两者测到的不是同一个东西。理解这层差别，才知道离线结果在实机上该打几折。</p></div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>动作块（ACT 的思路）：</b>一次预测 H 步，执行其中一部分再重新规划。重新规划的次数少了，复合误差也就少了。代价是块内开环，对新出现的偏差反应慢。</li>
+  <li><b>块与块的衔接：</b>推理要花 d 步时间。这期间机器人还在执行旧块，新块的前 d 步早已“过时”，直接拼接会产生跳变。</li>
+  <li><b>Real-Time Chunking（Black 等，2025）：</b>把上一块中已经承诺执行的那部分当作 inpainting 约束，在每一步去噪时引导新块和它一致。
+    <ul>
+      <li>引导权重随 t 变化，并被 <code>max_guidance_weight</code> 截断；</li>
+      <li>前缀权重按调度（LINEAR）逐步衰减；</li>
+      <li><code>execution_horizon</code> 决定每块执行多少步再重新规划。</li>
+    </ul>
+  </li>
+  <li><b>AMP：</b>训练和推理的精度（bf16）要一致。<code>use_amp</code> 不一致曾让 NUC 握手失败。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>src/lerobot/policies/rtc/README.md</code>、<code>modeling_rtc.py</code>（<code>denoise_step</code>，大约在第 116–230 行）、<code>configuration_rtc.py</code>。</li>
+  <li><code>tools/fr3/fr3_policy_server.py</code>：搜索 <code>rtc_*</code> 参数和 warm forward。</li>
+  <li><code>tools/fr3/policy_remote.py</code>：NUC 侧的客户端。</li>
+</ul>
+<h3>自测题</h3>
+<details><summary>离线 gain 是 0.67，实机上对偏移的修正可能更大还是更小？</summary>
+<p>多半更小，至少会更慢。实机的新块前缀被上一块约束住了（上一块还没开始修正），再加上推理延迟，修正会晚几步才生效。离线探针测的是“不受约束的整块”，相当于上限。</p></details>
+<details><summary>execution_horizon 调大或调小，各有什么代价？</summary>
+<p>调大：重新规划次数少，动作平滑，但对新偏差反应慢。调小：反应快，但推理负载高，衔接次数多，抖动风险更大。</p></details>
+<h3>动手练习</h3>
+<ol>
+  <li>读 RTC 的 README 和 <code>denoise_step</code>。假设 d = 3，<code>execution_horizon</code> 取 policy server 的实际参数值，画出连续三块的时间轴，标出哪些步是被约束的前缀。</li>
+  <li>在 rollout 日志里找推理延迟的分布，换算成 30 Hz 下的步数。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请完成以下几件事：
+1. 讲 action chunking 为什么能减少复合误差，以及块与块衔接时的问题。
+2. 详细讲 Real-Time Chunking（Black, Galliker, Levine 2025）：
+   - 推理延迟为 d 步时，如何把上一块已经承诺的动作当作 inpainting 约束；
+   - 基于 flow matching 的引导项怎么推导，引导权重怎么随时间 t 变化；
+   - 为什么要截断最大引导权重；
+   - 前缀注意力衰减调度（linear / exp）是什么。
+3. 离线探针用 inference_delay=0、不带上一块，它测到的和实机行为会有什么系统性差别？怎么设计一个更接近实机的离线评估？</pre></div>
+</section>
+
+<!-- ================= M7 ================= -->
+<section class="mod" id="m7" data-mod="m7">
+<div class="mod-head"><h2>M7 · 专家、标签与数据配方</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b>这个项目每一次真正的进展，都来自数据或标签：</p>
+  <ul>
+    <li>R4 靠重标，把合爪时的 dx 从 −8.5 mm 拉到了 +1.3 mm；</li>
+    <li>R6 新增的数据把离线 x gain 提高了一倍，但实机变差了；</li>
+    <li>“要不要多录”这类决策，答案也全在这里。</li>
+  </ul>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>专家的设计就是策略的上限，也是策略的“性格”。</b>标签是程序生成的，所以规则可以改，改完可以重标，不需要重新录制。但规则改动会影响所有用它重标的数据，需要你亲自批准。</li>
+  <li><b>覆盖比数量重要：</b>训练里低位帧占 26%，大多已经对准（p90 1.9 mm）；实机 rollout 里 57% 的帧落在窗口外。这是状态分布不匹配。</li>
+  <li><b>“该多录还是该改标签”的判据：</b>
+    <ul>
+      <li>模型已经接近标签（gain 约为标签的 0.85），但实机行为不好 → 问题在标签。</li>
+      <li>模型在训练集上贴合，在新场景上差 → 问题在覆盖或泛化。</li>
+    </ul>
+  </li>
+  <li><b>坏标签：</b>peg 倒下（113 次里有 5 次），funnel 照样会给出“正确”动作，但物理上是错的。这类数据需要过滤。</li>
+  <li><b>保留集要按 episode 或按场景划分：</b>同一条 episode 内的帧高度相关，按帧随机划分会泄漏。用 <code>gui_annotations.json</code> 里的 <code>includeInTraining: false</code> 来标记。</li>
+  <li><b>arm A 与 arm B：</b>A 是策略自己完整地跑一次，保留失败的那些，失败的部分再重标；B 是策略接近之后，由 funnel 接管。两者覆盖的状态分布不同。</li>
+</ul>
+<h3>对应代码</h3>
+<ul>
+  <li><code>tools/fr3/grasp_funnel.py</code>：状态机，以及“先抬起”的条件。</li>
+  <li><code>tools/fr3/funnel_relabel.py</code></li>
+  <li><code>tools/fr3/grasp_loop.py</code></li>
+  <li><code>tools/fr3/fr3_train_il_policy.py</code>：<code>annotated_excluded_episodes</code>、<code>view_training_episodes</code>。</li>
+</ul>
+<h3>自测题</h3>
+<details><summary>如果想让模型在 8–10 mm 偏离时“横移对准”而不是“先抬起”，有哪些做法？各有什么风险？</summary>
+<p>有三种做法：</p>
+<ol>
+<li><b>提高规则的阈值。</b>低位横移可能把 peg 碰倒，这正是当初设置“先抬起”规则的原因。</li>
+<li><b>只在重标里改规则</b>，实机 funnel 保持不变。标签和实际执行不一致，模型会学到一个从没被验证过的行为。</li>
+<li><b>给“抬起”类帧降权。</b>这是治标，而且会改变其他维度的梯度份额。</li>
+</ol>
+<p>三种做法都要先在离线指标上量化，再交给你决定。</p></details>
+<details><summary>为什么 s4000、R1 和 R7 纠正数据不能参与 R6c 的训练？</summary>
+<p>它们是对照组。s4000 和 R1 是 R4 从没见过的场景，用来测泛化。混进训练以后，就没有干净的保留集来判断 R6c 是否真的变好了。</p></details>
+<h3>动手练习</h3>
+<ol>
+  <li>读 <code>grasp_funnel.py</code>，用自己的话写出“先抬起”的完整条件，包括阈值和高度。</li>
+  <li>在 r6nearclean 视图中，统计 dz ≤ 25 mm、横向偏离 6–10 mm 和 &gt;10 mm 两档的帧里，标签 z 分量为正（抬起）的比例。和 30% / 100% 对照。</li>
+</ol>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>我有一个脚本专家（抓取漏斗：搜索 → 对准 → 下降 → 合爪），偏离超过约 8 mm 时会先抬起再对准。请讨论：
+1. 专家的设计如何决定模仿策略学到的“性格”？
+2. 数据覆盖（状态分布）和数据数量，哪个更重要？怎么度量覆盖？
+3. 怎么从“模型输出相对标签的增益”和“训练集与新场景的差距”，判断是该多录数据，还是该改标签规则？
+4. 物体倒下这类“专家照常给标签、但物理上错误”的坏数据，怎么检测和过滤？
+5. 保留集（held-out）应该按什么划分，才能测到真正的泛化？</pre></div>
+</section>
+
+<!-- ================= M8 ================= -->
+<section class="mod" id="m8" data-mod="m8">
+<div class="mod-head"><h2>M8 · 离线诊断工具箱</h2><span class="tag p1">P1</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why"><p><b>为什么跟你有关：</b>机器人时间是最贵的资源。R4 到 R6c 的每一个决定，都是先离线验证再上实机。掌握这套方法，你就能自己判断一个 checkpoint 值不值得上机器人。</p></div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>gain（增益）：</b>gain = −Σ(c·m) / Σc²，是过原点的最小二乘，意思是“每毫米偏移，模型修正多少毫米”。1 表示全部修正，0 表示完全不理会。
+    <ul>
+      <li>只取 |c| 在 3–10 mm 的帧：太小的偏移会被噪声淹没，太大的偏移会触发“先抬起”的规则。</li>
+      <li>对标签本身也算一遍 gain 作为参照，看的是“模型 / 标签”的比值。</li>
+    </ul>
+  </li>
+  <li><b>线性探针：</b>在冻结特征上做岭回归，读出偏移量，回答“信息在不在”。
+    <ul>
+      <li>必须按 episode 分组做交叉验证，否则同一条 episode 的相邻帧会泄漏。</li>
+      <li>alpha 用内层交叉验证来选。</li>
+    </ul>
+  </li>
+  <li><b>反事实交换探针：</b>只换腕部图像、只换侧面图像、或只换状态，看动作的变化应归因到哪个输入。10-29 的结论：只有腕部图像在起作用，没有走位置捷径。</li>
+  <li><b>按 episode 的 bootstrap：</b>以 episode 为单位重采样，得到置信区间。比较两个模型时，在同一批帧上做配对差值的 bootstrap，比两个独立的置信区间灵敏得多。</li>
+  <li><b>分组：</b>训练集、保留集和新场景要分开报告。“训练集好、新场景差”就是泛化缺口。</li>
+</ul>
+<h3>对应代码与数据</h3>
+<ul>
+  <li><code>tools/fr3/holdout_probe.py</code>、<code>tools/fr3/close_probe.py</code>、<code>tools/fr3/train_gate.py</code></li>
+  <li>结果数据：<code>outputs/eval_feat_20261029/</code>（moves.parquet、moves_r6.parquet、all_low.parquet）、<code>outputs/eval_r6_20261028/</code></li>
+</ul>
+<h3>动手练习：自己重算 R4 的 gain（已验证可运行）</h3>
+<pre><code>import numpy as np, pandas as pd
+d = pd.read_parquet("outputs/eval_feat_20261029/moves.parquet")
+d["cx"] = d.ox + 3.8                  # 以合爪时的固定偏移为中心（见 M2）
+d["m"] = d[["mx0", "mx1"]].mean(1)    # 两次采样的 x 位移平均（mm）
+def gain(h): return -(h.cx * h.m).sum() / (h.cx ** 2).sum()
+for g in ["train", "s4000"]:
+    h = d[(d.grp == g) & d.cx.abs().between(3, 10)]
+    print(g, round(gain(h), 2), h.vep.nunique(), "eps")
+# 预期：train 0.87（36 eps），s4000 0.37（18 eps）</code></pre>
+<p>运行时用 <code>PYTHONPATH=$PWD/src:$PWD .venv-fr3/bin/python</code>。做完之后再继续：</p>
+<ol>
+  <li>加上按 episode 的 bootstrap（2000 次），给出 95% 置信区间。</li>
+  <li>读入 <code>moves_r6.parquet</code>，确认两份数据的 <code>idx</code> 对齐后，计算 R6 − R4 的配对差值置信区间。</li>
+  <li>把标签位移（<code>lx</code>，单位是米，要乘以 1000）也代入同一个 gain 公式，算出“模型 / 标签”的比值。</li>
+</ol>
+<h3>自测题</h3>
+<details><summary>为什么 bootstrap 要按 episode 重采样，而不是按帧？</summary>
+<p>同一条 episode 内的帧共享同一个场景，误差高度相关。按帧重采样会把相关的样本当成独立样本，置信区间会窄得离谱，从而得出虚假的“显著”。</p></details>
+<details><summary>线性探针 R² 很高，能说明模型“会用”这个信息吗？</summary>
+<p>不能。它只说明信息存在于特征里，而且线性可读。模型是否用了这个信息，要看 gain 或交换探针。10-29 的结论正是“信息在（1.8 mm），映射没泛化”。</p></details>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>请教我一套针对模仿学习策略的离线诊断方法，每一项都给出 pandas/numpy 代码和常见陷阱：
+1. 用过原点回归定义“增益”（每毫米偏移模型修正多少毫米）。怎么选偏移区间？怎么和标签自身的增益对比？
+2. 在冻结的视觉特征上做线性探针（岭回归，对偶形式）。为什么必须按 episode 分组做交叉验证？alpha 怎么选？
+3. 反事实交换探针：分别交换腕部图像、侧面图像、状态，看动作变化归因到哪个输入。怎么设计配对，才能把“偏移”和“手臂位置”分开？
+4. 按 episode 的 bootstrap 置信区间，以及两个模型在同一批帧上的配对差值 bootstrap。
+5. 离线指标和实机成功率不一致时，常见的原因有哪些？</pre></div>
+</section>
+
+<!-- ================= M9 ================= -->
+<section class="mod" id="m9" data-mod="m9">
+<div class="mod-head"><h2>M9 · 实机实验设计与小样本统计</h2><span class="tag p2">P2</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<div class="why">
+  <p><b>为什么跟你有关：</b>你经历过的几种情况，都需要这部分知识来判断：</p>
+  <ul>
+    <li>R5 的 9/10 对 5/10 并不显著（p = 0.14），但机制指标显著（p = 0.03）；</li>
+    <li>R6 的 A/B 在第 16 次就停了，靠的是配对 6:0 的不一致对；</li>
+    <li>seed 0 的 4/10 其实是记住了位置。</li>
+  </ul>
+  <p>要分清哪些结论可信、下一次要跑多少次，就要懂小样本统计。</p>
+</div>
+<h3>必会概念</h3>
+<ul>
+  <li><b>二项比例的置信区间：</b>用 Wilson 或 Clopper-Pearson。10 次试验的区间非常宽（9/10 的 Wilson 95% 区间约为 0.60–0.98）。</li>
+  <li><b>配对设计：</b>同一个 peg 位置，两个 checkpoint 各跑一次。用 McNemar 精确检验，只看不一致的那几对。6:0 时 p = 2 × 0.5⁶ ≈ 0.031。</li>
+  <li><b>机制指标往往比成功率灵敏：</b>比如合爪时的 |dx|，用 Wilcoxon 符号秩检验。前提是这个机制确实决定了成功与否。</li>
+  <li><b>功效分析：</b>想检测从 50% 到 70% 的提升，需要的试验次数远多于 30 次。要在开跑之前就算好。</li>
+  <li><b>一次只变一个量</b>，否则结果无法归因。</li>
+  <li><b>偏差来源：</b>
+    <ul>
+      <li>看到数据再决定什么时候停（可选停止）；</li>
+      <li>挑 seed；</li>
+      <li>自动判定不等于真值（R3 里自动判为插入的 24 次中，有 6 次其实没插进）；</li>
+      <li>孔位会缓慢漂移。</li>
+    </ul>
+  </li>
+</ul>
+<h3>动手练习</h3>
+<ol>
+  <li>手算并用 <code>scipy.stats.binomtest</code> 验证 McNemar 6:0 的精确 p 值。再算 5:1 的 p 值。</li>
+  <li>写一个蒙特卡洛模拟：设 R4 的真实成功率 0.57、新模型 0.75，配对设计中两个模型的结果相关系数取 0.4，分别跑 n = 20、30、50 次，估计 McNemar 检验的功效。</li>
+  <li>重读 roadmap 里的 R5、R6 表格，给每条结论标上“显著 / 不显著 / 只是机制指标”。</li>
+</ol>
+<h3>自测题</h3>
+<details><summary>R6 的 A/B 跑到第 16 次就停了，这样做有偏差吗？</summary>
+<p>有。看着数据决定何时停止，会让 p 值偏乐观。当时 6:0 的方向很一致，加上 no_close 的机制解释，停下是合理的工程决定，但严格说应该事先定好停止规则，比如序贯检验（SPRT）。</p></details>
+<h3>去 ChatGPT 展开</h3>
+<div class="prompt"><button class="copy">复制</button><pre>实机评估时，每个 checkpoint 只能跑 10–30 次。请讲解：
+1. 二项比例的 Wilson 和 Clopper-Pearson 置信区间。
+2. 同一组物体位置上做配对比较时，McNemar 精确检验怎么算。例：不一致对 6:0、5:1 的 p 值。
+3. 机制指标（如合爪时的横向误差）怎么用 Wilcoxon 符号秩检验，前提是什么。
+4. 功效分析：配对设计下，从 57% 提高到 75% 需要多少次？请给 Python 蒙特卡洛代码。
+5. 序贯检验（SPRT）怎么让“提前停止”合法。
+6. 挑 seed、自动判定当真值、环境慢漂移，各自怎样引入偏差，怎么防范。</pre></div>
+</section>
+
+<!-- ================= M10 ================= -->
+<section class="mod" id="m10" data-mod="m10">
+<div class="mod-head"><h2>M10 · 进阶：精细操作的改进方向</h2><span class="tag p3">P3</span><label class="check"><input type="checkbox"> 已完成</label></div>
+<p>这部分不急，等 M1–M9 学完，再判断“数据和标签这条路走到头之后，下一步该改什么”。每一项都标了在本仓库中的切入点。</p>
+<div class="table-wrap"><table>
+  <tr><th>方向</th><th>解决什么</th><th>代价</th><th>本仓库的切入点</th></tr>
+  <tr><td>部分解冻视觉塔（末几层 LoRA）</td><td>特征对毫米级偏移不够敏感、新场景下特征漂移</td><td>显存增加；遗忘 VLM 的通用能力；需要更多数据</td><td><code>--lora</code> 的 target-modules 正则</td></tr>
+  <tr><td>Knowledge Insulation（pi0.5 KI）</td><td>动作梯度破坏 VLM 表征</td><td>训练配方更复杂</td><td>论文：Driess 等，2025</td></tr>
+  <tr><td>腕部相机的裁剪和分辨率</td><td>2 mm 在 224 px 下只有几个像素</td><td>要重新录或重新裁剪，统计要重算</td><td>视图的 crop 配置</td></tr>
+  <tr><td>数据增强（平移、颜色）</td><td>对未见过的场景泛化</td><td>平移增强会破坏“图像位置 ↔ 偏移”的对应，要小心</td><td>训练的 transform</td></tr>
+  <tr><td>力和触觉</td><td>合爪时的接触判断</td><td>硬件、同步、新模态</td><td><code>docs/fr3_act_tactile_encoder.md</code></td></tr>
+  <tr><td>RL 微调（残差 RL、基于经验的 RECAP 等）</td><td>超越专家，直接优化成功率</td><td>需要奖励、安全和大量实机时间</td><td><code>src/lerobot/policies/sac</code>（参考）</td></tr>
+  <tr><td>换动作头作对照（ACT、Diffusion Policy）</td><td>判断瓶颈是否只属于 pi0.5</td><td>多一条训练线</td><td><code>src/lerobot/policies/act</code>、<code>diffusion</code></td></tr>
+</table></div>
+<div class="prompt"><button class="copy">复制</button><pre>pi0.5 这类 VLA 在毫米级精细操作（比如 2.5 mm 间隙的抓取和插入）上，有哪些已知弱点和改进方向？请逐一分析下列方向的原理、代价、适用条件，以及要做什么离线实验来判断它值不值得尝试：
+- 部分解冻视觉塔
+- Knowledge Insulation
+- 提高腕部相机分辨率或裁剪
+- 平移和颜色数据增强
+- 加入力或触觉
+- 用强化学习微调 flow matching 策略（残差 RL、基于经验的 RL 微调如 RECAP）</pre></div>
+</section>
+
+<!-- ================= Reading ================= -->
+<h2 id="reading">核心阅读清单</h2>
+<div class="grid2">
+  <div class="card" style="margin:0"><b>模仿学习</b>
+    <ul>
+      <li>Ross, Gordon, Bagnell 2011 — DAgger</li>
+      <li>Kelly 等 2019 — HG-DAgger</li>
+      <li>Zhao 等 2023 — ACT（动作块）</li>
+      <li>Chi 等 2023 — Diffusion Policy</li>
+    </ul>
+  </div>
+  <div class="card" style="margin:0"><b>生成模型</b>
+    <ul>
+      <li>Lipman 等 2022 — Flow Matching</li>
+      <li>Liu 等 2022 — Rectified Flow</li>
+      <li>Ho 等 2020 — DDPM（对照着读）</li>
+    </ul>
+  </div>
+  <div class="card" style="margin:0"><b>VLA</b>
+    <ul>
+      <li>Black 等 2024 — π0</li>
+      <li>Physical Intelligence 2025 — π0.5</li>
+      <li>Driess 等 2025 — Knowledge Insulation</li>
+      <li>Beyer 等 2024 — PaliGemma；Zhai 等 2023 — SigLIP</li>
+    </ul>
+  </div>
+  <div class="card" style="margin:0"><b>工程与诊断</b>
+    <ul>
+      <li>Black, Galliker, Levine 2025 — Real-Time Chunking</li>
+      <li>Hu 等 2021 — LoRA</li>
+      <li>Alain &amp; Bengio 2016 — 线性探针</li>
+    </ul>
+  </div>
+</div>
+<p class="muted">读论文时，先读摘要、方法图和实验表，再对照本仓库对应的代码看实现，最后把不懂的公式贴给 ChatGPT。</p>
+
+<!-- ================= Capstone ================= -->
+<h2 id="capstone">结业作业：检验自己真的懂了</h2>
+<div class="card">
+  <p>R6c 训练完成后，先不看我的分析，自己写一页（中文，不限格式），回答下面四个问题：</p>
+  <ol>
+    <li><b>R6 为什么离线变好、实机变差？</b>请从 M1（标签规则）、M6（离线和实机的差异）、M8（gain 只测横向）三个角度各给出一条理由。</li>
+    <li><b>R6c 在检验什么，它只改了哪一个变量？</b>两条过关标准（s4000 上 x gain ≥ 0.7；下降阶段的抬起比例 ≤ R4 的约 0.15）分别对应哪个风险？</li>
+    <li><b>如果 R6c 的 gain 达标、抬起比例却偏高，</b>下一步改什么？写出至少两个方案，并给出各自的离线验证方法。</li>
+    <li><b>设计下一次 A/B：</b>用哪个 seed，配对还是不配对，跑多少次（附功效计算），主要指标和机制指标分别是什么，事先定好的停止规则是什么。</li>
+  </ol>
+  <p>写完之后发给我，我逐条对照数据给反馈。</p>
+</div>
+
+<footer>
+  <p>本文档对应仓库 <code>lerobot_workstation</code> 的 <code>workstation_teleop</code> 分支（2026-10-29）。行号是近似值，以函数名为准。</p>
+</footer>
+</main>
+
+<script>
+(function () {
+  var KEY = "fr3-study-plan-done";
+  var done = {};
+  try { done = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { done = {}; }
+  var toc = document.getElementById("toc");
+  var mods = document.querySelectorAll("section.mod");
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(done)); } catch (e) {} }
+  mods.forEach(function (s) {
+    var id = s.dataset.mod;
+    var title = s.querySelector("h2").textContent.split("·")[0].trim();
+    var a = document.createElement("a");
+    a.href = "#" + s.id;
+    a.textContent = title;
+    toc.appendChild(a);
+    var box = s.querySelector(".check input");
+    box.checked = !!done[id];
+    a.classList.toggle("done", box.checked);
+    box.addEventListener("change", function () {
+      done[id] = box.checked;
+      a.classList.toggle("done", box.checked);
+      save();
+    });
+  });
+  var cap = document.createElement("a");
+  cap.href = "#capstone"; cap.textContent = "结业作业";
+  toc.appendChild(cap);
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = b.parentElement.querySelector("pre").innerText;
+      var ok = function () { b.textContent = "已复制"; setTimeout(function () { b.textContent = "复制"; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(ok, function () { fallback(text); ok(); });
+      } else { fallback(text); ok(); }
+    });
+  });
+  function fallback(text) {
+    var t = document.createElement("textarea");
+    t.value = text; document.body.appendChild(t); t.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(t);
+  }
+})();
+</script>
+</body>
+</html>
