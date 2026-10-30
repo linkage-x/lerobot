@@ -601,6 +601,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-after-close',
+        choices=('script', 'teacher', 'policy'),
+        default='script',
+        help=(
+            'What follows a settled close. script: the segment ends and the scripted lift, carry and '
+            'insertion run outside the policy loop, unrecorded. teacher: the segment goes on with the '
+            "insertion teacher driving (grasp_insert_teacher.py), aimed at the hole plus the peg's "
+            'in-hand offset and recorded as an expert like the funnel. policy: the policy goes on '
+            'driving and the loop grades where it lets go. teacher and policy need '
+            '--grasp-loop-insert-pose.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-dataset-repo-id',
         type=str,
         default=None,
@@ -701,6 +714,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             '--action-samples for the align phase. 1 by default: an 8-draw forward takes ~15 steps, '
             'which is longer than the run it would choose.'
+        ),
+    )
+    parser.add_argument(
+        '--phase-align-unguided',
+        action='store_true',
+        help=(
+            'The align phase asks for its chunks without RTC guidance: no previous-chunk prefix, '
+            'inference delay 0. The queue still skips the steps run during inference.'
         ),
     )
     parser.add_argument(
@@ -5011,6 +5032,12 @@ class RolloutPhase:
     execution_horizon: int
     action_samples: int
     action_sample_horizon: int
+    # False: ask for each chunk with no RTC prefix and no guidance delay. The queue still drops the
+    # steps run during inference. 10-30 replay of the logged seed-4000 chunks: near the peg,
+    # guidance by the previous chunk's leftover cut the lateral response to the peg offset from
+    # 0.41 to 0.13 (R4, x), and a guidance window as short as the delay or a weight of 3 kept most
+    # of that cut.
+    guided: bool = True
 
 
 class RolloutPhaseSchedule:
@@ -5101,6 +5128,7 @@ def build_rollout_phase_schedule(
             chunk_size=chunk_size,
             replan_queue_size=replan_queue_size,
         ),
+        guided=not bool(args.phase_align_unguided),
     )
     return RolloutPhaseSchedule(
         approach,
@@ -5250,7 +5278,7 @@ def advance_rtc_queue(
             record(completed_plan)
 
         if action_queue.empty():
-            prev_chunk_left_over = action_queue.get_left_over()
+            prev_chunk_left_over = action_queue.get_left_over() if phase.guided else None
             if prev_chunk_left_over is not None:
                 prev_chunk_left_over = prev_chunk_left_over.detach().clone()
             guidance_delay_steps = _rtc_guidance_delay_steps(
@@ -5258,7 +5286,7 @@ def advance_rtc_queue(
                 action_samples=phase.action_samples,
                 time_per_step_s=time_per_step_s,
                 inference_delay_steps=inference_delay_steps,
-            )
+            ) if phase.guided else 0
             chunk_start_t = time.perf_counter()
             original_actions, processed_actions = predict_action_chunk_for_rollout(
                 policy_observation,
@@ -5310,15 +5338,17 @@ def advance_rtc_queue(
                 'queue_size': action_queue.qsize(),
             }
         else:
-            prev_chunk_left_over = action_queue.get_left_over()
+            prev_chunk_left_over = action_queue.get_left_over() if phase.guided else None
             if prev_chunk_left_over is not None:
                 prev_chunk_left_over = prev_chunk_left_over.detach().clone()
-            guidance_delay_steps = _rtc_guidance_delay_steps(
+            delay_steps = _rtc_guidance_delay_steps(
                 rtc_state,
                 action_samples=phase.action_samples,
                 time_per_step_s=time_per_step_s,
                 inference_delay_steps=inference_delay_steps,
             )
+            # Unguided, the delay still says which steps of the chunk will run, not how to guide.
+            guidance_delay_steps = delay_steps if phase.guided else 0
             started = planner.start(
                 policy_observation,
                 predict_kwargs={
@@ -5332,7 +5362,7 @@ def advance_rtc_queue(
                     # front of the returned chunk: they cover the inference the
                     # previous chunk drove through. They never reach the robot, so
                     # they get no vote in which draw is executed.
-                    'action_sample_offset': guidance_delay_steps,
+                    'action_sample_offset': delay_steps,
                 },
                 action_index_before_inference=action_queue.get_action_index(),
                 guidance_delay_steps=guidance_delay_steps,
@@ -5762,7 +5792,8 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             f'replan_queue_size={phase.replan_queue_size} '
             f'executed_steps={max(1, policy_chunk_size - phase.replan_queue_size)} '
             f'execution_horizon={phase.execution_horizon} '
-            f'action_samples={phase.action_samples} selection_horizon={phase.action_sample_horizon}'
+            f'action_samples={phase.action_samples} selection_horizon={phase.action_sample_horizon} '
+            f'guided={phase.guided}'
         )
     # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
     # is a startup error, not something discovered with a peg in the gripper 12 cm above the
@@ -5843,6 +5874,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 insertViaHome=bool(args.grasp_loop_insert_via_home),
                 funnelAlignDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_takeover_dz_mm),
                 funnelCorrective=bool(args.grasp_loop_funnel_corrective),
+                afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
@@ -5869,6 +5901,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             )
             + 'funnel_takeover_dz_mm=%g..%g ' % grasp_loop_request.funnelAlignDzMm
             + f'funnel_corrective={int(grasp_loop_request.funnelCorrective)} '
+            + f'after_close={grasp_loop_request.afterClose} '
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
@@ -6262,6 +6295,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         # of rotations and would flip at different frames.
         previous_dagger_quaternion_xyzw: np.ndarray | None = None
         funnel_seam = HandoverSeam()
+        teacher_seam = HandoverSeam()
         preview_gripper_offset: float | None = None
         latest_chunk_ee_poses: list[np.ndarray] | None = None
         camera_preview_enabled = bool(args.camera_preview_window)
@@ -6368,16 +6402,24 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     # here is a trial of the policy, so it ends where it stands.
                     print(f'[INFO] grasp_handover_voided step={step_idx}')
                     return finish_rollout('voided')
-                # The grasp loop's segment ends at the grasp: the lift that grades it is scripted,
-                # so nothing the policy does after a settled close is part of the measurement.
+                # The grasp loop's segment ends at the grasp, where the lift that grades it is
+                # scripted -- unless it goes on past the close (--grasp-loop-after-close), with the
+                # insertion teacher or the policy carrying the peg on to the hole.
                 if grasp_handover.observe(
                     step_idx,
                     tuple(float(robot_observation[key]) for key in ('ee.x', 'ee.y', 'ee.z')),
                     float(previous_sent_command['gripper.pos']) if previous_sent_command is not None else 1.0,
+                    rotvec=tuple(float(robot_observation[key]) for key in ('ee.wx', 'ee.wy', 'ee.wz')),
+                    width=float(robot_observation['gripper.pos']),
                 ):
                     print(
                         f'[INFO] grasp_handover step={step_idx} close_step={grasp_handover.closeStep} '
                         f'close_z={grasp_handover.closeXyz[2]:.4f}'
+                        + (
+                            f' after_close={grasp_handover.afterClose} end={grasp_handover.afterCloseEnd}'
+                            if grasp_handover.afterClose != 'script'
+                            else ''
+                        )
                     )
                     return finish_rollout('grasp_handover')
                 if grasp_handover.timed_out(step_idx):
@@ -6649,6 +6691,19 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     place_assist_state['stuck_count'] = 0
                     place_assist_state['offset_xyz_m'] = np.zeros(3, dtype=np.float64)
                     temporal_offset_state['stuck_count'] = 0
+            if grasp_handover is not None and grasp_handover.teacher is not None and grasp_handover.teacher.active:
+                # Past the close with --grasp-loop-after-close teacher: the insertion teacher has
+                # the arm, on either arm, through the same smoothing and clamp as the funnel.
+                robot_command = grasp_handover.teacher.step(
+                    step_idx,
+                    tuple(float(robot_observation[key]) for key in ('ee.x', 'ee.y', 'ee.z')),
+                    tuple(float(robot_observation[key]) for key in ('ee.wx', 'ee.wy', 'ee.wz')),
+                    float(robot_observation['gripper.pos']),
+                )
+                command_source = 'insert_teacher'
+                place_assist_state['stuck_count'] = 0
+                place_assist_state['offset_xyz_m'] = np.zeros(3, dtype=np.float64)
+                temporal_offset_state['stuck_count'] = 0
 
             # One smoothing and clamping path for both action sources. The expert's target is
             # a delta against `previous_sent_command`, which is the same pose the policy's
@@ -6762,8 +6817,12 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 # command reaches here through the same smoothing, clamp and gripper latch as the
                 # operator's, so the same inversion puts it in the dataset's action space.
                 # The funnel's first steps are its handover seam, not a correction: see HandoverSeam.
-                on_seam = command_source == 'funnel' and funnel_seam.skip(
-                    clamped=command_guard['status'] != 'pass'
+                on_seam = (
+                    command_source == 'funnel'
+                    and funnel_seam.skip(clamped=command_guard['status'] != 'pass')
+                ) or (
+                    command_source == 'insert_teacher'
+                    and teacher_seam.skip(clamped=command_guard['status'] != 'pass')
                 )
                 # A whole-trial buffer keeps the policy's own steps as well, unlabelled as
                 # interventions; the seam is still left out, without closing the span.
@@ -6922,6 +6981,9 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                         f" xy_error_mm={funnel_step['xy_error_mm']:.1f}"
                         f" funnel_transition={funnel_step['transition_reason'] or '-'}"
                     )
+                elif command_source == 'insert_teacher' and grasp_handover is not None and grasp_handover.teacher is not None:
+                    # Past the close: no SpaceMouse here either.
+                    log_message += f" source=insert_teacher teacher_state={grasp_handover.teacher.state}"
                 elif command_source != 'policy':
                     log_message += (
                         f" source={command_source} takeover={takeover_debug.get('status', '')}"
@@ -7188,7 +7250,8 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                             grasp_loop_request.funnelMaxSteps
                             + grasp_loop_request.closeSettleSteps
                             + 1
-                            + (grasp_loop_request.maxPolicySteps if args.grasp_loop_record_whole_trial else 0),
+                            + (grasp_loop_request.maxPolicySteps if args.grasp_loop_record_whole_trial else 0)
+                            + (grasp_loop_request.insertMaxSteps if grasp_loop_request.afterClose != 'script' else 0),
                         ),
                         max_still_frames=int(args.dagger_max_still_frames),
                         keep_policy_frames=bool(args.grasp_loop_record_whole_trial),

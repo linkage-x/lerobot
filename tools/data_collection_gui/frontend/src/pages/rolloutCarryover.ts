@@ -21,7 +21,8 @@ export function carriedOverNotice(params: RolloutLastParams): string {
   }
   const alignBelowZ = params.runtimeOptions?.phaseAlignBelowZ;
   if (alignBelowZ != null) {
-    parts.push(`The align phase is on from last time, below z = ${alignBelowZ} m.`);
+    const unguided = params.runtimeOptions?.phaseAlignUnguided ? ", without RTC guidance" : "";
+    parts.push(`The align phase is on from last time, below z = ${alignBelowZ} m${unguided}.`);
   }
   return parts.join(" ");
 }

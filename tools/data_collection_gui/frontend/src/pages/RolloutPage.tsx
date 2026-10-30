@@ -144,6 +144,8 @@ export function RolloutPage() {
   const [phaseAlignReplanQueueSize, setPhaseAlignReplanQueueSize] = useState("42");
   const [phaseAlignExecutionHorizon, setPhaseAlignExecutionHorizon] = useState("8");
   const [phaseAlignActionSamples, setPhaseAlignActionSamples] = useState("1");
+  const [phaseAlignUnguided, setPhaseAlignUnguided] = useState(false);
+  const [phaseHysteresisMm, setPhaseHysteresisMm] = useState("");
   const [terminalServoPose, setTerminalServoPose] = useState("");
   const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
   const [terminalServoSearchRing, setTerminalServoSearchRing] = useState("");
@@ -165,11 +167,14 @@ export function RolloutPage() {
   const [graspLoopRecord, setGraspLoopRecord] = useState(false);
   const [graspLoopRecordWholeTrial, setGraspLoopRecordWholeTrial] = useState(false);
   const [graspLoopKeepMisses, setGraspLoopKeepMisses] = useState(false);
+  const [graspLoopDatasetRoot, setGraspLoopDatasetRoot] = useState("");
   // 09-30: the policy's aim is set well above the funnel's old 60 mm, so recordings draw the
   // takeover from the whole approach by default.
   const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
   // 10-20: checkpoints on the plain funnel's trials aim once, high, and descend straight.
   const [graspLoopFunnelCorrective, setGraspLoopFunnelCorrective] = useState(false);
+  // 10-30: who inserts after the close. The teacher records the insertion; the policy is the e2e test.
+  const [graspLoopAfterClose, setGraspLoopAfterClose] = useState<"script" | "teacher" | "policy">("script");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -298,6 +303,9 @@ export function RolloutPage() {
       phaseAlignReplanQueueSize: positiveNumberOr(phaseAlignReplanQueueSize, 42),
       phaseAlignExecutionHorizon: positiveNumberOr(phaseAlignExecutionHorizon, 8),
       phaseAlignActionSamples: positiveNumberOr(phaseAlignActionSamples, 1),
+      // Sent only with a height: the gateway refuses it without one.
+      phaseAlignUnguided: phaseAlignBelowZ.trim() ? phaseAlignUnguided : undefined,
+      phaseHysteresisMm: optionalNumberOrNull(phaseHysteresisMm) ?? undefined,
       // The grasp loop ends every trial at the grasp, so a servo pose there is refused by the
       // runtime; not sending it keeps a leftover field from blocking the start.
       terminalServoPose: modeId === "grasp_loop" ? undefined : terminalServoPose.trim() || undefined,
@@ -312,6 +320,8 @@ export function RolloutPage() {
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
+      graspLoopDatasetRoot:
+        modeId === "grasp_loop" && graspLoopRecord ? graspLoopDatasetRoot.trim() || undefined : undefined,
       graspLoopRecordWholeTrial:
         modeId === "grasp_loop" && graspLoopRecord ? graspLoopRecordWholeTrial : undefined,
       graspLoopKeepMisses:
@@ -322,6 +332,10 @@ export function RolloutPage() {
         modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
       graspLoopFunnelCorrective:
         modeId === "grasp_loop" && graspLoopArms !== "A" ? graspLoopFunnelCorrective : undefined,
+      graspLoopAfterClose:
+        modeId === "grasp_loop" && graspLoopInsertPose.trim() && graspLoopAfterClose !== "script"
+          ? graspLoopAfterClose
+          : undefined,
       terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       terminalServoSearchRing: optionalNumberOrNull(terminalServoSearchRing),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
@@ -347,6 +361,8 @@ export function RolloutPage() {
       phaseAlignReplanQueueSize,
       phaseAlignExecutionHorizon,
       phaseAlignActionSamples,
+      phaseAlignUnguided,
+      phaseHysteresisMm,
       terminalServoPose,
       terminalServoHandoffZ,
       terminalServoSearchRing,
@@ -366,8 +382,10 @@ export function RolloutPage() {
       graspLoopRecord,
       graspLoopRecordWholeTrial,
       graspLoopKeepMisses,
+      graspLoopDatasetRoot,
       graspLoopFunnelTakeoverDzMm,
-      graspLoopFunnelCorrective
+      graspLoopFunnelCorrective,
+      graspLoopAfterClose
     ]
   );
 
@@ -503,6 +521,8 @@ export function RolloutPage() {
         setPhaseAlignExecutionHorizon(String(options.phaseAlignExecutionHorizon));
       if (options.phaseAlignActionSamples !== undefined)
         setPhaseAlignActionSamples(String(options.phaseAlignActionSamples));
+      setPhaseAlignUnguided(Boolean(options.phaseAlignUnguided));
+      setPhaseHysteresisMm(options.phaseHysteresisMm == null ? "" : String(options.phaseHysteresisMm));
       // Deliberately not carried over. Every other knob here tunes how the policy runs; this
       // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
       // an E5 trial that nobody asked for.
@@ -526,8 +546,11 @@ export function RolloutPage() {
       if (options.graspLoopRecordWholeTrial !== undefined)
         setGraspLoopRecordWholeTrial(options.graspLoopRecordWholeTrial);
       if (options.graspLoopKeepMisses !== undefined) setGraspLoopKeepMisses(options.graspLoopKeepMisses);
+      // Carried over: a second run of the same arm should land next to the first.
+      setGraspLoopDatasetRoot(options.graspLoopDatasetRoot ?? "");
       if (options.graspLoopFunnelCorrective !== undefined)
         setGraspLoopFunnelCorrective(options.graspLoopFunnelCorrective);
+      setGraspLoopAfterClose(options.graspLoopAfterClose ?? "script");
       if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
       if (options.daggerDatasetRoot !== undefined)
         setDaggerDatasetRoot(options.daggerDatasetRoot);
@@ -1547,6 +1570,24 @@ export function RolloutPage() {
               孔位须在 fixture pick 15 mm 内（孔就是 fixture）。留空则和以前一样只抓不插。
             </p>
             <label className="field">
+              <span>合爪之后谁来插（端到端）</span>
+              <select
+                value={graspLoopAfterClose}
+                onChange={(event) => setGraspLoopAfterClose(event.target.value as "script" | "teacher" | "policy")}
+                disabled={isLive || !graspLoopInsertPose.trim()}
+              >
+                <option value="script">脚本插入（原来的做法，不录）</option>
+                <option value="teacher">插入老师（在策略循环里执行，可录制）</option>
+                <option value="policy">策略自己插（端到端测试）</option>
+              </select>
+            </label>
+            <p className="hint">
+              插入老师：合爪后先上抬并按宽度判抓没抓住，再合紧、平移到「孔位 + 方块在手里的偏移」（合爪位置减去摆放位置，
+              去掉手指夹紧方向的分量）上方、慢速下降，落到位就松手上退；卡在孔面上就停下，交给脚本搜索把销放回 fixture，这条记为没插进、不录。
+              孔位用本次运行里最近 5 次插进的结果自动校正。策略自己插：合爪后一直由策略控制，它张开夹爪就判这一次，
+              最多 30 s。有人在场时松手后问你「进了 / 没进」。开录制时，老师模式只保留插进的 trial。
+            </p>
+            <label className="field">
               <span>对照臂</span>
               <select
                 value={graspLoopArms}
@@ -1616,6 +1657,15 @@ export function RolloutPage() {
                 disabled={isLive || !graspLoopRecord || !graspLoopRecordWholeTrial || graspLoopArms === "B"}
               />
               <span>A 臂没抓住的也存（empty / no_close）：只给离线重标（funnel_relabel --trial-rows）用，原样不能训练</span>
+            </label>
+            <label className="field">
+              <span>数据集目录（可选，留空 = 默认）</span>
+              <input
+                value={graspLoopDatasetRoot}
+                onChange={(event) => setGraspLoopDatasetRoot(event.target.value)}
+                placeholder={graspLoopRecordWholeTrial ? "outputs/datasets/trial_<checkpoint>" : "outputs/datasets/funnel_<checkpoint>"}
+                disabled={isLive || !graspLoopRecord}
+              />
             </label>
             <p className="hint">
               {graspLoopRecordWholeTrial
@@ -1822,7 +1872,29 @@ export function RolloutPage() {
                     disabled={isLive}
                   />
                 </label>
+                <label className="field inline">
+                  <span>Hysteresis (mm)</span>
+                  <input
+                    value={phaseHysteresisMm}
+                    onChange={(event) => setPhaseHysteresisMm(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="10"
+                    disabled={isLive}
+                  />
+                </label>
               </div>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={phaseAlignUnguided}
+                  onChange={(event) => setPhaseAlignUnguided(event.target.checked)}
+                  disabled={isLive || !phaseAlignBelowZ.trim()}
+                />
+                <span>
+                  Align unguided: below the align height, ask for each chunk without the RTC prefix
+                  (guidance delay 0). The steps run during inference are still skipped.
+                </span>
+              </label>
               <p className="hint">
                 Below the align height the queue replans every 50 &minus; replan-queue steps (8 at
                 42) instead of 16, so the newest frame steers the last stretch of the grasp and

@@ -765,6 +765,8 @@ def _sanitize_rollout_arm(arm: dict[str, Any]) -> dict[str, Any]:
             clean[key] = round(float(value), 5)
     if arm.get("actionAggregate") in _ARM_AGGREGATES:
         clean["actionAggregate"] = arm["actionAggregate"]
+    if isinstance(arm.get("phaseAlignGuided"), bool):
+        clean["phaseAlignGuided"] = arm["phaseAlignGuided"]
     xyz = arm.get("terminalServoXyz")
     if isinstance(xyz, (list, tuple)) and len(xyz) == 3:
         try:

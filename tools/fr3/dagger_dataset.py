@@ -483,7 +483,7 @@ def dagger_step_role(
     supervise like any other step. Not a cut either, since a second episode would start low and
     pull the start-pose contract with it.
     """
-    if command_source in ('expert', 'funnel'):
+    if command_source in ('expert', 'funnel', 'insert_teacher'):
         if not on_seam:
             return 'expert'
         return 'skip' if keeps_policy_frames else 'gap'

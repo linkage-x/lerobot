@@ -41,6 +41,15 @@ describe("describeArm", () => {
     ).toBe("medoid of 8 · align < 0.120 m: 8 steps");
   });
 
+  it("names an unguided align phase apart from a guided one", () => {
+    expect(
+      describeArm({ phaseAlignBelowZ: 0.118, phaseAlignExecutedSteps: 16, phaseAlignGuided: false })
+    ).toBe("align < 0.118 m: 16 steps, unguided");
+    expect(describeArm({ phaseAlignBelowZ: 0.118, phaseAlignExecutedSteps: 16, phaseAlignGuided: true })).toBe(
+      "align < 0.118 m: 16 steps"
+    );
+  });
+
   it("says nothing when the runtime announced nothing", () => {
     // Empty, not "default": silence is a runtime older than the announce, and printing a
     // default here would invent the one fact this field exists to record.

@@ -82,6 +82,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_PHASE_ALIGN_EXECUTION_HORIZON",
     "FR3_PHASE_ALIGN_ACTION_SAMPLES",
     "FR3_PHASE_HYSTERESIS_MM",
+    "FR3_PHASE_ALIGN_UNGUIDED",
     "FR3_TERMINAL_SERVO_POSE",
     "FR3_TERMINAL_SERVO_HANDOFF_Z",
     "FR3_TERMINAL_SERVO_SEARCH_RING",
@@ -104,6 +105,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_KEEP_MISSES",
     "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
     "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE",
+    "FR3_GRASP_LOOP_AFTER_CLOSE",
     "FR3_GRASP_LOOP_OUT",
 )
 # A grasp loop run's rows, `grasp_<stamp>.jsonl`; a resume names the stamp and appends to it.
@@ -429,6 +431,13 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options, raw, "phaseAlignActionSamples", "FR3_PHASE_ALIGN_ACTION_SAMPLES", minimum=1
     )
     _set_optional_float_env(options, raw, "phaseHysteresisMm", "FR3_PHASE_HYSTERESIS_MM", minimum=0.0)
+    # Below the align height, ask for chunks without the RTC prefix (10-30 replay: the guidance
+    # held the low lateral correction to a third). Refused without a height, where it would be a
+    # tick on the page that changes nothing on the arm.
+    if _parse_bool_field(raw.get("phaseAlignUnguided", False), "phaseAlignUnguided"):
+        if "FR3_PHASE_ALIGN_BELOW_Z" not in options:
+            raise RolloutError("phaseAlignUnguided acts below the align height: set phaseAlignBelowZ too.")
+        options["FR3_PHASE_ALIGN_UNGUIDED"] = "1"
 
     # E5. Refused here as well as at startup, because the page is where a mistyped pose is
     # cheapest to catch -- the alternative is a launcher that comes up, homes the arm and then
@@ -494,6 +503,15 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if not 1 <= len(numbers) <= 2 or len(numbers) != len(parts) or numbers[0] > numbers[-1]:
             raise RolloutError("graspLoopFunnelTakeoverDzMm must be 'h' or 'low,high' in mm, low <= high.")
         options["FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM"] = ",".join(f"{value:g}" for value in numbers)
+    # Past the close: the scripted insertion (default), the recorded insertion teacher, or the
+    # policy itself. The last two carry the peg to the hole, so they need its pose.
+    after_close = _optional_text(raw.get("graspLoopAfterClose"))
+    if after_close and after_close != "script":
+        if after_close not in ("teacher", "policy"):
+            raise RolloutError("graspLoopAfterClose must be script, teacher or policy.")
+        if not insert_pose:
+            raise RolloutError(f"graspLoopAfterClose {after_close} carries the peg to the hole: set graspLoopInsertPose.")
+        options["FR3_GRASP_LOOP_AFTER_CLOSE"] = after_close
     # Arm B's corrective demonstrations; the runtime refuses them without arm B.
     if _parse_bool_field(raw.get("graspLoopFunnelCorrective", False), "graspLoopFunnelCorrective"):
         if (grasp_arms or "A") == "A":
@@ -501,7 +519,10 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options["FR3_GRASP_LOOP_FUNNEL_CORRECTIVE"] = "1"
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
-        options["FR3_GRASP_LOOP_DATASET_ROOT"] = ""
+        root = _optional_text(raw.get("graspLoopDatasetRoot"))
+        if root and any(character in root for character in "\n\r\0"):
+            raise RolloutError("graspLoopDatasetRoot must be a single path with no line breaks.")
+        options["FR3_GRASP_LOOP_DATASET_ROOT"] = root or ""
         if _parse_bool_field(raw.get("graspLoopRecordWholeTrial", False), "graspLoopRecordWholeTrial"):
             options["FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL"] = "1"
     elif _parse_bool_field(raw.get("graspLoopRecordWholeTrial", False), "graspLoopRecordWholeTrial"):
@@ -826,6 +847,8 @@ _POLICY_ARM_RE = re.compile(
 _PHASE_ALIGN_CONFIG_RE = re.compile(
     r"rollout_phase_config phase=align below_z=(-?[\d.]+)\s+replan_queue_size=\d+"
     r"\s+executed_steps=(\d+)\s+execution_horizon=(\d+)\s+action_samples=(\d+)"
+    # Optional because runtimes before 2026-10-30 always guided, and printed no `guided=`.
+    r"(?:.*?\bguided=(True|False))?"
 )
 # E5 / E7-C. Printed once, only when a terminal servo pose is configured, so absence means the
 # rollout ended wherever the policy left it.
@@ -1075,7 +1098,8 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         parsed["phaseScheduleConfig"] = phase_config
         parsed["message"] = (
             f"Align phase below z = {phase_config['phaseAlignBelowZ']:.3f} m: replanning every "
-            f"{phase_config['phaseAlignExecutedSteps']} steps."
+            f"{phase_config['phaseAlignExecutedSteps']} steps"
+            f"{'' if phase_config['phaseAlignGuided'] else ', without RTC guidance'}."
         )
         return parsed
 
@@ -1257,7 +1281,7 @@ GRASP_LOOP_START_LEAD_S = 1800.0
 _GRASP_LOOP_RECORD_OPTIONS = (
     "graspLoopTrials", "graspLoopMaxPolicySteps", "graspLoopSeed", "graspLoopAttended",
     "graspLoopArms", "graspLoopInsertPose", "graspLoopFunnelTakeoverDzMm",
-    "graspLoopFunnelCorrective",
+    "graspLoopFunnelCorrective", "graspLoopAfterClose",
 )
 
 
@@ -1340,6 +1364,7 @@ def grasp_loop_resume_params(
     options["graspLoopAttended"] = bool(request.get("attended", False))
     options["graspLoopArms"] = str(request.get("arms") or "A")
     options["graspLoopFunnelCorrective"] = bool(request.get("funnelCorrective", False))
+    options["graspLoopAfterClose"] = str(request.get("afterClose") or "script")
     dz = request.get("funnelAlignDzMm")
     if isinstance(dz, list) and len(dz) == 2:
         low, high = dz
@@ -1566,6 +1591,7 @@ def parse_phase_schedule_config(text: str) -> dict[str, Any]:
         "phaseAlignExecutedSteps": int(match.group(2)),
         "phaseAlignExecutionHorizon": int(match.group(3)),
         "phaseAlignActionSamples": int(match.group(4)),
+        "phaseAlignGuided": match.group(5) != "False",
     }
 
 

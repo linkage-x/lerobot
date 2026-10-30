@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 import math
+import time
 import os
 import signal
 import subprocess
@@ -2957,6 +2958,67 @@ def test_a_fake_robot_descending_through_the_line_replans_twice_as_often_below_i
         assert prediction['task'] == 'insert the peg'
     # The robot really followed the queue: 70 steps of 2 mm.
     assert math.isclose(robot.z, 0.201 - 70 * 0.002, abs_tol=1e-6)
+
+
+def test_an_unguided_align_phase_asks_without_a_prefix_and_still_skips_the_steps_run_meanwhile(monkeypatch):
+    """--phase-align-unguided: below the line each chunk is asked with no RTC prefix and delay 0;
+    above it the approach phase is guided as before. Guided is the default."""
+    rt = fr3_act_infer_real_runtime
+    assert _phase_schedule('--phase-align-below-z', '0.12').align.guided is True
+    predictions: list[dict] = []
+
+    def fake_predict(observation, **kwargs):
+        predictions.append(
+            {
+                'z': float(observation['z'][0]),
+                'prefix': kwargs['prev_chunk_left_over'] is not None,
+                'delay': kwargs['inference_delay'],
+            }
+        )
+        time.sleep(0.05)  # long enough that steps run while the async plan is out
+        chunk = torch.full((50, 1), -0.002, dtype=torch.float32)
+        return chunk, chunk.clone()
+
+    monkeypatch.setattr(rt, 'predict_action_chunk_for_rollout', fake_predict)
+    schedule = _phase_schedule(
+        '--phase-align-below-z', '0.12', '--phase-align-replan-queue-size', '34',
+        '--phase-align-execution-horizon', '16', '--phase-align-unguided',
+    )
+    assert schedule.align.guided is False and schedule.approach.guided is True
+    rtc_state = {
+        'queue': rt.ActionQueue(rt.RTCConfig(enabled=True)),
+        'latency_trackers': {},
+        'planning_samples': 1,
+        'last_debug': {'status': 'reset'},
+    }
+    planner = rt.AsyncActionChunkPlanner()
+    robot = _FakeDescendingRobot(z=0.201)
+    for step_idx in range(90):
+        schedule.update(robot.z)
+        observation = {'z': np.array([robot.z], dtype=np.float32)}
+        action = rt.advance_rtc_queue(
+            rtc_state,
+            planner,
+            observation,
+            phase=schedule.current,
+            step_idx=step_idx,
+            time_per_step_s=1.0 / 30.0,
+            inference_delay_steps=None,
+            predict_kwargs={},
+        )
+        robot.execute(action)
+        time.sleep(1.0 / 30.0)
+    assert planner.join(timeout_s=2.0)
+
+    above = [p for p in predictions[1:] if p['z'] >= 0.12]
+    below = [p for p in predictions if p['z'] < 0.12]
+    assert above and below
+    assert all(p['prefix'] and p['delay'] > 0 for p in above)
+    assert all(not p['prefix'] and p['delay'] == 0 for p in below)
+    align_chunks = [c for c in rtc_state['chunks'] if c['phase'] == 'align' and c['status'] == 'replan_async_merge']
+    assert align_chunks
+    # Logged as unguided, but the steps run during inference are still dropped from the front.
+    assert all(c['guidance_delay_steps'] == 0 and c['merge_delay_steps'] >= 1 for c in align_chunks)
 
 
 def test_every_executed_step_is_stamped_with_the_chunk_and_position_it_came_from(monkeypatch):

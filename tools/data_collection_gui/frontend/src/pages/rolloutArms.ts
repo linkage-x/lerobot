@@ -43,7 +43,8 @@ export function describeArm(arm: RolloutArm | undefined): string {
   }
   if (arm.phaseAlignBelowZ !== undefined) {
     parts.push(
-      `align < ${arm.phaseAlignBelowZ.toFixed(3)} m: ${arm.phaseAlignExecutedSteps ?? "?"} steps`
+      `align < ${arm.phaseAlignBelowZ.toFixed(3)} m: ${arm.phaseAlignExecutedSteps ?? "?"} steps` +
+        (arm.phaseAlignGuided === false ? ", unguided" : "")
     );
   }
   return parts.join(" · ");

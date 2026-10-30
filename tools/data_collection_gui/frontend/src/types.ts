@@ -1377,6 +1377,8 @@ export type RolloutArm = {
   phaseAlignExecutedSteps?: number;
   phaseAlignExecutionHorizon?: number;
   phaseAlignActionSamples?: number;
+  /** False when the align phase asked for its chunks without the RTC prefix. */
+  phaseAlignGuided?: boolean;
 };
 
 /** What the rig concluded about the terminal descent, from its own `terminal_servo=done` line.
@@ -1658,6 +1660,8 @@ export type RolloutRuntimeOptions = {
   phaseAlignActionSamples?: number;
   /** How far above the line the arm must rise before the approach phase returns. */
   phaseHysteresisMm?: number;
+  /** Below the align height, chunks are asked for without the RTC prefix (guidance delay 0). */
+  phaseAlignUnguided?: boolean;
   /** E5. `x,y,z` in metres: below the handoff height, with the peg held, the arm comes off the
    *  policy and is driven here, then lets go. Empty or undefined leaves the policy in charge. */
   terminalServoPose?: string;
@@ -1695,10 +1699,14 @@ export type RolloutRuntimeOptions = {
   graspLoopRecordWholeTrial?: boolean;
   /** With graspLoopRecordWholeTrial: arm A's empty / no_close trials too, for an offline relabel only. */
   graspLoopKeepMisses?: boolean;
+  /** With graspLoopRecord: where to write instead of the checkpoint's default dataset. */
+  graspLoopDatasetRoot?: string;
   /** Arm B: how far above the peg the funnel takes over, "h" or "low,high" mm (drawn per trial). */
   graspLoopFunnelTakeoverDzMm?: string;
   /** Arm B: corrective demonstrations (part of the aim left to the descent; some low takeovers that lift and realign). */
   graspLoopFunnelCorrective?: boolean;
+  /** Past the close: the scripted insertion, the recorded insertion teacher, or the policy. Not script: needs graspLoopInsertPose. */
+  graspLoopAfterClose?: "script" | "teacher" | "policy";
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.

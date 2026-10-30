@@ -100,6 +100,7 @@ from tools.fr3.grasp_funnel import (
     FunnelConfig,
     GraspFunnel,
 )
+from tools.fr3.grasp_insert_teacher import InsertTeacher, InsertTeacherConfig, in_hand_offset_xy
 from tools.fr3.scene_reset import (
     SCENE_RESET_LIFT_M,
     SceneResetError,
@@ -316,6 +317,22 @@ GRASP_LOOP_INSERT_SEARCH_ORDER: tuple[int, ...] = (8, 7, 6, 0, 1, 9, 5, 14)
 # one. Eight is also the length of the default search order. A later seat is not believed:
 # unattended it is not let go of and counts as out; attended the question says so.
 GRASP_LOOP_INSERT_MAX_TRUSTED_LANDING = 8
+# What happens after a settled close. "script": the segment ends and the scripted lift, carry and
+# insertion follow, outside the policy's loop and so outside any recording (every run to 10-30).
+# "teacher": the segment goes on with `InsertTeacher` driving -- recorded, as the funnel is.
+# "policy": the policy goes on driving; the loop only grades where it lets go.
+GRASP_LOOP_AFTER_CLOSE = ("script", "teacher", "policy")
+# Steps the segment may run past the close in the last two: 30 s at 30 Hz, about three times the
+# teacher's own lift, 25 cm carry and slow seat.
+GRASP_LOOP_INSERT_MAX_STEPS = 900
+# The policy has let go once its command reads open for this many steps in a row.
+GRASP_LOOP_RELEASE_STEPS = 3
+# A policy's let-go is graded "in" unattended when the tool stood within the teacher's seated
+# depth of the seat, and this close to it across: the hole's clearance is 2.5 mm.
+GRASP_LOOP_LET_GO_XY_M = 0.004
+# The hole estimate for the teacher: the median over this many of the latest insertions that went
+# in. One is the noise of a 3.5 mm search grid; the hole creeps over days, not trials.
+GRASP_LOOP_HOLE_WINDOW = 5
 
 
 @dataclass(frozen=True)
@@ -363,6 +380,9 @@ class GraspLoopRequest:
     # TERMINAL_TRIAL_MAX_TILT_DEG's 2 and at most 4 deg of yaw from grasp to grasp, which the
     # stepped turn takes out at carry height. True restores the detour.
     insertViaHome: bool = False
+    # GRASP_LOOP_AFTER_CLOSE. Anything but "script" needs `insertServo`, for the hole.
+    afterClose: str = "script"
+    insertMaxSteps: int = GRASP_LOOP_INSERT_MAX_STEPS
 
     @property
     def regripZ(self) -> float:
@@ -451,6 +471,14 @@ def validate_grasp_loop_request(
             f"funnelAlignDzMm {low_dz:g},{high_dz:g} must be low <= high within {min_dz:g}..{max_dz:g} mm: "
             "below that the fingers move across at the peg top, above it the policy never drives."
         )
+    if request.afterClose not in GRASP_LOOP_AFTER_CLOSE:
+        raise SceneResetError(
+            f"afterClose must be one of {', '.join(GRASP_LOOP_AFTER_CLOSE)}, not {request.afterClose!r}."
+        )
+    if request.afterClose != "script" and request.insertServo is None:
+        raise SceneResetError(f"afterClose {request.afterClose!r} carries the peg to the hole: it needs insertServo.")
+    if request.insertMaxSteps <= 0:
+        raise SceneResetError("insertMaxSteps must be positive.")
     low, high = _workspace_bounds(workspace_min, workspace_max)
     _check_xyz_in_workspace(request.pickXyz, "pickXyz", low, high)
     if request.insertServo is not None:
@@ -589,6 +617,25 @@ class GraspHandover:
     # GRASP_LOOP_AIM_HEIGHTS_MM above the peg: its localisation, read the same way on either arm
     # and never once the funnel drives. Keyed by the height in mm, as a string for the JSON row.
     aimXy: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # Past the close (GRASP_LOOP_AFTER_CLOSE). With anything but "script" the close does not end
+    # the segment: `insertPlan` says where the hole is, and the config built from it at the close
+    # where this grasp's peg seats.
+    afterClose: str = "script"
+    insertPlan: InsertPlan | None = None
+    insertMaxSteps: int = GRASP_LOOP_INSERT_MAX_STEPS
+    closeRotvec: tuple[float, float, float] | None = None
+    insertConfig: InsertTeacherConfig | None = None
+    teacher: InsertTeacher | None = None
+    # How the segment ended past the close: the teacher's outcome ("empty", "seated", "blocked"),
+    # the policy's ("empty", "released"), or "timeout".
+    afterCloseEnd: str | None = None
+    # "policy": the grade read on its own lift, and where it let go.
+    liftWidths: list[float] = field(default_factory=list)
+    widthLifted: float | None = None
+    liftedHeld: bool | None = None
+    openStreak: int = 0
+    releasedStep: int | None = None
+    releasedXyz: tuple[float, float, float] | None = None
 
     def void_due(self) -> bool:
         return self.voidRequested is not None and bool(self.voidRequested())
@@ -601,15 +648,35 @@ class GraspHandover:
         )
 
     def timed_out(self, step: int) -> bool:
-        """Out of steps: the policy's budget until the funnel has the arm, the funnel's after."""
+        """Out of steps: the policy's budget until the funnel has the arm, the funnel's after, and
+        past the close the insertion's."""
 
+        if self.fired:
+            assert self.handoverStep is not None
+            if step >= self.handoverStep + self.insertMaxSteps:
+                self.afterCloseEnd = self.afterCloseEnd or "timeout"
+                return True
+            return False
         if self.funnel is not None and self.funnel.active and self.funnel.entryStep is not None:
             return step >= self.funnel.entryStep + self.funnelMaxSteps
         return step >= self.maxPolicySteps
 
-    def observe(self, step: int, xyz: tuple[float, float, float], commanded_gripper: float) -> bool:
-        """Feed one policy step; True when the arm should be taken off the policy now."""
+    def observe(
+        self,
+        step: int,
+        xyz: tuple[float, float, float],
+        commanded_gripper: float,
+        *,
+        rotvec: tuple[float, float, float] | None = None,
+        width: float | None = None,
+    ) -> bool:
+        """Feed one policy step; True when the arm should be taken off the policy now.
 
+        `rotvec` and `width` (the measured wrist and fingers) are read only past the close.
+        """
+
+        if self.fired:
+            return self._observe_after_close(xyz, commanded_gripper, width)
         if self.pegXyz is not None and (self.funnel is None or not self.funnel.active):
             above_mm = (float(xyz[2]) - self.pegXyz[2]) * 1000.0
             for height in GRASP_LOOP_AIM_HEIGHTS_MM:
@@ -631,13 +698,178 @@ class GraspHandover:
             # one that was held.
             self.closeStep = step
             self.closeXyz = tuple(float(v) for v in xyz)  # type: ignore[assignment]
+            self.closeRotvec = None if rotvec is None else tuple(float(v) for v in rotvec)  # type: ignore[assignment]
         self.closedStreak = streak
         if fire:
             self.fired = True
             self.handoverStep = step
             self.handoverXyz = tuple(float(v) for v in xyz)  # type: ignore[assignment]
             self.commandedGripper = float(commanded_gripper)
+            if self.afterClose != "script":
+                self._start_after_close()
+                return False
         return fire
+
+    def _start_after_close(self) -> None:
+        plan = self.insertPlan
+        assert plan is not None and self.closeXyz is not None and self.pegXyz is not None
+        assert self.commandedGripper is not None
+        self.insertConfig = InsertTeacherConfig(
+            closeXyz=self.closeXyz,
+            closeRotvec=self.closeRotvec,
+            pegXyz=self.pegXyz,
+            holeXyz=plan.holeXyz,
+            regripZ=plan.regripZ,
+            carryZ=plan.carryZ,
+            levelRotvec=plan.levelRotvec,
+            policyGripper=self.commandedGripper,
+            heldGripper=plan.heldGripper,
+            openGripper=plan.openGripper,
+            checkLiftM=plan.checkLiftM,
+            controlPeriodS=plan.controlPeriodS,
+        )
+        if self.afterClose == "teacher":
+            self.teacher = InsertTeacher(
+                self.insertConfig,
+                heldTest=lambda width, gripper: grasp_is_held(
+                    width, gripper, held_width=plan.heldWidth, blocked_margin=plan.blockedMargin
+                ),
+            )
+
+    def _observe_after_close(
+        self, xyz: tuple[float, float, float], commanded_gripper: float, width: float | None
+    ) -> bool:
+        if self.teacher is not None:
+            if self.teacher.done:
+                self.afterCloseEnd = self.teacher.outcome
+                return True
+            return False
+        plan, config = self.insertPlan, self.insertConfig
+        assert plan is not None and config is not None
+        # Graded as `check_grasp` grades, once the policy's own lift has taken it that far up.
+        if self.liftedHeld is None and width is not None and float(xyz[2]) >= config.closeXyz[2] + plan.checkLiftM:
+            self.liftWidths.append(float(width))
+            if len(self.liftWidths) >= GRASP_LOOP_WIDTH_SAMPLES:
+                self.widthLifted = float(statistics.median(self.liftWidths))
+                self.liftedHeld = grasp_is_held(
+                    self.widthLifted, config.policyGripper, held_width=plan.heldWidth, blocked_margin=plan.blockedMargin
+                )
+                if not self.liftedHeld:
+                    self.afterCloseEnd = "empty"
+                    return True
+        self.openStreak = self.openStreak + 1 if commanded_gripper >= GRASP_LOOP_OPEN_ABOVE else 0
+        if self.openStreak == 1:
+            self.releasedXyz = tuple(float(v) for v in xyz)  # type: ignore[assignment]
+        if self.openStreak >= GRASP_LOOP_RELEASE_STEPS:
+            self.afterCloseEnd = "released"
+            return True
+        return False
+
+    def lifted_grade(self) -> bool | None:
+        """Held or not as read past the close on the way up, None if nothing lifted it that far."""
+
+        if self.teacher is not None:
+            return self.teacher.held
+        return self.liftedHeld
+
+    def after_close_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {"mode": self.afterClose, "end": self.afterCloseEnd}
+        if self.teacher is not None:
+            record.update(self.teacher.record())
+            return record
+        config = self.insertConfig
+        if config is not None:
+            seat = config.seatXyz
+            record.update({
+                "offsetXyMm": [round(v * 1000.0, 1) for v in config.offsetXy],
+                "holeXyz": [round(v, 5) for v in config.holeXyz],
+                "seatXyz": [round(v, 5) for v in seat],
+                "raisedMm": round(config.raisedM * 1000.0, 1),
+            })
+            if self.releasedXyz is not None:
+                record["releasedXyz"] = [round(v, 5) for v in self.releasedXyz]
+                record["aboveSeatMm"] = round((self.releasedXyz[2] - seat[2]) * 1000.0, 1)
+                record["fromSeatXyMm"] = round(math.dist(self.releasedXyz[:2], seat[:2]) * 1000.0, 1)
+        record["held"] = self.liftedHeld
+        record["widthLifted"] = None if self.widthLifted is None else round(self.widthLifted, 4)
+        return record
+
+
+@dataclass(frozen=True)
+class InsertPlan:
+    """What a segment that goes on past the close needs to know of the hole and the loop."""
+
+    holeXyz: tuple[float, float, float]
+    regripZ: float
+    carryZ: float
+    levelRotvec: tuple[float, float, float] | None
+    heldGripper: float
+    openGripper: float
+    checkLiftM: float
+    heldWidth: float
+    blockedMargin: float
+    controlPeriodS: float
+
+
+def insert_plan(
+    request: GraspLoopRequest,
+    hole_xy: tuple[float, float],
+    level_rotvec: tuple[float, float, float] | None,
+) -> InsertPlan:
+    assert request.insertServo is not None
+    return InsertPlan(
+        holeXyz=(float(hole_xy[0]), float(hole_xy[1]), float(request.insertServo.xyz[2])),
+        regripZ=request.regripZ,
+        carryZ=float(request.insertServo.handoffZ),
+        levelRotvec=level_rotvec,
+        heldGripper=request.closedGripper,
+        openGripper=request.openGripper,
+        checkLiftM=request.checkLiftM,
+        heldWidth=request.heldWidth,
+        blockedMargin=request.blockedMargin,
+        controlPeriodS=request.controlPeriodS,
+    )
+
+
+def hole_sample_xy(row: dict[str, Any]) -> tuple[float, float] | None:
+    """Where a peg that went in says the hole is: the tool's xy at the seat less its in-hand offset.
+
+    The configured pose is the tool for a centred grip, and it creeps (+3.2 mm since 10-28, -2..-3
+    mm on 10-23). A teacher's or policy's seat, a scripted insertion's landing, or the landing of
+    the scripted search that rescued a blocked teacher -- the one that corrects a drifted hole --
+    each less the offset the grasp left. None for a row with no seat that went in.
+    """
+
+    segment = row.get("insertSegment") or {}
+    if segment.get("offsetXyMm") is not None:
+        offset = tuple(float(v) / 1000.0 for v in segment["offsetXyMm"])
+    elif row.get("closeXyz") and row.get("pegXyz"):
+        offset = in_hand_offset_xy(tuple(row["closeXyz"]), tuple(row["pegXyz"]))
+    else:
+        return None
+    seat = None
+    if row.get("inserted") is True:
+        seat = segment.get("stoppedXyz") or segment.get("releasedXyz") or (row.get("insert") or {}).get("landingXyz")
+    elif (row.get("rescue") or {}).get("inserted") is True:
+        seat = row["rescue"].get("landingXyz")
+    if not seat:
+        return None
+    return (float(seat[0]) - offset[0], float(seat[1]) - offset[1])
+
+
+def teacher_hole_xy(request: GraspLoopRequest, rows: Iterable[dict[str, Any]]) -> tuple[float, float]:
+    """The hole the teacher aims at: the median of the latest GRASP_LOOP_HOLE_WINDOW samples
+    within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of the configured pose, or that pose until one."""
+
+    assert request.insertServo is not None
+    configured = (float(request.insertServo.xyz[0]), float(request.insertServo.xyz[1]))
+    samples = [
+        xy for xy in (hole_sample_xy(row) for row in rows)
+        if xy is not None and math.dist(xy, configured) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M
+    ][-GRASP_LOOP_HOLE_WINDOW:]
+    if not samples:
+        return configured
+    return (statistics.median(x for x, _ in samples), statistics.median(y for _, y in samples))
 
 
 def read_width(robot: Any, samples: int = GRASP_LOOP_WIDTH_SAMPLES, period_s: float = 1.0 / 30.0) -> float:
@@ -1014,6 +1246,39 @@ def insert_held_peg(
     return outcome
 
 
+def grade_let_go(
+    handover: GraspHandover,
+    segment: dict[str, Any],
+    *,
+    trial: int,
+    ask_grade: OperatorGrade | None,
+) -> bool | None:
+    """In or out for a peg the segment let go of past the close: the operator's word when there
+    is one, else the teacher's seated stop, or the policy's let-go within the seat's tolerance.
+
+    Asked after the fingers opened, unlike `insert_held_peg`'s grade: the release was the
+    teacher's or the policy's to make, and it is the outcome being measured.
+    """
+
+    if handover.teacher is not None:
+        auto = segment.get("outcome") == "seated"
+    else:
+        above, across = segment.get("aboveSeatMm"), segment.get("fromSeatXyMm")
+        auto = (
+            above is not None and across is not None
+            and float(above) <= handover.insertConfig.seatedM * 1000.0  # type: ignore[union-attr]
+            and float(across) <= GRASP_LOOP_LET_GO_XY_M * 1000.0
+        )
+    if ask_grade is None:
+        return auto
+    answer = ask_grade(
+        f"grade: trial {trial + 1} auto={'seated' if auto else 'not_seated'} by={handover.afterClose} "
+        f"above_seat_mm={segment.get('aboveSeatMm')} offset_mm={segment.get('offsetXyMm')} "
+        "-- the fingers are open: is the peg in the hole? (in / out)"
+    )
+    return None if answer not in ("in", "out") else answer == "in"
+
+
 def next_insert_aim(
     request: GraspLoopRequest,
     rows: Iterable[dict[str, Any]],
@@ -1354,10 +1619,14 @@ KEEPABLE_MISS_VERDICTS = ("empty", "no_close")
 
 
 def keeps_trial_recording(row: dict[str, Any], *, keep_misses: bool) -> bool:
-    """Whether a finished trial's recording becomes episodes: held, or a keepable arm-A miss."""
+    """Whether a finished trial's recording becomes episodes: held, or a keepable arm-A miss.
+
+    A teacher's trial is a demonstration of the insertion too, so held is not enough: only one
+    whose peg went in. A blocked one ends standing on the face, which nothing should learn.
+    """
 
     if row.get("verdict") == "held":
-        return True
+        return row.get("afterClose") != "teacher" or row.get("inserted") is True
     return keep_misses and row.get("arm") == "A" and row.get("verdict") in KEEPABLE_MISS_VERDICTS
 
 
@@ -1411,7 +1680,7 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
         e2e = [r for r in graded if "inserted" in r and r["inserted"] is not None]
         inserted = sum(1 for r in e2e if r["inserted"])
         e2e_low, e2e_high = wilson_interval(inserted, len(e2e))
-        tried = [r for r in e2e if "insert" in r]
+        tried = [r for r in e2e if "insert" in r or "insertSegment" in r]
         out["endToEnd"] = {
             "graded": len(e2e),
             "inserted": inserted,
@@ -1422,7 +1691,8 @@ def _summarize_arm(rows: list[dict[str, Any]]) -> dict[str, Any]:
             # Landings, not ring index: with a search order the first landing need not be index 0.
             "firstLanding": sum(
                 1 for r in tried
-                if r["inserted"] and int(r["insert"].get("searchTried") or int(r["insert"].get("searchIndex") or 0) + 1) == 1
+                if "insert" in r and r["inserted"]
+                and int(r["insert"].get("searchTried") or int(r["insert"].get("searchIndex") or 0) + 1) == 1
             ),
         }
     localization = summarize_aim(graded)
@@ -1495,7 +1765,7 @@ def completed_trials(path: Path) -> list[dict[str, Any]]:
 # What a resumed run must share with the rows it appends to, or its trials are not the same
 # trials: where the pegs go (seed, mask, table height), which arm, how long the policy gets, and
 # which policy (`run_start.policy`, compared when both runs recorded one).
-RESUME_MUST_MATCH = ("seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo")
+RESUME_MUST_MATCH = ("seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo", "afterClose")
 
 
 def resume_point(path: Path, request: GraspLoopRequest, policy: str | None) -> int:
@@ -1882,6 +2152,13 @@ def run_grasp_loop(
                 funnelMaxSteps=request.funnelMaxSteps,
                 pegXyz=peg_xyz,
                 voidRequested=void_requested,
+                afterClose=request.afterClose,
+                insertMaxSteps=request.insertMaxSteps,
+                insertPlan=(
+                    None
+                    if request.afterClose == "script"
+                    else insert_plan(request, teacher_hole_xy(request, done), level_rotvec)
+                ),
             )
             if arm == "B":
                 handover.funnel = GraspFunnel(funnel_config(request, trial, peg_xyz))
@@ -1954,11 +2231,35 @@ def run_grasp_loop(
                     break
                 continue
             if handover.fired:
-                check = check_grasp(robot, request, gripper=float(handover.commandedGripper), request_id=request_id)
-                row.update({k: v for k, v in check.items() if k != "rotvec"})
-                row["verdict"] = "held" if check["held"] else "empty"
-                regrip = check["held"]
-                if check["held"] and request.insertServo is not None:
+                past_close = handover.afterClose != "script"
+                lifted = handover.lifted_grade() if past_close else None
+                if past_close:
+                    row["afterClose"] = handover.afterClose
+                    row["insertSegment"] = handover.after_close_record()
+                if lifted is not None:
+                    # Graded on the segment's own lift, as `check_grasp` grades.
+                    held = lifted
+                    row["widthLifted"] = row["insertSegment"].get("widthLifted")
+                elif past_close and handover.afterCloseEnd == "released":
+                    # The policy let go before anything lifted the peg: it carried nothing.
+                    held = False
+                else:
+                    check = check_grasp(robot, request, gripper=float(handover.commandedGripper), request_id=request_id)
+                    row.update({k: v for k, v in check.items() if k != "rotvec"})
+                    held = check["held"]
+                row["verdict"] = "held" if held else "empty"
+                regrip = held
+                let_go = past_close and held and handover.afterCloseEnd in ("seated", "released")
+                if let_go:
+                    row["inserted"] = grade_let_go(handover, row["insertSegment"], trial=trial, ask_grade=ask_grade)
+                    log(
+                        f"[INFO] grasp_loop_let_go trial={trial} mode={handover.afterClose} "
+                        f"above_seat_mm={row['insertSegment'].get('aboveSeatMm')} inserted={_flag(row['inserted'])}"
+                    )
+                    # In the fixture if it went in; otherwise wherever it fell, which is a person's.
+                    peg, regrip = ("at_pick" if row["inserted"] else "lost"), False
+                    release_and_clear(robot, request, request_id=request_id)
+                elif held and request.insertServo is not None:
                     assert handover.closeXyz is not None
                     clear_out_early()
                     insert = insert_held_peg(
@@ -1968,12 +2269,18 @@ def run_grasp_loop(
                         out_early=out_early_requested,
                     )
                     insert_rotvec = insert.pop("rotvec")
-                    row["insert"] = insert
-                    row["inserted"] = insert["inserted"]
-                    aim = next_insert_aim(request, [row], insert_aim)
-                    if aim != insert_aim:
-                        log(f"[INFO] grasp_loop_insert_aim trial={trial} xy={aim[0]:.4f},{aim[1]:.4f}")
-                    insert_aim = aim
+                    if past_close:
+                        # The teacher stood on the face or the policy ran out of steps: the
+                        # scripted search only puts the peg back in the fixture. The trial's
+                        # outcome stays the segment's, a miss.
+                        row["rescue"] = insert
+                    else:
+                        row["insert"] = insert
+                        row["inserted"] = insert["inserted"]
+                        aim = next_insert_aim(request, [row], insert_aim)
+                        if aim != insert_aim:
+                            log(f"[INFO] grasp_loop_insert_aim trial={trial} xy={aim[0]:.4f},{aim[1]:.4f}")
+                        insert_aim = aim
                     if insert["released"]:
                         # In the fixture, which is where the next staging takes it from.
                         peg, regrip = "at_pick", False
@@ -2001,7 +2308,7 @@ def run_grasp_loop(
                     else:
                         release_and_clear(robot, request, request_id=request_id)
                         peg = "lost"
-                elif not check["held"]:
+                elif not held and not let_go:
                     release_and_clear(robot, request, request_id=request_id)
             elif status == "voided":
                 # The staged peg fell over. Not the policy's trial: off every rate, and the peg,

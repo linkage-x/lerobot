@@ -40,6 +40,12 @@ describe("the align phase across rollouts", () => {
     ).not.toContain("align phase");
   });
 
+  it("says when the align phase comes back on without RTC guidance", () => {
+    expect(
+      carriedOverNotice({ mode: "real", runtimeOptions: { phaseAlignBelowZ: 0.118, phaseAlignUnguided: true } })
+    ).toContain("below z = 0.118 m, without RTC guidance");
+  });
+
   it("reaches the page's fields from the last rollout", () => {
     expect(rolloutPageSource).toContain("setPhaseAlignBelowZ(options.phaseAlignBelowZ == null");
   });

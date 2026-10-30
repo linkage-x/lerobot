@@ -2296,3 +2296,233 @@ def test_an_attended_fault_in_the_insertion_keeps_the_grasp_and_goes_on_to_the_n
     assert asked[0].startswith("hold:") and asked[1].startswith("fault:") and "next trial" in asked[1]
     summary = summarize_grasp_loop(rows)
     assert summary["held"] == 2 and summary["endToEnd"]["graded"] == 1
+
+
+# ------------------------------------------------------------------- past the close ---
+
+
+class OffsetInsertRig(InsertRig):
+    """The insertion rig with the peg held where the fingers found it along their face.
+
+    Closing centres the peg across the fingers (y) but not along them (x): it hangs off the tool
+    by the close's x miss for as long as it is held, and it is the *peg* that has to be over the
+    hole. That is the off-centre grasp the insertion teacher exists for.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.offset = (0.0, 0.0)
+
+    def _over_hole(self, x, y):
+        return math.dist((x - self.offset[0], y - self.offset[1]), self.hole_xy) <= self.capture_m
+
+    def send_action(self, action):
+        was_closed, was_held, peg_before = self.closed, self.held, self.peg_xyz
+        result = super().send_action(action)
+        if self.held and not was_closed:
+            self.offset = (self.xyz[0] - peg_before[0], 0.0)
+        if self.held:
+            self.peg_xyz = (self.xyz[0] - self.offset[0], self.xyz[1] - self.offset[1], self.xyz[2])
+        elif was_held:
+            if self.peg_xyz != PICK:
+                self.peg_xyz = (self.xyz[0] - self.offset[0], self.xyz[1] - self.offset[1], self.xyz[2])
+            self.offset = (0.0, 0.0)
+        return result
+
+
+def _offset_rig(hole_xy=PICK[:2]):
+    robot = OffsetInsertRig(hole_xy=hole_xy, capture_m=0.0025)
+    robot.face_z = TARGET_Z + 0.006 + robot.face_above_m
+    return robot
+
+
+def _walk_to(xyz, goal, step_m=0.003):
+    distance = math.dist(xyz, goal)
+    if distance <= step_m:
+        return tuple(goal)
+    return tuple(a + (b - a) * step_m / distance for a, b in zip(xyz, goal))
+
+
+def _policy_past_close(robot, misses, *, carry_to=None):
+    """A stand-in for the runtime past the close: what `run_policy_rollout` does, step by step.
+
+    The policy closes `misses[trial]` off the peg in x. Past the close the teacher's command is
+    sent while it has the arm; on "policy", `carry_to(trial, handover)` names where the stand-in
+    policy carries the peg (up, across, down) and lets go.
+    """
+
+    def run(trial, handover):
+        px, py, pz = robot.peg_xyz
+        at = (px + misses[trial], py, pz)
+        sent_gripper = 1.0
+        waypoints = None
+        last_xyz = None
+        for step in range(5000):
+            observation = robot.get_observation()
+            xyz = (observation["ee.x"], observation["ee.y"], observation["ee.z"])
+            rotvec = (observation["ee.wx"], observation["ee.wy"], observation["ee.wz"])
+            if handover.observe(step, xyz, sent_gripper, rotvec=rotvec, width=observation["gripper.pos"]):
+                return "grasp_handover"
+            if handover.timed_out(step):
+                return "grasp_timeout"
+            if handover.teacher is not None and handover.teacher.active:
+                command = handover.teacher.step(step, xyz, rotvec, observation["gripper.pos"])
+            elif handover.fired:
+                if waypoints is None:
+                    goal = carry_to(trial, handover)
+                    waypoints = [(xyz[0], xyz[1], 0.12), (goal[0], goal[1], 0.12), goal]
+                target, gripper = xyz, 0.2
+                if waypoints:
+                    target = _walk_to(xyz, waypoints[0])
+                    # Arrived, or standing on something: on to the next, and let go after the last.
+                    if target == waypoints[0] or xyz == last_xyz:
+                        waypoints.pop(0)
+                else:
+                    gripper = 1.0
+                last_xyz = xyz
+                command = {
+                    "ee.x": target[0], "ee.y": target[1], "ee.z": target[2],
+                    "ee.wx": rotvec[0], "ee.wy": rotvec[1], "ee.wz": rotvec[2], "gripper.pos": gripper,
+                }
+            else:
+                command = {
+                    "ee.x": at[0], "ee.y": at[1], "ee.z": at[2],
+                    "ee.wx": rotvec[0], "ee.wy": rotvec[1], "ee.wz": rotvec[2],
+                    "gripper.pos": 1.0 if step < 5 else 0.2,
+                }
+            robot.send_action(command)
+            sent_gripper = command["gripper.pos"]
+        return "grasp_timeout"
+
+    return run
+
+
+def test_the_teacher_inserts_an_off_centre_grasp_by_the_offset_and_the_row_says_so(tmp_path, _fast_servo):
+    robot = _offset_rig()
+    asked = []
+    out = tmp_path / "teacher.jsonl"
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo(), afterClose="teacher"),
+        run_policy_trial=_policy_past_close(robot, [0.004, -0.003]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in", "in"], asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["held", "held"]
+    assert [r["inserted"] for r in rows] == [True, True]
+    assert [r["insertSegment"]["outcome"] for r in rows] == ["seated", "seated"]
+    assert rows[0]["insertSegment"]["offsetXyMm"] == pytest.approx([4.0, 0.0], abs=0.1)
+    assert rows[1]["insertSegment"]["offsetXyMm"] == pytest.approx([-3.0, 0.0], abs=0.1)
+    # Asked once the fingers had opened: the release was the teacher's.
+    assert len(asked) == 2 and not any(held for _message, held in asked)
+    assert "by=teacher" in asked[0][0]
+    # No scripted insertion ran: the teacher's is the whole of it, and the peg is back in the fixture.
+    assert "insert" not in rows[0] and "rescue" not in rows[0]
+    assert [r["staging"] for r in rows] == ["fixture", "fixture"]
+    assert all(keeps_trial_recording(r, keep_misses=False) for r in rows)
+    assert result["summary"]["endToEnd"]["inserted"] == 2
+
+
+def test_a_teacher_blocked_on_the_face_is_a_miss_rescued_by_the_search_and_the_next_aims_at_the_real_hole(
+    tmp_path, _fast_servo
+):
+    # The fixture's hole has crept 3.5 mm from the configured pose: the teacher's first try lands
+    # on the face, the scripted search finds the hole, and the second try aims at what it found.
+    robot = _offset_rig(hole_xy=(PICK[0] + 0.0035, PICK[1]))
+    out = tmp_path / "blocked.jsonl"
+    asked = []
+    run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo(searchInnerRingM=0.0035), afterClose="teacher"),
+        run_policy_trial=_policy_past_close(robot, [0.004, 0.004]),
+        out_path=out,
+        # The search's seat is late (landing 10), so only a person's "in" lets go of it there.
+        ask_grade=_grades(robot, ["in", "in"], asked),
+    )
+    rows = _trials(out)
+    first, second = rows
+    # The search's question is asked holding the peg; the teacher's, after it let go.
+    assert [held for _message, held in asked] == [True, False]
+    assert first["verdict"] == "held" and first["insertSegment"]["outcome"] == "blocked"
+    assert first["inserted"] is False and first["rescue"]["inserted"] is True
+    assert not keeps_trial_recording(first, keep_misses=True)
+    # Within the search grid's reach of the real hole (the landing that seated was 0.5 mm off it).
+    assert second["insertSegment"]["holeXyz"][0] == pytest.approx(PICK[0] + 0.0035, abs=6e-4)
+    assert second["insertSegment"]["outcome"] == "seated" and second["inserted"] is True
+
+
+def test_an_empty_grasp_past_the_close_is_graded_on_the_teachers_lift(tmp_path, _fast_servo):
+    robot = _offset_rig()
+    out = tmp_path / "empty.jsonl"
+    run_grasp_loop(
+        robot,
+        # 9 mm off: outside the fingers' reach, they close on air.
+        _request(trials=1, insertServo=_insert_servo(), afterClose="teacher"),
+        run_policy_trial=_policy_past_close(robot, [0.009]),
+        out_path=out,
+    )
+    (row,) = _trials(out)
+    assert row["verdict"] == "empty" and row["insertSegment"]["outcome"] == "empty"
+    assert row["widthLifted"] == pytest.approx(GraspRig.EMPTY_WIDTH)
+    assert row["inserted"] is False and "rescue" not in row
+
+
+def test_the_policy_past_the_close_is_graded_where_it_lets_go(tmp_path, _fast_servo):
+    robot = _offset_rig()
+    out = tmp_path / "policy.jsonl"
+
+    def carry_to(trial, handover):
+        seat = handover.insertConfig.seatXyz
+        # Trial 0 compensates for the peg in its fingers; trial 1 aims the tool at the hole.
+        return seat if trial == 0 else (PICK[0], PICK[1], seat[2])
+
+    result = run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo(), afterClose="policy"),
+        run_policy_trial=_policy_past_close(robot, [0.004, 0.004], carry_to=carry_to),
+        out_path=out,
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["held", "held"]
+    assert [r["insertSegment"]["end"] for r in rows] == ["released", "released"]
+    assert [r["inserted"] for r in rows] == [True, False]
+    assert rows[0]["insertSegment"]["aboveSeatMm"] <= 3.0
+    assert rows[1]["insertSegment"]["aboveSeatMm"] > 30.0
+    assert result["summary"]["endToEnd"]["inserted"] == 1
+
+
+def test_past_the_close_needs_the_hole_and_a_known_mode():
+    with pytest.raises(SceneResetError, match="needs insertServo"):
+        validate_grasp_loop_request(_request(afterClose="teacher"))
+    with pytest.raises(SceneResetError, match="afterClose must be one of"):
+        validate_grasp_loop_request(_request(afterClose="person", insertServo=_insert_servo()))
+
+
+@pytest.mark.parametrize(
+    "row, kept",
+    [
+        ({"arm": "A", "verdict": "held", "afterClose": "teacher", "inserted": True}, True),
+        ({"arm": "A", "verdict": "held", "afterClose": "teacher", "inserted": False}, False),
+        ({"arm": "B", "verdict": "held", "afterClose": "teacher", "inserted": None}, False),
+        ({"arm": "A", "verdict": "held", "afterClose": "policy", "inserted": False}, True),
+        ({"arm": "A", "verdict": "held", "inserted": False}, True),
+    ],
+)
+def test_a_teachers_trial_is_kept_only_when_its_peg_went_in(row, kept):
+    assert keeps_trial_recording(row, keep_misses=False) is kept
+
+
+def test_the_hole_estimate_takes_the_seat_less_the_offset_and_ignores_far_or_missing_samples():
+    request = _request(insertServo=_insert_servo())
+    rows = [
+        {"inserted": True, "insertSegment": {"offsetXyMm": [4.0, 0.0], "stoppedXyz": [PICK[0] + 0.006, PICK[1], 0.06]}},
+        {"inserted": False, "insertSegment": {"offsetXyMm": [4.0, 0.0]}, "rescue": {"inserted": True, "landingXyz": [PICK[0] + 0.006, PICK[1], 0.06]}},
+        # Scripted, from the close and the peg: 1 mm off along x.
+        {"inserted": True, "closeXyz": [0.401, -0.15, 0.06], "pegXyz": [0.4, -0.151, 0.058], "insert": {"landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
+        # 20 mm away: some other fixture.
+        {"inserted": True, "insertSegment": {"offsetXyMm": [0.0, 0.0], "stoppedXyz": [PICK[0] + 0.02, PICK[1], 0.06]}},
+        {"inserted": False, "insertSegment": {"offsetXyMm": [0.0, 0.0], "stoppedXyz": [PICK[0] + 0.01, PICK[1], 0.06]}},
+    ]
+    assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx((PICK[0] + 0.002, PICK[1]))
+    assert grasp_loop.teacher_hole_xy(request, []) == pytest.approx(PICK[:2])

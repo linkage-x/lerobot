@@ -22,6 +22,7 @@
 #     FR3_GRASP_LOOP_KEEP_MISSES=1 (with whole trials: arm A's empty / no_close trials too, for relabelling)
 #     FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM ("h" or "low,high" mm above the peg; blank = 60)
 #     FR3_GRASP_LOOP_FUNNEL_CORRECTIVE (1 = arm B records corrective demonstrations)
+#     FR3_GRASP_LOOP_AFTER_CLOSE (script | teacher | policy: who inserts after the close; blank = script)
 #     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
@@ -142,6 +143,8 @@ phase_align_replan_queue_size="${FR3_PHASE_ALIGN_REPLAN_QUEUE_SIZE-}"
 phase_align_execution_horizon="${FR3_PHASE_ALIGN_EXECUTION_HORIZON-}"
 phase_align_action_samples="${FR3_PHASE_ALIGN_ACTION_SAMPLES-}"
 phase_hysteresis_mm="${FR3_PHASE_HYSTERESIS_MM-}"
+# 1 = below the align height, chunks are asked for without the RTC prefix.
+phase_align_unguided="${FR3_PHASE_ALIGN_UNGUIDED-0}"
 terminal_servo_handoff_z="${FR3_TERMINAL_SERVO_HANDOFF_Z-}"
 terminal_servo_search_ring="${FR3_TERMINAL_SERVO_SEARCH_RING-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
@@ -322,6 +325,9 @@ fi
 if [[ -n "${phase_hysteresis_mm}" ]]; then
   common_args+=(--phase-hysteresis-mm "${phase_hysteresis_mm}")
 fi
+if [[ "${phase_align_unguided}" == "1" ]]; then
+  common_args+=(--phase-align-unguided)
+fi
 if [[ -n "${terminal_servo_pose}" ]]; then
   common_args+=(--terminal-servo-pose "${terminal_servo_pose}")
 fi
@@ -375,6 +381,7 @@ case "$mode" in
     echo "FR3_PHASE_ALIGN_EXECUTION_HORIZON=${phase_align_execution_horizon:-<runtime default>}"
     echo "FR3_PHASE_ALIGN_ACTION_SAMPLES=${phase_align_action_samples:-<runtime default>}"
     echo "FR3_PHASE_HYSTERESIS_MM=${phase_hysteresis_mm:-<runtime default>}"
+    echo "FR3_PHASE_ALIGN_UNGUIDED=${phase_align_unguided}"
     echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
     echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
     echo "FR3_TERMINAL_SERVO_SEARCH_RING=${terminal_servo_search_ring:-<off>}"
@@ -494,6 +501,8 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-takeover-dz-mm "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM}"); fi
     # Arm B: the funnel leaves part of the aim to the descent and sometimes recovers from low (unset = off).
     if [[ "${FR3_GRASP_LOOP_FUNNEL_CORRECTIVE-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-corrective); fi
+    # Past the close: the recorded insertion teacher, or the policy itself (blank = the scripted insertion).
+    if [[ -n "${FR3_GRASP_LOOP_AFTER_CLOSE-}" ]]; then grasp_loop_args+=(--grasp-loop-after-close "${FR3_GRASP_LOOP_AFTER_CLOSE}"); fi
     # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).
     if [[ -n "${FR3_GRASP_LOOP_DATASET_ROOT-}" ]]; then grasp_loop_args+=(--grasp-loop-dataset-root "${FR3_GRASP_LOOP_DATASET_ROOT}"); fi
     # ... from each trial's first step, the policy's own steps as is_intervention=0 (unset = funnel only).

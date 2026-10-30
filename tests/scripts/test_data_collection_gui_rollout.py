@@ -4546,6 +4546,25 @@ def test_the_funnel_corrective_switch_reaches_the_launcher_only_with_arm_b():
     assert "grasp_loop_args+=(--grasp-loop-funnel-corrective)" in launcher
 
 
+def test_who_inserts_after_the_close_reaches_the_launcher_only_with_a_hole():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    pose = "0.3597,-0.1328,0.058"
+    for mode in ("teacher", "policy"):
+        assert sanitize({"graspLoopInsertPose": pose, "graspLoopAfterClose": mode}) == {
+            "FR3_GRASP_LOOP_INSERT_POSE": pose,
+            "FR3_GRASP_LOOP_AFTER_CLOSE": mode,
+        }
+    # The scripted insertion is the launcher's own default: nothing to send.
+    assert sanitize({"graspLoopInsertPose": pose, "graspLoopAfterClose": "script"}) == {"FR3_GRASP_LOOP_INSERT_POSE": pose}
+    with pytest.raises(rollout_backend.RolloutError, match="set graspLoopInsertPose"):
+        sanitize({"graspLoopAfterClose": "teacher"})
+    with pytest.raises(rollout_backend.RolloutError, match="script, teacher or policy"):
+        sanitize({"graspLoopInsertPose": pose, "graspLoopAfterClose": "person"})
+    assert "FR3_GRASP_LOOP_AFTER_CLOSE" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert 'grasp_loop_args+=(--grasp-loop-after-close "${FR3_GRASP_LOOP_AFTER_CLOSE}")' in launcher
+
+
 def test_the_phase_schedule_options_reach_the_launcher(tmp_path: Path):
     runtime_options = rollout_backend.sanitize_rollout_runtime_options(
         {
@@ -4583,6 +4602,7 @@ def test_the_align_phase_the_runtime_announces_becomes_part_of_the_arm():
         "phaseAlignExecutedSteps": 8,
         "phaseAlignExecutionHorizon": 8,
         "phaseAlignActionSamples": 1,
+        "phaseAlignGuided": True,
     }
     assert "every 8 steps" in parsed["message"]
     # The approach line carries no align phase, and must not be read as the sampling arm either.
@@ -4591,6 +4611,40 @@ def test_the_align_phase_the_runtime_announces_becomes_part_of_the_arm():
         "executed_steps=16 execution_horizon=16 action_samples=8 selection_horizon=16"
     )
     assert "phaseScheduleConfig" not in approach and "policyArm" not in approach
+
+
+def test_an_unguided_align_phase_reaches_the_launcher_and_is_read_back_as_its_own_arm(tmp_path: Path):
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {"phaseAlignBelowZ": 0.118, "phaseAlignUnguided": True}
+    )
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+    assert env["FR3_PHASE_ALIGN_UNGUIDED"] == "1"
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert "common_args+=(--phase-align-unguided)" in launcher
+    # Without a height it would change nothing on the arm, so the page is told rather than ignored.
+    with pytest.raises(rollout_backend.RolloutError, match="phaseAlignUnguided"):
+        rollout_backend.sanitize_rollout_runtime_options({"phaseAlignUnguided": True})
+    assert "FR3_PHASE_ALIGN_UNGUIDED" not in rollout_backend.sanitize_rollout_runtime_options(
+        {"phaseAlignBelowZ": 0.118}
+    )
+
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] rollout_phase_config phase=align below_z=0.1180 replan_queue_size=34 "
+        "executed_steps=16 execution_horizon=16 action_samples=1 selection_horizon=16 guided=False"
+    )
+    assert parsed["phaseScheduleConfig"]["phaseAlignGuided"] is False
+    assert "without RTC guidance" in parsed["message"]
+    assert checkpoint_backend._sanitize_rollout_arm({"phaseAlignGuided": False}) == {"phaseAlignGuided": False}
+
+
+def test_a_grasp_loop_dataset_root_from_the_page_replaces_the_checkpoints_default(tmp_path: Path):
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {"graspLoopRecord": True, "graspLoopRecordWholeTrial": True, "graspLoopDatasetRoot": " outputs/datasets/trial_x_unguided "}
+    )
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+    assert env["FR3_GRASP_LOOP_DATASET_ROOT"] == "outputs/datasets/trial_x_unguided"
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopDatasetRoot"):
+        rollout_backend.sanitize_rollout_runtime_options({"graspLoopRecord": True, "graspLoopDatasetRoot": "a\nb"})
 
 
 def test_the_align_phase_survives_the_arm_whitelist_into_the_outcome_log(tmp_path: Path):
