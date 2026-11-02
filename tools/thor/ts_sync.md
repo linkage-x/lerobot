@@ -657,22 +657,22 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
   L3b 校准残差阈值(50ms)自动回退到 L3a，不污染数据。**不要求 SDK 改 uint64**（结构体字段偏移
   全变, 属 ABI/协议破坏性改动, 代价高于收益）；将来若做长会话/连续录制, 在客户端 poll 循环里
   unwrap（检测 ts 回退则累加 2³²）即可彻底消除, 无需供应商配合。
-- CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
-  （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
+- CSV：v4.1 由 `box_sdk.conf` 的 `sensor_csv_enabled` 控制（默认关）；打开后写到 CWD 下
+  `sensor_data/session_*/`，`BoxClient.stop()` 默认删本会话新建的目录（`cleanup_box_csv`，
+  见 `box_sdk/TROUBLESHOOTING.md` §7）。
 
-### 9.3 触觉贴片型号与触点数（2026-08-17）
+### 9.3 触觉贴片型号与触点数（2026-08-17；2026-11-02 随 SDK v4.1 改写）
 
-BOX SDK 对**所有**触觉贴片都用同一个 239 槽定长数组 `TouchSensor.forces` 承载 —— 这是旧 Paxini L5325 的触点数，**不是**当前实际装的贴片的属性。装 M2020（3×3）时，`libbox_controller.so` 解析 `TLV_TYPE_GET_TOUCH_M2020_{LEFT,RIGHT}_DATA` 后调 `fill_touch_from_m2020()`，把 9 个真实触点写进槽 0–8，槽 9–238 恒零。**所以数组长度不能用来判断贴片型号**（没被按压的 Paxini 贴片同样全零）。
+**SDK v4.1 起**触觉帧自描述：`SensorCache.touch` 是两个 terminal（0=left、1=right）各一个 `{touch_device_id: TouchSensorSample}` 字典，`forces` 恰好是该贴片上报的 `point_count` 个触点；一个 terminal 允许挂多个触觉设备。两种贴片都走链路流 `0x0002`/`0x0003`（`kLinkStreamTouchT0/T1`），旧的 M2020 专用流 `0x0008`/`0x0009` 已删 —— **帧长度是唯一的型号证据**：
 
-判据是链路流 id（`LinkStats.tlv_type`）：
+| 触点数 | 贴片 | 布局 |
+|--------|------|------|
+| 239 | Paxini L5325 | 厂商 XYZ 坐标表 |
+| 9 | M2020 | 3×3，线缆在左，行优先编号 1–9 |
 
-| 链路流 | 贴片 | 触点数 | 布局 |
-|--------|------|--------|------|
-| `0x0002` / `0x0003` | Paxini L5325 | 239 | 厂商 XYZ 坐标表 |
-| `0x0008` / `0x0009` | M2020 | 9 | 3×3，线缆在左，行优先编号 1–9 |
-
-- `box_client.touch_model_from_link_stats()` 据此识别贴片，`_decode_touch()` 把每帧裁到真实触点数并打上 `model` / `points` 标签；识别前**不截断**（按完整 239 槽透传 + 告警），不做零尾启发式猜测。
-- 型号一经识别就**锁存**：贴片不可能录制中途换，中途改宽度会在同一 episode 里写出参差不齐的 fx/fy/fz。可用 `box_collection.touch_model` 在配置里钉死。
+- `_decode_touch()` 整帧透传，按长度打 `model` / `points`（不在 `TOUCH_MODELS` 里的长度记 `"unknown"`）并带 `touch_device_id`；同一 terminal 多个设备时只记最小 id 并告警一次。
+- `box_collection.touch_model` 不再影响数据：`auto` 取首帧型号，钉死的值只在帧型号不符时告警一次。
+- v4.0 及以前（历史数据）：所有贴片共用 239 槽定长数组，M2020 由 `fill_touch_from_m2020()` 只填槽 0–8，型号靠链路流 id 8/9 识别、识别前按 239 槽透传 —— 读旧数据时 `points`/`model` 标签依旧可信。
 - `_touch_summary()` 的 `mean_f{x,y,z}` 按**实际触点数**求平均。曾硬编码除以 239：M2020 下同样的物理接触，均值被稀释 239/9 ≈ 26.6 倍（实测 132514 数据集：`mean_fz` 0.435 → 11.556）。
 - `export_v3` 每次导出用 `_detect_touch_width()` 从 raw jsonl 定宽（parquet 是定长 list 列）；一次导出里各 episode 宽度不一致 = 采集中途换过贴片，会告警并取最宽。
 - 前端 `touchVisualization` 按 `model` 选布局（M2020 画 3×3 带触点编号，Paxini 走 239 点 XYZ 图），Calibration / Device Manager / Episode Replay 三个页面共用。
