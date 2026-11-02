@@ -1266,6 +1266,56 @@ def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):
     assert pub["capability_names"] == ["box_gripper", "box_imu"]
 
 
+def test_discover_boxes_drops_a_box_answering_twice(fake_box_module):
+    # v4.1 on Thor (2026-11-02) listed device 3100715645 @ 192.168.1.207 twice,
+    # which built two views polling the same box under one namespace.
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=3100715645, ip="192.168.1.207"),
+        _FakeDiscovered(device_id=3100715645, ip="192.168.1.207"),
+        _FakeDiscovered(device_id=42, ip="192.168.1.208"),
+    ]
+    found = box_client.discover_boxes()
+    assert [d.device_id for d in found] == [3100715645, 42]
+
+
+def test_discover_boxes_unions_rounds_that_each_see_one_box(fake_box_module):
+    # Thor 2026-11-02 (v4.1, collection + execution box): every broadcast
+    # answered with exactly one of the two boxes, alternating.
+    rounds = iter([
+        [_FakeDiscovered(device_id=3100715645, ip="192.168.1.207")],
+        [_FakeDiscovered(device_id=3906437858, ip="192.168.1.150", fw_version=3),
+         _FakeDiscovered(device_id=3906437858, ip="192.168.1.150", fw_version=2)],
+        [_FakeDiscovered(device_id=3100715645, ip="192.168.1.207")],
+        [_FakeDiscovered(device_id=3906437858, ip="192.168.1.150")],
+        [],
+    ])
+    calls = []
+
+    def _discover(**kw):
+        calls.append(kw)
+        return next(rounds)
+
+    fake_box_module.discover = _discover
+    found = box_client.discover_boxes()
+    assert [(d.device_id, d.ip) for d in found] == [
+        (3906437858, "192.168.1.150"), (3100715645, "192.168.1.207"),
+    ]
+    assert found[0].fw_version == 3  # first answer for a device wins
+    assert len(calls) == 4  # rounds 3 and 4 added nothing new -> stop
+
+
+def test_discover_boxes_keeps_trying_while_nothing_answers(fake_box_module):
+    calls = []
+
+    def _discover(**kw):
+        calls.append(kw)
+        return []
+
+    fake_box_module.discover = _discover
+    assert box_client.discover_boxes(retries=3) == []
+    assert len(calls) == 3
+
+
 def test_discovery_forwards_so_path_when_sdk_lives_in_the_wheel(fake_box_module):
     # Deployed on Thor, box_sdk is imported straight out of the vendored .whl, so
     # its own library resolver looks inside the zip (<...>.whl/box_sdk/lib) and
@@ -1286,7 +1336,8 @@ def test_discovery_forwards_so_path_when_sdk_lives_in_the_wheel(fake_box_module)
     client = box_client.BoxClient(cfg, so_path="/lib/libbox_controller.so")
     assert client.start() is True
     try:
-        assert seen == ["/lib/libbox_controller.so"]
+        # every broadcast round (answers are unioned over several) carries it
+        assert seen and set(seen) == {"/lib/libbox_controller.so"}
         assert client._device_id == 7
         # device_id learned -> address registered and startup_mode actually applied
         assert client._raw_box.registered == [(7, "192.168.2.60", 15000)]
