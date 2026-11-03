@@ -452,3 +452,74 @@ def test_named_holdout_episodes_take_ranges():
     from tools.fr3.funnel_relabel import _episode_list
 
     assert _episode_list("466-469,490") == [466, 467, 468, 469, 490]
+
+
+def test_an_aim_lag_moves_only_the_labels_xy_target(tmp_path):
+    """11-02: the labels aimed at the funnel's settled command (peg + 3.8 mm x); the policy closes
+    on the move ~0.9 mm off its command, so it closed ~2.8 mm +x. `aim_lag` aims at peg + lag."""
+
+    root, rows, peg_cmd, close_a = _source(tmp_path)
+    base, _ = relabel_source(root, 50, trial_rows=rows)
+    lag = np.array([0.0009, -0.0006])
+    out, summary = relabel_source(root, 50, trial_rows=rows, aim_lag=lag)
+    assert summary["label_aim_lag_mm"] == pytest.approx([0.9, -0.6])
+    for ep in (0, 1):
+        assert out[ep]["peg"] == pytest.approx(base[ep]["peg"], abs=1e-9)
+        want = np.array(base[ep]["peg"], dtype=np.float64)
+        want[:2] += lag - _TRACKING[:2]
+        assert out[ep]["aim"] == pytest.approx(want, abs=1e-6)  # the measured offset, float32 data
+        assert out[ep]["frames"].tolist() == base[ep]["frames"].tolist()
+    # A low frame's chunk now ends at the new xy, same height.
+    rec, t = out[1], close_a - 6
+    i = int(np.flatnonzero(rec["frames"] == t)[0])
+    cfg = FunnelConfig(pegXyz=tuple(rec["aim"]))
+    start = rec["state"][t, :3] + _TRACKING
+    full, _ = expert_chunk(start, rec["aim"], 300, config=cfg)
+    assert rec["action"][i] == pytest.approx(full[:50], abs=1e-7)
+    end = start + np.cumsum(full[:, :3].astype(np.float64), axis=0)[-1]
+    assert end[:2] == pytest.approx(rec["aim"][:2], abs=1e-5)
+    assert end[2] == pytest.approx(cfg.closeXyz[2], abs=1e-5)
+
+
+def test_mask_runs_drops_supervision_above_the_cut_only_on_those_runs(tmp_path):
+    """11-03 R8c: R7's arm-B episodes keep their low frames but lose every frame (policy and funnel)
+    more than `mask_above_mm` above the peg; episodes from other runs are untouched."""
+
+    root, rows, _peg_cmd, _close_a = _source(tmp_path)
+    rows = [{**r, "_run": "grasp_r7" if r["arm"] == "B" else "grasp_other"} for r in rows]
+    base, _ = relabel_source(root, 50, trial_rows=rows)
+    out, summary = relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7"}, mask_above_mm=60.0)
+
+    # The arm-A episode (another run) is exactly as before.
+    for key in ("frames", "action", "is_pad", "masked"):
+        assert np.array_equal(out[1][key], base[1][key])
+    # The arm-B episode: every frame above the cut is unsupervised, policy and funnel alike.
+    rec = out[0]
+    dz = (rec["state"][:, 2] - rec["peg"][2]) * 1000.0
+    high = np.flatnonzero(dz > 60.0)
+    assert len(high) and high.max() >= 40  # the funnel (from frame 40) also starts above the cut
+    got = dict(zip(rec["frames"].tolist(), range(len(rec["frames"])), strict=True))
+    for t in high:
+        i = got[int(t)]
+        assert rec["masked"][i] and rec["is_pad"][i].all()
+    # Below the cut, the policy frames keep their relabelled chunks and the funnel's are left as recorded.
+    for t in np.flatnonzero(dz <= 60.0):
+        if t < 40:
+            i, j = got[int(t)], int(np.flatnonzero(base[0]["frames"] == t)[0])
+            assert not rec["masked"][i] and np.array_equal(rec["action"][i], base[0]["action"][j])
+        else:
+            assert int(t) not in got
+    assert rec["frames"].tolist() == sorted(rec["frames"].tolist())
+    assert summary["masked_high_run_frames"] == len(high)
+    assert summary["mask_runs"] == ["grasp_r7"] and summary["mask_above_mm"] == 60.0
+    with pytest.raises(ValueError, match="go together"):
+        relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7"})
+
+
+def test_load_trial_rows_tags_each_row_with_its_run(tmp_path):
+    path = tmp_path / "grasp_20261028_113314.jsonl"
+    path.write_text(
+        json.dumps({"kind": "trial", "trial": 0, "dataset": {"kept": True, "firstEpisode": 0}}) + "\n"
+        + json.dumps({"kind": "run_start"}) + "\n"
+    )
+    assert [r["_run"] for r in load_trial_rows([path])] == ["grasp_20261028_113314"]

@@ -186,7 +186,8 @@ def load_trial_rows(paths: list[Path]) -> list[dict[str, Any]]:
             row = json.loads(line)
             kept = row.get("dataset") if row.get("kind") == "trial" else None
             if kept and kept.get("kept") and kept.get("firstEpisode") is not None:
-                rows.append(row)
+                # The run the row came from (the file's stem), for `mask_runs`.
+                rows.append({**row, "_run": Path(path).stem})
     return rows
 
 
@@ -276,8 +277,25 @@ def relabel_source(
     max_height_mm: float = DEFAULT_MAX_HEIGHT_MM,
     trial_rows: list[dict[str, Any]] | None = None,
     funnel_offset: np.ndarray | None = None,
+    aim_lag: np.ndarray | None = None,
+    mask_runs: set[str] | None = None,
+    mask_above_mm: float | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """Per source episode: the relabelled frames' chunks; plus a summary of what was done.
+
+    `aim_lag` (x, y in m, dataset frame): where the labels' command ends in xy, relative to the
+    peg's measured position (the settled close state). None, the default, aims at the funnel's
+    settled command, peg + the close tracking offset (~+3.8, -1.8 mm). The policy closes on the
+    move, ~(+0.9, -0.6) mm off its command (10-27, 11-02 traces), so a policy that follows those
+    labels closes ~2.8 mm +x of the funnel's close; passing that lag aims its close at the
+    funnel's. z keeps the tracking offset (the close height is unchanged). `peg` in the output is
+    unchanged either way; `aim` is what the chunks go to.
+
+    `mask_runs` / `mask_above_mm`: an episode whose grasp-loop row came from one of these runs (the
+    rows file's stem) gets no supervision on any frame more than `mask_above_mm` above the peg,
+    policy and funnel frames alike; below that it is treated as usual. For R8c (11-03): R7's 207
+    arm-B episodes carry the low -x corrections R8b gained, but their high frames all approach
+    from +y (median +29 mm) and R8b learnt a -y bias there that overshot ~10 mm on the robot.
 
     A policy-only episode (arm A: no funnel frame) closed wherever the policy closed, so its close
     is not the peg. Its peg is the grasp-loop row's `pegXyz` (`trial_rows`), carried into the
@@ -337,7 +355,9 @@ def relabel_source(
             "together with a source that has (build_relabelled_view does), or pass funnel_offset."
         )
     out: dict[int, dict[str, Any]] = {}
-    lagged = high = masked = masked_miss = 0
+    lagged = high = masked = masked_miss = masked_high_run = 0
+    if (mask_runs is None) != (mask_above_mm is None):
+        raise ValueError("mask_runs and mask_above_mm go together")
     row_vs_close_mm = []
     for ep in episodes:
         close_dz = np.array([0.0, 0.0, FUNNEL_CLOSE_DZ_MM / 1000.0])
@@ -355,9 +375,16 @@ def relabel_source(
             peg = ep["state"][ep["close"], :3] + offset - close_dz
             if row_peg is not None:
                 row_vs_close_mm.append((row_peg - peg) * 1000.0)
-        cfg = FunnelConfig(pegXyz=tuple(float(v) for v in peg))  # type: ignore[arg-type]
+        aim = np.array(peg, dtype=np.float64)
+        if aim_lag is not None:
+            aim[:2] = aim[:2] - offset[:2] + np.asarray(aim_lag, dtype=np.float64)[:2]
+        cfg = FunnelConfig(pegXyz=tuple(float(v) for v in aim))  # type: ignore[arg-type]
         missed = ep["row"] is not None and ep["row"].get("verdict") != "held"
+        mask_high = bool(mask_runs) and ep["row"] is not None and ep["row"].get("_run") in mask_runs
         frame_ids, chunks, pads, unsupervised = [], [], [], []
+
+        def too_high(t: int) -> bool:
+            return mask_high and (ep["state"][t, 2] - peg[2]) * 1000.0 > mask_above_mm  # type: ignore[operator]
 
         def unsupervise(t: int) -> None:
             frame_ids.append(t)
@@ -366,6 +393,10 @@ def relabel_source(
             unsupervised.append(True)
 
         for t in range(ep["first_funnel"]):
+            if too_high(t):
+                unsupervise(t)
+                masked_high_run += 1
+                continue
             skip = None
             if (ep["state"][t, 2] - peg[2]) * 1000.0 > max_height_mm:
                 skip = "high"
@@ -380,7 +411,7 @@ def relabel_source(
                 else:
                     lagged += 1
                 continue
-            chunk, pad = expert_chunk(ep["prev_cmd"][t], peg, horizon, config=cfg)
+            chunk, pad = expert_chunk(ep["prev_cmd"][t], aim, horizon, config=cfg)
             frame_ids.append(t)
             chunks.append(chunk)
             pads.append(pad)
@@ -389,6 +420,19 @@ def relabel_source(
             for t in range(ep["close"], len(ep["state"])):
                 unsupervise(t)
                 masked += 1
+        if mask_high:
+            # The funnel's own frames (and anything else not yet overridden) above the cut.
+            done = set(frame_ids)
+            for t in range(ep["first_funnel"], len(ep["state"])):
+                if t not in done and too_high(t):
+                    unsupervise(t)
+                    masked_high_run += 1
+        if frame_ids:
+            order = np.argsort(frame_ids, kind="stable")
+            frame_ids = [frame_ids[i] for i in order]
+            chunks = [chunks[i] for i in order]
+            pads = [pads[i] for i in order]
+            unsupervised = [unsupervised[i] for i in order]
         if frame_ids:
             out[ep["episode"]] = {
                 "frames": np.asarray(frame_ids, dtype=np.int64),
@@ -398,6 +442,7 @@ def relabel_source(
                 # on, and a miss's frames that are not relabelled).
                 "masked": np.asarray(unsupervised, dtype=bool),
                 "peg": peg,
+                "aim": aim,
                 "state": ep["state"],
             }
     summary = {
@@ -407,9 +452,12 @@ def relabel_source(
         "relabelled_episodes": len(out),
         "missed_episodes": sum(ep["row"] is not None and ep["row"].get("verdict") != "held" for ep in episodes),
         "never_closed_episodes": sum(ep["close"] is None for ep in episodes),
-        "relabelled_frames": int(sum(len(v["frames"]) for v in out.values())) - masked - masked_miss,
+        "relabelled_frames": int(sum(len(v["frames"]) for v in out.values())) - masked - masked_miss - masked_high_run,
         "masked_after_policy_close_frames": masked,
         "masked_unrelabelled_miss_frames": masked_miss,
+        "masked_high_run_frames": masked_high_run,
+        "mask_runs": None if not mask_runs else sorted(mask_runs),
+        "mask_above_mm": mask_above_mm,
         "skipped_lagged_frames": lagged,
         "kept_above_max_height_frames": high,
         "max_height_mm": max_height_mm,
@@ -417,6 +465,7 @@ def relabel_source(
         "close_tracking_offset_from": "funnel closes" if funnel_closed else "other sources' funnel closes",
         # For reference only: what the policy's own closes would have given.
         "policy_close_offset_mm": _offset_mm_or_none(policy_closed),
+        "label_aim_lag_mm": None if aim_lag is None else [round(float(v) * 1000.0, 2) for v in np.asarray(aim_lag)[:2]],
         "trial_row_matched_episodes": sum(ep["row"] is not None for ep in episodes),
     }
     if row_vs_close_mm:
@@ -446,6 +495,9 @@ def build_relabelled_view(
     seed: int = 0,
     trial_rows: list[dict[str, Any]] | None = None,
     holdout_named: list[int] | None = None,
+    aim_lag: np.ndarray | None = None,
+    mask_runs: set[str] | None = None,
+    mask_above_mm: float | None = None,
 ) -> dict[str, Any]:
     if out_root.exists():
         raise ValueError(f"{out_root} exists; pick a new name rather than overwrite a view")
@@ -492,7 +544,9 @@ def build_relabelled_view(
         if not expert.get("recordsPolicyFrames"):
             continue
         try:
-            per_source[name] = relabel_source(root, horizon, max_height_mm, trial_rows)
+            per_source[name] = relabel_source(
+                root, horizon, max_height_mm, trial_rows, aim_lag=aim_lag, mask_runs=mask_runs, mask_above_mm=mask_above_mm
+            )
         except NoFunnelCloseError:
             deferred.append((name, root, pairs))
             continue
@@ -505,7 +559,10 @@ def build_relabelled_view(
             )
         funnel_offset = np.median(np.asarray(measured, dtype=np.float64), axis=0) / 1000.0
         for name, root, pairs in deferred:
-            per_source[name] = relabel_source(root, horizon, max_height_mm, trial_rows, funnel_offset)
+            per_source[name] = relabel_source(
+                root, horizon, max_height_mm, trial_rows, funnel_offset, aim_lag=aim_lag,
+                mask_runs=mask_runs, mask_above_mm=mask_above_mm,
+            )
             _add(name, pairs)
     missing = [name for name in view_eps_by_source if name not in by_name]
     if not indices:
@@ -561,6 +618,9 @@ def build_relabelled_view(
         "holdout_named_view_episodes": named,
         "close_wait_steps": EXPERT_CLOSE_WAIT_STEPS,
         "post_close_steps": EXPERT_POST_CLOSE_STEPS,
+        "label_aim_lag_mm": None if aim_lag is None else [round(float(v) * 1000.0, 2) for v in np.asarray(aim_lag)[:2]],
+        "mask_runs": None if not mask_runs else sorted(mask_runs),
+        "mask_above_mm": mask_above_mm,
     }
     manifest["repo_id"] = f"local/{out_root.name}"
     manifest["action_overrides"] = report
@@ -594,7 +654,21 @@ def main() -> None:
                         help="a grasp-loop run's JSONL (outputs/analysis/grasp_loop/grasp_*.jsonl); required "
                         "for sources with arm-A (policy-only) episodes, whose peg comes from the row, and "
                         "what marks a kept miss as one")
+    parser.add_argument("--aim-lag-mm", default=None,
+                        help="'x,y': aim the labels' xy at the peg + this command lag (the policy's on-the-move "
+                        "close lag, ~0.9,-0.6) instead of the funnel's settled one (~3.8,-1.8). Default: the funnel's")
+    parser.add_argument("--mask-run", action="append", default=[],
+                        help="a grasp-loop run (its rows file's stem, e.g. grasp_20261028_113314; repeatable) whose "
+                        "episodes get no supervision above --mask-above-mm")
+    parser.add_argument("--mask-above-mm", type=float, default=None)
     args = parser.parse_args()
+    if bool(args.mask_run) != (args.mask_above_mm is not None):
+        parser.error("--mask-run and --mask-above-mm go together")
+    if unknown := sorted(set(args.mask_run) - {Path(p).stem for p in args.trial_rows}):
+        parser.error(f"--mask-run {unknown} is not among the --trial-rows files")
+    aim_lag = None if args.aim_lag_mm is None else np.array([float(v) for v in args.aim_lag_mm.split(",")]) / 1000.0
+    if aim_lag is not None and aim_lag.shape != (2,):
+        parser.error("--aim-lag-mm takes 'x,y'")
     report = build_relabelled_view(
         args.view_root,
         args.source_root,
@@ -606,6 +680,9 @@ def main() -> None:
         seed=args.seed,
         trial_rows=load_trial_rows(args.trial_rows),
         holdout_named=args.holdout_view_episodes,
+        aim_lag=aim_lag,
+        mask_runs=set(args.mask_run) or None,
+        mask_above_mm=args.mask_above_mm,
     )
     print(json.dumps(report, indent=2))
 
