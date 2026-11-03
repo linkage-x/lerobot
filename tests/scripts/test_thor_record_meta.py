@@ -381,6 +381,38 @@ def test_an_ordinary_capture_declares_no_intent_at_all(tmp_path: Path) -> None:
     assert "capture_intent" not in meta
 
 
+def test_the_6d_zero_each_box_ran_under_is_written_into_the_episode_meta(tmp_path: Path) -> None:
+    # The zero usually happens before the episode; without its attitude the bias it leaves in
+    # fxyz_mxyz cannot be undone offline (box_six_d.zero_bias).
+    thor_record = _load_thor_record_module()
+    thor_record._SIX_D_ZEROS.clear()
+    ctx = {"fxyz_mxyz": [0.1, 0.2, -7.7, -0.18, 0.0, 0.0], "acc_g": [-0.99, 0.09, 0.02],
+           "samples": 15, "wall_s": 1793677000.0, "device_id": 3969377039}
+    thor_record._note_six_d_zero({"box_id": "box3969377039", "ok": True, "method": "cali_6d_force_sensor",
+                                  "zero_context": ctx}, origin=False)
+    # a failed run changes nothing; an origin run without a context still marks the BOX
+    thor_record._note_six_d_zero({"box_id": "box3969377039", "ok": False, "zero_context": None}, origin=False)
+    thor_record._note_six_d_zero({"box_id": "box3100715645", "ok": True, "zero_context": None}, origin=True)
+
+    meta_path = thor_record._write_episode_meta(
+        _minimal_handle(tmp_path), _recorder_config(tmp_path), locked=[6], argus_failed=[],
+        connect_stream_errors=[], box_cfg=bc.BoxFleetConfig(enabled=True),
+        box_snapshots=[{"sensors": {"box3906437858/box_imu": {}, "box_imu": {}}}],
+        stop_reason="save", wallclock_start_utc="2026-11-03T00:00:00+00:00",
+        wallclock_end_utc="2026-11-03T00:00:30+00:00", world_frame={"status": "ok"},
+    )
+    meta = json.loads(meta_path.read_text())
+    thor_record._SIX_D_ZEROS.clear()
+
+    zeros = meta["box_six_d_zero"]
+    assert zeros["3969377039"]["kind"] == "software"
+    assert zeros["3969377039"]["acc_g"] == [-0.99, 0.09, 0.02]
+    assert zeros["3100715645"]["kind"] == "origin"
+    assert meta["box_devices"]["3969377039"] == {"role": "handheld", "hand": "left"}
+    assert meta["box_devices"]["3906437858"] == {"role": "handheld", "hand": "right"}
+    assert meta["box_devices"]["3100715645"] == {"role": "fr3_gripper"}
+
+
 # ---------------------------------------------------------------------------
 # Pruning the cameras a sweep was not for, once the sync gate is done with them
 

@@ -89,6 +89,7 @@ from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
 from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
+from tools.thor.gmsl2 import box_six_d  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -375,6 +376,46 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
 # up threads on a blocked SDK.
 _CALI_LOCK = threading.Lock()
 
+# The last 6D zero of each BOX in this recorder process, keyed by device id. A software zero leaves
+# a bias in fxyz_mxyz that depends on the attitude it ran at (box_six_d.zero_bias); the zero usually
+# happens before the episode, so every episode's meta.json carries the record it was recorded under.
+# An origin calibration is recorded too, as kind "origin": the readings after it are unusable for
+# compensation until the next software zero replaces it.
+_SIX_D_ZEROS: dict[str, dict[str, Any]] = {}
+_SIX_D_ZEROS_LOCK = threading.Lock()
+_BOX_LABEL_ID_RE = re.compile(r"^box(\d+)$")
+
+
+def _note_six_d_zero(res: dict[str, Any], *, origin: bool) -> None:
+    if not res.get("ok"):
+        return
+    ctx = dict(res.get("zero_context") or {})
+    did = ctx.get("device_id")
+    if did is None:
+        m = _BOX_LABEL_ID_RE.match(str(res.get("box_id") or ""))
+        did = int(m.group(1)) if m else None
+    key = str(int(did)) if did is not None else (res.get("box_id") or "box")
+    record = {"kind": "origin" if origin else "software", "method": res.get("method"), **ctx}
+    record.setdefault("wall_s", time.time())
+    with _SIX_D_ZEROS_LOCK:
+        _SIX_D_ZEROS[key] = record
+
+
+def _six_d_zeros_snapshot() -> dict[str, dict[str, Any]]:
+    with _SIX_D_ZEROS_LOCK:
+        return json.loads(json.dumps(_SIX_D_ZEROS))
+
+
+def _box_device_ids(box_snapshots: list[dict[str, Any]], zeros: dict[str, Any]) -> list[int]:
+    """BOX ids an episode saw: ``box<id>/`` sensor prefixes (several BOXes) plus the zeroed ones."""
+    ids = {int(k) for k in zeros if k.isdigit()}
+    for snap in box_snapshots:
+        for sid in (snap.get("sensors") or {}) if isinstance(snap, dict) else ():
+            m = _BOX_LABEL_ID_RE.match(str(sid).split("/", 1)[0])
+            if m and "/" in str(sid):
+                ids.add(int(m.group(1)))
+    return sorted(ids)
+
 
 def _run_six_d_force_cali(
     box: bc.BoxPool, *, origin: bool = False, box_id: str = ""
@@ -406,6 +447,7 @@ def _run_six_d_force_cali(
         ok_all = bool(results)
         for res in results:
             label = res.get("box_id") or "box"
+            _note_six_d_zero(res, origin=origin)
             if res.get("ok"):
                 _emit(
                     f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
@@ -1050,6 +1092,19 @@ def _write_episode_meta(
             "config": asdict(box_cfg),
             "snapshots": box_snapshots,
         }
+        # The 6D zero each BOX was recorded under (attitude + reading), so the external wrench can be
+        # recomputed offline with a per-BOX payload model (box_six_d.compensate_episode). Absent =
+        # no 6D zero in this recorder process since Connect.
+        zeros = _six_d_zeros_snapshot()
+        if zeros:
+            meta["box_six_d_zero"] = zeros
+        try:
+            roles = box_six_d.box_roles(box_six_d.load_registry(), _box_device_ids(box_snapshots, zeros))
+        except (OSError, ValueError) as exc:
+            logger.warning("BOX registry unreadable (%s); meta has no box_devices", exc)
+            roles = {}
+        if roles:
+            meta["box_devices"] = roles
     if capture_intent:
         # Why this episode was recorded, as declared by whoever asked for it
         # (the calibration wizard names the camera whose sweep this is). Like

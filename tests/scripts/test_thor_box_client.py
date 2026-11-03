@@ -505,8 +505,9 @@ def _force_box_factory(
     *,
     with_cali,
     with_origin=False,
+    acc=None,
 ):
-    """Fake Box that publishes a 6D force sample; optionally exposes cali()."""
+    """Fake Box that publishes a 6D force sample (and an IMU one with ``acc``); optionally exposes cali()."""
     calls: list[str] = []
 
     class _Box(_FakeBox):
@@ -525,7 +526,10 @@ def _force_box_factory(
         b.snaps.append(
             _SensorCache(
                 valid=1,
-                data=_AllSensor(six_d_force_data=_SixD(timestamp=7, data=tuple(force))),
+                data=_AllSensor(
+                    six_d_force_data=_SixD(timestamp=7, data=tuple(force)),
+                    imu_data=_Imu(timestamp=8, acc=tuple(acc)) if acc is not None else _Imu(),
+                ),
             ),
         )
         return b
@@ -650,6 +654,24 @@ def test_calibrate_six_d_force_invokes_sdk_and_reports_before_after(fake_box_mod
     assert result["error"] is None
     assert result["before"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert result["after"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_calibrate_six_d_force_reports_the_attitude_it_zeroed_at(fake_box_module):
+    # The offline payload model needs the attitude of the zero to undo the bias it leaves.
+    fake_box_module.Box, _ = _force_box_factory(with_cali=True, acc=(-0.99, 0.1, 0.02))
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01))
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        ctx = client.calibrate_six_d_force()["zero_context"]
+    finally:
+        client.stop()
+
+    assert ctx["fxyz_mxyz"] == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert ctx["acc_g"] == pytest.approx([-0.99, 0.1, 0.02])
+    assert ctx["samples"] >= 2
+    assert ctx["wall_s"] > 0
 
 
 def test_calibrate_six_d_force_origin_invokes_origin_sdk_method(fake_box_module):

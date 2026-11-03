@@ -1,0 +1,50 @@
+{
+  "schema": "box_devices/v1",
+  "note": "One entry per BOX, keyed by device_id (all three report sn box_collection_controller_000001; the id is the only thing that tells them apart, and the v4.1 firmware renumbered every BOX on 10-31, so a renumbering must be redone here). role: handheld (hand = the operator's hand it is held in) or fr3_gripper (which arm it is on lives in tools/fr3/fr3_arms.json, not here). six_d_payload: what the 6D sensor carries, one record per end-effector configuration, the latest valid_from_unix not after a sample applies; K (6x3, N and N*m per g of IMU acc_g) comes from `python -m tools.thor.gmsl2.box_six_d fit` on a free-air rotation (6 faces, 2-3 s each). Mounting or removing anything on the payload side of the sensor (gripper, brackets, cube) starts a new record: add one with K null and the time of the change, so the old fit is not applied to the new load, and fit again. See tools/thor/gmsl2/box_six_d.py for why the SDK's no_gravity is not used.",
+  "devices": {
+    "3969377039": {
+      "role": "handheld",
+      "hand": "left",
+      "ip_seen": "192.168.1.222",
+      "identified": "2026-11-03 on the rig: trigger and pad presses on the left-hand collector",
+      "six_d_payload": [
+        {
+          "valid_from_unix": 1793677826,
+          "valid_from": "2026-11-03 11:50:26 +08:00 (the fit; the configuration is older, when it started is not recorded)",
+          "end_effector": "gripper after the 11 swap + the structural parts, no cube",
+          "model": "affine_acc/v1",
+          "K": [
+            [0.00041, 5.14101, 0.02142],
+            [0.03398, 0.38227, -4.32314],
+            [5.22456, -0.15051, 0.21271],
+            [0.01156, -0.00107, 0.29881],
+            [-0.00034, 0.2869, -0.00163],
+            [-4e-05, -0.01182, -0.00143]
+          ],
+          "status": "provisional: one session, the z- face (IMU z down) was not held",
+          "fit": {
+            "log": "11-03 session scratchpad live_pose.log, 11:50:26-11:51:15, gateway preview at ~10 Hz, held by the body, gripper in free air",
+            "n_static": 244,
+            "attitudes": {"x+": 52, "x-": 59, "y+": 33, "y-": 46, "z+": 54},
+            "heldout_worst_force_N": 0.256,
+            "heldout_worst_moment_Nm": 0.009,
+            "rigid_reading": {"mass_kg": 0.4997, "axis_gain_kg": [0.5406, 0.5217, 0.4369], "com_in_ft_m": [0.0001, 0.0025, 0.0611], "vs_box_sdk_conf": "R_ft_imu 177.5 deg from the conf's (about FT z); conf mass 0.7935 kg, CoM (0, 0.0217, 0.0565)"}
+          }
+        }
+      ]
+    },
+    "3906437858": {
+      "role": "handheld",
+      "hand": "right",
+      "ip_seen": "192.168.1.150",
+      "identified": "2026-11-03 on the rig, by elimination against 3969377039; 1819152274 before the v4.1 firmware",
+      "six_d_payload": []
+    },
+    "3100715645": {
+      "role": "fr3_gripper",
+      "ip_seen": "192.168.1.207",
+      "identified": "596523097 before the v4.1 firmware; on the right FR3 since 11-02 (fr3_arms.json)",
+      "six_d_payload": []
+    }
+  }
+}
