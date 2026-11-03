@@ -283,6 +283,42 @@ def test_cli_apply_replace_writes_the_graph(tmp_path: Path) -> None:
     assert not (tmp_path / (wp.WORLD_GRAPH_FILE + ".tmp")).exists()
 
 
+def test_retire_keeps_the_edge_and_lets_a_new_one_in(tmp_path: Path) -> None:
+    graph = reg.apply_report(_report(), {"nodes": [{"world_frame_id": "world_a"}], "edges": []})
+    with pytest.raises(ValueError, match="--reason"):
+        reg.retire_edges(graph, "world_a", "fr3_base", reason="  ")
+    with pytest.raises(ValueError, match="no live edge"):
+        reg.retire_edges(graph, "world_a", "fr3_base_right", reason="moved")
+
+    retired = reg.retire_edges(graph, "fr3_base", "world_a", reason="base moved", utc="2026-11-03T08:00:00Z")
+    assert retired["edges"][0][wp.RETIRED_KEY] == {"utc": "2026-11-03T08:00:00Z", "reason": "base moved"}
+    assert retired["edges"][0]["T_to_from"] == graph["edges"][0]["T_to_from"]  # the record stays whole
+    assert wp.edge_retired(graph["edges"][0]) is None  # the input is not mutated
+    assert wp.world_transform(retired, "world_a", "fr3_base") is None
+    with pytest.raises(ValueError, match="no live edge"):
+        reg.retire_edges(retired, "world_a", "fr3_base", reason="again")
+
+    # re-registering the base after the move is a plain apply; --replace files the old one under supersedes
+    fresh = reg.apply_report(_shifted(0.7), retired)
+    assert wp.world_transform(fresh, "world_a", "fr3_base")[0][0][3] == pytest.approx(0.7)
+    replaced = reg.apply_report(_shifted(0.9), retired, replace=True)
+    assert len(replaced["edges"]) == 1
+    assert replaced["edges"][0]["supersedes"][0][wp.RETIRED_KEY]["reason"] == "base moved"
+
+
+def test_cli_retire_writes_the_graph(tmp_path: Path, capsys) -> None:
+    (tmp_path / wp.WORLD_GRAPH_FILE).write_text(
+        json.dumps(reg.apply_report(_report(), {"nodes": [{"world_frame_id": "world_a"}], "edges": []}))
+    )
+    args = ["--world-dir", str(tmp_path), "retire", "--from-world", "world_a"]
+    assert reg.main([*args, "--reason", ""]) == 1
+    assert reg.main([*args, "--reason", "both bases moved"]) == 0
+    assert "retired" in capsys.readouterr().out
+    graph = json.loads((tmp_path / wp.WORLD_GRAPH_FILE).read_text())
+    assert graph["edges"][0][wp.RETIRED_KEY]["reason"] == "both bases moved"
+    assert reg.main([*args, "--reason", "again"]) == 1  # nothing live left to retire
+
+
 # --- laser edge: station (world <- tracker) @ FR3 FK fit (tracker <- base) ---
 
 

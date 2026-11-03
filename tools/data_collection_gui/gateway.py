@@ -3948,10 +3948,22 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         graph = wp.read_world_graph(repo)
     except RuntimeError as exc:
         graph, error = {}, str(exc)
-    direct = [
+    touching = [
         edge
         for edge in graph.get("edges") or []
         if wp.FR3_BASE_WORLD_ID in (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
+    ]
+    # A retired edge is a record of where the base was, not the live edge: nothing routes through it.
+    direct = [edge for edge in touching if wp.edge_retired(edge) is None]
+    retired = [
+        {
+            "label": _edge_label(edge),
+            "createdUtc": edge.get("created_utc", ""),
+            "retiredUtc": str((wp.edge_retired(edge) or {}).get("utc") or ""),
+            "reason": str((wp.edge_retired(edge) or {}).get("reason") or ""),
+        }
+        for edge in touching
+        if wp.edge_retired(edge) is not None
     ]
     current: dict[str, Any] | None = None
     T_current: list[list[float]] | None = None
@@ -4057,6 +4069,7 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         "error": error,
         "referenceWorld": reference_id,
         "current": current,
+        "retired": retired,
         "runs": runs,
         "candidates": candidates,
         "runsRoot": str(_P0_RUNS_SUBDIR),
@@ -11202,10 +11215,11 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
             continue
         found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
         if found is None:
+            retired = wp.retired_note(graph, world, wp.FR3_BASE_WORLD_ID)
             raise RuntimeError(
                 f"episode {index} was recorded in {world} and no registration edge in "
                 f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {wp.FR3_BASE_WORLD_ID}; "
-                "its poses cannot be given to the FR3"
+                "its poses cannot be given to the FR3" + (f"\n{retired}" if retired else "")
             )
         transforms[index] = found[0]
         routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}

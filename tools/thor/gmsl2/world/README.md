@@ -114,6 +114,19 @@ FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
 `register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between
 worlds that are already connected.
 
+**Retired 2026-11-03.** Both FR3 bases were moved after the edge was solved
+(confirmed 10-26; the day of the move is unknown), so the 10-15 edge is kept in
+`world_graph.json` under `"retired": {utc, reason}` and nothing routes through
+it: `export_v3 --target-world auto` (the GUI) keeps the camera world and prints
+the reason, `--target-world fr3_base`, the MuJoCo/IK/real replay and the
+pseudo-bimanual builder refuse with it, and training on a dataset exported
+through it warns. It is retired outright rather than by recording date: poses
+are put in a base for the arm to run them where it stands *now*, which is not
+where the edge says, whenever the demo was recorded. `register_fr3_base.py
+retire --from-world <world> --reason "<what moved>"` retires an edge; at the
+final placement re-register and `apply` the new edge (`--replace` files the
+retired one under its `supersedes`).
+
 ### The table datum (`table_datum.json`, 2026-10-27)
 
 Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are

@@ -1494,11 +1494,11 @@ def export_task_to_v3(
     # deployment skip guessing that transform from one start pose. Without an edge
     # the recorded world is kept -- the stamp below says so, and deployment falls
     # back to start-pose alignment on any dataset not stamped fr3_base.
+    world_graph = wp.read_world_graph(_REPO_ROOT)
     if target_world == wp.TARGET_WORLD_AUTO:
         reachable = bool(world_frame_id) and (
             world_frame_id == wp.FR3_BASE_WORLD_ID
-            or wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, wp.FR3_BASE_WORLD_ID)
-            is not None
+            or wp.world_transform(world_graph, world_frame_id, wp.FR3_BASE_WORLD_ID) is not None
         )
         target_world = wp.FR3_BASE_WORLD_ID if reachable else None
         if not reachable:
@@ -1506,6 +1506,9 @@ def export_task_to_v3(
                 f"No registration edge reaches {wp.FR3_BASE_WORLD_ID} from "
                 f"{world_frame_id or 'unstamped episodes'}; keeping the recorded world"
             )
+            retired = wp.retired_note(world_graph, wp.FR3_BASE_WORLD_ID)
+            if retired:
+                _emit(f"WARNING: {retired}")
 
     output_world_frame = source_world_frame
     T_target_source: list[list[float]] | None = None
@@ -1514,11 +1517,12 @@ def export_task_to_v3(
             raise RuntimeError(
                 f"cannot re-express in {target_world}: the source episodes carry no world frame id"
             )
-        found = wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, target_world)
+        found = wp.world_transform(world_graph, world_frame_id, target_world)
         if found is None:
+            retired = wp.retired_note(world_graph, world_frame_id, target_world)
             raise RuntimeError(
                 f"no registration edge connects {world_frame_id} to {target_world} in "
-                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}"
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}" + (f"\n{retired}" if retired else "")
             )
         T_target_source, edges_used = found
         output_world_frame = wp.reexpressed_world_frame(

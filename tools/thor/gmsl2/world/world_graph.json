@@ -405,7 +405,11 @@
           ],
           "superseded_utc": "2026-10-15T03:08:47Z"
         }
-      ]
+      ],
+      "retired": {
+        "utc": "2026-11-03T08:13:42Z",
+        "reason": "Both FR3 bases were moved after this edge was solved (user confirmed 2026-10-26 evening; the exact day of the move is unknown): 192.168.11.102 (this edge's arm, now 'left') and the new arm 192.168.1.210 are on carts and not yet at their final placement. ball_check_20261015T030840Z no longer describes where the arm stands; re-register the base at its final placement (ball check / P0) and apply the new edge."
+      }
     }
   ]
 }

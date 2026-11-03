@@ -65,7 +65,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
   };
 
   const current = payload?.current ?? null;
-  const warnings = payload ? liveEdgeWarnings(current, payload.referenceWorld) : [];
+  const warnings = payload ? liveEdgeWarnings(current, payload.referenceWorld, payload.retired ?? []) : [];
   const spread = payload ? candidateSpread(payload.candidates) : null;
   const disabled = busy || running !== "";
   const stations = payload?.stations ?? [];

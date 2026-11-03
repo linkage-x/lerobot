@@ -377,6 +377,44 @@ def test_unconnected_worlds_have_no_transform_not_an_identity() -> None:
     assert wp.world_transform({"edges": []}, "a", "b") is None
 
 
+def test_a_retired_edge_connects_nothing_and_says_why() -> None:
+    # 10-15 world -> fr3_base edge; both bases moved by 10-26. Data re-expressed in a base is for the arm
+    # where it stands now, so the old edge must not route anything -- whenever the data was recorded.
+    retired = {**_edge("a", "fr3_base", _rz(10)), "created_utc": "2026-10-15T03:08:47Z",
+               wp.RETIRED_KEY: {"utc": "2026-11-03T08:00:00Z", "reason": "both FR3 bases moved"}}
+    graph = {"edges": [retired]}
+    assert wp.world_transform(graph, "a", "fr3_base") is None
+    assert wp.world_closures(graph, "a", "fr3_base") == []
+    assert wp.live_edges(graph) == []
+    note = wp.retired_note(graph, "fr3_base")
+    assert note == "edge a -> fr3_base (solved 2026-10-15T03:08:47Z) retired 2026-11-03T08:00:00Z: both FR3 bases moved"
+    assert wp.retired_note(graph, "elsewhere") == ""
+    # a live edge added beside it is the one used, and no closure is checked against the retired one
+    graph["edges"].append(_edge("a", "fr3_base", _rz(-20)))
+    transform, hops = wp.world_transform(graph, "a", "fr3_base")
+    assert transform == _rz(-20)
+    assert len(hops) == 1
+    # a retired edge's matrix is not even parsed: it is a record, not an input
+    assert wp.world_transform({"edges": [{**retired, "T_to_from": "garbage"}]}, "a", "fr3_base") is None
+
+
+def test_the_checked_in_fr3_base_edge_is_retired() -> None:
+    # Both bases moved (confirmed 2026-10-26); until the base is registered again, nothing may be
+    # re-expressed in fr3_base. Replace this test when a new edge is applied.
+    # The FR3 base enters as an edge, not as a redefinition of the world: the reference keeps naming
+    # the camera island, and the base stays a node of the graph while its edge is retired.
+    repo = Path(__file__).resolve().parents[2]
+    graph = wp.read_world_graph(repo)
+    world = wp.read_world_provenance(repo)["world_frame_id"]
+    assert wp.FR3_BASE_WORLD_ID in {node["world_frame_id"] for node in graph["nodes"]}
+    found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
+    if found is None:
+        assert f"{world} -> {wp.FR3_BASE_WORLD_ID} (solved 2026-10-15T03:08:47Z) retired" in wp.retired_note(graph)
+    else:
+        assert found[1][-1]["to_world_frame_id"] == wp.FR3_BASE_WORLD_ID
+        assert "2026-10-15T03:08:47Z" not in [hop["created_utc"] for hop in found[1]], "predates the base move"
+
+
 def test_a_non_rigid_edge_is_refused() -> None:
     bad = _rz(10)
     bad[0][0] *= 1.01
@@ -483,17 +521,6 @@ def test_transform_pose7_matches_the_matrix_product() -> None:
         assert np.allclose(mat(out), np.asarray(T) @ mat(pose), atol=1e-12)
     nan_pose = [float("nan")] * 7
     assert all(v != v for v in wp.transform_pose7(_rz(10), nan_pose))
-
-
-def test_repo_graph_reaches_the_fr3_base_from_the_current_world() -> None:
-    # The FR3 base enters as an edge, not as a redefinition of the world: the
-    # reference keeps naming the camera island and the graph says how to get out.
-    repo = Path(__file__).resolve().parents[2]
-    block = wp.read_world_provenance(repo)
-    found = wp.world_transform(wp.read_world_graph(repo), block["world_frame_id"], "fr3_base")
-    assert found is not None
-    T, path = found
-    assert path and path[-1]["to_world_frame_id"] == "fr3_base"
 
 
 def test_reexpress_pose_csv_moves_every_pose_group_by_its_episode(tmp_path):

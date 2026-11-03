@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from tools.thor.gmsl2 import label_provenance as lp
+from tools.thor.gmsl2 import label_provenance as lp, world_provenance as wp
 
 _T = [[1.0, 0.0, 0.0, 0.1], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 
@@ -98,6 +100,24 @@ def test_warnings_name_stale_cameras_and_a_superseded_edge():
     assert any("camera state stale" in w for w in warnings)
     assert any("created 2026-10-14T09:17:42Z; now 2026-10-15T03:08:47Z" in w for w in warnings)
     assert lp.label_warnings(lp.dataset_key(_fr3_world(_T, "x"), {"s": _session()}), None) == []
+
+
+def test_an_export_through_a_retired_edge_is_told_to_re_register(tmp_path):
+    world = _fr3_world(_T, "2026-10-15T03:08:47Z")
+    source = wp.world_frame_id_of(world["reexpressed_from"])
+    graph_path = tmp_path / wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE
+    graph_path.parent.mkdir(parents=True)
+    edge = {"from_world_frame_id": source, "to_world_frame_id": "fr3_base", "T_to_from": _T,
+            "created_utc": "2026-10-15T03:08:47Z"}
+    graph_path.write_text(json.dumps({"edges": [{**edge, "retired": {"utc": "u", "reason": "bases moved"}}]}))
+
+    current = lp.current_edge_key(tmp_path, world)
+    assert "bases moved" in current["retired"]
+    warnings = lp.label_warnings(lp.dataset_key(world, {"s": _session()}), current)
+    assert len(warnings) == 1 and "since retired" in warnings[0] and "bases moved" in warnings[0]
+
+    graph_path.write_text(json.dumps({"edges": []}))  # never had an edge: nothing to say
+    assert lp.current_edge_key(tmp_path, world) is None
 
 
 _BUNDLE_0929 = "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/marker_to_tcp_calibration_20260929.json"

@@ -520,10 +520,55 @@ def world_closures(graph: Mapping[str, Any], from_world: str, to_world: str) -> 
     return _resolve(graph, from_world, to_world)[2]
 
 
+#: Key of an edge that no longer describes the hardware: ``{"utc", "reason"}``.
+RETIRED_KEY = "retired"
+
+
+def edge_retired(edge: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The edge's retirement record, or ``None`` while it is live.
+
+    An edge measures a physical relation (a base where it stood, cameras where they hung). When that
+    hardware moves, the edge is kept -- it was measured once and cannot be re-measured for the old
+    placement -- but marked retired. A retired edge is not walked by :func:`world_transform`, so nothing
+    is re-expressed through it: data is re-expressed in a base to be replayed on the arm *now*, and the
+    arm is no longer where the edge says. Re-measuring adds a new edge (``register_fr3_base apply``).
+    """
+    record = edge.get(RETIRED_KEY)
+    if record is None or record is False:
+        return None
+    return record if isinstance(record, Mapping) else {"utc": "", "reason": str(record)}
+
+
+def live_edges(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The edges routes may use: every edge that is not :func:`edge_retired`."""
+    return [edge for edge in graph.get("edges") or [] if edge_retired(edge) is None]
+
+
+def retired_note(graph: Mapping[str, Any], *worlds: str) -> str:
+    """One line per retired edge touching any of ``worlds`` (all retired edges if none given), or ``""``.
+
+    For the message of a caller that found no route: "no edge" and "the edge was retired because the base
+    moved" ask for the same fix but are different news.
+    """
+    lines = []
+    for edge in graph.get("edges") or []:
+        record = edge_retired(edge)
+        if record is None:
+            continue
+        ends = (str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or ""))
+        if worlds and not set(worlds) & set(ends):
+            continue
+        lines.append(
+            f"edge {ends[0]} -> {ends[1]} (solved {edge.get('created_utc') or '?'}) retired "
+            f"{record.get('utc') or '?'}: {record.get('reason') or 'no reason recorded'}"
+        )
+    return "\n".join(lines)
+
+
 def _resolve(
     graph: Mapping[str, Any], from_world: str, to_world: str
 ) -> tuple[list[list[float]] | None, list[dict[str, Any]], list[dict[str, Any]]]:
-    edges = list(graph.get("edges") or [])
+    edges = live_edges(graph)
     matrices = [
         _checked_rigid(
             edge.get("T_to_from"),
@@ -567,7 +612,8 @@ def world_transform(
 ) -> tuple[list[list[float]], list[dict[str, Any]]] | None:
     """``(T_to_from, edges_used)``, or ``None`` when the worlds are not connected.
 
-    Over the edges in both directions, as ``metrology.world_frame.WorldGraph.transform``.  ``None`` is
+    Retired edges (:func:`edge_retired`) do not connect anything; :func:`retired_note` says which were
+    left out. Over the live edges in both directions, as ``metrology.world_frame.WorldGraph.transform``.  ``None`` is
     the honest answer for two islands; a caller must refuse rather than substitute an identity.
     ``edges_used`` is each traversed edge's provenance (endpoints, method, created_utc, and whether it was
     walked backwards), for the record a re-expressed dataset carries about itself.

@@ -71,9 +71,21 @@ export function liveEdgeSummary(current: Current | null): string {
 }
 
 /** What is wrong with the live edge itself, worded as what it does to the FR3. */
-export function liveEdgeWarnings(current: Current | null, referenceWorld: string): string[] {
+export function liveEdgeWarnings(
+  current: Current | null,
+  referenceWorld: string,
+  retired: NonNullable<Fr3BaseEdgeResponse["retired"]> = []
+): string[] {
+  const retiredLines = retired.map(
+    (r) => `已停用的边 ${r.label || "—"}（${r.createdUtc || "—"} 解出，${r.retiredUtc || "—"} 停用）：${r.reason || "未写原因"}`
+  );
   if (!current) {
-    return ["world_graph.json 里没有到 fr3_base 的边：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝。"];
+    return [
+      retired.length
+        ? "到 fr3_base 的边已停用（底座挪过）：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝，GUI 导出保留相机世界系；需要在臂的新位置重新注册。"
+        : "world_graph.json 里没有到 fr3_base 的边：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝。",
+      ...retiredLines,
+    ];
   }
   const warnings: string[] = [];
   if (!current.fromReferenceWorld) {

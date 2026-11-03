@@ -1440,6 +1440,8 @@ export type Fr3BaseEdgeResponse = {
     edgeCount: number;
     quality: Fr3BaseEdgeQuality;
   } | null;
+  /** Edges to fr3_base kept as a record of an old base placement; nothing routes through them. */
+  retired?: { label: string; createdUtc: string; retiredUtc: string; reason: string }[];
   runs: {
     name: string;
     captures: number;

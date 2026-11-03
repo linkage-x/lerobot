@@ -441,7 +441,12 @@ def label_warnings(key: Mapping[str, Any], current_edge: Any = None) -> list[str
             f"camera state {', '.join(states)}: the extrinsics did not fit the cameras when these were "
             "recorded (corner BA > 1 px); absolute labels are off by millimetres"
         )
-    if key.get("edge") is not None and current_edge is not None and _canonical(key["edge"]) != _canonical(current_edge):
+    if key.get("edge") is not None and isinstance(current_edge, Mapping) and "retired" in current_edge:
+        warnings.append(
+            "exported through an edge world_graph.json has since retired; these labels are in a base "
+            f"placement the arm has left -- re-register the base and re-export:\n{current_edge['retired']}"
+        )
+    elif key.get("edge") is not None and current_edge is not None and _canonical(key["edge"]) != _canonical(current_edge):
         exported = ", ".join(hop[2] for hop in key["edge"].get("edges") or []) or "?"
         current = ", ".join(hop[2] for hop in current_edge.get("edges") or []) or "?"
         warnings.append(
@@ -452,14 +457,22 @@ def label_warnings(key: Mapping[str, Any], current_edge: Any = None) -> list[str
 
 
 def current_edge_key(repo_root: Path, world_frame: Mapping[str, Any] | None) -> Any:
-    """The edge key an export of this world would get from today's ``world_graph.json``."""
+    """The edge key an export of this world would get from today's ``world_graph.json``.
+
+    ``{"retired": note}`` when no live route is left but a retired edge between the two worlds is.
+    """
     if not isinstance(world_frame, Mapping) or not isinstance(world_frame.get("reexpressed_from"), Mapping):
         return None
     source = wp.world_frame_id_of(world_frame["reexpressed_from"])
     target = str(world_frame.get("world_frame_id") or "")
-    found = wp.world_transform(wp.read_world_graph(repo_root), source, target) if source else None
-    if found is None:
+    if not source:
         return None
+    graph = wp.read_world_graph(repo_root)
+    found = wp.world_transform(graph, source, target)
+    if found is None:
+        # The export's own route may be retired: say so instead of going quiet.
+        retired = wp.retired_note(graph, source, target)
+        return {"retired": retired} if retired else None
     matrix, edges = found
     return _edge_key({"reexpressed_from": {}, "T_target_source": matrix, "edges": edges})
 

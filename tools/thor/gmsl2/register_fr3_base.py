@@ -737,6 +737,41 @@ def _apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def retire_edges(graph: dict[str, Any], a: str, b: str, *, reason: str, utc: str | None = None) -> dict[str, Any]:
+    """Return ``graph`` with every live direct edge between ``a`` and ``b`` marked retired (stdlib).
+
+    For hardware that moved (a base re-placed): the edge stays as the record of the old placement, and
+    nothing routes through it any more (``world_provenance.edge_retired``). Refuses an empty reason --
+    the reason is what every refused export and replay will print -- and a pair with no live edge.
+    """
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("say why the edge no longer holds (--reason); every refused export prints it")
+    edges = list(graph.get("edges") or [])
+    targets = [i for i, edge in enumerate(edges) if _is_direct(edge, a, b) and wp.edge_retired(edge) is None]
+    if not targets:
+        raise ValueError(f"no live edge between {a} and {b} in the world graph")
+    record = {"utc": utc or _now_iso(), "reason": reason}
+    for index in targets:
+        edges[index] = {**edges[index], wp.RETIRED_KEY: record}
+    return {**graph, "edges": edges}
+
+
+def _retire(args: argparse.Namespace) -> int:
+    world_dir = (args.world_dir or _REPO_ROOT / wp.WORLD_SUBDIR).resolve()
+    graph_path = world_dir / wp.WORLD_GRAPH_FILE
+    graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.is_file() else {"version": 1}
+    try:
+        updated = retire_edges(graph, args.from_world, args.to_world, reason=args.reason)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    write_graph(graph_path, updated)
+    print(wp.retired_note(updated, args.from_world, args.to_world))
+    print(f"written to {graph_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--world-dir", type=Path, default=None, help="default: tools/thor/gmsl2/world")
@@ -777,8 +812,15 @@ def main(argv: list[str] | None = None) -> int:
         help="add the edge although its worlds are already connected: a second, independent route that must "
         "agree with the others within the edges' sigmas (roadmap B4b)",
     )
+    retire = sub.add_parser(
+        "retire",
+        help="mark the direct edge(s) between two worlds retired: kept as a record, no longer routed through",
+    )
+    retire.add_argument("--from-world", required=True)
+    retire.add_argument("--to-world", default=DEFAULT_TARGET_WORLD)
+    retire.add_argument("--reason", required=True, help="what moved; printed by every refused export and replay")
     args = parser.parse_args(argv)
-    return {"solve": _solve, "laser": _laser, "apply": _apply}[args.command](args)
+    return {"solve": _solve, "laser": _laser, "apply": _apply, "retire": _retire}[args.command](args)
 
 
 if __name__ == "__main__":

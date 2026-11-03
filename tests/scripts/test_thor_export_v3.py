@@ -922,6 +922,33 @@ def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_p
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
+def test_export_does_not_re_express_through_a_retired_edge(tmp_path, monkeypatch, capsys):
+    # Both FR3 bases moved after the 10-15 edge was solved: the GUI's auto export keeps the camera world
+    # and says why, and asking for fr3_base outright is refused with the same reason.
+    pytest.importorskip("pyarrow")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-10-15T03:08:47Z",
+            "retired": {"utc": "2026-11-03T08:00:00Z", "reason": "both FR3 bases moved"}}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
+    kwargs = {
+        "datasets_root": datasets,
+        "exports_root": exports,
+        "base_name": "pick_and_place",
+        "repo_id": "local/pick_and_place",
+        "task": "pick the cube",
+    }
+
+    with pytest.raises(RuntimeError, match="retired 2026-11-03T08:00:00Z: both FR3 bases moved"):
+        export_v3.export_task_to_v3(**kwargs, target_world="fr3_base")
+
+    out = export_v3.export_task_to_v3(**kwargs, target_world="auto")
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    printed = capsys.readouterr().out
+    assert "WARNING: edge world_a -> fr3_base (solved 2026-10-15T03:08:47Z) retired" in printed
+    assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
+
+
 # ------------------------------------------------------ label provenance ---
 
 
