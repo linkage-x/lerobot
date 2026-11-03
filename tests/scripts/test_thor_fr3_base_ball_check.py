@@ -382,4 +382,5 @@ def test_a_joint_fit_takes_its_arm_from_its_runs(tmp_path):
     path = tmp_path / "joint" / "j.json"
     assert bc.fit_robot_ip(joint, path) == "192.168.1.210"
     assert bc.fit_robot_ip({**joint, "runs": ["a_pivot.json", "c_pivot.json"]}, path) == ""  # mixed: unknown
+    assert bc.fit_robot_ip({**joint, "runs": ["a_pivot.json", "aborted_pivot.json"]}, path) == "192.168.1.210"
     assert bc.fit_robot_ip({"robot_ip": "192.168.11.102"}) == "192.168.11.102"

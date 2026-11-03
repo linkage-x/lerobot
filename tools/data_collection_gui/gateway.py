@@ -5121,10 +5121,9 @@ def _pivot_fit_robot_ip(fit: Path) -> str:
     own = str(report.get("robot_ip") or "")
     if own or not report.get("runs"):
         return own
-    ips = {
-        str((_read_json_file(fit.parent.parent / (str(run).removesuffix(".json") + ".fit.json")) or {}).get("robot_ip") or "")
-        for run in report.get("runs") or []
-    }
+    sibling_fits = [_read_json_file(fit.parent.parent / (str(run).removesuffix(".json") + ".fit.json")) for run in report.get("runs") or []]
+    # an aborted run has no fit of its own; the others say which arm
+    ips = {str(sibling.get("robot_ip") or "") for sibling in sibling_fits if sibling}
     return ips.pop() if len(ips) == 1 else ""
 
 

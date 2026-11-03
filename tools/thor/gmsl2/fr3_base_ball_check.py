@@ -221,7 +221,7 @@ def fit_robot_ip(fr3_fit: dict[str, Any], fit_path: Path | None = None) -> str:
         try:
             ips.add(str(json.loads(sibling.read_text(encoding="utf-8")).get("robot_ip") or ""))
         except (OSError, ValueError):
-            ips.add("")
+            continue  # an aborted run has no fit of its own; the others say which arm
     return ips.pop() if len(ips) == 1 else ""
 
 
