@@ -670,7 +670,7 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 | 239 | Paxini L5325 | 厂商 XYZ 坐标表 |
 | 9 | M2020 | 3×3，线缆在左，行优先编号 1–9 |
 
-- `_decode_touch()` 整帧透传，按长度打 `model` / `points`（不在 `TOUCH_MODELS` 里的长度记 `"unknown"`）并带 `touch_device_id`。同一 terminal 上的贴片按 `touch_device_id` 排序映射：最小的仍是 `box_touch_left` / `box_touch_right`，第二片是 `box_touch_left_1` / `box_touch_right_1`（11-02 的机器每指两片，id 0、1）；第三片丢弃并告警一次。第二片原样录进 `box_sensors.jsonl`；导出时只有该批 episode 里录到了第二片，才多出 `observation.touch.box_touch_*_1.*` 列（一片的数据 schema 不变）。它**不进** `observation.state`：`BOX_STATE_NAMES` 仍是每指一片的摘要。
+- `_decode_touch()` 整帧透传，按长度打 `model` / `points`（不在 `TOUCH_MODELS` 里的长度记 `"unknown"`）并带 `touch_device_id`。同一 terminal 上的贴片按 `touch_device_id` 排序映射：最小的仍是 `box_touch_left` / `box_touch_right`，第二片是 `box_touch_left_1` / `box_touch_right_1`（11-02 的机器每指两片，id 0、1；11-03 采集 BOX 3906437858 逐片按压确认：id 0＝靠指根那片、id 1＝靠指尖那片，两片互相独立、串扰 ≤0.3 N）；第三片丢弃并告警一次。第二片原样录进 `box_sensors.jsonl`；导出时只有该批 episode 里录到了第二片，才多出 `observation.touch.box_touch_*_1.*` 列（一片的数据 schema 不变）。它**不进** `observation.state`：`BOX_STATE_NAMES` 仍是每指一片的摘要。
 - `box_collection.touch_model` 不再影响数据：`auto` 取首帧型号，钉死的值只在帧型号不符时告警一次。
 - v4.0 及以前（历史数据）：所有贴片共用 239 槽定长数组，M2020 由 `fill_touch_from_m2020()` 只填槽 0–8，型号靠链路流 id 8/9 识别、识别前按 239 槽透传 —— 读旧数据时 `points`/`model` 标签依旧可信。
 - `_touch_summary()` 的 `mean_f{x,y,z}` 按**实际触点数**求平均。曾硬编码除以 239：M2020 下同样的物理接触，均值被稀释 239/9 ≈ 26.6 倍（实测 132514 数据集：`mean_fz` 0.435 → 11.556）。
