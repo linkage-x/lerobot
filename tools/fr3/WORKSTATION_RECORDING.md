@@ -4,6 +4,12 @@ Deploy chain: `bash run/deploy.sh workstation` syncs the repo to `hph@192.168.10
 restarts the gateway with `--profile workstation --config-path tools/fr3/fr3_record_config.yaml`,
 and serves the frontend at <http://localhost:5173/>.
 
+Historical tele recordings are archived on Dante under
+`outputs/backups/tele_human50_20261102/`. See the
+[2026-11-02 backup record](../../docs/fr3_tele_backup_20261102.md) for the original
+50 demonstrations, additional corrections and experiment records, checksums, and
+restore instructions. The archive also preserves the pre-repair gripper data.
+
 ## Recording
 
 **Live Record** page → pick a backend → **Connect** → **StartEpisode**.
