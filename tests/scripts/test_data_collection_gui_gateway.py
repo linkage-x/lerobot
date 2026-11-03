@@ -8998,6 +8998,40 @@ def test_a_right_arm_ball_check_is_run_against_the_right_arms_base(tmp_path, mon
     assert "混用了两台臂" in gateway._run_ball_check(state, {"positions": both})["error"]
 
 
+def test_the_world_graph_guard_is_recorded_at_start_shown_red_and_confirmed_on_the_page(tmp_path):
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _write_edge_candidate(state, "run_b__1.json", _shift_x(T_live, 0.003))
+    gateway._bootstrap_world_graph_guard(state)
+    assert guard.check(state.repo_root)["state"] == guard.OK
+    assert gateway._snapshot(state)["worldGraphGuard"]["state"] == "ok"
+
+    # someone's deploy replaces the graph: the live edge is gone, an older one is back
+    graph_path = state.repo_root / guard.GRAPH_FILE
+    graph = json.loads(graph_path.read_text())
+    graph["edges"][0]["created_utc"] = "2026-09-01T00:00:00Z"
+    graph_path.write_text(json.dumps(graph))
+
+    snap = gateway._snapshot(state)["worldGraphGuard"]
+    assert snap["state"] == "diverged" and len(snap["problems"]) == 2
+    payload = gateway._fr3_base_edge_payload(state)
+    assert payload["graphGuard"]["state"] == "diverged"
+    assert payload["current"]["world"] == "world_a"  # still shown: the panel is where it gets checked
+    # applying would trust the rest of the file too
+    refused = gateway._apply_fr3_base_edge(state, {"report": "run_b__1.json"})
+    assert not refused["ok"] and "不一致" in refused["error"]
+    gateway._bootstrap_world_graph_guard(state)  # a restart says it out loud, and does not re-record
+    assert any("不一致" in e.message for e in state.events) and guard.check(state.repo_root)["state"] == "diverged"
+
+    # confirming what the page showed; a list that is not what is on disk now is refused
+    assert "又变了" in gateway._accept_world_graph(state, {"problems": ["something else"]})["error"]
+    accepted = gateway._accept_world_graph(state, {"problems": snap["problems"]})
+    assert accepted["ok"] and accepted["graphGuard"]["state"] == "ok"
+    assert gateway._apply_fr3_base_edge(state, {"report": "run_b__1.json"})["ok"]
+    assert guard.check(state.repo_root)["reason"] == "applied run_b__1.json on the calibration page"
+
+
 def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
     import urllib.request

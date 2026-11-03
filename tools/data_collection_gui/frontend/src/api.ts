@@ -1,5 +1,6 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  WorldGraphGuard,
   CollectionTask,
   EpisodeAnnotation,
   CalibrationStatus,
@@ -93,6 +94,8 @@ export type GuiSnapshot = {
   trackerMountSession?: TrackerMountSession;
   markerTcp?: MarkerTcpSession;
   datasetExport: DatasetExportStatus;
+  /** world_graph.json against the graph this machine last trusted (outputs/world_graph_guard.json). */
+  worldGraphGuard?: WorldGraphGuard;
   recordedDatasets: RecordedDataset[];
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
@@ -1517,6 +1520,20 @@ export class DataCollectionGuiApi {
     positions: { pivot: string; dataset: string; episode: number }[]
   ): Promise<Fr3PivotResponse | null> {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/check", { positions });
+  }
+
+  /** Trust world_graph.json as it is now; ``problems`` is what the page showed (refused if it changed since). */
+  async acceptWorldGraph(problems: string[]): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/world-graph/accept`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ problems }),
+      });
+      return (await response.json()) as Fr3BaseEdgeResponse;
+    } catch {
+      return null;
+    }
   }
 
   /** fr3_base -> fr3_base_right from balls both arms pivoted about (B3), written as a candidate report. */

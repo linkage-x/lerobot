@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { graphGuardBlocks, graphGuardLines } from "./calibration/fr3BaseEdge";
 import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
@@ -383,6 +384,13 @@ function App() {
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
         </div>
       </header>
+      {graphGuardBlocks(snapshot.worldGraphGuard) ? (
+        <div className="command-error" role="alert">
+          {graphGuardLines(snapshot.worldGraphGuard).map((line, i) => (
+            <div key={i}>{i === 0 ? <b>{line}</b> : `· ${line}`}</div>
+          ))}
+        </div>
+      ) : null}
       {commandError ? (
         <div className="command-error" role="alert">
           <span>{commandError}</span>

@@ -18,6 +18,8 @@ import {
   candidateSpread,
   edgeEnds,
   fmtNum,
+  graphGuardBlocks,
+  graphGuardLines,
   laserSelectionWarnings,
   liveEdgeSummary,
   liveEdgeWarnings,
@@ -36,6 +38,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
   const [confirming, setConfirming] = useState<Candidate | null>(null);
+  const [trusting, setTrusting] = useState(false);
   const [stationName, setStationName] = useState("");
   const [replayPaths, setReplayPaths] = useState<string[]>([]);
 
@@ -103,6 +106,22 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
         <b>单 tag</b>——FR3 工具上的 tag36h11 id6 停在若干个位姿，基准世界系的相机<b>固定在原位不动</b>，一起拟合 T_world_base、T_tcp_tag 和 tag 尺度；
         <b>激光</b>——跟踪仪站位（world ← 跟踪仪）乘上 FR3 回放时 FK 对激光的拟合（跟踪仪 ← fr3_base），不经过 tag。
       </p>
+
+      {graphGuardBlocks(payload?.graphGuard) ? (
+        <div className="cali-result-box">
+          <div className="cali-result-box-head">
+            <b className="cali-warn">world_graph.json 不是受信版本</b>
+            <button className="cali-mini-btn" disabled={disabled} onClick={() => setTrusting(true)}>
+              核对无误，确认当前版本
+            </button>
+          </div>
+          {graphGuardLines(payload?.graphGuard).map((line) => (
+            <p className="cali-warn" key={line}>
+              {line}
+            </p>
+          ))}
+        </div>
+      ) : null}
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
@@ -338,6 +357,37 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
       {error ? <pre className="cali-warn">{error}</pre> : null}
       {output ? <pre className="marker-tcp-example">{output}</pre> : null}
 
+      {trusting && payload?.graphGuard ? (
+        <Modal
+          title="确认 world_graph.json 为受信版本"
+          onClose={() => setTrusting(false)}
+          footer={
+            <>
+              <button onClick={() => setTrusting(false)}>取消</button>
+              <button
+                className="cali-btn-primary"
+                onClick={() => {
+                  const problems = payload.graphGuard?.problems ?? [];
+                  setTrusting(false);
+                  void act("trust", () => api.acceptWorldGraph(problems));
+                }}
+              >
+                确认
+              </button>
+            </>
+          }
+        >
+          <p>与上次确认的版本相比：</p>
+          <ul>
+            {payload.graphGuard.problems.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+          <p className="cali-muted">
+            只有这些变化是你有意为之（例如刚部署了已提交的新边）才确认。若是有人用旧代码部署覆盖了它，先重新部署正确的版本，不要确认。
+          </p>
+        </Modal>
+      ) : null}
       {confirming ? (
         <Modal
           title="替换 world → fr3_base 注册边"

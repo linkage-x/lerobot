@@ -3,6 +3,8 @@ import type { Fr3BaseEdgeResponse } from "../types";
 import {
   applyConfirmation,
   edgeEnds,
+  graphGuardBlocks,
+  graphGuardLines,
   candidateSpread,
   laserSelectionWarnings,
   liveEdgeSummary,
@@ -75,6 +77,17 @@ describe("fr3BaseEdge", () => {
     const text = applyConfirmation({ ...candidate("armarm_x", null), from: "fr3_base", to: "fr3_base_right", quality: q }, current);
     expect(text).toContain("fr3_base → fr3_base_right");
     expect(text).toContain("闭合");
+  });
+
+  it("turns red only while the world graph is not the trusted one", () => {
+    expect(graphGuardBlocks(undefined)).toBe(false);
+    expect(graphGuardLines({ state: "unrecorded", problems: [], recordedUtc: "" })).toEqual([]);
+    expect(graphGuardLines({ state: "ok", problems: [], recordedUtc: "t" })).toEqual([]);
+    const lines = graphGuardLines({ state: "diverged", problems: ["已停用的边 … 又成了现役"], recordedUtc: "2026-11-03T09:00:00Z" });
+    expect(lines[0]).toContain("导出不换算到基座系");
+    expect(lines[0]).toContain("2026-11-03T09:00:00Z");
+    expect(lines[1]).toContain("又成了现役");
+    expect(graphGuardBlocks({ state: "unreadable", problems: [], recordedUtc: "" })).toBe(true);
   });
 
   it("names a retired edge instead of saying there never was one", () => {

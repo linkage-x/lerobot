@@ -1422,6 +1422,14 @@ export type Fr3BaseEdgeMove = {
   rotationDeg: number;
 };
 
+/** world_graph_guard: "diverged"/"unreadable" stop every route into a robot base until confirmed. */
+export type WorldGraphGuard = {
+  state: "ok" | "diverged" | "unrecorded" | "unreadable" | "";
+  problems: string[];
+  recordedUtc: string;
+  reason?: string;
+};
+
 export type Fr3BaseEdgeResponse = {
   ok: boolean;
   error?: string;
@@ -1444,6 +1452,7 @@ export type Fr3BaseEdgeResponse = {
   } | null;
   /** Edges into a robot base kept as a record of an old placement; nothing routes through them. */
   retired?: { label: string; from?: string; to?: string; createdUtc: string; retiredUtc: string; reason: string }[];
+  graphGuard?: WorldGraphGuard;
   /** Every live edge into a robot base: world -> fr3_base, world -> fr3_base_right, fr3_base -> fr3_base_right. */
   links?: { from: string; to: string; label: string; createdUtc: string; sigmaMm: number | null; quality: Fr3BaseEdgeQuality }[];
   runs: {

@@ -949,6 +949,36 @@ def test_export_does_not_re_express_through_a_retired_edge(tmp_path, monkeypatch
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
+def test_export_does_not_re_express_while_the_world_graph_is_not_the_trusted_one(tmp_path, monkeypatch, capsys):
+    # Thor recorded the graph with the 10-15 edge retired; a deploy brought back one where it is live.
+    pytest.importorskip("pyarrow")
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-10-15T03:08:47Z"}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
+    repo = tmp_path / "repo"
+    graph_path = repo / guard.GRAPH_FILE
+    trusted = json.loads(graph_path.read_text())
+    guard.record(repo, reason="test", graph={**trusted, "edges": [{**edge, "retired": {"utc": "u", "reason": "moved"}}]})
+    kwargs = {
+        "datasets_root": datasets,
+        "exports_root": exports,
+        "base_name": "pick_and_place",
+        "repo_id": "local/pick_and_place",
+        "task": "pick the cube",
+    }
+
+    with pytest.raises(RuntimeError, match="又成了现役"):
+        export_v3.export_task_to_v3(**kwargs, target_world="fr3_base")
+
+    out = export_v3.export_task_to_v3(**kwargs, target_world="auto")
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    printed = capsys.readouterr().out
+    assert "WARNING: world_graph.json 与这台机器上次确认的版本" in printed
+
+
 # ------------------------------------------------------ label provenance ---
 
 

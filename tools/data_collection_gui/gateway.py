@@ -37,6 +37,7 @@ from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
 from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
+from tools.thor.gmsl2 import world_graph_guard
 from tools.thor.gmsl2 import world_provenance as wp
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -4133,6 +4134,12 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         "current": current,
         "retired": retired,
         "links": links,
+        "graphGuard": {
+            "state": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("state") or ""),
+            "problems": list((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("problems") or []),
+            "recordedUtc": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("recorded_utc") or ""),
+            "reason": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("reason") or ""),
+        },
         "runs": runs,
         "candidates": candidates,
         "runsRoot": str(_P0_RUNS_SUBDIR),
@@ -4261,10 +4268,15 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     try:
         register_fr3_base.check_reference(report, world_dir)
         graph = wp.read_world_graph(state.repo_root)
+        guard = graph.get(world_graph_guard.GRAPH_KEY)
+        if world_graph_guard.blocks(guard):
+            # applying would trust whatever else changed in the file too: confirm the graph first
+            raise ValueError(world_graph_guard.note(guard))
         # close_loop: with world -> both bases and the arm-arm edge the graph has a loop; the new edge goes
         # in only if every route between its ends agrees within the edges' sigmas (world_closures)
         updated = register_fr3_base.apply_report(report, graph, replace=True, close_loop=True)
         register_fr3_base.write_graph(graph_path, updated)
+        world_graph_guard.record(state.repo_root, reason=f"applied {name} on the calibration page")
     except (ValueError, RuntimeError, OSError) as exc:
         return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
     edge = report.get("edge") or {}
@@ -4279,11 +4291,66 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     return {**_fr3_base_edge_payload(state), "ok": True, "applied": name}
 
 
+def _accept_world_graph(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Trust the world graph on disk as it is now (world_graph_guard), after a person checked what changed.
+
+    ``problems`` must be the list the page showed: a graph that changed again since is not what was looked at.
+    """
+    status = world_graph_guard.check(state.repo_root)
+    shown = body.get("problems")
+    if isinstance(shown, list) and [str(p) for p in shown] != status["problems"]:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": "world_graph.json 在你查看之后又变了，刷新后重新核对"}
+    try:
+        world_graph_guard.record(state.repo_root, reason="confirmed on the calibration page")
+    except (OSError, world_graph_guard.WorldGraphGuardError) as exc:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    with state.lock:
+        state.log(
+            "warn",
+            "world_graph.json confirmed as trusted on the calibration page"
+            + (f" despite: {'; '.join(status['problems'])}" if status["problems"] else ""),
+        )
+    return {**_fr3_base_edge_payload(state), "ok": True}
+
+
+def _bootstrap_world_graph_guard(state: GatewayState) -> None:
+    """At gateway start: record the graph the first time; afterwards say loudly when it is not the trusted one."""
+    status = world_graph_guard.check(state.repo_root)
+    if status["state"] == world_graph_guard.UNRECORDED:
+        try:
+            world_graph_guard.record(state.repo_root, reason="first gateway start with the world graph guard")
+        except (OSError, world_graph_guard.WorldGraphGuardError) as exc:
+            state.log("warn", f"world graph guard: could not record the graph ({exc})")
+            return
+        state.log("info", "world graph guard: recorded the current world_graph.json as trusted")
+    elif world_graph_guard.blocks(status):
+        state.log("error", world_graph_guard.note(status))
+
+
+def _world_graph_guard_status(state: GatewayState) -> dict[str, Any]:
+    """For the snapshot: the guard's verdict, re-read only when either file changed."""
+    paths = (state.repo_root / world_graph_guard.GRAPH_FILE, state.repo_root / world_graph_guard.GUARD_FILE)
+    try:
+        key = tuple(p.stat().st_mtime_ns if p.exists() else 0 for p in paths)
+    except OSError:
+        key = (-1, -1)
+    cached = _WORLD_GRAPH_GUARD_CACHE.get(str(state.repo_root))
+    if cached is None or cached[0] != key:
+        status = world_graph_guard.check(state.repo_root)
+        cached = (key, {"state": status["state"], "problems": status["problems"], "recordedUtc": status["recorded_utc"]})
+        _WORLD_GRAPH_GUARD_CACHE[str(state.repo_root)] = cached
+    return cached[1]
+
+
+_WORLD_GRAPH_GUARD_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
 # Outside the state lock (see the POST handler): the solve runs for minutes.
 _FR3_BASE_EDGE_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
     "/api/calibration/fr3-base-edge/solve": _solve_fr3_base_edge,
     "/api/calibration/fr3-base-edge/solve-laser": _solve_fr3_base_laser_edge,
     "/api/calibration/fr3-base-edge/apply": _apply_fr3_base_edge,
+    "/api/calibration/world-graph/accept": _accept_world_graph,
 }
 
 
@@ -15452,6 +15519,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "tasks": _tasks_with_progress(state),
         "activeTaskId": state.active_task_id or "",
         "datasetExport": asdict(state.dataset_export),
+        "worldGraphGuard": _world_graph_guard_status(state),
     }
 
 
@@ -20412,6 +20480,7 @@ def main() -> None:
     )
     if state.profile == "workstation":
         _probe_workstation_devices(state)
+    _bootstrap_world_graph_guard(state)
     server = DataCollectionGuiServer((args.host, args.port), state)
     _start_background_workers(state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")

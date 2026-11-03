@@ -315,12 +315,21 @@ def assert_single_world(entries: Iterable[tuple[str, Mapping[str, Any] | None]])
 
 
 def read_world_graph(repo_root: Path | str) -> dict[str, Any]:
-    """The tracked world graph, or an empty one when the file is absent."""
+    """The tracked world graph, or an empty one when the file is absent.
+
+    Checked against the graph this machine last trusted (``world_graph_guard``): the verdict rides along
+    under ``world_graph_guard.GRAPH_KEY`` and, when the edges differ, :func:`live_edges` drops every edge
+    into a robot base until someone confirms -- so an old graph brought back by a deploy cannot
+    re-express anything silently. Writers strip the key (``register_fr3_base.write_graph``).
+    """
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
     payload, status = _read_json(Path(repo_root) / WORLD_SUBDIR / WORLD_GRAPH_FILE)
     if payload is None:
         if status == STATUS_MISSING:
             return {"version": 1, "nodes": [], "edges": []}
         raise RuntimeError(f"{WORLD_SUBDIR / WORLD_GRAPH_FILE} is {status}; restore it from git")
+    payload[guard.GRAPH_KEY] = guard.check(repo_root, payload)
     return payload
 
 
@@ -539,9 +548,32 @@ def edge_retired(edge: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return record if isinstance(record, Mapping) else {"utc": "", "reason": str(record)}
 
 
+def _guard_blocks(graph: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    status = graph.get(guard.GRAPH_KEY)
+    return status if isinstance(status, Mapping) and guard.blocks(status) else None
+
+
+def _base_ids(graph: Mapping[str, Any]) -> set[str]:
+    return _robot_bases(graph) | {FR3_BASE_WORLD_ID, "fr3_base_right"}
+
+
 def live_edges(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The edges routes may use: every edge that is not :func:`edge_retired`."""
-    return [edge for edge in graph.get("edges") or [] if edge_retired(edge) is None]
+    """The edges routes may use: every edge that is not :func:`edge_retired`.
+
+    While the graph is not the one this machine trusts (``world_graph_guard``), no edge into a robot base
+    either: camera worlds stay connected, nothing is put in an arm's base.
+    """
+    edges = [edge for edge in graph.get("edges") or [] if edge_retired(edge) is None]
+    if _guard_blocks(graph) is None:
+        return edges
+    bases = _base_ids(graph)
+    return [
+        edge
+        for edge in edges
+        if not {str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or "")} & bases
+    ]
 
 
 def retired_note(graph: Mapping[str, Any], *worlds: str) -> str:
@@ -550,7 +582,12 @@ def retired_note(graph: Mapping[str, Any], *worlds: str) -> str:
     For the message of a caller that found no route: "no edge" and "the edge was retired because the base
     moved" ask for the same fix but are different news.
     """
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
     lines = []
+    blocked = _guard_blocks(graph)
+    if blocked is not None and (not worlds or set(worlds) & _base_ids(graph)):
+        lines.append(guard.note(blocked))
     for edge in graph.get("edges") or []:
         record = edge_retired(edge)
         if record is None:

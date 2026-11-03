@@ -150,6 +150,26 @@ bases and the arm-arm edge exists, a new edge goes in only if every route
 between its ends agrees within the edges' sigmas (`world_closures`), so a
 moved cart or a bad registration is refused instead of picked silently.
 
+### The guard against a graph brought back by a deploy (2026-11-03)
+
+A deploy mirrors the deployer's tree, `world_graph.json` included: a tree
+without the retirement revives the 10-15 edge, and an edge applied on the
+calibration page (Thor's copy only) is dropped. `world_graph_guard.py` keeps the
+graph this machine trusts in `outputs/world_graph_guard.json`, which no deploy
+touches: written at the gateway's first start with the guard, whenever the page
+applies an edge, by `register_fr3_base apply/retire` on this checkout, and on
+confirmation. `read_world_graph` compares every read against it; when the edges
+differ (an edge revived, lost, edited or unknown) no edge into a robot base is
+walked -- exports keep the camera world, explicit `fr3_base` exports, replays
+and the pseudo-bimanual builder refuse with the list of differences -- the GUI
+shows a red banner, and the page refuses to apply anything until someone checks
+and confirms (`python -m tools.thor.gmsl2.world_graph_guard check|accept` from a
+shell). It cannot stop a deploy of a tree from before the guard (the checking
+code goes too), but its record outlives that deploy.
+
+After applying an edge on Thor, still copy `world_graph.json` back into the repo
+and commit: otherwise the next deploy, even of a current tree, trips the guard.
+
 ### The table datum (`table_datum.json`, 2026-10-27)
 
 Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are

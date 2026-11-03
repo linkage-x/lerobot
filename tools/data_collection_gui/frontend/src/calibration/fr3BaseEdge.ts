@@ -19,7 +19,7 @@
 // FR3 and the handheld pivoted about, at 4+ places): judged by predicting each
 // position from the others. Rigid on purpose -- the camera world's scale is
 // shown, not absorbed; it is fixed at its source and the edge refitted.
-import type { Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse } from "../types";
+import type { Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse, WorldGraphGuard } from "../types";
 
 type Current = NonNullable<Fr3BaseEdgeResponse["current"]>;
 type Candidate = Fr3BaseEdgeResponse["candidates"][number];
@@ -201,4 +201,19 @@ export function laserSelectionWarnings(station: Station | null, replays: LaserRe
     warnings.push("回放没有分在驻点两侧：它们彼此一致，也说明不了驻点期间跟踪仪没动。");
   }
   return warnings;
+}
+
+/** Whether world_graph.json is not the graph this machine trusts: nothing goes into a robot base until confirmed. */
+export function graphGuardBlocks(guard: WorldGraphGuard | null | undefined): boolean {
+  return guard?.state === "diverged" || guard?.state === "unreadable";
+}
+
+/** The red banner's text: what it stops, then what changed. Empty while the graph is trusted. */
+export function graphGuardLines(guard: WorldGraphGuard | null | undefined): string[] {
+  if (!guard || !graphGuardBlocks(guard)) return [];
+  return [
+    `world_graph.json 与这台机器上次确认的版本（${guard.recordedUtc || "—"}）不一致：确认之前，导出不换算到基座系，` +
+      "真机 / 双臂 replay 和 MuJoCo 预览到基座都会被拒绝。到「标定 → FR3 基座注册边」核对后确认。",
+    ...guard.problems,
+  ];
 }

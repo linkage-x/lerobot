@@ -719,6 +719,9 @@ def check_reference(report: dict[str, Any], world_dir: Path) -> None:
 
 def write_graph(graph_path: Path, graph: dict[str, Any]) -> None:
     """Atomically: replay and export read this file while it is being swapped."""
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    graph = {k: v for k, v in graph.items() if k != guard.GRAPH_KEY}  # the guard's verdict is not part of the graph
     temporary = graph_path.with_name(graph_path.name + ".tmp")
     temporary.write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(graph_path)
@@ -736,9 +739,19 @@ def _apply(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     write_graph(graph_path, updated)
+    _trust_if_repo_graph(args, f"register_fr3_base apply {args.report.name}")
     edge = report["edge"]
     print(f"edge {edge['from_world_frame_id']} -> {edge['to_world_frame_id']} written to {graph_path}")
     return 0
+
+
+def _trust_if_repo_graph(args: argparse.Namespace, reason: str) -> None:
+    """A change this tool made to this checkout's graph is a trusted one (world_graph_guard)."""
+    if args.world_dir is not None:
+        return
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    guard.record(_REPO_ROOT, reason=reason)
 
 
 def retire_edges(graph: dict[str, Any], a: str, b: str, *, reason: str, utc: str | None = None) -> dict[str, Any]:
@@ -771,6 +784,7 @@ def _retire(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     write_graph(graph_path, updated)
+    _trust_if_repo_graph(args, f"register_fr3_base retire {args.from_world} -> {args.to_world}")
     print(wp.retired_note(updated, args.from_world, args.to_world))
     print(f"written to {graph_path}")
     return 0
