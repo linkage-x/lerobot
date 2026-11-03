@@ -90,7 +90,7 @@ export function GripperTeleopBox({
         )}
         {payload?.armDeviceId != null ? <span className="cali-muted">FR3 夹爪 BOX {payload.armDeviceId}</span> : null}
       </div>
-      {teleopWarnings(payload).map((w) => (
+      {(armRequired && !robotIp ? ["先在下面 pivot 采集那栏的「FR3」里选臂：夹爪 BOX 按所选的臂找"] : teleopWarnings(payload)).map((w) => (
         <p className="cali-warn" key={w}>
           {w}
         </p>
