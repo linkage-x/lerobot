@@ -694,13 +694,17 @@ def check_reference(report: dict[str, Any], world_dir: Path) -> None:
     """Refuse a report solved against another ``world_reference.json`` than ``world_dir``'s.
 
     The edge is only valid with the camera poses it was solved against; after a
-    re-freeze or a revision those are not the ones on disk any more.
+    re-freeze or a revision those are not the ones on disk any more. An arm-arm ball edge
+    (base to base, FK only) has no camera side and passes.
     """
+    edge = report.get("edge") or {}
+    if wp.edge_method_kind(edge) == "arm_arm_ball":
+        # base to base, FK on both sides: no camera pose went into it, so no reference to have changed
+        return
     reference_path = world_dir / wp.WORLD_REFERENCE_FILE
     if not reference_path.is_file():
         raise ValueError(f"{reference_path} does not exist")
     reference = json.loads(reference_path.read_text(encoding="utf-8"))
-    edge = report.get("edge") or {}
     if str(edge.get("from_world_frame_id")) != str(reference.get("world_frame_id")):
         raise ValueError(
             f"the report leaves {edge.get('from_world_frame_id')}, but the reference world is "

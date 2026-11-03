@@ -23,6 +23,7 @@ import type {
 import { fmtNum } from "./fr3BaseEdge";
 
 type Run = Fr3PivotResponse["runs"][number];
+type JointFit = NonNullable<Fr3PivotResponse["joints"]>[number];
 type Episode = Fr3PivotResponse["episodes"][number];
 
 /** Below these the centre and the lever arm trade off (same gates as the tool's warning). */
@@ -253,6 +254,54 @@ export function positionDraftWarnings(drafts: PositionDraft[], runs: Run[], epis
     if (run && !run.fk) out.push(`${d.pivot} 还没拟合`);
     const ep = episodes.find((e) => episodeKey(e) === d.episodeKey);
     if (ep && !ep.world) out.push(`${ep.datasetName} ep${ep.episode} 没有 world 戳，检验会拒绝它`);
+  }
+  return out;
+}
+
+// --- which base: the arm that turned about the ball --------------------------------------------
+
+/** The base a check's FR3 centres are in; checks before 11-03 carry none and were the left arm's fr3_base. */
+export function checkBaseLabel(report: BallCheckReport): string {
+  const base = report.base || "fr3_base";
+  const ips = report.robot_ips?.length ? `（${report.robot_ips.join(", ")}）` : "";
+  return `FR3 一侧的球心在 ${base}${ips}，存成候选边是 world → ${base}`;
+}
+
+/** A ball check's positions must all be one arm's pivots (their centres are in that arm's base). */
+export function mixedArmWarning(drafts: PositionDraft[], runs: Run[], joints: JointFit[]): string {
+  const ips = new Set(
+    drafts
+      .filter((d) => d.pivot)
+      .map((d) => runs.find((r) => r.name === d.pivot)?.robotIp ?? joints.find((j) => j.name === d.pivot)?.robotIp ?? "")
+      .filter(Boolean)
+  );
+  return ips.size > 1 ? `选了两台臂的 pivot（${[...ips].join(", ")}）：一次同球检验只能是一台臂的，检验会拒绝` : "";
+}
+
+// --- arm-arm ball edge (fr3_arm_arm_ball.py, roadmap B3) ----------------------------------------
+
+export type ArmArmDraft = { left: string; right: string };
+export const ARM_ARM_MIN_POSITIONS = 4;
+
+/** The fitted pivots of one arm (by the IP each fit records): single runs and shared-centre joint fits. */
+export function pivotsOfArm(runs: Run[], joints: JointFit[], ip: string): { runs: Run[]; joints: JointFit[] } {
+  if (!ip) return { runs: [], joints: [] };
+  return {
+    runs: runs.filter((r) => r.fk && r.robotIp === ip),
+    joints: joints.filter((j) => j.sharedCentre && j.robotIp === ip),
+  };
+}
+
+export function armArmDraftWarnings(drafts: ArmArmDraft[], leftIp: string, rightIp: string): string[] {
+  const out: string[] = [];
+  if (!leftIp || !rightIp) out.push("fr3_arms.json 里要有在役的左臂和右臂");
+  const complete = drafts.filter((d) => d.left && d.right);
+  if (complete.length < ARM_ARM_MIN_POSITIONS) {
+    out.push(`要 ≥ ${ARM_ARM_MIN_POSITIONS} 个球位（每个由其余的预测，留一检验）；现在 ${complete.length} 个`);
+  }
+  for (const side of ["left", "right"] as const) {
+    const names = complete.map((d) => d[side]);
+    if (new Set(names).size < names.length) out.push(`${side === "left" ? "左" : "右"}臂同一次 pivot 用在了两个位置`);
   }
   return out;
 }

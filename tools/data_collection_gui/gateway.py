@@ -3742,19 +3742,6 @@ def _rotation_angle_deg(R: list[list[float]]) -> float:
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
 
 
-def _edge_T_fr3_base_world(edge: dict[str, Any]) -> list[list[float]] | None:
-    """``T_fr3_base_world`` of a direct edge, whichever way it was written."""
-    try:
-        T = [[float(v) for v in row] for row in edge["T_to_from"]]
-    except (KeyError, TypeError, ValueError):
-        return None
-    if str(edge.get("to_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
-        return T
-    if str(edge.get("from_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
-        return wp._rigid_inverse(T)
-    return None
-
-
 def _edge_is_laser(edge: dict[str, Any]) -> bool:
     return str(edge.get("method") or "").startswith(register_fr3_base.LASER_METHOD)
 
@@ -3767,9 +3754,46 @@ def _edge_is_ball(edge: dict[str, Any]) -> bool:
     return str(edge.get("method") or "").startswith(_BALL_EDGE_METHOD)
 
 
+# fr3_arm_arm_ball.METHOD: the two FR3 bases joined by balls both arms pivoted about (B3)
+_ARM_ARM_METHOD = "fr3_arm_arm_ball"
+# The right FR3's root (embodiments/fr3_dual.json) -- a base before any edge reaches it.
+_RIGHT_FR3_ROOT = "fr3_base_right"
+_ARM_ARM_SCRIPT = Path("tools") / "thor" / "gmsl2" / "fr3_arm_arm_ball.py"
+
+
+def _edge_is_arm_arm(edge: dict[str, Any]) -> bool:
+    return str(edge.get("method") or "").startswith(_ARM_ARM_METHOD)
+
+
+def _edge_pair(edge: dict[str, Any], bases: set[str]) -> tuple[str, str]:
+    """``(source, target)`` of an edge into a robot base: target is the base (the right one for base to base)."""
+    a, b = str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or "")
+    if b in bases and (a not in bases or _edge_is_arm_arm(edge)):
+        return a, b
+    if a in bases and b not in bases:
+        return b, a
+    return a, b
+
+
+def _edge_T_oriented(edge: dict[str, Any], source: str, target: str) -> list[list[float]] | None:
+    """``T_target_source`` of a direct edge between ``source`` and ``target``, whichever way it was written."""
+    try:
+        T = [[float(v) for v in row] for row in edge["T_to_from"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    ends = (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
+    if ends == (source, target):
+        return T
+    if ends == (target, source):
+        return wp._rigid_inverse(T)
+    return None
+
+
 def _edge_label(edge: dict[str, Any]) -> str:
     """What the edge was measured from, in a few words: the P0 run, the station and the replays, or the balls."""
     source = edge.get("source") or {}
+    if _edge_is_arm_arm(edge):
+        return f"{len(source.get('positions') or [])} 个球位 · 两臂同球"
     if _edge_is_ball(edge):
         return f"{len(source.get('positions') or [])} 个球位 · {Path(str(source.get('ball_check') or '')).stem}"
     if _edge_is_laser(edge):
@@ -3795,6 +3819,18 @@ def _edge_quality_summary(edge: dict[str, Any]) -> dict[str, Any]:
                 "edgeShiftDeg": shift.get("rotation_deg"),
             }
         )
+    if _edge_is_arm_arm(edge):
+        return {
+            "method": "armArm",
+            "positions": quality.get("positions"),
+            "residualRmsMm": quality.get("residual_rms_mm"),
+            "leaveOneOutRmsMm": quality.get("leave_one_out_rms_mm"),
+            "leaveOneOutMaxMm": quality.get("leave_one_out_max_mm"),
+            "rotationSpreadDeg": quality.get("rotation_spread_deg"),
+            "baselineM": quality.get("baseline_m"),
+            "extentMm": quality.get("extent_mm"),
+            "folds": [],
+        }
     if _edge_is_ball(edge):
         return {
             "method": "ball",
@@ -3948,16 +3984,26 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         graph = wp.read_world_graph(repo)
     except RuntimeError as exc:
         graph, error = {}, str(exc)
-    touching = [
-        edge
-        for edge in graph.get("edges") or []
-        if wp.FR3_BASE_WORLD_ID in (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
-    ]
+    # Every robot base: the graph's own robot_base nodes, and the two FR3 roots before they have an edge.
+    bases = wp._robot_bases(graph) | {wp.FR3_BASE_WORLD_ID, _RIGHT_FR3_ROOT}
+
+    def _ends(edge: dict[str, Any]) -> tuple[str, str]:
+        return str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or "")
+
+    touching = [edge for edge in graph.get("edges") or [] if set(_ends(edge)) & bases]
     # A retired edge is a record of where the base was, not the live edge: nothing routes through it.
-    direct = [edge for edge in touching if wp.edge_retired(edge) is None]
+    live_edges = [edge for edge in touching if wp.edge_retired(edge) is None]
+    # "current" stays the world -> fr3_base edge (the left arm's, the datasets' frame); the others are links
+    direct = [
+        edge
+        for edge in live_edges
+        if wp.FR3_BASE_WORLD_ID in _ends(edge) and not set(_ends(edge)) <= bases
+    ]
     retired = [
         {
             "label": _edge_label(edge),
+            "from": _edge_pair(edge, bases)[0],
+            "to": _edge_pair(edge, bases)[1],
             "createdUtc": edge.get("created_utc", ""),
             "retiredUtc": str((wp.edge_retired(edge) or {}).get("utc") or ""),
             "reason": str((wp.edge_retired(edge) or {}).get("reason") or ""),
@@ -3965,11 +4011,20 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         for edge in touching
         if wp.edge_retired(edge) is not None
     ]
+    links = [
+        {
+            "from": _edge_pair(edge, bases)[0],
+            "to": _edge_pair(edge, bases)[1],
+            "label": _edge_label(edge),
+            "createdUtc": edge.get("created_utc", ""),
+            "sigmaMm": wp.edge_sigma_mm(edge),
+            "quality": _edge_quality_summary(edge),
+        }
+        for edge in live_edges
+    ]
     current: dict[str, Any] | None = None
-    T_current: list[list[float]] | None = None
     if direct:
         edge = direct[-1]
-        T_current = _edge_T_fr3_base_world(edge)
         source = edge.get("source") or {}
         world = (
             str(edge.get("from_world_frame_id"))
@@ -4020,9 +4075,12 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         edge = report.get("edge") or {}
         source = edge.get("source") or {}
         run_name = Path(str(source.get("p0_run") or "")).name
-        T_new = _edge_T_fr3_base_world(edge)
+        pair = _edge_pair(edge, bases)
+        live_same = [e for e in live_edges if set(_ends(e)) == set(pair)]
+        T_new = _edge_T_oriented(edge, *pair)
+        T_live = _edge_T_oriented(live_same[-1], *pair) if live_same else None
         move = None
-        if T_new is not None and T_current is not None:
+        if T_new is not None and T_live is not None:
             if "workspace_points_base_m" in report:
                 # where the replays put the TCP, or where the balls were: the workspace this edge was measured in
                 points = report.get("workspace_points_base_m") or []
@@ -4030,18 +4088,20 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
                 if run_name not in positions:
                     positions[run_name] = _p0_run_tool_positions(runs_root / run_name)
                 points = positions[run_name]
-            move = _edge_move_in_workspace(T_new, T_current, points)
+            move = _edge_move_in_workspace(T_new, T_live, points)
         same_as_live = (
-            current is not None
-            and source == (direct[-1].get("source") or {})
+            bool(live_same)
+            and source == (live_same[-1].get("source") or {})
             and move is not None
             and move["maxMm"] < 0.01
         )
-        world = str(edge.get("from_world_frame_id") or "")
+        world = pair[0]
         blockers = []
         if report.get("verdict") != "ok":
             blockers.append("判定未通过")
-        if world != reference_id:
+        if _edge_is_arm_arm(edge):
+            pass  # base to base, FK only: no camera world to have changed
+        elif world != reference_id:
             blockers.append(f"解算时的世界系是 {world}，当前基准是 {reference_id or '—'}")
         elif source.get("world_reference_sha256") != reference_sha:
             blockers.append("world_reference.json 在解算之后改过，需要重新解算")
@@ -4051,6 +4111,8 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
             {
                 "name": path.name,
                 "generatedUtc": report.get("generated_utc", ""),
+                "from": pair[0],
+                "to": pair[1],
                 "label": _edge_label(edge),
                 "p0Run": run_name,
                 "verdict": report.get("verdict", ""),
@@ -4070,6 +4132,7 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         "referenceWorld": reference_id,
         "current": current,
         "retired": retired,
+        "links": links,
         "runs": runs,
         "candidates": candidates,
         "runsRoot": str(_P0_RUNS_SUBDIR),
@@ -4198,15 +4261,19 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     try:
         register_fr3_base.check_reference(report, world_dir)
         graph = wp.read_world_graph(state.repo_root)
-        updated = register_fr3_base.apply_report(report, graph, replace=True)
+        # close_loop: with world -> both bases and the arm-arm edge the graph has a loop; the new edge goes
+        # in only if every route between its ends agrees within the edges' sigmas (world_closures)
+        updated = register_fr3_base.apply_report(report, graph, replace=True, close_loop=True)
         register_fr3_base.write_graph(graph_path, updated)
     except (ValueError, RuntimeError, OSError) as exc:
         return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
-    run = _edge_label(report.get("edge") or {})
+    edge = report.get("edge") or {}
+    run = _edge_label(edge)
+    ends = f"{edge.get('from_world_frame_id')} -> {edge.get('to_world_frame_id')}"
     with state.lock:
         state.log(
             "warn",
-            f"world -> fr3_base edge replaced by {run} ({name}); every fr3_base replay and export from now on uses it. "
+            f"{ends} edge replaced by {run} ({name}); every replay and export through it from now on uses it. "
             f"{_WORLD_SUBDIR / _WORLD_GRAPH_FILE} changed on this machine only -- copy it back into the repo and commit.",
         )
     return {**_fr3_base_edge_payload(state), "ok": True, "applied": name}
@@ -4293,6 +4360,8 @@ def _fr3_pivot_runs(state: GatewayState) -> list[dict[str, Any]]:
                 "name": path.name,
                 "commanded": (fit or {}).get("commanded"),
                 "fitName": _fr3_pivot_fit_path(path).name if fit else "",
+                # which arm turned about the ball: its base is the one the centre is in
+                "robotIp": str((fit or {}).get("robot_ip") or ""),
                 "note": str((fit or {}).get("note") or ""),
                 "created": str((fit or {}).get("created") or ""),
                 "fk": (fit or {}).get("fk"),
@@ -4320,6 +4389,7 @@ def _fr3_pivot_joints(state: GatewayState) -> list[dict[str, Any]]:
                 "name": path.name,
                 "created": str(report.get("created") or ""),
                 "runs": list(report.get("runs") or []),
+                "robotIp": _pivot_fit_robot_ip(path),
                 "sharedCentre": bool(report.get("shared_centre")),
                 "fk": report.get("fk"),
                 "socketFrame": socket or None,
@@ -4978,6 +5048,50 @@ def _fit_joint_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str,
     return {**_fr3_pivot_payload(state), "jointFitted": out.name, "output": output}
 
 
+def _pivot_fit_robot_ip(fit: Path) -> str:
+    """The FR3 a pivot fit was collected on (fr3_base_ball_check.fit_robot_ip, stdlib): a joint fit's runs must agree."""
+    report = _read_json_file(fit) or {}
+    own = str(report.get("robot_ip") or "")
+    if own or not report.get("runs"):
+        return own
+    ips = {
+        str((_read_json_file(fit.parent.parent / (str(run).removesuffix(".json") + ".fit.json")) or {}).get("robot_ip") or "")
+        for run in report.get("runs") or []
+    }
+    return ips.pop() if len(ips) == 1 else ""
+
+
+def _resolve_pivot_fit(state: GatewayState, pivot: str) -> Path | None:
+    """A pivot run's fit, or a joint fit by name; ``None`` when it is neither."""
+    run = _fr3_pivot_run_path(state, pivot)
+    fit = _fr3_pivot_fit_path(run) if run is not None else _fr3_pivot_joint_root(state) / pivot
+    if not (run is not None or _FR3_PIVOT_JOINT_RE.match(pivot)) or not fit.is_file():
+        return None
+    return fit
+
+
+def _pivot_base(state: GatewayState, fits: list[Path]) -> tuple[str, str, str]:
+    """``(arm, robot_ip, root)`` all these pivot fits were collected on; ValueError if unknown or mixed.
+
+    The FR3 centre of a pivot is in the base of the arm that turned about the ball, so that arm's root
+    (embodiments/fr3_dual.json) is the base a ball edge from these pivots ends in.
+    """
+    ips = {_pivot_fit_robot_ip(fit) for fit in fits}
+    if "" in ips:
+        unknown = [fit.name for fit in fits if not _pivot_fit_robot_ip(fit)]
+        raise ValueError(f"这些 pivot 没有记下是哪台臂采的：{', '.join(unknown)}")
+    if len(ips) != 1:
+        raise ValueError(f"混用了两台臂的 pivot（{', '.join(sorted(ips))}）；每台臂单独做")
+    robot_ip = ips.pop()
+    arm = fr3_arms.arm_for_ip(fr3_arms.load(repo_root=state.repo_root), robot_ip)
+    if arm is None:
+        raise ValueError(f"{robot_ip} 不是 fr3_arms.json 里在役的臂")
+    root = _arm_root(state, arm)
+    if not root:
+        raise ValueError(f"{arm} 臂在 {_DUAL_FR3_EMBODIMENT} 里没有 root")
+    return arm, robot_ip, root
+
+
 def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Every edge -- live and each candidate report -- against the balls both pivots found."""
     raw = body.get("positions")
@@ -4986,15 +5100,17 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     known = {(row["dataset"], int(row["episode"])) for row in _ball_check_episodes(state)}
     args: list[str] = []
     pairs: list[tuple[Path, int]] = []
+    fits: list[Path] = []
     for i, item in enumerate(raw, start=1):
         if not isinstance(item, dict):
             return _fr3_pivot_refusal(state, f"第 {i} 个位置不是对象")
         # one run's fit, or a joint fit of several runs on this ball (one shared centre: steadier)
         pivot = str(item.get("pivot") or "").strip()
         run = _fr3_pivot_run_path(state, pivot)
-        fit = _fr3_pivot_fit_path(run) if run is not None else _fr3_pivot_joint_root(state) / pivot
-        if not (run is not None or _FR3_PIVOT_JOINT_RE.match(pivot)) or not fit.is_file():
+        fit = _resolve_pivot_fit(state, pivot)
+        if fit is None:
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{item.get('pivot')!r} 不是一次已拟合的 FR3 pivot 或合并拟合")
+        fits.append(fit)
         if run is None and not (_read_json_file(fit) or {}).get("shared_centre"):
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{pivot} 是每次一个球心的合并拟合，不是一个球位置")
         try:
@@ -5006,6 +5122,11 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{dataset} episode {episode} 不在最近的录制里")
         args += ["--position", str(fit), dataset, str(episode)]
         pairs.append((Path(dataset), episode))
+    try:
+        _, _, base = _pivot_base(state, fits)
+    except ValueError as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    args += ["--base", base]
     if not _BALL_CHECK_LOCK.acquire(blocking=False):
         return _fr3_pivot_refusal(state, "已有一次同球检验在运行")
     try:
@@ -5049,6 +5170,72 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     with state.lock:
         state.log("info", f"FR3 base ball check written: {out.name}")
     return {**_fr3_pivot_payload(state), "checked": out.name, "output": output}
+
+
+def _solve_arm_arm_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """fr3_base -> fr3_base_right from balls both arms pivoted about (B3): a candidate of the FR3 base panel.
+
+    ``positions``: ``[{"left": pivot, "right": pivot}, ...]``, each a fitted run or a shared-centre joint
+    fit; every left pivot must be the left arm's and every right the right arm's (by the IP each recorded).
+    """
+    raw = body.get("positions")
+    if not isinstance(raw, list) or not raw:
+        return _fr3_pivot_refusal(state, "至少要一个球位置：同一个球上左臂一次 pivot、右臂一次 pivot")
+    args: list[str] = []
+    sides: dict[str, list[Path]] = {"left": [], "right": []}
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置不是对象")
+        pair = []
+        for side in ("left", "right"):
+            pivot = str(item.get(side) or "").strip()
+            fit = _resolve_pivot_fit(state, pivot)
+            if fit is None:
+                return _fr3_pivot_refusal(state, f"第 {i} 个位置的{'左' if side == 'left' else '右'}臂：{pivot!r} 不是已拟合的 pivot")
+            sides[side].append(fit)
+            pair.append(str(fit))
+        args += ["--position", *pair]
+    ips = {}
+    for side in ("left", "right"):
+        try:
+            arm, robot_ip, root = _pivot_base(state, sides[side])
+        except ValueError as exc:
+            return _fr3_pivot_refusal(state, f"{'左' if side == 'left' else '右'}臂这一列：{exc}")
+        expected = wp.FR3_BASE_WORLD_ID if side == "left" else _RIGHT_FR3_ROOT
+        if root != expected:
+            return _fr3_pivot_refusal(state, f"{'左' if side == 'left' else '右'}臂这一列是 {arm} 臂（{robot_ip}）的 pivot，基座是 {root}，不是 {expected}")
+        ips[side] = robot_ip
+    out = _fr3_base_edge_reports_root(state) / f"armarm_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    try:
+        python = _marker_tcp_python(state)
+        proc = subprocess.run(
+            [
+                str(python),
+                str(state.repo_root / _ARM_ARM_SCRIPT),
+                *args,
+                "--left-ip", ips["left"],
+                "--right-ip", ips["right"],
+                "--out", str(out),
+            ],
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    report = _read_json_file(out) if out.is_file() else None
+    if proc.returncode not in (0, 2) or not report or "edge" not in report:
+        # nothing to compare or apply: not left in the candidates
+        out.unlink(missing_ok=True)
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {proc.returncode}"), "output": output}
+    with state.lock:
+        state.log("info", f"FR3 arm-arm ball edge written: {out.name} ({report.get('verdict')})")
+    return {**_fr3_pivot_payload(state), "armArmEdge": out.name, "output": output}
 
 
 _BALL_CHECK_NAME_RE = re.compile(r"^check_[0-9A-Za-z_]+\.json$")
@@ -5097,6 +5284,7 @@ _FR3_PIVOT_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, 
     "/api/calibration/fr3-pivot/fit-joint": _fit_joint_fr3_pivot,
     "/api/calibration/fr3-pivot/check": _run_ball_check,
     "/api/calibration/fr3-pivot/ball-edge": _save_ball_edge,
+    "/api/calibration/fr3-pivot/arm-arm-edge": _solve_arm_arm_edge,
 }
 
 

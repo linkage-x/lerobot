@@ -19,6 +19,10 @@ import {
   positionDraftWarnings,
   rankedEdges,
   socketFrameVerdict,
+  armArmDraftWarnings,
+  checkBaseLabel,
+  mixedArmWarning,
+  pivotsOfArm,
 } from "./fr3Pivot";
 
 type Run = Fr3PivotResponse["runs"][number];
@@ -345,5 +349,39 @@ describe("fr3Pivot joint fit", () => {
     expect(lines.find((l) => l.text.startsWith("去掉任意一次"))).toMatchObject({ ok: false });
     expect(lines.find((l) => l.text.includes("球动过"))?.text).toContain("20261014_113021_pivot.json 2.6 mm");
     expect(jointFitLines({ ...base, socketFrame: null })[0].ok).toBe(false);
+  });
+});
+
+describe("which arm a pivot belongs to", () => {
+  const L = "192.168.11.102";
+  const R = "192.168.1.210";
+  const runs = [run({ name: "l1_pivot.json", robotIp: L }), run({ name: "r1_pivot.json", robotIp: R }), run({ name: "r2_pivot.json", robotIp: R, fk: null })];
+  const joints = [
+    { name: "j_joint.json", created: "", runs: ["r1_pivot.json"], robotIp: R, sharedCentre: true, fk: null, socketFrame: null, warnings: [] },
+    { name: "k_joint.json", created: "", runs: ["r1_pivot.json"], robotIp: R, sharedCentre: false, fk: null, socketFrame: null, warnings: [] },
+  ];
+
+  it("lists only that arm's fitted pivots and shared-centre joint fits", () => {
+    const right = pivotsOfArm(runs, joints, R);
+    expect(right.runs.map((r) => r.name)).toEqual(["r1_pivot.json"]);
+    expect(right.joints.map((j) => j.name)).toEqual(["j_joint.json"]);
+    expect(pivotsOfArm(runs, joints, "")).toEqual({ runs: [], joints: [] });
+  });
+
+  it("warns before a ball check mixes the arms", () => {
+    expect(mixedArmWarning([{ pivot: "l1_pivot.json", episodeKey: "a" }, { pivot: "j_joint.json", episodeKey: "b" }], runs, joints)).toContain("两台臂");
+    expect(mixedArmWarning([{ pivot: "r1_pivot.json", episodeKey: "a" }, { pivot: "j_joint.json", episodeKey: "b" }], runs, joints)).toBe("");
+  });
+
+  it("asks for four positions and no pivot used twice", () => {
+    const one = [{ left: "l1_pivot.json", right: "r1_pivot.json" }];
+    expect(armArmDraftWarnings(one, L, R).join()).toContain("≥ 4");
+    expect(armArmDraftWarnings([...one, ...one, ...one, ...one], L, R).join()).toContain("左臂同一次 pivot");
+    expect(armArmDraftWarnings(one, "", R).join()).toContain("在役的左臂和右臂");
+  });
+
+  it("says which base a check's centres are in", () => {
+    expect(checkBaseLabel(report())).toContain("world → fr3_base");
+    expect(checkBaseLabel(report({ base: "fr3_base_right", robot_ips: [R] }))).toContain(`fr3_base_right（${R}）`);
   });
 });

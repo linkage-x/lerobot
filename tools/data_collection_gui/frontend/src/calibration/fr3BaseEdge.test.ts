@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Fr3BaseEdgeResponse } from "../types";
 import {
   applyConfirmation,
+  edgeEnds,
   candidateSpread,
   laserSelectionWarnings,
   liveEdgeSummary,
@@ -63,6 +64,17 @@ describe("fr3BaseEdge", () => {
     expect(liveEdgeWarnings(current, "world_20260928_063531")).toEqual([]);
     expect(liveEdgeWarnings({ ...current, fromReferenceWorld: false }, "world_new")[0]).toContain("world_new");
     expect(liveEdgeWarnings({ ...current, referenceUnchanged: false }, "w")[0]).toContain("改过");
+  });
+
+  it("describes the arm-arm edge and confirms it in terms of its ends", () => {
+    const q = { method: "armArm" as const, positions: 5, baselineM: 0.661, leaveOneOutRmsMm: 0.42, leaveOneOutMaxMm: 0.8, residualRmsMm: 0.3, folds: [] };
+    expect(methodLabel(q)).toBe("两臂同球");
+    expect(qualitySummary(q)).toContain("两基座相距 0.661 m");
+    expect(edgeEnds()).toBe("world → fr3_base");
+    expect(edgeEnds("fr3_base", "fr3_base_right")).toBe("fr3_base → fr3_base_right");
+    const text = applyConfirmation({ ...candidate("armarm_x", null), from: "fr3_base", to: "fr3_base_right", quality: q }, current);
+    expect(text).toContain("fr3_base → fr3_base_right");
+    expect(text).toContain("闭合");
   });
 
   it("names a retired edge instead of saying there never was one", () => {

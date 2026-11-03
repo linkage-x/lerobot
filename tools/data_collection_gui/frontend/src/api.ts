@@ -1519,6 +1519,11 @@ export class DataCollectionGuiApi {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/check", { positions });
   }
 
+  /** fr3_base -> fr3_base_right from balls both arms pivoted about (B3), written as a candidate report. */
+  async solveFr3ArmArmEdge(positions: { left: string; right: string }[]): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/arm-arm-edge", { positions });
+  }
+
   /** Write a check's ball edge as a candidate report; swapping it in is the FR3-base edge panel's. */
   async saveFr3BallEdge(check: string): Promise<Fr3PivotResponse | null> {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/ball-edge", { check });

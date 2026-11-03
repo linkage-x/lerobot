@@ -1377,7 +1377,9 @@ export type WorldFrameResponse = {
 export type Fr3BaseEdgeQuality = {
   /** singleTag: P0 tag hand-eye; laser: tracker station x FR3 FK fitted to the laser on replays;
    * ball: rigid fit of the ball check's positions (fr3_base_ball_check.py edge). */
-  method?: "singleTag" | "laser" | "ball";
+  method?: "singleTag" | "laser" | "ball" | "armArm";
+  /** armArm: distance between the two bases, metres. */
+  baselineM?: number | null;
   positions?: number | null;
   residualRmsMm?: number | null;
   /** Each ball position predicted from the others: what the verdict rests on. */
@@ -1440,8 +1442,10 @@ export type Fr3BaseEdgeResponse = {
     edgeCount: number;
     quality: Fr3BaseEdgeQuality;
   } | null;
-  /** Edges to fr3_base kept as a record of an old base placement; nothing routes through them. */
-  retired?: { label: string; createdUtc: string; retiredUtc: string; reason: string }[];
+  /** Edges into a robot base kept as a record of an old placement; nothing routes through them. */
+  retired?: { label: string; from?: string; to?: string; createdUtc: string; retiredUtc: string; reason: string }[];
+  /** Every live edge into a robot base: world -> fr3_base, world -> fr3_base_right, fr3_base -> fr3_base_right. */
+  links?: { from: string; to: string; label: string; createdUtc: string; sigmaMm: number | null; quality: Fr3BaseEdgeQuality }[];
   runs: {
     name: string;
     captures: number;
@@ -1454,6 +1458,9 @@ export type Fr3BaseEdgeResponse = {
   candidates: {
     name: string;
     generatedUtc: string;
+    /** The edge's ends, oriented into the base it measures (from the world, or fr3_base -> fr3_base_right). */
+    from?: string;
+    to?: string;
     label: string;
     p0Run: string;
     verdict: string;
@@ -1582,6 +1589,9 @@ export type BallCheckReport = {
   handheld_shared?: Record<string, { positions: number[]; s_mm?: number[]; s_sigma_mm?: number[]; s_per_position_mm?: number[][]; error?: string }>;
   reference_world?: string;
   world_reference_sha256?: string;
+  /** The base the FR3 centres are in (fr3_base = left arm, fr3_base_right = right); absent on checks before 11-03. */
+  base?: string;
+  robot_ips?: string[];
 };
 
 export type Fr3PivotJob = {
@@ -1649,10 +1659,14 @@ export type Fr3PivotResponse = {
   checked?: string;
   /** A check's ball edge written as a candidate of the FR3-base edge panel. */
   edgeSaved?: string;
+  /** fr3_base -> fr3_base_right from balls both arms pivoted about, written as a candidate. */
+  armArmEdge?: string;
   job: Fr3PivotJob;
   runs: {
     name: string;
     fitName: string;
+    /** The FR3 that turned about the ball: the centre is in that arm's base. */
+    robotIp?: string;
     note: string;
     created: string;
     fk: PivotFitSummary | null;
@@ -1745,6 +1759,8 @@ export type Fr3PivotJointFit = {
   name: string;
   created: string;
   runs: string[];
+  /** The FR3 its runs were collected on; "" when unrecorded or mixed. */
+  robotIp?: string;
   /** One ball centre for all runs (the ball not moved), else one per run. */
   sharedCentre: boolean;
   fk: JointPivotFitSummary | null;

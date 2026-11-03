@@ -8656,7 +8656,7 @@ if args[0] == "collect":
     print("collect: teaching mode", flush=True)
     if opt("--note") == "slow":
         time.sleep(30)
-    Path(opt("--out")).write_text(json.dumps({"note": opt("--note"), "created": "2026-10-13T16:00:00", "q": []}))
+    Path(opt("--out")).write_text(json.dumps({"robot_ip": opt("--robot-ip"), "note": opt("--note"), "created": "2026-10-13T16:00:00", "q": []}))
     print("wrote", opt("--out"), flush=True)
 elif args[0] == "fit-joint":
     runs = [a for a in args[1:] if a.endswith("_pivot.json")]
@@ -8674,7 +8674,7 @@ elif args[0] == "fit-joint":
 else:
     run = json.loads(Path(args[1]).read_text())
     Path(opt("--json")).write_text(json.dumps({
-        "note": run["note"], "created": run["created"],
+        "note": run["note"], "created": run["created"], "robot_ip": run.get("robot_ip", ""),
         "fk": {"s_ee_mm": [0.1, -0.2, -10.1], "s_sigma_mm": [0.02] * 3, "c_base_mm": [600.0, 0.0, 50.0],
                "c_sigma_mm": [0.03] * 3, "residual_rms_mm": 0.1, "residual_p95_mm": 0.2,
                "n_used": 300, "n_total": 4500, "span_deg": 32.0, "weak_singular": 0.25},
@@ -8689,6 +8689,10 @@ def _fr3_pivot_state(tmp_path, monkeypatch):
     tool = tmp_path / "tools" / "fr3" / "fr3_tcp_pivot.py"
     tool.parent.mkdir(parents=True)
     tool.write_text(_FAKE_PIVOT_TOOL)
+    # which base a pivot's centre is in: the arm's root, from the repo's own dual-FR3 description
+    embodiment = tmp_path / gateway._DUAL_FR3_EMBODIMENT
+    embodiment.parent.mkdir(parents=True, exist_ok=True)
+    embodiment.write_text((Path(__file__).resolve().parents[2] / gateway._DUAL_FR3_EMBODIMENT).read_text())
     monkeypatch.setattr(gateway, "_mujoco_replay_python", lambda _state: Path(sys.executable))
     monkeypatch.setattr(gateway, "_real_preflight_env", lambda _state: dict(os.environ))
     return state, T_live
@@ -8884,6 +8888,114 @@ def test_a_ball_checks_edge_is_saved_as_a_candidate_the_edge_panel_compares_and_
     assert applied["ok"], applied["error"]
     current = applied["current"]
     assert current["label"] == "5 个球位 · check_20261014T090000Z" and current["supersedes"] == 1
+
+
+def _write_pivot_fit(state, stamp: str, centre_m, robot_ip: str) -> str:
+    """A fitted pivot run as fr3_tcp_pivot.py leaves it: the run (with its arm's IP) and its fit."""
+    root = gateway._fr3_pivot_root(state)
+    root.mkdir(parents=True, exist_ok=True)
+    run = root / f"{stamp}_pivot.json"
+    run.write_text(json.dumps({"robot_ip": robot_ip, "note": "", "created": stamp, "q": []}))
+    fk = {"c_base_mm": (np.asarray(centre_m) * 1e3).tolist(), "c_sigma_mm": [0.05] * 3, "s_ee_mm": [0, 0, -10],
+          "residual_rms_mm": 0.1, "residual_p95_mm": 0.2, "n_used": 300, "n_total": 4000, "span_deg": 40.0,
+          "weak_singular": 0.3}
+    gateway._fr3_pivot_fit_path(run).write_text(json.dumps({"robot_ip": robot_ip, "note": "", "created": stamp, "fk": fk}))
+    return run.name
+
+
+def test_the_arm_arm_ball_edge_is_solved_compared_and_applied_with_the_loop_checked(tmp_path, monkeypatch):
+    state, T_live = _fr3_pivot_state(tmp_path, monkeypatch)
+    real_script = Path(__file__).resolve().parents[2] / "tools" / "thor" / "gmsl2" / "fr3_arm_arm_ball.py"
+    (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_arm_arm_ball.py").symlink_to(real_script)
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    left_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "left")["robot_ip"]
+    right_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")["robot_ip"]
+    c, s_ = math.cos(math.radians(2)), math.sin(math.radians(2))
+    T_left_right = np.array([[c, -s_, 0, 0.0], [s_, c, 0, -0.66], [0, 0, 1, 0.0], [0, 0, 0, 1.0]])
+    balls_right = [[0.45, 0.30, 0.05], [0.55, 0.45, 0.05], [0.40, 0.55, 0.20], [0.60, 0.25, 0.25], [0.50, 0.40, 0.35]]
+    positions = []
+    for i, ball in enumerate(balls_right):
+        left = _write_pivot_fit(state, f"20261103_10000{i}", (T_left_right @ np.r_[ball, 1.0])[:3], left_ip)
+        right = _write_pivot_fit(state, f"20261103_11000{i}", ball, right_ip)
+        positions.append({"left": left, "right": right})
+    runs = {r["name"]: r for r in gateway._fr3_pivot_payload(state)["runs"]}
+    assert runs[positions[0]["right"]]["robotIp"] == right_ip
+
+    solve = gateway._solve_arm_arm_edge
+    swapped = [{"left": p["right"], "right": p["left"]} for p in positions]
+    assert "基座是 fr3_base_right，不是 fr3_base" in solve(state, {"positions": swapped})["error"]
+    mixed = [{**positions[0], "right": positions[1]["left"]}, *positions[1:]]
+    assert "混用了两台臂" in solve(state, {"positions": mixed})["error"]
+
+    result = solve(state, {"positions": positions})
+
+    assert result["ok"], result.get("output") or result["error"]
+    payload = gateway._fr3_base_edge_payload(state)
+    candidate = next(c for c in payload["candidates"] if c["name"] == result["armArmEdge"])
+    assert (candidate["from"], candidate["to"]) == ("fr3_base", "fr3_base_right")
+    assert candidate["quality"]["method"] == "armArm" and candidate["quality"]["baselineM"] == pytest.approx(0.66, abs=0.01)
+    assert candidate["label"] == "5 个球位 · 两臂同球"
+    assert candidate["applyBlockers"] == []  # no camera side: the world reference does not apply
+    assert candidate["moveVsLive"] is None  # nothing between the two bases yet
+
+    applied = gateway._apply_fr3_base_edge(state, {"report": result["armArmEdge"]})
+    assert applied["ok"], applied["error"]
+    links = {(l["from"], l["to"]): l for l in applied["links"]}
+    assert set(links) == {("world_a", "fr3_base"), ("fr3_base", "fr3_base_right")}
+    assert links[("fr3_base", "fr3_base_right")]["sigmaMm"] == 0.5
+    assert applied["current"]["world"] == "world_a"  # the datasets' edge is still world -> fr3_base
+    graph = gateway.wp.read_world_graph(state.repo_root)
+    _, hops = gateway.wp.world_transform(graph, "world_a", "fr3_base_right")
+    assert len(hops) == 2
+
+    # a world -> fr3_base_right edge 40 mm off the route through fr3_base does not close the loop: refused
+    T_world_right = np.linalg.inv(T_left_right) @ np.asarray(T_live)
+    _write_edge_candidate(state, "right_far.json", _shift_x(T_world_right.tolist(), 0.04))
+    far = json.loads((tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_far.json").read_text())
+    far["edge"]["to_world_frame_id"] = "fr3_base_right"
+    far["target_node"]["world_frame_id"] = "fr3_base_right"
+    (tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_far.json").write_text(json.dumps(far))
+    refused = gateway._apply_fr3_base_edge(state, {"report": "right_far.json"})
+    assert not refused["ok"] and "do not close" in refused["error"]
+    # one that agrees goes in as the loop's second route
+    near = {**far, "edge": {**far["edge"], "T_to_from": _shift_x(T_world_right.tolist(), 0.001)}}
+    (tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_near.json").write_text(json.dumps(near))
+    assert gateway._apply_fr3_base_edge(state, {"report": "right_near.json"})["ok"]
+    assert len(gateway._fr3_base_edge_payload(state)["links"]) == 3
+
+
+def test_a_right_arm_ball_check_is_run_against_the_right_arms_base(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        out = Path(command[command.index("--out") + 1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"schema": "fr3_base_ball_check/v1", "positions": [], "edges": [], "ball_edges": {}}))
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    right_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")["robot_ip"]
+    left_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "left")["robot_ip"]
+    run_r = _write_pivot_fit(state, "20261103_120000", [0.5, 0.3, 0.1], right_ip)
+    run_l = _write_pivot_fit(state, "20261103_120100", [0.5, 0.3, 0.1], left_ip)
+    ds = state.datasets_root / "hh"
+    (ds / "meta").mkdir(parents=True)
+    (ds / "meta" / "info.json").write_text("{}")
+    (ds / "episodes" / "episode_000000").mkdir(parents=True)
+    (ds / "episodes" / "episode_000000" / "meta.json").write_text(json.dumps({"world_frame": {"status": "ok", "world_frame_id": "world_a"}}))
+    dataset = gateway._fr3_pivot_payload(state)["episodes"][0]["dataset"]
+
+    result = gateway._run_ball_check(state, {"positions": [{"pivot": run_r, "dataset": dataset, "episode": 0}]})
+    assert result["ok"], result["error"]
+    command = captured["command"]
+    assert command[command.index("--base") + 1] == "fr3_base_right"
+
+    both = [{"pivot": run_r, "dataset": dataset, "episode": 0}, {"pivot": run_l, "dataset": dataset, "episode": 0}]
+    assert "混用了两台臂" in gateway._run_ball_check(state, {"positions": both})["error"]
 
 
 def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypatch):

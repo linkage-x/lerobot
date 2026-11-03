@@ -16,6 +16,7 @@ import { Modal } from "./ConfirmModal";
 import {
   applyConfirmation,
   candidateSpread,
+  edgeEnds,
   fmtNum,
   laserSelectionWarnings,
   liveEdgeSummary,
@@ -87,7 +88,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
   return (
     <section className="panel">
       <div className="cali-result-head">
-        <h3>FR3 基座注册边 · world → fr3_base</h3>
+        <h3>FR3 基座注册边 · world → fr3_base / fr3_base_right</h3>
         <div className="cali-op-actions">
           <span className="cali-preview-badge">单 tag 手眼</span>
           <button className="cali-mini-btn" disabled={disabled} onClick={() => act("refresh", () => api.fetchFr3BaseEdge())}>
@@ -117,6 +118,19 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
             {w}
           </p>
         ))}
+        {(payload?.links ?? []).length ? (
+          <>
+            <p className="cali-muted">所有到机器人基座的现役边（导出用 world → fr3_base；右臂经 fr3_base → fr3_base_right 或 world → fr3_base_right）：</p>
+            <ul>
+              {(payload?.links ?? []).map((l) => (
+                <li key={`${l.from}-${l.to}-${l.createdUtc}`}>
+                  {edgeEnds(l.from, l.to)} · {methodLabel(l.quality)} · {l.label} · 写入 {l.createdUtc || "—"}
+                  {l.sigmaMm != null ? ` · σ ${fmtNum(l.sigmaMm, 1, " mm")}` : ""}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : null}
       </div>
 
       <div className="cali-result-box">
@@ -267,6 +281,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
           <table className="metric-table">
             <thead>
               <tr>
+                <th>边</th>
                 <th>来源</th>
                 <th>方法</th>
                 <th>判定</th>
@@ -278,6 +293,7 @@ export function Fr3BaseEdgePanel({ api, busy }: { api: DataCollectionGuiApi; bus
             <tbody>
               {payload.candidates.map((c) => (
                 <tr key={c.name} title={c.reasons.join("；")}>
+                  <td>{edgeEnds(c.from, c.to)}</td>
                   <td>
                     {c.label}
                     <div className="cali-muted">{c.generatedUtc}</div>

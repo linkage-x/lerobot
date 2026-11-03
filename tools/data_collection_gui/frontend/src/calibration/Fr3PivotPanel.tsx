@@ -29,12 +29,15 @@ import {
   jointFitLines,
   jobStatusText,
   pivotFitWarnings,
+  checkBaseLabel,
+  mixedArmWarning,
   positionDraftWarnings,
   rankedEdges,
   socketFrameVerdict,
   type PositionDraft,
 } from "./fr3Pivot";
 import { fmtNum } from "./fr3BaseEdge";
+import { Fr3ArmArmEdge } from "./Fr3ArmArmEdge";
 
 const POLL_MS = 1000;
 const LOG_TAIL = 14;
@@ -104,7 +107,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const duration = Number(durationS || payload?.defaultDurationS || 45);
   const [lo, hi] = payload?.durationRangeS ?? [15, 180];
   const disabled = busy || running !== "";
-  const draftWarnings = positionDraftWarnings(drafts, runs, episodes);
+  const draftWarnings = [...positionDraftWarnings(drafts, runs, episodes), mixedArmWarning(drafts, runs, joints)].filter(Boolean);
   const completeDrafts = drafts.filter((d) => d.pivot && d.episodeKey);
   const checks = payload?.checks ?? [];
   const shown: BallCheckReport | null = checks.find((c) => c.name === checkName) ?? checks[0] ?? null;
@@ -470,9 +473,11 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
       ) : null}
       {edgeSaved ? (
         <p>
-          已存为候选边 <code>{edgeSaved}</code>：到「world → fr3_base 注册边」面板点刷新，和现役边比较挪动量后再换边。
+          已存为候选边 <code>{edgeSaved}</code>：到「FR3 基座注册边」面板点刷新，和现役边比较挪动量后再换边。
         </p>
       ) : null}
+
+      <Fr3ArmArmEdge api={api} payload={payload} arms={arms} disabled={disabled} running={running === "armArm"} act={act} />
 
       {error ? <pre className="cali-warn">{error}</pre> : null}
       {output ? <pre className="marker-tcp-example">{output}</pre> : null}
@@ -538,6 +543,7 @@ function BallCheckResult({
         </select>
       </div>
       <p>{ballCheckVerdict(report)}</p>
+      <p className="cali-muted">{checkBaseLabel(report)}</p>
       {ranked.length ? (
         <table className="metric-table">
           <thead>

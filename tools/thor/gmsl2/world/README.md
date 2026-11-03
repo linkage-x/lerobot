@@ -127,6 +127,29 @@ retire --from-world <world> --reason "<what moved>"` retires an edge; at the
 final placement re-register and `apply` the new edge (`--replace` files the
 retired one under its `supersedes`).
 
+### Two arms: `fr3_base_right` and the arm-arm edge (2026-11-03)
+
+`embodiments/fr3_dual.json` gives each FR3 its own root: the left arm
+(192.168.11.102) is `fr3_base`, the right (192.168.1.210) `fr3_base_right`.
+Three edges can reach them, all from the calibration page:
+
+- **world → fr3_base** and **world → fr3_base_right**: the ball check, one arm
+  at a time. The base comes from the pivots themselves -- each fit records the
+  `robot_ip` it was collected on (a joint fit, its runs'), the gateway maps it
+  through `fr3_arms.json` and the embodiment to the arm's root and passes
+  `fr3_base_ball_check.py --base`; a check that mixes the two arms' pivots is
+  refused.
+- **fr3_base → fr3_base_right**: `fr3_arm_arm_ball.py` (B3). The same balls
+  pivoted about by both arms, FK on both sides (no camera, no TCP), rigid fit
+  over ≥ 4 positions judged by leave-one-out (≤ 3 mm), `sigma_mm` = its
+  leave-one-out rms (≥ 0.5 mm). `register_fr3_base.check_reference` passes it:
+  no camera pose went into it.
+
+The panel applies any of them with `close_loop`: once the world reaches both
+bases and the arm-arm edge exists, a new edge goes in only if every route
+between its ends agrees within the edges' sigmas (`world_closures`), so a
+moved cart or a bad registration is refused instead of picked silently.
+
 ### The table datum (`table_datum.json`, 2026-10-27)
 
 Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are
