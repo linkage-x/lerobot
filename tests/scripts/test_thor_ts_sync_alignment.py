@@ -269,6 +269,32 @@ def test_end_to_end_alignment_via_parquet(tmp_path):
 # 6. schema contract: MCU timestamps live in metadata, not observation.state
 # --------------------------------------------------------------------------
 
+def test_the_fingertip_pads_are_in_state_after_every_older_channel():
+    # 2026-11-03, rig: each finger has two pads, touch_device_id 0 by the finger root
+    # (box_touch_left/right) and 1 at the fingertip (box_touch_*_1). Both are state.
+    one_pad = lr3.BOX_STATE_NAMES_ONE_PAD
+    assert lr3.BOX_STATE_NAMES[: len(one_pad)] == one_pad  # older channels keep their index
+    assert lr3.BOX_STATE_NAMES[len(one_pad):] == tuple(
+        f"box_touch_{side}_1.{name}" for side in ("left", "right") for name in lr3._TOUCH_SUMMARY_NAMES
+    )
+    assert lr3.BOX_TIMESTAMP_NAMES[-2:] == ("box_touch_left_1.timestamp", "box_touch_right_1.timestamp")
+    assert lr3.BOX_TIMESTAMP_NAMES[:-2] == lr3.BOX_TIMESTAMP_NAMES_ONE_PAD
+    assert lr3.box_state_names(("box1", "box2"), one_pad=True)[len(one_pad)] == f"box2.{one_pad[0]}"
+
+    def pad(fz: int, ts: int) -> dict:
+        return {"timestamp": ts, "points": 9, "fx_0p1N": [0] * 9, "fy_0p1N": [0] * 9, "fz_0p1N": [fz] * 3 + [0] * 6}
+
+    snap = {"sensors": {"box_touch_left": pad(2, 10), "box_touch_left_1": pad(40, 11), "box_touch_right": pad(0, 12)}}
+    state = dict(zip(lr3.BOX_STATE_NAMES, lr3.box_snapshot_to_state(snap), strict=True))
+    assert state["box_touch_left.mean_fz_0p1N"] == pytest.approx(2 * 3 / 9)
+    assert state["box_touch_left_1.max_abs_fz_0p1N"] == 40.0
+    assert state["box_touch_left_1.active_points"] == 3.0
+    assert all(state[f"box_touch_right_1.{n}"] == 0.0 for n in lr3._TOUCH_SUMMARY_NAMES)  # absent pad: zeros
+    stamps = dict(zip(lr3.BOX_TIMESTAMP_NAMES, lr3.box_snapshot_to_timestamps(snap), strict=True))
+    assert stamps["box_touch_left_1.timestamp"] == 11.0
+    assert stamps["box_touch_right_1.timestamp"] == 0.0
+
+
 def test_timestamps_excluded_from_state_and_emitted_as_metadata_column(tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
 

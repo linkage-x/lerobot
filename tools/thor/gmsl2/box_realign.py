@@ -237,6 +237,11 @@ def realign(
         ep = load_episode(ep_dir)
         box_ids = lr3.box_ids_from_inputs([], ep["samples"])
         if len(lr3.box_state_names(box_ids)) != width:
+            if len(lr3.box_state_names(box_ids, one_pad=True)) == width:
+                raise ValueError(
+                    f"{ep_dir.name}: recorded with one touch pad per finger in observation.state (before "
+                    "2026-11-03); this tool rebuilds rows in the current two-pad layout, so it cannot realign it"
+                )
             raise ValueError(
                 f"{ep_dir.name}: {len(box_ids)} BOX(es) in the raw data, the parquet has {width} state channels"
             )

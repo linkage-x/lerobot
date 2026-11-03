@@ -675,6 +675,36 @@ def test_a_second_pad_per_finger_gets_columns_only_where_it_was_recorded(tmp_pat
     assert rows["observation.touch.box_touch_right_1.fz_0p1N"] == [[0.0] * 9] * 2
 
 
+def test_one_pad_sessions_keep_their_names_but_never_share_an_export_with_two_pad_ones(tmp_path, capsys):
+    import shutil as _sh
+
+    pytest.importorskip("pyarrow")
+    if _sh.which("ffmpeg") is None and _sh.which("gst-launch-1.0") is None:
+        pytest.skip("no transcoder (ffmpeg / gst-launch-1.0) available")
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    cams = ("cam_00",)
+    world = "world_20260819_031843"
+    old = _make_video_session(datasets, "pick_20261102_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id=world)
+    _write_box_parquet(old, {0: 5}, state_width=len(lr3.BOX_STATE_NAMES_ONE_PAD))
+    new = _make_video_session(datasets, "pick_20261103_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id=world)
+    _write_box_parquet(new, {0: 4}, state_width=len(lr3.BOX_STATE_NAMES))
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets, exports_root=tmp_path / "exports",
+        base_name="local/pick", repo_id="local/pick", task="pick",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["features"]["observation.state"]["names"] == list(lr3.BOX_STATE_NAMES_ONE_PAD)
+    assert info["total_episodes"] == 1
+    said = capsys.readouterr().out
+    assert "one touch pad per finger" in said
+    assert "export the two layouts as separate datasets" in said
+
+
 def test_export_refuses_to_mix_two_world_frames(tmp_path):
     # Absolute poses from two coordinate systems concatenated into one training
     # set are wrong in a way no downstream check can see, so the export has to

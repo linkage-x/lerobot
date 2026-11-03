@@ -1399,13 +1399,11 @@ def export_task_to_v3(
     if first_snapshots and first_snapshot_box_ids != ("",):
         box_state_names = list(lr3.box_state_names(first_snapshot_box_ids))
         box_ts_names = list(lr3.box_timestamp_names(first_snapshot_box_ids))
-        state_width = len(box_state_names)
-        ts_width = len(box_ts_names)
 
-    # Prefer the recorder's already-synced session parquet when it already has
-    # the selected schema. Export no longer re-derives BOX rows from raw jsonl or
-    # low-rate meta snapshots; the recording path owns BOX↔camera alignment.
-    if state_width == 0 and first_box:
+    # The recorder's already-synced session parquet decides the width. Export no
+    # longer re-derives BOX rows from raw jsonl or low-rate meta snapshots; the
+    # recording path owns BOX↔camera alignment.
+    if first_box:
         sample_row = None
         if first.local_index in first_box and first_box[first.local_index]:
             sample_row = first_box[first.local_index][0]
@@ -1417,8 +1415,25 @@ def export_task_to_v3(
         if sample_row is not None:
             state_width = len(sample_row["observation.state"])
             ts_width = len(sample_row.get("box.timestamps", []))
+    if state_width == 0 and first_snapshots and first_snapshot_box_ids != ("",):
+        state_width = len(box_state_names)
+        ts_width = len(box_ts_names)
 
     has_box = state_width > 0
+
+    # Sessions recorded before the fingertip pads joined observation.state
+    # (2026-11-03) have the same channels minus the trailing box_touch_*_1 ones,
+    # so they keep their names -- but they are a different layout, and the
+    # per-episode loop below refuses to put the two into one dataset.
+    if has_box and len(box_state_names) != state_width:
+        one_pad = lr3.box_state_names(first_snapshot_box_ids, one_pad=True)
+        if len(one_pad) == state_width:
+            box_state_names = list(one_pad)
+            box_ts_names = list(lr3.box_timestamp_names(first_snapshot_box_ids, one_pad=True))
+            _emit(
+                f"NOTE: one touch pad per finger in observation.state ({state_width} channels, "
+                "recorded before 2026-11-03); the fingertip pads are not in it"
+            )
 
     # The recorded parquet width wins, but a width that disagrees with the
     # current BOX_STATE_NAMES means the session predates a schema change (e.g.
@@ -1628,6 +1643,13 @@ def export_task_to_v3(
                         f"  note: {src.ep_dir.name} box grid {box_grid_len} vs camera {n_frames}; "
                         f"aligned by frame_index"
                     )
+            elif box_rows:
+                _emit(
+                    f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: its observation.state has "
+                    f"{parquet_width} channels, the first episode's {state_width} (one touch pad per finger "
+                    "vs two, before/after 2026-11-03?); export the two layouts as separate datasets"
+                )
+                continue
             else:
                 _emit(
                     f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: "

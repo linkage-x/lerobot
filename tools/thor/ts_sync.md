@@ -567,7 +567,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 
 `export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（taxel 维数按贴片型号，见 §9.3）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
 
-### 9.1 `observation.state` / `action`（float32，**28** 维）
+### 9.1 `observation.state` / `action`（float32，每台 BOX **44** 维）
 
 只放可训练的传感器读数，**不含任何时间戳、不含状态位**。通道分组（`BOX_STATE_NAMES`）：
 
@@ -576,12 +576,15 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 | gripper | `box_gripper.distance_m` | 1 |
 | trigger | `box_trigger.travel_pct` | 1 |
 | IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `quat_{x,y,z,w}` | 10（姿态只留四元数，**xyzw 标量在后**，见 §9.1.1） |
-| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
-| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（**按贴片实际触点数**聚合，见 §9.3） | 5+5 |
+| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` / `box_six_d_force_no_gravity.*` | 6+6 |
+| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（**按贴片实际触点数**聚合，见 §9.3）；先指根那片 `box_touch_left/right`，再指尖那片 `box_touch_left_1/right_1`（排在最后） | 5+5+5+5 |
 
 > 演进：42 维（含重复 `gripper.pos`、7 个 `*.timestamp`、恒定死通道 `box_status.{valid,liwp_index}`）
 > → 33 维（去重 gripper + 时间戳移出, 见 §9.2）→ 31 维（再删掉恒为常量的 `box_status.valid`(恒 1)
-> 和 `liwp_index`(HF 路径恒 0)）→ **28 维**（删 IMU 的 `roll/pitch/yaw_deg`，与 `quat` 冗余，见 §9.1.1）。
+> 和 `liwp_index`(HF 路径恒 0)）→ 28 维（删 IMU 的 `roll/pitch/yaw_deg`，与 `quat` 冗余，见 §9.1.1）
+> → 34 维（加 `box_six_d_force_no_gravity.*`）→ **44 维**（2026-11-03：每指第二片、靠指尖的贴片也进 state，
+> 追加在末尾，前 34 维下标不变；旧 34 维 session 导出时仍带列名(`BOX_STATE_NAMES_ONE_PAD`)，但不能和 44 维的同批导出，
+> `export_v3` 会跳过并说明；`box_realign` 只处理 44 维）。
 > 原则：state 只留可训练的传感器读数, 不放单调计数/常量/同一量的第二种编码, 避免归一化被带歪与时间泄漏。
 
 #### 9.1.1 IMU 姿态去冗余（31 → 28 维，`rpy` 删除 + quat 改 xyzw）✅ 2026-07-29
@@ -642,10 +645,10 @@ checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要�
 注意 `export_v3` **不会**把旧的 31 维 session parquet 转成 28 维——它复用录制器已同步的 state，只会
 按上表警告并丢掉列名。
 
-### 9.2 `box.timestamps` 元数据列（float64，**6** 维，非训练）
+### 9.2 `box.timestamps` 元数据列（float64，每台 BOX **8** 维，非训练）
 
-每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：**6 个传感器各一个 `*.timestamp`**
-（gripper / trigger / imu / six_d_force / touch_left / touch_right）。曾经一并放进来的
+每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：**8 个传感器各一个 `*.timestamp`**
+（gripper / trigger / imu / six_d_force / touch_left / touch_right / touch_left_1 / touch_right_1；2026-11-03 前是前 6 个）。曾经一并放进来的
 `box_status.liwp_timestamp` / `received_wall_time_s` 因 **HF 录制路径恒为 0** 且与 per-sensor
 mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更细更准）。
 
@@ -670,7 +673,7 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 | 239 | Paxini L5325 | 厂商 XYZ 坐标表 |
 | 9 | M2020 | 3×3，线缆在左，行优先编号 1–9 |
 
-- `_decode_touch()` 整帧透传，按长度打 `model` / `points`（不在 `TOUCH_MODELS` 里的长度记 `"unknown"`）并带 `touch_device_id`。同一 terminal 上的贴片按 `touch_device_id` 排序映射：最小的仍是 `box_touch_left` / `box_touch_right`，第二片是 `box_touch_left_1` / `box_touch_right_1`（11-02 的机器每指两片，id 0、1；11-03 采集 BOX 3906437858 逐片按压确认：id 0＝靠指根那片、id 1＝靠指尖那片，两片互相独立、串扰 ≤0.3 N）；第三片丢弃并告警一次。第二片原样录进 `box_sensors.jsonl`；导出时只有该批 episode 里录到了第二片，才多出 `observation.touch.box_touch_*_1.*` 列（一片的数据 schema 不变）。它**不进** `observation.state`：`BOX_STATE_NAMES` 仍是每指一片的摘要。
+- `_decode_touch()` 整帧透传，按长度打 `model` / `points`（不在 `TOUCH_MODELS` 里的长度记 `"unknown"`）并带 `touch_device_id`。同一 terminal 上的贴片按 `touch_device_id` 排序映射：最小的仍是 `box_touch_left` / `box_touch_right`，第二片是 `box_touch_left_1` / `box_touch_right_1`（11-02 的机器每指两片，id 0、1；11-03 采集 BOX 3906437858 逐片按压确认：id 0＝靠指根那片、id 1＝靠指尖那片，两片互相独立、串扰 ≤0.3 N）；第三片丢弃并告警一次。第二片原样录进 `box_sensors.jsonl`；导出时只有该批 episode 里录到了第二片，才多出 `observation.touch.box_touch_*_1.*` 列（一片的数据 schema 不变）。2026-11-03 起它的摘要也进 `observation.state`（排在最后，见 §9.1），没有第二片的 BOX 这 10 维为 0。
 - `box_collection.touch_model` 不再影响数据：`auto` 取首帧型号，钉死的值只在帧型号不符时告警一次。
 - v4.0 及以前（历史数据）：所有贴片共用 239 槽定长数组，M2020 由 `fill_touch_from_m2020()` 只填槽 0–8，型号靠链路流 id 8/9 识别、识别前按 239 槽透传 —— 读旧数据时 `points`/`model` 标签依旧可信。
 - `_touch_summary()` 的 `mean_f{x,y,z}` 按**实际触点数**求平均。曾硬编码除以 239：M2020 下同样的物理接触，均值被稀释 239/9 ≈ 26.6 倍（实测 132514 数据集：`mean_fz` 0.435 → 11.556）。
