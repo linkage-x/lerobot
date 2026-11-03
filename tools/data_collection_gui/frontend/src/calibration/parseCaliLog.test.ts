@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseForceVec, parseCaliLog, evaluateForce } from "./parseCaliLog";
+import { parseForceVec, parseCaliLog, evaluateForce, evaluateForceAgainstLoad } from "./parseCaliLog";
 import { ORIGIN_FORCE_LIMITS, DYNAMIC_FORCE_LIMITS } from "./config";
 import type { BoxCaliLogLine } from "../types";
 
@@ -102,5 +102,37 @@ describe("evaluateForce — origin vs dynamic Fz/Mx criteria differ", () => {
     const skewed = { fx: 0, fy: 0, fz: 0, mx: 0.05, my: 0, mz: 0 };
     const res = evaluateForce(skewed, ORIGIN_FORCE_LIMITS);
     expect(res.axes.find((a) => a.axis === "mx")?.pass).toBe(false);
+  });
+});
+
+describe("evaluateForceAgainstLoad — the dynamic check at the attitude the BOX rests in", () => {
+  // 11-03, left collector 3969377039 standing on its feet ~5.5 deg off vertical, right after a
+  // software zero: fxyz_mxyz and the SDK's fxyz_mxyz_gravity at that attitude.
+  const after = { fx: -0.793, fy: 0.134, fz: -7.691, mx: -0.18, my: -0.042, mz: 0.017 };
+  const load = { fx: -0.717, fy: 0.2, fz: -7.748, mx: -0.18, my: -0.041, mz: 0.016 };
+
+  it("the fixed spec numbers fail it on tilt alone", () => {
+    const fixed = evaluateForce(after, DYNAMIC_FORCE_LIMITS);
+    expect(fixed.pass).toBe(false);
+    expect(fixed.axes.filter((a) => !a.pass).map((a) => a.axis)).toEqual(["fx", "mx", "my", "mz"]);
+  });
+
+  it("against the payload weight at that attitude it passes", () => {
+    expect(evaluateForceAgainstLoad(after, load, DYNAMIC_FORCE_LIMITS).pass).toBe(true);
+  });
+
+  it("gripper-down the load is the spec, so it judges exactly like the fixed numbers", () => {
+    const down = { fx: 0, fy: 0, fz: -7.784, mx: -0.168, my: 0, mz: 0 };
+    const off = { fx: 0.1, fy: 0.1, fz: -7.784, mx: -0.2, my: 0, mz: 0 };
+    expect(evaluateForceAgainstLoad(off, down, DYNAMIC_FORCE_LIMITS).pass).toBe(evaluateForce(off, DYNAMIC_FORCE_LIMITS).pass);
+    expect(evaluateForceAgainstLoad(down, down, DYNAMIC_FORCE_LIMITS).pass).toBe(true);
+  });
+
+  it("a run that zeroed the payload away still fails, with the expected value in the reason", () => {
+    const zeroed = { fx: 0, fy: 0, fz: 0, mx: 0, my: 0, mz: 0 };
+    const res = evaluateForceAgainstLoad(zeroed, load, DYNAMIC_FORCE_LIMITS);
+    expect(res.pass).toBe(false);
+    expect(res.firstFailure).toContain("Fx");
+    expect(res.axes.find((a) => a.axis === "fz")?.reason).toContain("-7.75");
   });
 });

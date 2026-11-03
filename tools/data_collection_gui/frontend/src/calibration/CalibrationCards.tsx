@@ -280,7 +280,8 @@ export function ForceCalibrationCard({
         </div>
       ) : (
         <div className="cali-info">
-          动态校准后 Fz 应落在 <b>-7.784 ± 0.5 N</b>、Mx 应落在 <b>-0.168 ± 0.01 N·m</b>（保留负载，不应接近 0）；|Fx|,|Fy| ≤ 0.5 N，|My|,|Mz| ≤ 0.01 N·m。
+          动态校准后读数应等于负载（夹爪）在当前姿态下的重力（保留负载，不应接近 0），力 ± 0.5 N、力矩 ± 0.01 N·m。
+          夹爪朝下时就是 Fz <b>-7.784</b>、Mx <b>-0.168</b>、其余 ≈ 0；放歪了负载会分到 Fx/Fy/My/Mz 上，按 SDK 给出的当前姿态重力比，不算失败。
         </div>
       )}
 

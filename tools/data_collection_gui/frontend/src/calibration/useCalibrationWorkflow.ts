@@ -23,7 +23,7 @@ import {
   type CalibrationKind,
   type ForceAxisLimits,
 } from "./config";
-import { evaluateForce, parseCaliLog } from "./parseCaliLog";
+import { evaluateForce, evaluateForceAgainstLoad, parseCaliLog } from "./parseCaliLog";
 import {
   deviceBoxId,
   softwareVersion,
@@ -290,8 +290,9 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
     const { api, sampleDevices, sampleKind, limits, kind, operator, onRecord } = cfgRef.current;
 
     // Live snapshot per box for fallback / touch residuals.
-    const liveByBox = new Map<string, { force: ForceVec | null; net: number | null; residual: number | null }>();
-    const liveByDevice = new Map<string, { force: ForceVec | null; net: number | null; residual: number | null; label: string; boxId: string }>();
+    type LiveEntry = { force: ForceVec | null; load: ForceVec | null; net: number | null; residual: number | null };
+    const liveByBox = new Map<string, LiveEntry>();
+    const liveByDevice = new Map<string, LiveEntry & { label: string; boxId: string }>();
     await Promise.all(
       sampleDevices.map(async (dev) => {
         const preview = await api.fetchBoxPreview(dev.id);
@@ -299,6 +300,8 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
         const fz = numberArray(sensor?.["fz_0p1N"]);
         const entry = {
           force: forceVecFromSensor(sensor),
+          // the SDK's payload-weight model at the live attitude (v4.0+); null on older SDKs
+          load: forceVecFromSensor(sensor, "fxyz_mxyz_gravity"),
           net: touchNetForceN(fz),
           residual: touchMaxResidual0p1N(fz),
         };
@@ -312,10 +315,15 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
     const records: CalibrationRecord[] = [];
 
     if (sampleKind === "force" && limits) {
-      const singleLiveForce = liveByBox.size === 1 ? [...liveByBox.values()][0]?.force ?? null : null;
+      // dynamic: judged against the payload weight at the attitude the BOX rests in (see
+      // evaluateForceAgainstLoad); origin, or an SDK without the model: the fixed spec numbers
+      const judge = (vec: ForceVec, load: ForceVec | null | undefined) =>
+        kind === "force_dynamic" && load ? evaluateForceAgainstLoad(vec, load, limits) : evaluateForce(vec, limits);
+      const singleLive = liveByBox.size === 1 ? [...liveByBox.values()][0] ?? null : null;
       const results: ForceBoxResult[] = parsed.results.map((r) => {
-        const after = r.after ?? liveByBox.get(r.boxId)?.force ?? singleLiveForce;
-        const evaluation = after ? evaluateForce(after, limits) : null;
+        const live = liveByBox.get(r.boxId) ?? singleLive;
+        const after = r.after ?? live?.force ?? null;
+        const evaluation = after ? judge(after, live?.load) : null;
         const pass = (r.ok !== false) && !!evaluation?.pass;
         records.push({
           id: `${Date.now()}-${r.boxId}-${kind}`,
@@ -335,7 +343,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
       // If the log yielded no per-box lines, fall back to live-only evaluation.
       if (results.length === 0) {
         for (const [id, entry] of liveByDevice) {
-          const evaluation = entry.force ? evaluateForce(entry.force, limits) : null;
+          const evaluation = entry.force ? judge(entry.force, entry.load) : null;
           const pass = !!evaluation?.pass;
           results.push({ boxId: entry.boxId, ok: null, error: null, before: null, after: entry.force, evaluation, pass });
           records.push({
