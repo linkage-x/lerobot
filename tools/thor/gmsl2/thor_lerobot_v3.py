@@ -104,6 +104,11 @@ BOX_SENSOR_IDS: tuple[str, ...] = (
     "box_six_d_force",
     "box_touch_left",
     "box_touch_right",
+    # The second pad on each finger (BOX SDK v4.1). Recognised so a per-box snapshot keeps it,
+    # but not in observation.state: BOX_STATE_NAMES summarises one pad per finger, and its
+    # taxels reach the dataset as observation.touch.box_touch_*_1.* columns (export_v3).
+    "box_touch_left_1",
+    "box_touch_right_1",
 )
 
 

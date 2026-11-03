@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from typing import Any
@@ -1191,12 +1192,15 @@ def test_caps_to_sensor_ids_expands_touch_and_keeps_canonical_order():
     assert box_client.caps_to_sensor_ids(box_client.CAP_TOUCH) == [
         "box_touch_left", "box_touch_right",
     ]
-    # All caps -> full KNOWN_SENSOR_IDS in canonical order.
+    # All caps -> KNOWN_SENSOR_IDS in canonical order, less the second pads: one
+    # CAP_TOUCH bit cannot say how many pads a finger has, so those surface once they stream.
     all_caps = (
         box_client.CAP_GRIPPER | box_client.CAP_IMU | box_client.CAP_TRIGGER
         | box_client.CAP_6D_FORCE | box_client.CAP_TOUCH
     )
-    assert box_client.caps_to_sensor_ids(all_caps) == list(box_client.KNOWN_SENSOR_IDS)
+    assert box_client.caps_to_sensor_ids(all_caps) == [
+        sid for sid in box_client.KNOWN_SENSOR_IDS if sid not in ("box_touch_left_1", "box_touch_right_1")
+    ]
 
 
 def test_discover_boxes_returns_empty_when_wheel_missing(monkeypatch):
@@ -1471,24 +1475,60 @@ def test_decode_touch_tags_the_pad_its_frame_length_identifies():
     assert odd["points"] == 64 == len(odd["fz_0p1N"])
 
 
-def test_terminal_with_several_touch_devices_records_lowest_id_and_warns_once(caplog):
+def test_two_pads_per_finger_record_as_their_own_sensors():
+    # 11-02 rig: each finger carries two pads, touch_device_id 0 and 1. The first keeps the
+    # pre-v4.1 id (a one-pad rig records what it always did), the second gets ``_1``.
     box_client._warned_multi_touch.clear()
     snap = _SensorCache(
         touch=(
-            {7: _Touch(timestamp=70), 2: _Touch(timestamp=20)},
+            {1: _Touch(timestamp=11), 0: _Touch(timestamp=10)},
+            {0: _Touch(timestamp=20), 1: _Touch(timestamp=21)},
+        )
+    )
+    sensors = box_client.decode_sensor_cache(snap)["sensors"]
+    assert {sid: (d["touch_device_id"], d["timestamp"]) for sid, d in sensors.items() if "touch" in sid} == {
+        "box_touch_left": (0, 10),
+        "box_touch_left_1": (1, 11),
+        "box_touch_right": (0, 20),
+        "box_touch_right_1": (1, 21),
+    }
+    stamps = box_client._decode_sensor_timestamps(snap)
+    assert [stamps[sid] for sid in box_client.TOUCH_SENSOR_IDS] == [10, 11, 20, 21]
+    # The recording path decodes only what changed: one pad's new frame, not its neighbour's.
+    changed = box_client._decode_changed_sensors(snap, {"box_touch_right_1"})["sensors"]
+    assert list(changed) == ["box_touch_right_1"] and changed["box_touch_right_1"]["timestamp"] == 21
+    assert not box_client._warned_multi_touch
+
+
+def test_a_third_pad_on_a_finger_is_dropped_with_one_warning(caplog):
+    box_client._warned_multi_touch.clear()
+    snap = _SensorCache(
+        touch=(
+            {7: _Touch(timestamp=70), 2: _Touch(timestamp=20), 5: _Touch(timestamp=50)},
             {},
         )
     )
     with caplog.at_level(logging.WARNING, logger="box_client"):
         for _ in range(3):
             out = box_client.decode_sensor_cache(snap)
-    left = out["sensors"]["box_touch_left"]
-    assert left["touch_device_id"] == 2
-    assert left["timestamp"] == 20
+    assert out["sensors"]["box_touch_left"]["touch_device_id"] == 2
+    assert out["sensors"]["box_touch_left_1"]["touch_device_id"] == 5
+    assert not any(d.get("touch_device_id") == 7 for d in out["sensors"].values())
     assert "box_touch_right" not in out["sensors"]
-    assert box_client._decode_sensor_timestamps(snap)["box_touch_left"] == 20
-    warnings = [r for r in caplog.records if "reports 2 devices" in r.getMessage()]
+    assert box_client._decode_sensor_timestamps(snap)["box_touch_right_1"] == 0
+    warnings = [r for r in caplog.records if "reports 3 devices" in r.getMessage()]
     assert len(warnings) == 1
+
+
+def test_a_second_pad_gets_a_status_row_once_it_streams():
+    # Discovery's one CAP_TOUCH bit cannot announce it, so it is not in expected_devices.
+    cfg = box_client.BoxClientConfig(enabled=True, box_id="box0",
+                                     expected_devices=list(box_client.caps_to_sensor_ids(box_client.CAP_TOUCH)))
+    client = box_client.BoxClient(cfg)
+    with client._lock:
+        assert "box_touch_left_1" not in client._status_locked()["sensor_status"]
+        client._last_seen_at_s["box_touch_left_1"] = time.monotonic()
+        assert client._status_locked()["sensor_status"]["box_touch_left_1"]["fresh"]
 
 
 def test_touch_point_count_round_trips_through_the_model_table():

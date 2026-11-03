@@ -20,17 +20,19 @@ def test_the_registry_agrees_with_the_replay_yaml_and_the_embodiments() -> None:
         start = np.asarray(arm["start_joints_rad"])
         assert np.allclose(start, kin.Q_READY)  # what Panda.move_to_start() did before B2
         assert np.all(start > kin.Q_LOWER) and np.all(start < kin.Q_UPPER)
-    # 10-26: the registered arm (fr3_base) is the left one; the new one on its right has a bare flange
+    # 10-26: the registered arm (fr3_base) is the left one; the new one went in to its right.
     assert registry["arms"]["left"]["robot_ip"] == "192.168.11.102" and dual["left"]["root"] == "fr3_base"
     assert single["left"]["replay_config"] == registry["arms"]["left"]["replay_config"]
-    assert registry["arms"]["right"]["corenetic_device_id"] is None
+    # 11-02: the gripper moved to the right arm, under the id the v4.1 firmware gave its BOX
+    assert registry["arms"]["right"]["corenetic_device_id"] == 3100715645
+    assert registry["arms"]["left"]["corenetic_device_id"] is None
 
 
 def test_a_registry_that_disagrees_with_its_yaml_is_refused() -> None:
     registry = json.loads((fa._REPO_ROOT / fa.REGISTRY).read_text())
     wrong = copy.deepcopy(registry)
-    wrong["arms"]["left"]["corenetic_device_id"] = 1819152274  # the handheld BOX (10-09)
-    assert any("corenetic_device_id" in p and "says 596523097" in p for p in fa.validate(wrong))
+    wrong["arms"]["right"]["corenetic_device_id"] = 3906437858  # the handheld BOX (v4.1 firmware id)
+    assert any("corenetic_device_id" in p and "says 3100715645" in p for p in fa.validate(wrong))
     twins = copy.deepcopy(registry)
     twins["arms"]["right"] = dict(twins["arms"]["left"])
     assert any(p.startswith("two arms share robot_ip") for p in fa.validate(twins))
@@ -38,8 +40,8 @@ def test_a_registry_that_disagrees_with_its_yaml_is_refused() -> None:
     silent["arms"]["left"].update(in_service=False, why_not="")
     assert "arm left: not in service and no why_not" in fa.validate(silent)
     bare = copy.deepcopy(registry)
-    bare["arms"]["right"]["no_gripper_why"] = ""
-    assert "arm right: no gripper BOX (corenetic_device_id null) needs no_gripper_why" in fa.validate(bare)
+    bare["arms"]["left"]["no_gripper_why"] = ""
+    assert "arm left: no gripper BOX (corenetic_device_id null) needs no_gripper_why" in fa.validate(bare)
 
 
 def test_there_is_no_default_arm() -> None:
@@ -58,7 +60,7 @@ def test_there_is_no_default_arm() -> None:
         fa.resolve(registry, "left", "192.168.11.103")
     assert fa.resolve(registry, robot_ip="192.168.11.102")["arm"] == "left"
     assert fa.resolve(registry, robot_ip="192.168.1.210")["arm"] == "right"
-    assert fa.resolve(registry, "LEFT")["corenetic_device_id"] == 596523097
+    assert fa.resolve(registry, "RIGHT")["corenetic_device_id"] == 3100715645
 
 
 def test_the_payload_check_compares_desk_with_the_declared_load() -> None:

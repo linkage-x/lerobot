@@ -590,3 +590,42 @@ def test_an_unmeasurable_correction_is_null_rather_than_a_reassuring_zero() -> N
     summary = _alignment_summary(thor_record, corrected=[0.0, 1 / 60], raw=None)
 
     assert summary["exposure_correction_ms"] is None
+
+
+def test_connect_never_set_modes_any_fr3_gripper_box_the_registry_names(tmp_path):
+    # 10-31: the v4.1 firmware renumbered every BOX, the YAML's keep_mode id went stale, and each
+    # Connect would have set the arm's gripper BOX to mode 0 (jaw to its own trigger: it opens).
+    tr = _load_thor_record_module()
+    registry = tmp_path / "fr3_arms.json"
+    registry.write_text(json.dumps({"arms": {
+        "right": {"corenetic_device_id": 3100715645},
+        "left": {"corenetic_device_id": None},
+    }}))
+    cfg = bc.fleet_from_yaml_dict({"enabled": True, "keep_mode_device_ids": [596523097]})
+    assert tr._keep_fr3_gripper_box_modes(cfg, registry) == [3100715645]
+    assert cfg.keep_mode_device_ids == [596523097, 3100715645]
+    assert tr._keep_fr3_gripper_box_modes(cfg, registry) == []  # already kept: nothing doubled
+
+    cfg = bc.fleet_from_yaml_dict({"enabled": True, "keep_mode_device_ids": [7]})
+    assert tr._keep_fr3_gripper_box_modes(cfg, tmp_path / "missing.json") == []
+    assert cfg.keep_mode_device_ids == [7]
+    # the repo's own registry names the arm's gripper BOX
+    cfg = bc.fleet_from_yaml_dict({"enabled": True})
+    assert 3100715645 in tr._keep_fr3_gripper_box_modes(cfg)
+
+
+def test_a_second_touch_pad_streaming_gets_a_device_row():
+    # Discovery's one CAP_TOUCH bit announces one pad per finger; the second only streams.
+    tr = _load_thor_record_module()
+    roster = [
+        {"box_id": "box1", "expected_devices": ["box_gripper", "box_touch_left", "box_touch_right"]},
+        {"box_id": "box2", "expected_devices": ["box_gripper"]},
+    ]
+    live = ["box1/box_touch_left", "box1/box_touch_left_1", "box1/box_touch_right_1", "box2/box_gripper", "box2/bogus"]
+    assert tr._add_streaming_sensors_to_roster(roster, live)
+    assert roster[0]["expected_devices"][-2:] == ["box_touch_left_1", "box_touch_right_1"]
+    assert roster[1]["expected_devices"] == ["box_gripper"]
+    assert not tr._add_streaming_sensors_to_roster(roster, live)  # nothing new the second time
+    single = [{"box_id": "", "expected_devices": ["box_touch_left"]}]
+    assert tr._add_streaming_sensors_to_roster(single, ["box_touch_left", "box_touch_left_1"])
+    assert single[0]["expected_devices"] == ["box_touch_left", "box_touch_left_1"]

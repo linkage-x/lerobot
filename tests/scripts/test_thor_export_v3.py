@@ -649,6 +649,32 @@ def test_align_touch_rows_keeps_the_detected_width(tmp_path):
         assert all(len(row) == 9 for row in rows[column])
 
 
+def test_a_second_pad_per_finger_gets_columns_only_where_it_was_recorded(tmp_path):
+    # BOX SDK v4.1, 11-02 rig: two pads per finger. One-pad data keeps its schema.
+    one_pad = tmp_path / "one" / "episodes" / "episode_000000"
+    _write_touch_jsonl(one_pad, points=9, tagged=True)
+    assert export_v3._detect_touch_sensors([one_pad]) == ("box_touch_left", "box_touch_right")
+
+    two_pads = tmp_path / "two" / "episodes" / "episode_000000"
+    _write_touch_jsonl(two_pads, points=9, tagged=True)
+    with (two_pads / "box_sensors.jsonl").open("a", encoding="utf-8") as f:
+        for sid, fz in (("box0/box_touch_left_1", 5), ("box0/box_touch_right_1", 7)):
+            data = {"timestamp": 1, "points": 9, "fx_0p1N": [0] * 9, "fy_0p1N": [0] * 9, "fz_0p1N": [fz] * 9}
+            f.write(json.dumps({"sid": sid, "t_rel_s": 0.0, "data": data}) + "\n")
+    sensors = export_v3._detect_touch_sensors([one_pad, two_pads])
+    assert sensors == ("box_touch_left", "box_touch_right", "box_touch_left_1", "box_touch_right_1")
+
+    columns = export_v3._touch_array_columns(sensors)
+    rows, saw = export_v3._align_touch_rows(two_pads, 2, 30, width=9, columns=columns)
+    assert saw and len(rows) == 12
+    assert rows["observation.touch.box_touch_left_1.fz_0p1N"] == [[5.0] * 9] * 2
+    assert rows["observation.touch.box_touch_right_1.fz_0p1N"] == [[7.0] * 9] * 2
+    assert rows["observation.touch.box_touch_left.fz_0p1N"] == [[0.0] * 9] * 2
+    # an episode of the same export without the second pads is zero-filled, not dropped
+    rows, _ = export_v3._align_touch_rows(one_pad, 2, 30, width=9, columns=columns)
+    assert rows["observation.touch.box_touch_right_1.fz_0p1N"] == [[0.0] * 9] * 2
+
+
 def test_export_refuses_to_mix_two_world_frames(tmp_path):
     # Absolute poses from two coordinate systems concatenated into one training
     # set are wrong in a way no downstream check can see, so the export has to

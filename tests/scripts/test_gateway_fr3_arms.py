@@ -40,9 +40,9 @@ def test_the_arms_are_listed_and_required_on_thor_only(tmp_path: Path) -> None:
         server.server_close()
     assert payload["ok"] and payload["required"]
     right, left = payload["arms"]
-    # 10-26 (B1): the registered arm is the left one; the new one on its right has a bare flange
-    assert right == {**right, "arm": "right", "inService": True, "robotIp": "192.168.1.210", "gripperBox": None}
-    assert left == {**left, "arm": "left", "inService": True, "robotIp": "192.168.11.102", "gripperBox": 596523097}
+    # 10-26 (B1): the registered arm is the left one; 11-02 the gripper moved to the right one
+    assert right == {**right, "arm": "right", "inService": True, "robotIp": "192.168.1.210", "gripperBox": 3100715645}
+    assert left == {**left, "arm": "left", "inService": True, "robotIp": "192.168.11.102", "gripperBox": None}
     assert not gateway._robot_arms_payload(_state(tmp_path / "ws", "workstation"))["required"]
 
 
@@ -75,4 +75,4 @@ def test_single_arm_replay_is_only_for_the_arm_whose_base_the_dataset_is_in(tmp_
 
 
 def test_every_arm_s_gripper_box_is_the_arm_s_not_the_operator_s(tmp_path: Path) -> None:
-    assert "box596523097" in gateway._fr3_arm_box_ids(Path.cwd())
+    assert "box3100715645" in gateway._fr3_arm_box_ids(Path.cwd())

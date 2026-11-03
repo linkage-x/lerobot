@@ -9013,6 +9013,24 @@ def test_gripper_teleop_reports_why_it_could_not_start(tmp_path, monkeypatch):
     assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
 
 
+def test_gripper_teleop_panel_shows_the_chosen_arm_s_gripper(tmp_path, monkeypatch):
+    # 11-02: the gripper moved to the right arm and the left flange is bare. The panel read the
+    # default (left) YAML only, so it said "no gripper BOX" and kept Enter off for the right arm.
+    state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="null")
+    right = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")
+    config = tmp_path / right["replay_config"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("robot:\n  corenetic_device_id: 3100715645\ninput:\n  grasp_trigger_close_pct: 85\n")
+
+    assert gateway._gripper_teleop_payload(state)["armDeviceId"] is None
+    shown = gateway._gripper_teleop_payload(state, robot_ip="192.168.1.210")
+    assert shown["armDeviceId"] == 3100715645 and shown["graspTriggerClosePct"] == 85
+    assert gateway._gripper_teleop_payload(state, arm="right")["armDeviceId"] == 3100715645
+    assert gateway._gripper_teleop_payload(state, robot_ip="192.168.1.208")["armDeviceId"] is None  # no such arm
+    refused = gateway._start_gripper_teleop(state, {"arm": "left"})
+    assert "corenetic_device_id" in refused["error"] and refused["armDeviceId"] is None
+
+
 def test_gripper_teleop_over_http(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch)
     import urllib.request
@@ -9033,7 +9051,7 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
     try:
         started = post("/api/fr3/gripper-teleop/start", json.dumps({"arm": "left"}).encode())
         _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
-        with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop", timeout=10) as response:
+        with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop?robotIp=192.168.11.102", timeout=10) as response:
             running = json.loads(response.read())
         stopped = post("/api/fr3/gripper-teleop/stop")
     finally:
@@ -9041,7 +9059,7 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
         server.server_close()
 
     assert started["ok"], started["error"]
-    assert running["job"]["state"] == "running"
+    assert running["job"]["state"] == "running" and running["armDeviceId"] == 596523097  # the queried arm's YAML
     assert stopped["job"]["state"] == "exited"
 
 

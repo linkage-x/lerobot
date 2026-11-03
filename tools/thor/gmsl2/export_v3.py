@@ -87,13 +87,25 @@ _POSE7_NAN = [math.nan] * 7
 # with `points`. This is only the fallback for frames archived before that tag
 # existed; the real width is detected per export by _detect_touch_width().
 _TOUCH_SAMPLE_WIDTH_DEFAULT = 239
-_TOUCH_SENSOR_KEYS = ("box_touch_left", "box_touch_right")
+# One pad per finger always gets columns (zero-filled when absent, as before). The
+# second pad on a finger (box_client's ``_1`` sensors, BOX SDK v4.1; the 11-02 rig
+# has two per finger) gets its own columns only in an export whose episodes carry
+# it, so exports of one-pad data keep their schema.
+_TOUCH_BASE_SENSOR_KEYS = ("box_touch_left", "box_touch_right")
+_TOUCH_EXTRA_SENSOR_KEYS = ("box_touch_left_1", "box_touch_right_1")
+_TOUCH_SENSOR_KEYS = (*_TOUCH_BASE_SENSOR_KEYS, *_TOUCH_EXTRA_SENSOR_KEYS)
 _TOUCH_ARRAY_KEYS = ("fx_0p1N", "fy_0p1N", "fz_0p1N")
-_TOUCH_ARRAY_COLUMNS = tuple(
-    (f"observation.touch.{sensor}.{axis}", sensor, axis)
-    for sensor in _TOUCH_SENSOR_KEYS
-    for axis in _TOUCH_ARRAY_KEYS
-)
+
+
+def _touch_array_columns(sensors: tuple[str, ...]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (f"observation.touch.{sensor}.{axis}", sensor, axis)
+        for sensor in sensors
+        for axis in _TOUCH_ARRAY_KEYS
+    )
+
+
+_TOUCH_ARRAY_COLUMNS = _touch_array_columns(_TOUCH_BASE_SENSOR_KEYS)
 
 
 
@@ -295,6 +307,39 @@ def _detect_touch_width(ep_dirs: list[Path]) -> int:
     return max(widths)
 
 
+def _detect_touch_sensors(ep_dirs: list[Path]) -> tuple[str, ...]:
+    """Touch sensors one export gets columns for: both fingers' first pad, plus each
+    second pad any of its episodes recorded."""
+
+    found: set[str] = set()
+    for ep_dir in ep_dirs:
+        path = ep_dir / "box_sensors.jsonl"
+        if not path.is_file() or len(found) == len(_TOUCH_EXTRA_SENSOR_KEYS):
+            continue
+        try:
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    # Substring test before parsing: the file is mostly 480 Hz 6D rows.
+                    # The sid is bare ("box_touch_left_1") or namespaced ("box7/box_touch_left_1").
+                    if not any(
+                        sensor not in found and (f'"{sensor}"' in line or f'/{sensor}"' in line)
+                        for sensor in _TOUCH_EXTRA_SENSOR_KEYS
+                    ):
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sensor = _touch_sensor_key(str(row.get("sid") or "")) if isinstance(row, dict) else None
+                    if sensor in _TOUCH_EXTRA_SENSOR_KEYS:
+                        found.add(sensor)
+                        if len(found) == len(_TOUCH_EXTRA_SENSOR_KEYS):
+                            break
+        except OSError:
+            continue
+    return (*_TOUCH_BASE_SENSOR_KEYS, *(sensor for sensor in _TOUCH_EXTRA_SENSOR_KEYS if sensor in found))
+
+
 def _touch_array_from_data(data: Any, axis: str, width: int) -> list[float] | None:
     if not isinstance(data, dict):
         return None
@@ -390,14 +435,15 @@ def _align_touch_rows(
     *,
     pts_offset_s: float = 0.0,
     width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
+    columns: tuple[tuple[str, str, str], ...] = _TOUCH_ARRAY_COLUMNS,
 ) -> tuple[dict[str, list[list[float]]], bool]:
     touch_samples = _load_touch_samples(ep_dir, width)
-    touch_rows: dict[str, list[list[float]]] = {column: [] for column, _, _ in _TOUCH_ARRAY_COLUMNS}
+    touch_rows: dict[str, list[list[float]]] = {column: [] for column, _, _ in columns}
     zero = [0.0] * width
     saw_sample = any(touch_samples.values())
     for frame_index in range(n_frames):
         target_s = pts_offset_s + frame_index / max(int(fps), 1)
-        for column, sensor, axis in _TOUCH_ARRAY_COLUMNS:
+        for column, sensor, axis in columns:
             sample = _nearest_touch_sample(touch_samples.get(sensor, []), target_s)
             touch_rows[column].append(list(sample.get(axis, zero)) if sample is not None else list(zero))
     return touch_rows, saw_sample
@@ -1394,6 +1440,7 @@ def export_task_to_v3(
         )
 
     touch_width = _detect_touch_width([src.ep_dir for src in episodes])
+    touch_columns = _touch_array_columns(_detect_touch_sensors([src.ep_dir for src in episodes]))
     touch_model = lr3.touch_model_for_point_count(touch_width)
     _emit(
         f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, "
@@ -1520,7 +1567,7 @@ def export_task_to_v3(
         ts_width=ts_width,
         ts_names=box_ts_names if ts_width else None,
         pose_columns=pose_columns,
-        touch_columns=_TOUCH_ARRAY_COLUMNS,
+        touch_columns=touch_columns,
         touch_width=touch_width,
         world_frame=output_world_frame,
         tcp_frame=_dataset_tcp_frame(episodes) if pose_columns else None,
@@ -1617,6 +1664,7 @@ def export_task_to_v3(
             fps,
             pts_offset_s=_gmsl2_pts_offset_s(meta),
             width=touch_width,
+            columns=touch_columns,
         )
         if not touch_samples_found:
             _emit(f"  note: {src.ep_dir.name} has no box_sensors.jsonl touch arrays; exported touch columns are zero-filled")

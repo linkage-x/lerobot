@@ -983,6 +983,8 @@ _BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
     # and is reported per frame as `model`; keep the static label neutral.
     "box_touch_left": "BOX touch pad L",
     "box_touch_right": "BOX touch pad R",
+    "box_touch_left_1": "BOX touch pad L2",
+    "box_touch_right_1": "BOX touch pad R2",
 }
 
 
@@ -5137,18 +5139,27 @@ def _gripper_teleop_job_view(state: GatewayState) -> dict[str, Any]:
     return job
 
 
-def _gripper_teleop_payload(state: GatewayState) -> dict[str, Any]:
+def _gripper_teleop_payload(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    """The panel's view; ``arm``/``robot_ip`` name whose gripper (its replay YAML), as start does.
+
+    Without one, the default replay YAML's -- the left arm's, whose flange is bare since 11-02, so the
+    panel would read "no gripper BOX" and keep Enter disabled for the right arm that has it.
+    """
+    config: str | None = None
+    if str(arm or "").strip() or str(robot_ip or "").strip():
+        with suppress(ValueError):
+            config = _drive_target(state, arm, robot_ip).get("replay_config") or None
     return {
         "ok": True,
         "error": "",
         "job": _gripper_teleop_job_view(state),
-        **_gripper_teleop_settings(state),
+        **_gripper_teleop_settings(state, config),
         "hold": _read_json_file(_gripper_teleop_root(state) / "hold.json"),
     }
 
 
-def _gripper_teleop_refusal(state: GatewayState, message: str) -> dict[str, Any]:
-    return {**_gripper_teleop_payload(state), "ok": False, "error": message}
+def _gripper_teleop_refusal(state: GatewayState, message: str, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    return {**_gripper_teleop_payload(state, arm, robot_ip), "ok": False, "error": message}
 
 
 def _gripper_teleop_box_holder(state: GatewayState) -> str:
@@ -5200,17 +5211,18 @@ def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -
 
 
 def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    arm, robot_ip = body.get("arm"), body.get("robotIp")
     try:  # whose gripper: never a default (roadmap B2)
-        target = _drive_target(state, body.get("arm"), body.get("robotIp"))
+        target = _drive_target(state, arm, robot_ip)
     except ValueError as exc:
         return _gripper_teleop_refusal(state, str(exc))
     config = target.get("replay_config") or FR3_REPLAY_THOR_CONFIG
     settings = _gripper_teleop_settings(state, config)
     if settings["armDeviceId"] is None:
-        return _gripper_teleop_refusal(state, f"{config} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）")
+        return _gripper_teleop_refusal(state, f"{config} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）", arm, robot_ip)
     holder = _gripper_teleop_box_holder(state)
     if holder:
-        return _gripper_teleop_refusal(state, holder)
+        return _gripper_teleop_refusal(state, holder, arm, robot_ip)
     command = [
         str(_mujoco_replay_python(state)),
         str(state.repo_root / _GRIPPER_TELEOP_SCRIPT),
@@ -5253,16 +5265,16 @@ def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str
                     "error": "",
                 }
     if refusal or process is None:
-        return _gripper_teleop_refusal(state, refusal)
+        return _gripper_teleop_refusal(state, refusal, arm, robot_ip)
     with state.lock:
         state.log("info", f"FR3 gripper teleop started (arm BOX {settings['armDeviceId']})")
     Thread(target=_watch_gripper_teleop, args=(state, process), daemon=True, name=f"gripper-teleop-{process.pid}").start()
-    return _gripper_teleop_payload(state)
+    return _gripper_teleop_payload(state, arm, robot_ip)
 
 
 def _stop_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """SIGINT: the script sends the last command, leaves the arm's BOX in control mode, exits."""
-    del body
+    arm, robot_ip = body.get("arm"), body.get("robotIp")
     with state.gripper_teleop_lock:
         process = state.gripper_teleop_process
         if process is not None and process.poll() is None:
@@ -5272,13 +5284,13 @@ def _stop_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str,
         else:
             process = None
     if process is None:
-        return _gripper_teleop_refusal(state, "没有在遥控")
+        return _gripper_teleop_refusal(state, "没有在遥控", arm, robot_ip)
     with suppress(subprocess.TimeoutExpired):
         process.wait(timeout=_GRIPPER_TELEOP_STOP_WAIT_S)
     deadline = time.monotonic() + 1.0  # let the reader thread record the exit
     while time.monotonic() < deadline and _gripper_teleop_job_view(state).get("state") == "running":
         time.sleep(0.02)
-    return _gripper_teleop_payload(state)
+    return _gripper_teleop_payload(state, arm, robot_ip)
 
 
 _GRIPPER_TELEOP_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
@@ -19150,7 +19162,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.OK, _fr3_pivot_payload(self.server.state))
             return
         if path == "/api/fr3/gripper-teleop":
-            _json_response(self, HTTPStatus.OK, _gripper_teleop_payload(self.server.state))
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                _gripper_teleop_payload(
+                    self.server.state, query.get("arm", [""])[0], query.get("robotIp", [""])[0]
+                ),
+            )
             return
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))

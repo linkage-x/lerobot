@@ -29,9 +29,9 @@ export function GripperTeleopBox({
   const [confirming, setConfirming] = useState(false);
 
   const refresh = useCallback(async () => {
-    const result = await api.fetchGripperTeleop();
+    const result = await api.fetchGripperTeleop(robotIp);
     if (result) setPayload(result);
-  }, [api]);
+  }, [api, robotIp]);
 
   useEffect(() => {
     void refresh();
@@ -75,7 +75,7 @@ export function GripperTeleopBox({
       </p>
       <div className="cali-op-actions">
         {active ? (
-          <button className="cali-btn-primary" disabled={running !== ""} onClick={() => act("stop", () => api.stopGripperTeleop())}>
+          <button className="cali-btn-primary" disabled={running !== ""} onClick={() => act("stop", () => api.stopGripperTeleop(robotIp))}>
             {running === "stop" ? "退出中…" : "退出遥控（保持夹紧）"}
           </button>
         ) : (

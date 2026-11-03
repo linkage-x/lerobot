@@ -1524,9 +1524,11 @@ export class DataCollectionGuiApi {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/ball-edge", { check });
   }
 
-  async fetchGripperTeleop(): Promise<GripperTeleopResponse | null> {
+  // robotIp: whose gripper the panel shows (its replay YAML's BOX); none = the default YAML's.
+  async fetchGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    const query = robotIp ? `?robotIp=${encodeURIComponent(robotIp)}` : "";
     try {
-      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop`, {
+      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop${query}`, {
         headers: { Accept: "application/json" }
       });
       return response.ok ? ((await response.json()) as GripperTeleopResponse) : null;
@@ -1541,8 +1543,8 @@ export class DataCollectionGuiApi {
     return this.gripperTeleopPost("/api/fr3/gripper-teleop/start", { robotIp });
   }
 
-  async stopGripperTeleop(): Promise<GripperTeleopResponse | null> {
-    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop");
+  async stopGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop", { robotIp });
   }
 
   private async gripperTeleopPost(path: string, body: Record<string, unknown> = {}): Promise<GripperTeleopResponse | null> {

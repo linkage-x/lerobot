@@ -1,13 +1,15 @@
 # The right FR3 (192.168.1.210, in since 10-26; roadmap B1). A copy of the left arm's
 # third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml with
-# only the robot block changed: the flange is bare, so there is no BOX to pin and the gripper is a mock
-# (an unpinned corenetic backend would discover and drive whichever BOX answers, 10-09). The TCP stays
-# corenetic_socket_ee -- the virtual point D5 drives on a bare flange, the same point as on the left arm.
+# only the robot block changed. 11-02: the corenetic gripper moved here from the left arm. The TCP is
+# corenetic_socket_ee, the pivot insert's socket, as it was on the left arm.
 robot:
   type: franka_research3
   robot_ip: 192.168.1.210
-  gripper_backend: mock
-  corenetic_device_id: null
+  gripper_backend: corenetic
+  # The BOX on the arm, pinned: the handheld BOX (3906437858 since the v4.1 firmware) is on the same
+  # network and reports the same sn; unpinned, discovery picks by IP order and may drive it (10-09).
+  # It was 596523097 before the firmware renumbered every BOX (10-31).
+  corenetic_device_id: 3100715645
   allow_mock_gripper: true
   urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
   # The pivot insert's socket centre, (1.45, -0.78, -5.06) mm in corenetic_gripper_ee (FR3 pivot, 10-14):

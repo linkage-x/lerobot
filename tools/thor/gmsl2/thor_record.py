@@ -126,6 +126,8 @@ def _emit(text: str) -> None:
 BOX_SENSOR_NOMINAL_HZ = {
     "box_touch_left": 60.0,
     "box_touch_right": 60.0,
+    "box_touch_left_1": 60.0,  # the second pad on a finger (SDK v4.1), when fitted
+    "box_touch_right_1": 60.0,
     "box_gripper": 120.0,
     "box_trigger": 120.0,
     "box_imu": 240.0,
@@ -246,6 +248,28 @@ def _streaming_sensor_ids(observed_rates: dict[str, float]) -> list[str]:
     keeps returning the same stale snapshot -- from one that is streaming.
     """
     return sorted(sid for sid, hz in observed_rates.items() if hz > 0)
+
+
+def _add_streaming_sensors_to_roster(roster: list[dict[str, Any]], live_sids: list[str]) -> bool:
+    """Append to each roster entry's ``expected_devices`` the known sensors it streams but did
+    not announce; True when anything was added (so the GUI gets a row for it).
+
+    Discovery maps the vendor's single CAP_TOUCH bit to one pad per finger; a second pad
+    (BOX SDK v4.1, ``box_touch_*_1``) only shows up in the observed rates. ``live_sids`` are
+    bare for a single unnamespaced BOX and ``<box_id>/<sid>`` otherwise.
+    """
+    changed = False
+    for entry in roster:
+        if not isinstance(entry, dict):
+            continue
+        box_id = str(entry.get("box_id") or "")
+        expected = entry.setdefault("expected_devices", [])
+        for live in live_sids:
+            owner, _, bare = live.rpartition("/")
+            if owner == box_id and bare in bc.KNOWN_SENSOR_IDS and bare not in expected:
+                expected.append(bare)
+                changed = True
+    return changed
 
 
 def _box_stream_health(
@@ -401,6 +425,33 @@ def _run_six_d_force_cali(
         _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
     finally:
         _CALI_LOCK.release()
+
+
+_FR3_ARMS_REGISTRY = _REPO_ROOT / "tools" / "fr3" / "fr3_arms.json"
+
+
+def _keep_fr3_gripper_box_modes(box_cfg: bc.BoxFleetConfig, registry: Path = _FR3_ARMS_REGISTRY) -> list[int]:
+    """Add every FR3 gripper BOX named in fr3_arms.json to ``keep_mode_device_ids``; return what was added.
+
+    Connect set_mode(startup_mode)s every BOX it finds, and on an arm's BOX that opens the jaw
+    (mode 0 hands it to that BOX's own trigger). The YAML list went stale once already: the v4.1
+    firmware renumbered every BOX (10-31), so 596523097 stopped matching the arm's gripper and
+    every Connect dropped its mode. The registry is what real replay and teleop drive, so it is
+    kept current; reading it here keeps the two from drifting apart. Best effort: an unreadable
+    registry leaves the YAML list as it is.
+    """
+    try:
+        arms = (json.loads(registry.read_text(encoding="utf-8")).get("arms") or {}).values()
+        ids = {int(arm["corenetic_device_id"]) for arm in arms if arm.get("corenetic_device_id") is not None}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        logger.warning("FR3 arm registry %s unreadable (%s); keep_mode_device_ids stays %s",
+                       registry, exc, box_cfg.keep_mode_device_ids)
+        return []
+    added = sorted(ids - {int(i) for i in box_cfg.keep_mode_device_ids})
+    if added:
+        box_cfg.keep_mode_device_ids = [*box_cfg.keep_mode_device_ids, *added]
+        logger.info("BOX: FR3 gripper BOX(es) %s from %s are never set_mode()d", added, registry.name)
+    return added
 
 
 def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
@@ -1500,6 +1551,7 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    _keep_fr3_gripper_box_modes(box_cfg)
     # Tri-state on purpose: the yaml declares the hardware and defaults to off,
     # --laser-tracker / --no-laser-tracker is the GUI toggle for this session,
     # and "neither flag" means "whatever the file says".
@@ -1625,6 +1677,9 @@ def main(argv: list[str] | None = None) -> int:
         # emit "Box devices: (none)" -> gateway flips all box rows to red.
         rates = box.observed_rates()
         live_sids = _streaming_sensor_ids(rates)
+        if roster and _add_streaming_sensors_to_roster(roster, live_sids):
+            # A finger's second touch pad: discovery's one CAP_TOUCH bit could not announce it.
+            _emit("BOX_DEVICES_JSON " + json.dumps(roster, separators=(",", ":")))
         _emit(f"Box devices: {', '.join(live_sids) if live_sids else '(none)'}")
         if live_sids:
             parts = [f"{sid}={rates[sid]:.0f}" for sid in live_sids]
