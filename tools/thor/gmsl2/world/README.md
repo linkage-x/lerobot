@@ -54,6 +54,29 @@ re-solved (`calib_20261014_180431`) and registered back onto
 [Recalibration by camera centres](#recalibration-by-camera-centres-2026-10-15)).
 The id did not change.
 
+On 2026-11-04 two more revisions went in, in this order:
+
+- `calib_20261027_173815_extrinsics`, production since 10-27, whose promotion
+  had not written a revision: the reference still held the 10-14 poses, so the
+  next registration saw only 03/13/14 as stable (`degraded_cluster`). Replayed
+  with the 10-27 export's `--assume-stable` (03/06/07/13/14, 0.71 mm RMS);
+  08/09/12 re-placed.
+- `calib_20261102_195715_extrinsics`, a colleague's nine-camera solve after the
+  BOX-mount change (`outputs/box_mount_recalibration_20261102_195715` on Thor,
+  gauge cam_09, its own solver and validation). Its `T_cam09_cam` were
+  converted to a bundle report (`outputs/metrology/calib_20261102_195715/
+  extrinsics_report.json`, no RMSE: the solve is not ours) and exported with
+  `--world-reference`. cam_02 is left out: production has no lens for it. The
+  consensus was ambiguous (cam_09 moved only 2.5 mm / 0.65°, inside the
+  tolerance, so {03,08,09,12,14} was as large as {03,08,12,13,14}); resolved
+  with `--assume-stable cam_03 cam_08 cam_12 cam_13 cam_14` from the pairwise
+  comparison of ten solves (03/13/14 unmoved since 10-14, 08/12 since 10-27).
+  CONTINUOUS, 0.65 mm RMS (max 0.77); 06/07/09 re-placed (06 ≈ 20 mm / 2.9°,
+  07 ≈ 35 mm / 2.1°, 09 on its new bracket). The capture's table anchor is
+  `insufficient` (no table tag seen by the same two cameras in it and the
+  datum), so the common mode is not observed for this solve. Promoted through
+  the gateway (extrinsics only; the lenses are those of 10-27).
+
 ### The FR3 base (2026-10-09)
 
 `fr3_base` is a node with one edge, `world_20260928_063531 -> fr3_base`. It is
