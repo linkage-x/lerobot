@@ -523,3 +523,109 @@ def test_load_trial_rows_tags_each_row_with_its_run(tmp_path):
         + json.dumps({"kind": "run_start"}) + "\n"
     )
     assert [r["_run"] for r in load_trial_rows([path])] == ["grasp_20261028_113314"]
+
+
+def test_relabel_funnel_runs_gives_the_funnel_frames_the_same_aim_up_to_the_close(tmp_path):
+    """11-03 mass collection: on named runs the funnel's own frames get the simulated chunk too,
+    aimed at peg + lag like the policy's; the command is integrated back from the close, and from
+    the close on the recording stays. Other runs keep their funnel frames as recorded."""
+
+    root, rows, _peg_cmd, _close_a = _source(tmp_path)
+    rows = [{**r, "_run": "grasp_new" if r["arm"] == "B" else "grasp_other"} for r in rows]
+    lag = np.array([0.0009, -0.0006])
+    base, _ = relabel_source(root, 50, trial_rows=rows, aim_lag=lag)
+    out, summary = relabel_source(root, 50, trial_rows=rows, aim_lag=lag, relabel_funnel_runs={"grasp_new"})
+
+    for key in ("frames", "action", "is_pad", "masked"):
+        assert np.array_equal(out[1][key], base[1][key])
+    rec = out[0]
+    frames = rec["frames"].tolist()
+    assert frames == sorted(frames)
+    funnel = [t for t in frames if t >= 40]
+    assert funnel and funnel == list(range(40, funnel[-1] + 1))
+    assert summary["relabelled_funnel_frames"] == len(funnel)
+    assert summary["masked_funnel_frames"] == 0 and summary["funnel_gap_episodes"] == 0
+    assert summary["relabel_funnel_runs"] == ["grasp_new"]
+    cfg = FunnelConfig(pegXyz=tuple(rec["aim"]))
+    for t in funnel:
+        i = frames.index(t)
+        # The fixture's measured pose trails the command by _TRACKING, so this is the true prev_cmd.
+        want, pad = expert_chunk(rec["state"][t, :3] + _TRACKING, rec["aim"], 50, config=cfg)
+        assert not rec["masked"][i]
+        assert rec["action"][i] == pytest.approx(want, abs=2e-5)  # float32 states
+        assert np.array_equal(rec["is_pad"][i], pad)
+    # The close frame and after are not overridden: the recorded close and lift stay.
+    import pandas as pd
+
+    data = pd.read_parquet(next((root / "data").glob("*/*.parquet")))
+    actions = np.stack(data[data.episode_index == 0]["action"].to_numpy())
+    close = int(np.argmax(actions[:, 4] < 0.5))
+    assert funnel[-1] == close - 1
+
+
+def test_relabel_funnel_runs_masks_a_funnel_segment_with_a_hole(tmp_path, monkeypatch):
+    """A hole inside the funnel segment breaks the back-integration: no mixed aim, no supervision."""
+
+    import pandas as pd
+
+    import tools.fr3.funnel_relabel as funnel_relabel
+
+    # The fixture's only funnel episode is the one with the hole: give the offset it would measure.
+    monkeypatch.setattr(funnel_relabel, "close_tracking_offset", lambda episodes: _TRACKING.copy())
+
+    root, rows, _peg_cmd, _close_a = _source(tmp_path)
+    rows = [{**r, "_run": "grasp_new"} for r in rows]
+    path = next((root / "data").glob("*/*.parquet"))
+    data = pd.read_parquet(path)
+    drop = (data.episode_index == 0) & data.frame_index.between(50, 59)
+    data = data[~drop].reset_index(drop=True)
+    data["frame_index"] = data.groupby("episode_index").cumcount()
+    data["index"] = np.arange(len(data))
+    data.to_parquet(path)
+    out, summary = relabel_source(root, 50, trial_rows=rows, relabel_funnel_runs={"grasp_new"})
+    rec = out[0]
+    funnel = [i for i, t in enumerate(rec["frames"].tolist()) if t >= 40]
+    assert funnel and all(rec["masked"][i] for i in funnel)
+    assert summary["funnel_gap_episodes"] == 1 and summary["relabelled_funnel_frames"] == 0
+
+
+def test_a_masked_run_can_carry_its_own_cut(tmp_path):
+    """11-03: R7 cut at 40 mm, the mass collection (takeover 30-60) at 60."""
+
+    root, rows, _peg_cmd, _close_a = _source(tmp_path)
+    rows = [{**r, "_run": "grasp_r7" if r["arm"] == "B" else "grasp_other"} for r in rows]
+    by_default, _ = relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7"}, mask_above_mm=60.0)
+    own, summary = relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7": 60.0}, mask_above_mm=None)
+    for key in ("frames", "action", "is_pad", "masked"):
+        assert np.array_equal(own[0][key], by_default[0][key])
+    assert summary["mask_cuts_mm"] == {"grasp_r7": 60.0}
+    lower, _ = relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7": 40.0, "grasp_other": None}, mask_above_mm=200.0)
+    assert lower[0]["masked"].sum() > own[0]["masked"].sum()
+    with pytest.raises(ValueError, match="go together"):
+        relabel_source(root, 50, trial_rows=rows, mask_runs={"grasp_r7": None})
+
+
+def test_mask_lift_runs_unsupervise_lift_first_labels_only(tmp_path):
+    """A low frame outside the capture radius is labelled "up first, then across"; on a
+    mask-lift run it gets no supervision, everything else is as with the funnel relabel alone."""
+
+    root, rows, _peg_cmd, _close_a = _source(tmp_path, misses=True)
+    rows = [{**r, "_run": "grasp_new"} for r in rows]
+    plain, _ = relabel_source(root, 50, trial_rows=rows, relabel_funnel_runs={"grasp_new"})
+    out, summary = relabel_source(
+        root, 50, trial_rows=rows, relabel_funnel_runs={"grasp_new"}, mask_lift_runs={"grasp_new"}
+    )
+    assert summary["masked_lift_frames"] > 0
+    lifted = 0
+    for ep, rec in plain.items():
+        for i, t in enumerate(rec["frames"].tolist()):
+            j = int(np.flatnonzero(out[ep]["frames"] == t)[0])
+            if not rec["masked"][i] and rec["action"][i][:10, 2].sum() > 0.001:
+                assert out[ep]["masked"][j]
+                lifted += 1
+            else:
+                assert out[ep]["masked"][j] == rec["masked"][i]
+                assert np.array_equal(out[ep]["action"][j], rec["action"][i])
+    assert lifted == summary["masked_lift_frames"]
+    with pytest.raises(ValueError, match="among relabel_funnel_runs"):
+        relabel_source(root, 50, trial_rows=rows, mask_lift_runs={"grasp_new"})

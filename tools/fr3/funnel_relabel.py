@@ -23,7 +23,9 @@ has a hole there. The peg is the funnel's close point: the arm settles a fixed o
 its command at the close (measured per source on the gap-free episodes, ~(+3.8, -1.8, -3.2) mm
 with a +-0.5 mm IQR), and the funnel commands the close at `closeDzMm` below the peg.
 
-The funnel's own frames are left as recorded: they are the same expert, executed.
+The funnel's own frames are left as recorded: they are the same expert, executed -- except on
+runs named in `relabel_funnel_runs` (below), where they get the same simulated chunk as the
+policy's frames, so that every label of those runs aims where `aim_lag` says.
 
 Arm A's misses (`--grasp-loop-keep-misses`: graded empty or no_close) are the policy's own states
 where it goes wrong, and none of what it did there is to be learnt: every frame is either
@@ -278,8 +280,10 @@ def relabel_source(
     trial_rows: list[dict[str, Any]] | None = None,
     funnel_offset: np.ndarray | None = None,
     aim_lag: np.ndarray | None = None,
-    mask_runs: set[str] | None = None,
+    mask_runs: set[str] | dict[str, float | None] | None = None,
     mask_above_mm: float | None = None,
+    relabel_funnel_runs: set[str] | None = None,
+    mask_lift_runs: set[str] | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """Per source episode: the relabelled frames' chunks; plus a summary of what was done.
 
@@ -296,6 +300,26 @@ def relabel_source(
     policy and funnel frames alike; below that it is treated as usual. For R8c (11-03): R7's 207
     arm-B episodes carry the low -x corrections R8b gained, but their high frames all approach
     from +y (median +29 mm) and R8b learnt a -y bias there that overshot ~10 mm on the robot.
+    A dict gives a run its own cut (None: `mask_above_mm`): the 11-03 mass collection takes over
+    at 30-60 mm, so its cut is 60 while R7's stays 40.
+
+    `relabel_funnel_runs`: an episode whose row came from one of these runs gets the simulated
+    funnel chunk on its funnel frames too, from the first funnel frame up to its close (from the
+    close on, the recorded close and lift stay). Recorded funnel frames aim at the funnel's settled
+    command, ~3 mm +x of where `aim_lag` puts the policy's frames, and on the 11-03 mass
+    collection the funnel's low corrections are most of the new labels: left alone they would
+    teach the +x close back. The command those frames are measured from is integrated *back* from
+    the close (the issued close command is the close state + the tracking offset), because a late
+    takeover's recording has a hole before the funnel (the dropped low policy steps, and always
+    the handover seam), which a forward integration from the start carries into every later frame.
+    An episode whose funnel segment itself has a hole (a measured step over GAP_FREE_STEP_MM) gets
+    no supervision on its funnel frames before the close rather than a mixed aim.
+
+    `mask_lift_runs` (a subset of `relabel_funnel_runs`): on those runs a frame whose simulated
+    chunk starts by going up (low and outside the capture radius: the funnel lifts and realigns)
+    gets no supervision instead. Side agent 11-03: R7 lifted on 46 of 69 late takeovers, and R8b's
+    no_close trials loop descend/lift; a mass collection of late takeovers would teach the lift
+    from many more states. The lateral corrections inside the capture radius are what it is for.
 
     A policy-only episode (arm A: no funnel frame) closed wherever the policy closed, so its close
     is not the peg. Its peg is the grasp-loop row's `pegXyz` (`trial_rows`), carried into the
@@ -356,8 +380,10 @@ def relabel_source(
         )
     out: dict[int, dict[str, Any]] = {}
     lagged = high = masked = masked_miss = masked_high_run = 0
-    if (mask_runs is None) != (mask_above_mm is None):
-        raise ValueError("mask_runs and mask_above_mm go together")
+    funnel_relabelled = funnel_masked = funnel_gap_episodes = masked_lift = 0
+    if mask_lift_runs and not set(mask_lift_runs) <= set(relabel_funnel_runs or ()):
+        raise ValueError("mask_lift_runs must be among relabel_funnel_runs: the recorded funnel lifts would stay supervised")
+    cuts = _mask_cuts(mask_runs, mask_above_mm)
     row_vs_close_mm = []
     for ep in episodes:
         close_dz = np.array([0.0, 0.0, FUNNEL_CLOSE_DZ_MM / 1000.0])
@@ -380,11 +406,13 @@ def relabel_source(
             aim[:2] = aim[:2] - offset[:2] + np.asarray(aim_lag, dtype=np.float64)[:2]
         cfg = FunnelConfig(pegXyz=tuple(float(v) for v in aim))  # type: ignore[arg-type]
         missed = ep["row"] is not None and ep["row"].get("verdict") != "held"
-        mask_high = bool(mask_runs) and ep["row"] is not None and ep["row"].get("_run") in mask_runs
+        cut = cuts.get(ep["row"].get("_run")) if ep["row"] is not None else None
+        mask_lift = bool(mask_lift_runs) and ep["row"] is not None and ep["row"].get("_run") in mask_lift_runs
+        mask_high = cut is not None
         frame_ids, chunks, pads, unsupervised = [], [], [], []
 
         def too_high(t: int) -> bool:
-            return mask_high and (ep["state"][t, 2] - peg[2]) * 1000.0 > mask_above_mm  # type: ignore[operator]
+            return mask_high and (ep["state"][t, 2] - peg[2]) * 1000.0 > cut  # type: ignore[operator]
 
         def unsupervise(t: int) -> None:
             frame_ids.append(t)
@@ -412,6 +440,10 @@ def relabel_source(
                     lagged += 1
                 continue
             chunk, pad = expert_chunk(ep["prev_cmd"][t], aim, horizon, config=cfg)
+            if mask_lift and _lifts(chunk):
+                unsupervise(t)
+                masked_lift += 1
+                continue
             frame_ids.append(t)
             chunks.append(chunk)
             pads.append(pad)
@@ -420,6 +452,39 @@ def relabel_source(
             for t in range(ep["close"], len(ep["state"])):
                 unsupervise(t)
                 masked += 1
+        relabel_funnel = (
+            bool(relabel_funnel_runs)
+            and ep["row"] is not None
+            and ep["row"].get("_run") in relabel_funnel_runs
+            and not ep["policy_only"]
+            and ep["close"] is not None
+        )
+        if relabel_funnel:
+            c, f0 = ep["close"], ep["first_funnel"]
+            steps_mm = np.linalg.norm(np.diff(ep["state"][f0 : c + 1, :3], axis=0), axis=1) * 1000.0
+            gap = bool(len(steps_mm)) and float(steps_mm.max()) > GAP_FREE_STEP_MM
+            funnel_gap_episodes += int(gap)
+            # prev_cmd[t] = the command issued at the close minus every delta from t to the close.
+            issued_close = ep["state"][c, :3] + offset
+            back = issued_close - np.cumsum(ep["action"][f0 : c + 1, :3][::-1].astype(np.float64), axis=0)[::-1]
+            for t in range(f0, c):
+                if too_high(t):
+                    continue  # the mask below takes it
+                prev = back[t - f0]
+                if gap or np.linalg.norm(prev - ep["state"][t, :3]) * 1000.0 > MAX_COMMAND_LAG_MM:
+                    unsupervise(t)
+                    funnel_masked += 1
+                    continue
+                chunk, pad = expert_chunk(prev, aim, horizon, config=cfg)
+                if mask_lift and _lifts(chunk):
+                    unsupervise(t)
+                    masked_lift += 1
+                    continue
+                frame_ids.append(t)
+                chunks.append(chunk)
+                pads.append(pad)
+                unsupervised.append(False)
+                funnel_relabelled += 1
         if mask_high:
             # The funnel's own frames (and anything else not yet overridden) above the cut.
             done = set(frame_ids)
@@ -452,12 +517,24 @@ def relabel_source(
         "relabelled_episodes": len(out),
         "missed_episodes": sum(ep["row"] is not None and ep["row"].get("verdict") != "held" for ep in episodes),
         "never_closed_episodes": sum(ep["close"] is None for ep in episodes),
-        "relabelled_frames": int(sum(len(v["frames"]) for v in out.values())) - masked - masked_miss - masked_high_run,
+        "relabelled_frames": int(sum(len(v["frames"]) for v in out.values()))
+        - masked
+        - masked_miss
+        - masked_high_run
+        - funnel_masked
+        - masked_lift,
+        "masked_lift_frames": masked_lift,
+        "mask_lift_runs": None if not mask_lift_runs else sorted(mask_lift_runs),
+        "relabelled_funnel_frames": funnel_relabelled,
+        "masked_funnel_frames": funnel_masked,
+        "funnel_gap_episodes": funnel_gap_episodes,
+        "relabel_funnel_runs": None if not relabel_funnel_runs else sorted(relabel_funnel_runs),
         "masked_after_policy_close_frames": masked,
         "masked_unrelabelled_miss_frames": masked_miss,
         "masked_high_run_frames": masked_high_run,
-        "mask_runs": None if not mask_runs else sorted(mask_runs),
+        "mask_runs": None if not cuts else sorted(cuts),
         "mask_above_mm": mask_above_mm,
+        "mask_cuts_mm": cuts or None,
         "skipped_lagged_frames": lagged,
         "kept_above_max_height_frames": high,
         "max_height_mm": max_height_mm,
@@ -475,6 +552,26 @@ def relabel_source(
             "max_norm": round(float(np.linalg.norm(diff, axis=1).max()), 2),
         }
     return out, summary
+
+
+def _lifts(chunk: np.ndarray) -> bool:
+    """The chunk starts by going up: `expert_chunk`'s "up first" leg (> 1 mm in its first 10 steps)."""
+
+    return float(np.sum(chunk[:10, 2], dtype=np.float64)) > 0.001
+
+
+def _mask_cuts(mask_runs: set[str] | dict[str, float | None] | None, mask_above_mm: float | None) -> dict[str, float]:
+    """Each masked run's cut in mm: its own (a dict value) or `mask_above_mm`."""
+
+    if not mask_runs:
+        if mask_above_mm is not None:
+            raise ValueError("mask_runs and mask_above_mm go together")
+        return {}
+    named = mask_runs if isinstance(mask_runs, dict) else dict.fromkeys(mask_runs)
+    cuts = {run: (mask_above_mm if cut is None else cut) for run, cut in named.items()}
+    if any(cut is None for cut in cuts.values()):
+        raise ValueError("mask_runs and mask_above_mm go together: a run without its own cut needs mask_above_mm")
+    return {run: float(cut) for run, cut in cuts.items()}  # type: ignore[arg-type]
 
 
 def _view_episode_starts(view_root: Path) -> dict[int, tuple[int, int]]:
@@ -496,8 +593,10 @@ def build_relabelled_view(
     trial_rows: list[dict[str, Any]] | None = None,
     holdout_named: list[int] | None = None,
     aim_lag: np.ndarray | None = None,
-    mask_runs: set[str] | None = None,
+    mask_runs: set[str] | dict[str, float | None] | None = None,
     mask_above_mm: float | None = None,
+    relabel_funnel_runs: set[str] | None = None,
+    mask_lift_runs: set[str] | None = None,
 ) -> dict[str, Any]:
     if out_root.exists():
         raise ValueError(f"{out_root} exists; pick a new name rather than overwrite a view")
@@ -545,7 +644,8 @@ def build_relabelled_view(
             continue
         try:
             per_source[name] = relabel_source(
-                root, horizon, max_height_mm, trial_rows, aim_lag=aim_lag, mask_runs=mask_runs, mask_above_mm=mask_above_mm
+                root, horizon, max_height_mm, trial_rows, aim_lag=aim_lag, mask_runs=mask_runs, mask_above_mm=mask_above_mm,
+                relabel_funnel_runs=relabel_funnel_runs, mask_lift_runs=mask_lift_runs,
             )
         except NoFunnelCloseError:
             deferred.append((name, root, pairs))
@@ -561,7 +661,8 @@ def build_relabelled_view(
         for name, root, pairs in deferred:
             per_source[name] = relabel_source(
                 root, horizon, max_height_mm, trial_rows, funnel_offset, aim_lag=aim_lag,
-                mask_runs=mask_runs, mask_above_mm=mask_above_mm,
+                mask_runs=mask_runs, mask_above_mm=mask_above_mm, relabel_funnel_runs=relabel_funnel_runs,
+                mask_lift_runs=mask_lift_runs,
             )
             _add(name, pairs)
     missing = [name for name in view_eps_by_source if name not in by_name]
@@ -621,6 +722,9 @@ def build_relabelled_view(
         "label_aim_lag_mm": None if aim_lag is None else [round(float(v) * 1000.0, 2) for v in np.asarray(aim_lag)[:2]],
         "mask_runs": None if not mask_runs else sorted(mask_runs),
         "mask_above_mm": mask_above_mm,
+        "mask_cuts_mm": _mask_cuts(mask_runs, mask_above_mm) or None,
+        "relabel_funnel_runs": None if not relabel_funnel_runs else sorted(relabel_funnel_runs),
+        "mask_lift_runs": None if not mask_lift_runs else sorted(mask_lift_runs),
     }
     manifest["repo_id"] = f"local/{out_root.name}"
     manifest["action_overrides"] = report
@@ -659,13 +763,29 @@ def main() -> None:
                         "close lag, ~0.9,-0.6) instead of the funnel's settled one (~3.8,-1.8). Default: the funnel's")
     parser.add_argument("--mask-run", action="append", default=[],
                         help="a grasp-loop run (its rows file's stem, e.g. grasp_20261028_113314; repeatable) whose "
-                        "episodes get no supervision above --mask-above-mm")
+                        "episodes get no supervision above --mask-above-mm, or RUN@MM for its own cut")
     parser.add_argument("--mask-above-mm", type=float, default=None)
+    parser.add_argument("--relabel-funnel-run", action="append", default=[],
+                        help="a grasp-loop run (rows file stem; repeatable) whose funnel frames get the simulated "
+                        "chunk too, up to the close, so they aim where --aim-lag-mm says (11-03 mass collection)")
+    parser.add_argument("--mask-lift-run", action="append", default=[],
+                        help="a run among --relabel-funnel-run whose frames labelled 'lift first' (low, outside the "
+                        "capture radius) get no supervision (11-03: R8b's descend/lift loops)")
     args = parser.parse_args()
-    if bool(args.mask_run) != (args.mask_above_mm is not None):
-        parser.error("--mask-run and --mask-above-mm go together")
-    if unknown := sorted(set(args.mask_run) - {Path(p).stem for p in args.trial_rows}):
+    if not set(args.mask_lift_run) <= set(args.relabel_funnel_run):
+        parser.error("--mask-lift-run must also be a --relabel-funnel-run")
+    mask_runs: dict[str, float | None] = {}
+    for item in args.mask_run:
+        run, _, cut = item.partition("@")
+        mask_runs[run] = float(cut) if cut else None
+    try:
+        _mask_cuts(mask_runs, args.mask_above_mm)
+    except ValueError:
+        parser.error("--mask-run without @MM needs --mask-above-mm, and --mask-above-mm needs a --mask-run")
+    if unknown := sorted(set(mask_runs) - {Path(p).stem for p in args.trial_rows}):
         parser.error(f"--mask-run {unknown} is not among the --trial-rows files")
+    if unknown := sorted(set(args.relabel_funnel_run) - {Path(p).stem for p in args.trial_rows}):
+        parser.error(f"--relabel-funnel-run {unknown} is not among the --trial-rows files")
     aim_lag = None if args.aim_lag_mm is None else np.array([float(v) for v in args.aim_lag_mm.split(",")]) / 1000.0
     if aim_lag is not None and aim_lag.shape != (2,):
         parser.error("--aim-lag-mm takes 'x,y'")
@@ -681,8 +801,10 @@ def main() -> None:
         trial_rows=load_trial_rows(args.trial_rows),
         holdout_named=args.holdout_view_episodes,
         aim_lag=aim_lag,
-        mask_runs=set(args.mask_run) or None,
+        mask_runs=mask_runs or None,
         mask_above_mm=args.mask_above_mm,
+        relabel_funnel_runs=set(args.relabel_funnel_run) or None,
+        mask_lift_runs=set(args.mask_lift_run) or None,
     )
     print(json.dumps(report, indent=2))
 
