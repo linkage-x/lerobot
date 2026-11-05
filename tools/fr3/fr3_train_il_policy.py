@@ -22,6 +22,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -2389,6 +2390,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--relight-aug-maps",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Lighting augmentation of the ee camera (tools/fr3/relight_aug.py): shadow maps from "
+            "outputs/real2sim_20261104/tools/relight_aug_maps.py for this view. Removes the real lamp "
+            "shadows and re-lights with moved lamps, plus brightness/contrast/colour jitter on both cameras."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
 
@@ -2639,6 +2651,13 @@ def main() -> None:
         elif args.pretrained_path:
             print(f"[train] base weights: {assert_pretrained_weights_resolve(str(args.pretrained_path))}")
         cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train", f"--config_path={config_path}"]
+    if args.relight_aug_maps:
+        maps = args.relight_aug_maps.expanduser().resolve()
+        if not (maps / "meta.json").exists():
+            raise FileNotFoundError(f"--relight-aug-maps {maps}: no meta.json")
+        os.environ["RELIGHT_AUG_MAPS"] = str(maps)
+        cmd[1:3] = [str(Path(__file__).resolve().parent / "relight_train_entry.py")]
+        print(f"[train] relight augmentation: {maps}")
     print("[train] " + " ".join(cmd))
     subprocess.run(cmd, check=True)
 
