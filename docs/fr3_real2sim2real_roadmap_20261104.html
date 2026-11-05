@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FR3 Real2Sim2Real 路线图</title>
+<style>
+  /* 布局：单栏阅读页；顶部结论 + 难点评估 + 分阶段（每阶段带 gate） + 误差清单 + 风险 */
+  :root{
+    --bg:#f5f7f8;--panel:#ffffff;--text:#1d2a33;--muted:#5d6b75;--line:#dde3e7;--code:#eef2f4;
+    --accent:#0f6e77;--accent-bg:#e6f3f3;
+    --ok:#1f7a3f;--ok-bg:#e9f6ee;--warn:#9a5b00;--warn-bg:#fdf4e3;--bad:#a12a2a;--bad-bg:#fbecec;
+    --hero:#13252d;--hero-fg:#eef5f6;--hero-muted:#b6c8cd;
+    --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+    --bg:#0f171b;--panel:#16232a;--text:#dce6ea;--muted:#93a5ad;--line:#2a3a42;--code:#1f2f37;
+    --accent:#5cc4cc;--accent-bg:#14343a;
+    --ok:#6fd08f;--ok-bg:#163223;--warn:#f0b65a;--warn-bg:#3a2c12;--bad:#f08a8a;--bad-bg:#3a1a1a;
+    --hero:#0a1216;--hero-fg:#eef5f6;--hero-muted:#9fb3b9;color-scheme:dark}}
+  :root[data-theme="dark"]{
+    --bg:#0f171b;--panel:#16232a;--text:#dce6ea;--muted:#93a5ad;--line:#2a3a42;--code:#1f2f37;
+    --accent:#5cc4cc;--accent-bg:#14343a;
+    --ok:#6fd08f;--ok-bg:#163223;--warn:#f0b65a;--warn-bg:#3a2c12;--bad:#f08a8a;--bad-bg:#3a1a1a;
+    --hero:#0a1216;--hero-fg:#eef5f6;--hero-muted:#9fb3b9;color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.65}
+  .wrap{max-width:1040px;margin:0 auto;padding-block:28px 72px;
+    padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));
+    display:flex;flex-direction:column;gap:16px}
+  .hero{background:var(--hero);color:var(--hero-fg);border-radius:14px;padding:26px 26px 22px}
+  .hero h1{margin:0 0 8px;font-size:27px;line-height:1.3;text-wrap:balance}
+  .hero p{margin:6px 0;color:var(--hero-muted);max-width:68ch}
+  .hero strong{color:var(--hero-fg)}
+  .pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+  .pill{padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.2);font-size:13px;color:var(--hero-fg)}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;min-width:0}
+  h2{font-size:20px;margin:0 0 10px;text-wrap:balance}
+  h3{font-size:16px;margin:16px 0 6px}
+  p{margin:8px 0;max-width:72ch}
+  ul,ol{margin:6px 0 0 20px;padding:0}
+  li{margin:4px 0;max-width:72ch}
+  code{font-family:var(--mono);background:var(--code);border-radius:5px;padding:1px 5px;font-size:.9em;word-break:break-all}
+  .muted{color:var(--muted)}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .ok{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)}
+  .bad{color:var(--bad);background:var(--bad-bg)} .acc{color:var(--accent);background:var(--accent-bg)}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-bg);border-radius:8px;padding:10px 14px;margin:10px 0}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg);color:var(--text)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg);color:var(--text)}
+  .two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .two>div{min-width:0}
+  .tbl{overflow-x:auto;margin-top:8px}
+  table{border-collapse:collapse;width:100%;min-width:640px;font-size:14px}
+  th,td{border-bottom:1px solid var(--line);padding:8px 8px;text-align:left;vertical-align:top}
+  th{font-size:12px;letter-spacing:.04em;color:var(--muted);font-weight:700}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;margin-top:8px}
+  .node{flex:1 1 150px;min-width:0;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg);font-size:13.5px}
+  .node b{display:block;font-size:14px;margin-bottom:2px;color:var(--accent)}
+  .arrow{align-self:center;color:var(--muted);font-size:18px}
+  .phase{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:12px;background:var(--bg)}
+  .phase-head{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline}
+  .phase-head h3{margin:0}
+  .phase-head .meta{color:var(--muted);font-size:13px}
+  .gate{margin-top:10px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .gate>div{border-radius:8px;padding:8px 12px;font-size:14px;min-width:0}
+  .gate .pass{background:var(--ok-bg)} .gate .kill{background:var(--bad-bg)}
+  .gate b{display:block;font-size:12px;letter-spacing:.04em}
+  .gate .pass b{color:var(--ok)} .gate .kill b{color:var(--bad)}
+  .timeline{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin-top:10px;font-size:12.5px}
+  .timeline div{border-radius:6px;padding:6px 8px;background:var(--accent-bg);color:var(--text);min-width:0}
+  .timeline div.opt{background:var(--code);color:var(--muted)}
+  .timeline b{display:block;color:var(--accent)}
+  @media (max-width:720px){.two,.gate{grid-template-columns:1fr}.timeline{grid-template-columns:repeat(2,minmax(0,1fr))}.arrow{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>FR3 Real2Sim2Real 路线图</h1>
+  <p><strong>判断：可行，值得做，但要收窄范围。</strong>先只仿真“抓取前的下降与闭合”段（无接触，正是现在的瓶颈），插入段继续用真机/脚本。第 2 周末有一个视觉 gate，第 4 周末有一个“仿真能否复现已知 checkpoint 行为”的 gate，任何一个不过就停，损失有限。</p>
+  <p>真机定向采集（R9）不停，作为并行主线；仿真线只在过 gate 后才替代真机采集。</p>
+  <div class="pills">
+    <span class="pill">2026-11-04</span>
+    <span class="pill">首个真机结果约 5–6 周</span>
+    <span class="pill">总机器人时间约 3–5 h（不含 A/B）</span>
+    <span class="pill">难度：中偏高，主要风险在视觉</span>
+  </div>
+</header>
+
+<section>
+  <h2>为什么这个任务适合 real2sim</h2>
+  <p>过去两周的诊断已经把瓶颈说清楚了：策略缺的是<strong>低空（&lt;35 mm）偏心状态下的横向修正</strong>，数据量少（R6 时只有 28 条低空偏心 episode），而 ee 图像本身是能读出 x 偏差的（冻结特征线性探针 1.8 mm）。这类需求恰好是仿真最便宜的部分：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>我们现在缺的</th><th>真机怎么拿</th><th>仿真怎么拿</th></tr></thead>
+    <tbody>
+      <tr><td>低空偏心状态的覆盖</td><td>靠 R4 自己犯错，78 条/h，每条只有一次接管</td><td>直接在 15–60 mm 注入 ±15 mm 横向偏移，均匀覆盖，不依赖策略犯什么错</td></tr>
+      <tr><td>正确的修正标签</td><td>GT 漏斗 + relabel；peg 记录有误差（regrip 偏 ~5 mm），只能用 fixture 摆放</td><td>peg 位姿精确已知，漏斗专家和 aim-lag 规则原样复用</td></tr>
+      <tr><td>抬起/循环类坏标签</td><td><code>--mask-lift-run</code> 事后去掉（12%）</td><td>专家行为可控，直接不生成</td></tr>
+      <tr><td>checkpoint 评估</td><td>每个 A/B 30 条 ≈ 40 min 机器人，n 小、p 值大</td><td>同一组 peg 跑几百条，配对比较，噪声小</td></tr>
+    </tbody>
+  </table></div>
+  <p>另外几个已有条件降低了难度：</p>
+  <ul>
+    <li><code>.venv-fr3</code> 已装 MuJoCo 3.8.1，仓库里已有 FR3 + Pika 的 MJCF（<code>src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_scene.xml</code>），夹爪 STL 也在。</li>
+    <li>真机日志极其丰富：每帧的 cmd/state、相机图像、peg GT、闭合偏差、延迟分布都有，系统辨识和视觉对比可以直接用历史数据，不需要额外录。</li>
+    <li>手上有 5 个真机行为已知的 checkpoint（R4、R6、R6fix、R8b、R8c），可以检验仿真是否“说真话”。这是大多数 real2sim 项目没有的验证资产。</li>
+    <li>推理运行时已有 fake-robot 测试路径，仿真可以作为同一接口的机器人后端，RTC、chunk、相位逻辑走同一套代码。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>两个难点的评估（外加一个你没列的）</h2>
+  <div class="two">
+    <div>
+      <h3>1. 相机观测的迁移/对齐 <span class="tag bad">主要风险</span></h3>
+      <ul>
+        <li>策略只看 ee 图像，而且在毫米级读位置：抓取后 ee 视角约 2 px/mm，渲染的 peg 边缘位置误差必须 ≤ 1–2 px，否则仿真里学到的修正方向会偏。</li>
+        <li>近距离腕部视角下，手指的影子、peg 顶面反光、自动曝光、运动模糊都在画面里。</li>
+        <li>做法：静态场景（桌面、fixture、齿轮、孔）用 3D Gaussian Splatting 重建。用机械臂带 ee 相机扫描，相机位姿来自 FK，比 COLMAP 准。peg 和手指用网格 + 实拍纹理叠加。渲染后走<strong>同一套裁剪和视频编码</strong>，再加光照/曝光/模糊随机化。</li>
+        <li>可以定量验证：在真机历史帧的同一 ee 位姿、同一 peg GT 下渲染，再把渲染帧和真帧分别喂给现有 probe。不需要先训练任何东西。</li>
+      </ul>
+    </div>
+    <div>
+      <h3>2. 真机各环节误差的模拟 <span class="tag warn">中等，比想象的容易</span></h3>
+      <ul>
+        <li>瓶颈段是无接触的：下降和闭合前的对准基本是运动学 + 控制器跟踪 + 延迟。这些都已经在日志里测过（见下方误差清单）。</li>
+        <li>真正难模拟的是接触：2.5 mm 间隙、无倒角的插入，以及闭合瞬间 peg 在手里滑动。第一期不碰插入；闭合只建模“y 被手指居中，x 留在手里”这一条已经验证过的规律。</li>
+        <li>运行时一致性比物理精度更重要：仿真必须用同一个策略服务器、同一个 RTC/chunk 逻辑，否则 R8b 那种“下降/抬起循环”复现不出来。</li>
+      </ul>
+    </div>
+  </div>
+  <h3>3. 仿真里的“失败状态”不等于真机的失败状态 <span class="tag warn">容易忽略</span></h3>
+  <p>swap probe 表明真机误差来自“每个场景固定的误读”。仿真画面和真机画面哪怕只差一点，策略在仿真里犯的错就不是它在真机上犯的错，纯 DAgger 会收集错的那批状态。对策是<strong>以扰动覆盖为主、DAgger 为辅</strong>：在低空把偏心状态铺满，不依赖策略自己走到哪里；同时保留少量真机定向数据（就是现在的 mass collection）作为锚。</p>
+</section>
+
+<section>
+  <h2>系统结构</h2>
+  <div class="flow">
+    <div class="node"><b>真机资产</b>扫描帧（FK 位姿）、历史日志、peg/fixture 尺寸、相机内外参</div>
+    <div class="arrow">→</div>
+    <div class="node"><b>数字孪生</b>MuJoCo 运动学 + 控制器模型；3DGS 静态场景 + 网格 peg/手指；gsplat 渲染</div>
+    <div class="arrow">→</div>
+    <div class="node"><b>SimRobot 后端</b>接到现有 runtime / grasp_loop，策略服务器跑在 8a100</div>
+    <div class="arrow">→</div>
+    <div class="node"><b>数据生成</b>扰动覆盖 + 晚接管 DAgger；GT 漏斗专家 + aim-lag 标签</div>
+    <div class="arrow">→</div>
+    <div class="node"><b>回到真机</b>真机 + 仿真共训练；现有离线 gate + 仿真 gate + 真机 A/B</div>
+  </div>
+  <div class="callout warn"><strong>选型注意：</strong>8a100 的 A100 没有 RT core，Isaac Sim 的 RTX 渲染在上面跑不了或很慢；gsplat（纯 CUDA 光栅化）和 MuJoCo 没有这个问题。Dante 的 5090 要留给真机推理，不放仿真渲染。</div>
+</section>
+
+<section>
+  <h2>分阶段路线</h2>
+  <div class="timeline">
+    <div><b>S0 · 第 1 周</b>资产与标定</div>
+    <div><b>S1 · 第 2 周</b>视觉 gate</div>
+    <div><b>S2 · 第 3–4 周</b>闭环仿真 + 相关性 gate</div>
+    <div><b>S3 · 第 5 周</b>数据生成</div>
+    <div><b>S4 · 第 6 周</b>共训练 + 真机 A/B</div>
+    <div class="opt"><b>S5 · 可选</b>插入段接触仿真</div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S0 资产与标定</h3><span class="meta">3–5 天 · 机器人约 1 h（只在空中移动，不接触）</span></div>
+    <ul>
+      <li>场景 MJCF：在 <code>fr3_pika_gripper_scene.xml</code> 上加桌面、fixture、齿轮/孔、peg（尺寸实测，先用基本几何体），加 ee 和 side 两个相机（内参取自真机标定，ee 外参取自手眼标定）。</li>
+      <li>扫描：ee 相机在工作区上方按网格走约 300 个位姿（覆盖 15–250 mm 高度），每个位姿记录图像和 FK；side 相机固定拍几十张。peg 单独在 fixture 上转几个角度拍纹理。</li>
+      <li>在 8a100 上训练静态场景的 3DGS（用 FK 位姿初始化，再做位姿微调）。</li>
+      <li>手指：ee 视角里手指几乎固定，可以直接从真帧抠图叠加，只按开合度切换。</li>
+    </ul>
+    <div class="gate">
+      <div class="pass"><b>通过</b>在 50 张留出的真帧位姿下渲染，孔和 peg 顶边的像素位置误差中位 ≤ 2 px（约 1 mm）。</div>
+      <div class="kill"><b>不通过</b>先查手眼标定和相机内参，这一步通常是标定问题而不是渲染问题。</div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S1 视觉 gap 离线 gate</h3><span class="meta">1 周 · 机器人 0 h · <span class="tag bad">kill point</span></span></div>
+    <ul>
+      <li>做一个 holdout 的“渲染孪生视图”：取 R8b 视图里 fixture 摆放（peg 干净）的 holdout episode，每帧在相同 ee 位姿、相同 peg GT 下渲染 ee/side 图像，动作和标签不变，导出成同格式的 LeRobot 视图。</li>
+      <li>在真实视图和渲染视图上分别跑现有的 <code>holdout_probe.py</code> / <code>close_probe.py</code>，checkpoint 用 R4、R6fix、R8b。</li>
+      <li>冻结 ee 特征的 x 探针：用真帧训练，在渲染帧上测（真帧上是 1.8 mm）。</li>
+      <li>如果不过，先试一周的补救：随机化光照/曝光，渲染帧做真机风格的颜色迁移，或者只渲染“真帧 + 重定位后的 peg”这种半合成图像。</li>
+    </ul>
+    <div class="gate">
+      <div class="pass"><b>通过</b>每个 checkpoint 在两种视图上的 along / y_over / 近处 +x 修正之差，小于 checkpoint 之间的差；排序不变；x 探针在渲染帧上 ≤ 2.5 mm。</div>
+      <div class="kill"><b>不通过（补救一周后）</b>停掉数据生成路线。仿真最多保留为粗评估工具，数据仍靠真机。</div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S2 闭环仿真 + 系统辨识 + 相关性 gate</h3><span class="meta">1–2 周 · 机器人约 1 h（可选，补测控制器阶跃响应） · <span class="tag bad">kill point</span></span></div>
+    <ul>
+      <li>写 <code>SimRobot</code> 后端，实现 runtime 用到的机器人/相机接口（参照 fake-robot 测试），让 <code>grasp_loop</code> 原样跑在仿真上：同样的 RTC、chunk、相位、漏斗、verdict 逻辑。</li>
+      <li>控制器模型：用历史日志拟合 cmd→state（逐轴的一阶/二阶滞后，闭合时的跟踪偏差约 (2.97, −1.42, −3.51) mm）。</li>
+      <li>延迟：策略服务器的真实延迟分布（p50 约 0.22 s），加上相机帧龄。</li>
+      <li>闭合：手指把 y 居中，x 留在手里（93 条 held trial 的图像 dx 已验证）。</li>
+      <li>随机化：peg 摆放噪声，孔位漂移若干 mm，偶发的夹爪信号掉点。</li>
+      <li>策略服务器在 8a100 上起一份，和 Dante 的真机服务互不干扰。</li>
+      <li>相关性测试：R4、R6、R6fix、R8b 在 seed-4000 的同一组 peg 上各跑 30 条，与真机结果逐项对照。</li>
+    </ul>
+    <div class="tbl"><table>
+      <thead><tr><th>要复现的真机特征</th><th>真机实测</th><th>仿真需达到</th></tr></thead>
+      <tbody>
+        <tr><td>R4 近处 peg（x&lt;0.40）+x 过冲</td><td>近处 2/13 in，其余 24/27</td><td>近处明显差于其余</td></tr>
+        <tr><td>R8b −y 过冲 → no_close 循环</td><td>闭合 dy −9.7 mm，no_close 11/30</td><td>dy 符号为负、no_close 显著多于 R4</td></tr>
+        <tr><td>R6fix 闭合 +x 偏差</td><td>图像 dx 中位约 +8 mm</td><td>符号相同，量级 ±3 mm 内</td></tr>
+        <tr><td>e2e 排序</td><td>R4 16–17/30 ≥ R8b 14/30 &gt; R6</td><td>排序一致</td></tr>
+      </tbody>
+    </table></div>
+    <div class="gate">
+      <div class="pass"><b>通过</b>4 个特征复现 ≥ 3 个。此时仿真本身就成了新的离线 gate，以后每个 checkpoint 先在仿真里跑，真机 A/B 只做最后确认。</div>
+      <div class="kill"><b>不通过</b>说明误差模型或视觉还缺东西。先对照未复现的那一项补模型（最多一周），仍不行就停。</div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S3 仿真数据生成</h3><span class="meta">约 1 周 · 机器人 0 h</span></div>
+    <ul>
+      <li><strong>扰动覆盖（主）：</strong>脚本专家下降，在 15–60 mm 随机注入 ±15 mm 的横向偏移和不同的接近方向，专家负责修正。这条路不需要策略推理，吞吐最高。</li>
+      <li><strong>晚接管 DAgger（辅）：</strong>和现在的 mass collection 相同的请求（R4 驾驶，低位接管 15–60 mm），但 peg 是精确的 GT。</li>
+      <li>标签：漏斗专家 + aim-lag 0.9,−0.6，和 R9 用同一条规则，避免标签之间互相冲突（R8b 的教训）。</li>
+      <li>吞吐需要在 S2 实测。粗估：扰动覆盖每张 A100 每小时上千条，DAgger 受推理限制约几百条；对比真机 78 条/h。</li>
+      <li>产出 <code>sim_mass1</code> 数据集，格式和真机一致，<code>funnel_relabel</code> 和 <code>build_r9.sh</code> 可以直接使用。</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S4 共训练 + 真机 A/B</h3><span class="meta">约 1 周 · 机器人约 1 h/次 A/B</span></div>
+    <ul>
+      <li>单变量：在当时最好的真机视图上（R4 或 R9）加入仿真数据，其余配方不变。仿真帧占比先从 30% 试起，在 8a100 上并行跑 full 和 half 两档比例。</li>
+      <li>评估顺序：现有离线 gate（y_over、近处 +x 修正）→ 仿真评估 → 真机 seed 4000 配对 A/B。</li>
+      <li>不做纯仿真训练。真机数据始终是锚，仿真只负责补覆盖。</li>
+    </ul>
+    <div class="gate">
+      <div class="pass"><b>成功标准</b>近处 peg 闭合 dx 落入 −8..2 mm 窗口的比例明显上升，e2e 不低于基线；之后新数据轮次主要在仿真里生成。</div>
+      <div class="kill"><b>不成功</b>保留仿真作为评估工具（S2 的产出），数据仍以真机为主。</div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><h3>S5（可选）插入段接触仿真</h3><span class="meta">2–3 周 · 只在 S4 成功后做</span></div>
+    <ul>
+      <li>2.5 mm 间隙、无倒角，用基本几何体做 peg 和孔，MuJoCo 接触参数用 ATI 力传感器的真机插入曲线来标（仓库里已有 <code>fr3_pika_gripper_ati</code> 模型）。</li>
+      <li>目标是给“策略自己插入”的 end-to-end 目标补数据，替代现在的 insert teacher 录制。</li>
+      <li>这一段 sim2real 难度明显更高（摩擦、卡阻、手内滑动），所以单独立项，不和 S0–S4 绑在一起。</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>误差清单（S2 要建模的）</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>环节</th><th>已知数值 / 来源</th><th>建模方式</th><th>优先级</th></tr></thead>
+    <tbody>
+      <tr><td>控制器跟踪滞后</td><td class="num">闭合时 cmd−state 约 +0.9~3.8 mm（10-27、11-02 轨迹）</td><td>逐轴滞后模型，用日志拟合</td><td><span class="tag bad">高</span></td></tr>
+      <tr><td>推理延迟 + RTC</td><td class="num">p50 0.22 s</td><td>同一个策略服务器，加上延迟分布采样</td><td><span class="tag bad">高</span></td></tr>
+      <tr><td>ee 相机外参</td><td>手眼标定；每天孔位置的像素差 ±2 px</td><td>标定值 + 小幅随机扰动</td><td><span class="tag bad">高</span></td></tr>
+      <tr><td>闭合时 peg 在手里的位移</td><td>y 被手指居中，x 留在手里（r=0.87）</td><td>运动学规则，暂不做接触</td><td><span class="tag bad">高</span></td></tr>
+      <tr><td>peg 摆放误差</td><td>fixture 约 1 mm；regrip 记录偏 ~5 mm</td><td>仿真 GT 精确；按 fixture/regrip 两档加噪声</td><td><span class="tag warn">中</span></td></tr>
+      <tr><td>孔位漂移</td><td>孔会慢慢移动（物理约束）</td><td>每个 episode 随机平移几 mm</td><td><span class="tag warn">中</span></td></tr>
+      <tr><td>光照/曝光/编码</td><td>LeRobot 视频编码、ee 裁剪 286×542</td><td>同一裁剪和编码器，光照随机化</td><td><span class="tag warn">中</span></td></tr>
+      <tr><td>peg 倒下</td><td class="num">5/113 次摆放</td><td>少量倒下 episode，或干脆不生成</td><td><span class="tag ok">低</span></td></tr>
+      <tr><td>夹爪信号掉点</td><td>Pika SDK sentinel（已修）</td><td>低概率注入</td><td><span class="tag ok">低</span></td></tr>
+      <tr><td>FCI 通讯 reflex</td><td>已修，0 次</td><td>不建模</td><td><span class="tag ok">低</span></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>代价与风险</h2>
+  <div class="two">
+    <div>
+      <h3>机器人时间</h3>
+      <ul>
+        <li>真机定向采集：600 条 ≈ 7.7 h 机器人，每轮都要重新录。</li>
+        <li>real2sim：扫描约 1 h，可选的系统辨识约 1 h；之后每轮新数据 0 h，只剩 A/B（约 1 h/次）。</li>
+        <li>场景变化（换桌面、光照大变、换 fixture）需要重扫，约 1 h。</li>
+      </ul>
+    </div>
+    <div>
+      <h3>主要风险和退路</h3>
+      <ul>
+        <li><strong>毫米级的视觉 gap</strong>：在 S1 第 2 周就能看出来，不过就停。</li>
+        <li><strong>失败状态分布不同</strong>：靠扰动覆盖和真机锚数据缓解。</li>
+        <li><strong>工程量</strong>：SimRobot 后端和渲染管线是主要工作，约 2 周，其余复用现有工具。</li>
+        <li><strong>即使数据路线失败</strong>：S2 产出的“仿真评估器”本身也能把每个 checkpoint 的真机 A/B 从 30 条减到只做最终确认。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout bad"><strong>先不做：</strong>一开始就做接触插入仿真；纯仿真训练；在 A100 上跑 Isaac Sim；在仿真 gate 通过前停掉真机定向采集。</div>
+</section>
+
+<p class="muted">依据：outputs/mass_20261103/README.md（试录 084815），outputs/eval_r8c/gate_summary.csv，以及 R4–R8c 的真机/离线结论（memory: pure-policy-retrain-plan, r6fix-close-x-bias-20261102）。</p>
+</div>
+</body>
+</html>
