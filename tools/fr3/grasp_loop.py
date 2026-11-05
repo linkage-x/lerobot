@@ -268,6 +268,10 @@ GRASP_LOOP_CORRECTIVE_RESIDUAL_MM = (0.0, 25.0)
 GRASP_LOOP_CORRECTIVE_LATE_FRACTION = 0.3
 GRASP_LOOP_CORRECTIVE_LATE_DZ_MM = (15.0, 40.0)
 GRASP_LOOP_CORRECTIVE_LIFT_DZ_MM = 45.0
+# How low a drawn late takeover may be (`funnelLateDzMm`): 15 mm is the lowest the corrective
+# funnel has run at (10-20 onward, R7's 69 late trials of 113314 all held), with `lowContactMm`
+# watching the fingers. Above 320 it is not late.
+GRASP_LOOP_CORRECTIVE_LATE_DZ_RANGE_MM = (15.0, 320.0)
 # Heights above the peg at which the policy's aim is read (`aimXyAboveMm`): where it is still
 # travelling, where it has mostly arrived, and the funnel's v14 (3) takeover.
 GRASP_LOOP_AIM_HEIGHTS_MM = (150, 100, 60)
@@ -359,6 +363,17 @@ class GraspLoopRequest:
     funnelAlignDzMm: tuple[float, float] = (FUNNEL_ALIGN_DZ_MM, FUNNEL_ALIGN_DZ_MM)
     # Arm B: corrective demonstrations (GRASP_LOOP_CORRECTIVE_*, `funnel_config`).
     funnelCorrective: bool = False
+    # With `funnelCorrective`: the share of trials taken over late, and the height range that
+    # late takeover is drawn from. 11-03 mass collection: the policy's low, off-centre states
+    # are where its correction is weak (a third of the label), and R7 drew only 69 of 200 late.
+    funnelLateFraction: float = GRASP_LOOP_CORRECTIVE_LATE_FRACTION
+    funnelLateDzMm: tuple[float, float] = GRASP_LOOP_CORRECTIVE_LATE_DZ_MM
+    # With `funnelCorrective` and a whole-trial recording: keep the policy's own steps below the
+    # lift height before a late takeover (otherwise left out, `policy_off_course`), for
+    # `funnel_relabel` to label with the funnel's chunk. They are exactly the low, off-centre
+    # states the policy fails from; R7 dropped 1369 of them (median 17 a late trial). Never train
+    # on such a recording without the relabel: the policy's own action there is the error.
+    funnelKeepLowPolicy: bool = False
     seed: int = 0
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -420,8 +435,9 @@ def funnel_config(request: GraspLoopRequest, trial: int, peg_xyz: tuple[float, f
     align_dz = funnel_align_dz_mm(request, trial)
     corrective: dict[str, Any] = {}
     if request.funnelCorrective:
-        if random.Random(f"{request.seed}:{trial}:funnel_late").random() < GRASP_LOOP_CORRECTIVE_LATE_FRACTION:
-            align_dz = random.Random(f"{request.seed}:{trial}:funnel_late_dz").uniform(*GRASP_LOOP_CORRECTIVE_LATE_DZ_MM)
+        if random.Random(f"{request.seed}:{trial}:funnel_late").random() < request.funnelLateFraction:
+            low, high = (float(v) for v in request.funnelLateDzMm)
+            align_dz = random.Random(f"{request.seed}:{trial}:funnel_late_dz").uniform(low, high)
         corrective = {
             "residualMm": random.Random(f"{request.seed}:{trial}:funnel_residual").uniform(
                 *GRASP_LOOP_CORRECTIVE_RESIDUAL_MM
@@ -470,6 +486,22 @@ def validate_grasp_loop_request(
         raise SceneResetError(
             f"funnelAlignDzMm {low_dz:g},{high_dz:g} must be low <= high within {min_dz:g}..{max_dz:g} mm: "
             "below that the fingers move across at the peg top, above it the policy never drives."
+        )
+    late_low, late_high = (float(v) for v in request.funnelLateDzMm)
+    late_min, late_max = GRASP_LOOP_CORRECTIVE_LATE_DZ_RANGE_MM
+    if not 0.0 <= request.funnelLateFraction <= 1.0:
+        raise SceneResetError(f"funnelLateFraction {request.funnelLateFraction:g} must be in [0, 1].")
+    if not late_min <= late_low <= late_high <= late_max:
+        raise SceneResetError(
+            f"funnelLateDzMm {late_low:g},{late_high:g} must be low <= high within {late_min:g}..{late_max:g} mm."
+        )
+    late_changed = (
+        request.funnelLateFraction != GRASP_LOOP_CORRECTIVE_LATE_FRACTION
+        or (late_low, late_high) != tuple(GRASP_LOOP_CORRECTIVE_LATE_DZ_MM)
+    )
+    if (late_changed or request.funnelKeepLowPolicy) and not request.funnelCorrective:
+        raise SceneResetError(
+            "funnelLateFraction, funnelLateDzMm and funnelKeepLowPolicy shape the corrective funnel: turn funnelCorrective on."
         )
     if request.afterClose not in GRASP_LOOP_AFTER_CLOSE:
         raise SceneResetError(

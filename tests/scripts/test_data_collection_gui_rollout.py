@@ -4546,6 +4546,43 @@ def test_the_funnel_corrective_switch_reaches_the_launcher_only_with_arm_b():
     assert "grasp_loop_args+=(--grasp-loop-funnel-corrective)" in launcher
 
 
+def test_the_late_takeover_settings_reach_the_launcher_only_with_the_corrective_funnel():
+    """11-03 mass collection: how many trials the funnel takes late, how low, and keeping the
+    policy's low steps (whole trials only) for the offline relabel."""
+
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    raw = {
+        "graspLoopArms": "B",
+        "graspLoopFunnelCorrective": True,
+        "graspLoopFunnelLateFraction": "1",
+        "graspLoopFunnelLateDzMm": "20, 60",
+        "graspLoopRecord": True,
+        "graspLoopDatasetRoot": "/data/x",
+        "graspLoopRecordWholeTrial": True,
+        "graspLoopFunnelKeepLowPolicy": True,
+    }
+    got = sanitize(raw)
+    assert got["FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION"] == "1"
+    assert got["FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM"] == "20,60"
+    assert got["FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY"] == "1"
+    for bad, match in (
+        ({**raw, "graspLoopFunnelLateFraction": "1.2"}, "graspLoopFunnelLateFraction"),
+        ({**raw, "graspLoopFunnelLateFraction": "x"}, "graspLoopFunnelLateFraction"),
+        ({**raw, "graspLoopFunnelLateDzMm": "60,20"}, "graspLoopFunnelLateDzMm"),
+        ({**raw, "graspLoopFunnelCorrective": False}, "graspLoopFunnelCorrective on"),
+        ({**raw, "graspLoopRecordWholeTrial": False}, "graspLoopRecordWholeTrial on"),
+    ):
+        with pytest.raises(rollout_backend.RolloutError, match=match):
+            sanitize(bad)
+    for key in (
+        "FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION", "FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM", "FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY"
+    ):
+        assert key in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert "--grasp-loop-funnel-late-fraction" in launcher and "--grasp-loop-funnel-late-dz-mm" in launcher
+    assert "grasp_loop_args+=(--grasp-loop-funnel-keep-low-policy)" in launcher
+
+
 def test_who_inserts_after_the_close_reaches_the_launcher_only_with_a_hole():
     sanitize = rollout_backend.sanitize_rollout_runtime_options
     pose = "0.3597,-0.1328,0.058"

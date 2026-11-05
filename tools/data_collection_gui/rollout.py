@@ -105,6 +105,9 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_KEEP_MISSES",
     "FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM",
     "FR3_GRASP_LOOP_FUNNEL_CORRECTIVE",
+    "FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION",
+    "FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM",
+    "FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY",
     "FR3_GRASP_LOOP_AFTER_CLOSE",
     "FR3_GRASP_LOOP_OUT",
 )
@@ -517,6 +520,28 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if (grasp_arms or "A") == "A":
             raise RolloutError("graspLoopFunnelCorrective shapes arm B's funnel: choose arm B or AB.")
         options["FR3_GRASP_LOOP_FUNNEL_CORRECTIVE"] = "1"
+        # How many trials it takes over late, and how low; the runtime checks the ranges.
+        late_fraction = _optional_text(raw.get("graspLoopFunnelLateFraction"))
+        if late_fraction:
+            try:
+                fraction = float(late_fraction)
+            except ValueError:
+                fraction = math.nan
+            if not 0.0 <= fraction <= 1.0:
+                raise RolloutError("graspLoopFunnelLateFraction must be a number in [0, 1].")
+            options["FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION"] = f"{fraction:g}"
+        late_dz = _optional_text(raw.get("graspLoopFunnelLateDzMm"))
+        if late_dz:
+            parts = [part.strip() for part in late_dz.split(",")]
+            try:
+                numbers = [float(part) for part in parts]
+            except ValueError:
+                numbers = []
+            if not 1 <= len(numbers) <= 2 or len(numbers) != len(parts) or numbers[0] > numbers[-1]:
+                raise RolloutError("graspLoopFunnelLateDzMm must be 'h' or 'low,high' in mm, low <= high.")
+            options["FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM"] = ",".join(f"{value:g}" for value in numbers)
+    elif any(_optional_text(raw.get(key)) for key in ("graspLoopFunnelLateFraction", "graspLoopFunnelLateDzMm")):
+        raise RolloutError("graspLoopFunnelLateFraction / graspLoopFunnelLateDzMm shape the corrective funnel: turn graspLoopFunnelCorrective on.")
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         root = _optional_text(raw.get("graspLoopDatasetRoot"))
@@ -534,6 +559,13 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if (grasp_arms or "A") == "B":
             raise RolloutError("graspLoopKeepMisses keeps arm A's misses: choose arm A or AB.")
         options["FR3_GRASP_LOOP_KEEP_MISSES"] = "1"
+    # The policy's low steps before a late takeover, for the offline relabel only.
+    if _parse_bool_field(raw.get("graspLoopFunnelKeepLowPolicy", False), "graspLoopFunnelKeepLowPolicy"):
+        if options.get("FR3_GRASP_LOOP_FUNNEL_CORRECTIVE") != "1":
+            raise RolloutError("graspLoopFunnelKeepLowPolicy keeps the steps before a late takeover: turn graspLoopFunnelCorrective on.")
+        if options.get("FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL") != "1":
+            raise RolloutError("graspLoopFunnelKeepLowPolicy keeps policy steps: turn graspLoopRecordWholeTrial on too.")
+        options["FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY"] = "1"
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
@@ -1281,7 +1313,8 @@ GRASP_LOOP_START_LEAD_S = 1800.0
 _GRASP_LOOP_RECORD_OPTIONS = (
     "graspLoopTrials", "graspLoopMaxPolicySteps", "graspLoopSeed", "graspLoopAttended",
     "graspLoopArms", "graspLoopInsertPose", "graspLoopFunnelTakeoverDzMm",
-    "graspLoopFunnelCorrective", "graspLoopAfterClose",
+    "graspLoopFunnelCorrective", "graspLoopAfterClose", "graspLoopFunnelLateFraction",
+    "graspLoopFunnelLateDzMm", "graspLoopFunnelKeepLowPolicy",
 )
 
 
@@ -1365,6 +1398,13 @@ def grasp_loop_resume_params(
     options["graspLoopArms"] = str(request.get("arms") or "A")
     options["graspLoopFunnelCorrective"] = bool(request.get("funnelCorrective", False))
     options["graspLoopAfterClose"] = str(request.get("afterClose") or "script")
+    if request.get("funnelCorrective"):
+        if isinstance(request.get("funnelLateFraction"), (int, float)):
+            options["graspLoopFunnelLateFraction"] = f"{float(request['funnelLateFraction']):g}"
+        late_dz = request.get("funnelLateDzMm")
+        if isinstance(late_dz, list) and len(late_dz) == 2:
+            options["graspLoopFunnelLateDzMm"] = _mm(late_dz[0]) if late_dz[0] == late_dz[1] else f"{_mm(late_dz[0])},{_mm(late_dz[1])}"
+    options["graspLoopFunnelKeepLowPolicy"] = bool(request.get("funnelKeepLowPolicy", False))
     dz = request.get("funnelAlignDzMm")
     if isinstance(dz, list) and len(dz) == 2:
         low, high = dz

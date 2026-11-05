@@ -1719,6 +1719,12 @@ export type RolloutRuntimeOptions = {
   graspLoopFunnelTakeoverDzMm?: string;
   /** Arm B: corrective demonstrations (part of the aim left to the descent; some low takeovers that lift and realign). */
   graspLoopFunnelCorrective?: boolean;
+  /** With graspLoopFunnelCorrective: share of late takeovers, blank = 0.3. */
+  graspLoopFunnelLateFraction?: string;
+  /** With graspLoopFunnelCorrective: late takeover height, "h" or "low,high" mm, blank = 15,40. */
+  graspLoopFunnelLateDzMm?: string;
+  /** With graspLoopFunnelCorrective + whole trials: keep the policy's low steps before a late takeover, for the offline relabel. */
+  graspLoopFunnelKeepLowPolicy?: boolean;
   /** Past the close: the scripted insertion, the recorded insertion teacher, or the policy. Not script: needs graspLoopInsertPose. */
   graspLoopAfterClose?: "script" | "teacher" | "policy";
 };

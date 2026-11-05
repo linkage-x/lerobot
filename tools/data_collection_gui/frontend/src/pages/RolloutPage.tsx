@@ -173,6 +173,11 @@ export function RolloutPage() {
   const [graspLoopFunnelTakeoverDzMm, setGraspLoopFunnelTakeoverDzMm] = useState("60,300");
   // 10-20: checkpoints on the plain funnel's trials aim once, high, and descend straight.
   const [graspLoopFunnelCorrective, setGraspLoopFunnelCorrective] = useState(false);
+  // 11-03: mass collection of low, off-centre corrections -- more late takeovers, and the
+  // policy's own low steps kept for the offline relabel.
+  const [graspLoopFunnelLateFraction, setGraspLoopFunnelLateFraction] = useState("");
+  const [graspLoopFunnelLateDzMm, setGraspLoopFunnelLateDzMm] = useState("");
+  const [graspLoopFunnelKeepLowPolicy, setGraspLoopFunnelKeepLowPolicy] = useState(false);
   // 10-30: who inserts after the close. The teacher records the insertion; the policy is the e2e test.
   const [graspLoopAfterClose, setGraspLoopAfterClose] = useState<"script" | "teacher" | "policy">("script");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
@@ -332,6 +337,22 @@ export function RolloutPage() {
         modeId === "grasp_loop" ? graspLoopFunnelTakeoverDzMm.trim() || undefined : undefined,
       graspLoopFunnelCorrective:
         modeId === "grasp_loop" && graspLoopArms !== "A" ? graspLoopFunnelCorrective : undefined,
+      graspLoopFunnelLateFraction:
+        modeId === "grasp_loop" && graspLoopArms !== "A" && graspLoopFunnelCorrective
+          ? graspLoopFunnelLateFraction.trim() || undefined
+          : undefined,
+      graspLoopFunnelLateDzMm:
+        modeId === "grasp_loop" && graspLoopArms !== "A" && graspLoopFunnelCorrective
+          ? graspLoopFunnelLateDzMm.trim() || undefined
+          : undefined,
+      graspLoopFunnelKeepLowPolicy:
+        modeId === "grasp_loop" &&
+        graspLoopArms !== "A" &&
+        graspLoopFunnelCorrective &&
+        graspLoopRecord &&
+        graspLoopRecordWholeTrial
+          ? graspLoopFunnelKeepLowPolicy
+          : undefined,
       graspLoopAfterClose:
         modeId === "grasp_loop" && graspLoopInsertPose.trim() && graspLoopAfterClose !== "script"
           ? graspLoopAfterClose
@@ -385,6 +406,9 @@ export function RolloutPage() {
       graspLoopDatasetRoot,
       graspLoopFunnelTakeoverDzMm,
       graspLoopFunnelCorrective,
+      graspLoopFunnelLateFraction,
+      graspLoopFunnelLateDzMm,
+      graspLoopFunnelKeepLowPolicy,
       graspLoopAfterClose
     ]
   );
@@ -550,6 +574,10 @@ export function RolloutPage() {
       setGraspLoopDatasetRoot(options.graspLoopDatasetRoot ?? "");
       if (options.graspLoopFunnelCorrective !== undefined)
         setGraspLoopFunnelCorrective(options.graspLoopFunnelCorrective);
+      setGraspLoopFunnelLateFraction(options.graspLoopFunnelLateFraction ?? "");
+      setGraspLoopFunnelLateDzMm(options.graspLoopFunnelLateDzMm ?? "");
+      if (options.graspLoopFunnelKeepLowPolicy !== undefined)
+        setGraspLoopFunnelKeepLowPolicy(options.graspLoopFunnelKeepLowPolicy);
       setGraspLoopAfterClose(options.graspLoopAfterClose ?? "script");
       if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
       if (options.daggerDatasetRoot !== undefined)
@@ -1635,6 +1663,41 @@ export function RolloutPage() {
               15–40 mm（或它停住、要合手时）才接管；偏差超过 8 mm 就先竖直抬到 45 mm，再对准、下降。低位接管时策略可能碰倒销，
               建议有人看着。只跑 A 时不可用。
             </p>
+            {graspLoopFunnelCorrective && graspLoopArms !== "A" ? (
+              <>
+                <label className="field">
+                  <span>低位接管比例（纠偏示范；空 = 0.3）</span>
+                  <input
+                    value={graspLoopFunnelLateFraction}
+                    onChange={(event) => setGraspLoopFunnelLateFraction(event.target.value)}
+                    placeholder="0.3"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field">
+                  <span>低位接管高度 mm（离销；单值，或 最小,最大；空 = 15,40；不低于 15）</span>
+                  <input
+                    value={graspLoopFunnelLateDzMm}
+                    onChange={(event) => setGraspLoopFunnelLateDzMm(event.target.value)}
+                    placeholder="15,40"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={graspLoopFunnelKeepLowPolicy}
+                    onChange={(event) => setGraspLoopFunnelKeepLowPolicy(event.target.checked)}
+                    disabled={isLive || !graspLoopRecord || !graspLoopRecordWholeTrial}
+                  />
+                  <span>保留低位接管前策略自己的低空步（需录整条 trial）</span>
+                </label>
+                <p className="hint">
+                  默认这些步不录：那是策略偏着往下走的动作，直接训练会学坏。勾上后录进数据集（不算干预帧），
+                  只能经 funnel_relabel 改标成漏斗的纠正后再训练——这正是策略失败时所处的低空偏心状态（11-03 大量采集）。
+                </p>
+              </>
+            ) : null}
             <label className="checkbox">
               <input
                 type="checkbox"

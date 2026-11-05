@@ -2751,6 +2751,18 @@ def test_keeping_misses_is_off_unless_asked(tmp_path: Path):
     ).grasp_loop_keep_misses
 
 
+def test_late_takeover_flags_default_to_r7s_draws_and_keep_low_policy_is_off(tmp_path: Path):
+    args = _grasp_loop_dataset_args(tmp_path)
+    assert args.grasp_loop_funnel_late_fraction == pytest.approx(0.3)
+    assert fr3_act_infer_real_runtime.parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_late_dz_mm) == (15.0, 40.0)
+    assert args.grasp_loop_funnel_keep_low_policy is False
+    args = _grasp_loop_dataset_args(
+        tmp_path, '--grasp-loop-funnel-late-fraction', '1', '--grasp-loop-funnel-late-dz-mm', '20,60',
+        '--grasp-loop-record-whole-trial', '--grasp-loop-funnel-keep-low-policy',
+    )
+    assert args.grasp_loop_funnel_late_fraction == 1.0 and args.grasp_loop_funnel_keep_low_policy
+
+
 @pytest.mark.parametrize('recorded_whole, run_whole', [(False, True), (True, False)])
 def test_a_dataset_of_one_kind_of_episode_refuses_the_other(tmp_path: Path, monkeypatch, recorded_whole, run_whole):
     """Funnel episodes start mid-air, whole trials at the start pose: one dataset of both would put

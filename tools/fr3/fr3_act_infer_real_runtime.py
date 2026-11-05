@@ -126,6 +126,8 @@ from tools.fr3.grasp_funnel import FUNNEL_ALIGN_DZ_MM
 from tools.fr3.grasp_loop import (
     GRASP_LOOP_ARMS,
     GRASP_LOOP_BLOCKED_MARGIN,
+    GRASP_LOOP_CORRECTIVE_LATE_DZ_MM,
+    GRASP_LOOP_CORRECTIVE_LATE_FRACTION,
     GRASP_LOOP_HELD_WIDTH,
     GRASP_LOOP_INSERT_PRESS_CAP_N,
     GRASP_LOOP_INSERT_SEARCH_ORDER,
@@ -567,6 +569,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             'Arm B: record corrective demonstrations. The funnel leaves part of the policy\'s own aim '
             'error for the descent to close, and on some trials takes over low and lifts before '
             'realigning (grasp_loop GRASP_LOOP_CORRECTIVE_*). Off: the v14 (3) funnel.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-funnel-late-fraction',
+        type=float,
+        default=GRASP_LOOP_CORRECTIVE_LATE_FRACTION,
+        help=(
+            'With --grasp-loop-funnel-corrective: the share of trials the funnel takes over late '
+            '(the policy comes down to --grasp-loop-funnel-late-dz-mm first). Default 0.3.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-funnel-late-dz-mm',
+        default='%g,%g' % GRASP_LOOP_CORRECTIVE_LATE_DZ_MM,
+        help="With --grasp-loop-funnel-corrective: a late takeover's height above the peg, 'h' or 'low,high' mm. Default 15,40.",
+    )
+    parser.add_argument(
+        '--grasp-loop-funnel-keep-low-policy',
+        action='store_true',
+        help=(
+            "With --grasp-loop-funnel-corrective and whole-trial recording: keep the policy's own steps "
+            'below the lift height before a late takeover in the dataset (left out otherwise), for '
+            'funnel_relabel to label. Never train on such a recording without the relabel.'
         ),
     )
     parser.add_argument(
@@ -5833,6 +5858,10 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             '--grasp-loop-keep-misses keeps whole trials: it needs --grasp-loop-record-whole-trial '
             "(a miss's funnel steps alone are no demonstration of anything)."
         )
+    if args.grasp_loop_funnel_keep_low_policy and not args.grasp_loop_record_whole_trial:
+        raise SystemExit(
+            '--grasp-loop-funnel-keep-low-policy keeps policy steps: it needs --grasp-loop-record-whole-trial.'
+        )
     if int(args.grasp_loop_trials) > 0:
         if args.interactive_rollouts or args.dagger_takeover or terminal_servo_request is not None:
             raise SystemExit(
@@ -5874,6 +5903,9 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 insertViaHome=bool(args.grasp_loop_insert_via_home),
                 funnelAlignDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_takeover_dz_mm),
                 funnelCorrective=bool(args.grasp_loop_funnel_corrective),
+                funnelLateFraction=float(args.grasp_loop_funnel_late_fraction),
+                funnelLateDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_late_dz_mm),
+                funnelKeepLowPolicy=bool(args.grasp_loop_funnel_keep_low_policy),
                 afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
@@ -5901,6 +5933,16 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             )
             + 'funnel_takeover_dz_mm=%g..%g ' % grasp_loop_request.funnelAlignDzMm
             + f'funnel_corrective={int(grasp_loop_request.funnelCorrective)} '
+            + (
+                'funnel_late=%g@%g..%g keep_low_policy=%d '
+                % (
+                    grasp_loop_request.funnelLateFraction,
+                    *grasp_loop_request.funnelLateDzMm,
+                    int(grasp_loop_request.funnelKeepLowPolicy),
+                )
+                if grasp_loop_request.funnelCorrective
+                else ''
+            )
             + f'after_close={grasp_loop_request.afterClose} '
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
@@ -6832,6 +6874,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     keeps_policy_frames=dagger_buffer.keeps_policy_frames,
                     policy_off_course=(
                         command_source == 'policy'
+                        and not (grasp_loop_request is not None and grasp_loop_request.funnelKeepLowPolicy)
                         and grasp_handover is not None
                         and grasp_handover.funnel is not None
                         and grasp_handover.funnel.lowPolicyStep

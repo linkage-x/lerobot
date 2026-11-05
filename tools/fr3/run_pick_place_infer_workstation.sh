@@ -22,6 +22,9 @@
 #     FR3_GRASP_LOOP_KEEP_MISSES=1 (with whole trials: arm A's empty / no_close trials too, for relabelling)
 #     FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM ("h" or "low,high" mm above the peg; blank = 60)
 #     FR3_GRASP_LOOP_FUNNEL_CORRECTIVE (1 = arm B records corrective demonstrations)
+#     FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION (with corrective: share of late takeovers; blank = 0.3)
+#     FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM (with corrective: late takeover height, "h" or "low,high"; blank = 15,40)
+#     FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY (1 = with whole trials, keep the policy's low steps for the relabel)
 #     FR3_GRASP_LOOP_AFTER_CLOSE (script | teacher | policy: who inserts after the close; blank = script)
 #     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
@@ -501,6 +504,11 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-takeover-dz-mm "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM}"); fi
     # Arm B: the funnel leaves part of the aim to the descent and sometimes recovers from low (unset = off).
     if [[ "${FR3_GRASP_LOOP_FUNNEL_CORRECTIVE-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-corrective); fi
+    # With the corrective funnel: the share of late takeovers and their height (blank = 0.3 and 15,40 mm),
+    # and keeping the policy's low steps before one for the offline relabel (unset = off).
+    if [[ -n "${FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-late-fraction "${FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION}"); fi
+    if [[ -n "${FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-late-dz-mm "${FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM}"); fi
+    if [[ "${FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-keep-low-policy); fi
     # Past the close: the recorded insertion teacher, or the policy itself (blank = the scripted insertion).
     if [[ -n "${FR3_GRASP_LOOP_AFTER_CLOSE-}" ]]; then grasp_loop_args+=(--grasp-loop-after-close "${FR3_GRASP_LOOP_AFTER_CLOSE}"); fi
     # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).

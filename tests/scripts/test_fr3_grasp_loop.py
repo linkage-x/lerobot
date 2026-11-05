@@ -2174,6 +2174,47 @@ def test_corrective_demonstrations_without_arm_b_are_refused():
     grasp_loop.validate_grasp_loop_request(_request(arms="AB", funnelCorrective=True))
 
 
+def test_the_late_share_and_height_are_the_requests():
+    """11-03 mass collection: every trial late, drawn 20-60 mm; the same draws as the default for
+    the trials both call late, and the residual draws untouched."""
+
+    peg = (0.40, -0.15, 0.058)
+    base = _request(arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4, funnelCorrective=True)
+    every = _request(
+        arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4, funnelCorrective=True,
+        funnelLateFraction=1.0, funnelLateDzMm=(20.0, 60.0),
+    )
+    grasp_loop.validate_grasp_loop_request(every)
+    configs = [grasp_loop.funnel_config(every, t, peg) for t in range(100)]
+    assert all(20.0 <= c.alignDzMm <= 60.0 for c in configs)
+    assert [c.residualMm for c in configs] == [grasp_loop.funnel_config(base, t, peg).residualMm for t in range(100)]
+    none = _request(arms="B", funnelAlignDzMm=(60.0, 300.0), seed=4, funnelCorrective=True, funnelLateFraction=0.0)
+    assert all(
+        grasp_loop.funnel_config(none, t, peg).alignDzMm == grasp_loop.funnel_align_dz_mm(none, t) for t in range(100)
+    )
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        ({"funnelLateFraction": 1.5}, "funnelLateFraction"),
+        ({"funnelLateDzMm": (10.0, 40.0)}, "funnelLateDzMm"),
+        ({"funnelLateDzMm": (40.0, 20.0)}, "funnelLateDzMm"),
+    ],
+)
+def test_late_takeover_settings_out_of_range_are_refused(fields, match):
+    with pytest.raises(scene_reset.SceneResetError, match=match):
+        grasp_loop.validate_grasp_loop_request(_request(arms="B", funnelCorrective=True, **fields))
+
+
+@pytest.mark.parametrize(
+    "fields", [{"funnelLateFraction": 1.0}, {"funnelLateDzMm": (20.0, 60.0)}, {"funnelKeepLowPolicy": True}]
+)
+def test_late_takeover_settings_need_the_corrective_funnel(fields):
+    with pytest.raises(scene_reset.SceneResetError, match="turn funnelCorrective on"):
+        grasp_loop.validate_grasp_loop_request(_request(arms="B", **fields))
+
+
 # ------------------------------------------------------------------ resume and fault redo ---
 
 
