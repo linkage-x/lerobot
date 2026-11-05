@@ -221,9 +221,17 @@ describe("rollout page safety gating", () => {
 
   it("keeps pi0.5+LoRA runtime defaults on the Rollout page", () => {
     expect(rolloutPageSource).toContain("pi0.5+LoRA first rollout defaults");
-    expect(rolloutPageSource).toContain("runtimeOptions: rolloutRuntimeOptions");
+    expect(rolloutPageSource).toContain(": rolloutRuntimeOptions,");
     expect(rolloutPageSource).toContain("RTC auto stays disabled for ACT-style policies");
     expect(rolloutPageSource).toContain("Show advanced rollout knobs");
+  });
+
+  it("replaces the pi0.5 defaults with the task prompt alone for a remote deployment", () => {
+    expect(rolloutPageSource).toContain("{selected?.remote ? (");
+    expect(rolloutPageSource).toContain("<h4>Remote deployment runtime</h4>");
+    expect(rolloutPageSource).toContain(
+      '? { taskPrompt: rolloutRuntimeOptions.taskPrompt, rtcMode: "disabled" }'
+    );
   });
 
   it("offers a fetch, not the override, for a checkpoint that is not on this machine", () => {

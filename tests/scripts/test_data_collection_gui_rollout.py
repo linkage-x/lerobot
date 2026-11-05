@@ -4802,3 +4802,149 @@ def test_each_grasp_loop_start_is_kept_for_its_resume(tmp_path: Path):
     assert gateway._grasp_loop_resume_params(state, "grasp_20991231_000000") == {
         "ok": False, "error": "There is no grasp loop run grasp_20991231_000000 on this robot host."
     }
+
+
+# ------------------------------------------------------------- remote deployments ---
+
+from tools.data_collection_gui import remote_deployments  # noqa: E402
+
+REMOTE_ID = "remote/fr3-jepa-j1-s0"
+FAKE_BRIDGE = (
+    '#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$(dirname "$0")/argv.txt"\n'
+    'env | grep -E "^FR3_" | sort > "$(dirname "$0")/env.txt"\n'
+    + FAKE_LAUNCHER.split("\n", 1)[1]
+)
+
+
+def _closed_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _register_remote(state: gateway.GatewayState, *, bridge: bool = True, view: str = "jepa_view") -> Path:
+    repo = state.repo_root
+    _make_view(repo, view)
+    bridge_repo = repo.parent / "bridge"
+    if bridge:
+        launcher = bridge_repo / remote_deployments.BRIDGE_LAUNCHER
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text(FAKE_BRIDGE, encoding="utf-8")
+        launcher.chmod(0o755)
+    _write_json(
+        repo / remote_deployments.REGISTRY,
+        {
+            "deployments": [
+                {
+                    "id": REMOTE_ID,
+                    "label": "VLA-JEPA J1 s0",
+                    "endpoint": f"tcp/127.0.0.1:{_closed_port()}",
+                    "deployment": "fr3-jepa-j1-s0",
+                    "policyType": "vla_jepa",
+                    "chunkSize": 7,
+                    "datasetRoot": f"outputs/exports/training_views/{view}",
+                    "targetFrameName": "pika_gripper_ee",
+                    "robotIp": "192.168.1.206",
+                    "bridgeRepo": str(bridge_repo),
+                    "outRoot": str(repo.parent / "bridge_out"),
+                }
+            ]
+        },
+    )
+    return bridge_repo
+
+
+def _remote_entry(state: gateway.GatewayState) -> dict:
+    listing = gateway._checkpoint_entries(state, training_backend.LOCAL_HOST_ID)
+    return next(item for item in listing["checkpoints"] if item["id"] == REMOTE_ID)
+
+
+def test_a_registered_remote_deployment_is_listed_and_judged_like_a_checkpoint(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _register_remote(state)
+
+    entry = _remote_entry(state)
+
+    assert entry["remote"]["deployment"] == "fr3-jepa-j1-s0"
+    assert entry["cameras"] == ["ee", "side"]
+    assert entry["view"]["actionMode"] == "delta_ee_from_prev_cmd"
+    # The contract matches the rig; only the (closed) server is worth a warning.
+    assert [issue["field"] for issue in entry["issues"]] == ["server"]
+    assert entry["verdict"] == "warn"
+
+
+def test_a_remote_deployment_without_its_bridge_is_blocked(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _register_remote(state, bridge=False)
+
+    entry = _remote_entry(state)
+
+    assert entry["verdict"] == "block"
+    assert "bridge" in [issue["field"] for issue in entry["issues"]]
+
+
+def test_a_broken_registry_is_reported_without_hiding_the_checkpoints(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _write_json(state.repo_root / remote_deployments.REGISTRY, {"deployments": [{"id": "job/x"}]})
+
+    listing = gateway._checkpoint_entries(state, training_backend.LOCAL_HOST_ID)
+
+    assert any(item["id"] == "job_a/020000" for item in listing["checkpoints"])
+    assert any("remote deployments" in line for line in listing["detail"])
+
+
+def test_a_remote_smoke_runs_the_bridge_with_its_own_server_and_more_steps(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    bridge_repo = _register_remote(state)
+
+    # The policy-server choice is the page's, and it does not apply to a remote deployment.
+    gateway._start_rollout(
+        state, {"mode": "smoke", "checkpointId": REMOTE_ID, "policyServer": "10.0.0.9:8790"}
+    )
+    assert _wait_for(lambda: (bridge_repo / "tools/fr3_wam/env.txt").is_file())
+    gateway._stop_rollout(state)
+
+    argv = (bridge_repo / "tools/fr3_wam/argv.txt").read_text().split("\n")
+    env = dict(
+        line.split("=", 1) for line in (bridge_repo / "tools/fr3_wam/env.txt").read_text().splitlines()
+    )
+    assert argv[0] == "smoke"
+    assert argv[-3:-1] == ["--max-steps", str(remote_deployments.SMOKE_STEPS)]
+    assert env["FR3_INFER_CHECKPOINT"] == REMOTE_ID
+    assert env["FR3_INFER_DATASET_ROOT"] == "outputs/exports/training_views/jepa_view"
+    assert env["FR3_WAM_WORKSTATION"] == str(state.repo_root)
+    assert env["FR3_WAM_ENDPOINT"].startswith("tcp/127.0.0.1:")
+    assert env["FR3_WAM_OUT"].startswith(str(tmp_path / "bridge_out" / "r4_smoke_"))
+    assert "FR3_POLICY_SERVER" not in env
+    assert gateway._rollout_last_params(state)["checkpointId"] == REMOTE_ID
+
+
+def test_modes_the_bridge_cannot_run_are_refused_before_launch(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _register_remote(state)
+
+    with pytest.raises(ValueError, match="R4 bridge"):
+        gateway._start_rollout(state, {"mode": "dagger_sim", "checkpointId": REMOTE_ID})
+    assert state.rollout_process is None
+
+
+def test_dagger_takeover_is_refused_over_the_bridge(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _register_remote(state)
+    deployment = remote_deployments.find(state.repo_root, REMOTE_ID)
+    command = ["bash", str(state.repo_root / rollout_backend.LAUNCHER), "real"]
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="DAgger"):
+        remote_deployments.rollout_command(
+            command, {"FR3_DAGGER_TAKEOVER": "1"}, repo_root=state.repo_root, deployment=deployment, mode="real"
+        )
+
+
+def test_a_remote_deployment_cannot_be_deleted_as_a_checkpoint(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _register_remote(state)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="another machine"):
+        gateway._guard_checkpoint_deletion(state, [REMOTE_ID])

@@ -1142,6 +1142,20 @@ export type Checkpoint = {
   hostLabel: string;
   wandbProject?: string;
   wandbRunId?: string;
+  /** Set for a policy served from another machine through the R4 bridge
+   *  (`remote_deployments.py`): no weights here, its own server, the page's policy-server
+   *  choice does not apply. */
+  remote?: RemoteDeployment;
+};
+
+export type RemoteDeployment = {
+  label: string;
+  endpoint: string;
+  deployment: string;
+  bridgeRepo: string;
+  bridgeReady: boolean;
+  reachable: boolean;
+  detail: string;
 };
 
 /** What the rig is configured as today, for comparison against a checkpoint. */

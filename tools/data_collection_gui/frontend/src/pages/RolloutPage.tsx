@@ -739,7 +739,11 @@ export function RolloutPage() {
         overrideContract,
         moveToStart,
         maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0,
-        runtimeOptions: rolloutRuntimeOptions,
+        // A remote deployment shows only the task prompt, so nothing hidden on this page (EMA,
+        // alignment, servo pose left from a pi0.5 run) is sent with it.
+        runtimeOptions: selected.remote
+          ? { taskPrompt: rolloutRuntimeOptions.taskPrompt, rtcMode: "disabled" }
+          : rolloutRuntimeOptions,
         policyServer: policyChoice ?? LOCAL_POLICY
       })
     );
@@ -1688,6 +1692,25 @@ export function RolloutPage() {
           </label>
         )}
 
+        {selected?.remote ? (
+          <div className="subcard rollout-runtime-options">
+            <h4>Remote deployment runtime</h4>
+            <p className="hint">
+              The policy runs on the GPU host; the bridge runs R4 with RTC off and one action per
+              step, so the pi0.5 RTC, draw and alignment knobs do not apply. The task prompt
+              below is still passed to the deployment.
+            </p>
+            <label className="field">
+              <span>Task prompt override</span>
+              <input
+                value={taskPrompt}
+                onChange={(event) => setTaskPrompt(event.target.value)}
+                placeholder={`auto from dataset task; e.g. ${DEFAULT_TASK_PROMPT_PLACEHOLDER}`}
+                disabled={isLive}
+              />
+            </label>
+          </div>
+        ) : (
         <div className="subcard rollout-runtime-options">
           <h4>pi0.5+LoRA first rollout defaults</h4>
           <p className="hint">
@@ -1945,6 +1968,7 @@ export function RolloutPage() {
             </>
           )}
         </div>
+        )}
 
         {takeoverSupported && (
           <div className="subcard rollout-runtime-options">
@@ -2094,7 +2118,14 @@ export function RolloutPage() {
         {/* Where the forward pass runs. Beside Start, because it is a per-launch choice. */}
         <div className="subcard">
           <h4>Policy compute</h4>
-          {policyListing === null ? (
+          {selected?.remote ? (
+            <p className="hint">
+              Served by <code>{selected.remote.deployment}</code> ({selected.remote.label}) at{" "}
+              <code>{selected.remote.endpoint}</code> through the R4 bridge —{" "}
+              {selected.remote.reachable ? "server listening" : `server not listening: ${selected.remote.detail}`}.
+              Every R4 safety guard applies; the choices below do not.
+            </p>
+          ) : policyListing === null ? (
             <p className="hint">Asking the gateway where a policy can run…</p>
           ) : (
             <>

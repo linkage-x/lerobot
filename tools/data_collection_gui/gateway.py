@@ -35,6 +35,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend
 from tools.data_collection_gui import policy_servers
+from tools.data_collection_gui import remote_deployments
 from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import table_plane
 from tools.data_collection_gui import task_ladders
@@ -6194,10 +6195,29 @@ def _checkpoint_entries(state: GatewayState, host_id: str) -> dict[str, Any]:
         entry["verdict"] = checkpoint_backend.verdict_for(issues)
         entry["outcomes"] = outcomes.get(str(entry.get("id") or ""), None)
         entries.append(entry)
+    detail = list(report.get("detail", []) or [])
+    if host.kind == "local":
+        # Policies served from another machine through the R4 bridge (remote_deployments.py),
+        # judged by the same contract check plus whether the bridge and the server are there.
+        try:
+            deployments = remote_deployments.load(state.repo_root)
+        except checkpoint_backend.CheckpointError as exc:
+            deployments = []
+            detail.append(f"remote deployments: {exc}")
+        for deployment in deployments:
+            entry = remote_deployments.entry(state.repo_root, deployment)
+            entry["hostId"] = host.id
+            entry["hostLabel"] = host.label
+            issues = checkpoint_backend.check_contract(entry, rig=rig, local=True)
+            issues += remote_deployments.extra_issues(entry)
+            entry["issues"] = [asdict(issue) for issue in issues]
+            entry["verdict"] = checkpoint_backend.verdict_for(issues)
+            entry["outcomes"] = outcomes.get(entry["id"], None)
+            entries.append(entry)
     return {
         "ok": bool(report.get("ok")),
         "error": report.get("error", ""),
-        "detail": report.get("detail", []),
+        "detail": detail,
         "host": asdict(host),
         "rig": asdict(rig),
         "checkpoints": entries,
@@ -6267,6 +6287,12 @@ def _guard_checkpoint_deletion(state: GatewayState, checkpoint_ids: list[str]) -
     ids = {item for item in checkpoint_ids if item}
     if not ids:
         return
+    remote = sorted(item for item in ids if remote_deployments.is_remote_id(item))
+    if remote:
+        raise checkpoint_backend.CheckpointError(
+            f"{', '.join(remote)} is served from another machine and has nothing on disk here; "
+            f"edit {remote_deployments.REGISTRY} to remove it."
+        )
     if _rollout_is_running(state) and state.rollout.checkpointId in ids:
         raise checkpoint_backend.CheckpointError(
             f"{state.rollout.checkpointId} is loaded by the rollout running right now. "
@@ -6558,6 +6584,14 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
             "This checkpoint does not match the rig: "
             + " ".join(issue["message"] for issue in blocking)
         )
+    remote = remote_deployments.find(state.repo_root, checkpoint_id) if selected.get("remote") else None
+    if selected.get("remote") and remote is None:
+        raise ValueError(f"{checkpoint_id} is no longer registered in {remote_deployments.REGISTRY}.")
+    if remote is not None and mode.id not in remote_deployments.MODES:
+        raise ValueError(
+            f"{checkpoint_id} is served remotely through the R4 bridge, which does not run "
+            f"{mode.label}. Supported: {', '.join(remote_deployments.MODES)}."
+        )
 
     contract = selected.get("contract") or {}
     rig = listing["rig"]
@@ -6568,8 +6602,13 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     runtime_options = rollout_backend.sanitize_rollout_runtime_options(
         payload.get("runtimeOptions")
     )
-    policy_server = policy_servers.resolve_choice(
-        payload.get("policyServer"), state.policy_servers, needs_policy=mode.id != "env"
+    # A remote deployment names its own server; the page's policy-server choice does not apply.
+    policy_server = (
+        ""
+        if remote is not None
+        else policy_servers.resolve_choice(
+            payload.get("policyServer"), state.policy_servers, needs_policy=mode.id != "env"
+        )
     )
 
     # Recorded before launch, and from the values that were actually validated: a rollout that
@@ -6604,17 +6643,19 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     # an A/B between two checkpoints has to hold still. Aligned here because this is the last
     # point before the value is read, and it catches checkpoints fetched from another machine as
     # well as ones trained on this one.
-    try:
-        alignment = use_amp_alignment.align_checkpoint_use_amp(
-            Path(str(selected.get("pretrainedPath") or selected.get("path") or ""))
-        )
-    except use_amp_alignment.AlignmentError as exc:
-        # Warned, not refused. A rollout blocked over a metadata field costs an operator more
-        # than the mismatch it is protecting against, and the log still says what this run got.
-        state.log("warn", f"Could not align use_amp on {checkpoint_id}: {exc}")
-    else:
-        if alignment.changed:
-            state.log("warn", f"Aligned use_amp before the rollout -- {alignment.summary}")
+    # A remote deployment has no checkpoint here; its server owns the precision.
+    if remote is None:
+        try:
+            alignment = use_amp_alignment.align_checkpoint_use_amp(
+                Path(str(selected.get("pretrainedPath") or selected.get("path") or ""))
+            )
+        except use_amp_alignment.AlignmentError as exc:
+            # Warned, not refused. A rollout blocked over a metadata field costs an operator more
+            # than the mismatch it is protecting against, and the log still says what this run got.
+            state.log("warn", f"Could not align use_amp on {checkpoint_id}: {exc}")
+        else:
+            if alignment.changed:
+                state.log("warn", f"Aligned use_amp before the rollout -- {alignment.summary}")
 
     command, env = rollout_backend.build_rollout_command(
         state.repo_root,
@@ -6634,6 +6675,10 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         base_env=_tool_env(state.repo_root),
         policy_server=policy_server,
     )
+    if remote is not None:
+        command, env = remote_deployments.rollout_command(
+            command, env, repo_root=state.repo_root, deployment=remote, mode=mode.id
+        )
 
     log_dir = state.repo_root / "outputs" / "logs" / "rollout"
     log_dir.mkdir(parents=True, exist_ok=True)
