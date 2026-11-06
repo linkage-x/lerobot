@@ -44,7 +44,7 @@
             [0.01231, 0.45255, -0.00425],
             [-0.00381, -0.27148, 0.00423]
           ],
-          "status": "fitted at full opening (88.7 mm): two passes, all six faces. At 33.5 mm with the 26.8 g pivot insert clamped (x+, y+, y-, z+ only), with the insert's weight taken out at the 168 mm tip, a constant remains that does not follow the attitude: Fz -0.47 N, Mx -0.07 N*m (opening or clamping, not separated; nothing corrects it)",
+          "status": "fitted at full opening (88.7 mm): two passes, all six faces, 16-21 min after the BOX powered on (the vendor manual asks for 30 min of warm-up; re-checked 11-06 16:48 after origin + re-power + a dynamic zero on the upright fixture: 9 hand-held holds over all faces at |F| 0.09-0.22 N, |M| <= 0.009 N*m, back on the fixture 0.10 N). Opening shows no attitude-dependent effect: at 33.5 mm with the 26.8 g pivot insert (x+, y+, y-, z+ only) what is left after the insert's weight is constant, and the 11-06 15:52 grasp at 32 mm moved F by at most 0.15 N. The full-open rest baseline itself stepped 0.2-0.4 N between handlings, so differences below that mean nothing",
           "fit": {
             "log": "Thor ~/lerobot_rig_v9b_smoke/outputs/e2e_20261106/six_d_20261106{,_p2}/free_air.log, 11-06 15:26:52-15:27:40 and 15:30:01-15:30:56, gateway preview at ~10 Hz, held by the handle, gripper in free air",
             "n_static": 632,
