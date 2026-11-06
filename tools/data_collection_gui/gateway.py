@@ -201,6 +201,8 @@ class RecordingStatus:
     syncSummary: str = ""
     syncReportPath: str = ""
     syncWarnings: list[str] = field(default_factory=list)
+    # What the running episode misses of the 6D calibration procedure; it records regardless.
+    sixDCaliWarnings: list[str] = field(default_factory=list)
     # Whether this Connect asked for the laser tracker. The instrument is shared
     # and booked by other people, so this is a per-session choice rather than a
     # property of the rig, and the UI has to be able to turn it off on the days
@@ -16521,6 +16523,7 @@ def _connect_recorder(
     state.recording.cameraIdentityExpectedFrom = ""
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
+    state.recording.sixDCaliWarnings = []
     state.recorder_log_path = recorder_log_path
     _append_line(recorder_log_path, f"# command: {' '.join(command)}")
     _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
@@ -17589,6 +17592,18 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             return
         if isinstance(report, dict):
             _apply_box_button(state, report)
+        return
+    if output.startswith("SIX_D_CALI_WARN "):
+        try:
+            report = json.loads(output.removeprefix("SIX_D_CALI_WARN ").strip())
+        except ValueError:
+            state.log("warn", "recorder: malformed SIX_D_CALI_WARN payload")
+            return
+        state.recording.sixDCaliWarnings = [
+            f"BOX {device_id}：{warning}" for device_id, found in report.items() for warning in found
+        ]
+        for warning in state.recording.sixDCaliWarnings:
+            state.log("warn", f"6D calibration: {warning}")
         return
     if output.startswith("LT_BEAM_BROKEN "):
         state.recording.laserTrackerBeamBroken = output.removeprefix("LT_BEAM_BROKEN ").strip() == "1"

@@ -27,6 +27,8 @@ already understands so the existing GUI plumbing keeps working:
   * ``Episode discarded`` / ``Recording stopped``
   * ``BOX_BUTTON <json>``                          → a gesture on a BOX button; the
                                                      gateway decides what it does
+  * ``SIX_D_CALI_WARN <json>``                     → what this episode misses of the 6D
+                                                     calibration procedure, by device id
 
 stdin commands accepted (the gateway writes lines to our stdin):
 
@@ -428,6 +430,32 @@ _CALI_LOCK = threading.Lock()
 _SIX_D_ZEROS: dict[str, dict[str, Any]] = {}
 _SIX_D_ZEROS_LOCK = threading.Lock()
 _BOX_LABEL_ID_RE = re.compile(r"^box(\d+)$")
+# The last origin of each BOX, on disk: it is done once a day and lives in the MCU, so unlike the
+# software zero (held by the SDK in this process) it outlasts a re-Connect.
+_SIX_D_ORIGIN_PATH = _REPO_ROOT / "outputs" / "box_six_d_origin.json"
+# What the current episode misses of the calibration procedure, by device id; lands in its meta.json.
+_SIX_D_CALI_WARNINGS: dict[str, list[str]] = {}
+
+
+def _read_six_d_origins() -> dict[str, dict[str, Any]]:
+    try:
+        return json.loads(_SIX_D_ORIGIN_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("6D origin record %s unreadable: %s", _SIX_D_ORIGIN_PATH, exc)
+        return {}
+
+
+def _write_six_d_origin(key: str, record: dict[str, Any]) -> None:
+    try:
+        origins = {**_read_six_d_origins(), key: record}
+        _SIX_D_ORIGIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SIX_D_ORIGIN_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(origins, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(_SIX_D_ORIGIN_PATH)
+    except OSError as exc:
+        logger.warning("6D origin record %s not written: %s", _SIX_D_ORIGIN_PATH, exc)
 
 
 def _note_six_d_zero(res: dict[str, Any], *, origin: bool) -> None:
@@ -443,6 +471,38 @@ def _note_six_d_zero(res: dict[str, Any], *, origin: bool) -> None:
     record.setdefault("wall_s", time.time())
     with _SIX_D_ZEROS_LOCK:
         _SIX_D_ZEROS[key] = record
+        last_origin = _read_six_d_origins().get(key)
+        updated = record if origin else last_origin and box_six_d.with_recheck(last_origin, record)
+        if updated:
+            _write_six_d_origin(key, updated)
+
+
+def _warn_six_d_calibration(box: bc.BoxPool, capture_intent: Any) -> None:
+    """Say what the starting episode misses of the 6D calibration procedure; it records regardless.
+
+    Handheld BOXes only: the fixture and the procedure are theirs, an arm's BOX never leaves the arm.
+    A calibration capture (``capture_intent``) does not use the 6D channel, so it is not told.
+    """
+    warnings: dict[str, list[str]] = {}
+    if capture_intent is None:
+        try:
+            registry = box_six_d.load_registry()
+            origins = _read_six_d_origins()
+            zeros = _six_d_zeros_snapshot()
+            for device_id, uptime_s in box.six_d_uptimes().items():
+                key = str(device_id)
+                if (box_six_d.device_entry(registry, device_id) or {}).get("role") != "handheld":
+                    continue
+                found = box_six_d.calibration_warnings(
+                    origins.get(key), zeros.get(key), now_s=time.time(), uptime_s=uptime_s
+                )
+                if found:
+                    warnings[key] = found
+        except Exception as exc:  # noqa: BLE001 - a warning must never stop the episode
+            logger.warning("6D calibration check failed: %s", exc)
+    _SIX_D_CALI_WARNINGS.clear()
+    _SIX_D_CALI_WARNINGS.update(warnings)
+    _emit("SIX_D_CALI_WARN " + json.dumps(warnings, separators=(",", ":")))
 
 
 def _six_d_zeros_snapshot() -> dict[str, dict[str, Any]]:
@@ -1142,6 +1202,8 @@ def _write_episode_meta(
         zeros = _six_d_zeros_snapshot()
         if zeros:
             meta["box_six_d_zero"] = zeros
+        if _SIX_D_CALI_WARNINGS:
+            meta["box_six_d_calibration_warnings"] = dict(_SIX_D_CALI_WARNINGS)
         try:
             roles = box_six_d.box_roles(box_six_d.load_registry(), _box_device_ids(box_snapshots, zeros))
         except (OSError, ValueError) as exc:
@@ -2326,6 +2388,7 @@ def main(argv: list[str] | None = None) -> int:
                         "power-cycle the box, and reconnect."
                     )
                 box.start_recording(t_start)
+                _warn_six_d_calibration(box, capture_intent)
             # Anchored to the same t_start the cameras use, so the tracker's
             # episode and the video share one wall-clock origin even though the
             # samples themselves are stamped by the controller and married to

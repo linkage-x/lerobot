@@ -977,6 +977,20 @@ def _preloaded_box_factory(distance: float):
     return _factory
 
 
+def test_box_pool_dates_each_box_power_on_from_its_mcu_clock(fake_box_module):
+    pool = box_client.BoxPool(box_client.BoxFleetConfig(boxes=[box_client.BoxClientConfig(box_id="")]))
+
+    def stub(device_id, sensors):
+        return types.SimpleNamespace(_effective_device_id=lambda: device_id, read=lambda: {"sensors": sensors})
+
+    pool._clients = [
+        ("a", stub(7, {"box_six_d_force": {"timestamp": 81_000_000}})),
+        ("b", stub(8, {"box_imu": {"timestamp": 5}})),  # no 6D sensor
+        ("c", stub(None, {"box_six_d_force": {"timestamp": 1}})),  # not identified yet
+    ]
+    assert pool.six_d_uptimes() == {7: 81.0}
+
+
 def test_box_pool_single_empty_id_delegates_without_namespacing(fake_box_module):
     fake_box_module.Box = _preloaded_box_factory(0.05)  # type: ignore[assignment]
     fleet = box_client.BoxFleetConfig(

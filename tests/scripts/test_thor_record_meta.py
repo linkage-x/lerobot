@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 from tools.thor.box_sdk import box_client as bc
@@ -381,10 +382,11 @@ def test_an_ordinary_capture_declares_no_intent_at_all(tmp_path: Path) -> None:
     assert "capture_intent" not in meta
 
 
-def test_the_6d_zero_each_box_ran_under_is_written_into_the_episode_meta(tmp_path: Path) -> None:
+def test_the_6d_zero_each_box_ran_under_is_written_into_the_episode_meta(tmp_path: Path, monkeypatch) -> None:
     # The zero usually happens before the episode; without its attitude the bias it leaves in
     # fxyz_mxyz cannot be undone offline (box_six_d.zero_bias).
     thor_record = _load_thor_record_module()
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", tmp_path / "origin.json")
     thor_record._SIX_D_ZEROS.clear()
     ctx = {"fxyz_mxyz": [0.1, 0.2, -7.7, -0.18, 0.0, 0.0], "acc_g": [-0.99, 0.09, 0.02],
            "samples": 15, "wall_s": 1793677000.0, "device_id": 3969377039}
@@ -661,3 +663,61 @@ def test_a_second_touch_pad_streaming_gets_a_device_row():
     single = [{"box_id": "", "expected_devices": ["box_touch_left"]}]
     assert tr._add_streaming_sensors_to_roster(single, ["box_touch_left", "box_touch_left_1"])
     assert single[0]["expected_devices"] == ["box_touch_left", "box_touch_left_1"]
+
+
+class _SixDPool:
+    def __init__(self, uptimes):
+        self.uptimes = uptimes
+
+    def six_d_uptimes(self):
+        if isinstance(self.uptimes, Exception):
+            raise self.uptimes
+        return self.uptimes
+
+
+def _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool, capture_intent=None):
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", tmp_path / "origin.json")
+    monkeypatch.setattr(thor_record, "_SIX_D_ZEROS", {})
+    thor_record._warn_six_d_calibration(pool, capture_intent)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("SIX_D_CALI_WARN ")]
+    assert len(lines) == 1
+    return json.loads(lines[0].removeprefix("SIX_D_CALI_WARN "))
+
+
+def test_an_episode_is_told_what_it_misses_of_the_6d_procedure_and_only_a_handheld_box(capsys, monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    pool = _SixDPool({3969377039: 7200.0, 3100715645: 7200.0})
+    report = _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool)
+    assert list(report) == ["3969377039"]  # 3100715645 is on the arm
+    assert any("origin" in w for w in report["3969377039"])
+    assert report == thor_record._SIX_D_CALI_WARNINGS
+
+
+def test_the_6d_check_says_nothing_to_a_calibration_capture_and_never_stops_an_episode(capsys, monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    pool = _SixDPool({3969377039: 7200.0})
+    assert _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool, capture_intent={"purpose": "pivot"}) == {}
+    assert _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, _SixDPool(RuntimeError("box gone"))) == {}
+    assert thor_record._SIX_D_CALI_WARNINGS == {}
+
+
+def test_an_origin_outlasts_the_recorder_and_the_zero_after_the_re_power_rechecks_it(monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    path = tmp_path / "origin.json"
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", path)
+    monkeypatch.setattr(thor_record, "_SIX_D_ZEROS", {})
+    now = time.time()
+    fixture = [-1.0, 0.0, -0.05]
+    thor_record._note_six_d_zero(
+        {"ok": True, "method": "origin", "zero_context": {"device_id": 3969377039, "wall_s": now - 100,
+                                                          "mcu_us": 2_000_000_000, "acc_g": fixture}},
+        origin=True,
+    )
+    assert "recheck" not in json.loads(path.read_text())["3969377039"]
+    thor_record._note_six_d_zero(
+        {"ok": True, "method": "zero", "zero_context": {"device_id": 3969377039, "wall_s": now, "mcu_us": 80_000_000,
+                                                        "acc_g": fixture, "fxyz_mxyz_raw": [0.1, 0, -0.2, 0, 0, 0]}},
+        origin=False,
+    )
+    saved = json.loads(path.read_text())["3969377039"]
+    assert saved["kind"] == "origin" and saved["recheck"]["pass"] is True

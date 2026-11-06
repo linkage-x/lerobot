@@ -118,6 +118,8 @@ export type RecordingStatus = {
   syncSummary?: string;
   syncReportPath?: string;
   syncWarnings?: string[];
+  // What the running episode misses of the 6D calibration procedure; it records regardless.
+  sixDCaliWarnings?: string[];
   // Whether this Connect asked for the laser tracker. A per-session choice, not
   // a property of the rig: the instrument is shared and admits one client.
   laserTracker?: boolean;

@@ -150,6 +150,91 @@ def external_wrench(f: np.ndarray, acc_g: np.ndarray, model: PayloadModel, bias:
 # --- fitting -----------------------------------------------------------------------------------
 
 
+# The vendor's procedure (数采Box传感器标定与操作说明 v1.1): warm up 30 min, origin on the upright
+# fixture, re-power, check raw, dynamic zero on the fixture, again every 30 min and after a re-power.
+WARMUP_S = 30 * 60
+ORIGIN_MAX_AGE_S = 24 * 3600
+DYNAMIC_MAX_AGE_S = 30 * 60
+# A boot this soon after an origin is the re-power the procedure asks for: the sensor stayed warm,
+# so its short uptime is not a cold start.
+REPOWER_WINDOW_S = 10 * 60
+# IMU acc on the upright fixture, measured 11-06 on 3969377039. It only says the attitude was right:
+# a hand holding the same attitude passes too.
+FIXTURE_ACC_G = (-1.0, 0.0, -0.05)
+FIXTURE_ACC_TOL_G = 0.15
+ORIGIN_RAW_LIMITS = (0.5, 0.5, 0.5, 0.01, 0.01, 0.01)
+
+
+def _on_fixture(record: dict[str, Any]) -> bool | None:
+    acc = record.get("acc_g")
+    if not acc:
+        return None
+    return bool(np.linalg.norm(np.asarray(acc, dtype=float) - FIXTURE_ACC_G) <= FIXTURE_ACC_TOL_G)
+
+
+def with_recheck(origin: dict[str, Any], zero: dict[str, Any]) -> dict[str, Any] | None:
+    """``origin`` with its re-check filled in from software zero ``zero``, or None if that is no re-check.
+
+    The first zero on the fixture after the re-power sees the raw channel the manual wants checked;
+    a software zero moves ``fxyz_mxyz`` only, so raw there is still what the origin left. Later zeros
+    say nothing: raw may drift over a day without the origin having been wrong.
+    """
+    raw, mcu_us = zero.get("fxyz_mxyz_raw"), zero.get("mcu_us")
+    if origin.get("recheck") or not raw or not mcu_us or not _on_fixture(zero):
+        return None
+    if zero["wall_s"] - mcu_us / 1e6 <= origin["wall_s"]:
+        return None  # same boot as the origin, which has not taken effect yet
+    ok = all(abs(v) <= limit for v, limit in zip(raw, ORIGIN_RAW_LIMITS, strict=True))
+    return {**origin, "recheck": {"wall_s": zero["wall_s"], "fxyz_mxyz_raw": raw, "pass": ok}}
+
+
+def calibration_warnings(
+    origin: dict[str, Any] | None, zero: dict[str, Any] | None, *, now_s: float, uptime_s: float | None
+) -> list[str]:
+    """What an episode starting now misses of the vendor's procedure, in the operator's words.
+
+    ``origin`` is the BOX's last origin (with its re-check), ``zero`` its last record in this recorder
+    process, ``uptime_s`` how long it has been on now (None: unknown, the checks needing it are skipped).
+    """
+    found: list[str] = []
+    boot_s = None if uptime_s is None else now_s - uptime_s
+    if not origin:
+        found.append("没有 origin 记录")
+    else:
+        age_s = now_s - origin["wall_s"]
+        if age_s > ORIGIN_MAX_AGE_S:
+            found.append(f"origin 已是 {age_s / 3600:.0f} 小时前，要求每天一次")
+        if origin.get("mcu_us") is not None and origin["mcu_us"] / 1e6 < WARMUP_S:
+            found.append(f"origin 时只预热了 {origin['mcu_us'] / 6e7:.0f} 分钟，要求 30 分钟")
+        if _on_fixture(origin) is False:
+            found.append("origin 时不在工装姿态")
+        recheck = origin.get("recheck")
+        if boot_s is not None and origin["wall_s"] >= boot_s:
+            found.append("origin 后还没有重新上电，新零点未生效")
+        elif not recheck:
+            found.append("origin 重新上电后还没有复核 raw（在工装上做一次动态校准即可记录）")
+        elif not recheck["pass"]:
+            raw = ", ".join(f"{v:.3f}" for v in recheck["fxyz_mxyz_raw"])
+            found.append(f"origin 复核 raw 超限（{raw}）")
+
+    if not zero or zero.get("kind") != "software":
+        found.append("这次连接后还没有做动态校准" if not zero else "origin 之后还没有做动态校准")
+    else:
+        age_s = now_s - zero["wall_s"]
+        if boot_s is not None and zero["wall_s"] < boot_s:
+            found.append("BOX 重新上电后还没有做动态校准")
+        elif age_s > DYNAMIC_MAX_AGE_S:
+            found.append(f"动态校准已过 {age_s / 60:.0f} 分钟，要求每 30 分钟一次")
+        if _on_fixture(zero) is False:
+            found.append("动态校准时不在工装姿态")
+
+    if uptime_s is not None and uptime_s < WARMUP_S:
+        repowered = origin is not None and 0 < boot_s - origin["wall_s"] <= REPOWER_WINDOW_S
+        if not repowered:
+            found.append(f"BOX 才上电 {uptime_s / 60:.0f} 分钟，要求预热 30 分钟")
+    return found
+
+
 def static_mask(acc_g: np.ndarray, gyr_deg_s: np.ndarray | None) -> np.ndarray:
     acc_g = np.asarray(acc_g, dtype=float)
     ok = np.abs(np.linalg.norm(acc_g, axis=1) - 1.0) < STATIC_ACC_TOL_G

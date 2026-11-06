@@ -310,6 +310,16 @@ export function RecordingPanel({
           {laserBanner.text}
         </p>
       )}
+      {status.sixDCaliWarnings?.length ? (
+        <div className="laser-episode-banner laser-episode-warning">
+          ⚠️ 6D 校准未满足要求，录制照常进行，6D 绝对值可能不可信：
+          <ul>
+            {status.sixDCaliWarnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       <SyncAuditPanel status={status} />
       {logLines && logLines.length > 0
         ? <RecorderLogStream lines={logLines} />

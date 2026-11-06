@@ -169,3 +169,83 @@ def test_an_episode_is_compensated_from_its_meta_and_box_sensors(tmp_path):
     out = bsd.compensate_episode(tmp_path, reg)
 
     assert np.allclose(out["7"]["external"], 0.0, atol=1e-9)
+
+
+FIXTURE_ACC = [-1.0, 0.0, -0.05]
+BOOT_S = 2_000_000_000.0  # the re-power
+
+
+def _origin(**over):
+    # 35 min after the previous power-on, on the fixture, 15 s before the re-power
+    return {"kind": "origin", "wall_s": BOOT_S - 15, "mcu_us": 2100e6, "acc_g": FIXTURE_ACC, **over}
+
+
+def _zero(at_s=BOOT_S + 80, **over):
+    return {"kind": "software", "wall_s": at_s, "mcu_us": (at_s - BOOT_S) * 1e6, "acc_g": FIXTURE_ACC,
+            "fxyz_mxyz_raw": [0.15, 0.01, -0.27, 0.001, 0.0, 0.002], **over}
+
+
+def _checked_origin(**over):
+    origin = bsd.with_recheck(_origin(**over), _zero())
+    assert origin is not None
+    return origin
+
+
+def _warnings(origin, zero, *, at_s=BOOT_S + 600, boot_s=BOOT_S):
+    return bsd.calibration_warnings(origin, zero, now_s=at_s, uptime_s=at_s - boot_s)
+
+
+def test_the_full_procedure_warns_of_nothing():
+    assert _checked_origin()["recheck"]["pass"] is True
+    assert _warnings(_checked_origin(), _zero()) == []
+
+
+def test_each_missed_step_of_the_procedure_is_named():
+    origin, zero = _checked_origin(), _zero()
+    assert any("没有 origin" in w for w in _warnings(None, zero))
+    assert any("预热了 5 分钟" in w for w in _warnings(_checked_origin(mcu_us=300e6), zero))
+    assert any("origin 时不在工装" in w for w in _warnings(_checked_origin(acc_g=[0.0, 0.0, 1.0]), zero))
+    assert any("还没有复核" in w for w in _warnings(_origin(), zero))
+    assert any("还没有做动态校准" in w for w in _warnings(origin, None))
+    assert any("origin 之后还没有" in w for w in _warnings(origin, {**_origin(), "kind": "origin"}))
+    assert any("动态校准时不在工装" in w for w in _warnings(origin, _zero(acc_g=[0.7, -0.1, 0.7])))
+
+
+def test_an_origin_with_no_power_cycle_after_it_has_not_taken_effect():
+    # the 11-06 16:46:38 origin: run 27 s into a boot, nothing since
+    origin = _origin(wall_s=BOOT_S + 27, mcu_us=27e6)
+    found = _warnings(origin, _zero(at_s=BOOT_S + 42))
+    assert any("origin 后还没有重新上电" in w for w in found)
+    assert any("预热了 0 分钟" in w for w in found)
+    assert bsd.with_recheck(origin, _zero(at_s=BOOT_S + 42)) is None  # same boot: raw says nothing
+
+
+def test_the_recheck_is_the_first_fixture_zero_after_the_re_power_and_no_later_one():
+    bad = bsd.with_recheck(_origin(), _zero(fxyz_mxyz_raw=[0.7, 0, 0, 0, 0, 0]))
+    assert bad["recheck"]["pass"] is False
+    assert any("复核 raw 超限" in w for w in _warnings(bad, _zero()))
+    assert bsd.with_recheck(_origin(), _zero(acc_g=[0.0, 0.0, 1.0])) is None
+    assert bsd.with_recheck(_checked_origin(), _zero(at_s=BOOT_S + 4000)) is None
+
+
+def test_old_calibrations_expire():
+    origin = _checked_origin()
+    late = BOOT_S + 1900
+    assert any("31 分钟" in w for w in _warnings(origin, _zero(), at_s=BOOT_S + 80 + 1860))
+    assert _warnings(origin, _zero(at_s=late), at_s=late + 60) == []
+    day = BOOT_S + 25 * 3600
+    assert any("要求每天一次" in w for w in _warnings(origin, _zero(at_s=day), at_s=day + 60))
+
+
+def test_a_new_power_on_needs_a_new_zero_and_a_warm_up_unless_it_is_the_origins_re_power():
+    origin = _checked_origin()
+    assert _warnings(origin, _zero(), at_s=BOOT_S + 200) == []  # warm: the sensor was on for the origin
+    cold = BOOT_S + 3 * 3600
+    found = _warnings(origin, _zero(), at_s=cold + 300, boot_s=cold)
+    assert any("重新上电后还没有做动态校准" in w for w in found)
+    assert any("才上电 5 分钟" in w for w in found)
+
+
+def test_an_unknown_uptime_skips_what_needs_it_and_still_checks_the_rest():
+    found = bsd.calibration_warnings(None, None, now_s=BOOT_S, uptime_s=None)
+    assert len(found) == 2

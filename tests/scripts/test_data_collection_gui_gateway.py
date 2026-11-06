@@ -273,6 +273,17 @@ def test_start_episode_names_tracker_connection_failure(tmp_path, monkeypatch, p
     assert written == []
 
 
+def test_a_6d_calibration_warning_is_shown_for_its_episode_and_cleared_by_the_next(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+
+    gateway._apply_recorder_output(state, 'SIX_D_CALI_WARN {"3969377039":["\\u6ca1\\u6709 origin"]}')
+    assert state.recording.sixDCaliWarnings == ["BOX 3969377039：没有 origin"]
+    assert any("没有 origin" in item.message for item in state.events)
+
+    gateway._apply_recorder_output(state, "SIX_D_CALI_WARN {}")
+    assert state.recording.sixDCaliWarnings == []
+
+
 def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
     """Homed, then the beam broke: the lock's range is not absolute any more."""
     state = _marker_tcp_gateway_state(tmp_path)
