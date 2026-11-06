@@ -1321,7 +1321,8 @@ def _build_episode_rows(
     ``frame_times_s`` is the camera timeline (``camera_frame_times_rel``).  Given
     ``sof_frame_times_s`` as well (the same sidecar at ``exposure_fraction=0``),
     ``frame_times_s`` is taken to be mid-exposure and each BOX is read at
-    ``frame_time + d_box`` if ``box_delays_s`` has it, at the raw SOF otherwise
+    ``frame_time + d_box`` if ``box_delays_s`` has it (``""`` is the BOX of a one-BOX
+    recording, which names no device), at the raw SOF otherwise
     (exactly what it got before the delays existed).  Without it every BOX is read
     at ``frame_times_s`` and no delay is applied.  ``interpolate`` reads the
     channels in :data:`BOX_INTERPOLATED_FIELDS` between samples (the recorder turns
@@ -1365,9 +1366,8 @@ def _build_episode_rows(
         sensor_lookup: dict[str, tuple[list[float], float]] = {}
         for sid in per_sensor:
             split = _split_box_sensor_id(sid)
-            box = split[0] if split is not None else ""
-            if box and box in delays:
-                sensor_lookup[sid] = (lookup_main, delays[box])
+            if split is not None and split[0] in delays:
+                sensor_lookup[sid] = (lookup_main, delays[split[0]])
             else:
                 sensor_lookup[sid] = (lookup_sof, 0.0)
 

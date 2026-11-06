@@ -173,6 +173,14 @@ def test_an_episode_s_own_d_box_counts_and_a_missing_bundle_is_a_reason():
     assert missing["status"] == lp.UNVALIDATED and "not readable" in missing["reasons"][0]
 
 
+def test_a_one_box_recording_s_estimate_is_the_hand_s_d_box():
+    bundle = {"cubes": {"left": {"device_id": "box1", "pivot": {"source": "laser_tracker"}}}}
+    estimated = {"0": {"boxes": {"unnamed": {"target": "mid_exposure_plus_d_box", "source": "episode"}}}}
+    assert lp.hand_validation("left", bundle, {"boxes": {}}, estimated)["d_box"] == "episode"
+    unmeasured = {"0": {"boxes": {"unnamed": {"target": "raw_sof", "source": "unmeasured"}}}}
+    assert lp.hand_validation("left", bundle, {"boxes": {}}, unmeasured)["d_box"] == "none"
+
+
 def test_the_export_carries_each_hand_s_status_outside_the_key(tmp_path):
     session, run = _tracked_session(tmp_path, _BUNDLE_0929)
     labels = lp.session_labels(session, run, {0: {}}, lp._REPO_ROOT)

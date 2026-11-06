@@ -132,7 +132,9 @@ def hand_validation(
       solutions of the 08-25 left pivot disagree by 7 mm;
     * marker -> TCP not flagged stale (an ``open_items`` entry starting ``STALE``);
     * the hand's BOX has a measured ``d_box`` (the delay table, or an episode's own estimate in
-      the session's ``box_alignment``); without one its BOX columns are read at the raw SOF.
+      the session's ``box_alignment``, where a one-BOX recording's BOX is ``unnamed``: its gyro
+      correlated with the tracked hand, so it is that hand's); without one its BOX columns are
+      read at the raw SOF.
 
     This does not refuse anything: the labels export as they are, and the reasons travel with
     them so nobody reads an unvalidated hand's absolute error as execution or registration error.
@@ -153,7 +155,10 @@ def hand_validation(
     own = sorted(
         str(index)
         for index, episode in realigned.items()
-        if str((((episode or {}).get("boxes") or {}).get(device) or {}).get("source") or "") == "episode"
+        if any(
+            str((((episode or {}).get("boxes") or {}).get(key) or {}).get("source") or "") == "episode"
+            for key in (device, "unnamed")
+        )
     )
     in_table = bool(device) and device in ((delays or {}).get("boxes") or {})
     if not in_table and not own:
