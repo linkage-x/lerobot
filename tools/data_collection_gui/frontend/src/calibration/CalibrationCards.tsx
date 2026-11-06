@@ -11,6 +11,7 @@ import {
   CALIBRATION_KIND_LABELS,
   DYNAMIC_FORCE_LIMITS,
   ORIGIN_FORCE_LIMITS,
+  ORIGIN_RECHECK,
   TOUCH_TOLERANCE,
   fmtDuration,
   fmtN,
@@ -175,7 +176,7 @@ function RebootStep({ wf }: { wf: WorkflowApi }) {
   return (
     <div className="cali-reboot">
       <p>
-        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。BOX 留在工装上，上电满 60 秒后自动采样复核 raw。
+        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。BOX 留在工装上，上电满 {ORIGIN_RECHECK.minUptimeS} 秒后自动采样复核 raw。
       </p>
       <button className="cali-btn-primary" onClick={() => wf.confirmReboot()}>
         我已重新上电，开始复核

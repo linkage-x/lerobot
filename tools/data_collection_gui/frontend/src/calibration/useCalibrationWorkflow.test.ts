@@ -91,6 +91,16 @@ describe("origin re-check", () => {
     addRecheckSample(recheck, sample(40.3), t0 + 60_300);
 
     expect(recheck.rebooted).toBe(true);
+    expect(recheck.samples).toHaveLength(1);
+  });
+
+  it("waits out the boot before it takes a sample", () => {
+    const recheck = newOriginRecheck(sample(1440), t0);
+    const early = ORIGIN_RECHECK.minUptimeS - 5;
+    addRecheckSample(recheck, sample(early), t0 + 60_000);
+    addRecheckSample(recheck, sample(early + 0.3), t0 + 60_300);
+
+    expect(recheck.rebooted).toBe(true);
     expect(recheck.samples).toHaveLength(0);
     expect(recheckProgress([recheck])).toContain(`满 ${ORIGIN_RECHECK.minUptimeS} s`);
   });

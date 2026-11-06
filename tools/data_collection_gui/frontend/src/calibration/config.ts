@@ -151,11 +151,12 @@ export const CALIBRATION_TIMEOUT_MS = 45_000;
 /** How often we poll the calibration log while a run is active (ms). */
 export const CALI_LOG_POLL_MS = 300;
 
-// The re-check after an origin reads raw once the BOX is back. It waits out the boot: on 11-06 the
-// reading moved about 1 N between 27 s and 42 s of uptime, and passed at 81 s. The timeout covers the
-// operator's power cycle as well.
+// The re-check after an origin reads raw once the BOX is back, past the boot. 25 s is the operator's
+// call: 60 s was too long to stand and wait. On 11-06 the reading moved about 1 N between 27 s and 42 s
+// of uptime, with an origin command in between, so a failure this early deserves one more try.
+// The timeout covers the operator's power cycle as well.
 export const ORIGIN_RECHECK = {
-  minUptimeS: 60,
+  minUptimeS: 25,
   windowMs: 3000,
   minSamples: 5,
   timeoutMs: 180_000,
