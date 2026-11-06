@@ -9881,3 +9881,123 @@ def test_fr3_pivot_joint_fit_takes_the_chosen_runs_and_becomes_the_anchor(tmp_pa
     # a run collected after the joint fit is newer data: its own fit is the anchor again
     _guided_fit(state, "20991231_235959")
     assert gateway._fr3_pivot_payload(state)["anchor"]["run"] == "20991231_235959_pivot.json"
+
+
+def _button_state(tmp_path, monkeypatch, recording_state="armed", role="handheld"):
+    registry = tmp_path / "tools" / "thor" / "box_devices.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"devices": {"3969377039": {"role": role}}}), encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", state=recording_state),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    monkeypatch.setattr(gateway, "_start_episode", lambda _state: calls.append("start"))
+    monkeypatch.setattr(gateway, "_stop_recorder", lambda _state, action: calls.append(action))
+    return state, calls
+
+
+def _press(state, gesture, *, device=3969377039, age_s=0.0):
+    report = {"device_id": device, "gesture": gesture, "mcu_us": 1, "wall_s": time.time() - age_s}
+    gateway._apply_recorder_output(state, "BOX_BUTTON " + json.dumps(report))
+
+
+@pytest.mark.parametrize(
+    ("recording_state", "gesture", "expected"),
+    [
+        ("armed", "single", ["start"]),
+        ("recording", "single", ["save"]),
+        ("review", "single", ["save"]),
+        ("recording", "long", ["discard"]),
+        ("review", "long", ["discard"]),
+        ("recording", "double", []),
+        ("armed", "double", []),
+        ("armed", "long", []),
+        ("saving", "single", []),
+        ("discarding", "long", []),
+        ("connecting", "single", []),
+        ("idle", "single", []),
+    ],
+)
+def test_box_button_does_what_the_recorder_state_makes_it_mean(
+    tmp_path, monkeypatch, recording_state, gesture, expected
+):
+    state, calls = _button_state(tmp_path, monkeypatch, recording_state)
+    _press(state, gesture)
+    assert calls == expected
+
+
+def test_box_button_of_a_box_that_is_not_handheld_does_nothing(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch, role="fr3_gripper")
+    _press(state, "single")
+    _press(state, "single", device=42)  # and one the registry does not know
+    assert calls == []
+
+
+@pytest.mark.parametrize("session", ["calibration_session", "tracker_mount_session", "marker_tcp_session"])
+def test_box_button_leaves_a_capture_that_holds_the_recorder_alone(tmp_path, monkeypatch, session):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    getattr(state, session).active = True
+    getattr(state, session).stage = "capture"
+    _press(state, "single")
+    assert calls == []
+    # a finished session that stays on record must not take the button away
+    getattr(state, session).stage = "done"
+    _press(state, "single")
+    assert calls == ["start"]
+
+
+def test_box_button_press_that_started_cannot_also_stop(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    _press(state, "single")
+    state.recording.state = "recording"
+    _press(state, "single")
+    assert calls == ["start"]
+    state.box_button_last_action_s -= gateway._BOX_BUTTON_COOLDOWN_S
+    _press(state, "single")
+    assert calls == ["start", "save"]
+
+
+def test_box_button_line_that_waited_is_not_acted_on(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    _press(state, "single", age_s=gateway._BOX_BUTTON_MAX_AGE_S + 1.0)
+    assert calls == []
+
+
+def test_box_button_says_why_a_start_was_refused(tmp_path, monkeypatch):
+    state, _ = _button_state(tmp_path, monkeypatch)
+
+    def refuse(_state):
+        raise RuntimeError("相机和端口的对应关系与标定时不一致")
+
+    monkeypatch.setattr(gateway, "_start_episode", refuse)
+    _press(state, "single")
+    assert any("不一致" in event.message for event in state.events)
+
+
+def test_box_button_goes_through_the_real_start_checks(tmp_path, monkeypatch):
+    class Running:
+        pid = 0
+
+        def poll(self):
+            return None
+
+    state, _ = _button_state(tmp_path, monkeypatch)
+    monkeypatch.undo()
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.process = Running()
+    state.recording.cameraIdentityMismatches = [{"camera": "cam_06", "actual": "a", "expected": "b"}]
+
+    _press(state, "single")
+    assert state.recording.state == "armed" and written == []
+    assert any("未执行" in event.message for event in state.events)
+
+    state.recording.cameraIdentityMismatches = []
+    state.box_button_last_action_s = float("-inf")
+    _press(state, "single")
+    assert state.recording.state == "recording" and written[-1] == "\n"

@@ -569,6 +569,7 @@ class GatewayState:
     log_dir: Path | None = None
     gateway_log_path: Path | None = None
     recorder_log_path: Path | None = None
+    box_button_last_action_s: float = float("-inf")
     device_preview: dict[str, Any] = field(default_factory=dict)
     # BOX 6D force-sensor calibration: the recorder streams CALI_LOG/CALI_DONE
     # lines on stdout after a `cali_6dforce` stdin command; the reader thread
@@ -17478,8 +17479,93 @@ def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> Non
         _set_device_state(state, m["camera"], "error", detail)
 
 
+# (recorder state, gesture) -> what the button on a handheld BOX does. Discarding is the one that
+# cannot be taken back, so it takes the gesture that cannot happen by accident. A double click
+# marks a moment of the episode; the recorder has already kept it for meta.json.
+_BOX_BUTTON_ACTIONS = {
+    ("armed", "single"): "start",
+    ("recording", "single"): "save",
+    ("review", "single"): "save",
+    ("recording", "long"): "discard",
+    ("review", "long"): "discard",
+    ("recording", "double"): "mark",
+}
+_BOX_BUTTON_GESTURES = {"single": "单击", "double": "双击", "long": "长按"}
+# Long enough that a press meant to start cannot also stop what it started.
+_BOX_BUTTON_COOLDOWN_S = 1.0
+# A line that waited this long behind a held lock no longer says what the operator wants now.
+_BOX_BUTTON_MAX_AGE_S = 2.0
+
+
+def _box_button_capture_owner(state: GatewayState) -> str:
+    """Which capture holds the recorder. The button would not be aimed at it: an episode started
+    here clears the capture's redirect and lands in the task dataset."""
+    for name, session in (
+        ("相机标定", state.calibration_session),
+        ("跟踪仪站位", state.tracker_mount_session),
+        ("marker→TCP", state.marker_tcp_session),
+    ):
+        if session.active and session.stage == "capture":
+            return name
+    return ""
+
+
+def _apply_box_button(state: GatewayState, report: dict[str, Any]) -> None:
+    """Do what a gesture on a handheld BOX means now. Runs under ``state.lock``, as the Live Record
+    routes do, and through the same calls, so the button skips none of their checks."""
+    gesture = str(report.get("gesture") or "")
+    name = _BOX_BUTTON_GESTURES.get(gesture, gesture)
+    device = str(report.get("device_id") or "")
+    registry = _read_json_file(state.repo_root / "tools" / "thor" / "box_devices.json") or {}
+    role = str(((registry.get("devices") or {}).get(device) or {}).get("role") or "")
+    if role != "handheld":
+        state.log("info", f"BOX 按钮：box{device} 不是手持 BOX（{role or '未登记'}），{name}已忽略")
+        return
+    if not _state_is_gmsl2(state):
+        return
+    age_s = time.time() - float(report.get("wall_s") or 0.0)
+    if age_s > _BOX_BUTTON_MAX_AGE_S:
+        state.log("warn", f"BOX 按钮：{name}等了 {age_s:.1f} s 才处理，已忽略，请重按")
+        return
+    owner = _box_button_capture_owner(state)
+    if owner:
+        state.log("warn", f"BOX 按钮：{owner}采集中，{name}已忽略")
+        return
+    recording_state = state.recording.state
+    action = _BOX_BUTTON_ACTIONS.get((recording_state, gesture))
+    if action is None:
+        state.log("info", f"BOX 按钮：{name}在 {recording_state} 状态下无动作")
+        return
+    if action == "mark":
+        state.log("info", "BOX 按钮：已打点")
+        return
+    now = time.monotonic()
+    if now - state.box_button_last_action_s < _BOX_BUTTON_COOLDOWN_S:
+        state.log("info", f"BOX 按钮：{name}紧跟上一次操作，已忽略")
+        return
+    state.box_button_last_action_s = now
+    try:
+        if action == "start":
+            _start_episode(state)
+        else:
+            _stop_recorder(state, action)
+    except Exception as exc:  # noqa: BLE001 - nobody is waiting on a response to read a raised error
+        state.log("warn", f"BOX 按钮：{name}未执行：{exc}")
+        return
+    state.log("info", f"BOX 按钮：{name} -> {action}")
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("BOX_BUTTON "):
+        try:
+            report = json.loads(output.removeprefix("BOX_BUTTON ").strip())
+        except ValueError:
+            state.log("warn", "recorder: malformed BOX_BUTTON payload")
+            return
+        if isinstance(report, dict):
+            _apply_box_button(state, report)
         return
     if output.startswith("LT_BEAM_BROKEN "):
         state.recording.laserTrackerBeamBroken = output.removeprefix("LT_BEAM_BROKEN ").strip() == "1"

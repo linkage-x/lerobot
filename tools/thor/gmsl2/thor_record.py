@@ -25,6 +25,8 @@ already understands so the existing GUI plumbing keeps working:
   * ``Episode length <S>s``                        → length this episode runs
   * ``Episode saved. Total saved episodes: N/<budget>``
   * ``Episode discarded`` / ``Recording stopped``
+  * ``BOX_BUTTON <json>``                          → a gesture on a BOX button; the
+                                                     gateway decides what it does
 
 stdin commands accepted (the gateway writes lines to our stdin):
 
@@ -89,6 +91,7 @@ from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
 from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
+from tools.thor.gmsl2 import box_button as bb  # noqa: E402
 from tools.thor.gmsl2 import box_six_d  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
@@ -115,9 +118,50 @@ class StdinCommand:
     raw: str
 
 
+_EMIT_LOCK = threading.Lock()
+
+
 def _emit(text: str) -> None:
-    """Single point for protocol lines so flushing is consistent."""
-    print(text, flush=True)
+    """Single point for protocol lines so flushing is consistent.
+
+    One write under a lock: this is called from the stdin, calibration and SDK threads as well as
+    the main loop, and ``print`` writes the text and the newline separately, which glued two lines
+    into one the gateway could parse as neither (``Episode 0 readyTOUCHCALI_LOG ...``, 11-06).
+    """
+    with _EMIT_LOCK:
+        sys.stdout.write(f"{text}\n")
+        sys.stdout.flush()
+
+
+def _watch_box_button(box: Any) -> list[dict[str, Any]]:
+    """Report each BOX button gesture to the gateway; returns the list double clicks collect in.
+
+    The recorder only says what was pressed. What a gesture does depends on what the session is
+    doing, which is the gateway's to know (``gateway._apply_box_button``). A double click needs
+    nothing from it but the moment, so that is kept here for the episode's meta.json.
+    """
+    decoders: dict[int, bb.ButtonGestures] = {}
+    marks: list[dict[str, Any]] = []
+
+    def on_event(event: dict[str, Any]) -> None:
+        device_id = int(event["device_id"])
+        gesture = decoders.setdefault(device_id, bb.ButtonGestures()).feed(
+            int(event["event"]), int(event["timestamp"])
+        )
+        if gesture is None:
+            return
+        report = {
+            "device_id": device_id,
+            "gesture": gesture,
+            "mcu_us": int(event["timestamp"]),
+            "wall_s": float(event["received_wall_time_s"]),
+        }
+        if gesture == bb.DOUBLE:
+            marks.append(report)
+        _emit("BOX_BUTTON " + json.dumps(report, separators=(",", ":")))
+
+    box.set_button_callback(on_event)
+    return marks
 
 
 # BOX 采集板 v3.1 firmware + v3.4 SDK nominal stream rates. A box that answers
@@ -1690,6 +1734,7 @@ def main(argv: list[str] | None = None) -> int:
     # incoming UDP packet (see tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
+    button_marks = _watch_box_button(box) if box_started else []
     # The tracker lives on another machine and is booked by other people, so it
     # must never stop nine cameras from recording: start() returns False instead
     # of raising, and every use below is guarded by the flag.
@@ -2489,6 +2534,9 @@ def main(argv: list[str] | None = None) -> int:
                         box_ids=episode_boxes,
                     ),
                 }
+                marks = bb.episode_marks(button_marks, t_start, capture_end_wall_s)
+                if marks:
+                    annotations["button_marks"] = marks
                 if frame_sync_payload is not None:
                     annotations["argus_frame_sync"] = frame_sync_payload
                 if online_sync_payload is not None:
