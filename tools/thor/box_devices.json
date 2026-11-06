@@ -30,6 +30,14 @@
             "heldout_worst_moment_Nm": 0.009,
             "rigid_reading": {"mass_kg": 0.4997, "axis_gain_kg": [0.5406, 0.5217, 0.4369], "com_in_ft_m": [0.0001, 0.0025, 0.0611], "vs_box_sdk_conf": "R_ft_imu 177.5 deg from the conf's (about FT z); conf mass 0.7935 kg, CoM (0, 0.0217, 0.0565)"}
           }
+        },
+        {
+          "valid_from_unix": 1793894400,
+          "valid_from": "2026-11-06 00:00:00 +08:00 (the rig went on that morning, hour not recorded; set to the start of the day, the first recording with it is 10:22 and the last without it 11-03)",
+          "end_effector": "gripper + gripper-holder V3 marker rig v9b",
+          "model": "affine_acc/v1",
+          "K": null,
+          "status": "not fitted: the rig added payload after the 11-03 fit"
         }
       ]
     },
