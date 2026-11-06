@@ -1039,7 +1039,7 @@ export class DataCollectionGuiApi {
     boxId: string,
     cadPath: string,
     socketBeyondTcpMm: string,
-    rig: string = "april_cube"
+    rig: string = ""
   ): Promise<{ ok: boolean; error?: string }> {
     const params = new URLSearchParams({
       box_id: boxId,

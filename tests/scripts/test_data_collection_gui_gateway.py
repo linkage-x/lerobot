@@ -5894,6 +5894,60 @@ def test_marker_tcp_solve_on_the_v9b_rig_uses_its_own_layout_dictionary_and_bund
     assert json.loads(production_bundle.read_text()) == _marker_tcp_bundle(INHERITED_ROTATION)
 
 
+def _bind_rig_v9b_to(repo_root: Path, box_id: str) -> None:
+    bundle_path = _install_rig_v9b(repo_root) / "marker_to_tcp_calibration_gripper_rig_v9b.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["cubes"]["left"]["device_id"] = box_id
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+@pytest.mark.parametrize(("rig", "on_rig"), [("", True), ("april_cube", False)])
+def test_marker_tcp_solve_of_the_box_on_a_rig_uses_that_rig_unless_told_otherwise(tmp_path, monkeypatch, rig, on_rig):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _bind_rig_v9b_to(state.repo_root, "box1672693301")
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig=rig, background=False)
+
+    assert result["ok"] is True, result.get("error")
+    detect = next(command for command in calls if "metrology.cli.detect_rig_markers" in command)
+    assert (detect[detect.index("--dictionary") + 1] == "DICT_6X6_250") is on_rig
+
+
+def test_marker_tcp_solve_of_a_box_on_no_rig_stays_on_the_cube(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _bind_rig_v9b_to(state.repo_root, "box_on_the_rig")
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+
+    assert gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="", background=False)["ok"] is True
+    detect = next(command for command in calls if "metrology.cli.detect_rig_markers" in command)
+    assert detect[detect.index("--dictionary") + 1] != "DICT_6X6_250"
+
+
+def test_marker_tcp_solve_that_tracks_no_frame_says_which_target_it_looked_for(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+    original_run = gateway._run_marker_tcp_command
+
+    def run_tracking_nothing(state_, command, *, label, log_path, timeout_s=7200):
+        result = original_run(state_, command, label=label, log_path=log_path, timeout_s=timeout_s)
+        if "metrology.cli.track_marker_rig_in_base" in command:
+            out_dir = Path(command[command.index("--out-dir") + 1])
+            (out_dir / "tracking_summary.json").write_text('{"num_frames_success": 0}', encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", run_tracking_nothing)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="april_cube", background=False)
+
+    assert result["ok"] is False
+    assert "DICT_APRILTAG_36h11" in result["error"] and "Marker rig" in result["error"]
+    assert not any("metrology.cli.pivot_marker_tcp_calibration" in command for command in calls)
+
+
 def test_marker_tcp_solve_refuses_an_unknown_rig(tmp_path, monkeypatch):
     state, _, _ = _marker_tcp_solve_repo(tmp_path)
     _stub_marker_tcp_chain(monkeypatch, [])

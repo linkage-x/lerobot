@@ -6613,7 +6613,7 @@ def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, 
             if not _box_numeric_id(target)
             else ""
         )
-        + "夹爪 rig 请在面板选 rig（它不按 BOX 查）；cube 请登记该 BOX，"
+        + "夹爪 rig 请在面板选 rig，或把这只 BOX 写进 rig bundle 的 device_id；cube 请登记该 BOX，"
         "或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
     )
 
@@ -7018,6 +7018,22 @@ def _marker_tcp_layout_rig(state: GatewayState, rig: str) -> dict[str, Any]:
     }
 
 
+def _marker_tcp_rig_for_box(state: GatewayState, box_id: str) -> str:
+    """The target a BOX's pivot is solved on when the operator did not name one.
+
+    A layout rig's bundle names the BOX mounted on it. That has to win over the BOX registry,
+    which calls the same BOX a left-hand handheld and so resolves it to the cube `left`
+    (11-06: a rig pivot solved with the cube's dictionary found no rig marker, and all the
+    operator saw was "no fused samples").
+    """
+    for rig in MARKER_TCP_RIGS:
+        if rig == DEFAULT_TRACKING_TARGET or not (state.repo_root / TRACKING_TARGETS[rig]["config"]).is_file():
+            continue
+        if str(_marker_tcp_layout_rig(state, rig)["bundleEntry"].get("device_id") or "").strip() == box_id:
+            return rig
+    return DEFAULT_TRACKING_TARGET
+
+
 def _marker_tcp_cad_check(pivot_report: dict[str, Any], bundle_entry: dict[str, Any]) -> dict[str, Any] | None:
     """Where the pivot landed against the bundle's expected pivot points.
 
@@ -7373,14 +7389,14 @@ def _run_marker_tcp_solve(
         return {"ok": False, "error": "已有解算在进行中，请等它结束"}
     try:
         box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id)
-        rig_name = str(rig or DEFAULT_TRACKING_TARGET).strip().lower()
+        rig_name = str(rig or "").strip().lower() or _marker_tcp_rig_for_box(state, box_id_norm)
         if rig_name not in MARKER_TCP_RIGS:
             raise ValueError(f"未知 rig {rig_name!r}；可选 {list(MARKER_TCP_RIGS)}")
         layout_rig = None if rig_name == DEFAULT_TRACKING_TARGET else _marker_tcp_layout_rig(state, rig_name)
         if layout_rig is None:
             cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
         else:
-            # A layout rig is not looked up by BOX: it has one entry, in its own bundle.
+            # A layout rig has one entry, in its own bundle, whichever BOX is being solved.
             cube_name = layout_rig["cubeName"]
             existing_entry = layout_rig["bundleEntry"]
             existing_bundle_path = layout_rig["bundlePath"]
@@ -7502,6 +7518,7 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         # 2. Detect once, cache the corners, then track. Splitting these is what
         #    lets a re-solve skip the expensive half.
         detections_path = solve_dir / "detections.npz"
+        dictionary = _marker_tcp_aruco_dictionary(state) if layout_rig is None else layout_rig["dictionary"]
         _run_marker_tcp_command(
             state,
             [
@@ -7515,7 +7532,7 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
                 "--cameras",
                 *cameras,
                 "--dictionary",
-                _marker_tcp_aruco_dictionary(state) if layout_rig is None else layout_rig["dictionary"],
+                dictionary,
                 "--out",
                 str(detections_path),
             ],
@@ -7551,6 +7568,12 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         )
         if not tracking_run_dir.is_dir():
             raise FileNotFoundError(f"tracking run was not written: {tracking_run_dir}")
+        tracking_summary = _read_json_file(tracking_run_dir / "tracking_summary.json") or {}
+        if tracking_summary.get("num_frames_success") == 0:
+            raise ValueError(
+                f"{target_label}：按 {dictionary} 在 {len(cameras)} 台相机上没解出任何一帧位姿，"
+                "这段录的多半不是这个目标。请确认面板的 Marker rig 和实物一致，并且 marker 在画面里。"
+            )
 
         bundle_path = solve_dir / "marker_to_tcp_calibration.json"
         if existing_bundle_path is not None and existing_bundle_path.is_file():

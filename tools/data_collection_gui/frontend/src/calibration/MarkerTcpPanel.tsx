@@ -283,7 +283,7 @@ export function MarkerTcpPanel({
   const [staticPath, setStaticPath] = useState("");
   const [cadPath, setCadPath] = useState("");
   const [socketBeyondTcpMm, setSocketBeyondTcpMm] = useState("0");
-  const [rig, setRig] = useState("april_cube");
+  const [rig, setRig] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [formatHelp, setFormatHelp] = useState<FormatHelp | null>(null);
@@ -460,6 +460,7 @@ export function MarkerTcpPanel({
             <label>
               Marker rig
               <select value={rig} disabled={disabled} onChange={(event) => setRig(event.target.value)}>
+                <option value="">自动（BOX 装在 rig 上就用 rig，否则 cube）</option>
                 <option value="april_cube">AprilTag cube（BOX 生产 bundle）</option>
                 <option value="gripper_rig_v9b">Gripper Rig v9b（ArUco 106–109）</option>
               </select>
