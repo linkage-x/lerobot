@@ -170,11 +170,12 @@ export function CalibrationResultPanel({
 
 // --- reboot step (origin only) -----------------------------------------------
 function RebootStep({ wf }: { wf: WorkflowApi }) {
+  if (wf.state === "reconnecting") return <p className="cali-reboot">{wf.recheckDetail}</p>;
   if (wf.state !== "waiting_for_reboot") return null;
   return (
     <div className="cali-reboot">
       <p>
-        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。重启并等待重新连接后将自动复核原始数据。
+        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。BOX 留在工装上，上电满 60 秒后自动采样复核 raw。
       </p>
       <button className="cali-btn-primary" onClick={() => wf.confirmReboot()}>
         我已重新上电，开始复核
