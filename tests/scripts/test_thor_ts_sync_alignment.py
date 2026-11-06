@@ -18,6 +18,8 @@ The gripper's ``distance_m`` maps to ``observation.state[0]`` (see
 *exactly which sample* a given camera frame selected.
 """
 
+import random
+
 import pytest
 
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
@@ -212,6 +214,21 @@ def test_calibration_fallback_too_few_samples():
     few = _make_gripper_samples(5)            # < 10 → cannot fit
     out = lr3.calibrate_sensor_samples(few, T0_WALL_S)
     assert [s["t_rel_s"] for s in out[GRIPPER]] == [s["t_rel_s"] for s in few[GRIPPER]]
+
+
+def test_mcu_calibration_is_the_same_whatever_adds_it_up():
+    """The recorder (Python 3.12) and box_realign (3.10) must get the same line from the same
+    samples. 3.12's ``sum()`` compensates and 3.10's does not, which on real magnitudes put the
+    two up to 50 ULP apart, and a plain sum depends on the order it adds in. ``fsum`` is exact in
+    any order, so a shuffle must give the identical fit, bit for bit.
+    """
+    rng = random.Random(0)
+    mcu = [691_576_583 + 2262 * k + rng.randrange(-40, 40) for k in range(8840)]
+    host = [1793945419.3901238 + 1e-6 * (t - mcu[0]) + rng.gauss(0.0, 3e-4) for t in mcu]
+    order = list(range(len(mcu)))
+    rng.shuffle(order)
+    shuffled = lr3.calibrate_mcu_clock([mcu[i] for i in order], [host[i] for i in order])
+    assert shuffled == lr3.calibrate_mcu_clock(mcu, host)
 
 
 def test_calibration_fallback_all_zero_mcu_timestamps():

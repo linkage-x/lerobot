@@ -623,21 +623,28 @@ def calibrate_mcu_clock(
     Centred, the same 72 fits land within **0.3 µs**, which is the float64
     representation limit of a 1.8e9-second wall clock rather than anything left
     in the algorithm.
+
+    Every sum is ``math.fsum``, so the fit does not depend on the interpreter. The recorder
+    runs on Python 3.12, whose ``sum()`` compensates float rounding; box_realign runs on the
+    opencv_kalibr venv's 3.10, whose ``sum()`` does not. Adding thousands of 1.8e9 wall clocks
+    the plain way moved the intercept by up to 50 ULP (12 us on 8840 IMU samples, 2026-11-06):
+    nothing to the pairing, but a rebuild no longer reproduced the stored interpolated stamps
+    and box_realign refused every one-BOX dataset.
     """
     n = len(mcu_timestamps)
     if n < 2:
         return (0.0, 0.0, float("inf"))
-    mean_x = sum(mcu_timestamps) / n
-    mean_y = sum(host_times) / n
+    mean_x = math.fsum(mcu_timestamps) / n
+    mean_y = math.fsum(host_times) / n
     dx = [x - mean_x for x in mcu_timestamps]
-    denom = sum(d * d for d in dx)
+    denom = math.fsum(d * d for d in dx)
     if denom < 1e-30:
         return (0.0, 0.0, float("inf"))
-    slope = sum(d * (y - mean_y) for d, y in zip(dx, host_times)) / denom
+    slope = math.fsum(d * (y - mean_y) for d, y in zip(dx, host_times)) / denom
     intercept = mean_y - slope * mean_x
     residuals = [y - (slope * x + intercept)
                  for x, y in zip(mcu_timestamps, host_times)]
-    res_std = (sum(r * r for r in residuals) / n) ** 0.5
+    res_std = (math.fsum(r * r for r in residuals) / n) ** 0.5
     return (slope, intercept, res_std)
 
 
