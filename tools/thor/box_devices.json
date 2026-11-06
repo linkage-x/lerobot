@@ -36,8 +36,36 @@
           "valid_from": "2026-11-06 00:00:00 +08:00 (the rig went on that morning, hour not recorded; set to the start of the day, the first recording with it is 10:22 and the last without it 11-03)",
           "end_effector": "gripper + gripper-holder V3 marker rig v9b",
           "model": "affine_acc/v1",
-          "K": null,
-          "status": "not fitted: the rig added payload after the 11-03 fit"
+          "K": [
+            [0.21016, 8.78921, -0.02446],
+            [2.81833, 0.54597, -6.12454],
+            [8.75731, -0.12657, 0.57133],
+            [0.22843, 0.00373, 0.46187],
+            [0.01231, 0.45255, -0.00425],
+            [-0.00381, -0.27148, 0.00423]
+          ],
+          "status": "fitted at full opening (88.7 mm): two passes, all six faces. At 33.5 mm with the 26.8 g pivot insert clamped (x+, y+, y-, z+ only), with the insert's weight taken out at the 168 mm tip, a constant remains that does not follow the attitude: Fz -0.47 N, Mx -0.07 N*m (opening or clamping, not separated; nothing corrects it)",
+          "fit": {
+            "log": "Thor ~/lerobot_rig_v9b_smoke/outputs/e2e_20261106/six_d_20261106{,_p2}/free_air.log, 11-06 15:26:52-15:27:40 and 15:30:01-15:30:56, gateway preview at ~10 Hz, held by the handle, gripper in free air",
+            "n_static": 632,
+            "attitudes": {
+              "x+": 86,
+              "x-": 123,
+              "y+": 112,
+              "y-": 114,
+              "z+": 75,
+              "z-": 122
+            },
+            "heldout_worst_force_N": 0.224,
+            "heldout_worst_moment_Nm": 0.02,
+            "cross_pass_rms_force_N": [0.125, 0.147, 0.156],
+            "rigid_reading": {
+              "mass_kg": 0.8179,
+              "axis_gain_kg": [0.9597, 0.8942, 0.5999],
+              "com_in_ft_m": [0.0001, 0.0379, 0.0566],
+              "note": "not a weighing: the gain spread is 38 %, and FT Fy now also follows IMU x (2.82 N/g, 0.03 on 11-03); unexplained, the affine K absorbs it for gravity, nothing here corrects an external force"
+            }
+          }
         }
       ]
     },
