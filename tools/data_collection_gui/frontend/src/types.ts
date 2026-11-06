@@ -932,7 +932,7 @@ export type CubeVideoOverlay = {
   usedForFusion: boolean;
 };
 
-export type TrackingTarget = "april_cube" | "hybrid_carrier_v1";
+export type TrackingTarget = "april_cube" | "hybrid_carrier_v1" | "gripper_rig_v9b";
 
 export type TrackingDetectionSummary = {
   target: TrackingTarget;

@@ -727,7 +727,27 @@ export class DataCollectionGuiApi {
     if (markerTcpCalibrationPath.trim()) {
       params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
     }
-    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
+    // 409 with otherTrackingTargets: the dataset already has another target's trajectories
+    // (cube vs gripper rig). Ask before moving them aside; the gateway never does it unasked.
+    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`, async (payload) => {
+      const detail = payload.otherTrackingTargets as { otherTargets?: Record<string, number>; supersededDir?: string } | undefined;
+      if (!detail) {
+        return null;
+      }
+      const others = Object.entries(detail.otherTargets ?? {})
+        .map(([name, count]) => `${name}（${count} 个文件）`)
+        .join("、");
+      const ok = window.confirm(
+        `这个数据集已经有 ${others} 的轨迹，不是这次选的目标（${trackingTarget}）生成的。\n\n` +
+          `先确认数据集录的是哪种目标。确定要换成本目标吗？旧轨迹会挪到 ${detail.supersededDir ?? "_superseded/"} 下，不删除。`
+      );
+      if (!ok) {
+        this.log("info", `Traj-gen cancelled: ${path} already has ${others}`);
+        return structuredClone(this.snapshot);
+      }
+      params.set("supersede_other_targets", "1");
+      return this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
+    });
     if (remote) {
       return remote;
     }
@@ -1018,12 +1038,14 @@ export class DataCollectionGuiApi {
   async solveMarkerTcpTransform(
     boxId: string,
     cadPath: string,
-    socketBeyondTcpMm: string
+    socketBeyondTcpMm: string,
+    rig: string = "april_cube"
   ): Promise<{ ok: boolean; error?: string }> {
     const params = new URLSearchParams({
       box_id: boxId,
       cad_path: cadPath,
-      socket_beyond_tcp_mm: socketBeyondTcpMm
+      socket_beyond_tcp_mm: socketBeyondTcpMm,
+      rig
     });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
@@ -1886,12 +1908,26 @@ export class DataCollectionGuiApi {
     }
   }
 
-  private async postRemoteSnapshot(endpoint: string): Promise<GuiSnapshot | null> {
+  private async postRemoteSnapshot(
+    endpoint: string,
+    onConflict?: (payload: Record<string, unknown>) => Promise<GuiSnapshot | null>
+  ): Promise<GuiSnapshot | null> {
     try {
       const response = await fetch(`${this.apiBase}${endpoint}`, {
         method: "POST",
         headers: { Accept: "application/json" }
       });
+      if (response.status === 409 && onConflict) {
+        const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+        const handled = await onConflict(payload);
+        if (handled) {
+          return handled;
+        }
+        const message = typeof payload.error === "string" ? payload.error : `HTTP ${response.status}`;
+        this.applyRemoteCommandError(endpoint, message);
+        this.usingRemote = true;
+        return structuredClone(this.snapshot);
+      }
       if (!response.ok) {
         const message = await this.remoteErrorMessage(response);
         this.applyRemoteCommandError(endpoint, message);

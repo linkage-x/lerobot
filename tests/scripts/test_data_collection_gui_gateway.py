@@ -821,6 +821,114 @@ def test_marker_tcp_sample_save_tolerates_recorder_returning_to_armed(tmp_path, 
     assert state.marker_tcp_session.samples[0].episodeIndex == 7
 
 
+def test_marker_tcp_episode_comes_from_the_capture_intent_not_the_save_count(tmp_path, monkeypatch):
+    """11-06: the recorder's save count said episode 1 of a dataset whose only episode was 0."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+    intents = []
+
+    def fake_start_episode(fake_state, *, capture_intent=None, **_kwargs):
+        intents.append(capture_intent)
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    gateway._marker_tcp_record_sample(state, "start", box_id="box3969377039", condition="same_mount_01")
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.episodeIndex == 7
+    assert intents[0]["sample_id"] == sample.id
+
+    episode = Path(state.recording.datasetRoot) / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    (episode / "meta.json").write_text(json.dumps({"capture_intent": intents[0]}), encoding="utf-8")
+    other = episode.parent / "episode_000001"
+    other.mkdir()
+    (other / "meta.json").write_text(
+        json.dumps({"capture_intent": {**intents[0], "session_id": "another_session"}}), encoding="utf-8"
+    )
+
+    gateway._marker_tcp_correct_episodes(state, state.marker_tcp_session.sessionName, [sample])
+    assert sample.episodeIndex == 0
+
+    # a sample recorded before the intent named it keeps what it has
+    legacy = gateway.MarkerTcpSample(
+        id="sample_099", side="left", condition="old", datasetRoot=state.recording.datasetRoot, episodeIndex=3
+    )
+    gateway._marker_tcp_correct_episodes(state, state.marker_tcp_session.sessionName, [legacy])
+    assert legacy.episodeIndex == 3
+
+
+def _marker_tcp_box_registry_repo(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema": "marker_rig_to_tcp_calibration/v1",
+                "cubes": {"left": {"device_id": "box1672693301"}, "right": {"device_id": "box1819152274"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f"ee_from_cube:\n  marker_to_tcp_calibration_path: {bundle}\n", encoding="utf-8")
+    registry = tmp_path / "tools" / "thor" / "box_devices.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "devices": {
+                    "3969377039": {"role": "handheld", "hand": "left"},
+                    "3100715645": {"role": "fr3_gripper"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return state
+
+
+def test_a_renumbered_handheld_box_finds_its_cube_through_the_registry(tmp_path):
+    state = _marker_tcp_box_registry_repo(tmp_path)
+    assert gateway._marker_tcp_cube_for_box_id(state, "box1819152274")[0] == "right"
+    assert gateway._marker_tcp_cube_for_box_id(state, "box3969377039")[0] == "left"
+    assert gateway._marker_tcp_cube_for_box_id(state, "3969377039")[0] == "left"
+    with pytest.raises(ValueError, match="box3100715645"):  # on an arm: no hand, so no cube
+        gateway._marker_tcp_cube_for_box_id(state, "box3100715645")
+
+
+def test_the_shared_factory_serial_is_refused_by_name(tmp_path):
+    state = _marker_tcp_box_registry_repo(tmp_path)
+    with pytest.raises(ValueError, match="出厂序列号"):
+        gateway._marker_tcp_cube_for_box_id(state, "box_collection_controller_000001")
+
+
+def test_connect_starts_the_episode_count_over(tmp_path, monkeypatch):
+    """A new recorder counts from zero and says nothing until its first save."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.recording.savedEpisodes = 1
+    state.recording.episodeIndex = 1
+
+    class StopAfterSpawnError(Exception):
+        pass
+
+    class FakeProcess:
+        pid = 4321
+        stdin = stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: FakeProcess())
+    monkeypatch.setattr(gateway, "_resolve_recorder_config_path", lambda _state: tmp_path / "config.yaml")
+    monkeypatch.setattr(gateway, "_set_all_device_states", lambda *_a: (_ for _ in ()).throw(StopAfterSpawnError()))
+    with pytest.raises(StopAfterSpawnError):
+        gateway._connect_recorder(state)
+    assert state.recording.savedEpisodes == 0
+    assert state.recording.episodeIndex == 0
+
+
 def test_marker_tcp_sample_records_box_id_target(tmp_path, monkeypatch):
     state = _marker_tcp_gateway_state(tmp_path)
     assert gateway._start_marker_tcp_session(state)["ok"] is True
@@ -2554,6 +2662,101 @@ def test_traj_gen_starts_april_tracking_with_selected_dataset_root(tmp_path, mon
     item = gateway._processing_item_from_dataset(dataset_root)
     assert item["status"] == "running"
     assert "AprilTag cube tracking" in item["message"]
+
+
+def _rig_over_cube_repo(tmp_path):
+    """A cube-tracked dataset about to be tracked as the gripper rig (the wrong-target case)."""
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.write_text("#!/usr/bin/env bash\necho tracking\n", encoding="utf-8")
+    config_path = repo_root / gateway.TRACKING_TARGETS["gripper_rig_v9b"]["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "cube_tracker:\n  cubes:\n    - name: left\n"
+        "save_to_dataset:\n  sidecar_dir: derived/april_cube_tracking_in_robot_base\n",
+        encoding="utf-8",
+    )
+    sidecar = dataset_root / "derived" / "april_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    for name in ("state_action.left.csv", "state.left.npy", "cube_pose.left.cam_06.csv", "state_action.right.csv"):
+        (sidecar / name).write_text("x\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+    return state, dataset_root, sidecar
+
+
+def test_traj_gen_refuses_to_put_a_second_target_next_to_the_first(tmp_path, monkeypatch):
+    """Rig trajectories next to cube ones: export would ship both while meta describes one run."""
+    state, dataset_root, sidecar = _rig_over_cube_repo(tmp_path)
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 1234
+        stdout = []
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **_k: launched.append(command) or FakeProcess())
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+
+    with pytest.raises(gateway.OtherTrackingTargetsError) as refused:
+        gateway._queue_traj_gen(state, dataset_root, tracking_target="gripper_rig_v9b")
+    assert refused.value.detail["otherTargets"] == {"right": 1}
+    assert refused.value.detail["runTargets"] == ["left"]
+    assert launched == []
+    assert str(dataset_root) not in state.processing_starting
+
+    # Re-running the cube itself is not a conflict: same targets, a plain replacement.
+    cube_config = tmp_path / "cube.yaml"
+    cube_config.write_text(
+        "cube_tracker:\n  cubes:\n    - name: left\n    - name: right\n    - name: head\n", encoding="utf-8"
+    )
+    assert gateway._other_tracking_targets(dataset_root, cube_config) is None
+
+    # Asked for explicitly, the tracker gets the flag; the gateway itself moves nothing.
+    gateway._queue_traj_gen(state, dataset_root, tracking_target="gripper_rig_v9b", supersede_other_targets=True)
+    assert launched[-1][-1] == "--supersede-other-targets"
+    assert (sidecar / "state_action.left.csv").is_file()
+
+
+def test_traj_gen_conflict_reaches_the_gui_as_409_with_the_targets(tmp_path, monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    state, dataset_root, _sidecar = _rig_over_cube_repo(tmp_path)
+    monkeypatch.setattr(gateway, "_resolve_known_dataset", lambda _state, _requested: dataset_root)
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: pytest.fail("must not launch"))
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        query = urllib.parse.urlencode({"path": str(dataset_root), "tracking_target": "gripper_rig_v9b"})
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/processing/traj-gen?{query}", method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as answered:
+            urllib.request.urlopen(request, timeout=5)
+        body = json.loads(answered.value.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert answered.value.code == 409
+    assert body["otherTrackingTargets"]["otherTargets"] == {"right": 1}
+    assert body["otherTrackingTargets"]["supersededDir"].endswith("april_cube_tracking_in_robot_base/_superseded")
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
 
 
 def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path):
@@ -5595,6 +5798,133 @@ def test_marker_tcp_solve_refuses_a_box_the_production_bundle_does_not_cover(tmp
 
     assert result["ok"] is False
     assert "box_unknown" in result["error"]
+
+
+_RIG_V9B_SOURCE = Path(__file__).resolve().parents[2] / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG
+
+
+def _install_rig_v9b(repo_root: Path) -> Path:
+    """Copy the shipped v9b config, layout and bundle into a test repo at their real paths."""
+    config_dir = _RIG_V9B_SOURCE.parent
+    target_dir = repo_root / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        _RIG_V9B_SOURCE.name,
+        "gripper_rig_v9b_marker_layout.json",
+        "marker_to_tcp_calibration_gripper_rig_v9b.json",
+    ):
+        shutil.copy2(config_dir / name, target_dir / name)
+    return target_dir
+
+
+def test_gripper_rig_v9b_is_a_tracking_target_with_its_own_entrypoint_config(tmp_path):
+    repo_root = tmp_path / "repo"
+    _install_rig_v9b(repo_root)
+    runner = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    command = gateway._ee_trajectory_command(state, tmp_path / "ds", tracking_target="gripper_rig_v9b")
+
+    assert command[command.index("--tracking-target") + 1] == "gripper_rig_v9b"
+    assert command[command.index("--config") + 1].endswith("gripper_rig_v9b_tracking_in_robot_base_thor.yaml")
+    with pytest.raises(ValueError, match="cube-only"):
+        gateway._ee_trajectory_command(
+            state, tmp_path / "ds", tracking_target="gripper_rig_v9b",
+            marker_to_tcp_calibration_path=tmp_path / "x.json",
+        )
+    # Calibration promotion rewrites it together with production, never leaves it behind.
+    assert gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+
+
+def test_marker_tcp_solve_on_the_v9b_rig_uses_its_own_layout_dictionary_and_bundle(tmp_path, monkeypatch):
+    state, _, production_bundle = _marker_tcp_solve_repo(tmp_path)
+    _install_rig_v9b(state.repo_root)
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+    original_run = gateway._run_marker_tcp_command
+
+    def run_with_cad_fit(state_, command, *, label, log_path, timeout_s=7200):
+        result = original_run(state_, command, label=label, log_path=log_path, timeout_s=timeout_s)
+        if "metrology.cli.pivot_marker_tcp_calibration" in command:
+            report = Path(command[command.index("--out") + 1])
+            data = json.loads(report.read_text(encoding="utf-8"))
+            data["fit"]["p_cube_mm"] = [1.4, 1.21, 167.91]  # 1.5 mm from the measured socket centre
+            report.write_text(json.dumps(data), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", run_with_cad_fit)
+
+    result = gateway._run_marker_tcp_solve(
+        state, box_id="box1672693301", socket_beyond_tcp_mm="0", rig="gripper_rig_v9b", background=False
+    )
+
+    assert result["ok"] is True, result.get("error")
+    steps = [next(part for part in command if part.startswith("metrology.cli.")) for command in calls]
+    # No cube-template step: the rig's corner table is already the production one.
+    assert steps == [
+        "metrology.cli.detect_rig_markers",
+        "metrology.cli.track_marker_rig_in_base",
+        "metrology.cli.pivot_marker_tcp_calibration",
+    ]
+    detect, track, pivot = calls
+    assert detect[detect.index("--dictionary") + 1] == "DICT_6X6_250"
+    assert track[track.index("--config") + 1].endswith("gripper_rig_v9b_tracking_in_robot_base_thor.yaml")
+    assert track[track.index("--rig-name") + 1] == "left"
+    assert pivot[pivot.index("--cube") + 1] == "left"
+    # Rotation comes from the rig's CAD/URDF bundle, not from the cube's production one.
+    assert pivot[pivot.index("--rotation-cube-tcp") + 1] == "0,1,0;1,0,0;0,0,-1"
+    session = state.marker_tcp_session
+    layout = json.loads((Path(session.solvePath).parent / gateway.DEFAULT_MARKER_LAYOUT_NAME).read_text())
+    assert [m["id"] for m in layout["markers"]] == [106, 107, 108, 109]
+    summary = json.loads(Path(session.solveSummaryPath).read_text(encoding="utf-8"))
+    assert summary["rig"] == "gripper_rig_v9b"
+    nearest = summary["cadCheck"]["nearest"]
+    assert nearest["name"] == "insert_nov4_socket_centre"
+    assert nearest["distanceMm"] == pytest.approx(1.5, abs=0.01)
+    assert "pivot 点离 insert_nov4_socket_centre" in session.message
+    # The cube's production bundle is untouched by a rig solve.
+    assert json.loads(production_bundle.read_text()) == _marker_tcp_bundle(INHERITED_ROTATION)
+
+
+def test_marker_tcp_solve_refuses_an_unknown_rig(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _stub_marker_tcp_chain(monkeypatch, [])
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="cube9000", background=False)
+    assert result["ok"] is False and "cube9000" in result["error"]
+
+
+def test_marker_layout_overlay_model_draws_each_marker_square_facing_out(tmp_path):
+    layout_path = _RIG_V9B_SOURCE.parent / "gripper_rig_v9b_marker_layout.json"
+    # What the tracker really writes: MarkerLayout.from_json lets the file's own `source`
+    # (a provenance dict) win, so the summary's `source` is that dict as a string -- long
+    # enough to overflow PATH_MAX -- and the file is named by `path` (Thor smoke 11-05:
+    # reading `source` drew the default cube instead of the layout).
+    provenance = str(json.loads(layout_path.read_text(encoding="utf-8"))["source"]) * 40
+    summary = {
+        "cube_tracker": {"pose_estimation_mode": "marker_layout_pnp"},
+        "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": provenance, "path": str(layout_path)}}},
+    }
+    model = gateway._load_marker_layout_overlay_model(summary)
+    assert model is not None
+    # Summaries from before `path` existed name a provenance-free layout file in `source`.
+    legacy = {**summary, "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": str(layout_path)}}}}
+    assert gateway._load_marker_layout_overlay_model(legacy) == model
+    no_file = {**summary, "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": provenance}}}}
+    assert gateway._load_marker_layout_overlay_model(no_file) is None
+    assert [a["id"] for a in model["anchors"]] == [106, 107, 108, 109]
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    for facet, marker in zip(model["facets"], layout["markers"], strict=True):
+        normal = np.asarray(facet["normal"], dtype=float)
+        assert float(normal @ np.asarray(marker["normal_rig"])) > 0  # outward, for the back-face test
+    assert gateway._load_marker_layout_overlay_model({"cube_tracker": {"pose_estimation_mode": "x"}}) is None
 
 
 def test_queue_traj_gen_writes_a_marker_tcp_override_config_and_records_it(tmp_path, monkeypatch):

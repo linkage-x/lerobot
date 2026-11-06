@@ -105,6 +105,13 @@ DEFAULT_EE_TRAJECTORY_CONFIG = Path(
 HYBRID_CARRIER_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/hybrid_carrier_tracking_in_robot_base_thor.yaml"
 )
+# Gripper-holder V3 marker rig (v9b, ArUco DICT_6X6_250 ids 106-109). Its corner
+# table and rig->TCP bundle are generated from the CAD descriptor and the measured
+# socket centre by metrology.cli.export_marker_rig_layout; the config names both.
+GRIPPER_RIG_V9B_TARGET = "gripper_rig_v9b"
+GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_tracking_in_robot_base_thor.yaml"
+)
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -124,7 +131,16 @@ TRACKING_TARGETS = {
         "config": HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
         "algorithm": "hybrid_carrier_v1_anchors_facets",
     },
+    GRIPPER_RIG_V9B_TARGET: {
+        "label": "Gripper Rig v9b (ArUco 106-109)",
+        "config": GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
+        "algorithm": "marker_layout_rig_corner_ba",
+    },
 }
+# Rigs the marker->TCP pivot solve accepts. The cube's corner table is resolved
+# from the production cube template; a layout rig ships its own table, its own
+# dictionary and its own CAD bundle, all named by its tracking config.
+MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET)
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -5662,7 +5678,7 @@ _TRACKING_CONFIG = (
 )
 # Trackers that read the same camera rig. Promotion keeps them on the run
 # _TRACKING_CONFIG points at; they are never the authority on what is live.
-_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,)
+_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG, GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG)
 
 
 def _load_active_calibration_runs(state: GatewayState) -> None:
@@ -6010,6 +6026,14 @@ def _promote_calibration(
 
 class StaleCalibrationError(RuntimeError):
     """Trajectory generation would silently use a calibration that is not the newest."""
+
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+class OtherTrackingTargetsError(RuntimeError):
+    """The dataset's sidecar already holds trajectories of a target this run does not produce."""
 
     def __init__(self, message: str, detail: dict[str, Any]) -> None:
         super().__init__(message)
@@ -6549,6 +6573,19 @@ def _resolve_marker_tcp_calibration_file(state: GatewayState, raw_path: str) -> 
     return path
 
 
+def _box_numeric_id(box_id: str) -> str:
+    """The firmware device_id in ``box123`` or ``123``; empty for anything else, e.g. a serial."""
+    match = re.fullmatch(r"(?:box)?(\d+)", str(box_id or "").strip())
+    return match.group(1) if match else ""
+
+
+def _box_registry_hand(state: GatewayState, box_id: str) -> str:
+    """Which hand tools/thor/box_devices.json says this handheld BOX is held in, if any."""
+    registry = _read_json_file(state.repo_root / "tools" / "thor" / "box_devices.json") or {}
+    entry = (registry.get("devices") or {}).get(_box_numeric_id(box_id)) or {}
+    return str(entry.get("hand") or "") if entry.get("role") == "handheld" else ""
+
+
 def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, dict[str, Any], Path | None]:
     target = str(box_id or "").strip()
     default_path = _default_marker_tcp_bundle_path(state)
@@ -6560,12 +6597,23 @@ def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, 
         for name, entry in cubes.items():
             if isinstance(entry, dict) and str(entry.get("device_id", "")).strip() == target:
                 return str(name), entry, default_path
+        # The bundle's ids are as old as its pivot, and the v4.1 firmware renumbered every BOX.
+        # The registry knows the hand a handheld BOX is held in, which is what names its cube.
+        hand = _box_registry_hand(state, target)
+        if hand and isinstance(cubes.get(hand), dict):
+            return hand, cubes[hand], default_path
     legacy = target.lower()
     if legacy in {"left", "right"}:
         return legacy, {}, default_path
     raise ValueError(
-        f"默认 production marker→TCP bundle 中找不到 BOX ID {target!r}。"
-        "请先登记该 BOX，或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
+        f"默认 production marker→TCP bundle 里没有 BOX {target!r} 的 cube，box_devices.json 也没登记它是哪只手。"
+        + (
+            "这个名字是出厂序列号，所有 BOX 都一样，认不出是哪一台；请更新前端后重新选择 BOX。"
+            if not _box_numeric_id(target)
+            else ""
+        )
+        + "夹爪 rig 请在面板选 rig（它不按 BOX 查）；cube 请登记该 BOX，"
+        "或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
     )
 
 
@@ -6793,6 +6841,24 @@ def _marker_tcp_saved_samples(session: MarkerTcpSession, box_id: str) -> list[Ma
     return sorted(samples, key=lambda item: (item.datasetRoot, item.episodeIndex, item.id))
 
 
+def _marker_tcp_correct_episodes(state: GatewayState, session_name: str, samples: list[MarkerTcpSample]) -> None:
+    """Point each sample at the episode whose meta.json says it is that sample.
+
+    ``episodeIndex`` is the recorder's running save count when the sample started, and that
+    count is session-wide across capture roots: a calibration episode saved under another root
+    moves it without adding an episode to this dataset. The episode's own capture intent
+    is the record that cannot drift. A sample from before the intent carried ``sample_id``
+    matches nothing and keeps its index.
+    """
+    for sample in samples:
+        episodes = _resolve_user_path(state, sample.datasetRoot) / "episodes"
+        for meta_path in sorted(episodes.glob("episode_*/meta.json")):
+            intent = (_read_json_file(meta_path) or {}).get("capture_intent") or {}
+            if intent.get("session_id") == session_name and intent.get("sample_id") == sample.id:
+                sample.episodeIndex = int(meta_path.parent.name.removeprefix("episode_"))
+                break
+
+
 def _marker_tcp_subset_dataset(
     state: GatewayState,
     *,
@@ -6897,6 +6963,89 @@ def _marker_tcp_aruco_dictionary(state: GatewayState) -> str:
             f"cube_tracker.aruco_dictionary 未设置：{state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG}"
         )
     return dictionary
+
+
+def _marker_tcp_layout_rig(state: GatewayState, rig: str) -> dict[str, Any]:
+    """Everything a layout rig's pivot solve needs, read from its tracking config.
+
+    The config is the one place that names the rig's corner table and bundle, so
+    the solve reads them from there instead of carrying a second copy of either
+    path -- a solve on one table and a production run on another would agree
+    on nothing while both looked fine.
+    """
+    spec = TRACKING_TARGETS.get(rig)
+    if spec is None:
+        raise ValueError(f"unknown rig {rig!r}")
+    config_rel = Path(spec["config"])
+    cfg = _load_yaml_mapping(state.repo_root / config_rel)
+    tracker = cfg.get("cube_tracker") if isinstance(cfg.get("cube_tracker"), dict) else {}
+    cubes = tracker.get("cubes") if isinstance(tracker.get("cubes"), list) else []
+    if len(cubes) != 1 or not isinstance(cubes[0], dict):
+        raise ValueError(f"{config_rel}: a layout rig config must track exactly one rig")
+    cube_name = str(cubes[0].get("name") or "").strip().lower()
+    layout_raw = str(cubes[0].get("marker_layout_path") or tracker.get("marker_layout_path") or "").strip()
+    if not cube_name or not layout_raw:
+        raise ValueError(f"{config_rel}: cube_tracker.cubes[0] needs name and marker_layout_path")
+    layout_path = Path(layout_raw)
+    if not layout_path.is_absolute():
+        # Resolved like the tracker does: relative to hikon_cube_tracking_offline/.
+        layout_path = (state.repo_root / config_rel).parents[1] / layout_path
+    if not layout_path.is_file():
+        raise FileNotFoundError(f"{rig} 的 marker layout 不存在：{layout_path}")
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    dictionary = str(layout.get("aruco_dictionary") or "").strip()
+    if not dictionary:
+        raise ValueError(f"{layout_path}: layout declares no aruco_dictionary")
+    ee_cfg = cfg.get("ee_from_cube") if isinstance(cfg.get("ee_from_cube"), dict) else {}
+    bundle_raw = str(ee_cfg.get("marker_to_tcp_calibration_path") or "").strip()
+    if not bundle_raw:
+        raise ValueError(f"{config_rel}: ee_from_cube.marker_to_tcp_calibration_path is required")
+    bundle_path = _resolve_user_path(state, bundle_raw)
+    bundle = _load_marker_tcp_calibration_bundle(bundle_path)
+    entry = bundle["cubes"].get(cube_name)
+    if not isinstance(entry, dict) or "T_cube_tcp" not in entry:
+        raise ValueError(f"{bundle_path}: no T_cube_tcp for rig {cube_name!r}")
+    return {
+        "rig": rig,
+        "configPath": str(config_rel),
+        "cubeName": cube_name,
+        "layoutPath": str(layout_path),
+        "dictionary": dictionary,
+        "markerSizeSource": str(layout.get("marker_size_source") or ""),
+        "bundlePath": bundle_path,
+        "bundleEntry": entry,
+    }
+
+
+def _marker_tcp_cad_check(pivot_report: dict[str, Any], bundle_entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Where the pivot landed against the bundle's expected pivot points.
+
+    A rig's bundle carries the points a new pivot has to land on: a CAD point, or the
+    socket centre an earlier pivot measured. The distance is the error of the whole
+    chain -- print, paste, extrinsics, detection -- in one number.
+    """
+    fit = pivot_report.get("fit") if isinstance(pivot_report, dict) else None
+    p_fit = fit.get("p_cube_mm") if isinstance(fit, dict) else None
+    expected = bundle_entry.get("expected_pivot_points_mm") if isinstance(bundle_entry, dict) else None
+    if not isinstance(p_fit, list) or len(p_fit) != 3 or not isinstance(expected, dict):
+        return None
+    rows = []
+    for name, point in expected.items():
+        if isinstance(point, list) and len(point) == 3:
+            delta = [float(p_fit[i]) - float(point[i]) for i in range(3)]
+            rows.append({
+                "name": str(name),
+                "expectedMm": [float(v) for v in point],
+                "deltaMm": delta,
+                "distanceMm": math.sqrt(sum(d * d for d in delta)),
+            })
+    if not rows:
+        return None
+    return {
+        "pivotFitMm": [float(v) for v in p_fit],
+        "points": rows,
+        "nearest": min(rows, key=lambda row: row["distanceMm"]),
+    }
 
 
 def _marker_tcp_layout_command(
@@ -7065,6 +7214,7 @@ def _marker_tcp_record_sample(
                 return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
             if state.recording.state in {"idle", "error"}:
                 return {"ok": False, "error": "相机还没连接。请先到「采集」页 Connect，再回来采 marker→TCP 样本。"}
+            sample_id = f"sample_{len(session.samples) + 1:03d}"
             if _state_is_gmsl2(state):
                 # Why this episode exists, in its own meta.json. On disk a pivot
                 # sample is nine videos like any other, and the tracker-mount
@@ -7074,6 +7224,7 @@ def _marker_tcp_record_sample(
                     capture_intent={
                         "purpose": "calibration_marker_tcp",
                         "session_id": session.sessionName,
+                        "sample_id": sample_id,
                         "box_id": box_id_norm,
                         "condition": condition_text,
                         "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
@@ -7083,7 +7234,7 @@ def _marker_tcp_record_sample(
                 _start_episode(state)
             tracker_on = bool(state.recording.laserTracker)
             sample = MarkerTcpSample(
-                id=f"sample_{len(session.samples) + 1:03d}",
+                id=sample_id,
                 side=target_label,
                 condition=condition_text,
                 boxId=box_id_norm,
@@ -7199,6 +7350,7 @@ def _run_marker_tcp_solve(
     box_id: str = "",
     cad_path: str = "",
     socket_beyond_tcp_mm: str = "0",
+    rig: str = "",
     background: bool = True,
 ) -> dict[str, Any]:
     """Validate the request, then run the solve chain off the request thread.
@@ -7220,10 +7372,22 @@ def _run_marker_tcp_solve(
         return {"ok": False, "error": "已有解算在进行中，请等它结束"}
     try:
         box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id)
-        cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        rig_name = str(rig or DEFAULT_TRACKING_TARGET).strip().lower()
+        if rig_name not in MARKER_TCP_RIGS:
+            raise ValueError(f"未知 rig {rig_name!r}；可选 {list(MARKER_TCP_RIGS)}")
+        layout_rig = None if rig_name == DEFAULT_TRACKING_TARGET else _marker_tcp_layout_rig(state, rig_name)
+        if layout_rig is None:
+            cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        else:
+            # A layout rig is not looked up by BOX: it has one entry, in its own bundle.
+            cube_name = layout_rig["cubeName"]
+            existing_entry = layout_rig["bundleEntry"]
+            existing_bundle_path = layout_rig["bundlePath"]
+            target_label = f"{target_label} · {TRACKING_TARGETS[rig_name]['label']}"
         samples = _marker_tcp_saved_samples(session, box_id_norm)
         if not samples:
             return {"ok": False, "error": f"{target_label} 没有 saved 样本，先录制并保存至少 1 段 pivot 数据"}
+        _marker_tcp_correct_episodes(state, session.sessionName, samples)
         try:
             socket_mm = float(str(socket_beyond_tcp_mm or "0").strip())
         except ValueError as exc:
@@ -7261,6 +7425,7 @@ def _run_marker_tcp_solve(
         "rotation": rotation,
         "rotation_source": rotation_source,
         "truth_note": truth_note,
+        "layout_rig": layout_rig,
     }
     if not background:
         return _marker_tcp_solve_worker(state, plan)
@@ -7289,33 +7454,41 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
     rotation = plan["rotation"]
     rotation_source = plan["rotation_source"]
     truth_note = plan["truth_note"]
+    layout_rig = plan.get("layout_rig")
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         solve_dir = Path(session.sessionRoot) / f"solve_{_marker_tcp_slug(box_id_norm)}_{timestamp}"
         solve_dir.mkdir(parents=True, exist_ok=True)
         log_path = solve_dir / "solve.log"
         python_bin = _marker_tcp_python(state)
-        tracking_config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+        tracking_config_path = state.repo_root / (
+            DEFAULT_EE_TRAJECTORY_CONFIG if layout_rig is None else Path(layout_rig["configPath"])
+        )
         subset_root, episode_map = _marker_tcp_subset_dataset(state, solve_dir=solve_dir, samples=samples)
         episodes = [int(entry["subsetEpisodeIndex"]) for entry in episode_map]
         cameras = _marker_tcp_tracking_cameras(state, subset_root, episodes)
 
-        # 1. Resolve the layout. The cube geometry did not change when the rig
-        #    moved, so the corner table comes from the production cube template
-        #    rather than being re-estimated; only its placement can come from CAD.
         layout_path = solve_dir / DEFAULT_MARKER_LAYOUT_NAME
-        _run_marker_tcp_command(
-            state,
-            _marker_tcp_layout_command(
+        if layout_rig is not None:
+            # 1'. A layout rig's corner table is already the production one, cut
+            #     from CAD; copy it so the solve directory names what it solved on.
+            shutil.copy2(layout_rig["layoutPath"], layout_path)
+        else:
+            # 1. Resolve the layout. The cube geometry did not change when the rig
+            #    moved, so the corner table comes from the production cube template
+            #    rather than being re-estimated; only its placement can come from CAD.
+            _run_marker_tcp_command(
                 state,
-                python_bin=python_bin,
-                cube_name=cube_name,
-                out_path=layout_path,
-                cad_path=truth_path if _cad_declares_rig_placement(truth_path, cube_name) else None,
-            ),
-            label=f"解算 {target_label}: resolve marker layout",
-            log_path=log_path,
-        )
+                _marker_tcp_layout_command(
+                    state,
+                    python_bin=python_bin,
+                    cube_name=cube_name,
+                    out_path=layout_path,
+                    cad_path=truth_path if _cad_declares_rig_placement(truth_path, cube_name) else None,
+                ),
+                label=f"解算 {target_label}: resolve marker layout",
+                log_path=log_path,
+            )
         if not layout_path.is_file():
             raise FileNotFoundError(f"resolved marker layout was not written: {layout_path}")
         rotation, rig_frame_composed = _compose_rig_rotation(rotation, layout_path)
@@ -7341,7 +7514,7 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
                 "--cameras",
                 *cameras,
                 "--dictionary",
-                _marker_tcp_aruco_dictionary(state),
+                _marker_tcp_aruco_dictionary(state) if layout_rig is None else layout_rig["dictionary"],
                 "--out",
                 str(detections_path),
             ],
@@ -7416,6 +7589,10 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         if not bundle_path.is_file():
             raise FileNotFoundError(f"marker→TCP bundle was not written: {bundle_path}")
         pivot_report = json.loads(pivot_report_path.read_text(encoding="utf-8")) if pivot_report_path.is_file() else {}
+        cad_check = (
+            None if layout_rig is None
+            else _marker_tcp_cad_check(pivot_report, layout_rig["bundleEntry"])
+        )
         summary_path = solve_dir / "solve_summary.json"
         solve_summary = {
             "schema": "marker_tcp_gui_solve/v1",
@@ -7443,6 +7620,8 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
             "primaryFit": pivot_report.get("primary_fit", ""),
             "pivotP95Mm": (pivot_report.get("fit") or {}).get("residual_mm", {}).get("p95") if isinstance(pivot_report, dict) else None,
             "logPath": str(log_path),
+            "rig": DEFAULT_TRACKING_TARGET if layout_rig is None else layout_rig["rig"],
+            "cadCheck": cad_check,
         }
         _write_marker_tcp_json(summary_path, solve_summary)
 
@@ -7456,9 +7635,14 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         session.stage = "capture"
         p95 = solve_summary.get("pivotP95Mm")
         warning = "；注意 socket 在 episode 间移动" if solve_summary["socketMovedBetweenEpisodes"] else ""
+        cad_text = ""
+        if cad_check and cad_check.get("nearest"):
+            nearest = cad_check["nearest"]
+            cad_text = f"，pivot 点离 {nearest['name']} {nearest['distanceMm']:.2f} mm"
         session.message = (
             f"marker→TCP 解算完成：{target_label} -> {bundle_path}"
             + (f"，pivot p95={float(p95):.2f} mm" if isinstance(p95, (int, float)) else "")
+            + cad_text
             + warning
         )
         state.log("info", f"Marker→TCP solve written: {bundle_path}")
@@ -8220,6 +8404,7 @@ def _run_marker_tcp_tracker_check(
         if mount_fit is not None and not mount_fit.is_file():
             raise FileNotFoundError(f"lever-arm JSON 不存在: {mount_fit}")
         samples = [s for s in _marker_tcp_saved_samples(session, box_id_norm) if s.condition == condition]
+        _marker_tcp_correct_episodes(state, session.sessionName, samples)
         if not samples:
             raise ValueError(f"{target_label} · {condition} 没有 saved 样本")
         mount_id = _marker_tcp_slug(f"{box_id_norm}_{condition}")
@@ -12250,18 +12435,50 @@ def _tracking_calibration_stamp(state: GatewayState, config_path: Path) -> dict[
     return out
 
 
+def _other_tracking_targets(dataset_root: Path, config_path: Path) -> dict[str, Any] | None:
+    """What the tracker would refuse over: other targets' trajectories in the sidecar this run writes.
+
+    Same rule as the tracker (metrology.sidecar_targets), asked before launching so the GUI
+    can ask the operator instead of showing a failed job a few seconds later.
+    """
+    cfg = _load_yaml_mapping(config_path)
+    tracker = cfg.get("cube_tracker") if isinstance(cfg.get("cube_tracker"), dict) else {}
+    cubes = tracker.get("cubes")
+    if not isinstance(cubes, list):
+        return None  # single-target naming carries no target name to compare
+    run_targets = [str(cube.get("name")) for cube in cubes if isinstance(cube, dict) and cube.get("name")]
+    save_cfg = cfg.get("save_to_dataset") if isinstance(cfg.get("save_to_dataset"), dict) else {}
+    sidecar_dir = dataset_root / str(save_cfg.get("sidecar_dir") or f"derived/{DEFAULT_TRAJ_SIDECAR_NAME}")
+    if str(_METROLOGY_ROOT) not in sys.path:
+        sys.path.insert(0, str(_METROLOGY_ROOT))
+    from metrology import sidecar_targets
+
+    others = sidecar_targets.other_targets(sidecar_dir, run_targets)
+    if not others:
+        return None
+    return {
+        "message": sidecar_targets.refusal_message(sidecar_dir, others, run_targets),
+        "sidecarDir": str(sidecar_dir),
+        "runTargets": sorted(run_targets),
+        "otherTargets": {name: len(files) for name, files in sorted(others.items())},
+        "supersededDir": str(sidecar_dir / sidecar_targets.SUPERSEDED_DIRNAME),
+    }
+
+
 def _ee_trajectory_command(
     state: GatewayState,
     dataset_root: Path,
     *,
     marker_to_tcp_calibration_path: Path | None = None,
     tracking_target: str = DEFAULT_TRACKING_TARGET,
+    supersede_other_targets: bool = False,
 ) -> list[str]:
     runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
     if marker_to_tcp_calibration_path is not None and tracking_target != DEFAULT_TRACKING_TARGET:
         raise ValueError(
-            "marker-to-TCP override is cube-only; Hybrid Carrier V1 uses its versioned CAD socket bundle"
+            "marker-to-TCP override is cube-only; Hybrid Carrier V1 and the gripper rig use the "
+            "versioned bundle their tracking config names"
         )
     config_path = state.repo_root / Path(target_spec["config"])
     if not runner_path.is_file():
@@ -12272,7 +12489,7 @@ def _ee_trajectory_command(
         config_path = _write_ee_trajectory_override_config(
             state, dataset_root, marker_to_tcp_calibration_path, base_config_path=config_path
         )
-    return [
+    command = [
         "bash",
         str(runner_path),
         "--dataset-root",
@@ -12282,6 +12499,9 @@ def _ee_trajectory_command(
         "--tracking-target",
         tracking_target,
     ]
+    if supersede_other_targets:
+        command.append("--supersede-other-targets")
+    return command
 
 
 def _update_traj_gen_meta(
@@ -12460,6 +12680,7 @@ def _queue_traj_gen(
     marker_to_tcp_calibration_path: Path | None = None,
     tracking_target: str = DEFAULT_TRACKING_TARGET,
     allow_stale_calibration: bool = False,
+    supersede_other_targets: bool = False,
 ) -> None:
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
     # Checked here rather than only in the HTTP handler so that every path into
@@ -12468,6 +12689,10 @@ def _queue_traj_gen(
         gate = _stale_calibration_gate(state)
         if gate:
             raise StaleCalibrationError(gate["message"], gate)
+    if not supersede_other_targets:
+        conflict = _other_tracking_targets(dataset_root, state.repo_root / Path(target_spec["config"]))
+        if conflict:
+            raise OtherTrackingTargetsError(conflict["message"], conflict)
     key = str(dataset_root)
     with state.lock:
         running = state.processing_processes.get(key)
@@ -12488,6 +12713,7 @@ def _queue_traj_gen(
             dataset_root,
             marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
             tracking_target=tracking_target,
+            supersede_other_targets=supersede_other_targets,
         )
         marker_path_text = "" if marker_to_tcp_calibration_path is None else str(marker_to_tcp_calibration_path)
         launched_config_path = Path(command[command.index("--config") + 1])
@@ -13663,6 +13889,56 @@ def _load_hybrid_carrier_overlay_model(
     }
 
 
+def _load_marker_layout_overlay_model(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """Overlay geometry for a plain marker-layout rig, in the carrier overlay's shape.
+
+    The rig is nothing but its corner table, so the model drawn over the video is
+    each layout marker's square projected through the per-camera pose, next to
+    the corners that camera actually detected -- a quarter-turned or misplaced
+    sticker shows up as a square that does not sit on its marker.
+    """
+    tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
+    if str(tracker_summary.get("pose_estimation_mode") or "") != "marker_layout_pnp":
+        return None
+    corner_ba = summary.get("corner_ba") if isinstance(summary.get("corner_ba"), dict) else {}
+    layouts = corner_ba.get("marker_layouts_by_cube") if isinstance(corner_ba.get("marker_layouts_by_cube"), dict) else {}
+    for entry in layouts.values():
+        if not isinstance(entry, dict):
+            continue
+        # `path` is the corner table's file. `source` is only a path for a layout file
+        # without provenance of its own (MarkerLayout.from_json lets the file's `source`
+        # win), so it is the fallback for summaries written before `path` existed.
+        layout = {}
+        for candidate in (entry.get("path"), entry.get("source")):
+            try:
+                found = bool(candidate) and Path(str(candidate)).is_file()
+            except OSError:  # a stringified provenance dict can exceed NAME_MAX/PATH_MAX
+                found = False
+            if found:
+                layout = _load_json_file(Path(str(candidate)))
+                break
+        facets: list[dict[str, Any]] = []
+        anchors: list[dict[str, Any]] = []
+        for marker in layout.get("markers") or []:
+            if not isinstance(marker, dict):
+                continue
+            points = _carrier_points(marker.get("corners_rig"), 1.0)
+            if len(points) != 4:
+                continue
+            ax, ay, az = (points[1][i] - points[0][i] for i in range(3))
+            bx, by, bz = (points[3][i] - points[0][i] for i in range(3))
+            # (BL - TL) x (TR - TL): TL->TR is image-right and TL->BL image-down, so this is
+            # the outward normal the back-face test in the overlay expects.
+            normal = (by * az - bz * ay, bz * ax - bx * az, bx * ay - by * ax)
+            label = f"id {marker.get('id')}"
+            anchors.append({"id": marker.get("id"), "name": label, "points": points})
+            facets.append({"name": label, "colour": "white", "points": points, "normal": normal})
+        if anchors:
+            return {"carrierId": str(layout.get("layout_id") or entry.get("layout_id") or "marker_rig"),
+                    "anchors": anchors, "facets": facets}
+    return None
+
+
 def _hybrid_carrier_overlay_from_row(
     row: dict[str, Any],
     *,
@@ -13795,7 +14071,7 @@ def _read_video_cube_overlays(
     tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
     cube_size_m = float((tracker_summary.get("cube_size_cm") or DEFAULT_CUBE_SIZE_M * 100.0)) / 100.0
     camera_model = str(tracker_summary.get("camera_model") or "rational")
-    carrier_model = _load_hybrid_carrier_overlay_model(state, summary)
+    carrier_model = _load_hybrid_carrier_overlay_model(state, summary) or _load_marker_layout_overlay_model(summary)
     overlays: dict[int, dict[str, list[dict[str, Any]]]] = {}
     active_streams = summary.get("active_streams") if isinstance(summary.get("active_streams"), list) else []
     for stream in active_streams:
@@ -16195,6 +16471,11 @@ def _connect_recorder(
     state.recording.pid = state.process.pid
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
+    # A new recorder counts from zero and only says so after its first save; until then the
+    # last session's count would read as this session's next episode (11-06: a pivot sample
+    # recorded as episode 1 of a dataset whose only episode is 0).
+    state.recording.savedEpisodes = 0
+    state.recording.episodeIndex = 0
     state.recording.message = (
         f"Starting FR3 {state.recording.backend} recorder"
         if is_workstation
@@ -19881,12 +20162,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 allow_stale = (
                     query.get("allow_stale_calibration", query.get("allowStaleCalibration", [""]))[0] or ""
                 ).strip() in {"1", "true", "yes"}
+                supersede = (
+                    query.get("supersede_other_targets", query.get("supersedeOtherTargets", [""]))[0] or ""
+                ).strip() in {"1", "true", "yes"}
                 _queue_traj_gen(
                     state,
                     dataset_root,
                     marker_to_tcp_calibration_path=marker_tcp_path,
                     allow_stale_calibration=allow_stale,
                     tracking_target=tracking_target,
+                    supersede_other_targets=supersede,
                 )
                 with state.lock:
                     response = _snapshot(state)
@@ -19900,6 +20185,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         "error": str(exc),
                         "staleCalibration": exc.detail,
                         "hint": "先在标定中心提升，或带 allow_stale_calibration=1 明确用旧标定生成。",
+                    },
+                )
+            except OtherTrackingTargetsError as exc:
+                _json_response(
+                    self,
+                    HTTPStatus.CONFLICT,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "otherTrackingTargets": exc.detail,
+                        "hint": "确认数据集录的是哪种目标；确要换成本目标，带 supersede_other_targets=1，旧轨迹会挪到 _superseded/ 下，不删除。",
                     },
                 )
             except NotImplementedError as exc:
@@ -20165,6 +20461,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             query.get("socket_beyond_tcp_mm", query.get("socketBeyondTcpMm", ["0"]))[0]
                             or "0"
                         ).strip(),
+                        rig=(query.get("rig", [""])[0] or "").strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)

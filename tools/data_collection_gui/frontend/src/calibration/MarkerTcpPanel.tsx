@@ -283,6 +283,7 @@ export function MarkerTcpPanel({
   const [staticPath, setStaticPath] = useState("");
   const [cadPath, setCadPath] = useState("");
   const [socketBeyondTcpMm, setSocketBeyondTcpMm] = useState("0");
+  const [rig, setRig] = useState("april_cube");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [formatHelp, setFormatHelp] = useState<FormatHelp | null>(null);
@@ -457,6 +458,13 @@ export function MarkerTcpPanel({
               />
             </label>
             <label>
+              Marker rig
+              <select value={rig} disabled={disabled} onChange={(event) => setRig(event.target.value)}>
+                <option value="april_cube">AprilTag cube（BOX 生产 bundle）</option>
+                <option value="gripper_rig_v9b">Gripper Rig v9b（ArUco 106–109）</option>
+              </select>
+            </label>
+            <label>
               球心→TCP 偏置 mm
               <input
                 value={socketBeyondTcpMm}
@@ -477,13 +485,19 @@ export function MarkerTcpPanel({
               单点 pivot 只能观测 TCP 原点，观测不到旋转。留空 CAD/真值 JSON 时旋转从现有 production bundle
               继承，并写进 bundle 的 <code>rotation_source</code>；本次解算只更新 translation。
             </p>
+            {rig === "gripper_rig_v9b" ? (
+              <p className="panel-note">
+                Gripper Rig v9b：角点表、字典（DICT_6X6_250）和旋转都取自 rig 自己的 bundle；TCP 是 11-06 实测的
+                插件球窝中心，新的 pivot 结果是<b>核对</b>——完成后会报告拟合点离这个球窝中心多少 mm。
+              </p>
+            ) : null}
           </div>
 
           <div className="control-row">
             <button
               className="cali-btn-primary"
               disabled={disabled || !canSolve}
-              onClick={() => call(() => api.solveMarkerTcpTransform(selectedBoxId, cadPath, socketBeyondTcpMm))}
+              onClick={() => call(() => api.solveMarkerTcpTransform(selectedBoxId, cadPath, socketBeyondTcpMm, rig))}
             >
               解算并写生产 bundle
             </button>
