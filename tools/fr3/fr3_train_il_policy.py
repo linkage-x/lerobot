@@ -2401,6 +2401,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "shadows and re-lights with moved lamps, plus brightness/contrast/colour jitter on both cameras."
         ),
     )
+    parser.add_argument(
+        "--relight-aug-dd",
+        action="store_true",
+        help=(
+            "Lighting augmentation of the ee camera without sim maps (tools/fr3/shadow_dd.py): the cast shadows "
+            "are read off each frame, removed and re-applied at another strength or shifted; same colour jitter."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
 
@@ -2658,6 +2666,10 @@ def main() -> None:
         os.environ["RELIGHT_AUG_MAPS"] = str(maps)
         cmd[1:3] = [str(Path(__file__).resolve().parent / "relight_train_entry.py")]
         print(f"[train] relight augmentation: {maps}")
+    elif args.relight_aug_dd:
+        os.environ["RELIGHT_AUG_MODE"] = "dd"
+        cmd[1:3] = [str(Path(__file__).resolve().parent / "relight_train_entry.py")]
+        print("[train] relight augmentation: image-read shadows (dd)")
     print("[train] " + " ".join(cmd))
     subprocess.run(cmd, check=True)
 

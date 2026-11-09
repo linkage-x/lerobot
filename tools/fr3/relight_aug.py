@@ -12,6 +12,11 @@ its lit brightness, in lamp 2's shadow k2 = 0.88 x, multiplicative. Augmented fr
     out  = lit * k1n ** occ_key' * k2n ** occ_l2'                      (each lamp: none / fitted / moved j; k random)
 then (all frames, both cameras) brightness / contrast / per-channel gain jitter.
 
+Mode "dd" (env RELIGHT_AUG_MODE=dd, 11-06): no sim maps; the cast shadows are read off each ee frame
+(tools/fr3/shadow_dd.py), removed, and replaced by none / the own shadow at another strength / the own shadow shifted,
+on every ee frame (all phases). Reason: the sim maps miss the sharpest real shadow (peg + finger silhouettes), which
+the 11-06 SET5 probe showed is the close cue (R4 dz<=15 closes 0.98 -> 0.56 with it removed).
+
 Applied by patching LeRobotDataset.__getitem__ (install()): the item's images are relit before the dataset's own
 image_transforms (Resize), using item episode_index / frame_index to find the maps. Env RELIGHT_AUG_MAPS = maps dir.
 """
@@ -35,7 +40,12 @@ CFG = dict(
     k1_new=(0.45, 0.90), k2_new=(0.70, 0.98),
     k1_old_jit=0.06, k2_old_jit=0.04,  # deshadow strength jitter around the fit (so leftovers are not one fixed halo)
     p_photo=0.8, brightness=(0.7, 1.3), contrast=(0.8, 1.2), gain=(0.9, 1.1),
+    # mode "dd": new shadow = none / own ** g / own shifted ** g
+    dd_choice=(0.3, 0.3, 0.4), dd_gamma=(0.3, 1.8), dd_shift_gamma=(0.5, 1.5), dd_shift_px=80.0,
 )
+# env RELIGHT_AUG_CFG = JSON overrides of CFG (11-06: dd variants, e.g. {"dd_choice": [0.5, 0.5, 0.0]} = no shift)
+CFG.update({k: tuple(v) if isinstance(v, list) else v for k, v in json.loads(os.environ.get("RELIGHT_AUG_CFG", "{}")).items()})
+MODE = os.environ.get("RELIGHT_AUG_MODE", "maps")
 K1_FIT, K2_FIT = 0.69, 0.88
 # Systematic sim->real misregistration of the shadow maps, full-res crop px (u right, v down): the 11-05 shift check
 # (outputs/real2sim_20261104/tools/shadow_shift_check.py) found the best shift ~(+14, +9) px with IQR 13-20 px in
@@ -44,7 +54,11 @@ MAP_SHIFT_UV = (14.0, 9.0)
 
 
 class RelightAug:
-    def __init__(self, maps_dir: str | Path):
+    def __init__(self, maps_dir: str | Path | None):
+        self.mode = MODE
+        if self.mode == "dd":
+            self.J = 0
+            return
         self.dir = Path(maps_dir)
         self.meta = json.loads((self.dir / "meta.json").read_text())
         self.J = int(self.meta["J"])
@@ -88,6 +102,23 @@ class RelightAug:
         return (img / div[None]).clamp(0, 1)
 
     @staticmethod
+    def relight_dd(img: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+        """img (3, H, W) float in [0, 1] -> own cast shadows removed and re-applied differently."""
+        import shadow_dd as SD
+
+        x = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.float32)
+        r = SD.shadow_ratio(x)
+        out = x / r
+        c = rng.choice(3, p=CFG["dd_choice"])
+        if c == 1:
+            out = out * r ** rng.uniform(*CFG["dd_gamma"])
+        elif c == 2:
+            a = rng.uniform(0, 2 * np.pi); d = CFG["dd_shift_px"] * np.sqrt(rng.uniform())
+            rf = SD.shadow_ratio(x, fill=True)   # no object holes in the moved shadow
+            out = out * SD.shift(rf, d * np.cos(a), d * np.sin(a)) ** rng.uniform(*CFG["dd_shift_gamma"])
+        return torch.from_numpy(np.clip(out / 255.0, 0, 1).astype(np.float32)).permute(2, 0, 1).to(img.dtype)
+
+    @staticmethod
     def photometric(img: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
         b = rng.uniform(*CFG["brightness"]); c = rng.uniform(*CFG["contrast"])
         g = torch.tensor(rng.uniform(*CFG["gain"], size=3), dtype=img.dtype)[:, None, None]
@@ -98,7 +129,11 @@ class RelightAug:
     def __call__(self, item: dict, cams: list[str]) -> dict:
         rng = np.random.default_rng(int(torch.randint(0, 2**62, (1,)).item()))   # torch is reseeded per worker
         ep = int(item["episode_index"]); fi = int(item["frame_index"])
-        if EE_KEY in item and rng.uniform() < CFG["p_relight"]:
+        if EE_KEY in item and self.mode == "dd":
+            if rng.uniform() < CFG["p_relight"]:
+                x = item[EE_KEY]
+                item[EE_KEY] = self.relight_dd(x, rng) if x.ndim == 3 else torch.stack([self.relight_dd(t, rng) for t in x])
+        elif EE_KEY in item and rng.uniform() < CFG["p_relight"]:
             m = self.maps(ep, fi)
             if m is not None:
                 x = item[EE_KEY]
@@ -114,7 +149,7 @@ class RelightAug:
 def install(maps_dir: str | Path | None = None) -> RelightAug | None:
     """Patch LeRobotDataset.__getitem__ so every item is relit before its image_transforms."""
     maps_dir = maps_dir or os.environ.get("RELIGHT_AUG_MAPS")
-    if not maps_dir:
+    if not maps_dir and MODE != "dd":
         return None
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -139,5 +174,5 @@ def install(maps_dir: str | Path | None = None) -> RelightAug | None:
 
     __getitem__._relight = True
     LeRobotDataset.__getitem__ = __getitem__
-    print(f"[relight_aug] installed: maps {maps_dir} J={aug.J} cfg={json.dumps(CFG)}", flush=True)
+    print(f"[relight_aug] installed: mode {MODE} maps {maps_dir} J={aug.J} cfg={json.dumps(CFG)}", flush=True)
     return aug

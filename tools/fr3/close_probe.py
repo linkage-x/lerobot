@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -150,6 +151,19 @@ def main() -> None:
                           args.lift_steps)  # fmt: skip
     print(f"frames {len(frames)} episodes {frames.vep.nunique()} {frames.cls.value_counts().to_dict()}", flush=True)
     obs = observations(frames, view_root)
+    # env PROBE_EE_DD (11-07): re-light the ee image with the image-read shadow (tools/fr3/shadow_dd.py) before the
+    # policy sees it: "deshadow" removes the cast shadows, "half" halves them (r ** 0.5). Tests whether a model's low
+    # x correction reads the shadow.
+    dd = os.environ.get("PROBE_EE_DD")
+    if dd:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import shadow_dd as SD
+
+        for o in obs:
+            img = o["observation.images.ee"]; r = SD.shadow_ratio(img)
+            o["observation.images.ee"] = SD.relight(img, r, r if dd == "half" else None, 0.5)
+        print(f"ee images re-lit: {dd}", flush=True)
     dev = torch.device("cuda")
     draws = []
     for name, ckpt in ckpts.items():
