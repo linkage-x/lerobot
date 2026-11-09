@@ -32,6 +32,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 log_path="run/logs/policy_server.log"
+# Written when the GPU services panel (tools/fr3/gpu_services_agent.py) stops the server to give
+# the card to another service. `ensure` (what a deploy runs) leaves a parked server stopped; an
+# explicit start, from the panel or here, un-parks it.
+parked_path="run/logs/policy_server_parked"
 # Written by the server: every repo .py file it has imported, hashed when first seen.
 code_manifest="run/logs/policy_server_code.json"
 
@@ -126,6 +130,7 @@ start_server() {
     exit 1
   fi
   mkdir -p run/logs
+  rm -f "$parked_path"
   echo "==== $(date -Iseconds) start ${server_args[*]:-}" >>"$log_path"
   # Offline hub: pi05's preprocessor builds the paligemma tokenizer, and without HF_HUB_OFFLINE the
   # hub tries huggingface.co before the local cache -- from here that connect hangs, inside the
@@ -156,6 +161,10 @@ case "$action" in
   ensure)
     pids="$(server_pids || true)"
     pid="$(echo "$pids" | head -1)"
+    if [[ -z "$pid" && -f "$parked_path" ]]; then
+      echo "policy server parked ($(cat "$parked_path")); not started -- start it from the Rollout page's GPU panel, or: bash run/policy_server.sh start"
+      exit 0
+    fi
     if [[ -n "$pid" ]] && listening && why="$(code_current "$pid")"; then
       echo "policy server (pid ${pid}) already runs this code; kept, with whatever policy it holds"
     else
@@ -171,6 +180,7 @@ case "$action" in
       tail -3 "$log_path" 2>/dev/null || true
     else
       echo "policy server not running"
+      [[ -f "$parked_path" ]] && echo "parked: $(cat "$parked_path")"
     fi
     ;;
   *)

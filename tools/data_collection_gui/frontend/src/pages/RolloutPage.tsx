@@ -7,6 +7,7 @@ import { blockersToSend, mismatchCount, reasonSlots, slotLabel } from "./takeove
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
 import { carriedOverNotice } from "./rolloutCarryover";
 import { remoteRuntimeOptions } from "./remoteRuntime";
+import { GpuHostPanel } from "./GpuHostPanel";
 import { LIVE_STATES, sessionAvailability, sessionNote } from "./rolloutSessionControls";
 import { LOCAL_POLICY, defaultPolicyChoice, describeServer, startNote } from "./policyServers";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
@@ -2241,6 +2242,7 @@ export function RolloutPage() {
               )}
             </>
           )}
+          <GpuHostPanel rolloutLive={isLive} />
         </div>
 
         <button type="button" onClick={() => void onStart()} disabled={startDisabled}>

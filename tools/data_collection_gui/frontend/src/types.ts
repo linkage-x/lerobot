@@ -1774,6 +1774,49 @@ export type PolicyServerEntry = {
   status?: PolicyServerStatus;
 };
 
+/** One service on a GPU host, as tools/fr3/gpu_services_agent.py reports it. */
+export type GpuService = {
+  id: string;
+  label: string;
+  port: number | null;
+  gpuGb: number;
+  state: "stopped" | "starting" | "running" | "stopping";
+  pids: number[];
+  upS: number | null;
+  gpuMb: number;
+  units?: string[];
+  /** policy_server only: `<job>/<step>` it holds, a load in progress, the rollout holding it. */
+  loaded?: string | null;
+  loading?: boolean;
+  holder?: string | null;
+};
+
+export type GpuServiceOp = {
+  action: "start" | "stop" | "switch";
+  service: string;
+  state: "running" | "done" | "failed";
+  message: string;
+  startedAt: number;
+  finishedAt: number | null;
+};
+
+export type GpuHostStatus = {
+  host: string;
+  gpu: { name: string; total_mb: number; used_mb: number };
+  services: GpuService[];
+  /** GPU processes no configured service accounts for. */
+  others: { pid: number; mb: number; what: string; unit: string }[];
+  training: string[];
+  op: GpuServiceOp | null;
+};
+
+export type GpuHostEntry = {
+  address: string;
+  reachable: boolean;
+  error?: string;
+  status?: GpuHostStatus;
+};
+
 /** /api/policy-servers: where a rollout's forward pass can run. */
 export type PolicyServerListing = {
   local: { available: boolean; detail: string };

@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend
+from tools.data_collection_gui import gpu_hosts
 from tools.data_collection_gui import policy_servers
 from tools.data_collection_gui import remote_deployments
 from tools.data_collection_gui import rollout as rollout_backend
@@ -14236,6 +14237,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with state.lock:
                 _json_response(self, HTTPStatus.OK, _table_alignment_snapshot(state, camera_key))
             return
+        if path == "/api/gpu-hosts":
+            state = self.server.state
+            # Outside the lock, like the policy server probe: one HTTP round trip per host.
+            _json_response(self, HTTPStatus.OK, gpu_hosts.listing(list(state.policy_servers)))
+            return
         if path == "/api/policy-servers":
             state = self.server.state
             # Outside the lock: each probe is a network round trip, up to a timeout per dead host.
@@ -14807,6 +14813,26 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                 return
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
+            return
+        if path == "/api/gpu-hosts/action":
+            state = self.server.state
+            body = _read_json_body(self)
+            with state.lock:
+                running = _rollout_is_running(state)
+            try:
+                result = gpu_hosts.act(
+                    str(body.get("address") or ""),
+                    list(state.policy_servers),
+                    str(body.get("action") or ""),
+                    str(body.get("service") or ""),
+                    rollout_running=running,
+                )
+            except gpu_hosts.GpuHostError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            with state.lock:
+                state.log("info", f"GPU host {result['address']}: {body.get('action')} {body.get('service')}")
+            _json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/policy-servers/unload":
             state = self.server.state

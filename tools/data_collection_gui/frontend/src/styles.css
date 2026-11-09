@@ -5253,3 +5253,34 @@ button.danger {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+.gpu-hosts {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.gpu-host {
+  border-top: 1px solid rgba(96, 112, 124, 0.25);
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+}
+
+.gpu-host-bar {
+  background: rgba(96, 112, 124, 0.2);
+  border-radius: 3px;
+  height: 6px;
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.gpu-host-bar span {
+  background: #0f766e;
+  display: block;
+  height: 100%;
+}
+
+.gpu-host-failed {
+  color: #b42318;
+}

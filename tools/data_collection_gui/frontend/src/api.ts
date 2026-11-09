@@ -49,6 +49,8 @@ import type {
   RolloutLastParams,
   GraspLoopResumeParams,
   PolicyServerListing,
+  GpuHostEntry,
+  GpuServiceOp,
   RolloutLandmarks,
   TableAlignment,
   TableWindow,
@@ -1071,6 +1073,16 @@ export class DataCollectionGuiApi {
   /** This machine and each policy server the gateway was deployed with, probed live. */
   async fetchPolicyServers(): Promise<PolicyServerListing | null> {
     return this.trainingGet<PolicyServerListing>("/api/policy-servers");
+  }
+
+  /** What holds each policy host's GPU, from the agent on that host (tools/fr3/gpu_services_agent.py). */
+  async fetchGpuHosts(): Promise<{ hosts: GpuHostEntry[] } | null> {
+    return this.trainingGet<{ hosts: GpuHostEntry[] }>("/api/gpu-hosts");
+  }
+
+  /** Start, stop or switch to one of a GPU host's configured services; it runs on, the status follows it. */
+  async gpuHostAction(address: string, action: "start" | "stop" | "switch", service: string) {
+    return this.trainingPost<{ op?: GpuServiceOp }>("/api/gpu-hosts/action", { address, action, service });
   }
 
   /** Free a policy server's GPU memory now instead of waiting for its idle timeout. */

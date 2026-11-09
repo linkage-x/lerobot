@@ -156,10 +156,13 @@ if [[ -n "$policy_address" ]]; then
       echo "WARN: deploying from ${repo_root}, but the policy server runs ${policy_dir}" >&2
     fi
     bash "${policy_dir}/run/policy_server.sh" ensure --port "$policy_port" --warm-last
+    # The Rollout page's GPU panel talks to this agent; restarted for its new code, never taking
+    # a service down (each runs in a unit of its own). A parked policy server stays parked above.
+    bash "${policy_dir}/run/gpu_services_agent.sh" restart || echo "WARN: gpu services agent did not start" >&2
   else
     echo "WARN: this is not the policy host; the server there keeps its own checkout of ${policy_dir}" >&2
     ssh -o ConnectTimeout=5 -o BatchMode=yes "$policy_remote" \
-      "bash '${policy_dir}/run/policy_server.sh' ensure --port '${policy_port}' --warm-last"
+      "bash '${policy_dir}/run/policy_server.sh' ensure --port '${policy_port}' --warm-last; bash '${policy_dir}/run/gpu_services_agent.sh' restart || echo 'WARN: gpu services agent did not start' >&2"
   fi
 fi
 
