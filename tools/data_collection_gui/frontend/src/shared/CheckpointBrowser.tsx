@@ -95,6 +95,24 @@ export function needsFetch(checkpoint: Checkpoint): boolean {
   return checkpoint.issues.some((issue) => issue.level === "block" && issue.field === "location");
 }
 
+/** The rows the picker shows before "Show all": the newest `PICKER_VISIBLE`, plus the rows that
+ * must never sit past the cut.
+ *
+ *   - A checkpoint picked before the list was filtered or refreshed: dropping its row would leave
+ *     the rollout controls below naming a checkpoint that is nowhere on screen, with the radio
+ *     for it unreachable.
+ *   - A remote deployment: it has no weights here and so no age (`modifiedAt` 0), and the gateway
+ *     lists it after this machine's checkpoints, so "newest first" would always hide it.
+ */
+export function pickerRows(checkpoints: Checkpoint[], selectedId: string): Checkpoint[] {
+  if (checkpoints.length <= PICKER_VISIBLE) return checkpoints;
+  const head = checkpoints.slice(0, PICKER_VISIBLE);
+  const kept = checkpoints
+    .slice(PICKER_VISIBLE)
+    .filter((item) => item.remote || (selectedId && item.id === selectedId));
+  return [...head, ...kept];
+}
+
 type Props = {
   /** "picker" hides the destructive actions and reports the selection upward. */
   mode: "manage" | "picker";
@@ -159,18 +177,10 @@ export function CheckpointBrowser({
 
   // The manage view is a disk-reclamation tool: it has to show everything it offers to delete,
   // so the cap is the picker's alone.
-  const visibleCheckpoints = useMemo(() => {
-    if (mode !== "picker" || showAll || checkpoints.length <= PICKER_VISIBLE) return checkpoints;
-    const head = checkpoints.slice(0, PICKER_VISIBLE);
-    // A checkpoint picked before the list was filtered or refreshed can sit past the cut.
-    // Dropping its row would leave the rollout controls below naming a checkpoint that is
-    // nowhere on screen, with the radio for it unreachable.
-    if (selectedId && !head.some((item) => item.id === selectedId)) {
-      const picked = checkpoints.find((item) => item.id === selectedId);
-      if (picked) head.push(picked);
-    }
-    return head;
-  }, [checkpoints, mode, selectedId, showAll]);
+  const visibleCheckpoints = useMemo(
+    () => (mode !== "picker" || showAll ? checkpoints : pickerRows(checkpoints, selectedId ?? "")),
+    [checkpoints, mode, selectedId, showAll]
+  );
 
   const totalBytes = useMemo(
     // `last` is a symlink onto a numbered step, so counting it would double the newest
@@ -483,14 +493,26 @@ export function CheckpointBrowser({
                       </td>
                     )}
                     <td>
-                      <strong>{checkpoint.jobName}</strong>
-                      <div className="cell-sub">
-                        step {checkpoint.step.toLocaleString()}
-                        {checkpoint.aliasOf ? ` · last → ${checkpoint.aliasOf}` : ""}
-                        {checkpoint.totalSteps
-                          ? ` of ${checkpoint.totalSteps.toLocaleString()}`
-                          : ""}
-                      </div>
+                      {checkpoint.remote ? (
+                        // Served from another machine: its id names it, and it has no step here.
+                        <>
+                          <strong>{checkpoint.id}</strong>
+                          <div className="cell-sub">
+                            {checkpoint.remote.label} · {checkpoint.remote.endpoint}
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <strong>{checkpoint.jobName}</strong>
+                          <div className="cell-sub">
+                            step {checkpoint.step.toLocaleString()}
+                            {checkpoint.aliasOf ? ` · last → ${checkpoint.aliasOf}` : ""}
+                            {checkpoint.totalSteps
+                              ? ` of ${checkpoint.totalSteps.toLocaleString()}`
+                              : ""}
+                          </div>
+                        </>
+                      )}
                     </td>
                     <td>{checkpoint.policyType || "—"}</td>
                     <td>

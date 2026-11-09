@@ -5,6 +5,7 @@ import {
   checkpointToRestore,
   formatBytes,
   needsFetch,
+  pickerRows,
   successRate,
   verdictClass
 } from "./CheckpointBrowser";
@@ -229,9 +230,7 @@ describe("rollout page safety gating", () => {
   it("replaces the pi0.5 defaults with the task prompt alone for a remote deployment", () => {
     expect(rolloutPageSource).toContain("{selected?.remote ? (");
     expect(rolloutPageSource).toContain("<h4>Remote deployment runtime</h4>");
-    expect(rolloutPageSource).toContain(
-      '? { taskPrompt: rolloutRuntimeOptions.taskPrompt, rtcMode: "disabled" }'
-    );
+    expect(rolloutPageSource).toContain("? remoteRuntimeOptions(rolloutRuntimeOptions)");
   });
 
   it("offers a fetch, not the override, for a checkpoint that is not on this machine", () => {
@@ -241,5 +240,38 @@ describe("rollout page safety gating", () => {
     expect(rolloutPageSource).toContain("api.fetchCheckpointToLocal(source.hostId, source.id)");
     expect(rolloutPageSource).toContain("    needsLocalCopy ||\n");
     expect(rolloutPageSource).toContain("focusHost={checkpointFocus}");
+  });
+});
+
+describe("picker rows", () => {
+  const local = Array.from({ length: 12 }, (_, index) =>
+    makeCheckpoint({ id: `job/${String(index).padStart(6, "0")}` })
+  );
+  const remote = makeCheckpoint({
+    id: "remote/fr3-jepa-j1-s0",
+    modifiedAt: 0,
+    remote: {
+      label: "VLA-JEPA",
+      endpoint: "tcp/10.77.0.64:8791",
+      deployment: "fr3-jepa-j1-s0",
+      bridgeRepo: "/bridge",
+      bridgeReady: true,
+      reachable: true,
+      detail: "listening"
+    }
+  });
+
+  it("keeps a remote deployment the gateway lists after the cut", () => {
+    const rows = pickerRows([...local, remote], "");
+    expect(rows.map((item) => item.id)).toEqual([...local.slice(0, 10).map((item) => item.id), remote.id]);
+  });
+
+  it("keeps the picked checkpoint and drops the other old ones", () => {
+    const rows = pickerRows(local, "job/000011");
+    expect(rows.map((item) => item.id)).toEqual([...local.slice(0, 10).map((item) => item.id), "job/000011"]);
+  });
+
+  it("shows a short list whole", () => {
+    expect(pickerRows([local[0], remote], "")).toHaveLength(2);
   });
 });

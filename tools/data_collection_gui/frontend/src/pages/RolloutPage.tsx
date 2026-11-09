@@ -6,6 +6,7 @@ import { describeArm, verdictAgreement } from "./rolloutArms";
 import { blockersToSend, mismatchCount, reasonSlots, slotLabel } from "./takeoverReasons";
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
 import { carriedOverNotice } from "./rolloutCarryover";
+import { remoteRuntimeOptions } from "./remoteRuntime";
 import { LIVE_STATES, sessionAvailability, sessionNote } from "./rolloutSessionControls";
 import { LOCAL_POLICY, defaultPolicyChoice, describeServer, startNote } from "./policyServers";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
@@ -767,10 +768,10 @@ export function RolloutPage() {
         overrideContract,
         moveToStart,
         maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0,
-        // A remote deployment shows only the task prompt, so nothing hidden on this page (EMA,
-        // alignment, servo pose left from a pi0.5 run) is sent with it.
+        // A remote deployment shows only the task prompt (and the grasp loop's own panel), so
+        // nothing hidden on this page (EMA, alignment, servo pose left from a pi0.5 run) is sent.
         runtimeOptions: selected.remote
-          ? { taskPrompt: rolloutRuntimeOptions.taskPrompt, rtcMode: "disabled" }
+          ? remoteRuntimeOptions(rolloutRuntimeOptions)
           : rolloutRuntimeOptions,
         policyServer: policyChoice ?? LOCAL_POLICY
       })
@@ -1761,7 +1762,8 @@ export function RolloutPage() {
             <p className="hint">
               The policy runs on the GPU host; the bridge runs R4 with RTC off and one action per
               step, so the pi0.5 RTC, draw and alignment knobs do not apply. The task prompt
-              below is still passed to the deployment.
+              below is still passed to the deployment, and the grasp loop's settings apply as for
+              any checkpoint.
             </p>
             <label className="field">
               <span>Task prompt override</span>

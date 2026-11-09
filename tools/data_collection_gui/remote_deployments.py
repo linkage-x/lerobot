@@ -40,9 +40,11 @@ from . import checkpoints as checkpoint_backend
 REGISTRY = Path("outputs/remote_deployments.json")
 BRIDGE_LAUNCHER = Path("tools/fr3_wam/run_r4_jepa.sh")
 JOB = "remote"
-# Launcher modes the bridge supports. The grasp loop and the DAgger rehearsal drive the runtime
-# in ways the bridge refuses (takeover, scripted segments) or does not need a policy at all.
-MODES = ("env", "smoke", "preview", "real_once", "real", "real_debug")
+# Launcher modes the bridge supports. The grasp loop runs: the policy is reset (a new server
+# session) at every trial start and stepped until the handover, and the scripted lift, insertion
+# and restaging between trials only leave the session idle until the next reset. The DAgger
+# rehearsal drives the runtime in a way the bridge refuses (takeover).
+MODES = ("env", "smoke", "preview", "real_once", "real", "real_debug", "grasp_loop")
 # Smoke runs one step on the in-process path. Over the bridge the first chunk needs ~3 ticks to
 # arrive and those ticks hold, so one step would only ever show a hold; this many shows the
 # policy's own actions while still sending nothing.

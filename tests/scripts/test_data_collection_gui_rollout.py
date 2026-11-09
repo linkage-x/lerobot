@@ -4958,6 +4958,35 @@ def test_a_remote_smoke_runs_the_bridge_with_its_own_server_and_more_steps(tmp_p
     assert gateway._rollout_last_params(state)["checkpointId"] == REMOTE_ID
 
 
+def test_a_remote_grasp_loop_runs_the_bridge_with_the_loop_settings(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    bridge_repo = _register_remote(state)
+
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "grasp_loop",
+            "checkpointId": REMOTE_ID,
+            "confirmMotion": True,
+            "runtimeOptions": {"graspLoopTrials": 3, "graspLoopSeed": "7", "rtcMode": "disabled"},
+        },
+    )
+    assert _wait_for(lambda: (bridge_repo / "tools/fr3_wam/env.txt").is_file())
+    gateway._stop_rollout(state)
+
+    argv = (bridge_repo / "tools/fr3_wam/argv.txt").read_text().split("\n")
+    env = dict(
+        line.split("=", 1) for line in (bridge_repo / "tools/fr3_wam/env.txt").read_text().splitlines()
+    )
+    assert argv[0] == "grasp_loop"
+    # The step limit is the loop's own, per trial; smoke's override is not appended here.
+    assert "--max-steps" not in argv
+    assert env["FR3_GRASP_LOOP_TRIALS"] == "3"
+    assert env["FR3_GRASP_LOOP_SEED"] == "7"
+    assert env["FR3_WAM_OUT"].startswith(str(tmp_path / "bridge_out" / "r4_grasp_loop_"))
+    assert env["FR3_INFER_CHECKPOINT"] == REMOTE_ID
+
+
 def test_modes_the_bridge_cannot_run_are_refused_before_launch(tmp_path: Path):
     state = _rollout_state(tmp_path)
     _register_remote(state)
