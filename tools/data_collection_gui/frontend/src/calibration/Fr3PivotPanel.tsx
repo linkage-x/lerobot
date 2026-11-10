@@ -5,7 +5,7 @@
 // ordinary recording. The FR3 half settles corenetic_socket_ee on its own; the
 // two together score every edge -- live, single-tag, laser -- at the ball,
 // without the laser or any TCP definition. See fr3Pivot.ts for the wording.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import type { BallCheckReport, Fr3PivotResponse } from "../types";
 import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
@@ -41,6 +41,8 @@ import { Fr3ArmArmEdge } from "./Fr3ArmArmEdge";
 
 const POLL_MS = 1000;
 const LOG_TAIL = 14;
+/** Pivot runs shown before the results table scrolls. */
+const RUNS_VISIBLE = 10;
 
 export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
   const [payload, setPayload] = useState<Fr3PivotResponse | null>(null);
@@ -102,6 +104,29 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const pickedRuns = picked.filter((name) => runs.some((r) => r.name === name));
   const togglePicked = (name: string, on: boolean) =>
     setPicked((names) => (on ? [...names.filter((n) => n !== name), name] : names.filter((n) => n !== name)));
+  // The runs table shows RUNS_VISIBLE rows and scrolls for the rest. Rows differ in height (warnings, notes), so the
+  // limit is the measured bottom of the last visible row, re-measured when the table reflows.
+  const runsScrollRef = useRef<HTMLDivElement>(null);
+  const [runsMaxHeight, setRunsMaxHeight] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const box = runsScrollRef.current;
+    if (!box) return;
+    const measure = () => {
+      const rows = box.querySelectorAll("tbody tr");
+      if (rows.length <= RUNS_VISIBLE) {
+        setRunsMaxHeight(null);
+        return;
+      }
+      const last = rows[RUNS_VISIBLE - 1] as HTMLElement;
+      setRunsMaxHeight(Math.ceil(last.getBoundingClientRect().bottom - box.getBoundingClientRect().top + box.scrollTop) + 1);
+    };
+    measure();
+    const table = box.querySelector("table");
+    if (!table || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(table);
+    return () => observer.disconnect();
+  }, [runs.length]);
   const episodes = payload?.episodes ?? [];
   const ip = arms?.required ? armIp(arms, arm) : robotIp || payload?.robotIp || "";
   const duration = Number(durationS || payload?.defaultDurationS || 45);
@@ -233,6 +258,11 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
           <span className="cali-muted">{payload?.runsRoot ?? "outputs/fr3_tcp_pivot"}</span>
         </div>
         {runs.length ? (
+          <div
+            className="fr3-pivot-runs-scroll"
+            ref={runsScrollRef}
+            style={runsMaxHeight ? { maxHeight: runsMaxHeight } : undefined}
+          >
           <table className="metric-table">
             <thead>
               <tr>
@@ -303,6 +333,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
               })}
             </tbody>
           </table>
+          </div>
         ) : (
           <p className="cali-muted">还没有 FR3 pivot 采集。</p>
         )}

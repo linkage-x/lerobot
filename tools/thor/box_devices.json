@@ -25,10 +25,21 @@
           "fit": {
             "log": "11-03 session scratchpad live_pose.log, 11:50:26-11:51:15, gateway preview at ~10 Hz, held by the body, gripper in free air",
             "n_static": 244,
-            "attitudes": {"x+": 52, "x-": 59, "y+": 33, "y-": 46, "z+": 54},
+            "attitudes": {
+              "x+": 52,
+              "x-": 59,
+              "y+": 33,
+              "y-": 46,
+              "z+": 54
+            },
             "heldout_worst_force_N": 0.256,
             "heldout_worst_moment_Nm": 0.009,
-            "rigid_reading": {"mass_kg": 0.4997, "axis_gain_kg": [0.5406, 0.5217, 0.4369], "com_in_ft_m": [0.0001, 0.0025, 0.0611], "vs_box_sdk_conf": "R_ft_imu 177.5 deg from the conf's (about FT z); conf mass 0.7935 kg, CoM (0, 0.0217, 0.0565)"}
+            "rigid_reading": {
+              "mass_kg": 0.4997,
+              "axis_gain_kg": [0.5406, 0.5217, 0.4369],
+              "com_in_ft_m": [0.0001, 0.0025, 0.0611],
+              "vs_box_sdk_conf": "R_ft_imu 177.5 deg from the conf's (about FT z); conf mass 0.7935 kg, CoM (0, 0.0217, 0.0565)"
+            }
           }
         },
         {
@@ -80,7 +91,42 @@
       "role": "fr3_gripper",
       "ip_seen": "192.168.1.207",
       "identified": "596523097 before the v4.1 firmware; on the right FR3 since 11-02 (fr3_arms.json)",
-      "six_d_payload": []
+      "six_d_payload": [
+        {
+          "valid_from_unix": 1794211020,
+          "valid_from": "2026-11-09 15:57:00 +08:00",
+          "end_effector": "gripper + camera/SMR adaptor, SMR out, on the FR3",
+          "model": "affine_acc/v1",
+          "K": [
+            [0.02362, 7.15942, -0.12396],
+            [-0.02832, -0.14783, -7.15724],
+            [6.94537, -0.00858, -0.03901],
+            [0.18341, 0.00758, 0.3686],
+            [0.00294, 0.37285, -0.00785],
+            [-0.00064, -0.1863, 0.00571]
+          ],
+          "status": "fitted from the calibration page (held by the FR3 (right), six_d poses)",
+          "fit": {
+            "log": "outputs/fr3_payload/20261109_155224_fr3_smr_out.six_d.log (held by the FR3 (right), six_d poses)",
+            "n_static": 10114,
+            "attitudes": {
+              "x+": 1549,
+              "x-": 2325,
+              "y+": 1565,
+              "y-": 1565,
+              "z+": 1556,
+              "z-": 1554
+            },
+            "heldout_worst_force_N": 0.0895,
+            "heldout_worst_moment_Nm": 0.0029,
+            "rigid_reading": {
+              "mass_kg": 0.7228,
+              "axis_gain_kg": [0.7313, 0.7289, 0.7082],
+              "com_in_ft_m": [-0.0003, 0.0261, 0.0519]
+            }
+          }
+        }
+      ]
     }
   }
 }

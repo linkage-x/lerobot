@@ -1,7 +1,11 @@
-// Calibration center (标定中心). Composes the global status bar, readiness
-// checklist, and — grouped per BOX device — the live monitors and the three
-// calibration operation cards (origin + dynamic 6D force, tactile), plus a
-// shared operation log and history list.
+// Calibration center (标定中心). A status bar on top, then one tab per subject
+// (cameras, hand-held end effector, FR3, BOX sensors, laser tracker, log), so
+// the page shows the dozen panels a few at a time instead of one long scroll.
+// The overview tab answers the usual question first -- does anything need
+// redoing? -- and says which tab to go to for what.
+//
+// Panels mount only on their own tab: their polling stops when hidden, and
+// their jobs live on the gateway, so switching tabs loses nothing.
 //
 // Backwards compatible with a single BOX: single-box rigs carry an empty
 // box_id and bare sensor ids, so `boxGroups` yields one group and every
@@ -38,6 +42,10 @@ import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
 import { HandEyePanel } from "./HandEyePanel";
 import { TrackerMountPanel } from "./TrackerMountPanel";
+import { Fr3PayloadPanel } from "./Fr3PayloadPanel";
+import { Fr3SixDZeroPanel } from "./Fr3SixDZeroPanel";
+import { SixDFitPanel } from "./SixDFitPanel";
+import { CALIBRATION_TABS, readStoredTab, storeTab, type CalibrationTabId } from "./calibrationTabs";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -77,9 +85,18 @@ export function CalibrationPage({
   const [forceLog, setForceLog] = useState<BoxCaliLogLine[]>([]);
   const [touchLog, setTouchLog] = useState<BoxCaliLogLine[]>([]);
   const refreshRef = useRef<() => void>(() => {});
+  const [tab, setTabState] = useState<CalibrationTabId>(() => readStoredTab());
+  const setTab = (next: CalibrationTabId) => {
+    setTabState(next);
+    storeTab(next);
+    window.scrollTo({ top: 0 });
+  };
+  // the BOX calibration logs only matter on the tabs that show them
+  const wantsCaliLog = tab === "box" || tab === "log";
 
   // Live calibration log buffers for the unified log panel.
   useEffect(() => {
+    if (!wantsCaliLog) return;
     let cancelled = false;
     const load = async () => {
       const [f, t] = await Promise.all([api.fetchBoxCaliLog(), api.fetchBoxTouchCaliLog()]);
@@ -94,7 +111,7 @@ export function CalibrationPage({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [api]);
+  }, [api, wantsCaliLog]);
 
   const setOperatorPersist = (value: string) => {
     setOperator(value);
@@ -143,6 +160,25 @@ export function CalibrationPage({
 
   const logEntries = useMemo(() => toLogEntries(forceLog, touchLog), [forceLog, touchLog]);
 
+  // BOX tab badge: calibrations past their validity, over every BOX and kind it has
+  const boxOverdue = boxGroups.reduce((n, g) => {
+    const kinds: CalibrationKind[] = [
+      ...(g.force.length ? (["force_origin", "force_dynamic"] as CalibrationKind[]) : []),
+      ...(g.touch.length ? (["touch"] as CalibrationKind[]) : []),
+    ];
+    return (
+      n +
+      kinds.filter((k) => {
+        const st = computeValidity(historyFor(k, g.boxId)[0]?.timestamp ?? null, k).state;
+        return st === "overdue" || st === "unknown";
+      }).length
+    );
+  }, 0);
+  const badges: Partial<Record<CalibrationTabId, { text: string; tone: "error" | "warning" | "running" }>> = {
+    ...(boxOverdue ? { box: { text: String(boxOverdue), tone: "error" as const } } : {}),
+    ...(recording ? { overview: { text: "录制中", tone: "warning" as const } } : {}),
+  };
+
   return (
     <div className="page-stack">
       {/* --- global status bar (spec §1) --- */}
@@ -177,92 +213,156 @@ export function CalibrationPage({
         </div>
       </section>
 
-      {/* Self-check sits above the calibration itself: the usual question is
-          "does anything need redoing?", and the answer is usually no. */}
-      {/* Wrapped: this button hands its click event to whatever it is given, and
-          the solve now takes an options object. */}
-      <RigCheckPanel api={api} busy={busy} onRecalibrate={() => onRunMultiCameraCalibration()} />
+      <nav className="cali-tabs" role="tablist" aria-label="标定分类">
+        {CALIBRATION_TABS.map((t) => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            className={tab === t.id ? "cali-tab active" : "cali-tab"}
+            title={t.hint}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+            {badges[t.id] ? <small className={`nav-badge nav-badge-${badges[t.id]!.tone}`}>{badges[t.id]!.text}</small> : null}
+          </button>
+        ))}
+      </nav>
 
-      {/* The self-check above only sees pose, and says so -- a bump invalidates
-          the extrinsics and leaves the lens alone. This is the other half: the
-          intrinsics do not go stale from bumps, they go stale from having been
-          fitted on a sweep that never reached the frame edge, which no
-          reprojection number on this page can reveal. */}
-      <IntrinsicsCoveragePanel api={api} onRecapture={() => onRunMultiCameraCalibration()} />
-
-      {/* Whether a bump happened is the self-check above; whether the world
-          frame survived it is a different question, and the one that decides
-          if today's absolute poses can be compared with last week's. */}
-      <WorldFramePanel api={api} busy={busy} />
-
-      {/* The one edge that leaves that world for the FR3 base. Every replay and
-          fr3_base export goes through it, so it sits right after the world it
-          starts from. */}
-      <Fr3BaseEdgePanel api={api} busy={busy} />
-
-      {/* A referee for that edge that needs no laser and no TCP definition:
-          the FR3 and the handheld pivot about one ball on the table. */}
-      <Fr3PivotPanel api={api} busy={busy} />
-
-      {/* Both checks above compare with the past, so an extrinsic that was
-          wrong from the day it was solved passes them. This one compares the
-          cameras with each other, in the workspace, now. */}
-      <CrossCameraPanel api={api} busy={busy} />
-
-      <CalibrationWizard
-        snapshot={snapshot}
-        api={api}
-        busy={busy}
-        onSolve={onRunMultiCameraCalibration}
-      />
-
-      <MarkerTcpPanel snapshot={snapshot} api={api} busy={busy} />
-
-      {/* The pivot above measures translation and is structurally blind to
-          rotation -- a spherical joint leaves it in the null space. This is the
-          other half of the same constant, and the larger of the two errors: the
-          rotation in production is a declared 2.0 deg that was never measured. */}
-      <HandEyePanel api={api} busy={busy} />
-
-      {/* The laser tracker's own two constants. Neither is readable from CAD:
-          T_WG depends on where the tracker was parked, c on where the plate was
-          bolted this time. Sits after the marker->TCP pair deliberately -- this
-          fit absorbs exactly that constant, so it can measure everything about
-          the cube pose *except* the thing those two panels are for. */}
-      <TrackerMountPanel api={api} busy={busy} snapshot={snapshot} />
-
-      {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
-      {boxGroups.map((group) => (
-        <BoxCalibrationGroup
-          key={group.boxId || "single"}
-          api={api}
-          group={group}
-          operator={operator}
-          guard={guard}
-          onRecord={onRecord}
-          historyFor={historyFor}
-          now={now}
-          recorderConnected={recorderConnected}
-        />
-      ))}
-
-      {boxDevices.length === 0 && (
-        <section className="panel">
-          <p className="cali-muted">
-            未检测到 BOX 传感器。请先点顶栏的「Connect」连接 GMSL2/BOX 录制器（录制器供录制 / 标定 / 设备预览共用）。
-          </p>
-        </section>
+      {tab === "overview" && (
+        <>
+          {/* Self-check sits above the calibration itself: the usual question is
+              "does anything need redoing?", and the answer is usually no. */}
+          {/* Wrapped: this button hands its click event to whatever it is given, and
+              the solve now takes an options object. */}
+          <RigCheckPanel api={api} busy={busy} onRecalibrate={() => onRunMultiCameraCalibration()} />
+          <section className="panel">
+            <div className="panel-heading">
+              <h2>什么时候做哪项标定</h2>
+            </div>
+            <div className="cali-map">
+              {CALIBRATION_TABS.filter((t) => t.id !== "overview").map((t) => (
+                <button key={t.id} className="cali-map-card" onClick={() => setTab(t.id)}>
+                  <strong>
+                    {t.label}
+                    {badges[t.id] ? <small className={`nav-badge nav-badge-${badges[t.id]!.tone}`}>{badges[t.id]!.text}</small> : null}
+                  </strong>
+                  <span>{t.when}</span>
+                  <em>{t.contents}</em>
+                </button>
+              ))}
+            </div>
+          </section>
+        </>
       )}
 
-      {/* --- log + history (spec §10, §11) --- */}
-      <CalibrationLogPanel entries={logEntries} />
-      <CalibrationHistory
-        records={records}
-        onClear={() => {
-          historyRepo.clear();
-          setHistoryTick((n) => n + 1);
-        }}
-      />
+      {tab === "cameras" && (
+        <>
+          <CalibrationWizard snapshot={snapshot} api={api} busy={busy} onSolve={onRunMultiCameraCalibration} />
+
+          {/* The self-check only sees pose, and says so -- a bump invalidates
+              the extrinsics and leaves the lens alone. This is the other half: the
+              intrinsics do not go stale from bumps, they go stale from having been
+              fitted on a sweep that never reached the frame edge, which no
+              reprojection number on this page can reveal. */}
+          <IntrinsicsCoveragePanel api={api} onRecapture={() => onRunMultiCameraCalibration()} />
+
+          {/* Whether a bump happened is the self-check; whether the world
+              frame survived it is a different question, and the one that decides
+              if today's absolute poses can be compared with last week's. */}
+          <WorldFramePanel api={api} busy={busy} />
+
+          {/* The checks above compare with the past, so an extrinsic that was
+              wrong from the day it was solved passes them. This one compares the
+              cameras with each other, in the workspace, now. */}
+          <CrossCameraPanel api={api} busy={busy} />
+        </>
+      )}
+
+      {tab === "handheld" && (
+        <>
+          <MarkerTcpPanel snapshot={snapshot} api={api} busy={busy} />
+
+          {/* The pivot above measures translation and is structurally blind to
+              rotation -- a spherical joint leaves it in the null space. This is the
+              other half of the same constant, and the larger of the two errors: the
+              rotation in production is a declared 2.0 deg that was never measured. */}
+          <HandEyePanel api={api} busy={busy} />
+        </>
+      )}
+
+      {tab === "fr3" && (
+        <>
+          {/* What hangs below the flange, for Desk: every other FR3 panel moves or
+              holds the arm with that load configured, so it comes first. */}
+          <Fr3PayloadPanel api={api} busy={busy} />
+
+          {/* The gripper BOX's 6D zero with the arm as the vendor's fixture (fingertips up);
+              every 30 min, and before an episode whose 6D is used. */}
+          <Fr3SixDZeroPanel api={api} busy={busy} />
+
+          {/* The one edge that leaves the world for the FR3 base. Every replay and
+              fr3_base export goes through it. */}
+          <Fr3BaseEdgePanel api={api} busy={busy} />
+
+          {/* A referee for that edge that needs no laser and no TCP definition:
+              the FR3 and the handheld pivot about one ball on the table. */}
+          <Fr3PivotPanel api={api} busy={busy} />
+        </>
+      )}
+
+      {tab === "box" && (
+        <>
+          {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
+          {boxGroups.map((group) => (
+            <BoxCalibrationGroup
+              key={group.boxId || "single"}
+              api={api}
+              group={group}
+              operator={operator}
+              guard={guard}
+              onRecord={onRecord}
+              historyFor={historyFor}
+              now={now}
+              recorderConnected={recorderConnected}
+            />
+          ))}
+
+          {boxDevices.length === 0 && (
+            <section className="panel">
+              <p className="cali-muted">
+                未检测到 BOX 传感器。零点/origin/触觉校准要先点顶栏的「Connect」连接 GMSL2/BOX 录制器（录制器供录制 / 标定 / 设备预览共用）。
+                下面的 6D 拟合反过来要求录制器断开。
+              </p>
+            </section>
+          )}
+
+          {/* The zero (above) shifts the reading at one attitude; K takes out the
+              payload's weight at every attitude. Both are needed for a usable 6D. */}
+          <SixDFitPanel api={api} busy={busy} />
+        </>
+      )}
+
+      {tab === "laser" && (
+        /* The laser tracker's own two constants. Neither is readable from CAD:
+           T_WG depends on where the tracker was parked, c on where the plate was
+           bolted this time. This fit absorbs the marker->TCP constant, so it can
+           measure everything about the cube pose *except* what those panels are for. */
+        <TrackerMountPanel api={api} busy={busy} snapshot={snapshot} />
+      )}
+
+      {tab === "log" && (
+        <>
+          <CalibrationLogPanel entries={logEntries} />
+          <CalibrationHistory
+            records={records}
+            onClear={() => {
+              historyRepo.clear();
+              setHistoryTick((n) => n + 1);
+            }}
+          />
+        </>
+      )}
     </div>
   );
 }

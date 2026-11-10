@@ -249,3 +249,112 @@ def test_a_new_power_on_needs_a_new_zero_and_a_warm_up_unless_it_is_the_origins_
 def test_an_unknown_uptime_skips_what_needs_it_and_still_checks_the_rest():
     found = bsd.calibration_warnings(None, None, now_s=BOOT_S, uptime_s=None)
     assert len(found) == 2
+
+
+def test_a_fit_is_registered_as_a_new_record_and_the_old_file_is_kept(tmp_path):
+    registry = {
+        "schema": bsd.SCHEMA,
+        "devices": {"7": {"role": "fr3_gripper", "six_d_payload": [{"valid_from_unix": 50, "K": None}]}},
+    }
+    path = tmp_path / "box_devices.json"
+    path.write_text(json.dumps(registry))
+    acc = _faces()
+    fit = bsd.fit_payload(acc @ K_TRUE.T, acc, np.zeros_like(acc))
+    (tmp_path / "fit.json").write_text(json.dumps(fit))
+
+    rc = bsd.main(
+        [
+            "register", str(tmp_path / "fit.json"), "--device-id", "7", "--end-effector", "gripper",
+            "--valid-from-unix", "100", "--registry", str(path), "--source", "robot-held",
+        ]
+    )
+    assert rc == 0
+    written = bsd.load_registry(path)
+    records = written["devices"]["7"]["six_d_payload"]
+    assert [r["valid_from_unix"] for r in records] == [50, 100]
+    assert records[1]["fit"]["log"] == "robot-held" and records[1]["end_effector"] == "gripper"
+    model = bsd.payload_model(written, 7, 150.0)
+    assert model is not None and np.allclose(model.K, K_TRUE, atol=1e-4)
+    assert len(list(tmp_path.glob("box_devices.json.*.bak"))) == 1
+    # numbers stay on one line, as in the checked-in file
+    assert '"K": [\n' in path.read_text() and "[0.0, " in path.read_text().replace("-0.0", "0.0")
+
+    # the same time twice is refused, an unknown BOX too
+    with pytest.raises(ValueError, match="already has"):
+        bsd.add_payload_record(written, 7, records[1])
+    with pytest.raises(ValueError, match="not in the registry"):
+        bsd.add_payload_record(written, 8, records[1])
+
+
+def test_register_refuses_a_fit_that_missed_the_target(tmp_path):
+    path = tmp_path / "box_devices.json"
+    path.write_text(json.dumps({"schema": bsd.SCHEMA, "devices": {"7": {"role": "handheld"}}}))
+    (tmp_path / "fit.json").write_text(json.dumps({"K": K_TRUE.tolist(), "meets_target": False}))
+    args = ["register", str(tmp_path / "fit.json"), "--device-id", "7", "--end-effector", "x", "--valid-from-unix", "1"]
+    assert bsd.main([*args, "--registry", str(path)]) == 1
+    assert "six_d_payload" not in bsd.load_registry(path)["devices"]["7"]
+
+
+def test_fit_json_holds_the_refusal(tmp_path):
+    log = tmp_path / "free_air.log"
+    acc = _faces(faces=("x+", "x-"))
+    log.write_text("\n".join(json.dumps({"t": i, "k": "box_six_d_force", "f": list(a @ K_TRUE.T), "acc": list(a), "gyr": [0, 0, 0]}) for i, a in enumerate(acc)))
+    assert bsd.main(["fit", str(log), "--json", str(tmp_path / "fit.json")]) == 2
+    assert "attitudes" in json.loads((tmp_path / "fit.json").read_text())["error"]
+
+
+def _held_capture(drift_fx_n_per_s=0.0, up0_s=40 * 60.0):
+    """An arm-held capture: every face held 3 s at 100 Hz, then x+ and z- again 300 s later."""
+    rng = np.random.default_rng(3)
+    plan = [("x+", 0.0), ("x-", 20.0), ("y+", 40.0), ("y-", 60.0), ("z+", 80.0), ("z-", 100.0), ("x+", 300.0), ("z-", 320.0)]
+    acc, t = [], []
+    for face, start in plan:
+        axis, sign = "xyz".index(face[0]), 1.0 if face[1] == "+" else -1.0
+        v = np.zeros(3)
+        v[axis] = sign
+        for k in range(300):
+            acc.append(v + rng.normal(0, 0.002, 3))
+            t.append(1.79e9 + start + k / 100)
+    acc, t = np.array(acc), np.array(t)
+    f = acc @ K_TRUE.T + rng.normal(0, 0.02, (len(acc), 6))
+    f[:, 0] += drift_fx_n_per_s * (t - t[0])
+    return f, acc, t, up0_s + (t - t[0])
+
+
+def test_fit_reports_how_far_one_attitude_drifted_and_a_cold_box():
+    f, acc, t, mcu = _held_capture(drift_fx_n_per_s=0.003, up0_s=49.0)  # 0.9 N on Fx over the 300 s
+    fit = bsd.fit_payload(f, acc, np.zeros_like(acc), t_s=t, mcu_s=mcu)
+
+    drift = fit["drift_same_attitude"]
+    assert drift["holds"] == 8 and drift["pairs"] == 2  # x+ and z-, each held twice
+    assert drift["axis"] == "Fx" and drift["change_N"] == pytest.approx(0.9, abs=0.05)
+    assert drift["from_s"] == pytest.approx(1.5, abs=0.1) and drift["to_s"] == pytest.approx(301.5, abs=0.1)
+    assert drift["acc_g"] == pytest.approx([1.0, 0.0, 0.0], abs=0.01)
+    assert fit["box_uptime_s"]["start_s"] == 49.0
+    assert len(fit["warnings"]) == 2
+    assert "才上电 1 分钟" in fit["warnings"][0]
+    assert "Fx" in fit["warnings"][1] and "+0.90 N" in fit["warnings"][1]
+
+
+def test_a_warm_steady_box_gets_no_drift_warning_and_no_times_no_check():
+    f, acc, t, mcu = _held_capture()
+    fit = bsd.fit_payload(f, acc, np.zeros_like(acc), t_s=t, mcu_s=mcu)
+    assert fit["drift_same_attitude"]["pairs"] == 2 and fit["drift_same_attitude"]["worst_force_N"] < 0.05
+    assert fit["warnings"] == [] and fit["meets_target"]
+
+    fit = bsd.fit_payload(f, acc, np.zeros_like(acc))
+    assert fit["drift_same_attitude"] is None and fit["box_uptime_s"] is None and fit["warnings"] == []
+
+
+def test_fit_cli_reads_the_times_from_the_log(tmp_path):
+    f, acc, t, mcu = _held_capture(drift_fx_n_per_s=0.003, up0_s=49.0)
+    log = tmp_path / "six_d.log"
+    rows = [
+        {"t": float(ti), "k": "box_six_d_force", "ts": int(mi * 1e6), "f": fi.tolist(), "acc": ai.tolist(), "gyr": [0, 0, 0]}
+        for fi, ai, ti, mi in zip(f, acc, t, mcu, strict=True)
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert bsd.main(["fit", str(log), "--json", str(tmp_path / "fit.json")]) == 1  # the drift also spoils the rms
+    fit = json.loads((tmp_path / "fit.json").read_text())
+    assert fit["drift_same_attitude"]["axis"] == "Fx" and fit["box_uptime_s"]["start_s"] == 49.0
+    assert len(fit["warnings"]) == 2

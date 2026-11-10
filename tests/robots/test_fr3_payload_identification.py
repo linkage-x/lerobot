@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from lerobot.robots.franka_research3.backends import PANDA_PY_JOINT_LIMITS_LOWER, PANDA_PY_JOINT_LIMITS_UPPER
+from lerobot.robots.franka_research3.backends import (
+    PANDA_PY_JOINT_LIMITS_LOWER,
+    PANDA_PY_JOINT_LIMITS_UPPER,
+    PANDA_PY_JOINT_POSITION_START,
+)
 from lerobot.robots.franka_research3.payload_identification import (
     default_poses,
     fit_difference,
@@ -188,7 +193,7 @@ def test_move_retries_only_the_communication_reflex(monkeypatch):
     assert not _move(arm) and arm.recovered == 3
 
 
-def test_desk_config_writes_one_config_per_smr_state_with_the_template_tcp(tmp_path):
+def test_desk_config_writes_one_config_per_smr_state_with_the_template_tcp_on_request(tmp_path):
     pytest.importorskip("mujoco")
     from tools.fr3 import fr3_payload_identification_runtime as runtime
 
@@ -214,6 +219,7 @@ def test_desk_config_writes_one_config_per_smr_state_with_the_template_tcp(tmp_p
         out_dir=tmp_path / "desk",
         stem="load",
         urdf=_URDF,
+        tcp_template=True,
     )
     runtime.desk_config(args)
     for stem, run, name in (
@@ -240,3 +246,186 @@ def test_franka_external_wrench_of_an_unconfigured_mass_is_its_weight():
         f = np.array([0.0, 0.0, m * 9.81])
         np.testing.assert_allclose(w[:3], f, atol=1e-9)
         np.testing.assert_allclose(w[3:], np.cross(T[:3, :3] @ c + T[:3, 3], f), atol=1e-9)
+
+
+def test_six_d_poses_turn_every_tool_axis_up_inside_the_joint_walls():
+    mujoco = pytest.importorskip("mujoco")
+    from lerobot.robots.franka_research3.payload_identification import pose_set, six_d_poses
+
+    poses = six_d_poses()
+    lo, hi = np.asarray(PANDA_PY_JOINT_LIMITS_LOWER), np.asarray(PANDA_PY_JOINT_LIMITS_UPPER)
+    model = mujoco.MjModel.from_xml_path(str(_XML))
+    # the FR3's own limits (the MJCF's) as well as panda_py's walls: the FR3's j6 stops at 0.5445
+    lo_all, hi_all = np.maximum(lo, model.jnt_range[:7, 0]), np.minimum(hi, model.jnt_range[:7, 1])
+    assert np.all(poses > lo_all + 0.1) and np.all(poses < hi_all - 0.1)
+    # the upper arm stays in the start pose: only the wrist moves
+    np.testing.assert_allclose(poses[:, :4], np.tile(poses[0, :4], (len(poses), 1)))
+    visit_sequence(poses, 0.03, lo_all, hi_all)  # every pose reachable from both sides
+    data = mujoco.MjData(model)
+    ft = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link_sensor_ft")
+    faces = set()
+    for q in poses:
+        data.qpos[:] = 0.0
+        data.qpos[:7] = q
+        mujoco.mj_forward(model, data)
+        up = data.xmat[ft].reshape(3, 3).T @ np.array([0.0, 0.0, 1.0])
+        k = int(np.argmax(np.abs(up)))
+        assert abs(up[k]) > 0.85
+        faces.add(f"{'xyz'[k]}{'+' if up[k] > 0 else '-'}")
+    assert faces == {"x+", "x-", "y+", "y-", "z+", "z-"}
+    assert len(pose_set("payload+six_d")) == len(default_poses()) + len(poses)
+
+
+def test_desk_config_of_the_bare_gripper_leaves_the_adaptor_out(tmp_path):
+    pytest.importorskip("mujoco")
+    from tools.fr3 import fr3_payload_identification_runtime as runtime
+
+    run, *_ = _sim_run(tmp_path, "gripper", tool_config="gripper", poses="payload+six_d", hysteresis_nm=0.2)
+    assert run["tool_config"] == "gripper" and not run["smr_present"]
+    full, *_ = _sim_run(tmp_path, "full")
+    m_adaptor = full["sim"]["truth"]["mass_kg"] - run["sim"]["truth"]["mass_kg"]
+    assert m_adaptor == pytest.approx(0.046529 + 0.1871 + 0.14, abs=1e-6)  # mount + camera case + SMR
+    (tmp_path / "template.json").write_text(json.dumps({"id": "old", "tcp": {"z": 0.172}, "deviceId": "g"}))
+    args = argparse.Namespace(
+        runs=[tmp_path / "gripper.json"],
+        template=tmp_path / "template.json",
+        name=["gripper=Corenetic gripper"],
+        name_smr=None,
+        name_no_smr=None,
+        out_dir=tmp_path / "desk",
+        stem="load",
+        urdf=_URDF,
+        report=tmp_path / "report.json",
+    )
+    assert runtime.desk_config(args) == 0
+    cfg = json.loads((tmp_path / "desk" / "load_gripper.json").read_text())
+    assert cfg["name"] == "Corenetic gripper"
+    assert cfg["inertial"]["mass"] == pytest.approx(run["sim"]["truth"]["mass_kg"], abs=1e-3)
+    entry = json.loads((tmp_path / "report.json").read_text())["configs"]["gripper"]
+    assert entry["n_poses"] == len(default_poses()) + 13
+    from lerobot.robots.franka_research3.payload_identification import urdf_subtree_inertial
+
+    m_full_cad = urdf_subtree_inertial(_URDF)[0]
+    assert m_full_cad - entry["cad"]["mass_kg"] == pytest.approx(m_adaptor, abs=1e-3)
+    # a run of a configuration without a name is refused
+    args.name = []
+    with pytest.raises(SystemExit, match="no Desk name"):
+        runtime.desk_config(args)
+
+
+def test_desk_tcp_defaults_to_the_new_tips_and_takes_an_fr3_pivot_through_the_urdf(tmp_path):
+    from tools.fr3 import fr3_payload_identification_runtime as runtime
+
+    template = {"rotation": {"roll": 0, "pitch": 0, "yaw": -0.7853981633974483}, "translation": {"x": 0, "y": 0, "z": 0.17199}}
+    tcp, src = runtime.desk_tcp(template, urdf=_URDF)
+    assert src["kind"] == "estimate" and tcp["translation"] == {"x": 0.0, "y": 0.0, "z": runtime.NEW_TIP_TCP_Z_M}
+    assert tcp["rotation"] == template["rotation"]
+    assert runtime.desk_tcp(template, keep_template=True, urdf=_URDF)[0] == template
+    assert runtime.desk_tcp(template, tcp_z_m=0.2, urdf=_URDF)[0]["translation"]["z"] == 0.2
+    # corenetic_gripper_ee is the template's TCP (z 171.99 mm, yaw -45 deg): a socket 18 mm further out
+    # along its z and 1 mm along its x lands at z 189.99 and x/y rotated by -45 deg in the flange frame
+    fit = tmp_path / "x_pivot.fit.json"
+    fit.write_text(json.dumps({"frame": "corenetic_gripper_ee", "robot_ip": "ip", "fk": {"s_ee_mm": [1.0, 0.0, 18.0], "s_sigma_mm": [0.1, 0.1, 0.2]}}))
+    tcp, src = runtime.desk_tcp(template, pivot=fit, urdf=_URDF)
+    assert src["kind"] == "pivot" and src["s_ee_mm"] == [1.0, 0.0, 18.0]
+    t = tcp["translation"]
+    assert t["z"] == pytest.approx(0.18999, abs=2e-5)
+    assert (t["x"], t["y"]) == pytest.approx((0.001 * math.cos(-math.pi / 4), 0.001 * math.sin(-math.pi / 4)), abs=2e-5)
+    assert tcp["rotation"] == template["rotation"]
+    fit.write_text(json.dumps({"fk": {}}))
+    with pytest.raises(SystemExit):
+        runtime.desk_tcp(template, pivot=fit, urdf=_URDF)
+
+
+def test_six_d_zero_pose_points_the_fingertips_straight_up_inside_both_limit_sets():
+    mujoco = pytest.importorskip("mujoco")
+    from lerobot.robots.franka_research3.payload_identification import pose_set, six_d_zero_pose
+
+    q = six_d_zero_pose()
+    model = mujoco.MjModel.from_xml_path(str(_XML))
+    lo = np.maximum(PANDA_PY_JOINT_LIMITS_LOWER, model.jnt_range[:7, 0])
+    hi = np.minimum(PANDA_PY_JOINT_LIMITS_UPPER, model.jnt_range[:7, 1])
+    assert np.all(q > lo + 0.3) and np.all(q < hi - 0.3)
+    start = np.array(PANDA_PY_JOINT_POSITION_START)
+    assert q[[0, 2, 4]].tolist() == [0.0, 0.0, 0.0] and q[6] == pytest.approx(start[6])  # planar, j7 unturned
+    data = mujoco.MjData(model)
+    data.qpos[:7] = q
+    mujoco.mj_forward(model, data)
+    ft = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link_sensor_ft")
+    assert data.xmat[ft].reshape(3, 3)[2, 2] == pytest.approx(1.0, abs=1e-9)  # sensor z (fingertips) up
+    route = pose_set("six_d_zero")
+    np.testing.assert_array_equal(route[0], q)
+    np.testing.assert_array_equal(route[-1], start)  # check-poses covers the way back too
+
+
+def test_the_zero_route_is_the_only_way_between_its_waypoints():
+    from lerobot.robots.franka_research3.payload_identification import (
+        SIX_D_ZERO_ROUTE,
+        six_d_zero_moves,
+        six_d_zero_waypoints,
+    )
+
+    points = six_d_zero_waypoints()
+    np.testing.assert_allclose(points["start"], PANDA_PY_JOINT_POSITION_START)
+    assert set(SIX_D_ZERO_ROUTE) == set(points)
+    moves = six_d_zero_moves()
+    assert frozenset(("start", "six_d_zero")) in moves and frozenset(("check_xplus", "start")) in moves
+    # from the zero pose straight to a side pose: a path check-poses never sampled
+    assert frozenset(("six_d_zero", "check_xplus")) not in moves
+    assert frozenset(("six_d_zero", "check_yminus")) not in moves
+    # the re-check poses move only the wrist from the start pose
+    for name in ("check_xplus", "check_yminus"):
+        assert np.array_equal(points[name][:4], points["start"][:4])
+
+
+def test_move_waypoint_only_moves_along_the_checked_route(monkeypatch, capsys):
+    import sys
+    import types
+
+    from lerobot.robots.franka_research3.payload_identification import six_d_zero_waypoints
+    from tools.fr3 import fr3_payload_identification_runtime as runtime
+
+    points = six_d_zero_waypoints()
+    arm = {"q": points["start"].copy(), "moves": []}
+
+    class Robot:
+        def read_once(self):
+            return types.SimpleNamespace(q=arm["q"].tolist(), last_motion_errors=None)
+
+    class Panda:
+        def __init__(self, ip):
+            pass
+
+        def get_robot(self):
+            return Robot()
+
+        def move_to_joint_position(self, q, speed_factor):
+            arm["moves"].append(speed_factor)
+            arm["q"] = np.asarray(q)
+            return True
+
+        def stop_controller(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "panda_py", types.SimpleNamespace(Panda=Panda))
+
+    def run(to):
+        return runtime.move_waypoint(argparse.Namespace(robot_ip="x", to=to, speed_factor=0.1, max_retries=0))
+
+    assert run("check_xplus") == 0 and "REACHED check_xplus" in capsys.readouterr().out
+    # from a side pose straight up: check-poses never sampled that path
+    assert run("six_d_zero") == 1 and "not a move of the checked route" in capsys.readouterr().out
+    assert run("start") == 0 and run("six_d_zero") == 0
+    np.testing.assert_allclose(arm["q"], points["six_d_zero"])
+    arm["q"] = points["start"] + 0.2  # pushed away / left after a replay
+    assert run("six_d_zero") == 1 and "no waypoint" in capsys.readouterr().out
+    assert len(arm["moves"]) == 3
+
+
+def test_a_cold_box_gets_a_reminder_not_a_refusal():
+    from tools.fr3 import fr3_payload_identification_runtime as runtime
+
+    text = runtime.six_d_warmup_warning(23 * 60)
+    assert "才上电 23 分钟" in text and "预热 30 分钟" in text and "照常继续" in text
+    assert runtime.six_d_warmup_warning(31 * 60) == ""
+    assert runtime.six_d_warmup_warning(None) == ""  # no BOX clock: nothing to say

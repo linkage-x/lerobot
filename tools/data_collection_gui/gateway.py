@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.data_collection_gui import fr3_payload_calibration as payload_cal
 from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
@@ -549,6 +550,8 @@ class GatewayState:
     fr3_pivot_process: subprocess.Popen[str] | None = None
     fr3_pivot_job: dict[str, Any] = field(default_factory=dict)
     fr3_pivot_lock: Lock = field(default_factory=Lock)
+    # calibration page: FR3 end-effector load + BOX 6D payload fit (fr3_payload_calibration.py)
+    payload_calibration: Any = None
     # FR3 gripper teleop from the handheld BOX (tools/fr3/fr3_gripper_teleop.py); same pattern.
     gripper_teleop_process: subprocess.Popen[str] | None = None
     gripper_teleop_job: dict[str, Any] = field(default_factory=dict)
@@ -4667,6 +4670,8 @@ def _fr3_pivot_fci_holder(state: GatewayState) -> str:
         recorder = state.process
         if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
             return "FR3 录制器已连接"
+    if state.payload_calibration is not None:
+        return state.payload_calibration.fci_user()
     return ""
 
 
@@ -5508,11 +5513,117 @@ def _gripper_teleop_box_holder(state: GatewayState) -> str:
         replay = state.replay_process
         if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
             return "真机 replay 正在运行，它在控制 FR3 夹爪"
+    if state.payload_calibration is not None:
+        return state.payload_calibration.box_port_user()
     return ""
 
 
 def _gripper_teleop_conflict() -> str:
     return "FR3 夹爪遥控正在运行，它占着 BOX 端口（:15000）；先在标定页退出遥控"
+
+
+def _box_port_conflict(state: GatewayState) -> str:
+    """Why Connect / a real replay cannot take the BOX port now (teleop, a 6D capture, a payload run), or ""."""
+    if _gripper_teleop_running(state):
+        return _gripper_teleop_conflict()
+    if state.payload_calibration is not None:
+        return state.payload_calibration.box_port_user()
+    return ""
+
+
+# --- FR3 end-effector load + BOX 6D payload fit (calibration page) -----------
+
+
+def _payload_calibration(state: GatewayState) -> payload_cal.PayloadCalibration:
+    if state.payload_calibration is None:
+
+        def log(level: str, message: str) -> None:
+            with state.lock:
+                state.log(level, message)
+
+        def box_port_holder() -> str:
+            # everything but this module's own job, which the module checks itself
+            if _gripper_teleop_running(state):
+                return _gripper_teleop_conflict()
+            with state.lock:
+                recorder = state.process
+                if recorder is not None and recorder.poll() is None:
+                    return "录制器已连接，它占着 BOX 端口（:15000）；先 Disconnect"
+                replay = state.replay_process
+                if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+                    return "真机 replay 正在运行，它在控制 FR3 夹爪"
+            return ""
+
+        def fci_holder() -> str:
+            with state.lock:
+                replay = state.replay_process
+                if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+                    return "真机 replay 正在运行"
+                teleop = state.teleop_process
+                if teleop is not None and teleop.poll() is None:
+                    return "FR3 遥操作正在运行"
+                recorder = state.process
+                if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
+                    return "FR3 录制器已连接"
+            with state.fr3_pivot_lock:
+                if state.fr3_pivot_job.get("state") in ("collecting", "fitting"):
+                    return "FR3 pivot 正在采集"
+            return ""
+
+        def resolve_arm(arm: str) -> dict[str, Any]:
+            return _drive_target(state, arm or None, None)
+
+        def recorder_box_refusal() -> str:
+            with state.lock:
+                recorder = state.process
+                if recorder is None or recorder.poll() is not None:
+                    return "录制器没有连接；先 Connect"
+                if not _state_is_gmsl2(state):
+                    return "当前录制器不是 GMSL2/BOX 录制器"
+            return ""
+
+        def box_preview() -> dict[str, Any]:
+            box = state.device_preview.get("box")
+            return dict(box) if isinstance(box, dict) else {}
+
+        def six_d_cali_log() -> tuple[bool, list[dict[str, Any]]]:
+            with state.box_cali_lock:
+                return state.box_cali_running, [dict(e) for e in state.box_cali_log]
+
+        state.payload_calibration = payload_cal.PayloadCalibration(
+            payload_cal.Host(
+                repo_root=state.repo_root,
+                python=lambda: _mujoco_replay_python(state),
+                env=lambda: _real_preflight_env(state),
+                resolve_arm=resolve_arm,
+                arms=lambda: _robot_arms_payload(state)["arms"],
+                fci_holder=fci_holder,
+                box_port_holder=box_port_holder,
+                log=log,
+                recorder_box_refusal=recorder_box_refusal,
+                box_preview=box_preview,
+                box_roster=lambda: list(state.box_devices_roster or []),
+                trigger_six_d_cali=lambda origin, box_id: _trigger_box_six_d_force_cali(
+                    state, origin=origin, box_id=box_id
+                ),
+                six_d_cali_log=six_d_cali_log,
+            )
+        )
+    return state.payload_calibration
+
+
+_PAYLOAD_CALIBRATION_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/fr3-payload/check": lambda state, body: _payload_calibration(state).check(body),
+    "/api/calibration/fr3-payload/collect": lambda state, body: _payload_calibration(state).collect(body),
+    "/api/calibration/fr3-payload/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/fr3-payload/desk": lambda state, body: _payload_calibration(state).desk(body),
+    "/api/calibration/fr3-six-d-zero/start": lambda state, body: _payload_calibration(state).zero_start(body),
+    "/api/calibration/fr3-six-d-zero/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/six-d/capture": lambda state, body: _payload_calibration(state).capture_start(body),
+    "/api/calibration/six-d/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/six-d/fit": lambda state, body: _payload_calibration(state).refit(body),
+    "/api/calibration/six-d/register": lambda state, body: _payload_calibration(state).register(body),
+}
 
 
 def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -16589,8 +16700,9 @@ def _connect_recorder(
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
-    if _gripper_teleop_running(state):
-        raise ValueError(_gripper_teleop_conflict())
+    conflict = _box_port_conflict(state)
+    if conflict:
+        raise ValueError(conflict)
 
     is_workstation = state.profile == "workstation"
     if backend is not None:
@@ -19403,8 +19515,9 @@ def _start_real_replay(
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
-    if _gripper_teleop_running(state):
-        raise ValueError(_gripper_teleop_conflict())
+    conflict = _box_port_conflict(state)
+    if conflict:
+        raise ValueError(conflict)
 
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
@@ -20008,6 +20121,25 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/fr3-pivot":
             _json_response(self, HTTPStatus.OK, _fr3_pivot_payload(self.server.state))
             return
+        if path == "/api/calibration/fr3-payload":
+            _json_response(self, HTTPStatus.OK, _payload_calibration(self.server.state).payload())
+            return
+        if path == "/api/calibration/fr3-payload/desk-file":
+            desk_file = _payload_calibration(self.server.state).desk_file(
+                query.get("desk", [""])[0], query.get("name", [""])[0]
+            )
+            if desk_file is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "no such desk config"})
+                return
+            data = desk_file.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", f'attachment; filename="{desk_file.name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/api/fr3/gripper-teleop":
             _json_response(
                 self,
@@ -20507,6 +20639,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             or _CROSS_CAMERA_ROUTES.get(path)
             or _FR3_BASE_EDGE_ROUTES.get(path)
             or _FR3_PIVOT_ROUTES.get(path)
+            or _PAYLOAD_CALIBRATION_ROUTES.get(path)
             or _GRIPPER_TELEOP_ROUTES.get(path)
             or _FR3_MOVE_TO_START_ROUTES.get(path)
             or _DUAL_REPLAY_ROUTES.get(path)

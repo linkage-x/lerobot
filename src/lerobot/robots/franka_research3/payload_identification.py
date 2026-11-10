@@ -230,6 +230,106 @@ def default_poses() -> np.ndarray:
     return np.array(poses)
 
 
+def six_d_poses() -> np.ndarray:
+    """13 static poses that point each axis of the tool (link_sensor_ft) up at least once.
+
+    For the BOX 6D payload fit (``tools/thor/gmsl2/box_six_d.py``), which needs the IMU's specific
+    force on all six faces: ``default_poses`` keeps the tool within 45 deg of pointing down (always
+    the z- face), so the fitted K's z column cannot be told from the zero offset there. Every pose
+    is panda_py's start pose with only the wrist moved (j5 +-1.5 lays the tool on its side, j5 +-2.6
+    turns it up to ~31 deg off vertical, j6 3.0 tilts it about the other axis, j7 spins it within
+    -0.8..2.35 so the cable never winds further than in the payload poses). Joint limits are the FR3's
+    and panda_py's together: the FR3's j6 stops at 0.5445 (panda_py's wall at -0.0175 is the Panda's),
+    so the tool cannot fold towards the forearm from the start pose (11-09: two poses at j6 0.15 did,
+    replaced by j5 -1.5 / j6 3.0 with j7 -0.8),
+    so the upper arm and the load on j2/j4 stay as in the start pose and the tool stays 0.4-0.95 m
+    above the base plane (MuJoCo, 11-09; faces from the URDF, the IMU axes follow the FT axes up to
+    the BOX's own mounting, which the fit does not assume). Tool-arm clearance along the path >= 30 mm
+    (KD-tree on 5 mm surface samples, nearest on the way to the x- pose against fr3_link5).
+    """
+    start = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4])
+    wrist = (  # (j5, j6, j7) changes from the start pose; the face that points up in the comment
+        {},  # z-
+        {6: -0.8},  # z-, spun
+        {4: -1.5, 6: -0.8},  # y-
+        {5: 3.0, 6: -0.8},  # x-
+        {4: 1.5},  # x+
+        {4: 1.5, 6: 2.35},  # y-
+        {4: 2.6},  # z+
+        {4: 2.6, 6: -0.8},  # z+, spun
+        {4: -1.5},  # x-
+        {4: -1.5, 6: 2.35},  # y+
+        {4: -2.6},  # z+
+        {5: 3.0},  # y+
+        {5: 3.0, 6: 2.35},  # x+
+    )
+    poses = []
+    for change in wrist:
+        q = start.copy()
+        for j, v in change.items():
+            q[j] = v
+        poses.append(q)
+    return np.array(poses)
+
+
+def six_d_zero_pose() -> np.ndarray:
+    """Where the FR3 holds its gripper BOX for the 6D zero: fingertips straight up, as on the vendor fixture.
+
+    The vendor procedure (数采Box传感器标定与操作说明 v1.1) zeros the 6D sensor with the BOX upright on its
+    fixture, fingertips up; on the arm the robot is the fixture. Planar (j1 = j3 = j5 = 0, j7 as in the
+    start pose, so the cable is routed as in every other pose): j6 = j2 - j4 + pi turns the tool from
+    straight down (the start pose's j6 = j2 - j4) to straight up. panda_py's j6 wall (3.7525) caps
+    j2 - j4 at ~0.5, which is why the arm stands nearly upright: every planar fingertips-up pose does,
+    the lower non-planar ones run j3/j4 near their limits. Here j2 - j4 = 0.2 keeps 0.41 rad off that wall
+    and 0.45 off j4's; the tool stays behind the base axis (x ~ -0.14 m, never over the table), the
+    fingertips ~1.33 m above the base plane (MuJoCo, 11-09).
+    """
+    j2, j4 = -0.4, -0.6
+    return np.array([0.0, j2, 0.0, j4, 0.0, j2 - j4 + math.pi, math.pi / 4])
+
+
+def six_d_zero_waypoints() -> dict[str, np.ndarray]:
+    """The poses of the arm-held 6D zero: panda_py's start, the zero pose, and the two re-check poses.
+
+    The re-checks lay the tool on its side two different ways (x+ up, y- up; both from ``six_d_poses``):
+    with the zero right, ``f - K @ acc - b`` is ~0 at an attitude other than the zero's.
+    """
+    start = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4])
+    x_plus, y_minus = start.copy(), start.copy()
+    x_plus[4] = 1.5
+    y_minus[4], y_minus[6] = -1.5, -0.8
+    return {"start": start, "six_d_zero": six_d_zero_pose(), "check_xplus": x_plus, "check_yminus": y_minus}
+
+
+#: The order the zero job visits them in, after starting at ``start``. ``check-poses --poses six_d_zero``
+#: checks exactly this path, so a move between two waypoints is allowed only along it (either way).
+SIX_D_ZERO_ROUTE = ("six_d_zero", "start", "check_xplus", "check_yminus", "start")
+
+
+def six_d_zero_moves() -> set[frozenset[str]]:
+    """The waypoint pairs one move may join: consecutive on the route, in either direction."""
+    route = ("start", *SIX_D_ZERO_ROUTE)
+    return {frozenset(pair) for pair in zip(route[:-1], route[1:], strict=True)}
+
+
+#: Named pose sets for a run: the payload fit, the 6D fit, or both in one visit of the arm.
+#: ``six_d_zero`` is the route of the arm-held 6D zero (``check-poses`` only, nothing to fit).
+POSE_SETS = ("payload", "six_d", "payload+six_d", "six_d_zero")
+
+
+def pose_set(name: str) -> np.ndarray:
+    if name == "payload":
+        return default_poses()
+    if name == "six_d":
+        return six_d_poses()
+    if name == "payload+six_d":
+        return np.vstack([default_poses(), six_d_poses()])
+    if name == "six_d_zero":
+        points = six_d_zero_waypoints()
+        return np.array([points[n] for n in SIX_D_ZERO_ROUTE])
+    raise ValueError(f"unknown pose set {name!r}; one of {POSE_SETS}")
+
+
 def visit_sequence(poses, approach_rad: float, lower, upper) -> list[tuple[np.ndarray, str | None, int]]:
     """Moves for a run: ``(target q, measurement tag or None, pose index)``.
 
@@ -242,6 +342,8 @@ def visit_sequence(poses, approach_rad: float, lower, upper) -> list[tuple[np.nd
     lower, upper = np.asarray(lower, dtype=np.float64), np.asarray(upper, dtype=np.float64)
     out: list[tuple[np.ndarray, str | None, int]] = []
     for i, q in enumerate(np.asarray(poses, dtype=np.float64)):
+        if np.any(q < lower) or np.any(q > upper):
+            raise ValueError(f"pose {i} is outside the joint limits")
         if approach_rad <= 0:
             out.append((q, "single", i))
             continue
@@ -292,6 +394,26 @@ def urdf_link_load(urdf_path: str | Path, link: str, flange: str = "fr3_link8") 
         raise ValueError(f"{link} has no inertial")
     com = np.array([float(v) for v in inertial.find("origin").get("xyz", "0 0 0").split()])
     return float(inertial.find("mass").get("value")), R @ com + t
+
+
+def urdf_fixed_transform(urdf_path, parent: str, child: str) -> np.ndarray:
+    """4x4 pose of link ``child`` in link ``parent``, walking the URDF's joints at zero (fixed chains)."""
+    root = ET.parse(str(urdf_path)).getroot()
+    up = {}
+    for j in root.findall("joint"):
+        o = j.find("origin")
+        xyz = [float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()]
+        rpy = [float(v) for v in (o.get("rpy", "0 0 0") if o is not None else "0 0 0").split()]
+        T = np.eye(4)
+        T[:3, :3], T[:3, 3] = _rpy(*rpy), xyz
+        up[j.find("child").get("link")] = (j.find("parent").get("link"), T)
+    T, link = np.eye(4), child
+    while link != parent:
+        if link not in up:
+            raise ValueError(f"{child} is not below {parent} in {urdf_path}")
+        link, T_joint = up[link]
+        T = T_joint @ T
+    return T
 
 
 def urdf_subtree_inertial(

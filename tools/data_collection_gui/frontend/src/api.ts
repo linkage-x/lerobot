@@ -55,6 +55,7 @@ import type {
   TrackerMountChainResponse,
   TrackerValidateResponse,
 } from "./types";
+import type { PayloadCalibrationResponse } from "./calibration/payloadCalibration";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
@@ -1617,6 +1618,43 @@ export class DataCollectionGuiApi {
     } catch {
       return null;
     }
+  }
+
+  // --- FR3 end-effector load + BOX 6D payload fit (calibration page) ---
+  async fetchPayloadCalibration(): Promise<PayloadCalibrationResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-payload`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as PayloadCalibrationResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // check | collect | stop | desk, six-d/{capture,stop,fit,register}, fr3-six-d-zero/{start,stop}. A collect or a zero moves the arm:
+  // the panel confirms first, and the gateway refuses it without a passing check-poses.
+  async payloadCalibrationPost(action: string, body: Record<string, unknown> = {}): Promise<PayloadCalibrationResponse | null> {
+    const path =
+      action.startsWith("six-d/") || action.startsWith("fr3-six-d-zero/")
+        ? `/api/calibration/${action}`
+        : `/api/calibration/fr3-payload/${action}`;
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<PayloadCalibrationResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as PayloadCalibrationResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  payloadDeskFileUrl(desk: string, name: string): string {
+    return `${this.apiBase}/api/calibration/fr3-payload/desk-file?desk=${encodeURIComponent(desk)}&name=${encodeURIComponent(name)}`;
   }
 
   private async fr3PivotPost(path: string, body: Record<string, unknown>): Promise<Fr3PivotResponse | null> {

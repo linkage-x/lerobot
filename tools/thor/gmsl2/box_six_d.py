@@ -33,8 +33,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +54,16 @@ STATIC_GYR_DEG_S = 15.0
 STATIC_ACC_TOL_G = 0.05
 #: Held-out-attitude rms the fit must reach before it is worth writing to the registry.
 TARGET_HELDOUT_RMS_N = 0.3
+#: Drift check: a hold is a run of quasi-static samples (no gap over HOLD_GAP_S, IMU acc within
+#: HOLD_ACC_G of its first sample). Two holds whose acc agrees within SAME_ATTITUDE_G and that lie
+#: DRIFT_MIN_APART_S or more apart should read the same force once K*acc is taken off; what they
+#: differ by is drift (a cold BOX: 11-09 right arm, Fx -1.3 N in 8 min from 49 s after power-up).
+HOLD_GAP_S = 1.0
+HOLD_ACC_G = 0.02
+HOLD_MIN_SAMPLES = 5
+SAME_ATTITUDE_G = 0.05
+DRIFT_MIN_APART_S = 30.0
+DRIFT_WARN_N = TARGET_HELDOUT_RMS_N
 
 
 @dataclass(frozen=True)
@@ -261,18 +274,31 @@ def _rms(e: np.ndarray) -> list[float]:
     return [float(v) for v in np.sqrt((e**2).mean(axis=0))]
 
 
-def fit_payload(f: np.ndarray, acc_g: np.ndarray, gyr_deg_s: np.ndarray | None = None) -> dict[str, Any]:
+def fit_payload(
+    f: np.ndarray,
+    acc_g: np.ndarray,
+    gyr_deg_s: np.ndarray | None = None,
+    *,
+    t_s: np.ndarray | None = None,
+    mcu_s: np.ndarray | None = None,
+) -> dict[str, Any]:
     """Fit K from free-air samples (the BOX held by its body, nothing touching the payload).
 
     Returns K, the in-sample and leave-one-attitude-out residuals, and the rigid-body reading of
     K (mass from the force block's singular values, their spread as the gain anisotropy, CoM from
     the moment block). The offset the fit also finds is the current zero's bias, not a property of
     the BOX, and is reported only for comparison.
+
+    With the sample times ``t_s`` (host, s) it also reports how far the same attitude drifted over
+    the capture (:func:`same_attitude_drift`); with the BOX clock ``mcu_s`` (s since power-up) how
+    long the BOX had been on. Either can add to ``warnings``; neither changes the verdict.
     """
     f = np.asarray(f, dtype=float)
     acc = np.asarray(acc_g, dtype=float)
     keep = static_mask(acc, gyr_deg_s)
     f, acc = f[keep], acc[keep]
+    t_keep = None if t_s is None else np.asarray(t_s, dtype=float)[keep]
+    mcu_keep = None if mcu_s is None else np.asarray(mcu_s, dtype=float)[keep]
     if len(f) < 30:
         raise ValueError(f"only {len(f)} quasi-static samples; hold each attitude still for 2-3 s")
     labels = attitude_labels(acc)
@@ -302,6 +328,25 @@ def fit_payload(f: np.ndarray, acc_g: np.ndarray, gyr_deg_s: np.ndarray | None =
 
     worst_n = max((max(v[:3]) for v in heldout.values()), default=math.nan)
     worst_nm = max((max(v[3:]) for v in heldout.values()), default=math.nan)
+
+    warnings: list[str] = []
+    uptime = None
+    if mcu_keep is not None and np.isfinite(mcu_keep).any():
+        up = mcu_keep[np.isfinite(mcu_keep)]
+        uptime = {"start_s": round(float(up[0]), 1), "end_s": round(float(up[-1]), 1)}
+        if up[0] < WARMUP_S:
+            warnings.append(
+                f"BOX 开始采集时才上电 {up[0] / 60:.0f} 分钟（要求预热 30 分钟），读数会随温度漂，留一面误差会被拉大"
+            )
+    drift = None
+    if t_keep is not None and np.isfinite(t_keep).all():
+        drift = same_attitude_drift(f, acc, t_keep, K)
+        if drift["pairs"] and drift["worst_force_N"] > DRIFT_WARN_N:
+            a = ", ".join(f"{v:+.2f}" for v in drift["acc_g"])
+            warnings.append(
+                f"同一朝向（acc ≈ ({a}) g）的 {drift['axis']} 在采集第 {drift['from_s']:.0f}–{drift['to_s']:.0f} s 之间"
+                f"漂了 {drift['change_N']:+.2f} N（> {DRIFT_WARN_N} N）；多半是 BOX 没预热"
+            )
     return {
         "K": K.round(5).tolist(),
         "n_static": int(len(f)),
@@ -320,7 +365,66 @@ def fit_payload(f: np.ndarray, acc_g: np.ndarray, gyr_deg_s: np.ndarray | None =
             "com_in_ft_m": [round(float(c), 4) for c in com],
         },
         "zero_offset_seen": [round(float(v), 4) for v in offset],
+        "box_uptime_s": uptime,
+        "drift_same_attitude": drift,
+        "warnings": warnings,
     }
+
+
+def _holds(acc: np.ndarray, t: np.ndarray) -> list[np.ndarray]:
+    """Index arrays of the holds in time-ordered quasi-static samples (see ``HOLD_GAP_S``)."""
+    order = np.argsort(t, kind="stable")
+    holds: list[list[int]] = []
+    for i in order:
+        if holds and t[i] - t[holds[-1][-1]] <= HOLD_GAP_S and np.abs(acc[i] - acc[holds[-1][0]]).max() <= HOLD_ACC_G:
+            holds[-1].append(int(i))
+        else:
+            holds.append([int(i)])
+    return [np.asarray(h) for h in holds if len(h) >= HOLD_MIN_SAMPLES]
+
+
+def same_attitude_drift(f: np.ndarray, acc: np.ndarray, t: np.ndarray, k: np.ndarray) -> dict[str, Any]:
+    """How much the force at one attitude changed over the capture.
+
+    Takes K*acc off every quasi-static sample (the offset cancels in a difference), averages each
+    hold, and compares every pair of holds at the same attitude at least ``DRIFT_MIN_APART_S``
+    apart. Reports the largest force change (later minus earlier), where and when it was, and the
+    largest change per force axis. Times are seconds from the first sample. ``pairs`` is 0 when no
+    attitude was held twice (a hand-held capture that visits each face once): drift is then unknown.
+    """
+    t = np.asarray(t, dtype=float)
+    r = np.asarray(f, dtype=float) - np.asarray(acc, dtype=float) @ np.asarray(k, dtype=float).T
+    holds = _holds(acc, t)
+    t0 = float(t.min()) if len(t) else 0.0
+    h_acc = np.array([acc[h].mean(axis=0) for h in holds]).reshape(-1, 3)
+    h_t = np.array([t[h].mean() for h in holds])
+    h_r = np.array([r[h, :3].mean(axis=0) for h in holds]).reshape(-1, 3)
+    out: dict[str, Any] = {"holds": len(holds), "pairs": 0, "worst_force_N": 0.0, "max_abs_by_axis_N": [0.0, 0.0, 0.0]}
+    best = None
+    by_axis = np.zeros(3)
+    for i in range(len(holds)):
+        for j in range(i + 1, len(holds)):
+            a, b = (i, j) if h_t[i] <= h_t[j] else (j, i)
+            if h_t[b] - h_t[a] < DRIFT_MIN_APART_S or np.abs(h_acc[a] - h_acc[b]).max() > SAME_ATTITUDE_G:
+                continue
+            out["pairs"] += 1
+            d = h_r[b] - h_r[a]
+            by_axis = np.maximum(by_axis, np.abs(d))
+            k = int(np.argmax(np.abs(d)))
+            if best is None or abs(d[k]) > abs(best[0]):
+                best = (float(d[k]), k, a, b)
+    if best is not None:
+        change, k, a, b = best
+        out.update(
+            worst_force_N=round(abs(change), 3),
+            axis=("Fx", "Fy", "Fz")[k],
+            change_N=round(change, 3),
+            from_s=round(float(h_t[a] - t0), 1),
+            to_s=round(float(h_t[b] - t0), 1),
+            acc_g=[round(float(v), 3) for v in h_acc[a]],
+            max_abs_by_axis_N=[round(float(v), 3) for v in by_axis],
+        )
+    return out
 
 
 def _skew(v: np.ndarray) -> np.ndarray:
@@ -331,9 +435,20 @@ def _skew(v: np.ndarray) -> np.ndarray:
 # --- inputs ------------------------------------------------------------------------------------
 
 
-def read_live_log(path: Path, *, sensor_key: str = "", t0: float | None = None, t1: float | None = None):
-    """Rows of a gateway-preview log (``{"t","k","f","acc","gyr"}`` per line) -> f, acc, gyr arrays."""
-    f, acc, gyr = [], [], []
+def read_live_log(
+    path: Path,
+    *,
+    sensor_key: str = "",
+    t0: float | None = None,
+    t1: float | None = None,
+    with_time: bool = False,
+):
+    """Rows of a gateway-preview log (``{"t","k","f","acc","gyr"}`` per line) -> f, acc, gyr arrays.
+
+    ``with_time`` adds the host time ``t`` (s) and the BOX clock ``ts`` (µs since its power-up, as
+    s; NaN where a row has none).
+    """
+    f, acc, gyr, wall, mcu = [], [], [], [], []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         try:
             row = json.loads(line)
@@ -348,7 +463,13 @@ def read_live_log(path: Path, *, sensor_key: str = "", t0: float | None = None, 
             f.append(row["f"])
             acc.append(row["acc"])
             gyr.append(row["gyr"])
-    return np.asarray(f, dtype=float), np.asarray(acc, dtype=float), np.asarray(gyr, dtype=float)
+            wall.append(float(t) if t is not None else math.nan)
+            ts = row.get("ts")
+            mcu.append(float(ts) / 1e6 if isinstance(ts, (int, float)) and ts > 0 else math.nan)
+    arrays = np.asarray(f, dtype=float), np.asarray(acc, dtype=float), np.asarray(gyr, dtype=float)
+    if with_time:
+        return (*arrays, np.asarray(wall, dtype=float), np.asarray(mcu, dtype=float))
+    return arrays
 
 
 def read_box_sensors(path: Path, device_id: int | str | None = None):
@@ -413,13 +534,98 @@ def compensate_episode(ep_dir: Path, registry: dict[str, Any] | None = None) -> 
     return out
 
 
+# --- registry writes ---------------------------------------------------------------------------
+
+
+def format_registry(registry: dict[str, Any]) -> str:
+    """The registry as the checked-in file lays it out: two-space JSON, lists of numbers on one line."""
+    text = json.dumps(registry, indent=2, ensure_ascii=False)
+    number = r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+    pattern = re.compile(r"\[\s*(" + number + r"(?:,\s*" + number + r")*)\s*\]")
+    return pattern.sub(lambda m: "[" + ", ".join(v.strip() for v in m.group(1).split(",")) + "]", text) + "\n"
+
+
+def payload_record(
+    fit: dict[str, Any],
+    *,
+    end_effector: str,
+    valid_from_unix: float,
+    status: str,
+    source: str,
+) -> dict[str, Any]:
+    """A ``six_d_payload`` entry from a :func:`fit_payload` result."""
+    if fit.get("K") is None or np.asarray(fit["K"]).shape != (6, 3):
+        raise ValueError("the fit has no 6x3 K")
+    stamp = datetime.fromtimestamp(valid_from_unix, tz=timezone(timedelta(hours=8)))
+    return {
+        "valid_from_unix": int(valid_from_unix),
+        "valid_from": stamp.strftime("%Y-%m-%d %H:%M:%S +08:00"),
+        "end_effector": end_effector,
+        "model": MODEL,
+        "K": fit["K"],
+        "status": status,
+        "fit": {
+            "log": source,
+            "n_static": fit.get("n_static"),
+            "attitudes": fit.get("attitudes"),
+            "heldout_worst_force_N": fit.get("heldout_worst_force_N"),
+            "heldout_worst_moment_Nm": fit.get("heldout_worst_moment_Nm"),
+            "rigid_reading": {
+                k: v for k, v in (fit.get("rigid_reading") or {}).items() if k in ("mass_kg", "axis_gain_kg", "com_in_ft_m")
+            },
+        },
+    }
+
+
+def add_payload_record(registry: dict[str, Any], device_id: int | str, record: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``registry`` with ``record`` added to the BOX's ``six_d_payload`` list (kept in time order).
+
+    Refuses a BOX the registry does not know (add it with its role first) and a second record with
+    the same ``valid_from_unix`` (an end-effector change is a new time, a re-fit of the same
+    configuration replaces nothing silently).
+    """
+    out = json.loads(json.dumps(registry))
+    entry = device_entry(out, device_id)
+    if entry is None:
+        raise ValueError(f"BOX {device_id} is not in the registry; add it with its role first")
+    records = entry.setdefault("six_d_payload", [])
+    if any(int(r.get("valid_from_unix", -1)) == int(record["valid_from_unix"]) for r in records):
+        raise ValueError(f"BOX {device_id} already has a record valid from {record['valid_from_unix']}")
+    records.append(record)
+    records.sort(key=lambda r: float(r["valid_from_unix"]))
+    return out
+
+
+def write_registry(registry: dict[str, Any], path: Path = REGISTRY_PATH) -> Path | None:
+    """Write the registry; the previous file is kept next to it as ``<name>.<stamp>.bak``."""
+    path = Path(path)
+    backup = None
+    if path.is_file():
+        backup = path.with_name(f"{path.name}.{datetime.now():%Y%m%d_%H%M%S}.bak")
+        shutil.copy2(path, backup)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(format_registry(registry), encoding="utf-8")
+    tmp.replace(path)
+    return backup
+
+
 # --- CLI ---------------------------------------------------------------------------------------
 
 
 def _cmd_fit(args: argparse.Namespace) -> int:
-    f, acc, gyr = read_live_log(args.log, sensor_key=args.key, t0=args.t0, t1=args.t1)
-    result = fit_payload(f, acc, gyr)
+    f, acc, gyr, wall, mcu = read_live_log(args.log, sensor_key=args.key, t0=args.t0, t1=args.t1, with_time=True)
+    try:
+        result = fit_payload(f, acc, gyr, t_s=wall, mcu_s=mcu)
+    except ValueError as exc:
+        if args.json:
+            Path(args.json).write_text(json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"fit refused: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        Path(args.json).write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    for w in result["warnings"]:
+        print(f"warning: {w}", file=sys.stderr)
     if not result["meets_target"]:
         print(
             f"held-out attitude rms {result['heldout_worst_force_N']} N > {TARGET_HELDOUT_RMS_N} N: "
@@ -447,6 +653,28 @@ def _cmd_episode(args: argparse.Namespace) -> int:
     return rc
 
 
+def _cmd_register(args: argparse.Namespace) -> int:
+    fit = json.loads(Path(args.fit).read_text(encoding="utf-8"))
+    if not fit.get("meets_target") and not args.allow_unmet:
+        print(
+            f"the fit's held-out attitude rms {fit.get('heldout_worst_force_N')} N is above "
+            f"{TARGET_HELDOUT_RMS_N} N; not registered (--allow-unmet to register it anyway)",
+            file=sys.stderr,
+        )
+        return 1
+    record = payload_record(
+        fit,
+        end_effector=args.end_effector,
+        valid_from_unix=float(args.valid_from_unix),
+        status=args.status,
+        source=args.source or str(args.fit),
+    )
+    registry = add_payload_record(load_registry(args.registry), args.device_id, record)
+    backup = write_registry(registry, args.registry)
+    print(json.dumps({"registered": record, "registry": str(args.registry), "backup": str(backup) if backup else None}, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -455,7 +683,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--key", default="", help="sensor key to keep, e.g. box3969377039/box_six_d_force")
     p.add_argument("--t0", type=float)
     p.add_argument("--t1", type=float)
+    p.add_argument("--json", type=Path, help="also write the result (or the refusal) here")
     p.set_defaults(func=_cmd_fit)
+    p = sub.add_parser("register", help="add a fit to the BOX's six_d_payload records in the registry")
+    p.add_argument("fit", type=Path, help="a `fit --json` result")
+    p.add_argument("--device-id", required=True)
+    p.add_argument("--end-effector", required=True, help="what the 6D sensor carries in this configuration")
+    p.add_argument(
+        "--valid-from-unix",
+        type=float,
+        required=True,
+        help="when this configuration was mounted (not when it was fitted): the record applies from then",
+    )
+    p.add_argument("--status", default="fitted")
+    p.add_argument("--source", default="", help="where the log is (default: the fit path)")
+    p.add_argument("--registry", type=Path, default=REGISTRY_PATH)
+    p.add_argument("--allow-unmet", action="store_true")
+    p.set_defaults(func=_cmd_register)
     p = sub.add_parser("episode", help="external wrench summary of a recorded episode")
     p.add_argument("episode", type=Path)
     p.set_defaults(func=_cmd_episode)
