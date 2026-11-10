@@ -3,6 +3,8 @@ import type { Fr3BaseEdgeResponse } from "../types";
 import {
   applyConfirmation,
   edgeEnds,
+  cartAttentionLines,
+  cartBlockingLines,
   graphGuardBlocks,
   graphGuardLines,
   candidateSpread,
@@ -77,6 +79,34 @@ describe("fr3BaseEdge", () => {
     const text = applyConfirmation({ ...candidate("armarm_x", null), from: "fr3_base", to: "fr3_base_right", quality: q }, current);
     expect(text).toContain("fr3_base → fr3_base_right");
     expect(text).toContain("闭合");
+  });
+
+  it("turns red for a moved cart, yellow for what only a maintainer can settle", () => {
+    const base = {
+      base: "fr3_base_right",
+      why: "",
+      episode: "ds/episodes/episode_000000",
+      episodeStartUtc: "2026-11-10T10:00:00+00:00",
+      checkedUtc: "",
+      tagsMissing: [],
+      currentEdge: true,
+      blocking: false,
+      note: "",
+    };
+    expect(cartBlockingLines(undefined)).toEqual([]);
+    const check = (verdict: "ok" | "moved" | "inconsistent" | "partial" | "reference_stale", extra = {}) => ({
+      enabled: true,
+      references: [],
+      bases: [{ ...base, verdict, ...extra }],
+    });
+    expect(cartBlockingLines(check("ok"))).toEqual([]);
+    expect(cartAttentionLines(check("ok"))).toEqual([]);
+    expect(cartAttentionLines(check("partial"))).toEqual([]);
+    const moved = check("moved", { blocking: true, note: "fr3_base_right 的小车被推动过：…" });
+    expect(cartBlockingLines(moved)).toEqual(["fr3_base_right 的小车被推动过：…"]);
+    expect(cartAttentionLines(moved)).toEqual([]);
+    expect(cartAttentionLines(check("inconsistent"))[0]).toContain("tag 彼此对不上");
+    expect(cartAttentionLines(check("reference_stale", { currentEdge: false }))[0]).toContain("重新绑定");
   });
 
   it("turns red only while the world graph is not the trusted one", () => {

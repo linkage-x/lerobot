@@ -67,6 +67,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # pyarrow-only helpers shared with the recorder's box v3 writer.
+from tools.fr3 import fr3_arms  # noqa: E402
 from tools.thor.gmsl2 import (  # noqa: E402
     label_provenance as lp,
     thor_lerobot_v3 as lr3,
@@ -1337,6 +1338,39 @@ def _describe_labels(labels: dict[str, Any]) -> str:
     )
 
 
+def _deployable_arms(world_graph: dict[str, Any], world_frame_id: str) -> list[str]:
+    """One line per arm: can a policy trained on poses in ``world_frame_id`` be placed in its base today?
+
+    Informational -- the dataset does not depend on it -- but it is the answer an operator needs before
+    training for an arm: an arm whose edge is retired (or blocked by the world-graph guard) has to be
+    registered before deployment will run on it.
+    """
+    if not world_frame_id:
+        return [
+            "WARNING: unstamped episodes: no arm's base can be reached through world_graph.json; deployment can "
+            "only estimate the transform from the start pose"
+        ]
+    lines = []
+    for arm in fr3_arms.ARMS:
+        base = fr3_arms.base_world_id(arm)
+        try:
+            found = wp.world_transform(world_graph, world_frame_id, base)
+        except wp.WorldGraphClosureError as exc:
+            lines.append(f"WARNING: {arm} arm ({base}): the graph's routes disagree: {exc}")
+            continue
+        if found is not None:
+            hops = found[1]
+            via = ", ".join(f"{h['method'] or '?'} solved {h['created_utc'] or '?'}" for h in hops) or "same frame"
+            lines.append(f"Deployable on the {arm} arm ({base}) via {via}")
+            continue
+        retired = wp.retired_note(world_graph, world_frame_id, base)
+        lines.append(
+            f"Not deployable on the {arm} arm ({base}) until it is registered"
+            + (": " + retired.replace("\n", "; ") if retired else ": no edge")
+        )
+    return lines
+
+
 def export_task_to_v3(
     *,
     datasets_root: Path,
@@ -1489,26 +1523,25 @@ def export_task_to_v3(
     # world_graph.json or not at all: an unstamped source has no world to start
     # from, and two unconnected worlds have no transform -- neither may fall back
     # to an identity, which would relabel the poses without moving them.
-    # "auto" is what the GUI asks for. The poses are for the FR3, which commands in
-    # its own base frame; when a measured edge reaches it, using it here is what lets
-    # deployment skip guessing that transform from one start pose. Without an edge
-    # the recorded world is kept -- the stamp below says so, and deployment falls
-    # back to start-pose alignment on any dataset not stamped fr3_base.
+    # "auto" is what the GUI asks for: keep the world the episodes were recorded in.
+    # Until 11-10 it re-expressed in fr3_base whenever an edge reached it, which made
+    # the frame of an export depend on the state of world_graph.json that day -- the
+    # same task exported before and after an arm is registered would land in two
+    # frames, and a dataset baked into one arm's base cannot drive the other arm or
+    # both. The camera world is the one frame both hands share; deployment puts the
+    # poses in the driven arm's base through the edge live *then*
+    # (fr3_act_infer_real_runtime --dataset-alignment world_graph), so re-registering
+    # an arm does not leave trained policies on a stale edge. Asking for a base by
+    # name (--target-world fr3_base) still re-expresses, as before.
     world_graph = wp.read_world_graph(_REPO_ROOT)
     if target_world == wp.TARGET_WORLD_AUTO:
-        reachable = bool(world_frame_id) and (
-            world_frame_id == wp.FR3_BASE_WORLD_ID
-            or wp.world_transform(world_graph, world_frame_id, wp.FR3_BASE_WORLD_ID) is not None
+        target_world = None
+        _emit(
+            f"Keeping the recorded world {world_frame_id or '(unstamped)'}; deployment puts the poses "
+            "in the driven arm's base through world_graph.json"
         )
-        target_world = wp.FR3_BASE_WORLD_ID if reachable else None
-        if not reachable:
-            _emit(
-                f"No registration edge reaches {wp.FR3_BASE_WORLD_ID} from "
-                f"{world_frame_id or 'unstamped episodes'}; keeping the recorded world"
-            )
-            retired = wp.retired_note(world_graph, wp.FR3_BASE_WORLD_ID)
-            if retired:
-                _emit(f"WARNING: {retired}")
+        for line in _deployable_arms(world_graph, world_frame_id):
+            _emit(line)
 
     output_world_frame = source_world_frame
     T_target_source: list[list[float]] | None = None
@@ -1775,9 +1808,9 @@ def main(argv: list[str] | None = None) -> int:
         "--target-world",
         default=None,
         help="re-express world-frame poses in this world (e.g. fr3_base) through a "
-        "registration edge of tools/thor/gmsl2/world/world_graph.json; 'auto' picks "
-        "fr3_base when an edge reaches it and keeps the recorded world otherwise; "
-        "default keeps the world the episodes were recorded in",
+        "registration edge of tools/thor/gmsl2/world/world_graph.json; 'auto' (the GUI) keeps "
+        "the recorded world and lists the arms deployment can reach from it; default keeps the "
+        "world the episodes were recorded in",
     )
     ap.add_argument(
         "--allow-mixed-labels",

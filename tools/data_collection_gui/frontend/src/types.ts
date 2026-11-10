@@ -5,6 +5,20 @@ export type DeploymentProfile = {
   label: string;
   capabilities: string[];
   defaultRoute: string;
+  /** Personal sandbox name (run/deploy.sh thor --sandbox NAME); null/absent on production. */
+  sandbox?: string | null;
+  /** What run/deploy.sh wrote into the gateway's tree (DEPLOYED.json); null when deployed some other way. */
+  release?: DeployedRelease | null;
+};
+
+export type DeployedRelease = {
+  commit: string | null;
+  branch: string | null;
+  deployedUtc: string | null;
+  by: string | null;
+  /** The commit is on origin/box (a reviewed, merged version). */
+  onBox: boolean | null;
+  sandbox: string | null;
 };
 
 export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator" | "laser_tracker";
@@ -245,6 +259,10 @@ export type ReplayStatus = {
   message: string;
   datasetRoot?: string;
   datasetKind?: DatasetKind;
+  // Exported (training) datasets only: the recording this episode was exported from. Every replay
+  // check reads the recording's trajectory files, so they run there; problem: why it no longer
+  // vouches for this export (gone, or its trajectory regenerated after the export).
+  exportSource?: ExportSource | null;
   sourcePath?: string;
   dataStatus?: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   trajectoryKind?: "pose" | "gripper_width" | "none";
@@ -592,6 +610,14 @@ export type CollectionTask = {
 // merged into a v3 export.
 // "pseudo_bimanual" pairs two recorded right hands (one mirrored) for the two-arm panels; it has no
 // parquet or video of its own and is never a capture, an export source or training data.
+export type ExportSource = {
+  session: string;
+  episode: number;
+  datasetRoot: string;
+  hands: string[];
+  problem: string;
+};
+
 export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration" | "pseudo_bimanual";
 
 export type RecordedDataset = {
@@ -1432,6 +1458,48 @@ export type WorldGraphGuard = {
   problems: string[];
   recordedUtc: string;
   reason?: string;
+};
+
+/** Is each FR3 cart still where its world edge was solved (gateway _cart_check_status, cart_state). */
+export type CartCheckVerdict =
+  | "ok"
+  | "moved"
+  | "partial"
+  | "unseen"
+  | "inconsistent"
+  | "other_calibration"
+  | "reference_stale"
+  | "";
+
+export type CartCheckBase = {
+  base: string;
+  verdict: CartCheckVerdict;
+  why: string;
+  episode: string;
+  episodeStartUtc: string;
+  checkedUtc: string;
+  boundMm?: number | null;
+  limitMm?: number | null;
+  tagsMissing: number[];
+  /** the verdict was measured against an edge that is still live */
+  currentEdge: boolean;
+  /** the cart moved since its edge was solved: that edge is out of every route */
+  blocking: boolean;
+  note: string;
+};
+
+export type CartCheck = {
+  enabled: boolean;
+  references: {
+    group: string;
+    base: string;
+    source: string;
+    boundUtc: string;
+    tags: number[];
+    limitMm?: number | null;
+    edgeCreatedUtc: string;
+  }[];
+  bases: CartCheckBase[];
 };
 
 export type Fr3BaseEdgeResponse = {

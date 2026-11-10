@@ -218,6 +218,48 @@ code goes too), but its record outlives that deploy.
 After applying an edge on Thor, still copy `world_graph.json` back into the repo
 and commit: otherwise the next deploy, even of a current tree, trips the guard.
 
+### The cart reference (`cart_reference.json`, 2026-11-10)
+
+An edge into a robot base is right only while the arm's cart stands where it
+stood when the edge was solved, and the guard above compares files, not
+positions. `cart_reference.json` keeps, per cart, the tags on it as the
+cameras saw them while the cart stood there, and the edge that holds for that
+placement (`world_graph_guard.edge_key`: ends, solve time, matrix hash).
+
+- **right_cart** (`fr3_base_right`): tags 40/42/44 from
+  `thor_gmsl2_11ch_v1_20261110_165824` (16.7 s static clip, cable cleared off
+  42), bound to the 11-10 ball edge (solved 02:49:19Z), calibration
+  `calib_20261102_195715` extrinsics on `calib_20261027_173815` intrinsics.
+  Tags 500/326/308 mm apart, smallest triangle angle 37°. 40 and 44 sat within
+  0.5–0.6 mm of where the pivot-time episode `…_100154` (10:02, same cameras)
+  put them, so the cart had not moved since the edge was solved. 41/43 are
+  not stuck and will not be: three tags, no redundancy (one hidden tag leaves
+  only a shift check; a tag that moved on its own is caught by the fit
+  residual, not identified).
+- Written by `cart_redock_check.py bind-reference <measurement> --group
+  right_cart --source <dataset>`; refused with fewer than 3 tags, tags nearly
+  on a line, a tag seen by cameras under 10° apart, or not exactly one live
+  edge between the world and the base.
+- **Every new episode** is checked by the gateway in the background
+  (`cart_redock_check.py cart <episode>`, 16 keyframes per camera, cameras the
+  table tags say moved left out). The verdict per base goes to
+  `outputs/cart_check.json` (no deploy touches it); `world_provenance.
+  live_edges` drops an edge whose cart `moved` -- the arm's working volume
+  (`CLOSURE_WORKSPACE_M`) displaced by more than 3 mm (provisional: the edge
+  itself is good to ~3 mm; 3 tags read the volume to ~1.4 mm p95 in a Monte
+  Carlo on 165824's cameras). Only `moved` blocks; `partial` (two tags: shift
+  only), `unseen`, `inconsistent` (tags not moving together),
+  `other_calibration` and `reference_stale` are shown, not enforced. A later
+  episode with the cart back in place lifts it, and so does a new edge.
+- It only knows what was recorded: a cart pushed after the latest episode is
+  unseen until the next one. After a push, record a short clip with the cart's
+  tags and the table in view before replaying (user guide, section 3).
+- Each `moved` result carries `predicted_edge_T_to_from` (the edge moved with
+  the tags), marked `validated_for_correction: false`. Using it instead of a
+  ball check needs a push-away/push-back test against a single-ball check first.
+- Re-registering the base, or recalibrating the cameras, needs a new reference
+  (`--replace`), taken while the cart has not moved since.
+
 ### The table datum (`table_datum.json`, 2026-10-27)
 
 Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are

@@ -34,6 +34,7 @@ from urllib.request import urlopen
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.data_collection_gui import fr3_payload_calibration as payload_cal
 from tools.fr3 import fr3_arms
+from tools.thor.gmsl2 import cart_state
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
 from tools.thor.gmsl2 import register_fr3_base
@@ -540,6 +541,9 @@ class GatewayState:
     recording: RecordingStatus
     replay: ReplayStatus
     profile: str = "thor"
+    # Name of a personal sandbox (run/deploy.sh thor --sandbox NAME), None for production. A sandbox
+    # shares the machine with the production gateway, so it never opens cameras, BOXes or robots.
+    sandbox: str | None = None
     datasets_root: Path | None = None
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
@@ -3730,8 +3734,8 @@ def _log_common_mode(state: GatewayState, summary_path: Path) -> None:
 
 # --- FR3 base registration edge (world -> fr3_base) ----------------------------
 #
-# Every fr3_base trajectory -- MuJoCo preview, IK QC, real replay, export with
-# --target-world auto -- goes through this one edge of world_graph.json. It is
+# Every fr3_base trajectory -- MuJoCo preview, IK QC, real replay, deployment of a
+# policy on that arm -- goes through this one edge of world_graph.json. It is
 # measured by tools/thor/gmsl2/register_fr3_base.py from a P0 single-tag run:
 # tag36h11 id6 on the FR3 tool, seen at many arm poses by the world's cameras
 # held at their reference poses.
@@ -4379,6 +4383,188 @@ def _world_graph_guard_status(state: GatewayState) -> dict[str, Any]:
 
 
 _WORLD_GRAPH_GUARD_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
+# --- Cart check (11-10) ------------------------------------------------------------
+#
+# A world -> robot-base edge holds while the arm's cart stands where it stood when the
+# edge was solved; the guard above compares files and cannot see a pushed cart. After
+# every recording the newest complete episode is checked in the background against
+# world/cart_reference.json (cart_redock_check.py cart, the tags on the cart): a cart
+# seen to have moved takes its edge out of every route (cart_state, read by
+# world_provenance.live_edges) and the GUI shows it in red, until a later clip finds the
+# cart back in place or the base is registered again. It only knows what was recorded:
+# a cart pushed after the last episode is unseen until the next one.
+_CART_CHECK_SCRIPT = Path("tools") / "thor" / "gmsl2" / "cart_redock_check.py"
+_CART_CHECK_INTERVAL_S = 30.0
+# 11-10 165824 (8 cameras x 16 keyframes): a few seconds; generous for a long episode on a busy Thor
+_CART_CHECK_TIMEOUT_S = 900
+# not while the recorder starts, writes or finalises an episode: decoding 8 cameras competes with it
+_CART_CHECK_BUSY_STATES = frozenset({"connecting", "recording", "saving", "discarding"})
+# only datasets touched in the last day hold candidates: the newest episode is what says where the cart is now
+_CART_CHECK_RECENT_S = 24 * 3600
+
+
+def _cart_check_enabled(state: GatewayState) -> bool:
+    """Production Thor with a cart reference: a sandbox has copies, the workstation no camera episodes."""
+    return (
+        state.profile != "workstation"
+        and not state.sandbox
+        and (state.repo_root / cart_state.REFERENCE_FILE).is_file()
+    )
+
+
+def _newest_complete_episode(state: GatewayState) -> Path | None:
+    """The most recently finished camera episode (has meta.json and cam_*.mkv) under the datasets root."""
+    root = state.datasets_root
+    if root is None or not root.is_dir():
+        return None
+    now = time.time()
+    best: Path | None = None
+    best_mtime = -1.0
+    try:
+        datasets = [root] if (root / "episodes").is_dir() else [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    for dataset in datasets:
+        episodes = dataset / "episodes"
+        try:
+            if not episodes.is_dir() or now - episodes.stat().st_mtime > _CART_CHECK_RECENT_S:
+                continue
+            for episode in episodes.iterdir():
+                meta = episode / "meta.json"
+                if not meta.is_file():
+                    continue
+                mtime = meta.stat().st_mtime
+                if mtime > best_mtime and any(episode.glob("cam_*.mkv")):
+                    best, best_mtime = episode, mtime
+        except OSError:
+            continue
+    return best
+
+
+def _cart_check_python(state: GatewayState) -> Path:
+    """numpy + cv2: opencv_kalibr's venv on Thor."""
+    candidate = state.repo_root / "third_party" / "opencv_kalibr" / ".venv" / "bin" / "python3"
+    return candidate if candidate.is_file() else _venv_python3(state.repo_root)
+
+
+def _run_cart_check(
+    state: GatewayState, episode: Path, *, run: Callable[..., Any] = subprocess.run
+) -> list[str]:
+    """Check one episode's carts; returns the verdict lines (also logged). Never raises."""
+    command = [
+        "nice", "-n", "10", str(_cart_check_python(state)), str(state.repo_root / _CART_CHECK_SCRIPT),
+        "cart", str(episode), "--calibration-root", str(_calibration_root(state)),
+        "--repo-root", str(state.repo_root),
+    ]
+    # numpy + cv2 only; an inherited PYTHONPATH could put another numpy first
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    try:
+        proc = run(
+            command, cwd=str(state.repo_root), env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=_CART_CHECK_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        with state.lock:
+            state.log("warn", f"Cart check failed on {episode}: {exc}")
+        return []
+    lines = [line for line in (proc.stdout or "").splitlines() if line.startswith("cart check")]
+    with state.lock:
+        if proc.returncode not in (0, 1) or not lines:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            state.log("warn", f"Cart check failed on {episode}: {tail[-1] if tail else proc.returncode}")
+            return []
+        for line in lines:
+            state.log("error" if f": {cart_state.MOVED}" in line else "info", f"{line} ({episode.parent.parent.name}/{episode.name})")
+    return lines
+
+
+def _cart_check_worker(state: GatewayState) -> None:
+    """Background: check the newest finished episode once, whenever a new one appears and the recorder is idle."""
+    last: tuple[str, int] | None = None
+    while True:
+        time.sleep(_CART_CHECK_INTERVAL_S)
+        try:
+            if not _cart_check_enabled(state) or state.recording.state in _CART_CHECK_BUSY_STATES:
+                continue
+            episode = _newest_complete_episode(state)
+            if episode is None:
+                continue
+            key = (str(episode), (episode / "meta.json").stat().st_mtime_ns)
+            if key == last:
+                continue
+            last = key
+            _run_cart_check(state, episode)
+        except Exception as exc:  # noqa: BLE001 -- the worker must outlive any one bad episode
+            with state.lock:
+                state.log("warn", f"Cart check worker: {exc}")
+
+
+def _cart_check_status(state: GatewayState) -> dict[str, Any]:
+    """For the snapshot: each cart's reference and latest verdict, and whether it holds its edge back."""
+    paths = (
+        state.repo_root / cart_state.STATE_FILE,
+        state.repo_root / cart_state.REFERENCE_FILE,
+        state.repo_root / world_graph_guard.GRAPH_FILE,
+    )
+    try:
+        key = tuple(p.stat().st_mtime_ns if p.exists() else 0 for p in paths)
+    except OSError:
+        key = (-1, -1, -1)
+    cached = _CART_CHECK_CACHE.get(str(state.repo_root))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    reference = _read_json_file(paths[1]) or {}
+    try:
+        graph = wp.read_world_graph(state.repo_root)
+    except RuntimeError:
+        graph = {"edges": [], cart_state.GRAPH_KEY: cart_state.read(state.repo_root)}
+    blocked = cart_state.blocked_edges(graph, world_graph_guard.edge_key)
+    live_keys = {
+        json.dumps(world_graph_guard.edge_key(e), sort_keys=True, separators=(",", ":"))
+        for e in graph.get("edges") or []
+        if wp.edge_retired(e) is None
+    }
+    bases = []
+    for base, entry in sorted(((graph.get(cart_state.GRAPH_KEY) or {}).get("bases") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        edge = json.dumps(entry.get("edge"), sort_keys=True, separators=(",", ":"))
+        episode = Path(str(entry.get("episode") or ""))
+        bases.append({
+            "base": base,
+            "verdict": str(entry.get("verdict") or ""),
+            "why": str(entry.get("why") or ""),
+            "episode": "/".join(episode.parts[-3:]) if episode.parts else "",
+            "episodeStartUtc": str(entry.get("episode_start_utc") or ""),
+            "checkedUtc": str(entry.get("checked_utc") or ""),
+            "boundMm": entry.get("within_reach_bound_mm"),
+            "limitMm": entry.get("limit_mm"),
+            "tagsMissing": list(entry.get("tags_missing") or []),
+            "currentEdge": edge in live_keys,
+            "blocking": edge in blocked,
+            "note": cart_state.note(dict(entry, base=base)) if edge in blocked else "",
+        })
+    references = [
+        {
+            "group": group,
+            "base": str(ref.get("base") or ""),
+            "source": str(ref.get("source") or ""),
+            "boundUtc": str(ref.get("bound_utc") or ""),
+            "tags": list(ref.get("tags") or []),
+            "limitMm": ref.get("limit_mm"),
+            "edgeCreatedUtc": str((ref.get("edge") or {}).get("created_utc") or ""),
+        }
+        for group, ref in sorted((reference.get("groups") or {}).items())
+        if isinstance(ref, dict)
+    ]
+    status = {"enabled": _cart_check_enabled(state), "references": references, "bases": bases}
+    _CART_CHECK_CACHE[str(state.repo_root)] = (key, status)
+    return status
+
+
+_CART_CHECK_CACHE: dict[str, tuple[tuple[int, ...], dict[str, Any]]] = {}
 
 
 # Outside the state lock (see the POST handler): the solve runs for minutes.
@@ -11327,9 +11513,9 @@ def _export_command(state: GatewayState, task: dict[str, Any]) -> tuple[list[str
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
-        # Not an operator choice: the poses are for the FR3, so they go to its base
-        # frame whenever a measured edge reaches it (export_v3 keeps the recorded
-        # world and says so otherwise, and info.json records which it was).
+        # Not an operator choice: the poses stay in the camera world they were
+        # recorded in (both hands' common frame); deployment puts them in the driven
+        # arm's base through the edge live then. export_v3 lists which arms that is.
         "--target-world", "auto",
     ]
     return command, out_root
@@ -11369,9 +11555,9 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
-        # Not an operator choice: the poses are for the FR3, so they go to its base
-        # frame whenever a measured edge reaches it (export_v3 keeps the recorded
-        # world and says so otherwise, and info.json records which it was).
+        # Not an operator choice: the poses stay in the camera world they were
+        # recorded in (both hands' common frame); deployment puts them in the driven
+        # arm's base through the edge live then. export_v3 lists which arms that is.
         "--target-world", "auto",
     ]
     return command, out_root
@@ -16104,7 +16290,12 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     _refresh_mujoco_validation_current(state)
 
     return {
-        "deployment": {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]},
+        "deployment": {
+            "profile": state.profile,
+            **DEPLOYMENT_PROFILES[state.profile],
+            "sandbox": state.sandbox,
+            "release": _deployed_release(state.repo_root),
+        },
         "gateway": {
             "configPath": str(state.config_path),
             "pid": state.recording.pid,
@@ -16118,7 +16309,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             for device in state.devices
         ],
         "recording": asdict(state.recording),
-        "replay": asdict(state.replay),
+        "replay": {**asdict(state.replay), "exportSource": _replay_export_source(state)},
         "teleop": asdict(state.teleop),
         "annotation": _active_annotation(state),
         "calibration": _calibration_payload(state),
@@ -16133,6 +16324,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "activeTaskId": state.active_task_id or "",
         "datasetExport": asdict(state.dataset_export),
         "worldGraphGuard": _world_graph_guard_status(state),
+        "cartCheck": _cart_check_status(state),
     }
 
 
@@ -17362,6 +17554,7 @@ def _start_background_workers(state: GatewayState) -> None:
         target=_dataset_stats_refresher, args=(state,),
         daemon=True, name="dataset-stats-refresher",
     ).start()
+    Thread(target=_cart_check_worker, args=(state,), daemon=True, name="cart-check").start()
 
 
 def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -19374,6 +19567,127 @@ def _start_dry_run_replay(state: GatewayState) -> None:
     state.log("info", state.replay.message)
 
 
+EXPORT_SOURCES_FILE = Path("meta") / "export_sources.json"
+
+
+def _export_source_episode(state: GatewayState, dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """The recording an exported episode came from (None if the export does not say).
+
+    An export_v3 dataset is training data: its poses are copied out of the recording's
+    derived/<sidecar>/state_action.<hand>.csv, and every replay check (EE trajectory, IK QC,
+    MuJoCo, real replay) reads those files, so the checks run on the recording, never on the export.
+    ``problem`` is non-empty when the recording no longer vouches for this export: it is gone,
+    or its trajectory was regenerated after the export was written.
+    """
+    sources_path = dataset_root / EXPORT_SOURCES_FILE
+    sources = _load_json_file(sources_path)
+    rows = sources.get("episodes") if isinstance(sources.get("episodes"), list) else []
+    row: dict[str, Any] | None = None
+    for candidate in rows:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            if int(candidate.get("global_episode_index", -1)) == int(episode):
+                row = candidate
+                break
+        except (TypeError, ValueError):
+            continue
+    if row is None:
+        return None
+    session = str(row.get("session") or "")
+    source_episode = str(row.get("source_episode") or "")
+    try:
+        source_index = int(source_episode.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    source_root = next(
+        (
+            candidate
+            for candidate in _complete_replay_dataset_candidates(state)
+            if candidate.name == session and _dataset_kind(state, candidate) == "recorded"
+        ),
+        None,
+    )
+    hands = sorted(
+        key.removeprefix("observation.ee_pose.").removesuffix(".base")
+        for key in (_load_dataset_info(dataset_root).get("features") or {})
+        if key.startswith("observation.ee_pose.") and key.endswith(".base")
+    )
+    problem = ""
+    if source_root is None:
+        problem = f"its recording {session} is not on this machine any more, so nothing vouches for its poses"
+    else:
+        try:
+            exported_at = sources_path.stat().st_mtime
+        except OSError:
+            exported_at = 0.0
+        sidecar = source_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+        regenerated = [
+            hand
+            for hand in hands
+            if (sidecar / f"state_action.{hand}.csv").is_file()
+            and (sidecar / f"state_action.{hand}.csv").stat().st_mtime > exported_at
+        ]
+        if regenerated:
+            problem = (
+                f"the {', '.join(regenerated)} trajectory of {session} was generated again after this export was "
+                "written, so the export still holds the old poses: export again"
+            )
+    return {
+        "session": session,
+        "episode": source_index,
+        "datasetRoot": str(source_root) if source_root is not None else "",
+        "hands": hands,
+        "problem": problem,
+    }
+
+
+def _replay_export_source(state: GatewayState) -> dict[str, Any] | None:
+    if state.replay.datasetKind != "exported":
+        return None
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(
+        state, state.replay.datasetRoot or state.replay.dataset
+    )
+    if dataset_root is None:
+        return None
+    return _export_source_episode(state, dataset_root, state.replay.episode)
+
+
+def _exported_replay_refusal(state: GatewayState, dataset_root: Path, episode: int) -> str:
+    source = _export_source_episode(state, dataset_root, episode)
+    head = (
+        f"{dataset_root.name} is an exported (training) dataset; EE trajectory, IK QC, MuJoCo and real replay "
+        "run on the recording it was exported from"
+    )
+    if source is None:
+        return f"{head}, and this export does not record which one ({EXPORT_SOURCES_FILE} has no episode {episode})."
+    where = f"{source['session']} episode {source['episode']}"
+    if source["problem"]:
+        return f"{head} ({where}), but {source['problem']}."
+    return f"{head}: open {where} (Open source recording) and check it there."
+
+
+def _open_export_source(state: GatewayState) -> None:
+    """Select the recording (and episode) the selected exported episode came from."""
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(
+        state, state.replay.datasetRoot or state.replay.dataset
+    )
+    if dataset_root is None or _dataset_kind(state, dataset_root) != "exported":
+        raise ValueError("Select an exported dataset first.")
+    episode = state.replay.episode
+    source = _export_source_episode(state, dataset_root, episode)
+    if source is None or not source["datasetRoot"]:
+        raise RuntimeError(_exported_replay_refusal(state, dataset_root, episode))
+    _select_replay_dataset(state, source["datasetRoot"])
+    _select_replay_episode(state, str(source["episode"]))
+    note = f"; note: {source['problem']}" if source["problem"] else ""
+    state.replay.message = (
+        f"Opened {source['session']} episode {source['episode']}, the recording of {dataset_root.name} "
+        f"episode {episode}{note}"
+    )
+    state.log("warn" if note else "info", state.replay.message)
+
+
 def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE, arm: str = "") -> None:
     """``arm``: the arm the replay panel has selected -- the preview plans in its base (none: the hand's own
     arm's), and real replay later refuses an arm whose base is not the one checked."""
@@ -19387,6 +19701,8 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {cube_mode!r}")
+    if state.profile != "workstation" and _dataset_kind(state, dataset_root) == "exported":
+        raise RuntimeError(_exported_replay_refusal(state, dataset_root, state.replay.episode))
     if state.profile != "workstation":
         # Thor validates against AprilTag cube trajectories generated from the camera stream.
         # A workstation dataset carries the arm's own EE actions instead, so there is no
@@ -20173,6 +20489,78 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
     state.log("warn", "Terminated handheld recorder process")
 
 
+# --- Personal sandboxes -------------------------------------------------------------------
+#
+# A sandbox gateway (run/deploy.sh thor --sandbox NAME) runs a student's branch next to the
+# production gateway on the same Thor. The cameras (one Argus slot), the BOXes, the laser tracker
+# and the FR3 arms each take exactly one owner, and that owner is production: a sandbox that opened
+# any of them would break a recording in progress or move an arm nobody is watching. So a sandbox
+# answers every endpoint that touches hardware with 409 and keeps everything offline (trajectory
+# generation, QC, MuJoCo, export, the replay viewer) on its own copies of the data.
+#
+# This is a guard against accidents, not a security boundary: it lives in the code the sandbox runs.
+SANDBOX_HARDWARE_POST_PREFIXES = (
+    "/api/handheld/record/",  # recorder: cameras, BOXes, laser tracker
+    "/api/device",  # BOX calibration (/api/device/...) and live previews (/api/device-preview/...)
+    "/api/replay/start-real",
+    "/api/replay/execute-real",
+    "/api/replay/preflight",
+    "/api/replay/dual-fr3/",
+    "/api/robot/",
+    "/api/teleop/",
+    "/api/fr3/",
+    "/api/calibration/fr3-pivot/",
+    "/api/calibration/fr3-payload",
+    "/api/calibration/session/",
+    "/api/calibration/marker-tcp/",
+    "/api/calibration/tracker-mount/",
+    "/api/calibration/rig-check",
+    "/api/calibration/world-frame/",
+)
+SANDBOX_HARDWARE_GET_PREFIXES = (
+    "/api/device-preview/",
+    "/api/replay/realsense",
+    "/api/teleop/camera.jpg",
+)
+DEPLOYED_RELEASE_FILE = "DEPLOYED.json"
+_DEPLOYED_RELEASE_CACHE: dict[str, tuple[int, dict[str, Any] | None]] = {}
+
+
+def _sandbox_hardware_refusal(state: GatewayState, method: str, path: str) -> str | None:
+    """Why a sandbox gateway refuses this request, or None when it may run it."""
+    if not state.sandbox:
+        return None
+    prefixes = SANDBOX_HARDWARE_POST_PREFIXES if method == "POST" else SANDBOX_HARDWARE_GET_PREFIXES
+    if not path.startswith(prefixes):
+        return None
+    return (
+        f"sandbox '{state.sandbox}' does not touch hardware: {path} needs the cameras, a BOX, the laser "
+        "tracker or an FR3 arm, and those belong to the production gateway (port 8765). Use the "
+        "production GUI for it, or test your change offline here."
+    )
+
+
+def _deployed_release(repo_root: Path) -> dict[str, Any] | None:
+    """What run/deploy.sh says it put in this tree (DEPLOYED.json), re-read only when the file changes."""
+    path = repo_root / DEPLOYED_RELEASE_FILE
+    try:
+        key = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    cached = _DEPLOYED_RELEASE_CACHE.get(str(path))
+    if cached is None or cached[0] != key:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        release = None
+        if isinstance(raw, dict):
+            release = {k: raw.get(k) for k in ("commit", "branch", "deployedUtc", "by", "onBox", "sandbox")}
+        cached = (key, release)
+        _DEPLOYED_RELEASE_CACHE[str(path)] = cached
+    return cached[1]
+
+
 class DataCollectionGuiHandler(BaseHTTPRequestHandler):
     server: "DataCollectionGuiServer"
 
@@ -20183,6 +20571,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        refusal = _sandbox_hardware_refusal(self.server.state, "GET", path)
+        if refusal is not None:
+            _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
         if path == "/api/teleop/camera.jpg":
             if self.server.state.profile != "workstation":
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "teleoperation is unavailable"})
@@ -20585,6 +20977,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # training view instead.
             "/api/tasks/export",
         }
+        refusal = _sandbox_hardware_refusal(self.server.state, "POST", path)
+        if refusal is not None:
+            self.server.state.log("warn", refusal)
+            _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
         if self.server.state.profile != "thor" and path in thor_only_paths:
             _json_response(
                 self,
@@ -20813,6 +21210,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/replay/select-episode":
                     _select_replay_episode(self.server.state, query.get("episode", [""])[0])
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/open-export-source":
+                    _open_export_source(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/delete-episode":
@@ -21227,6 +21628,7 @@ def make_state(
     log_dir: Path | None = None,
     gateway_log_path: Path | None = None,
     profile: str = "thor",
+    sandbox: str | None = None,
 ) -> GatewayState:
     if profile not in DEPLOYMENT_PROFILES:
         raise ValueError(f"Unknown deployment profile: {profile}")
@@ -21246,6 +21648,7 @@ def make_state(
         config_path=resolved_config,
         config=config,
         profile=profile,
+        sandbox=sandbox or None,
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
@@ -21262,6 +21665,8 @@ def make_state(
         state.teleop.simXmlPath = str(sim_xml_path)
         state.teleop.message = "FR3 Pika MuJoCo teleop is ready on the workstation"
     state.log("info", f"Loaded {profile} config {resolved_config}")
+    if state.sandbox:
+        state.log("info", f"Sandbox '{state.sandbox}': cameras, BOXes, laser tracker and FR3 arms are off limits")
     if resolved_datasets_root is not None:
         state.log("info", f"Scanning datasets under {resolved_datasets_root}")
     return state
@@ -21277,6 +21682,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
     parser.add_argument("--log-dir", type=Path, default=None)
+    parser.add_argument(
+        "--sandbox",
+        default=None,
+        help="personal sandbox name (set by run/deploy.sh --sandbox): refuse everything that touches hardware",
+    )
     return parser.parse_args()
 
 
@@ -21300,7 +21710,7 @@ def main() -> None:
     log_dir, gateway_log_path = _setup_gateway_log(repo_root, args.log_dir)
     state = make_state(
         repo_root, args.config_path, args.datasets_root, args.exports_root,
-        log_dir=log_dir, gateway_log_path=gateway_log_path, profile=args.profile,
+        log_dir=log_dir, gateway_log_path=gateway_log_path, profile=args.profile, sandbox=args.sandbox,
     )
     if state.profile == "workstation":
         _probe_workstation_devices(state)

@@ -116,6 +116,32 @@ ANCHOR_SAMPLES = 120
 #: a table tag the anchor fit misses by more than this moved on the table; with three tags there is no telling
 #: which one, so no anchor.  10-27 185829 against the datum: 0.45-1.38 mm
 ANCHOR_TAG_MM = 3.0
+#: frames ``measure`` reads per camera, spread over the episode.  11-10 165824 (16.7 s, 17 keyframes): 40/42/44
+#: in every keyframe of 4-5 cameras; the same episodes read from their first 5 s missed 40 or 44 in most
+MEASURE_SAMPLES = 40
+REPO_ROOT = Path(__file__).resolve().parents[3]
+CART_REFERENCE_PATH = Path(__file__).with_name("world") / "cart_reference.json"
+CART_REFERENCE_SCHEMA = "cart_reference/v1"
+CART_CHECK_SCHEMA = "cart_check/v1"
+#: frames ``cart`` reads per camera of a new episode (the gateway runs it after every recording)
+CART_SAMPLES = 16
+#: a reference needs this many tags: two leave the rotation about the line through them to noise (11-10, right
+#: cart 40/44 from 100154 to 165824, unmoved: 0.105 deg, 2.7 mm at 1.2 m)
+REFERENCE_MIN_TAGS = 3
+#: ... whose centres make a triangle with no angle below this (11-10 right cart 40/42/44: 37/39/104 deg)
+REFERENCE_MIN_ANGLE_DEG = 15.0
+#: a cart moved when its tags' motion moves a corner of the arm's working volume by more than this.  Provisional:
+#: the right edge itself is good to ~3 mm (leave-one-out 3.16 mm, 11-10); 3 tags at 0.1 px corner noise read the
+#: working volume to ~1.4 mm p95 (Monte Carlo on 165824's cameras), 2 tags measured unmoved read 2.7 mm
+CART_LIMIT_MM = 3.0
+#: the reference tags must follow one rigid motion within this (rms over their corners), else one moved on its own
+CART_FIT_RMS_MM = 1.0
+#: what ``cart`` keeps per base in outputs/cart_check.json (cart_state)
+CART_STATE_FIELDS = (
+    "verdict", "why", "episode", "episode_start_utc", "checked_utc", "edge", "reference", "limit_mm",
+    "within_reach_bound_mm", "centroid_shift_mm", "rotation_deg", "fit_rms_mm", "tags_used", "tags_missing",
+    "cameras_excluded", "predicted_edge_T_to_from", "validated_for_correction",
+)
 
 
 # ------------------------------------------------------------------ cameras ---
@@ -137,15 +163,30 @@ def _resolve(path_text: str, run_dir: Path) -> Path:
 
 
 def load_cameras(
-    calibration_root: Path, extrinsics_run: str
+    calibration_root: Path, extrinsics_run: str, intrinsics_run: str | None = None
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """The calibrated cameras of one run: fisheye K, D and T_world_camera; and what identifies the run."""
+    """The calibrated cameras of one run: fisheye K, D and T_world_camera; and what identifies the run.
+
+    ``intrinsics_run`` is the run production pairs the extrinsics with (the recorder stamps both in each episode's
+    ``meta.json``, :func:`_episode_calibration_runs`); the same-named run when not given.  They differ: since
+    11-04 production is calib_20261102_195715 extrinsics on calib_20261027_173815 intrinsics.
+    """
     extrinsics_run = (
         extrinsics_run if extrinsics_run.endswith("_extrinsics") else f"{extrinsics_run}_extrinsics"
     )
-    intrinsics_run = extrinsics_run.removesuffix("_extrinsics") + "_intrinsics"
+    if intrinsics_run:
+        intrinsics_run = (
+            intrinsics_run if intrinsics_run.endswith("_intrinsics") else f"{intrinsics_run}_intrinsics"
+        )
+    else:
+        intrinsics_run = extrinsics_run.removesuffix("_extrinsics") + "_intrinsics"
     extr_path = calibration_root / extrinsics_run / "summary.json"
     intr_path = calibration_root / intrinsics_run / "summary.json"
+    if not intr_path.is_file():
+        raise SystemExit(
+            f"{intr_path} not found: {extrinsics_run} is paired with another intrinsics run "
+            "(see the episode's meta.json production_calibration); give --intrinsics-run"
+        )
     extr = json.loads(extr_path.read_text(encoding="utf-8"))
     intr = json.loads(intr_path.read_text(encoding="utf-8"))
     poses = {
@@ -631,6 +672,73 @@ def _episode_calibration(
     return run, "world_registration"
 
 
+def _episode_intrinsics(episode: Path) -> str | None:
+    """The intrinsics run the recorder stamped in the episode's meta.json (10-28 on), if any."""
+    try:
+        payload = json.loads((episode / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    stamped = payload.get("production_calibration") or {}
+    run = stamped.get("intrinsics_run") if stamped.get("status") == "ok" else None
+    return str(run) if run else None
+
+
+def measure_episode(
+    episode: Path,
+    cams: dict[str, dict[str, Any]],
+    identity: dict[str, Any],
+    layout: dict[str, Any],
+    *,
+    layout_path: Path = LAYOUT_PATH,
+    samples: int = MEASURE_SAMPLES,
+    stride: int | None = None,
+    max_samples: int = 60,
+    ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Detect the layout's tags (or ``ids``) in each calibrated camera of one episode and triangulate them.
+
+    Frames: ``samples`` keyframes spread over the whole episode, or, with ``stride``, every ``stride``-th from the
+    start (the old default: the first 5 s, when someone is often still standing in front of the carts -- 11-10,
+    tags 40/44 were seen in the whole of an episode and not in its start).
+    """
+    wanted = set(layout["group_of"]) if ids is None else set(ids)
+    videos = {n: episode / f"{n}.mkv" for n in sorted(cams) if (episode / f"{n}.mkv").exists()}
+
+    def run(name: str) -> tuple[str, dict[str, Any]]:
+        video = videos[name]
+        if stride:
+            return name, detect_video(video, layout["dictionary"], wanted, stride=stride, max_samples=max_samples)
+        return name, detect_video(
+            video, layout["dictionary"], wanted, positions=spread_positions(_frame_count(video), samples)
+        )
+
+    detections: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(videos), 8))) as pool:
+        for name, det in pool.map(run, videos):
+            if det["size"] and tuple(det["size"]) != cams[name]["size"]:
+                raise ValueError(f"{name}: video is {det['size']}, the intrinsics are {cams[name]['size']}")
+            detections[name] = det
+    result = measure_from_detections(cams, detections, layout)
+    for name, det in detections.items():
+        result["cameras"].setdefault(name, {})["frames_sampled"] = det["sampled"]
+        result["cameras"][name]["spread_px"] = {
+            str(t): round(v["spread_px"], 3) for t, v in det["tags"].items()
+        }
+    return {
+        "schema": MEASUREMENT_SCHEMA,
+        "measured_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),  # noqa: UP017
+        "episode": str(episode),
+        "episode_complete": (episode / "meta.json").exists(),
+        "calibration": identity,
+        "layout_sha256": _sha256(layout_path),
+        "dictionary": layout["dictionary"],
+        "sampling": f"every {stride}th frame from the start, at most {max_samples}"
+        if stride
+        else f"{samples} frames spread over the episode (keyframes)",
+        **result,
+    }
+
+
 def _measure(args: argparse.Namespace) -> int:
     episode = args.episode.resolve()
     layout = load_layout(args.layout)
@@ -641,34 +749,22 @@ def _measure(args: argparse.Namespace) -> int:
     if not run:
         print(f"{episode}: no meta.json naming the calibration it was recorded with; give --calibration-run")
         return 2
-    cams, identity = load_cameras(args.calibration_root.resolve(), run)
-    ids = set(layout["group_of"])
-    detections: dict[str, dict[str, Any]] = {}
-    for name in sorted(cams):
-        video = episode / f"{name}.mkv"
-        if not video.exists():
-            continue
-        det = detect_video(video, layout["dictionary"], ids, stride=args.stride, max_samples=args.max_samples)
-        if det["size"] and tuple(det["size"]) != cams[name]["size"]:
-            print(f"{name}: video is {det['size']}, the intrinsics are {cams[name]['size']}")
-            return 2
-        detections[name] = det
-    result = measure_from_detections(cams, detections, layout)
-    for name, det in detections.items():
-        result["cameras"].setdefault(name, {})["frames_sampled"] = det["sampled"]
-        result["cameras"][name]["spread_px"] = {
-            str(t): round(v["spread_px"], 3) for t, v in det["tags"].items()
-        }
-    out = {
-        "schema": MEASUREMENT_SCHEMA,
-        "measured_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),  # noqa: UP017
-        "episode": str(episode),
-        "episode_complete": (episode / "meta.json").exists(),
-        "calibration": identity,
-        "layout_sha256": _sha256(args.layout),
-        "dictionary": layout["dictionary"],
-        **result,
-    }
+    intrinsics = args.intrinsics_run or (None if args.calibration_run else _episode_intrinsics(episode))
+    cams, identity = load_cameras(args.calibration_root.resolve(), run, intrinsics)
+    try:
+        out = measure_episode(
+            episode,
+            cams,
+            identity,
+            layout,
+            layout_path=args.layout,
+            samples=args.samples,
+            stride=args.stride,
+            max_samples=args.max_samples,
+        )
+    except ValueError as exc:
+        print(exc)
+        return 2
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
     print(_measurement_summary(out, layout))
@@ -1065,7 +1161,9 @@ def _report_summary(r: dict[str, Any]) -> str:
 def _load_measurement_cameras(
     calibration_root: Path, m: dict[str, Any]
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]] | str:
-    cams, identity = load_cameras(calibration_root.resolve(), m["calibration"]["extrinsics_run"])
+    cams, identity = load_cameras(
+        calibration_root.resolve(), m["calibration"]["extrinsics_run"], m["calibration"].get("intrinsics_run")
+    )
     for key in ("extrinsics_sha256", "intrinsics_sha256"):
         if identity[key] != m["calibration"][key]:
             return (
@@ -1199,7 +1297,9 @@ def _freeze_datum(args: argparse.Namespace) -> int:
             "(tags re-stuck, table moved). Pass --replace to make it."
         )
         return 2
-    cams, identity = load_cameras(args.calibration_root.resolve(), m["calibration"]["extrinsics_run"])
+    cams, identity = load_cameras(
+        args.calibration_root.resolve(), m["calibration"]["extrinsics_run"], m["calibration"].get("intrinsics_run")
+    )
     if any(identity[k] != m["calibration"].get(k) for k in ("extrinsics_sha256", "intrinsics_sha256")):
         print(f"{identity['extrinsics_run']} changed since the measurement; measure again")
         return 2
@@ -1756,6 +1856,369 @@ def _session(args: argparse.Namespace) -> int:
     return 1 if flagged else 0
 
 
+# ------------------------------------------------------- cart vs its edge ---
+#
+# ``compare`` asks "did the cart come back where it was?" between two captures.  The question replay needs is
+# narrower and standing: "is the cart still where its world edge was solved?".  ``bind-reference`` keeps one
+# measurement, taken while the cart stood where the edge was solved, together with that edge
+# (world/cart_reference.json); ``cart`` holds any later episode against it and records the verdict in
+# outputs/cart_check.json, which routes read (cart_state: an edge whose cart moved is not walked).
+
+
+def _repo_modules() -> tuple[Any, Any, Any]:
+    """cart_state, world_graph_guard, world_provenance -- importable when this file runs as a script too."""
+    try:
+        from tools.thor.gmsl2 import cart_state, world_graph_guard, world_provenance
+    except ImportError:  # python tools/thor/gmsl2/cart_redock_check.py: only this directory is on sys.path
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.thor.gmsl2 import cart_state, world_graph_guard, world_provenance
+    return cart_state, world_graph_guard, world_provenance
+
+
+def _triangle_min_angle_deg(centres: list[np.ndarray]) -> float:
+    """The largest, over triples of tag centres, of the triangle's smallest angle: 0 when they are on a line."""
+    best = 0.0
+    n = len(centres)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                a, b, c = centres[i], centres[j], centres[k]
+                angles = []
+                for p, q, r in ((a, b, c), (b, a, c), (c, a, b)):
+                    u, v = q - p, r - p
+                    nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+                    if nu < 1e-9 or nv < 1e-9:
+                        angles.append(0.0)
+                        continue
+                    angles.append(float(np.degrees(np.arccos(np.clip(u @ v / (nu * nv), -1.0, 1.0)))))
+                best = max(best, min(angles))
+    return best
+
+
+def _edge_into(graph: dict[str, Any], world: str, base: str) -> list[dict[str, Any]]:
+    """The edges of ``graph`` between ``world`` and ``base`` that are not retired."""
+    return [
+        e
+        for e in graph.get("edges") or []
+        if {str(e.get("from_world_frame_id") or ""), str(e.get("to_world_frame_id") or "")} == {world, base}
+        and not e.get("retired")
+    ]
+
+
+def _t_base_world(edge: dict[str, Any], base: str) -> np.ndarray:
+    T = np.asarray(edge["T_to_from"], dtype=np.float64)
+    return T if str(edge.get("to_world_frame_id")) == base else np.linalg.inv(T)
+
+
+def bind_reference(
+    cams: dict[str, dict[str, Any]],
+    m: dict[str, Any],
+    layout: dict[str, Any],
+    group: str,
+    graph: dict[str, Any],
+    *,
+    source: str,
+    note: str = "",
+    limit_mm: float | None = None,
+) -> dict[str, Any]:
+    """One cart's reference entry: ``m``'s triangulated tags of ``group``, bound to the live edge into its base.
+
+    Refused (ValueError, every reason listed) unless at least REFERENCE_MIN_TAGS of the group's tags were
+    triangulated, each by >= 2 cameras whose rays meet at >= MIN_RAY_ANGLE_DEG, their centres are not near a
+    line, and exactly one live edge joins the measurement's world and the base.  ``graph`` is the graph routes see
+    (``world_provenance.read_world_graph``): an edge the guard or a moved cart holds back cannot be bound.
+    """
+    _, guard, wp = _repo_modules()
+    spec = (layout.get("groups") or {}).get(group)
+    if not spec or spec.get("kind") != "cart" or not spec.get("base"):
+        raise ValueError(f"{group}: not a cart group of the layout (one with a base)")
+    base = str(spec["base"])
+    world = str(m["calibration"].get("world_frame_id") or "")
+    problems: list[str] = []
+    tags = []
+    for t in spec["ids"]:
+        v = m["tags"].get(str(t)) or {}
+        if v.get("status") != "ok":
+            continue
+        if len(v["cameras"]) < 2:
+            problems.append(f"tag {t}: {len(v['cameras'])} camera(s) agree on it")
+            continue
+        P = np.asarray(v["corners_world_m"], dtype=np.float64)
+        angle = ray_angle_deg(cams, v["cameras"], P.mean(axis=0))
+        if angle < MIN_RAY_ANGLE_DEG:
+            problems.append(f"tag {t}: its cameras {v['cameras']} see it from {angle:.1f} deg apart")
+            continue
+        tags.append(int(t))
+    if len(tags) < REFERENCE_MIN_TAGS:
+        problems.append(
+            f"{len(tags)} usable tag(s) of {group} ({tags}); a reference needs {REFERENCE_MIN_TAGS}: with two, the "
+            "rotation about the line through them is noise"
+        )
+    centres = [np.asarray(m["tags"][str(t)]["corners_world_m"]).mean(axis=0) for t in tags]
+    min_angle = _triangle_min_angle_deg(centres) if len(centres) >= 3 else 0.0
+    if len(centres) >= 3 and min_angle < REFERENCE_MIN_ANGLE_DEG:
+        problems.append(
+            f"tags {tags} are nearly on a line (best triangle's smallest angle {min_angle:.1f} deg < "
+            f"{REFERENCE_MIN_ANGLE_DEG:g})"
+        )
+    live = [e for e in wp.live_edges(graph) if e in _edge_into(graph, world, base)]
+    if len(live) != 1:
+        held = wp.retired_note(graph, base)
+        problems.append(
+            f"{len(live)} live edges between {world or '?'} and {base}; a reference is bound to exactly one"
+            + (f" ({held})" if held else "")
+        )
+    if problems:
+        raise ValueError("cannot bind a reference:\n  - " + "\n  - ".join(problems))
+    edge = live[0]
+    keep = ("status", "corners_world_m", "cameras", "observations_px", "reprojection_rms_px", "edge_mm")
+    return {
+        "base": base,
+        "world_frame_id": world,
+        "edge": guard.edge_key(edge),
+        "edge_T_to_from": edge["T_to_from"],
+        "bound_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),  # noqa: UP017
+        "source": source,
+        "episode": m["episode"],
+        "measured_utc": m["measured_utc"],
+        "note": note,
+        "calibration": m["calibration"],
+        "tags": tags,
+        "tag_measurements": {str(t): {k: m["tags"][str(t)][k] for k in keep} for t in tags},
+        "limit_mm": float(CART_LIMIT_MM if limit_mm is None else limit_mm),
+        "geometry": {
+            "tag_centres_m": {str(t): c.round(5).tolist() for t, c in zip(tags, centres, strict=True)},
+            "min_triangle_angle_deg": round(min_angle, 2),
+            "pairwise_mm": {
+                f"{a}-{b}": round(float(np.linalg.norm(centres[i] - centres[j])) * 1000, 1)
+                for i, a in enumerate(tags)
+                for j, b in enumerate(tags)
+                if i < j
+            },
+        },
+    }
+
+
+def _workspace_world(ref: dict[str, Any]) -> np.ndarray:
+    """The corners of the arm's working volume (world_provenance.CLOSURE_WORKSPACE_M), in the world, through the
+    edge the reference is bound to: where a moved cart would put the replay wrong."""
+    _, _, wp = _repo_modules()
+    T_world_base = np.linalg.inv(_t_base_world({"T_to_from": ref["edge_T_to_from"], "to_world_frame_id": ref["base"]}, ref["base"]))
+    P = np.asarray(wp.CLOSURE_WORKSPACE_M, dtype=np.float64)
+    return P @ T_world_base[:3, :3].T + T_world_base[:3, 3]
+
+
+def cart_check(
+    cams: dict[str, dict[str, Any]],
+    ref: dict[str, Any],
+    m: dict[str, Any],
+    *,
+    cameras_moved: list[str] | None = None,
+) -> dict[str, Any]:
+    """One cart in a later measurement against its reference: a cart_state verdict and the numbers behind it.
+
+    The reference's tags are re-triangulated in both captures by the cameras both share (``paired_corners``), so
+    the cameras' systematic error cancels in the difference.  All tags: the rigid motion Δ (Kabsch); the cart
+    ``moved`` when Δ moves a corner of the arm's working volume by more than ``limit_mm``, ``inconsistent`` when
+    the tags disagree with one rigid motion (fit rms > CART_FIT_RMS_MM).  Two: only their shift is bounded
+    (``moved`` if over the limit, else ``partial``).  Fewer: ``unseen``.  ``cameras_moved`` (by the table tags)
+    are left out.
+    """
+    cart_state, _, _ = _repo_modules()
+    limit = float(ref["limit_mm"])
+    out: dict[str, Any] = {
+        "schema": CART_CHECK_SCHEMA,
+        "base": ref["base"],
+        "edge": ref["edge"],
+        "reference": {k: ref.get(k) for k in ("source", "episode", "bound_utc")},
+        "episode": m["episode"],
+        "limit_mm": limit,
+        "tags_reference": ref["tags"],
+        "cameras_excluded": sorted(cameras_moved or []),
+        "validated_for_correction": False,
+    }
+    if any(ref["calibration"].get(k) != m["calibration"].get(k) for k in ("extrinsics_sha256", "intrinsics_sha256")):
+        return {
+            **out,
+            "verdict": cart_state.OTHER_CALIBRATION,
+            "why": f"measured on {m['calibration'].get('extrinsics_run')}, the reference on "
+            f"{ref['calibration'].get('extrinsics_run')}: the cameras were recalibrated, bind a new reference",
+        }
+    ref_m = {"tags": ref["tag_measurements"]}
+    exclude = set(cameras_moved or [])
+    pairs = {t: pc for t in ref["tags"] if (pc := paired_corners(cams, ref_m, m, t, exclude)) is not None}
+    out.update(tags_used=sorted(pairs), tags_missing=sorted(set(ref["tags"]) - set(pairs)))
+    out["tag_cameras"] = {str(t): pc[2] for t, pc in pairs.items()}
+    if len(pairs) < 2:
+        return {
+            **out,
+            "verdict": cart_state.UNSEEN,
+            "why": f"{len(pairs)} of the reference tags {ref['tags']} triangulated by the same cameras as in the reference",
+        }
+    P_ref = np.concatenate([pairs[t][0] for t in sorted(pairs)])
+    P_cur = np.concatenate([pairs[t][1] for t in sorted(pairs)])
+    shift = P_cur.mean(axis=0) - P_ref.mean(axis=0)
+    out["centroid_shift_mm"] = round(float(np.linalg.norm(shift)) * 1000, 3)
+    if len(pairs) < len(ref["tags"]):
+        moved = out["centroid_shift_mm"] > limit
+        return {
+            **out,
+            "verdict": cart_state.MOVED if moved else cart_state.PARTIAL,
+            "within_reach_bound_mm": out["centroid_shift_mm"],
+            "why": f"only tags {sorted(pairs)}: their shift {out['centroid_shift_mm']:.2f} mm is "
+            + ("over the limit" if moved else "within the limit, the rotation is not known"),
+        }
+    R, t = kabsch(P_ref, P_cur)
+    fit = P_ref @ R.T + t - P_cur
+    rms_mm = _rms_mm(fit)
+    W = _workspace_world(ref)
+    bound = float(np.linalg.norm(W @ R.T + t - W, axis=1).max()) * 1000
+    delta = np.eye(4)
+    delta[:3, :3], delta[:3, 3] = R, t
+    # T_world_base_now = Δ · T_world_base_ref  =>  T_base_world_now = T_base_world_ref · Δ⁻¹
+    T_bw_ref = _t_base_world({"T_to_from": ref["edge_T_to_from"], "to_world_frame_id": ref["base"]}, ref["base"])
+    out.update(
+        rotation_deg=round(float(np.degrees(np.linalg.norm(_rotvec(R)))), 4),
+        within_reach_bound_mm=round(bound, 3),
+        fit_rms_mm=round(rms_mm, 3),
+        delta_world=delta.round(9).tolist(),
+        predicted_edge_T_to_from={
+            "matrix_4x4": (T_bw_ref @ np.linalg.inv(delta)).round(9).tolist(),
+            "frame": f"{ref['world_frame_id']} -> {ref['base']}",
+            "meaning": "where the edge would be if the cart moved rigidly with its tags; not validated, not applied",
+        },
+    )
+    if rms_mm > CART_FIT_RMS_MM:
+        return {
+            **out,
+            "verdict": cart_state.INCONSISTENT,
+            "why": f"the tags do not move together (fit rms {rms_mm:.2f} mm > {CART_FIT_RMS_MM:g}): one was bumped, "
+            "peeled or misread; with three tags there is no telling which",
+        }
+    moved = bound > limit
+    return {
+        **out,
+        "verdict": cart_state.MOVED if moved else cart_state.OK,
+        "why": f"the arm's working volume moved up to {bound:.2f} mm (limit {limit:g})",
+    }
+
+
+def _bind_reference(args: argparse.Namespace) -> int:
+    _, _, wp = _repo_modules()
+    layout = load_layout(args.layout)
+    m = json.loads(args.measurement.read_text(encoding="utf-8"))
+    loaded = _load_measurement_cameras(args.calibration_root, m)
+    if isinstance(loaded, str):
+        print(loaded)
+        return 2
+    cams, _ = loaded
+    graph = wp.read_world_graph(args.repo_root)
+    try:
+        entry = bind_reference(
+            cams, m, layout, args.group, graph, source=args.source, note=args.note, limit_mm=args.limit_mm
+        )
+    except ValueError as exc:
+        print(exc)
+        return 2
+    existing = json.loads(args.out.read_text(encoding="utf-8")) if args.out.exists() else None
+    if existing and args.group in (existing.get("groups") or {}) and not args.replace:
+        print(f"{args.out} already has a reference for {args.group}; pass --replace to replace it")
+        return 2
+    payload = existing or {"schema": CART_REFERENCE_SCHEMA, "groups": {}}
+    if args.group in payload["groups"]:
+        payload.setdefault("replaced", []).append(
+            {k: payload["groups"][args.group].get(k) for k in ("source", "bound_utc", "edge")} | {"group": args.group}
+        )
+    payload["groups"][args.group] = entry
+    payload["layout_sha256"] = _sha256(args.layout)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    g = entry["geometry"]
+    print(
+        f"bound {args.group} ({entry['base']}) to the edge solved {entry['edge']['created_utc']}: tags {entry['tags']}, "
+        f"spacing {g['pairwise_mm']} mm, smallest angle {g['min_triangle_angle_deg']} deg, limit {entry['limit_mm']:g} mm"
+    )
+    print(f"wrote {args.out}")
+    return 0
+
+
+def _cart(args: argparse.Namespace) -> int:
+    """Every cart of the reference in one episode; the verdicts go to the state file unless --no-state."""
+    cart_state, guard, wp = _repo_modules()
+    episode = args.episode.resolve()
+    meta_path = episode / "meta.json"
+    if not meta_path.is_file():
+        print(f"cart check: {episode} has no meta.json (still recording, or not an episode)")
+        return 2
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    reference = json.loads(args.reference.read_text(encoding="utf-8"))
+    groups = reference.get("groups") or {}
+    if reference.get("schema") != CART_REFERENCE_SCHEMA or not groups:
+        print(f"cart check: {args.reference} holds no cart reference")
+        return 2
+    layout = load_layout(args.layout)
+    graph = wp.read_world_graph(args.repo_root)
+    episode_run = _episode_calibration(episode)[0]
+    flagged = 0
+    results: dict[str, Any] = {}
+    measured: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
+    for group, ref in sorted(groups.items()):
+        calib = ref["calibration"]
+        key = (str(calib["extrinsics_run"]), str(calib.get("intrinsics_run") or ""))
+        if key not in measured:
+            cams, identity = load_cameras(args.calibration_root.resolve(), *key)
+            ids = {t for g in groups.values() for t in g["tags"]} | set(_static_ids(layout))
+            measured[key] = (cams, measure_episode(episode, cams, identity, layout, layout_path=args.layout, samples=args.samples, ids=ids))
+        cams, m = measured[key]
+        # cameras the table tags say moved since the reference's calibration capture are left out
+        anchor = calibration_reference(args.calibration_root.resolve(), str(calib["extrinsics_run"]).removesuffix("_extrinsics"))
+        cameras_moved: list[str] = []
+        if anchor is not None:
+            detections = {
+                n: {"tags": {int(t): {"corners_px": np.asarray(c)} for t, c in (v.get("corners_px") or {}).items()}}
+                for n, v in m["cameras"].items()
+            }
+            table = episode_table_check(anchor[1], detections, float(layout["thresholds"]["static_px"]))
+            cameras_moved = list(table["cameras_moved"])
+        if episode_run and str(episode_run).removesuffix("_extrinsics") != str(calib["extrinsics_run"]).removesuffix("_extrinsics"):
+            r = {
+                "schema": CART_CHECK_SCHEMA, "base": ref["base"], "edge": ref["edge"], "episode": str(episode),
+                "verdict": cart_state.OTHER_CALIBRATION, "limit_mm": ref["limit_mm"],
+                "why": f"recorded on {episode_run}, the reference on {calib['extrinsics_run']}: bind a new reference",
+            }
+        elif not any(_canonical_key(guard.edge_key(e)) == _canonical_key(ref["edge"]) for e in _edge_into(graph, ref["world_frame_id"], ref["base"])):
+            r = {
+                "schema": CART_CHECK_SCHEMA, "base": ref["base"], "edge": ref["edge"], "episode": str(episode),
+                "verdict": cart_state.REFERENCE_STALE, "limit_mm": ref["limit_mm"],
+                "why": f"the reference is bound to the edge solved {ref['edge'].get('created_utc')}, which is no longer "
+                "a live edge of the graph: bind a reference to the new edge",
+            }
+        else:
+            r = cart_check(cams, ref, m, cameras_moved=cameras_moved)
+        r["episode_start_utc"] = str(meta.get("wallclock_start_utc") or "")
+        r["checked_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017
+        results[group] = r
+        flagged += r["verdict"] == cart_state.MOVED
+        line = f"cart check {ref['base']}: {r['verdict']}"
+        if "within_reach_bound_mm" in r:
+            line += f" {r['within_reach_bound_mm']:.2f} mm (limit {r['limit_mm']:g})"
+        if r.get("tags_missing"):
+            line += f", tags not seen {r['tags_missing']}"
+        print(f"{line} -- {r.get('why', '')}")
+        if not args.no_state:
+            entry = {k: r.get(k) for k in CART_STATE_FIELDS if k in r}
+            if not cart_state.update(args.repo_root, ref["base"], entry):
+                print(f"  (not recorded: {cart_state.STATE_FILE} already holds a later episode for {ref['base']})")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    return 1 if flagged else 0
+
+
+def _canonical_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, default=LAYOUT_PATH)
@@ -1768,7 +2231,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="e.g. calib_20261014_180431_extrinsics; default: the one in the episode's meta.json",
     )
-    m.add_argument("--stride", type=int, default=5, help="use every n-th frame")
+    m.add_argument(
+        "--intrinsics-run",
+        default=None,
+        help="the intrinsics production pairs the extrinsics with; default: the episode's meta.json stamp "
+        "(the same-named run with --calibration-run)",
+    )
+    m.add_argument(
+        "--samples", type=int, default=MEASURE_SAMPLES, help="frames read per camera, spread over the episode"
+    )
+    m.add_argument(
+        "--stride", type=int, default=None, help="instead: every n-th frame from the start (with --max-samples)"
+    )
     m.add_argument("--max-samples", type=int, default=60)
     m.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("compare", help="a capture after a re-dock against the reference (cv2)")
@@ -1819,8 +2293,28 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--datum", type=Path, default=DATUM_PATH)
     a.add_argument("--samples", type=int, default=ANCHOR_SAMPLES, help="frames read per camera")
     a.add_argument("--out", type=Path, required=True, help=f"conventionally <bundle dir>/{ANCHOR_FILE}")
+    b = sub.add_parser("bind-reference", help="keep a measurement of a cart as the reference of its live edge")
+    b.add_argument("measurement", type=Path, help="measure output of a capture taken with the cart where the edge was solved")
+    b.add_argument("--group", required=True, help="the cart group of the layout, e.g. right_cart")
+    b.add_argument("--source", required=True, help="the recording it came from, e.g. the Thor dataset name")
+    b.add_argument("--note", default="", help="why this capture stands for the edge's placement")
+    b.add_argument("--limit-mm", type=float, default=None, help=f"default {CART_LIMIT_MM:g}")
+    b.add_argument("--calibration-root", type=Path, default=Path("outputs/calibration"))
+    b.add_argument("--repo-root", type=Path, default=REPO_ROOT, help="whose world graph the edge is read from")
+    b.add_argument("--out", type=Path, default=CART_REFERENCE_PATH)
+    b.add_argument("--replace", action="store_true", help="replace this group's reference (kept as replaced)")
+    e = sub.add_parser("cart", help="each referenced cart in one recorded episode; records the verdict (cv2)")
+    e.add_argument("episode", type=Path, help="episodes/episode_XXXXXX dir holding cam_XX.mkv and meta.json")
+    e.add_argument("--reference", type=Path, default=CART_REFERENCE_PATH)
+    e.add_argument("--calibration-root", type=Path, default=Path("outputs/calibration"))
+    e.add_argument("--repo-root", type=Path, default=REPO_ROOT, help="whose graph and outputs/cart_check.json")
+    e.add_argument("--samples", type=int, default=CART_SAMPLES, help="frames read per camera")
+    e.add_argument("--no-state", action="store_true", help="print only; do not record the verdicts")
+    e.add_argument("--out", type=Path, default=None, help="also write the full results here")
     args = parser.parse_args(argv)
     return {
+        "bind-reference": _bind_reference,
+        "cart": _cart,
         "measure": _measure,
         "compare": _compare,
         "freeze-datum": _freeze_datum,

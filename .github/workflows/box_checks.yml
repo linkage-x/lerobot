@@ -1,0 +1,104 @@
+# Checks every pull request into box (the reviewed branch production is deployed from).
+#
+# The submodules (opencv_kalibr, box-sdk) are private and the tests read fr3_arms.json, replay configs
+# and the tracker from them. Each is cloned with its own read-only deploy key (one key cannot be a deploy
+# key on two repositories). Two repository secrets hold the private keys:
+#   SUBMODULE_KEY_OPENCV_KALIBR  -> deploy key "lerobot CI (box_checks, read-only)" on linkage-x/opencv_kalibr
+#   SUBMODULE_KEY_BOX_SDK        -> deploy key "lerobot CI (box_checks, read-only)" on linkage-x/box-sdk
+# To rotate: ssh-keygen -t ed25519, add the .pub as a read-only deploy key on that repository, put the
+# private key in the secret. Pull requests from forks get no secrets, so their Python job cannot clone.
+name: Box checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - box
+
+permissions:
+  contents: read
+
+concurrency:
+  group: box-checks-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Gateway / Thor / FR3 tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Private submodules (one deploy key each)
+        env:
+          KEY_OPENCV_KALIBR: ${{ secrets.SUBMODULE_KEY_OPENCV_KALIBR }}
+          KEY_BOX_SDK: ${{ secrets.SUBMODULE_KEY_BOX_SDK }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY_OPENCV_KALIBR" ] || [ -z "$KEY_BOX_SDK" ]; then
+            echo "::error::secrets SUBMODULE_KEY_OPENCV_KALIBR / SUBMODULE_KEY_BOX_SDK missing (see the header of this file)"
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY_OPENCV_KALIBR" > ~/.ssh/opencv_kalibr
+          printf '%s\n' "$KEY_BOX_SDK" > ~/.ssh/box_sdk
+          chmod 600 ~/.ssh/opencv_kalibr ~/.ssh/box_sdk
+          # GitHub's published host key (api.github.com/meta), so no trust-on-first-use.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'CFG'
+          Host github-opencv_kalibr github-box_sdk
+            HostName github.com
+            User git
+            HostKeyAlias github.com
+            IdentitiesOnly yes
+          Host github-opencv_kalibr
+            IdentityFile ~/.ssh/opencv_kalibr
+          Host github-box_sdk
+            IdentityFile ~/.ssh/box_sdk
+          CFG
+          git config --global url."git@github-opencv_kalibr:linkage-x/opencv_kalibr".insteadOf "git@github.com:linkage-x/opencv_kalibr"
+          git config --global url."git@github-box_sdk:linkage-x/box-sdk".insteadOf "git@github.com:linkage-x/box-sdk"
+          git submodule update --init --recursive --depth 1
+      - uses: astral-sh/setup-uv@v6
+      - name: Test environment
+        run: |
+          # named .venv like a developer's checkout: the gateway looks for <repo>/.venv/bin/python
+          uv venv -p 3.12 .venv
+          uv pip install -p .venv/bin/python pytest pyyaml numpy scipy pyarrow av opencv-python-headless
+      # --noconftest: the upstream LeRobot conftest imports torch, which these tests do not need.
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: |
+          .venv/bin/python -m pytest -q --noconftest -p no:cacheprovider \
+            tests/scripts/test_data_collection_gui_gateway.py \
+            tests/scripts/test_thor_box_realign.py \
+            tests/scripts/test_thor_label_provenance.py \
+            tests/scripts/test_thor_export_v3.py \
+            tests/scripts/test_thor_world_graph_guard.py \
+            tests/scripts/test_thor_cart_state.py \
+            tests/scripts/test_thor_cart_redock_check.py \
+            tests/scripts/test_thor_world_provenance.py \
+            tests/scripts/test_fr3_arms.py
+
+  frontend:
+    name: GUI frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tools/data_collection_gui/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/data_collection_gui/frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit -p .
+      - run: npm test

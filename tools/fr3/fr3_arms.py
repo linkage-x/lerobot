@@ -35,6 +35,9 @@ ARMS = ("right", "left")
 #: identification could tell apart (its repeat spread was ~0.02 kg, a few mm).
 PAYLOAD_TOL_KG = 0.05
 PAYLOAD_TOL_COM_M = 0.01
+#: Each arm's base frame as a node of tools/thor/gmsl2/world/world_graph.json. The left keeps the id the
+#: single-arm days gave it (world_provenance.FR3_BASE_WORLD_ID); the gateway's panels use the same two.
+BASE_WORLD = {"left": "fr3_base", "right": "fr3_base_right"}
 
 
 class ArmConfigError(ValueError):
@@ -211,6 +214,26 @@ def resolve_args(args: Any, *, repo_root: Path | str = _REPO_ROOT) -> dict[str, 
     args.arm = entry["arm"]
     args.robot_ip = str(entry["robot_ip"])
     return entry
+
+
+def base_world_id(arm: str) -> str:
+    """The arm's base frame in world_graph.json: what a pose must be re-expressed in to drive that arm."""
+    if arm not in BASE_WORLD:
+        raise ArmConfigError(f"no arm {arm!r} (one of {ARMS})")
+    return BASE_WORLD[arm]
+
+
+def tool_model(entry: Mapping[str, Any], *, repo_root: Path | str = _REPO_ROOT) -> dict[str, Any]:
+    """What the arm's replay YAML says it drives: ``gripper_backend``, ``corenetic_device_id``, ``urdf_path``,
+    ``target_frame_name`` (missing keys absent). The replay path is the one that was checked on the arm, so an
+    entry point that is only told the arm's name takes the tool from there rather than from its own defaults.
+    Refused when the YAML cannot be read -- guessing a tool model is how IK ends up on the wrong link."""
+    config = str(entry.get("replay_config") or "")
+    robot = _replay_robot(Path(repo_root), config) if config else None
+    if robot is None:
+        raise ArmConfigError(f"the {entry.get('arm')} arm's replay_config {config!r} cannot be read here")
+    keys = ("gripper_backend", "corenetic_device_id", "urdf_path", "target_frame_name")
+    return {key: robot[key] for key in keys if robot.get(key) is not None}
 
 
 def payload_check(

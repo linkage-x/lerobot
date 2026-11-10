@@ -312,3 +312,30 @@ def test_a_failed_move_is_not_followed_by_another_one(tmp_path, monkeypatch):
     job = _wait(cal)
     assert job["state"] == "error" and "手动" in job["error"]
     assert rig.moves == ["six_d_zero"] and rig.triggers == []
+
+
+def test_the_box_tab_still_finds_this_mornings_origin_after_many_dynamic_zeros(tmp_path):
+    cal = _cal(tmp_path, FakeRig())
+    root = tmp_path / z.REPORT_SUBDIR
+    root.mkdir(parents=True)
+
+    def report(created: str, mode: str, passed: bool, arm: str = "right", device: int = DEVICE) -> None:
+        stamp = created.replace("-", "").replace(":", "").replace("T", "_")
+        rep = {"created": created, "arm": arm, "device_id": device, "mode": mode, "pass": passed, "state": "done"}
+        (root / f"{stamp}_{arm}_box{device}.json").write_text(json.dumps(rep))
+
+    report("2026-11-10T08:00:00", "origin", True)
+    report("2026-11-10T08:10:00", "origin", False)
+    for i in range(pc.LIST_LIMIT + 3):
+        report(f"2026-11-10T{9 + i // 2:02d}:{30 * (i % 2):02d}:00", "dynamic", True)
+    report("2026-11-10T09:15:00", "dynamic", True, arm="left", device=1234)
+    report("2026-11-10T17:00:00", "dynamic", False)
+
+    payload = cal.payload()
+    assert all(r["mode"] == "dynamic" for r in payload["zeroReports"])  # the origin fell off the recent list
+    latest = {(r["arm"], r["deviceId"], r["mode"]): r["created"] for r in payload["zeroLatest"]}
+    assert latest == {
+        ("right", DEVICE, "origin"): "2026-11-10T08:00:00",  # the failed 08:10 one does not count
+        ("right", DEVICE, "dynamic"): "2026-11-10T16:00:00",  # nor the failed 17:00 one
+        ("left", 1234, "dynamic"): "2026-11-10T09:15:00",
+    }

@@ -77,6 +77,11 @@ export function Metric({ label, value }: { label: string; value: string | number
 }
 
 
+// The operator guide: one static page in public/, versioned with this code and readable on its own.
+export function userGuideUrl(section = ""): string {
+  return `${import.meta.env.BASE_URL}user_guide.html${section ? `#${section}` : ""}`;
+}
+
 export function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
   return (
     <div className="page-header">

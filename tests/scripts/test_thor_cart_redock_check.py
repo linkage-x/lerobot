@@ -697,3 +697,180 @@ def test_episodes_on_a_new_calibration_are_held_against_its_own_capture(tmp_path
     detail = after["episodes_detail"]["episode_000000"]
     assert after["verdict"] == "ok" and detail["reference"]["kind"] == "calibration_capture"
     assert after["extrinsics_runs_unreferenced"] == [] and after["worst_shift_px"]["cam_09"] < 0.6
+
+
+# ------------------------------------------------- a cart against its edge ---
+
+WORLD = "world_x"
+BASE_RIGHT = (0.0, -0.40, -0.10)  # the synthetic right cart's base, world frame, axes along the world's
+
+
+def _edge(created="2026-11-10T02:49:19Z", base=BASE_RIGHT) -> dict:
+    T_base_world = np.eye(4)
+    T_base_world[:3, 3] = -np.asarray(base)
+    return {
+        "from_world_frame_id": WORLD,
+        "to_world_frame_id": "fr3_base_right",
+        "T_to_from": T_base_world.tolist(),
+        "created_utc": created,
+    }
+
+
+def _graph(*edges) -> dict:
+    return {"version": 1, "nodes": [], "edges": list(edges or [_edge()])}
+
+
+def _in_world(m: dict) -> dict:
+    m["calibration"]["world_frame_id"] = WORLD
+    return m
+
+
+def _reference(cams, layout, **kw) -> dict:
+    m = _in_world(_capture(cams, layout, _detections(cams, _corners(), seed=1)))
+    return rc.bind_reference(cams, m, layout, "right_cart", _graph(), source="synthetic", **kw)
+
+
+def test_a_reference_binds_three_spread_tags_to_the_live_edge(tmp_path) -> None:
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    assert ref["tags"] == [40, 41, 42] and ref["base"] == "fr3_base_right"
+    assert ref["edge"] == guard.edge_key(_edge())
+    assert ref["limit_mm"] == rc.CART_LIMIT_MM
+    assert ref["geometry"]["min_triangle_angle_deg"] > rc.REFERENCE_MIN_ANGLE_DEG
+
+
+def test_a_reference_is_refused_with_two_tags_on_a_line_or_without_one_live_edge(tmp_path) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    hidden = {(n, 41) for n in cams}
+    two = _in_world(_capture(cams, layout, _detections(cams, _corners(), seed=1, hide=hidden)))
+    with pytest.raises(ValueError, match="needs 3"):
+        rc.bind_reference(cams, two, layout, "right_cart", _graph(), source="s")
+    # the left cart's 20/21/22 are one straight strip
+    layout["groups"]["left_cart"]["ids"] = [20, 21, 22]
+    strip = _in_world(_capture(cams, layout, _detections(cams, _corners(), seed=1)))
+    with pytest.raises(ValueError, match="nearly on a line"):
+        rc.bind_reference(cams, strip, layout, "left_cart", _graph(), source="s")
+    full = _in_world(_capture(cams, layout, _detections(cams, _corners(), seed=1)))
+    retired = dict(_edge(), retired={"utc": "2026-11-11", "reason": "moved"})
+    with pytest.raises(ValueError, match="0 live edges"):
+        rc.bind_reference(cams, full, layout, "right_cart", _graph(retired), source="s")
+
+
+def test_an_unmoved_cart_passes_and_a_pushed_one_is_caught_with_the_edge_it_would_need(tmp_path) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    still = _capture(cams, layout, _detections(cams, _corners(), seed=2))
+    r = rc.cart_check(cams, ref, still)
+    assert r["verdict"] == "ok" and r["within_reach_bound_mm"] < 1.0, r
+    # pushed 4 mm and turned 0.3 deg about the vertical through its base
+    R = _rot_z(0.3)
+    c = np.asarray(BASE_RIGHT)
+    t = c - R @ c + np.array([0.004, 0.0, 0.0])
+    pushed = _corners(dict.fromkeys((40, 41, 42), (R, t)))
+    r = rc.cart_check(cams, ref, _capture(cams, layout, _detections(cams, pushed, seed=2)))
+    assert r["verdict"] == "moved" and r["within_reach_bound_mm"] > rc.CART_LIMIT_MM, r
+    assert r["rotation_deg"] == pytest.approx(0.3, abs=0.03)
+    assert not r["validated_for_correction"]
+    # the predicted edge puts the arm's working volume where the pushed base has it
+    T_world_base_true = np.eye(4)
+    T_world_base_true[:3, :3], T_world_base_true[:3, 3] = R, R @ c + t
+    predicted = np.linalg.inv(np.asarray(r["predicted_edge_T_to_from"]["matrix_4x4"]))
+    W = np.array([(x, y, z, 1.0) for x in (0.3, 0.7) for y in (-0.4, 0.4) for z in (0.0, 0.4)])
+    assert np.abs(W @ predicted.T - W @ T_world_base_true.T).max() < 5e-4
+
+
+def test_with_two_tags_only_the_shift_is_bounded(tmp_path) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    hidden = {(n, 41) for n in cams}
+    r = rc.cart_check(cams, ref, _capture(cams, layout, _detections(cams, _corners(), seed=2, hide=hidden)))
+    assert r["verdict"] == "partial" and r["tags_missing"] == [41], r
+    shoved = _corners(dict.fromkeys((40, 41, 42), (np.eye(3), np.array([0.0, 0.01, 0.0]))))
+    r = rc.cart_check(cams, ref, _capture(cams, layout, _detections(cams, shoved, seed=2, hide=hidden)))
+    assert r["verdict"] == "moved" and r["centroid_shift_mm"] == pytest.approx(10.0, abs=0.5)
+    hidden |= {(n, 42) for n in cams}
+    r = rc.cart_check(cams, ref, _capture(cams, layout, _detections(cams, _corners(), seed=2, hide=hidden)))
+    assert r["verdict"] == "unseen"
+
+
+def test_a_tag_that_moved_on_its_own_is_inconsistent_not_a_moved_cart(tmp_path) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    bumped = _corners({42: (np.eye(3), np.array([0.006, 0.0, 0.0]))})
+    r = rc.cart_check(cams, ref, _capture(cams, layout, _detections(cams, bumped, seed=2)))
+    assert r["verdict"] == "inconsistent" and r["fit_rms_mm"] > rc.CART_FIT_RMS_MM, r
+
+
+def test_a_capture_on_other_extrinsics_cannot_be_held_against_the_reference(tmp_path) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    other = _capture(cams, layout, _detections(cams, _corners(), seed=2), extrinsics_sha="f" * 64)
+    assert rc.cart_check(cams, ref, other)["verdict"] == "other_calibration"
+
+
+def _episode_repo(tmp_path, graph, run="calib_x") -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    (repo / "tools/thor/gmsl2/world").mkdir(parents=True)
+    (repo / "tools/thor/gmsl2/world/world_graph.json").write_text(json.dumps(graph))
+    episode = tmp_path / "ds/episodes/episode_000000"
+    episode.mkdir(parents=True)
+    meta = {
+        "wallclock_start_utc": "2026-11-10T09:00:00+00:00",
+        "production_calibration": {"status": "ok", "extrinsics_run": f"{run}_extrinsics", "intrinsics_run": "calib_x_intrinsics"},
+    }
+    (episode / "meta.json").write_text(json.dumps(meta))
+    return repo, episode
+
+
+def _run_cart(
+    monkeypatch, tmp_path, cams, layout, ref, current, graph, run="calib_x", layout_path=None
+) -> tuple[int, dict]:
+    from tools.thor.gmsl2 import cart_state
+
+    repo, episode = _episode_repo(tmp_path, graph, run)
+    reference = tmp_path / "cart_reference.json"
+    ref["calibration"]["extrinsics_run"] = "calib_x_extrinsics"
+    reference.write_text(json.dumps({"schema": rc.CART_REFERENCE_SCHEMA, "groups": {"right_cart": ref}}))
+    layout_path = layout_path or tmp_path / "cart_tags.json"
+    monkeypatch.setattr(rc, "load_cameras", lambda root, extr, intr=None: (cams, current["calibration"]))
+    monkeypatch.setattr(rc, "measure_episode", lambda *a, **k: current)
+    rcode = rc.main(
+        ["--layout", str(layout_path), "cart", str(episode), "--reference", str(reference),
+         "--repo-root", str(repo), "--calibration-root", str(tmp_path / "calib")]
+    )  # fmt: skip
+    return rcode, cart_state.read(repo)
+
+
+def test_cart_records_the_verdict_against_the_edge_and_routes_stop_using_it(tmp_path, monkeypatch) -> None:
+    from tools.thor.gmsl2 import world_provenance as wp
+
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    pushed = _corners(dict.fromkeys((40, 41, 42), (np.eye(3), np.array([0.0, 0.01, 0.0]))))
+    current = _in_world(_capture(cams, layout, _detections(cams, pushed, seed=2)))
+    rcode, state = _run_cart(monkeypatch, tmp_path, cams, layout, ref, current, _graph())
+    entry = state["bases"]["fr3_base_right"]
+    assert rcode == 1 and entry["verdict"] == "moved"
+    assert entry["episode_start_utc"] == "2026-11-10T09:00:00+00:00"
+    graph = wp.read_world_graph(tmp_path / "repo")
+    assert wp.live_edges(graph) == []
+    assert "小车被推动过" in wp.retired_note(graph, "fr3_base_right")
+
+
+def test_cart_on_a_re_solved_edge_or_new_extrinsics_does_not_block(tmp_path, monkeypatch) -> None:
+    cams, layout = _cameras(), _layout(tmp_path)
+    ref = _reference(cams, layout)
+    pushed = _corners(dict.fromkeys((40, 41, 42), (np.eye(3), np.array([0.0, 0.01, 0.0]))))
+    current = _in_world(_capture(cams, layout, _detections(cams, pushed, seed=2)))
+    rcode, state = _run_cart(
+        monkeypatch, tmp_path / "a", cams, layout, ref, current, _graph(_edge(created="2026-11-12T00:00:00Z")),
+        layout_path=tmp_path / "cart_tags.json",
+    )
+    assert rcode == 0 and state["bases"]["fr3_base_right"]["verdict"] == "reference_stale"
+    rcode, state = _run_cart(
+        monkeypatch, tmp_path / "b", cams, layout, ref, current, _graph(), run="calib_y",
+        layout_path=tmp_path / "cart_tags.json",
+    )
+    assert rcode == 0 and state["bases"]["fr3_base_right"]["verdict"] == "other_calibration"

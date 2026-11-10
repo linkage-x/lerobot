@@ -178,8 +178,15 @@ def test_connect_refuses_what_c4_did_not_clear_and_the_real_arms_without_panda_p
 
 def _home_state(tmp_path: Path, monkeypatch, right_away: str = "#q=1:0.5"):
     """The real runtime and the real registry, on the stand-in panda_py: a ``panda_py`` shim first on the
-    path, which puts the right arm ``right_away`` (fake_panda_py's host suffix) from its start."""
+    path, which puts the right arm ``right_away`` (fake_panda_py's host suffix) from its start, with Desk
+    holding each arm's declared payload."""
     import sys
+
+    def desk(arm: str) -> str:
+        load = json.loads((Path.cwd() / "tools/fr3/fr3_arms.json").read_text())["arms"][arm]["payload"]
+        return f"#m_ee={load['mass_kg']}#com={':'.join(map(str, load['com_m']))}" if load else ""
+
+    suffix = {"192.168.1.210": desk("right") + right_away, "192.168.11.102": desk("left")}
 
     shim = tmp_path / "shim" / "panda_py"
     shim.mkdir(parents=True)
@@ -187,7 +194,7 @@ def _home_state(tmp_path: Path, monkeypatch, right_away: str = "#q=1:0.5"):
         "from tests.scripts import fake_panda_py as _fake\n"
         "class Panda(_fake.Panda):\n"
         "    def __init__(self, hostname, name='panda'):\n"
-        f"        super().__init__(hostname + ({right_away!r} if hostname == '192.168.1.210' else ''), name)\n"
+        f"        super().__init__(hostname + {suffix!r}.get(hostname, ''), name)\n"
     )
     state = gateway.GatewayState(
         repo_root=tmp_path,

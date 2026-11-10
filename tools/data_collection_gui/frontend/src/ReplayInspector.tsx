@@ -375,7 +375,10 @@ export function ReplayInspector({
   const fps = timeline?.fps ?? fallbackFps;
   const mujocoRunning = replayStatus.state === "sim_replay";
   const replayActive = mujocoRunning || replayStatus.state === "replaying";
+  // On Thor, an export carries no trajectory files of its own: MuJoCo runs on its recording.
+  const exportedCubes = cubeSelection && replayStatus.datasetKind === "exported";
   const canRunMujoco =
+    !exportedCubes &&
     replayStatus.dataStatus === "loaded" &&
     (replayStatus.recordedFrames ?? replayStatus.totalFrames) > 0;
 
@@ -907,7 +910,9 @@ export function ReplayInspector({
           ) : null}
         </div>
         <p className="panel-note">
-          {!cubeSelection
+          {exportedCubes
+            ? "Exported dataset: run MuJoCo on its source recording (Open source recording, above)."
+            : !cubeSelection
             ? "The FR3 follows the absolute-EE action stream recorded in this episode; the verdict lands automatically when the run finishes."
             : mujocoMode === "both"
               ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."

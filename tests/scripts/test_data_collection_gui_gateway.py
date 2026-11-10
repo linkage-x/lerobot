@@ -1384,6 +1384,8 @@ def test_remux_writes_tmp_then_replaces_mp4(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gateway, "_cached_mp4_is_usable", fake_cache_ok)
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    # ffmpeg is faked above; without this the test depends on the host having it (the CI runner does not)
+    monkeypatch.setattr(gateway.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     result = gateway._remux_mkv_to_mp4(mkv, expected_duration_s=10.0)
 
@@ -2955,6 +2957,95 @@ def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path
 
     with pytest.raises(RuntimeError, match="Real-robot replay is disabled for exported datasets"):
         gateway._require_mujoco_validation(state)
+
+
+def _exported_from_recording(tmp_path):
+    """An export of recording ``recorded_set`` whose episode 1 is that recording's episode 0 (right hand)."""
+    repo_root = tmp_path / "repo"
+    recorded_root = repo_root / "outputs" / "datasets" / "recorded_set"
+    exported_root = repo_root / "outputs" / "exports" / "exported_set"
+    _write_minimal_episode_dataset(recorded_root, total_episodes=1)
+    _write_minimal_episode_dataset(exported_root, total_episodes=2)
+    info_path = exported_root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"]["observation.ee_pose.right.base"] = {"dtype": "float32", "shape": [7]}
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    sidecar = recorded_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    csv_path = sidecar / "state_action.right.csv"
+    csv_path.write_text("episode_index,frame_index\n", encoding="utf-8")
+    sources_path = exported_root / gateway.EXPORT_SOURCES_FILE
+    sources_path.write_text(
+        json.dumps(
+            {
+                "episodes": [
+                    {"global_episode_index": 0, "session": "elsewhere", "source_episode": "episode_000003"},
+                    {"global_episode_index": 1, "session": "recorded_set", "source_episode": "episode_000000"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(csv_path, (1_000, 1_000))
+    os.utime(sources_path, (2_000, 2_000))
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(recorded_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+        datasets_root=recorded_root.parent,
+        exports_root=exported_root.parent,
+    )
+    return state, recorded_root, exported_root, csv_path
+
+
+def test_mujoco_on_an_exported_episode_points_at_its_recording(tmp_path, monkeypatch):
+    state, recorded_root, exported_root, _csv = _exported_from_recording(tmp_path)
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: pytest.fail("must not launch"))
+    gateway._select_replay_dataset(state, str(exported_root))
+    gateway._select_replay_episode(state, "1")
+
+    source = gateway._snapshot(state)["replay"]["exportSource"]
+    assert source == {
+        "session": "recorded_set",
+        "episode": 0,
+        "datasetRoot": str(recorded_root),
+        "hands": ["right"],
+        "problem": "",
+    }
+    # not "Run Generate EE Trajectory first": the trajectory exists, on the recording
+    with pytest.raises(RuntimeError, match=r"open recorded_set episode 0 \(Open source recording\)"):
+        gateway._start_mujoco_replay(state, "right")
+
+    gateway._open_export_source(state)
+    assert state.replay.datasetRoot == str(recorded_root)
+    assert state.replay.datasetKind == "recorded"
+    assert state.replay.episode == 0
+    assert gateway._snapshot(state)["replay"]["exportSource"] is None
+
+
+def test_an_exported_episode_whose_recording_is_gone_or_regenerated_says_so(tmp_path):
+    state, _recorded_root, exported_root, csv_path = _exported_from_recording(tmp_path)
+    gateway._select_replay_dataset(state, str(exported_root))
+
+    gone = gateway._export_source_episode(state, exported_root, 0)
+    assert gone["datasetRoot"] == ""
+    assert "elsewhere is not on this machine" in gone["problem"]
+    with pytest.raises(RuntimeError, match="elsewhere is not on this machine"):
+        gateway._open_export_source(state)
+
+    os.utime(csv_path, (3_000, 3_000))
+    regenerated = gateway._export_source_episode(state, exported_root, 1)
+    assert "right trajectory of recorded_set was generated again" in regenerated["problem"]
+    gateway._select_replay_episode(state, "1")
+    with pytest.raises(RuntimeError, match="export again"):
+        gateway._start_mujoco_replay(state, "right")
+
+    assert gateway._export_source_episode(state, exported_root, 7) is None
+    (exported_root / gateway.EXPORT_SOURCES_FILE).unlink()
+    with pytest.raises(RuntimeError, match="does not record which one"):
+        gateway._start_mujoco_replay(state, "right")
 
 
 def test_replay_realsense_preview_paths_keep_full_camera_key(tmp_path):
@@ -10331,3 +10422,161 @@ def test_the_arm_held_6d_zero_reads_the_recorder_through_the_gateway(tmp_path: P
     route = gateway._PAYLOAD_CALIBRATION_ROUTES["/api/calibration/fr3-six-d-zero/start"]
     res = route(state, {"arm": "right", "mode": "dynamic", "confirmed": True})
     assert not res["ok"] and "zeroReports" in res
+
+
+def test_a_sandbox_gateway_refuses_hardware_and_keeps_offline_work(tmp_path, monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.request
+
+    state = _calibration_gateway_state(tmp_path)
+    state.devices = []
+    state.sandbox = "zhangsan"
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: pytest.fail("a sandbox must not launch hardware"))
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def call(method: str, path: str) -> tuple[int, dict]:
+        request = urllib.request.Request(f"{base}{path}", method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    try:
+        for method, path in [
+            ("POST", "/api/handheld/record/connect"),
+            ("POST", "/api/replay/start-real?arm=right"),
+            ("POST", "/api/replay/execute-real"),
+            ("POST", "/api/robot/move-to-start"),
+            ("POST", "/api/robot/dual-home/execute"),
+            ("POST", "/api/calibration/fr3-pivot/execute"),
+            ("POST", "/api/device/calibrate-touch"),
+            ("GET", "/api/device-preview/camera.jpg?device=cam_06"),
+        ]:
+            code, body = call(method, path)
+            assert code == 409, path
+            assert "sandbox 'zhangsan' does not touch hardware" in body["error"], path
+        # Reads and offline work still answer, and the snapshot says where it came from.
+        code, snapshot = call("GET", "/api/snapshot")
+        assert code == 200
+        assert snapshot["deployment"]["sandbox"] == "zhangsan"
+        code, _ = call("GET", "/api/robot/arms")
+        assert code == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
+def test_production_gateway_is_not_affected_by_the_sandbox_guard(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    assert gateway._sandbox_hardware_refusal(state, "POST", "/api/replay/start-real") is None
+    state.sandbox = "lisi"
+    assert gateway._sandbox_hardware_refusal(state, "POST", "/api/processing/traj-gen") is None
+    assert gateway._sandbox_hardware_refusal(state, "POST", "/api/replay/start-mujoco") is None
+    assert gateway._sandbox_hardware_refusal(state, "GET", "/api/replay/dual-fr3/job") is None
+
+
+def test_snapshot_reports_what_deploy_wrote(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    state.devices = []
+    assert gateway._snapshot(state)["deployment"]["release"] is None
+    (tmp_path / "DEPLOYED.json").write_text(
+        json.dumps({"commit": "abc123", "branch": "box", "deployedUtc": "2026-11-10T08:00:00Z", "by": "hph", "onBox": True})
+    )
+    release = gateway._snapshot(state)["deployment"]["release"]
+    assert release["commit"] == "abc123" and release["onBox"] is True
+    assert gateway._snapshot(state)["deployment"]["sandbox"] is None
+
+
+def _cart_repo(tmp_path: Path) -> gateway.GatewayState:
+    """A production-like Thor tree: a live edge into fr3_base, a cart reference bound to it, and datasets."""
+    from tools.thor.gmsl2 import cart_state, world_graph_guard as guard
+
+    state, _ = _fr3_base_edge_repo(tmp_path)
+    state.profile = "thor"
+    edge = json.loads((state.repo_root / guard.GRAPH_FILE).read_text())["edges"][0]
+    ref = {"base": "fr3_base", "source": "ds_ref", "bound_utc": "2026-11-10T09:30:00+00:00", "tags": [40, 42, 44],
+           "limit_mm": 3.0, "edge": guard.edge_key(edge)}  # fmt: skip
+    (state.repo_root / cart_state.REFERENCE_FILE).write_text(
+        json.dumps({"schema": "cart_reference/v1", "groups": {"right_cart": ref}})
+    )
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    return state
+
+
+def _episode(state: gateway.GatewayState, dataset: str, index: int, *, meta: bool = True) -> Path:
+    episode = state.datasets_root / dataset / "episodes" / f"episode_{index:06d}"
+    episode.mkdir(parents=True)
+    (episode / "cam_03.mkv").write_bytes(b"x")
+    if meta:
+        (episode / "meta.json").write_text("{}")
+    return episode
+
+
+def test_the_cart_check_takes_the_newest_finished_episode_and_only_on_production(tmp_path):
+    state = _cart_repo(tmp_path)
+    older = _episode(state, "ds_a", 0)
+    newer = _episode(state, "ds_b", 0)
+    os.utime(older / "meta.json", (1_000_000_000, 1_000_000_000))
+    _episode(state, "ds_b", 1, meta=False)  # still recording: no meta.json yet
+    assert gateway._newest_complete_episode(state) == newer
+    assert gateway._cart_check_enabled(state)
+    state.sandbox = "alice"
+    assert not gateway._cart_check_enabled(state)  # a sandbox has copies; production's carts are not its business
+    state.sandbox = None
+    state.profile = "workstation"
+    assert not gateway._cart_check_enabled(state)
+
+
+def test_the_cart_check_runs_detached_from_stdin_and_logs_a_moved_cart_as_an_error(tmp_path, monkeypatch):
+    state = _cart_repo(tmp_path)
+    episode = _episode(state, "ds_a", 0)
+    monkeypatch.setenv("PYTHONPATH", "/somewhere/else")
+    seen = {}
+
+    class Done:
+        returncode = 1
+        stdout = "measuring...\ncart check fr3_base: moved 8.50 mm (limit 3) -- the arm's working volume moved\n"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        seen.update(command=command, **kwargs)
+        return Done()
+
+    lines = gateway._run_cart_check(state, episode, run=fake_run)
+    assert lines == ["cart check fr3_base: moved 8.50 mm (limit 3) -- the arm's working volume moved"]
+    assert seen["stdin"] is gateway.subprocess.DEVNULL and "PYTHONPATH" not in seen["env"]
+    assert seen["command"][seen["command"].index("cart") + 1] == str(episode)
+    assert any(e.level == "error" and "moved" in e.message for e in state.events)
+
+    class Broken:
+        returncode = 2
+        stdout = ""
+        stderr = "Traceback ...\nSystemExit: no intrinsics\n"
+
+    assert gateway._run_cart_check(state, episode, run=lambda *a, **k: Broken()) == []
+    assert any(e.level == "warn" and "no intrinsics" in e.message for e in state.events)
+
+
+def test_a_moved_cart_is_red_in_the_snapshot_and_its_edge_stops_routing(tmp_path):
+    from tools.thor.gmsl2 import cart_state
+
+    state = _cart_repo(tmp_path)
+    ref = json.loads((state.repo_root / cart_state.REFERENCE_FILE).read_text())["groups"]["right_cart"]
+    snap = gateway._snapshot(state)["cartCheck"]
+    assert snap["enabled"] and snap["bases"] == [] and snap["references"][0]["tags"] == [40, 42, 44]
+    cart_state.update(state.repo_root, "fr3_base", {
+        "verdict": "moved", "episode": str(tmp_path / "ds_a/episodes/episode_000000"),
+        "episode_start_utc": "2026-11-10T10:00:00+00:00", "edge": ref["edge"],
+        "within_reach_bound_mm": 8.5, "limit_mm": 3.0,
+    })  # fmt: skip
+    base = gateway._snapshot(state)["cartCheck"]["bases"][0]
+    assert base["blocking"] and base["currentEdge"] and "小车被推动过" in base["note"]
+    assert base["episode"] == "ds_a/episodes/episode_000000"
+    assert gateway.wp.live_edges(gateway.wp.read_world_graph(state.repo_root)) == []

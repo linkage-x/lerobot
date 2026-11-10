@@ -1,0 +1,22 @@
+# Pull requests touching these paths need a maintainer's review. This only takes effect once branch
+# protection on `box` requires pull requests and "Review from Code Owners" (repository settings).
+
+# Deployment, the production guard and the sandbox guard
+/run/                                      @BigJohnn
+/.github/                                  @BigJohnn
+/AGENTS.md                                 @BigJohnn
+/CLAUDE.md                                 @BigJohnn
+
+# Robot motion, real replay, inference, pivot and payload calibration
+/tools/fr3/                                @BigJohnn
+
+# Calibration, world registration, BOX timing, label provenance
+/tools/thor/gmsl2/world/                   @BigJohnn
+/tools/thor/gmsl2/box_time_delays.json     @BigJohnn
+/tools/thor/gmsl2/label_provenance.py      @BigJohnn
+/tools/thor/gmsl2/world_graph_guard.py     @BigJohnn
+/third_party/                              @BigJohnn
+/tools/thor/box_sdk                        @BigJohnn
+
+# The gateway itself (hardware endpoints, gates, the sandbox guard all live in it)
+/tools/data_collection_gui/gateway.py      @BigJohnn
