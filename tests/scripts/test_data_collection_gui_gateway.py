@@ -9896,6 +9896,40 @@ def test_fr3_pivot_probe_plans_without_an_anchor(tmp_path, monkeypatch):
     assert plan["kind"] == "probe" and plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
 
 
+def test_fr3_pivot_probe_turns_about_a_prior_when_given_one(tmp_path, monkeypatch):
+    # 11-09 16:05: about the origin the probe dragged the cup (the ball ~23 mm out); Desk's EE is the prior
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    planned = gateway._plan_fr3_pivot(
+        state, {"centre": centre, "probe": True, "priorMm": [-1.4, 0.7, 23.2], "priorFrom": "desk_ee"}
+    )
+    assert planned["ok"], planned["error"]
+    (plan,) = planned["plans"]
+    assert plan["kind"] == "probe" and plan["anchorMm"] == [-1.4, 0.7, 23.2] and plan["anchorFrom"] == "prior: Desk EE"
+    far = gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "priorMm": [0, 0, 46]})
+    assert "超过 45 mm" in far["error"]
+    assert "3 个数" in gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "priorMm": [0, 1]})["error"]
+    # a full plan never takes a prior: it turns about a fit or the origin
+    full = gateway._plan_fr3_pivot(state, {"centre": centre, "priorMm": [0, 0, 23]})
+    assert full["ok"] and full["plans"][0]["anchorMm"] == [0.0, 0.0, 0.0]
+
+
+def test_a_centre_lists_where_desks_ee_sits_in_the_socket_frame():
+    # the right arm's 11-09 16:04 centre: Desk set to the new fingertip, 23 mm out along the tool axis
+    centre = {
+        "centre_m": [0.5121437624584804, 0.20132528759228563, 0.4461663468223124],
+        "R": [[0.43745480608219495, -0.1513077955718019, 0.8864193384819576],
+              [-0.11616781499943822, -0.9869912718704766, -0.11114525635291589],
+              [0.8917052940259159, -0.0543523711598758, -0.4493411714448764]],
+        "O_T_EE": [[0.4374547985954714, -0.15131430497816684, 0.8864182268889045, 0.532035605492199],
+                   [-0.11616781301133033, -0.9869904384335728, -0.11115250719266764, 0.1981993633971732],
+                   [0.8917052787650291, -0.05434906918371507, -0.4493415707275643, 0.4344549089317308],
+                   [0.0, 0.0, 0.0, 1.0]],
+    }
+    assert gateway._desk_ee_in_socket_mm(centre) == [-1.4, 0.7, 23.2]
+    assert gateway._desk_ee_in_socket_mm({"centre_m": [0, 0, 0]}) is None
+
+
 def test_fr3_pivot_anchor_follows_the_socket_frame_the_urdf_has_now(tmp_path, monkeypatch):
     # 10-14 corenetic_socket_ee moved from z -10.3 to the pivot's (1.45, -0.78, -5.06): a fit made before
     # then holds its socket_frame against the old origin, so the anchor comes from its gripper_ee value.
@@ -9944,7 +9978,7 @@ def test_fr3_pivot_anchor_warns_but_stays_usable_once_the_gripper_teleop_ran_aft
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and "夹爪遥控正在运行" in anchor["warning"]
     state.gripper_teleop_process = None
-    _guided_fit(state, "20261013_181645", rms=4.1, s=(0.1, -0.5, 25.0))
+    _guided_fit(state, "20261013_181645", rms=4.1, s=(0.1, -0.5, 50.0))  # 11-09: 23-36 mm is a real ball now
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert not anchor["available"] and "残差 4.1 mm" in anchor["reason"] and "不像球心" in anchor["reason"]
 

@@ -1499,8 +1499,21 @@ export class DataCollectionGuiApi {
   }
 
   // Survey + dwells + route + checks: a minute or two.
-  async planFr3Pivot(centre: string, biasMm: number[], anchorFromFit = false, probe = false): Promise<Fr3PivotResponse | null> {
-    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm, anchorFromFit, probe });
+  // ``prior`` (probe only): the ball centre in corenetic_socket_ee the probe turns about before any fit.
+  async planFr3Pivot(
+    centre: string,
+    biasMm: number[],
+    anchorFromFit = false,
+    probe = false,
+    prior: { mm: number[]; from: "desk_ee" | "manual" } | null = null
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", {
+      centre,
+      biasMm,
+      anchorFromFit,
+      probe,
+      ...(prior ? { priorMm: prior.mm, priorFrom: prior.from } : {}),
+    });
   }
 
   // Moves the real FR3 along a plan that passed: the panel confirms first.

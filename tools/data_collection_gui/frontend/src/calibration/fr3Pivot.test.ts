@@ -9,6 +9,7 @@ import {
   biasLabel,
   contactText,
   planSummaryText,
+  probePrior,
   episodeKey,
   fmtVec,
   handheldSharedSummary,
@@ -254,6 +255,9 @@ describe("fr3Pivot", () => {
     expect(planSummaryText({ ...dwells, kind: "probe", dwells: 6, anchorFrom: "" })).toMatch(
       /^通过：试探：6 个驻点、离起点不远，跑完的拟合给完整规划当球心，136 s/
     );
+    expect(
+      planSummaryText({ ...dwells, kind: "probe", dwells: 6, anchorFrom: "prior: Desk EE", anchorMm: [-1.4, 0.7, 23.2] })
+    ).toMatch(/^通过：试探：6 个驻点、离起点不远，绕先验球心 \(-1\.4, 0\.7, 23\.2\) mm（取自 Desk EE），跑完/);
     expect(biasLabel([-3, 0, 0])).toBe("偏置 −3 mm（x）");
     expect(biasLabel([1, 2, 0])).toBe("偏置 (1.0, 2.0, 0.0) mm");
   });
@@ -383,5 +387,21 @@ describe("which arm a pivot belongs to", () => {
   it("says which base a check's centres are in", () => {
     expect(checkBaseLabel(report())).toContain("world → fr3_base");
     expect(checkBaseLabel(report({ base: "fr3_base_right", robot_ips: [R] }))).toContain(`fr3_base_right（${R}）`);
+  });
+});
+
+describe("the probe's prior ball centre", () => {
+  // 11-09: the 44 mm fingertips put the ball 23 mm out from corenetic_socket_ee; Desk's EE is the default
+  const deskEe = [-1.4, 0.7, 23.2];
+  it("is Desk's EE while the fields still read it, entered once edited", () => {
+    expect(probePrior(["-1.4", "0.7", "23.2"], deskEe)).toEqual({ mm: deskEe, from: "desk_ee" });
+    expect(probePrior(["0", "0", "20"], deskEe)).toEqual({ mm: [0, 0, 20], from: "manual" });
+    expect(probePrior(["0", "0", "20"], null)).toEqual({ mm: [0, 0, 20], from: "manual" });
+  });
+  it("refuses what is not three numbers or further than a ball can be", () => {
+    expect(probePrior(["0", "", "20"], deskEe)).toMatch(/3 个数/);
+    expect(probePrior(["0", "x", "20"], deskEe)).toMatch(/3 个数/);
+    expect(probePrior(["-1.4", "0.7", "36"], deskEe)).toEqual({ mm: [-1.4, 0.7, 36], from: "manual" });
+    expect(probePrior(["0", "0", "46"], deskEe)).toMatch(/超过 45 mm/);
   });
 });

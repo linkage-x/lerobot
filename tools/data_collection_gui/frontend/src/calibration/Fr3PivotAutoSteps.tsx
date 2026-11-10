@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import type { Fr3PivotResponse } from "../types";
 import { Modal } from "./ConfirmModal";
-import { BIAS_PRESETS, anchorText, biasLabel, fmtVec, planSummaryText } from "./fr3Pivot";
+import { BIAS_PRESETS, anchorText, biasLabel, fmtVec, planSummaryText, probePrior } from "./fr3Pivot";
 
 const CENTRES_SHOWN = 3;
 const PLANS_SHOWN = 6;
@@ -61,6 +61,16 @@ export function Fr3PivotAutoSteps({
   }, [anchorKey, anchorRun, centre, variant]);
 
   const chosen = centres.find((c) => c.name === centre);
+  // The probe's prior: empty (about the origin) by default, since 11-10 corenetic_socket_ee is the measured ball
+  // centre; cleared again for each centre. Desk's EE is only shown for reference (it is not the ball: 15 mm short).
+  const deskEe = chosen?.deskEeInSocketMm ?? null;
+  const [priorFields, setPriorFields] = useState<string[]>(["", "", ""]);
+  useEffect(() => {
+    setPriorFields(["", "", ""]);
+  }, [centre]);
+  const priorOff = priorFields.every((f) => f.trim() === "");
+  const prior = priorOff ? null : probePrior(priorFields, deskEe);
+  const priorError = typeof prior === "string" ? prior : "";
   const toRun = plans.find((p) => p.name === confirmPlan);
   const locked = disabled || active;
 
@@ -210,6 +220,9 @@ export function Fr3PivotAutoSteps({
         <b>2 试探（演算约 1 分钟，执行 1–1.5 分钟）：</b>杯子真正绕着转的点离 corenetic_socket_ee 的原点多远，随夹持而变（10-19 一次 1.4 mm、一次 8.7 mm）。
         规划绕错的点转，转大了球窝要跟着挪十几毫米，力环吃不下。所以先只在起点附近 20° 内排 6 个驻点、3°/s 慢慢转一圈，跑完自动拟合出球心；
         之后的完整规划会自动勾上「绕上次拟合的球心转」。换了夹持（重夹、加装东西）就重新试探。
+        试探本身绕「先验球心」转：三个格子空着就绕 corenetic_socket_ee 的原点转——11-09 的 pivot 已把实测球心写回模型，原点就是球心，默认留空，
+        每次换球心也会清空。只有换了夹爪/插件、模型里的球窝不再对时才手填。旁边显示的 Desk EE 只作参考：它不是球心（11-09 测得球比 Desk EE 远约 15 mm，
+        11-09 17:05 和 11-10 09:09 两次试探都因先验被填成 Desk EE 而停）。
         <br />
         <b>3 规划 + 演算（约 1–2 分钟）：</b>先在仿真里把球心周围的姿态（工具轴朝向、俯仰 −20°～+10°、绕工具轴滚转 ±40°）逐格解 IK，
         每格查关节限位（含 panda_py 那组更窄的墙）、自碰撞、离桌面高度（fr3_base 上方 120 mm），以及球窝和夹爪离球的支架多远（支架和球窝按插件 CAD，夹爪按厂商网格；10-13/10-14 的 21 次引导都落在它算出的可行域里）。
@@ -248,7 +261,33 @@ export function Fr3PivotAutoSteps({
           />{" "}
           绕上次拟合的球心转
         </label>
-        <button className="cali-btn-primary" disabled={locked || !chosen} onClick={() => act("probe", () => api.planFr3Pivot(centre, [0, 0, 0], false, true))}>
+        <label className="cali-muted" title="试探绕这个点转（corenetic_socket_ee 里，mm）；留空=绕原点（模型里的球窝就是实测球心）">
+          试探先验球心{" "}
+          {priorFields.map((f, i) => (
+            <input
+              key={i}
+              style={{ width: "4.5em" }}
+              value={f}
+              disabled={locked}
+              onChange={(e) => setPriorFields(priorFields.map((g, j) => (j === i ? e.target.value : g)))}
+            />
+          ))}{" "}
+          mm{priorOff ? "（留空=绕原点）" : ""}
+          {deskEe ? (
+            <span title="取球心时 Desk EE 在 corenetic_socket_ee 里的位置；不是球心，不要照填">
+              {" "}
+              · 参考：Desk EE 在 ({deskEe.map((x) => x.toFixed(1)).join(", ")}) mm，离原点 {Math.hypot(...deskEe).toFixed(1)} mm
+            </span>
+          ) : null}
+        </label>
+        <button
+          className="cali-btn-primary"
+          disabled={locked || !chosen || !!priorError}
+          title={priorError}
+          onClick={() =>
+            act("probe", () => api.planFr3Pivot(centre, [0, 0, 0], false, true, prior && typeof prior !== "string" ? prior : null))
+          }
+        >
           {running === "probe" ? "演算中…" : "规划试探"}
         </button>
         <button
@@ -259,6 +298,7 @@ export function Fr3PivotAutoSteps({
           {running === "plan" ? "演算中…" : "规划 + 演算"}
         </button>
       </div>
+      {priorError ? <p className="cali-warn">{priorError}</p> : null}
       {plans.length ? (
         <table className="metric-table">
           <thead>

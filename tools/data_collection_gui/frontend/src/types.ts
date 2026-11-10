@@ -1787,6 +1787,8 @@ export type Fr3PivotCentre = {
   /** Tool axis above (+) or below (-) level; the cup faces down across it. */
   toolFromLevelDeg: number | null;
   wallProblems: string[];
+  /** Desk's EE origin in corenetic_socket_ee at the capture (mm): the probe's default prior for the ball. */
+  deskEeInSocketMm?: number[] | null;
 };
 
 export type Fr3PivotPlan = {

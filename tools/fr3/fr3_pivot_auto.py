@@ -56,10 +56,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gc
 import json
 import signal
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -187,8 +189,40 @@ PRESS_SETTLE_S = 3.0
 EXECUTE_STOP_TRACKING_MM = 5.0
 EXECUTE_STOP_FORCE_N = 7.0
 EXECUTE_STOP_JOINT_DEG = 3.0
+# Seated, the force at the ball across the press is a preload the arm holds where Desk guiding let go
+# (joint stiction, mostly j2: 11-09 0.6 -> 1.6 Nm), not the model's bias: 2.2-5.6 N on four seatings of
+# one grip. The loop keeps it (the across target is the seated reading) and the stop counts it, so
+# 17:18 with 5.7 N across and the 3 N press was at 6.2 N before moving and stopped at 7.1 N 4.8 s in.
+# Above this, re-seat instead of starting (3.8 N at 17:05 still ran 53 s).
+EXECUTE_SEATED_ACROSS_MAX_N = 4.0
 # From where the arm stands (within START_TOLERANCE_DEG of the plan's first posture) onto the plan.
 EXECUTE_BLEND_S = 1.0
+# The plan's clock advances by the loop's time per tick, at most this much. 11-10: every execute run
+# stalled 0.40-0.46 s at ~48.7 s (Python's first full garbage collection over ~480k tracked objects --
+# the plan's lists, pinocchio, numpy; reproduced on Thor), the arm held its last command, and the plan
+# index, read off the wall clock, jumped ahead on resume: 09:56's second stall, at 190 s in the fast
+# return, put j1 1.7° behind its command and the catch-up hit the ball at 7.1 N. A stall now pauses the
+# plan instead. 3 ticks at 100 Hz: the loop's own jitter (10.4 ms median) never reaches it.
+EXECUTE_MAX_CLOCK_STEP_S = 0.03
+
+
+def hold_gc() -> Callable[[], None]:
+    """No garbage collection until the returned function is called (a control loop's ``finally``).
+
+    What is alive now is collected once, before the arm moves, and frozen out of the collector's sight.
+    The loop's own objects are lists of floats, freed by reference counting, so nothing piles up meanwhile.
+    """
+    gc.collect()
+    gc.freeze()
+    enabled = gc.isenabled()
+    gc.disable()
+
+    def resume() -> None:
+        if enabled:
+            gc.enable()
+        gc.unfreeze()
+
+    return resume
 # A joint at twice the plan's fastest (and 20°/s at least) is a fault: 10-19's wrist oscillation would
 # have stopped at 0.07 s instead of 0.58 s.
 STOP_JOINT_SPEED_DEG_S = 20.0
@@ -198,6 +232,8 @@ STOP_JOINT_SPEED_DEG_S = 20.0
 # turned 80° about the origin that is 11 mm the socket has to follow, more than the force loop may.
 # Within 20° it is <= 3 mm (2.5-2.9 mm on 10-19's two centres), at 3°/s the loop lags by ~1.7 N, and the fit
 # clears the GUI's anchor gate (>= 20° span, weak singular >= 0.1: 0.13-0.17; 15° gave 0.096).
+# A probe takes --anchor-mm too, as a prior: 11-09 the ball was ~23 mm off (GUIDE_MAX_ANCHOR_MM), 8 mm to
+# follow within 20°; about Desk's EE (the fingertip estimate) the probe only has that estimate's error left.
 PROBE_WITHIN_DEG = 20.0
 PROBE_DWELLS = 6
 PROBE_MIN_DWELLS = 5
@@ -221,7 +257,13 @@ GUIDE_NULLSPACE_STIFFNESS = 2.0
 GUIDE_WALL_WARN_DEG = 6.0
 GUIDE_PHASES = ["press", "guide", "release"]
 # A held point further than this from the socket frame is not a fitted ball centre but a bad fit.
-GUIDE_MAX_ANCHOR_MM = 20.0
+# 11-09: with the 44 mm fingertips the ball sits ~23 mm out along the tool axis from the URDF's
+# corenetic_socket_ee (144.7 mm below link_sensor_ft; the rig's nov4 pivot measured 167.9). The probe
+# turned about the origin then dragged the cup 2.6 mm by 6.5° and stopped at 7 N (16:05), so the probe
+# now starts from a prior (the GUI: Desk's EE in the socket frame). 16:51, about Desk's EE (23 mm), the
+# spin went through but tilting 17.6° lifted the cup: the press loop chased it 3.9 mm down, i.e. the ball
+# ~13 mm further out still (~203 mm from the flange; the caliper's ~190 is by eye). Hence 45.
+GUIDE_MAX_ANCHOR_MM = 45.0
 # The insert's cup sits on top of the ball (the ball on a stand on the table, the gripper reaching in
 # roughly level -- the 10-13 photo): the cup opens downwards, across the tool axis, not along it. So the
 # press is straight down in fr3_base, onto the stand, and the pivot turns about axes through the ball:
@@ -695,6 +737,8 @@ def capture(args) -> int:
     print(
         f"centre (socket FK) {np.round(T[:3, 3] * 1e3, 1).tolist()} mm in fr3_base, tool axis {payload['tool_from_level_deg']}° from level (+ = up)"
     )
+    ee_in_socket = (np.linalg.inv(T) @ _ee_matrix(state))[:3, 3] * 1e3
+    print(f"Desk's EE in {SOCKET_FRAME}: {np.round(ee_in_socket, 1).tolist()} mm (a probe's --anchor-mm prior)")
     for line in beyond:
         print(f"ERROR: {line}")
     for line in close:
@@ -961,6 +1005,18 @@ def press_stuck(shift_m, force_n, target_n) -> str:
     return ""
 
 
+def seated_problem(force0) -> str:
+    """Why the seated force leaves the run no room under EXECUTE_STOP_FORCE_N, or ""."""
+    across = float(np.linalg.norm(along_across(force0)[1]))
+    if across <= EXECUTE_SEATED_ACROSS_MAX_N:
+        return ""
+    return (
+        f"坐上时横向力 {across:.1f} N（超过 {EXECUTE_SEATED_ACROSS_MAX_N:g} N）：再压 {PRESS_FORCE_N:g} N 就离 "
+        f"{EXECUTE_STOP_FORCE_N:g} N 停机线只剩 {EXECUTE_STOP_FORCE_N - float(np.hypot(across, PRESS_FORCE_N)):.1f} N。"
+        "多半是拖动放下时关节静摩擦留的预紧：拖动模式下把杯子轻轻提起再放回球上、松手前不要往前顶，然后重新执行"
+    )
+
+
 def execute(args) -> int:
     plan_data = json.loads(args.plan.read_text(encoding="utf-8"))
     if plan_data.get("schema") != PLAN_SCHEMA:
@@ -1012,6 +1068,10 @@ def execute(args) -> int:
     anchor = np.asarray(params.get("anchor_mm", [0.0, 0.0, 0.0]), dtype=float) / 1e3
     force0 = kin.point_force(q_now, state.tau_ext_hat_filtered, anchor)
     press0 = float(force0 @ PRESS_DIR)
+    why = seated_problem(force0)
+    if why:
+        print(f"ERROR: not starting: {why}")
+        return 2
     goal = PRESS_FORCE_N * PRESS_DIR + along_across(force0)[1]
     ramp_s = max(float(params["ramp_s"]), 1e-3)
     shift_m = np.zeros(3)
@@ -1046,16 +1106,28 @@ def execute(args) -> int:
         f"plan press {params['press_mm']} mm, "
         f"bias {params['bias_mm']} mm"
     )
+    stalls: list[list[float]] = []
+    resume_gc = hold_gc()
     panda.start_controller(ctrl)
     try:
         ctrl.set_control(q_now, np.zeros(7))
-        t0 = time.monotonic()
+        wall = time.monotonic()
+        elapsed = 0.0
         next_print = 0.0
         last = 0.0
         force = force0
         realized = np.zeros(3)
         while not stop["why"]:
-            elapsed = time.monotonic() - t0
+            now = time.monotonic()
+            step, wall = now - wall, now
+            if step > EXECUTE_MAX_CLOCK_STEP_S:
+                # the loop stood still; the arm held its last command, so the plan waits for it
+                stalls.append([round(elapsed, 3), round(step, 3)])
+                print(
+                    f"  WARNING: control loop stalled {step:.2f} s at {elapsed:.1f} s; the plan paused with it",
+                    flush=True,
+                )
+            elapsed += min(step, EXECUTE_MAX_CLOCK_STEP_S)
             settled = np.linalg.norm(force - force0) < PRESS_SETTLE_N
             if elapsed > t_plan[-1] and (settled or elapsed > t_plan[-1] + PRESS_SETTLE_S):
                 break
@@ -1107,6 +1179,7 @@ def execute(args) -> int:
         stop["why"] = f"robot error: {exc}"
     finally:
         panda.stop_controller()
+        resume_gc()
 
     payload = {
         "robot_ip": args.robot_ip,
@@ -1128,6 +1201,8 @@ def execute(args) -> int:
         "force_source": "F_ball",
         "F_ball_point_mm": np.round(anchor * 1e3, 3).tolist(),
         "stopped": stop["why"],
+        # [plan time s, wall time the loop stood still s]: the plan paused for each (EXECUTE_MAX_CLOCK_STEP_S)
+        "loop_stalls": stalls,
         **rec,
     }
     if stop["why"]:
@@ -1242,6 +1317,7 @@ def guide(args) -> int:
         f"{args.press_mm} mm, bias {list(args.bias_mm)} mm, held at {list(args.anchor_mm)} mm in {SOCKET_FRAME}; "
         "rotation free -- by hand, pitch the gripper and roll it about its own axis +-20-30°, and swing it round the ball"
     )
+    resume_gc = hold_gc()
     panda.start_controller(ctrl)
     release_from = None
     try:
@@ -1304,6 +1380,7 @@ def guide(args) -> int:
         flags["abort"] = f"robot error: {exc}"
     finally:
         panda.stop_controller()
+        resume_gc()
 
     tilt, spin = guide_progress(R_start, seen)
     payload = {
@@ -1370,7 +1447,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--probe",
         action="store_true",
-        help=f"a short slow plan within {PROBE_WITHIN_DEG:g}° of the start, to fit the ball's centre for --anchor-mm",
+        help=f"a short slow plan within {PROBE_WITHIN_DEG:g}° of the start, to fit the ball's centre for --anchor-mm "
+        "(with --anchor-mm itself: a prior it turns about, e.g. Desk's EE as capture prints it)",
     )
     p.add_argument(
         "--within-deg",

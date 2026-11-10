@@ -341,7 +341,10 @@ export function planSummaryText(plan: Fr3PivotPlan): string {
 
 // "14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.27 mm，"
 function dwellText(plan: Fr3PivotPlan): string {
-  if (plan.kind === "probe") return `试探：${plan.dwells ?? 0} 个驻点、离起点不远，跑完的拟合给完整规划当球心，`;
+  if (plan.kind === "probe") {
+    const prior = plan.anchorFrom && isAnchored(plan.anchorMm) ? `，绕先验球心 ${fmtVec(plan.anchorMm)} mm（${priorLabel(plan.anchorFrom)}）` : "";
+    return `试探：${plan.dwells ?? 0} 个驻点、离起点不远${prior}，跑完的拟合给完整规划当球心，`;
+  }
   if (plan.kind !== "dwells" || !plan.dwells) return "";
   const s = plan.sigmaPerUnit?.s;
   const sigma = s && s.length ? `，每个驻点误差 0.5 mm 时球窝 σ ≤ ${(0.5 * maxOf(s)).toFixed(2)} mm` : "";
@@ -417,4 +420,28 @@ export function biasConsistency(runs: Run[]): BiasPairVerdict[] {
     out.push({ centre, runs: [a.name, b.name], dBiasMm: dBias, dCentreMm: dCentre, dSocketMm: dSocket, seated, text });
   }
   return out;
+}
+
+// The probe's prior: where it guesses the ball (corenetic_socket_ee, mm) before any fit. 11-09 the new
+// fingertips put it 38.6 mm out along the tool axis; 11-10 that measured point is the model's socket, so the page
+// leaves the prior empty (about the origin) and shows Desk's EE (15 mm short of the ball) only for reference.
+export const PROBE_PRIOR_MAX_MM = 45;
+
+export function priorLabel(anchorFrom: string | undefined): string {
+  if (anchorFrom === "prior: Desk EE") return "取自 Desk EE";
+  if (anchorFrom === "prior: entered") return "手填";
+  return anchorFrom || "";
+}
+
+/** The prior to send from the three fields, or why not; "desk_ee" while they still read Desk's EE. */
+export function probePrior(
+  fields: string[],
+  deskEeMm: number[] | null | undefined
+): { mm: number[]; from: "desk_ee" | "manual" } | string {
+  const mm = fields.map((f) => (f.trim() === "" ? NaN : Number(f)));
+  if (mm.length !== 3 || mm.some((x) => !Number.isFinite(x))) return "先验球心要填 3 个数（mm）";
+  const n = Math.hypot(...mm);
+  if (n > PROBE_PRIOR_MAX_MM) return `先验球心离球窝坐标系 ${n.toFixed(1)} mm，超过 ${PROBE_PRIOR_MAX_MM} mm`;
+  const same = !!deskEeMm && deskEeMm.length === 3 && deskEeMm.every((x, i) => Math.abs(x - mm[i]) < 0.05);
+  return { mm, from: same ? "desk_ee" : "manual" };
 }

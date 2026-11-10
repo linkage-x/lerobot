@@ -4416,7 +4416,11 @@ _FR3_PIVOT_ANCHOR_MAX_RMS_MM = 3.0
 _FR3_PIVOT_ANCHOR_MAX_SIGMA_MM = 3.0
 _FR3_PIVOT_ANCHOR_MIN_SPAN_DEG = 20.0
 _FR3_PIVOT_ANCHOR_MIN_WEAK = 0.1
-_FR3_PIVOT_ANCHOR_MAX_MM = 20.0
+# 11-09: the 44 mm fingertips put the ball 23-36 mm out from corenetic_socket_ee (fr3_pivot_auto's
+# GUIDE_MAX_ANCHOR_MM, the same number).
+_FR3_PIVOT_ANCHOR_MAX_MM = 45.0
+# The probe's prior (plan --probe --anchor-mm): where it guesses the ball before any fit. Its labels.
+_FR3_PIVOT_PRIOR_FROM = {"desk_ee": "prior: Desk EE", "manual": "prior: entered"}
 # corenetic_socket_ee is a pure translation of corenetic_gripper_ee in this URDF (the one the tool fits
 # with). A fit's socket_frame is relative to the frame as it was when fitted (10-14 it moved from z -10.3
 # to the pivot's own value), so the anchor re-expresses the fit's corenetic_gripper_ee value in today's.
@@ -4559,9 +4563,25 @@ def _fr3_pivot_centres(state: GatewayState) -> list[dict[str, Any]]:
                 "centreMm": [round(float(x) * 1e3, 1) for x in centre.get("centre_m") or []],
                 "toolFromLevelDeg": centre.get("tool_from_level_deg"),
                 "wallProblems": list(centre.get("wall_problems") or []),
+                "deskEeInSocketMm": _desk_ee_in_socket_mm(centre),
             }
         )
     return out
+
+
+def _desk_ee_in_socket_mm(centre: dict[str, Any]) -> list[float] | None:
+    """Desk's EE origin in corenetic_socket_ee at the capture (mm): R^T (EE - socket), both in the file.
+    With Desk set to the fingertip estimate this is the probe's prior for the ball."""
+    try:
+        R = [[float(v) for v in row] for row in centre["R"]]
+        ee = [float(row[3]) for row in centre["O_T_EE"][:3]]
+        c = [float(v) for v in centre["centre_m"]]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if len(R) != 3 or any(len(row) != 3 for row in R) or len(c) != 3:
+        return None
+    d = [ee[i] - c[i] for i in range(3)]
+    return [round(1e3 * sum(R[i][j] * d[i] for i in range(3)), 1) for j in range(3)]
 
 
 def _fr3_pivot_plans(state: GatewayState) -> list[dict[str, Any]]:
@@ -4852,6 +4872,11 @@ def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     # The plan turns about the fitted ball centre too, as guide holds it there. A probe is what finds it.
     probe = bool(body.get("probe"))
     anchor_args: list[str] = ["--probe"] if probe else []
+    if probe and body.get("priorMm") is not None:
+        prior = _fr3_pivot_prior(body)
+        if isinstance(prior, str):
+            return _fr3_pivot_refusal(state, prior)
+        anchor_args += ["--anchor-mm", *[f"{x:g}" for x in prior[0]], "--anchor-from", prior[1]]
     if body.get("anchorFromFit") and not probe:
         anchor = _fr3_pivot_anchor(state)
         if not anchor["available"]:
@@ -4912,6 +4937,20 @@ def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, A
         state.log("warn", f"FR3 planned pivot executing on {robot_ip}: {name} -> {run.name}")
     Thread(target=_watch_fr3_pivot, args=(state, process, run), daemon=True, name=f"fr3-pivot-{process.pid}").start()
     return _fr3_pivot_payload(state)
+
+
+def _fr3_pivot_prior(body: dict[str, Any]) -> tuple[list[float], str] | str:
+    """The probe's prior ball centre in corenetic_socket_ee (mm) and its label, or why not."""
+    try:
+        prior = [float(x) for x in body.get("priorMm") or []]
+    except (TypeError, ValueError):
+        return "先验球心要是 3 个数"
+    if len(prior) != 3 or not all(math.isfinite(x) for x in prior):
+        return "先验球心要是 3 个数"
+    if math.hypot(*prior) > _FR3_PIVOT_ANCHOR_MAX_MM:
+        return f"先验球心离球窝坐标系 {math.hypot(*prior):.1f} mm，超过 {_FR3_PIVOT_ANCHOR_MAX_MM:g} mm"
+    label = _FR3_PIVOT_PRIOR_FROM.get(str(body.get("priorFrom") or ""), _FR3_PIVOT_PRIOR_FROM["manual"])
+    return prior, label
 
 
 def _fr3_pivot_bias(body: dict[str, Any]) -> list[float] | str:

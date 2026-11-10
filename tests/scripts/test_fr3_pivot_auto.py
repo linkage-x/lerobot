@@ -29,7 +29,7 @@ def kin():
 def centre(kin):
     # As in the 10-13 photo: the gripper reaching in about level (26° down), the cup facing down onto a
     # ball 80 mm above the table (fr3_base z = 120 mm), 0.45 m out, heading 90° off radial.
-    q = np.array([-0.63018, 0.22631, 0.14601, -2.21704, 0.87887, 1.63422, -1.68999])
+    q = np.array([-0.66639, 0.22881, 0.11594, -2.15429, 0.8339, 1.5574, -1.67546])  # 11-09 socket at nov4
     T = kin.fk(q)
     assert T[:3, 3] == pytest.approx([0.45, 0.0, 0.20], abs=1e-4)
     assert T[2, 2] == pytest.approx(-0.434, abs=0.01)  # tool axis 26° below level
@@ -537,6 +537,42 @@ def test_execute_stops_on_force_and_keeps_nothing_to_fit(kin, centre, tmp_path, 
     assert "外力 20.0 N" in capsys.readouterr().out
 
 
+def test_a_stalled_loop_pauses_the_plan_instead_of_jumping_it(kin, centre, tmp_path, monkeypatch, capsys):
+    """11-10 09:56: the loop stood still 0.46 s (a full GC), the plan index jumped on with the wall clock,
+    and the catch-up hit the ball at 7.1 N. Now the plan waits, and no collection runs inside the loop."""
+    gripper = pa.Kinematics(frame="corenetic_gripper_ee")
+    module, calls = _fake_panda_module(gripper, centre["q"])
+    monkeypatch.setitem(__import__("sys").modules, "panda_py", module)
+    clock = _FakeClock()
+    ticks = {"n": 0, "gc_on": []}
+
+    def sleep(s):
+        ticks["n"] += 1
+        ticks["gc_on"].append(pa.gc.isenabled())
+        clock.sleep(s + (0.46 if ticks["n"] == 120 else 0.0))  # mid-move, as the real one
+
+    monkeypatch.setattr(pa.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(pa.time, "sleep", sleep)
+    handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
+    plan = _plan_file(tmp_path, kin, centre)
+    out = tmp_path / "20261013_200000_pivot.json"
+    assert pa.gc.isenabled()
+    try:
+        assert pa.main(["execute", str(plan), "--arm", "right", "--out", str(out)]) == 0
+    finally:
+        for sig, h in handlers.items():
+            pa.signal.signal(sig, h)
+    run = json.loads(out.read_text())
+    assert len(run["loop_stalls"]) == 1 and run["loop_stalls"][0][1] == pytest.approx(0.47, abs=0.005)
+    assert "control loop stalled 0.47 s" in capsys.readouterr().out
+    # the plan's clock moved by at most one capped step per tick: the command never leapt
+    t = np.asarray(run["t"])
+    assert np.diff(t).max() <= pa.EXECUTE_MAX_CLOCK_STEP_S + 1e-9
+    step_deg = np.degrees(np.abs(np.diff(np.asarray(run["q_cmd"]), axis=0)).max())
+    assert step_deg < 0.5
+    assert not any(ticks["gc_on"]) and pa.gc.isenabled()  # held in the loop, back on after it
+
+
 def _fake_hand_panda(kin_gripper, qs_hand, *, force=1.8, force_after=None):
     """A Panda whose joints the operator moves along ``qs_hand``; records what the spring was set to."""
     calls = {"started": 0, "stopped": 0, "set": [], "impedance": None, "reads": 0}
@@ -697,3 +733,11 @@ def test_guide_anchored_on_the_fitted_ball_centre_stops_dragging_the_socket_fram
         assert run["anchor_mm"] == (true_s.tolist() if anchored else [0.0, 0.0, 0.0])
     assert errors[False].max() > 0.3  # the frame origin swings about the ball centre as the hand turns
     assert errors[True].max() < 1e-3  # held at the ball centre: only the press is left
+
+
+def test_a_seated_preload_across_is_refused_before_moving():
+    # 11-09 seatings: 17:05 3.8 N across ran; 17:18 5.6 N across stopped at 7.1 N 4.8 s in
+    assert pa.seated_problem([3.64, 1.196, -0.998]) == ""
+    why = pa.seated_problem([5.61, 1.186, -2.466])
+    assert "横向力 5.7 N" in why and "重新执行" in why
+    assert pa.seated_problem([0.0, 0.0, -9.0]) == ""  # along the press is the loop's business
