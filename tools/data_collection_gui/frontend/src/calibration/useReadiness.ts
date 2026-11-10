@@ -103,8 +103,10 @@ export type TactileActivationApi = {
 /** Short side label for a touch pad ("左"/"右", else the device label). */
 function padSideLabel(dev: DeviceStatus): string {
   const suffix = boxSensorSuffix(dev.id).toLowerCase();
-  if (suffix.includes("left")) return "左";
-  if (suffix.includes("right")) return "右";
+  // the second (fingertip) pad on a finger, BOX SDK v4.1: "L2"/"R2" like its device row
+  const second = suffix.endsWith("_1") ? "2" : "";
+  if (suffix.includes("left")) return `左${second}`;
+  if (suffix.includes("right")) return `右${second}`;
   return dev.label || dev.id;
 }
 

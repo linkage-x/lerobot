@@ -81,7 +81,18 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     *tuple(f"box_six_d_force_no_gravity.{axis}" for axis in _SIX_D_FORCE_AXIS_NAMES),
     *tuple(f"box_touch_left.{name}" for name in _TOUCH_SUMMARY_NAMES),
     *tuple(f"box_touch_right.{name}" for name in _TOUCH_SUMMARY_NAMES),
+    # The second pad on each finger (BOX SDK v4.1, touch_device_id 1: the fingertip pad;
+    # id 0 is the one by the finger root -- pressed one by one on the rig 2026-11-03).
+    # Appended rather than interleaved so every channel above keeps its index; a
+    # one-pad BOX leaves these zero. ts_sync.md §9.1 / §9.3.
+    *tuple(f"box_touch_left_1.{name}" for name in _TOUCH_SUMMARY_NAMES),
+    *tuple(f"box_touch_right_1.{name}" for name in _TOUCH_SUMMARY_NAMES),
 )
+
+#: The layout before the second pads joined (sessions recorded up to 2026-11-03):
+#: exactly the leading part of :data:`BOX_STATE_NAMES`, so its columns can still be
+#: named. It is not a layout to train against next to the current one.
+BOX_STATE_NAMES_ONE_PAD: tuple[str, ...] = BOX_STATE_NAMES[: -2 * len(_TOUCH_SUMMARY_NAMES)]
 
 # Per-frame timestamp metadata, emitted as a SEPARATE non-observation parquet
 # column ``box.timestamps`` (float64 to preserve the µs-resolution MCU counters
@@ -95,7 +106,10 @@ BOX_TIMESTAMP_NAMES: tuple[str, ...] = (
     "box_six_d_force.timestamp",
     "box_touch_left.timestamp",
     "box_touch_right.timestamp",
+    "box_touch_left_1.timestamp",
+    "box_touch_right_1.timestamp",
 )
+BOX_TIMESTAMP_NAMES_ONE_PAD: tuple[str, ...] = BOX_TIMESTAMP_NAMES[:-2]
 
 BOX_SENSOR_IDS: tuple[str, ...] = (
     "box_gripper",
@@ -104,6 +118,10 @@ BOX_SENSOR_IDS: tuple[str, ...] = (
     "box_six_d_force",
     "box_touch_left",
     "box_touch_right",
+    # The second (fingertip) pad on each finger (BOX SDK v4.1): summarised in
+    # observation.state like the first, its taxels in observation.touch.box_touch_*_1.*.
+    "box_touch_left_1",
+    "box_touch_right_1",
 )
 
 
@@ -184,18 +202,25 @@ def _prefix_box_name(box_id: str, name: str) -> str:
     return f"{box_id}.{name}" if box_id else name
 
 
-def box_state_names(box_ids: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
+def box_state_names(
+    box_ids: tuple[str, ...] | list[str] | None = None, *, one_pad: bool = False
+) -> tuple[str, ...]:
+    """State channel names; ``one_pad`` names the pre-2026-11-03 layout (one pad per finger)."""
+    names = BOX_STATE_NAMES_ONE_PAD if one_pad else BOX_STATE_NAMES
     ids = tuple(box_ids or ("",))
     if ids == ("",):
-        return BOX_STATE_NAMES
-    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in BOX_STATE_NAMES)
+        return names
+    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in names)
 
 
-def box_timestamp_names(box_ids: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
+def box_timestamp_names(
+    box_ids: tuple[str, ...] | list[str] | None = None, *, one_pad: bool = False
+) -> tuple[str, ...]:
+    names = BOX_TIMESTAMP_NAMES_ONE_PAD if one_pad else BOX_TIMESTAMP_NAMES
     ids = tuple(box_ids or ("",))
     if ids == ("",):
-        return BOX_TIMESTAMP_NAMES
-    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in BOX_TIMESTAMP_NAMES)
+        return names
+    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in names)
 
 
 def _snapshot_for_box(snapshot: dict[str, Any], box_id: str) -> dict[str, Any]:
@@ -308,6 +333,8 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
     six_d = _sensor(snapshot, "box_six_d_force")
     touch_left = _sensor(snapshot, "box_touch_left")
     touch_right = _sensor(snapshot, "box_touch_right")
+    touch_left_1 = _sensor(snapshot, "box_touch_left_1")
+    touch_right_1 = _sensor(snapshot, "box_touch_right_1")
 
     state = [
         _finite_float(gripper.get("distance_m")),
@@ -319,6 +346,8 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         *_list_values(six_d, "fxyz_mxyz_no_gravity", 6),
         *_touch_summary(touch_left),
         *_touch_summary(touch_right),
+        *_touch_summary(touch_left_1),
+        *_touch_summary(touch_right_1),
     ]
     if len(state) != len(BOX_STATE_NAMES):
         raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES)}")
@@ -339,6 +368,8 @@ def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
     six_d = _sensor(snapshot, "box_six_d_force")
     touch_left = _sensor(snapshot, "box_touch_left")
     touch_right = _sensor(snapshot, "box_touch_right")
+    touch_left_1 = _sensor(snapshot, "box_touch_left_1")
+    touch_right_1 = _sensor(snapshot, "box_touch_right_1")
 
     timestamps = [
         _timestamp(gripper),
@@ -347,6 +378,8 @@ def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
         _timestamp(six_d),
         _timestamp(touch_left),
         _timestamp(touch_right),
+        _timestamp(touch_left_1),
+        _timestamp(touch_right_1),
     ]
     if len(timestamps) != len(BOX_TIMESTAMP_NAMES):
         raise RuntimeError(
@@ -590,21 +623,28 @@ def calibrate_mcu_clock(
     Centred, the same 72 fits land within **0.3 µs**, which is the float64
     representation limit of a 1.8e9-second wall clock rather than anything left
     in the algorithm.
+
+    Every sum is ``math.fsum``, so the fit does not depend on the interpreter. The recorder
+    runs on Python 3.12, whose ``sum()`` compensates float rounding; box_realign runs on the
+    opencv_kalibr venv's 3.10, whose ``sum()`` does not. Adding thousands of 1.8e9 wall clocks
+    the plain way moved the intercept by up to 50 ULP (12 us on 8840 IMU samples, 2026-11-06):
+    nothing to the pairing, but a rebuild no longer reproduced the stored interpolated stamps
+    and box_realign refused every one-BOX dataset.
     """
     n = len(mcu_timestamps)
     if n < 2:
         return (0.0, 0.0, float("inf"))
-    mean_x = sum(mcu_timestamps) / n
-    mean_y = sum(host_times) / n
+    mean_x = math.fsum(mcu_timestamps) / n
+    mean_y = math.fsum(host_times) / n
     dx = [x - mean_x for x in mcu_timestamps]
-    denom = sum(d * d for d in dx)
+    denom = math.fsum(d * d for d in dx)
     if denom < 1e-30:
         return (0.0, 0.0, float("inf"))
-    slope = sum(d * (y - mean_y) for d, y in zip(dx, host_times)) / denom
+    slope = math.fsum(d * (y - mean_y) for d, y in zip(dx, host_times)) / denom
     intercept = mean_y - slope * mean_x
     residuals = [y - (slope * x + intercept)
                  for x, y in zip(mcu_timestamps, host_times)]
-    res_std = (sum(r * r for r in residuals) / n) ** 0.5
+    res_std = (math.fsum(r * r for r in residuals) / n) ** 0.5
     return (slope, intercept, res_std)
 
 
@@ -1281,7 +1321,8 @@ def _build_episode_rows(
     ``frame_times_s`` is the camera timeline (``camera_frame_times_rel``).  Given
     ``sof_frame_times_s`` as well (the same sidecar at ``exposure_fraction=0``),
     ``frame_times_s`` is taken to be mid-exposure and each BOX is read at
-    ``frame_time + d_box`` if ``box_delays_s`` has it, at the raw SOF otherwise
+    ``frame_time + d_box`` if ``box_delays_s`` has it (``""`` is the BOX of a one-BOX
+    recording, which names no device), at the raw SOF otherwise
     (exactly what it got before the delays existed).  Without it every BOX is read
     at ``frame_times_s`` and no delay is applied.  ``interpolate`` reads the
     channels in :data:`BOX_INTERPOLATED_FIELDS` between samples (the recorder turns
@@ -1325,9 +1366,8 @@ def _build_episode_rows(
         sensor_lookup: dict[str, tuple[list[float], float]] = {}
         for sid in per_sensor:
             split = _split_box_sensor_id(sid)
-            box = split[0] if split is not None else ""
-            if box and box in delays:
-                sensor_lookup[sid] = (lookup_main, delays[box])
+            if split is not None and split[0] in delays:
+                sensor_lookup[sid] = (lookup_main, delays[split[0]])
             else:
                 sensor_lookup[sid] = (lookup_sof, 0.0)
 

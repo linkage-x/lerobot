@@ -38,7 +38,7 @@ open it. The target is written to ``--hold-file`` for the next entry.
 
 Status goes to stdout as ``STATUS {json}`` lines (the GUI's panel reads them).
 On Thor, from ~/lerobot:  PYTHONPATH=src ~/Code/infer/.venv-fr3/bin/python \
-  tools/fr3/fr3_gripper_teleop.py --arm-device-id 596523097
+  tools/fr3/fr3_gripper_teleop.py --arm-device-id 3100715645
 """
 
 from __future__ import annotations

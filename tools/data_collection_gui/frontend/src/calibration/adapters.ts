@@ -257,9 +257,11 @@ export function deviceBoxIdentity(device: DeviceStatus): string {
   const cfg = device.config ?? {};
   const namespaced = deviceBoxId(device);
   if (namespaced) return namespaced;
-  const sn = String((cfg.sn as string | undefined) ?? "").trim();
-  if (sn) return sn;
+  // device_id before sn: every BOX reports the same factory serial, so with one online the
+  // serial looks unique and still says nothing about which BOX this is.
   const deviceId = cfg.device_id;
   if (deviceId != null && String(deviceId).trim()) return `box${String(deviceId).trim()}`;
+  const sn = String((cfg.sn as string | undefined) ?? "").trim();
+  if (sn) return sn;
   return "";
 }

@@ -41,7 +41,7 @@ def stand():
 @pytest.fixture(scope="module")
 def centre(kin):
     # test_fr3_pivot_auto's capture: the gripper about level (26° down), heading 90° off radial
-    q = np.array([-0.63018, 0.22631, 0.14601, -2.21704, 0.87887, 1.63422, -1.68999])
+    q = np.array([-0.66639, 0.22881, 0.11594, -2.15429, 0.8339, 1.5574, -1.67546])  # 11-09 socket at nov4
     T = kin.fk(q)
     assert T[:3, 3] == pytest.approx(BALL, abs=1e-4)
     return {"schema": pa.CENTRE_SCHEMA, "q": q.tolist(), "centre_m": T[:3, 3].tolist()}
@@ -182,7 +182,7 @@ def test_a_probe_stays_near_the_start_and_fits_well_enough_to_anchor(kin, stand,
     assert max(turned) <= pa.PROBE_WITHIN_DEG + pp.SurveyParams.heading_step_deg + 0.5
     summary = pa.check_path(path, qs, np.asarray(centre["q"]), kin, scene, params.rate_hz, table_z_m=TABLE_Z)
     assert summary["passed"], summary["problems"]
-    assert summary["duration_s"] < 90
+    assert summary["duration_s"] < 100  # 11-09 real probes planned 78-92 s
     delta = [-3.2, 0.8, -8.0]
     qs_seated = _seated_run(kin, centre, path, delta)
     gripper = pa.Kinematics(frame="corenetic_gripper_ee")
@@ -283,7 +283,7 @@ def test_plan_cli_writes_a_dwell_plan_execute_accepts(kin, centre, tmp_path, mon
     handlers = {sig: pa.signal.getsignal(sig) for sig in (pa.signal.SIGINT, pa.signal.SIGTERM)}
     run = tmp_path / "20261015_120200_pivot.json"
     try:
-        assert pa.main(["execute", str(out), "--out", str(run)]) == 0
+        assert pa.main(["execute", str(out), "--arm", "right", "--out", str(run)]) == 0
     finally:
         for sig, h in handlers.items():
             pa.signal.signal(sig, h)

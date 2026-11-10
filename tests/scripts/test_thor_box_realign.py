@@ -167,3 +167,135 @@ def test_a_parquet_the_rebuild_cannot_reproduce_is_left_alone(tmp_path):
     with pytest.raises(RuntimeError, match="does not reproduce"):
         br.realign(root, estimate=False, write=True, table={"boxA": 0.009})
     assert not path.with_name(path.name + ".pre_realign").exists()
+
+
+def _make_one_box_dataset(tmp_path):
+    """A recording of the one BOX the recorder does not name: bare sensor ids, stored as
+    the recorder stores it since 2026-10-15 (interpolated, read at the raw SOF)."""
+    root = tmp_path / "thor_gmsl2_11ch_v1_20261106_120000"
+    ep = root / "episodes" / "episode_000000"
+    ep.mkdir(parents=True)
+    rows = ["logical_frame_index,sensor_timestamp_ns,sensor_exposure_time_ns"]
+    rows += [
+        f"{f},{int(round((T0_MONO + _sof(f)) * 1e9))},{int(EXPOSURE_S * 1e9)}" for f in range(FRAMES + 5)
+    ]
+    (ep / "cam_03.argus_frame_metadata.csv").write_text("\n".join(rows) + "\n")
+    samples = []
+    for i in range(1000):
+        wall = T0_WALL + i / 1000.0
+        data = {"timestamp": 1_000_000 + i * 1000, "distance_m": i / 1000.0}
+        samples.append({"t_rel_s": wall - T0_WALL, "wall_s": wall, "data": data})
+    (ep / "box_sensors.jsonl").write_text(
+        "\n".join(json.dumps({"sid": "box_gripper", "mcu_ts": s["data"]["timestamp"], **s}) for s in samples)
+        + "\n"
+    )
+    (ep / "meta.json").write_text(
+        json.dumps(
+            {
+                "sync_reference": {"t0_wall_s": T0_WALL, "t0_mono_s": T0_MONO},
+                "box_camera_alignment": {
+                    "mode": "sensor_timestamp_sof",
+                    "exposure_fraction": -0.5,
+                    "box_targets": {"unnamed": {"target": "raw_sof", "d_box_ms": None}},
+                },
+            }
+        )
+    )
+    lr3.write_box_lerobot_v3_episode(
+        root,
+        repo_id="x",
+        task="t",
+        fps=FPS,
+        episode_index=0,
+        snapshots=[],
+        duration_s=FRAMES / FPS,
+        sensor_samples={"box_gripper": samples},
+        t0_wall_s=T0_WALL,
+        frame_times_s=lr3.camera_frame_times_rel(ep, T0_MONO, exposure_fraction=-0.5),
+        sof_frame_times_s=lr3.camera_frame_times_rel(ep, T0_MONO, exposure_fraction=0.0),
+        box_delays_s={},
+        interpolate=True,
+    )
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    info.update({"fps": FPS, "derived": {br.SIDECAR: {"summary_json": ""}}})
+    info_path.write_text(json.dumps(info))
+    return root
+
+
+def test_the_episode_estimate_moves_the_one_box_recording_and_a_second_run_reproduces_it(
+    tmp_path, monkeypatch
+):
+    root = _make_one_box_dataset(tmp_path)
+    monkeypatch.setattr(br, "_tracking_csv", lambda dataset: root / "x.csv")
+    monkeypatch.setattr(br, "estimate_delays", lambda dataset, csv: {0: {"": {"d_box_ms": 8.0, "r": 0.95}}})
+    assert np.abs(_gripper(root, 0) - np.array([_sof(f) for f in range(FRAMES)])).max() < 1e-5
+
+    report = br.realign(root, estimate=True, write=True, table={})
+    entry = report["episodes"]["0"]
+    assert entry["boxes"]["unnamed"] == {
+        "target": "mid_exposure_plus_d_box",
+        "source": "episode",
+        "d_box_ms": 8.0,
+        "r": 0.95,
+    }
+    # what the report says is what the columns hold: mid-exposure + d_box, not the raw SOF
+    target = np.array([_sof(f) - EXPOSURE_S / 2 + 0.008 for f in range(FRAMES)])
+    assert np.abs(_gripper(root, 0) - target).max() < 1e-5
+
+    # tracking the dataset again runs realign again: it must read its own record back
+    again = br.realign(root, estimate=True, write=True, table={})
+    assert again["episodes"]["0"]["reproduced_same_pick"] == 1.0
+    assert again["episodes"]["0"]["max_change"] < 1e-6
+
+
+def test_a_one_box_estimate_that_does_not_correlate_stays_on_the_raw_sof(tmp_path, monkeypatch):
+    root = _make_one_box_dataset(tmp_path)
+    monkeypatch.setattr(br, "_tracking_csv", lambda dataset: root / "x.csv")
+    monkeypatch.setattr(br, "estimate_delays", lambda dataset, csv: {0: {"": {"d_box_ms": 8.0, "r": 0.4}}})
+    boxes = br.realign(root, estimate=True, write=True, table={})["episodes"]["0"]["boxes"]
+    assert boxes["unnamed"]["target"] == "raw_sof" and boxes["unnamed"]["episode_estimate"]["r"] == 0.4
+    assert np.abs(_gripper(root, 0) - np.array([_sof(f) for f in range(FRAMES)])).max() < 1e-5
+
+
+def test_a_one_box_episode_without_its_own_estimate_takes_the_table_by_device(tmp_path, monkeypatch):
+    """One flat episode must not stay at the raw SOF beside the session's others: the export
+    refuses a session paired two ways."""
+    root = _make_one_box_dataset(tmp_path)
+    meta_path = root / "episodes" / "episode_000000" / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["box_collection"] = {"snapshots": [{"status": {"device_id": 3969377039}}]}
+    meta_path.write_text(json.dumps(meta))
+    monkeypatch.setattr(br, "_tracking_csv", lambda dataset: root / "x.csv")
+    monkeypatch.setattr(br, "estimate_delays", lambda dataset, csv: {0: {"": {"d_box_ms": 3.0, "r": 0.4}}})
+
+    report = br.realign(root, estimate=True, write=True, table={"box3969377039": 0.008})
+    box = report["episodes"]["0"]["boxes"]["unnamed"]
+    assert (box["target"], box["source"], box["d_box_ms"]) == ("mid_exposure_plus_d_box", "table", 8.0)
+    assert box["episode_estimate"]["r"] == 0.4
+    target = np.array([_sof(f) - EXPOSURE_S / 2 + 0.008 for f in range(FRAMES)])
+    assert np.abs(_gripper(root, 0) - target).max() < 1e-5
+    again = br.realign(root, estimate=True, write=True, table={"box3969377039": 0.008})
+    assert again["episodes"]["0"]["max_change"] < 1e-6
+
+
+def test_the_estimator_s_one_box_episode_is_kept(tmp_path, monkeypatch):
+    from metrology.cli import estimate_camera_imu_time_offset as est
+
+    def fake_main(argv):
+        out = argv[argv.index("--output-dir") + 1]
+        episodes = [
+            {
+                "status": "ok",
+                "imu_sid": "box_imu",
+                "episode_index": 0,
+                "coarse": {"peak_normalized_correlation": 0.99},
+                "fine": {"delta_ms": 9.98},
+            }
+        ]
+        with open(f"{out}/camera_imu_time_offset.json", "w", encoding="utf-8") as handle:
+            json.dump({"episodes": episodes}, handle)
+        return 0
+
+    monkeypatch.setattr(est, "main", fake_main)
+    assert br.estimate_delays(tmp_path, tmp_path / "x.csv") == {0: {"": {"d_box_ms": 9.98, "r": 0.99}}}

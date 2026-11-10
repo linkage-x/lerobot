@@ -52,6 +52,27 @@ MIN_PEAK_CORRELATION = 0.8
 REPRODUCE_MIN_SAME_PICK = 0.99
 REPRODUCE_TOL = 1e-5
 SIDECAR = "april_cube_tracking_in_robot_base"
+# What meta.json and box_alignment call the BOX of a one-BOX recording, whose id in the raw data
+# is "". The table is keyed by device, so for that BOX it is looked up by the id the recorder's
+# snapshots hold (_table_key).
+UNNAMED_BOX = "unnamed"
+
+
+def _box_id(label: str) -> str:
+    return "" if label == UNNAMED_BOX else label
+
+
+def _table_key(box: str, meta: dict[str, Any]) -> str:
+    """The delay table's key for ``box``. Without it, a one-BOX episode with too little rotation
+    for its own estimate would stay at the raw SOF beside episodes moved to mid-exposure + d_box,
+    and the export refuses a session whose episodes are paired two ways."""
+    if box:
+        return box
+    for snapshot in (meta.get("box_collection") or {}).get("snapshots") or []:
+        device = ((snapshot or {}).get("status") or {}).get("device_id")
+        if device:
+            return f"box{device}"
+    return ""
 
 
 def load_episode(ep_dir: Path) -> dict[str, Any]:
@@ -95,7 +116,7 @@ def build_rows(
     }
     if legacy and prior is not None:
         delays_s = {
-            b: c["d_box_ms"] / 1000.0
+            _box_id(b): c["d_box_ms"] / 1000.0
             for b, c in prior.items()
             if c.get("target") == "mid_exposure_plus_d_box"
         }
@@ -105,7 +126,7 @@ def build_rows(
             times = ep["sof"] if ep["recorded_fraction"] == 0.0 else ep["mid"]
             return lr3._build_episode_rows(**kw, frame_times_s=times)
         recorded = {
-            b: t["d_box_ms"] / 1000.0
+            _box_id(b): t["d_box_ms"] / 1000.0
             for b, t in ep["recorded_targets"].items()
             if t.get("d_box_ms") is not None
         }
@@ -151,7 +172,11 @@ def _reproduces(rows, stored_state, stored_ts, ts_names) -> tuple[float | None, 
 
 
 def estimate_delays(dataset: Path, tracking_csv: Path) -> dict[int, dict[str, dict[str, float]]]:
-    """``episode -> box -> {d_box_ms, r}`` from the camera<->IMU estimator at mid-exposure."""
+    """``episode -> box -> {d_box_ms, r}`` from the camera<->IMU estimator at mid-exposure.
+
+    The box of a one-BOX recording is ``""``. The estimate is still that BOX's: there is no other
+    gyro it could be, and a BOX not on the tracked hand fails the correlation threshold.
+    """
     from metrology.cli import estimate_camera_imu_time_offset as est
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -172,8 +197,8 @@ def estimate_delays(dataset: Path, tracking_csv: Path) -> dict[int, dict[str, di
         if e.get("status") != "ok":
             continue
         split = lr3._split_box_sensor_id(str(e.get("imu_sid", "")))
-        if split is None or not split[0]:
-            continue  # a one-BOX recording names no device
+        if split is None:
+            continue
         r = float(e["coarse"]["peak_normalized_correlation"])
         d = float(e["fine"]["delta_ms"])
         prev = out.setdefault(int(e["episode_index"]), {}).get(split[0])
@@ -237,6 +262,11 @@ def realign(
         ep = load_episode(ep_dir)
         box_ids = lr3.box_ids_from_inputs([], ep["samples"])
         if len(lr3.box_state_names(box_ids)) != width:
+            if len(lr3.box_state_names(box_ids, one_pad=True)) == width:
+                raise ValueError(
+                    f"{ep_dir.name}: recorded with one touch pad per finger in observation.state (before "
+                    "2026-11-03); this tool rebuilds rows in the current two-pad layout, so it cannot realign it"
+                )
             raise ValueError(
                 f"{ep_dir.name}: {len(box_ids)} BOX(es) in the raw data, the parquet has {width} state channels"
             )
@@ -256,17 +286,17 @@ def realign(
             own = measured.get(ep_index, {}).get(box)
             if own is not None and own["r"] >= MIN_PEAK_CORRELATION:
                 delays_s[box] = own["d_box_ms"] / 1000.0
-                choice[box or "unnamed"] = {"target": "mid_exposure_plus_d_box", "source": "episode", **own}
-            elif box and box in table:
-                delays_s[box] = table[box]
-                choice[box] = {
+                choice[box or UNNAMED_BOX] = {"target": "mid_exposure_plus_d_box", "source": "episode", **own}
+            elif (key := _table_key(box, ep["meta"])) and key in table:
+                delays_s[box] = table[key]
+                choice[box or UNNAMED_BOX] = {
                     "target": "mid_exposure_plus_d_box",
                     "source": "table",
-                    "d_box_ms": round(table[box] * 1000.0, 3),
+                    "d_box_ms": round(table[key] * 1000.0, 3),
                     **({"episode_estimate": own} if own else {}),
                 }
             else:
-                choice[box or "unnamed"] = {
+                choice[box or UNNAMED_BOX] = {
                     "target": "raw_sof",
                     "source": "unmeasured",
                     **({"episode_estimate": own} if own else {}),

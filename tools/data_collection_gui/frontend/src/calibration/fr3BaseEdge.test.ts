@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { Fr3BaseEdgeResponse } from "../types";
 import {
   applyConfirmation,
+  edgeEnds,
+  graphGuardBlocks,
+  graphGuardLines,
   candidateSpread,
   laserSelectionWarnings,
   liveEdgeSummary,
@@ -63,6 +66,39 @@ describe("fr3BaseEdge", () => {
     expect(liveEdgeWarnings(current, "world_20260928_063531")).toEqual([]);
     expect(liveEdgeWarnings({ ...current, fromReferenceWorld: false }, "world_new")[0]).toContain("world_new");
     expect(liveEdgeWarnings({ ...current, referenceUnchanged: false }, "w")[0]).toContain("改过");
+  });
+
+  it("describes the arm-arm edge and confirms it in terms of its ends", () => {
+    const q = { method: "armArm" as const, positions: 5, baselineM: 0.661, leaveOneOutRmsMm: 0.42, leaveOneOutMaxMm: 0.8, residualRmsMm: 0.3, folds: [] };
+    expect(methodLabel(q)).toBe("两臂同球");
+    expect(qualitySummary(q)).toContain("两基座相距 0.661 m");
+    expect(edgeEnds()).toBe("world → fr3_base");
+    expect(edgeEnds("fr3_base", "fr3_base_right")).toBe("fr3_base → fr3_base_right");
+    const text = applyConfirmation({ ...candidate("armarm_x", null), from: "fr3_base", to: "fr3_base_right", quality: q }, current);
+    expect(text).toContain("fr3_base → fr3_base_right");
+    expect(text).toContain("闭合");
+  });
+
+  it("turns red only while the world graph is not the trusted one", () => {
+    expect(graphGuardBlocks(undefined)).toBe(false);
+    expect(graphGuardLines({ state: "unrecorded", problems: [], recordedUtc: "" })).toEqual([]);
+    expect(graphGuardLines({ state: "ok", problems: [], recordedUtc: "t" })).toEqual([]);
+    const lines = graphGuardLines({ state: "diverged", problems: ["已停用的边 … 又成了现役"], recordedUtc: "2026-11-03T09:00:00Z" });
+    expect(lines[0]).toContain("导出不换算到基座系");
+    expect(lines[0]).toContain("2026-11-03T09:00:00Z");
+    expect(lines[1]).toContain("又成了现役");
+    expect(graphGuardBlocks({ state: "unreadable", problems: [], recordedUtc: "" })).toBe(true);
+  });
+
+  it("names a retired edge instead of saying there never was one", () => {
+    const retired = [
+      { label: "ball_check_20261015T030840Z", createdUtc: "2026-10-15T03:08:47Z", retiredUtc: "2026-11-03T08:00:00Z", reason: "base moved" },
+    ];
+    const warnings = liveEdgeWarnings(null, "w", retired);
+    expect(warnings[0]).toContain("已停用");
+    expect(warnings[0]).toContain("保留相机世界系");
+    expect(warnings[1]).toContain("ball_check_20261015T030840Z");
+    expect(warnings[1]).toContain("base moved");
   });
 
   it("reports the move in the workspace with its direction", () => {

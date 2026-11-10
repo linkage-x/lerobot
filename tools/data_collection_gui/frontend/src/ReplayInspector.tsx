@@ -808,7 +808,7 @@ export function ReplayInspector({
         <div className="panel-heading">
           <h2>End-effector pose</h2>
           <span>
-            drag to orbit · wheel to zoom{cubePoseNames.length ? ` · cubes ${cubePoseNames.join(", ")}` : ""}
+            drag to orbit · wheel to zoom{cubePoseNames.length ? ` · hands ${cubePoseNames.join(", ")}` : ""}
           </span>
         </div>
         <ReplayTransport
@@ -864,7 +864,7 @@ export function ReplayInspector({
         </div>
         <div className="mujoco-local-controls">
           {cubeSelection ? (
-            <div className="mujoco-mode-picker" role="group" aria-label="MuJoCo cube trajectory">
+            <div className="mujoco-mode-picker" role="group" aria-label="MuJoCo hand trajectory">
               {(["left", "right", "both"] as MujocoCubeMode[]).map((mode) => (
                 <button
                   key={mode}
@@ -873,7 +873,7 @@ export function ReplayInspector({
                   onClick={() => onMujocoModeChange(mode)}
                   type="button"
                 >
-                  {mode === "both" ? "Both cubes" : `${mode[0].toUpperCase()}${mode.slice(1)} cube`}
+                  {mode === "both" ? "Both hands" : `${mode[0].toUpperCase()}${mode.slice(1)} hand`}
                 </button>
               ))}
             </div>
@@ -939,7 +939,7 @@ export function ReplayInspector({
             {nativeVideoFailed
               ? "The native MuJoCo FR3 video could not be loaded. Run MuJoCo again to regenerate it."
               : cubeSelection
-                ? "Choose a cube mode and run MuJoCo here to render the true FR3 model for this dataset and episode."
+                ? "Choose a hand and run MuJoCo here to render the true FR3 model for this dataset and episode."
                 : "Run MuJoCo here to render the true FR3 model for this dataset and episode."}
           </div>
         )}
@@ -963,7 +963,7 @@ export function ReplayInspector({
         />
         {cubeSeriesNames.length ? (
           <SeriesPlot
-            title="cube pose trajectories"
+            title="hand pose trajectories"
             names={cubeSeriesNames}
             pickValue={pickCubePose}
             currentFrame={currentFrame}

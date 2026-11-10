@@ -13,9 +13,9 @@ import {
   fmtNm,
   fmtNum,
 } from "./config";
-import { useBoxPreview } from "./useBoxPreview";
+import { forceVecFromSensor, useBoxPreview } from "./useBoxPreview";
 import { ForceAxisGrid, TouchHeatmap } from "./BoxSensorViews";
-import { evaluateForce } from "./parseCaliLog";
+import { evaluateForce, evaluateForceAgainstLoad } from "./parseCaliLog";
 import type { ForceVec } from "./types";
 
 function StaleChip({ fresh, staleS }: { fresh: boolean; staleS: number | null }) {
@@ -44,6 +44,9 @@ export function ForceSensorCard({
   // Operational reference for out-of-range highlighting: the dynamic limits
   // (Fz is expected loaded during use). Highlight is per-axis, not whole-card.
   const limits = DYNAMIC_FORCE_LIMITS;
+  // against the payload weight at the live attitude, like the dynamic calibration's own check
+  const load = forceVecFromSensor(view.sensor, "fxyz_mxyz_gravity");
+  const evals = view.force && load ? evaluateForceAgainstLoad(view.force, load, limits).axes : null;
 
   return (
     <div className="cali-monitor cali-monitor-dark">
@@ -56,7 +59,7 @@ export function ForceSensorCard({
       </div>
       <div className="cali-monitor-body">
         {view.force ? (
-          <ForceAxisGrid vec={view.force} limits={limits} variant="monitor" />
+          <ForceAxisGrid vec={view.force} limits={limits} evals={evals} variant="monitor" />
         ) : (
           <div className="cali-axis-empty">无力数据（{online ? "等待采样" : "离线"}）</div>
         )}

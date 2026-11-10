@@ -43,7 +43,7 @@ for extra_path in (REPO_ROOT, SRC_ROOT):
     if extra_path_str not in sys.path:
         sys.path.insert(0, extra_path_str)
 
-from tools.fr3 import fr3_record
+from tools.fr3 import fr3_arms, fr3_record
 from lerobot.cameras.hikrobot.camera_hikrobot import HikrobotCamera
 from lerobot.cameras.hikrobot.configuration_hikrobot import Cv2Rotation, HikrobotCameraConfig
 from tools.hikrobot.list_hikrobot_gige_cameras import _resolve_net_export_filter, list_gige_cameras
@@ -321,6 +321,33 @@ def check_fr3_arm(robot_ip: str) -> tuple[bool, str]:
                 pass
 
 
+def check_fr3_payload(robot_ip: str) -> tuple[bool, str]:
+    """Does Desk hold the end-effector load fr3_arms.json declares for this arm (roadmap B2)?
+
+    An IP no arm in the registry has (the workstation's FR3) is not checked: nothing declares its load.
+    """
+    try:
+        entry = fr3_arms.resolve(fr3_arms.load(), robot_ip=robot_ip)
+    except fr3_arms.ArmConfigError as exc:
+        return True, f"skipped: {exc}"
+    robot = None
+    try:
+        from panda_py import Panda
+
+        robot = Panda(robot_ip)
+        state = robot.get_robot().read_once()  # get_state() is a frozen cache without a controller (10-12)
+        ok, details = fr3_arms.payload_check(entry, float(state.m_ee), list(state.F_x_Cee))
+        return ok, f"{entry['arm']} arm: {details}"
+    except Exception as exc:
+        return False, _exception_details(exc)
+    finally:
+        if robot is not None and hasattr(robot, "stop_controller"):
+            try:
+                robot.stop_controller()
+            except Exception:
+                pass
+
+
 def check_franka_hand(robot_ip: str) -> tuple[bool, str]:
     gripper = None
     try:
@@ -501,6 +528,9 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], Hikrobot
     if not args.skip_arm:
         arm_ok, arm_details = check_fr3_arm(robot_ip)
         _record(results, "fr3_arm", arm_ok, arm_details)
+        if arm_ok:
+            payload_ok, payload_details = check_fr3_payload(robot_ip)
+            _record(results, "fr3_payload", payload_ok, payload_details)
 
     gripper_backend = str(robot_cfg.get("gripper_backend", "pika")).lower()
     if not args.skip_gripper:

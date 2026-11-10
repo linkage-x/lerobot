@@ -11,6 +11,9 @@ Do not use the meshes to locate points on the fingertip, such as the pivot inser
 that socket at EE (1.45, −0.78, −5.06) mm in the TCP frame while the insert is gripped, with a 35 mm gap
 between the pads: the FR3 pivot about a fixed ball, 2026-10-14, and a caliper reads flange face → socket
 166.9 mm. The earlier −10.3 mm came from the laser end to end and included the world → fr3_base edge.
+Since 2026-11-09 the gripper carries the 44 mm fingertips (`corenetic_gripper_ldt_tip_description` in
+opencv_kalibr) holding insert nov4, and `corenetic_socket_ee` is that insert's ball: (−0.96, 2.06, 33.50) mm,
+205.5 mm from the flange, by FR3 pivot. The finger meshes here are still the old fingertips'.
 The repo URDF matches Thor's replay model (`box_api/replay_p0_arm_only_20260908/model.urdf`) frame for frame.
 
 - `urdf/gripper_w_v2_franka_description.urdf`: the vendor file, verbatim, for reference only. It does not

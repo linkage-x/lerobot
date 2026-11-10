@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { graphGuardBlocks, graphGuardLines } from "./calibration/fr3BaseEdge";
 import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
@@ -276,8 +277,8 @@ function App() {
       <EpisodeReplayPage
         snapshot={snapshot}
         busy={busy}
-        onPreflight={() => run(() => api.preflightReplay())}
-        onMujocoReplay={(mode) => run(() => api.startMujocoReplay(mode))}
+        onPreflight={(arm) => run(() => api.preflightReplay(arm))}
+        onMujocoReplay={(mode, arm) => run(() => api.startMujocoReplay(mode, arm))}
         onApproveMujoco={(mode) => run(() => api.approveMujocoReplay(mode))}
         onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure, recordTracker, commandLeadFrames) =>
           run(() =>
@@ -383,6 +384,13 @@ function App() {
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
         </div>
       </header>
+      {graphGuardBlocks(snapshot.worldGraphGuard) ? (
+        <div className="command-error" role="alert">
+          {graphGuardLines(snapshot.worldGraphGuard).map((line, i) => (
+            <div key={i}>{i === 0 ? <b>{line}</b> : `· ${line}`}</div>
+          ))}
+        </div>
+      ) : null}
       {commandError ? (
         <div className="command-error" role="alert">
           <span>{commandError}</span>

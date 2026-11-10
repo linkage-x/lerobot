@@ -22,6 +22,13 @@ import yaml
 from tools.data_collection_gui import gateway
 
 
+@pytest.fixture(autouse=True)
+def _repo_arm_registry(monkeypatch):
+    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2)."""
+    registry = gateway.fr3_arms.load()
+    monkeypatch.setattr(gateway.fr3_arms, "load", lambda path=None, repo_root=None: registry)
+
+
 def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -264,6 +271,17 @@ def test_start_episode_names_tracker_connection_failure(tmp_path, monkeypatch, p
     assert "重新 Connect" in str(exc.value)
     assert "home 窝" not in str(exc.value)
     assert written == []
+
+
+def test_a_6d_calibration_warning_is_shown_for_its_episode_and_cleared_by_the_next(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+
+    gateway._apply_recorder_output(state, 'SIX_D_CALI_WARN {"3969377039":["\\u6ca1\\u6709 origin"]}')
+    assert state.recording.sixDCaliWarnings == ["BOX 3969377039：没有 origin"]
+    assert any("没有 origin" in item.message for item in state.events)
+
+    gateway._apply_recorder_output(state, "SIX_D_CALI_WARN {}")
+    assert state.recording.sixDCaliWarnings == []
 
 
 def test_start_episode_names_a_beam_break_since_home(tmp_path, monkeypatch):
@@ -812,6 +830,114 @@ def test_marker_tcp_sample_save_tolerates_recorder_returning_to_armed(tmp_path, 
     assert state.marker_tcp_session.pendingSampleId == ""
     assert state.marker_tcp_session.samples[0].status == "saved"
     assert state.marker_tcp_session.samples[0].episodeIndex == 7
+
+
+def test_marker_tcp_episode_comes_from_the_capture_intent_not_the_save_count(tmp_path, monkeypatch):
+    """11-06: the recorder's save count said episode 1 of a dataset whose only episode was 0."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+    intents = []
+
+    def fake_start_episode(fake_state, *, capture_intent=None, **_kwargs):
+        intents.append(capture_intent)
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    gateway._marker_tcp_record_sample(state, "start", box_id="box3969377039", condition="same_mount_01")
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.episodeIndex == 7
+    assert intents[0]["sample_id"] == sample.id
+
+    episode = Path(state.recording.datasetRoot) / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    (episode / "meta.json").write_text(json.dumps({"capture_intent": intents[0]}), encoding="utf-8")
+    other = episode.parent / "episode_000001"
+    other.mkdir()
+    (other / "meta.json").write_text(
+        json.dumps({"capture_intent": {**intents[0], "session_id": "another_session"}}), encoding="utf-8"
+    )
+
+    gateway._marker_tcp_correct_episodes(state, state.marker_tcp_session.sessionName, [sample])
+    assert sample.episodeIndex == 0
+
+    # a sample recorded before the intent named it keeps what it has
+    legacy = gateway.MarkerTcpSample(
+        id="sample_099", side="left", condition="old", datasetRoot=state.recording.datasetRoot, episodeIndex=3
+    )
+    gateway._marker_tcp_correct_episodes(state, state.marker_tcp_session.sessionName, [legacy])
+    assert legacy.episodeIndex == 3
+
+
+def _marker_tcp_box_registry_repo(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema": "marker_rig_to_tcp_calibration/v1",
+                "cubes": {"left": {"device_id": "box1672693301"}, "right": {"device_id": "box1819152274"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f"ee_from_cube:\n  marker_to_tcp_calibration_path: {bundle}\n", encoding="utf-8")
+    registry = tmp_path / "tools" / "thor" / "box_devices.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "devices": {
+                    "3969377039": {"role": "handheld", "hand": "left"},
+                    "3100715645": {"role": "fr3_gripper"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return state
+
+
+def test_a_renumbered_handheld_box_finds_its_cube_through_the_registry(tmp_path):
+    state = _marker_tcp_box_registry_repo(tmp_path)
+    assert gateway._marker_tcp_cube_for_box_id(state, "box1819152274")[0] == "right"
+    assert gateway._marker_tcp_cube_for_box_id(state, "box3969377039")[0] == "left"
+    assert gateway._marker_tcp_cube_for_box_id(state, "3969377039")[0] == "left"
+    with pytest.raises(ValueError, match="box3100715645"):  # on an arm: no hand, so no cube
+        gateway._marker_tcp_cube_for_box_id(state, "box3100715645")
+
+
+def test_the_shared_factory_serial_is_refused_by_name(tmp_path):
+    state = _marker_tcp_box_registry_repo(tmp_path)
+    with pytest.raises(ValueError, match="出厂序列号"):
+        gateway._marker_tcp_cube_for_box_id(state, "box_collection_controller_000001")
+
+
+def test_connect_starts_the_episode_count_over(tmp_path, monkeypatch):
+    """A new recorder counts from zero and says nothing until its first save."""
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.recording.savedEpisodes = 1
+    state.recording.episodeIndex = 1
+
+    class StopAfterSpawnError(Exception):
+        pass
+
+    class FakeProcess:
+        pid = 4321
+        stdin = stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: FakeProcess())
+    monkeypatch.setattr(gateway, "_resolve_recorder_config_path", lambda _state: tmp_path / "config.yaml")
+    monkeypatch.setattr(gateway, "_set_all_device_states", lambda *_a: (_ for _ in ()).throw(StopAfterSpawnError()))
+    with pytest.raises(StopAfterSpawnError):
+        gateway._connect_recorder(state)
+    assert state.recording.savedEpisodes == 0
+    assert state.recording.episodeIndex == 0
 
 
 def test_marker_tcp_sample_records_box_id_target(tmp_path, monkeypatch):
@@ -1501,6 +1627,56 @@ def test_box_live_output_updates_preview_without_log_noise(tmp_path):
     assert state.events == []
 
 
+def test_recorder_log_samples_box_live_but_the_gateway_still_sees_every_line(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    state.recorder_log_path = tmp_path / "recorder.log"
+    lines = [
+        'BOX_LIVE {"valid":false,"sensors":{}}',
+        'BOX_LIVE {"valid":false,"sensors":{}}',
+        "Recording started",
+        'BOX_LIVE {"valid":true,"sensors":{}}',
+        'BOX_LIVE {"valid":true,"sensors":{}}',
+    ]
+    process = types.SimpleNamespace(stdout=[line + "\n" for line in lines])
+
+    gateway._read_process_output(state, process)
+
+    # Within a minute, only the first BOX_LIVE and the one where validity flipped are kept.
+    assert state.recorder_log_path.read_text().splitlines() == [lines[0], lines[2], lines[3]]
+    queued = [state.recorder_output_queue.get_nowait()[1] for _ in lines]
+    assert queued == lines
+
+
+def test_recorder_log_rotates_and_keeps_the_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway, "_RECORDER_LOG_MAX_BYTES", 10)
+    path = tmp_path / "recorder_x.log"
+
+    for line in ["first-line", "second-line", "third-line"]:
+        gateway._append_recorder_log(path, line)
+
+    assert (tmp_path / "recorder_x.log.1").read_text().splitlines()[-1] == "second-line"
+    assert path.read_text().splitlines()[-1] == "third-line"
+
+
+def test_recorder_logs_are_pruned_oldest_first_to_the_budget(tmp_path):
+    for age, name in enumerate(["recorder_c.log", "recorder_b.log.gz", "recorder_a.log.1"]):
+        path = tmp_path / name
+        path.write_bytes(b"x" * 100)
+        os.utime(path, (1000 - age, 1000 - age))
+    (tmp_path / "gateway_old.log").write_bytes(b"x" * 1000)
+
+    removed = gateway._prune_recorder_logs(tmp_path, budget_bytes=150)
+
+    assert [p.name for p in removed] == ["recorder_a.log.1", "recorder_b.log.gz"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway_old.log", "recorder_c.log"]
+
+
 def test_recorder_tlv_ignored_output_is_noise(tmp_path):
     state = gateway.GatewayState(
         repo_root=Path.cwd(),
@@ -1731,12 +1907,13 @@ def _stamped_replay_dataset(tmp_path: Path, *, edges: list[dict]) -> tuple[gatew
     return state, dataset_root
 
 
-def _write_planned_mujoco_start(dataset_root, cube, episode=0):
-    """A MuJoCo preview report carrying the start joints the real replay is handed."""
+def _write_planned_mujoco_start(dataset_root, cube, episode=0, read=None):
+    """A MuJoCo preview report carrying the start joints the real replay is handed; ``read`` is the copy it planned on."""
     report_path = gateway._mujoco_preview_report_path(dataset_root, episode, cube)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps({
+            "dataset_root": str(read or ""),
             "initial_joints": "trajectory_start",
             "robots": {cube: {"trajectory_start": {"feasible": True, "joints_rad": [0.1] * 7}}},
         }),
@@ -1751,18 +1928,163 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
         tmp_path,
         edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": edge_matrix}],
     )
-    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
+    fr3_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+    by_arm = gateway._fr3_trajectory_dir_path(dataset_root, gateway.FR3_BY_ARM_TRAJECTORY_SUBDIR)
 
     mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
     _write_planned_mujoco_start(dataset_root, "right")
     real = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
 
     # The camera-world sidecar is never what the arm (simulated or real) is given.
-    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
-    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(by_arm)
+    assert gateway._fr3_copy_root(by_arm, "right") == "fr3_base"
+    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real  # an IP that is no arm's: fr3_base
     row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
-    assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["from"]["fr3_base"]["world_a"]["T_root_world"] == edge_matrix
+    assert frame["root"] == "fr3_base"
+    assert frame["roots"] == {"state_action.right.csv": "fr3_base"} and frame["refused"] == {}
+
+
+def _two_arm_stamped_dataset(tmp_path, edges):
+    """A stamped dataset with a left and a right hand, the repo's dual-FR3 description and ``edges``."""
+    state, dataset_root = _stamped_replay_dataset(tmp_path, edges=edges)
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    (sidecar / "state_action.left.csv").write_text((sidecar / "state_action.right.csv").read_text(), encoding="utf-8")
+    graph_path = state.repo_root / "tools" / "thor" / "gmsl2" / "world" / "world_graph.json"
+    graph = json.loads(graph_path.read_text())
+    graph["nodes"].append({"world_frame_id": "fr3_base_right"})
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    embodiment = state.repo_root / gateway._DUAL_FR3_EMBODIMENT
+    embodiment.parent.mkdir(parents=True, exist_ok=True)
+    embodiment.write_text((Path(__file__).resolve().parents[2] / gateway._DUAL_FR3_EMBODIMENT).read_text())
+    return state, dataset_root
+
+
+def test_each_hand_goes_to_the_base_of_the_arm_that_replays_it(tmp_path):
+    # 11-10: world -> fr3_base_right went live while fr3_base's edge stayed retired; the IK check
+    # failed the right hand on fr3_base, a base the right arm never commands in.
+    edge_matrix = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge_matrix}],
+    )
+    by_arm = gateway._fr3_trajectory_dir_path(dataset_root, gateway.FR3_BY_ARM_TRAJECTORY_SUBDIR)
+    right_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base_right")
+    left_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+
+    assert gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "right") == by_arm / "state_action.right.csv"
+    row = next(csv.DictReader((by_arm / "state_action.right.csv").open()))
+    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    # the left hand's own arm is unregistered: the other arm, which can replay it, is where it is checked
+    frame = json.loads((by_arm / "frame.json").read_text())
+    assert frame["roots"] == {"state_action.left.csv": "fr3_base_right", "state_action.right.csv": "fr3_base_right"}
+    assert frame["refused"] == {}
+
+    # the left arm's base is reached by nothing: its copy is refused, with the reason, and no stale file stays
+    stale = left_dir / "state_action.left.csv"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("left over from an earlier edge\n")
+    with pytest.raises(RuntimeError, match="left hand: episode 0 was recorded in world_a"):
+        gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "left", "fr3_base")
+    assert not stale.exists()
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
+        gateway._mujoco_replay_command(state, dataset_root, "right", "left")
+
+    # the right arm previews either hand in its own base; "both" puts each hand on an arm that reaches it
+    for cube in ("right", "left"):
+        mujoco = gateway._mujoco_replay_command(state, dataset_root, cube, "right")
+        assert mujoco[mujoco.index("--dataset-root") + 1] == str(right_dir)
+    assert gateway._fr3_copy_root(right_dir, "left") == "fr3_base_right"
+    both = gateway._mujoco_replay_command(state, dataset_root, "both", "right")
+    assert both[both.index("--dataset-root") + 1] == str(by_arm)
+
+
+def test_a_hand_falls_back_to_fr3_base_while_its_own_arm_is_unregistered(tmp_path):
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
+    )
+    # one FR3 replayed either hand before there were two; that still holds until the right is registered
+    by_arm = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
+    assert gateway._fr3_copy_root(by_arm, "right") == "fr3_base"
+    assert gateway._fr3_copy_root(by_arm, "left") == "fr3_base"
+
+
+def _guarded_real_start(monkeypatch, state, dataset_root):
+    """``_start_real_replay`` up to its arm/base guard: past it, it raises PastTheGuardError."""
+    monkeypatch.setattr(gateway, "_require_mujoco_validation", lambda *a, **k: dataset_root)
+    monkeypatch.setattr(gateway, "_read_sidecar_cube_poses", lambda *a: {"right": [object()], "left": [object()]})
+    monkeypatch.setattr(gateway, "_trajectory_tcp_link", lambda *a: "")
+    monkeypatch.setattr(gateway, "_box_port_conflict", lambda *a: "")
+
+    class PastTheGuardError(Exception):
+        pass
+
+    def stop(*_a, **_k):
+        raise PastTheGuardError
+
+    monkeypatch.setattr(gateway, "_start_realsense_preview", stop)
+    return PastTheGuardError
+
+
+def test_the_right_arm_replays_the_right_hand_in_its_own_base_with_its_own_config(tmp_path, monkeypatch):
+    edge = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge}],
+    )
+    right_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base_right")
+    gateway._mujoco_replay_command(state, dataset_root, "right", "right")
+    _write_planned_mujoco_start(dataset_root, "right", read=right_dir)
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.210")
+    config = command[command.index("--config_path") + 1]
+    assert config == str(state.repo_root / "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml")
+    assert f"--input.csv_path={right_dir / 'state_action.right.csv'}" in command
+    # the left arm's IP: its own YAML, and its own (unreachable) base -- never the right arm's copy
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
+        gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
+
+    # the start guard lets the right arm through, and refuses the left arm: no edge reaches its base
+    past = _guarded_real_start(monkeypatch, state, dataset_root)
+    state.replay.mujocoValidation = {"cubeMode": "right"}
+    with pytest.raises(past):
+        gateway._start_real_replay(state, "right", arm="right")
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
+        gateway._start_real_replay(state, "right", arm="left")
+
+
+def test_either_arm_replays_either_hand_once_both_bases_are_registered(tmp_path, monkeypatch):
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    shifted = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity},
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": shifted},
+        ],
+    )
+    left_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+    # the left arm replays a right-hand recording: previewed and executed in the left arm's base
+    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right", "left")
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(left_dir)
+    _write_planned_mujoco_start(dataset_root, "right", read=left_dir)
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
+    assert f"--input.csv_path={left_dir / 'state_action.right.csv'}" in command
+    assert command[command.index("--config_path") + 1] == str(state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG)
+    row = next(csv.DictReader((left_dir / "state_action.right.csv").open()))
+    right_row = next(csv.DictReader(gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "right", "fr3_base_right").open()))
+    assert float(right_row["state_x_m"]) - float(row["state_x_m"]) == pytest.approx(0.5)
+
+    past = _guarded_real_start(monkeypatch, state, dataset_root)
+    state.replay.mujocoValidation = {"cubeMode": "right"}
+    with pytest.raises(past):
+        gateway._start_real_replay(state, "right", arm="left")
+    # the right arm is refused the left arm's plan: another base's start joints and coordinates
+    with pytest.raises(ValueError, match="checked the right trajectory in fr3_base, but the right arm commands in fr3_base_right; select that arm and run MuJoCo right again"):
+        gateway._start_real_replay(state, "right", arm="right")
 
 
 def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
@@ -1799,7 +2121,7 @@ def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
         data_dir / "file-000.parquet",
     )
 
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
 
     rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(r["gripper_width_m"]) for r in rows[:2]] == pytest.approx([0.0887, 0.0323])
@@ -1853,7 +2175,7 @@ def test_fr3_base_trajectory_reads_the_handheld_box_when_the_arm_box_was_recorde
         data_dir / "file-000.parquet",
     )
 
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
 
     rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(r["gripper_width_m"]) for r in rows] == pytest.approx([0.0887, 0.0326])
@@ -1864,7 +2186,7 @@ def test_fr3_base_trajectory_reads_the_handheld_box_when_the_arm_box_was_recorde
 
     # Without knowing which BOX is on the arm there are two candidates: nothing is guessed.
     replay_yaml.write_text("robot: {}\n", encoding="utf-8")
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
     assert json.loads((fr3_dir / "frame.json").read_text())["gripper_width"]["rows"] == {"state_action.right.csv": 0}
 
 
@@ -2499,6 +2821,101 @@ def test_traj_gen_starts_april_tracking_with_selected_dataset_root(tmp_path, mon
     assert "AprilTag cube tracking" in item["message"]
 
 
+def _rig_over_cube_repo(tmp_path):
+    """A cube-tracked dataset about to be tracked as the gripper rig (the wrong-target case)."""
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.write_text("#!/usr/bin/env bash\necho tracking\n", encoding="utf-8")
+    config_path = repo_root / gateway.TRACKING_TARGETS["gripper_rig_v9b"]["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "cube_tracker:\n  cubes:\n    - name: left\n"
+        "save_to_dataset:\n  sidecar_dir: derived/april_cube_tracking_in_robot_base\n",
+        encoding="utf-8",
+    )
+    sidecar = dataset_root / "derived" / "april_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    for name in ("state_action.left.csv", "state.left.npy", "cube_pose.left.cam_06.csv", "state_action.right.csv"):
+        (sidecar / name).write_text("x\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+    return state, dataset_root, sidecar
+
+
+def test_traj_gen_refuses_to_put_a_second_target_next_to_the_first(tmp_path, monkeypatch):
+    """Rig trajectories next to cube ones: export would ship both while meta describes one run."""
+    state, dataset_root, sidecar = _rig_over_cube_repo(tmp_path)
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 1234
+        stdout = []
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **_k: launched.append(command) or FakeProcess())
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+
+    with pytest.raises(gateway.OtherTrackingTargetsError) as refused:
+        gateway._queue_traj_gen(state, dataset_root, tracking_target="gripper_rig_v9b")
+    assert refused.value.detail["otherTargets"] == {"right": 1}
+    assert refused.value.detail["runTargets"] == ["left"]
+    assert launched == []
+    assert str(dataset_root) not in state.processing_starting
+
+    # Re-running the cube itself is not a conflict: same targets, a plain replacement.
+    cube_config = tmp_path / "cube.yaml"
+    cube_config.write_text(
+        "cube_tracker:\n  cubes:\n    - name: left\n    - name: right\n    - name: head\n", encoding="utf-8"
+    )
+    assert gateway._other_tracking_targets(dataset_root, cube_config) is None
+
+    # Asked for explicitly, the tracker gets the flag; the gateway itself moves nothing.
+    gateway._queue_traj_gen(state, dataset_root, tracking_target="gripper_rig_v9b", supersede_other_targets=True)
+    assert launched[-1][-1] == "--supersede-other-targets"
+    assert (sidecar / "state_action.left.csv").is_file()
+
+
+def test_traj_gen_conflict_reaches_the_gui_as_409_with_the_targets(tmp_path, monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    state, dataset_root, _sidecar = _rig_over_cube_repo(tmp_path)
+    monkeypatch.setattr(gateway, "_resolve_known_dataset", lambda _state, _requested: dataset_root)
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: pytest.fail("must not launch"))
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        query = urllib.parse.urlencode({"path": str(dataset_root), "tracking_target": "gripper_rig_v9b"})
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/processing/traj-gen?{query}", method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as answered:
+            urllib.request.urlopen(request, timeout=5)
+        body = json.loads(answered.value.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert answered.value.code == 409
+    assert body["otherTrackingTargets"]["otherTargets"] == {"right": 1}
+    assert body["otherTrackingTargets"]["supersededDir"].endswith("april_cube_tracking_in_robot_base/_superseded")
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
 def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path):
     repo_root = tmp_path / "repo"
     recorded_root = repo_root / "outputs" / "datasets" / "recorded_set"
@@ -2732,7 +3149,7 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
 
     gateway._select_replay_dataset(state, str(dataset_root))
-    gateway._preflight_replay(state)
+    gateway._preflight_replay(state, "right")
     gateway._start_dry_run_replay(state)
     assert "strongly recommended" in state.replay.message
     assert state.replay.state == "dry_run"
@@ -2757,7 +3174,7 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
         "avg_pos_mm=2.0 max_pos_mm=4.0 avg_rot_deg=1.0 max_rot_deg=3.0",
     )
     gateway._finish_mujoco_validation(state, 0)
-    gateway._preflight_replay(state)
+    gateway._preflight_replay(state, "right")
     planned = [1.22, -1.05, -1.62, -2.26, -1.99, 2.89, 1.65]
     report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3107,7 +3524,7 @@ def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path)
     )
 
     with pytest.raises(RuntimeError, match="connection refused"):
-        gateway._run_real_preflight(state, ["192.168.1.99"])
+        gateway._run_real_preflight(state, [{"arm": "", "robot_ip": "192.168.1.99"}])
 
     joined = "\n".join(state.replay.realReplayLog)
     assert "replay_cube_pose_in_robot_base.thor.yaml" in joined
@@ -4054,6 +4471,89 @@ def test_freeze_then_register_keeps_the_same_world_across_a_gauge_change(tmp_pat
     assert registration["consensus"]["moved_cameras"] == ["cam_03"]
 
 
+def _write_table_anchor(bundle: Path, *, shift_m: float, table_moved_m: float = 0.0) -> Path:
+    """What cart_redock_check.py anchor leaves next to a bundle: the table's frame in W and in its gauge."""
+    T_world_anchor = [[1.0, 0.0, 0.0, 0.5], [0.0, 1.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    seen = [row[:] for row in T_world_anchor]
+    for axis in range(3):
+        seen[axis][3] -= shift_m  # in the bundle's gauge everything sits shift_m lower on every axis
+    seen[0][3] += table_moved_m
+    path = bundle.parent / gateway._TABLE_ANCHOR_FILE
+    path.write_text(
+        json.dumps(
+            {
+                "status": "measured",
+                "bundle": {"sha256": hashlib.sha256(bundle.read_bytes()).hexdigest()},
+                "T_world_anchor": T_world_anchor,
+                "T_session_anchor": seen,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_registration_uses_the_table_anchor_of_exactly_this_bundle(tmp_path, monkeypatch):
+    """The table sees the one motion camera consensus cannot; an anchor left by an earlier solve is not it."""
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    first = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(first.parent)
+    assert gateway._freeze_world_reference(state)["ok"] is True
+
+    second = _write_bundle_report(
+        tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0
+    )
+    state.calibration.outputPath = str(second.parent)
+    blind = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    assert blind["registration"]["common_mode"]["observable"] is False
+
+    _write_table_anchor(second, shift_m=3.0, table_moved_m=0.02)
+    seen = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    common = seen["registration"]["common_mode"]
+    assert common["observable"] is True and common["drifted"] is True
+    assert common["translation_mm"] == pytest.approx(20.0, abs=1e-6)
+
+    # Re-solved into the same directory: the old anchor no longer belongs to it.
+    _write_bundle_report(second, shift_m=3.0, moved="cam_03")
+    again = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+    assert again["registration"]["common_mode"]["observable"] is False
+
+
+def test_the_table_anchor_runs_on_the_capture_and_never_fails_the_solve(tmp_path, monkeypatch):
+    state = _world_gateway_state(tmp_path)
+    bundle = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run" / "extrinsics_report.json")
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_x" / "extrinsics"
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) is None  # no datum yet
+
+    datum = tmp_path / gateway._WORLD_SUBDIR / gateway._TABLE_DATUM_FILE
+    datum.parent.mkdir(parents=True, exist_ok=True)
+    datum.write_text("{}", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        _write_table_anchor(bundle, shift_m=0.0)
+        return subprocess.CompletedProcess(command, 0, "table anchor measured: tags [45, 46, 48]\nwrote x\n", "")
+
+    monkeypatch.setenv("PYTHONPATH", "/opt/ros/somewhere")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) == (
+        bundle.parent / gateway._TABLE_ANCHOR_FILE
+    )
+    command, kwargs = calls[-1]
+    assert command[2:4] == ["anchor", str(capture)] and command[command.index("--datum") + 1] == str(datum)
+    assert kwargs["stdin"] is subprocess.DEVNULL and "PYTHONPATH" not in kwargs["env"]
+
+    def failing_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "Traceback ...\nKeyError: 'camera_pixels'")
+
+    monkeypatch.setattr(gateway.subprocess, "run", failing_run)
+    assert gateway._measure_table_anchor(state, Path(sys.executable), capture, bundle) is None
+    assert not (bundle.parent / gateway._TABLE_ANCHOR_FILE).exists()  # the last one does not linger
+    assert "KeyError" in state.events[0].message and state.events[0].level == "warn"
+
+
 def test_freezing_twice_is_refused_because_it_would_be_a_different_world(tmp_path, monkeypatch):
     state = _world_gateway_state(tmp_path)
     monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
@@ -4571,6 +5071,43 @@ def test_the_bar_walks_all_three_steps_of_a_real_solve(tmp_path, monkeypatch):
     assert finished[0] == ("检测 ChArUco 角点…", 6)  # every video counted, none twice
     assert state.calibration.state == "complete", state.calibration.message
     assert state.calibration.progress.fraction == 1.0
+
+
+def test_rejected_views_and_an_unconverged_bundle_reach_the_operator(tmp_path, monkeypatch):
+    """Neither shows in the per-camera RMSE, so the solve has to say them out loud."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    report_path = tmp_path / "outputs" / "metrology" / "run_x" / "extrinsics_report.json"
+    intrinsics = tmp_path / gateway._CALIB_INTRINSICS_REPORT
+    intrinsics.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics.write_text("{}", encoding="utf-8")
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        if "metrology.cli.calibrate_extrinsics" in args:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                "rmse_px": 0.29,
+                "num_frames": 250,
+                "per_camera_rmse": {"cam_00": 0.29},
+                "converged": False,
+                "nfev": 60,
+                "termination": "The maximum number of function evaluations is exceeded.",
+                "rejected_views": [{"episode": "episode_000000", "frame": 948, "camera": "cam_14", "pnp_rmse_px": 156.6}],
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(state, dataset, "run_x", Path(sys.executable))
+
+    assert state.calibration.state == "complete", state.calibration.message
+    assert "剔除 1 个 PnP 失败的视角" in state.calibration.message
+    assert "BA 未收敛" in state.calibration.message
+    logged = " | ".join(entry.message for entry in state.events)
+    assert "cam_14@948" in logged
+    assert "stopped before converging after 60" in logged
 
 
 # ---------------------------------------------------------------------------
@@ -5418,6 +5955,187 @@ def test_marker_tcp_solve_refuses_a_box_the_production_bundle_does_not_cover(tmp
 
     assert result["ok"] is False
     assert "box_unknown" in result["error"]
+
+
+_RIG_V9B_SOURCE = Path(__file__).resolve().parents[2] / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG
+
+
+def _install_rig_v9b(repo_root: Path) -> Path:
+    """Copy the shipped v9b config, layout and bundle into a test repo at their real paths."""
+    config_dir = _RIG_V9B_SOURCE.parent
+    target_dir = repo_root / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        _RIG_V9B_SOURCE.name,
+        "gripper_rig_v9b_marker_layout.json",
+        "marker_to_tcp_calibration_gripper_rig_v9b.json",
+    ):
+        shutil.copy2(config_dir / name, target_dir / name)
+    return target_dir
+
+
+def test_gripper_rig_v9b_is_a_tracking_target_with_its_own_entrypoint_config(tmp_path):
+    repo_root = tmp_path / "repo"
+    _install_rig_v9b(repo_root)
+    runner = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    command = gateway._ee_trajectory_command(state, tmp_path / "ds", tracking_target="gripper_rig_v9b")
+
+    assert command[command.index("--tracking-target") + 1] == "gripper_rig_v9b"
+    assert command[command.index("--config") + 1].endswith("gripper_rig_v9b_tracking_in_robot_base_thor.yaml")
+    with pytest.raises(ValueError, match="cube-only"):
+        gateway._ee_trajectory_command(
+            state, tmp_path / "ds", tracking_target="gripper_rig_v9b",
+            marker_to_tcp_calibration_path=tmp_path / "x.json",
+        )
+    # Calibration promotion rewrites it together with production, never leaves it behind.
+    assert gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+
+
+def test_marker_tcp_solve_on_the_v9b_rig_uses_its_own_layout_dictionary_and_bundle(tmp_path, monkeypatch):
+    state, _, production_bundle = _marker_tcp_solve_repo(tmp_path)
+    _install_rig_v9b(state.repo_root)
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+    original_run = gateway._run_marker_tcp_command
+
+    def run_with_cad_fit(state_, command, *, label, log_path, timeout_s=7200):
+        result = original_run(state_, command, label=label, log_path=log_path, timeout_s=timeout_s)
+        if "metrology.cli.pivot_marker_tcp_calibration" in command:
+            report = Path(command[command.index("--out") + 1])
+            data = json.loads(report.read_text(encoding="utf-8"))
+            data["fit"]["p_cube_mm"] = [1.4, 1.21, 167.91]  # 1.5 mm from the measured socket centre
+            report.write_text(json.dumps(data), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", run_with_cad_fit)
+
+    result = gateway._run_marker_tcp_solve(
+        state, box_id="box1672693301", socket_beyond_tcp_mm="0", rig="gripper_rig_v9b", background=False
+    )
+
+    assert result["ok"] is True, result.get("error")
+    steps = [next(part for part in command if part.startswith("metrology.cli.")) for command in calls]
+    # No cube-template step: the rig's corner table is already the production one.
+    assert steps == [
+        "metrology.cli.detect_rig_markers",
+        "metrology.cli.track_marker_rig_in_base",
+        "metrology.cli.pivot_marker_tcp_calibration",
+    ]
+    detect, track, pivot = calls
+    assert detect[detect.index("--dictionary") + 1] == "DICT_6X6_250"
+    assert track[track.index("--config") + 1].endswith("gripper_rig_v9b_tracking_in_robot_base_thor.yaml")
+    assert track[track.index("--rig-name") + 1] == "left"
+    assert pivot[pivot.index("--cube") + 1] == "left"
+    # Rotation comes from the rig's CAD/URDF bundle, not from the cube's production one.
+    assert pivot[pivot.index("--rotation-cube-tcp") + 1] == "0,1,0;1,0,0;0,0,-1"
+    session = state.marker_tcp_session
+    layout = json.loads((Path(session.solvePath).parent / gateway.DEFAULT_MARKER_LAYOUT_NAME).read_text())
+    assert [m["id"] for m in layout["markers"]] == [106, 107, 108, 109]
+    summary = json.loads(Path(session.solveSummaryPath).read_text(encoding="utf-8"))
+    assert summary["rig"] == "gripper_rig_v9b"
+    nearest = summary["cadCheck"]["nearest"]
+    assert nearest["name"] == "insert_nov4_socket_centre"
+    assert nearest["distanceMm"] == pytest.approx(1.5, abs=0.01)
+    assert "pivot 点离 insert_nov4_socket_centre" in session.message
+    # The cube's production bundle is untouched by a rig solve.
+    assert json.loads(production_bundle.read_text()) == _marker_tcp_bundle(INHERITED_ROTATION)
+
+
+def _bind_rig_v9b_to(repo_root: Path, box_id: str) -> None:
+    bundle_path = _install_rig_v9b(repo_root) / "marker_to_tcp_calibration_gripper_rig_v9b.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["cubes"]["left"]["device_id"] = box_id
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+@pytest.mark.parametrize(("rig", "on_rig"), [("", True), ("april_cube", False)])
+def test_marker_tcp_solve_of_the_box_on_a_rig_uses_that_rig_unless_told_otherwise(tmp_path, monkeypatch, rig, on_rig):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _bind_rig_v9b_to(state.repo_root, "box1672693301")
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig=rig, background=False)
+
+    assert result["ok"] is True, result.get("error")
+    detect = next(command for command in calls if "metrology.cli.detect_rig_markers" in command)
+    assert (detect[detect.index("--dictionary") + 1] == "DICT_6X6_250") is on_rig
+
+
+def test_marker_tcp_solve_of_a_box_on_no_rig_stays_on_the_cube(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _bind_rig_v9b_to(state.repo_root, "box_on_the_rig")
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+
+    assert gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="", background=False)["ok"] is True
+    detect = next(command for command in calls if "metrology.cli.detect_rig_markers" in command)
+    assert detect[detect.index("--dictionary") + 1] != "DICT_6X6_250"
+
+
+def test_marker_tcp_solve_that_tracks_no_frame_says_which_target_it_looked_for(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+    original_run = gateway._run_marker_tcp_command
+
+    def run_tracking_nothing(state_, command, *, label, log_path, timeout_s=7200):
+        result = original_run(state_, command, label=label, log_path=log_path, timeout_s=timeout_s)
+        if "metrology.cli.track_marker_rig_in_base" in command:
+            out_dir = Path(command[command.index("--out-dir") + 1])
+            (out_dir / "tracking_summary.json").write_text('{"num_frames_success": 0}', encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", run_tracking_nothing)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="april_cube", background=False)
+
+    assert result["ok"] is False
+    assert "DICT_APRILTAG_36h11" in result["error"] and "Marker rig" in result["error"]
+    assert not any("metrology.cli.pivot_marker_tcp_calibration" in command for command in calls)
+
+
+def test_marker_tcp_solve_refuses_an_unknown_rig(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _stub_marker_tcp_chain(monkeypatch, [])
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", rig="cube9000", background=False)
+    assert result["ok"] is False and "cube9000" in result["error"]
+
+
+def test_marker_layout_overlay_model_draws_each_marker_square_facing_out(tmp_path):
+    layout_path = _RIG_V9B_SOURCE.parent / "gripper_rig_v9b_marker_layout.json"
+    # What the tracker really writes: MarkerLayout.from_json lets the file's own `source`
+    # (a provenance dict) win, so the summary's `source` is that dict as a string -- long
+    # enough to overflow PATH_MAX -- and the file is named by `path` (Thor smoke 11-05:
+    # reading `source` drew the default cube instead of the layout).
+    provenance = str(json.loads(layout_path.read_text(encoding="utf-8"))["source"]) * 40
+    summary = {
+        "cube_tracker": {"pose_estimation_mode": "marker_layout_pnp"},
+        "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": provenance, "path": str(layout_path)}}},
+    }
+    model = gateway._load_marker_layout_overlay_model(summary)
+    assert model is not None
+    # Summaries from before `path` existed name a provenance-free layout file in `source`.
+    legacy = {**summary, "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": str(layout_path)}}}}
+    assert gateway._load_marker_layout_overlay_model(legacy) == model
+    no_file = {**summary, "corner_ba": {"marker_layouts_by_cube": {"rig_v9b": {"source": provenance}}}}
+    assert gateway._load_marker_layout_overlay_model(no_file) is None
+    assert [a["id"] for a in model["anchors"]] == [106, 107, 108, 109]
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    for facet, marker in zip(model["facets"], layout["markers"], strict=True):
+        normal = np.asarray(facet["normal"], dtype=float)
+        assert float(normal @ np.asarray(marker["normal_rig"])) > 0  # outward, for the back-face test
+    assert gateway._load_marker_layout_overlay_model({"cube_tracker": {"pose_estimation_mode": "x"}}) is None
 
 
 def test_queue_traj_gen_writes_a_marker_tcp_override_config_and_records_it(tmp_path, monkeypatch):
@@ -7709,6 +8427,35 @@ def test_a_capture_nobody_tracked_is_tracked_before_the_fit(tmp_path, monkeypatc
     assert queued == [dataset]
 
 
+@_real_sidecar_ensure
+def test_a_rig_pivot_nobody_tracked_is_tracked_with_its_boxs_rig(tmp_path, monkeypatch):
+    """11-09: the right rig's pivot (BOX 3906437858) has no AprilTag cube for the default tracker."""
+    dataset = tmp_path / "ds"
+    meta = dataset / "episodes" / "episode_000000" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    meta.write_text(json.dumps({"box_devices": {"3906437858": {"role": "handheld", "hand": "right"}}}))
+    os.utime(meta, (time.time() + 60,) * 2)
+    rigs = {"box3906437858": "gripper_rig_v9b_right"}
+    monkeypatch.setattr(gateway, "_marker_tcp_rig_for_box", lambda _s, box: rigs.get(box, gateway.DEFAULT_TRACKING_TARGET))
+    queued: list[str] = []
+
+    def track(_state, root, tracking_target=gateway.DEFAULT_TRACKING_TARGET, **_kw):
+        queued.append(tracking_target)
+        _sidecar(root, "right", [(0, True)])
+        os.utime(gateway._marker_tcp_sidecar_path(root, "right"), (time.time() + 120,) * 2)
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", track)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *a, **k: {"status": "complete"})
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert queued == ["gripper_rig_v9b_right"]
+    # a BOX on no rig, or none named: the cube's tracker as before
+    meta.write_text(json.dumps({"box_devices": {"3969000000": {"role": "handheld"}}}))
+    assert gateway._tracking_target_for_episodes(state, dataset, [0]) == gateway.DEFAULT_TRACKING_TARGET
+    meta.write_text("{}")
+    assert gateway._tracking_target_for_episodes(state, dataset, [0]) == gateway.DEFAULT_TRACKING_TARGET
+
+
 def test_a_tracker_fit_route_does_not_hold_the_gateway(tmp_path, monkeypatch):
     """A fit can wait minutes on a traj-gen job; snapshots must keep answering."""
     import urllib.request
@@ -8479,7 +9226,7 @@ if args[0] == "collect":
     print("collect: teaching mode", flush=True)
     if opt("--note") == "slow":
         time.sleep(30)
-    Path(opt("--out")).write_text(json.dumps({"note": opt("--note"), "created": "2026-10-13T16:00:00", "q": []}))
+    Path(opt("--out")).write_text(json.dumps({"robot_ip": opt("--robot-ip"), "note": opt("--note"), "created": "2026-10-13T16:00:00", "q": []}))
     print("wrote", opt("--out"), flush=True)
 elif args[0] == "fit-joint":
     runs = [a for a in args[1:] if a.endswith("_pivot.json")]
@@ -8497,7 +9244,7 @@ elif args[0] == "fit-joint":
 else:
     run = json.loads(Path(args[1]).read_text())
     Path(opt("--json")).write_text(json.dumps({
-        "note": run["note"], "created": run["created"],
+        "note": run["note"], "created": run["created"], "robot_ip": run.get("robot_ip", ""),
         "fk": {"s_ee_mm": [0.1, -0.2, -10.1], "s_sigma_mm": [0.02] * 3, "c_base_mm": [600.0, 0.0, 50.0],
                "c_sigma_mm": [0.03] * 3, "residual_rms_mm": 0.1, "residual_p95_mm": 0.2,
                "n_used": 300, "n_total": 4500, "span_deg": 32.0, "weak_singular": 0.25},
@@ -8512,6 +9259,10 @@ def _fr3_pivot_state(tmp_path, monkeypatch):
     tool = tmp_path / "tools" / "fr3" / "fr3_tcp_pivot.py"
     tool.parent.mkdir(parents=True)
     tool.write_text(_FAKE_PIVOT_TOOL)
+    # which base a pivot's centre is in: the arm's root, from the repo's own dual-FR3 description
+    embodiment = tmp_path / gateway._DUAL_FR3_EMBODIMENT
+    embodiment.parent.mkdir(parents=True, exist_ok=True)
+    embodiment.write_text((Path(__file__).resolve().parents[2] / gateway._DUAL_FR3_EMBODIMENT).read_text())
     monkeypatch.setattr(gateway, "_mujoco_replay_python", lambda _state: Path(sys.executable))
     monkeypatch.setattr(gateway, "_real_preflight_env", lambda _state: dict(os.environ))
     return state, T_live
@@ -8530,7 +9281,7 @@ def _await_pivot(state, states=("done", "error", "stopped"), timeout_s=10.0):
 def test_fr3_pivot_collect_runs_the_tool_then_fits_what_it_wrote(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
 
-    started = gateway._start_fr3_pivot(state, {"robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
+    started = gateway._start_fr3_pivot(state, {"arm": "left", "robotIp": "192.168.11.102", "durationS": 30, "note": "位置 1"})
 
     assert started["ok"], started["error"]
     assert started["job"]["state"] in ("collecting", "fitting", "done")
@@ -8547,7 +9298,9 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
     start = gateway._start_fr3_pivot
     assert "IP" in start(state, {"robotIp": "not-an-ip"})["error"]
-    assert "15–180" in start(state, {"durationS": 5})["error"]
+    assert "there is no default arm" in start(state, {"durationS": 30})["error"]  # roadmap B2
+    assert "no arm 'middle'" in start(state, {"arm": "middle"})["error"]
+    assert "15–180" in start(state, {"arm": "left", "durationS": 5})["error"]
 
     class Alive:
         pid = 1
@@ -8556,17 +9309,17 @@ def test_fr3_pivot_collect_refuses_while_the_fci_is_taken_or_the_input_is_bad(tm
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in start(state, {})["error"]
+    assert "真机 replay" in start(state, {"arm": "left"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in start(state, {})["error"]
+    assert "遥操作" in start(state, {"arm": "left"})["error"]
     assert gateway._fr3_pivot_job_view(state) == {"log": []}
 
 
 def test_fr3_pivot_stop_interrupts_the_collect_and_a_second_start_is_refused(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
-    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
-    assert "已有一次" in gateway._start_fr3_pivot(state, {})["error"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "slow"})["ok"]
+    assert "已有一次" in gateway._start_fr3_pivot(state, {"arm": "left"})["error"]
 
     assert gateway._stop_fr3_pivot(state, {})["ok"]
 
@@ -8601,7 +9354,7 @@ def test_fr3_pivot_ball_check_scores_the_live_edge_and_every_candidate(tmp_path,
     (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_base_ball_check.py").symlink_to(real_script)
     monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
     monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
-    assert gateway._start_fr3_pivot(state, {"note": "位置 1"})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "位置 1"})["ok"]
     run = _await_pivot(state)["run"]
 
     # The handheld episode about the same ball: the live edge maps c_base (600, 0, 50) mm to the world.
@@ -8707,6 +9460,148 @@ def test_a_ball_checks_edge_is_saved_as_a_candidate_the_edge_panel_compares_and_
     assert current["label"] == "5 个球位 · check_20261014T090000Z" and current["supersedes"] == 1
 
 
+def _write_pivot_fit(state, stamp: str, centre_m, robot_ip: str) -> str:
+    """A fitted pivot run as fr3_tcp_pivot.py leaves it: the run (with its arm's IP) and its fit."""
+    root = gateway._fr3_pivot_root(state)
+    root.mkdir(parents=True, exist_ok=True)
+    run = root / f"{stamp}_pivot.json"
+    run.write_text(json.dumps({"robot_ip": robot_ip, "note": "", "created": stamp, "q": []}))
+    fk = {"c_base_mm": (np.asarray(centre_m) * 1e3).tolist(), "c_sigma_mm": [0.05] * 3, "s_ee_mm": [0, 0, -10],
+          "residual_rms_mm": 0.1, "residual_p95_mm": 0.2, "n_used": 300, "n_total": 4000, "span_deg": 40.0,
+          "weak_singular": 0.3}
+    gateway._fr3_pivot_fit_path(run).write_text(json.dumps({"robot_ip": robot_ip, "note": "", "created": stamp, "fk": fk}))
+    return run.name
+
+
+def test_the_arm_arm_ball_edge_is_solved_compared_and_applied_with_the_loop_checked(tmp_path, monkeypatch):
+    state, T_live = _fr3_pivot_state(tmp_path, monkeypatch)
+    real_script = Path(__file__).resolve().parents[2] / "tools" / "thor" / "gmsl2" / "fr3_arm_arm_ball.py"
+    (tmp_path / "tools" / "thor" / "gmsl2" / "fr3_arm_arm_ball.py").symlink_to(real_script)
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    left_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "left")["robot_ip"]
+    right_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")["robot_ip"]
+    c, s_ = math.cos(math.radians(2)), math.sin(math.radians(2))
+    T_left_right = np.array([[c, -s_, 0, 0.0], [s_, c, 0, -0.66], [0, 0, 1, 0.0], [0, 0, 0, 1.0]])
+    balls_right = [[0.45, 0.30, 0.05], [0.55, 0.45, 0.05], [0.40, 0.55, 0.20], [0.60, 0.25, 0.25], [0.50, 0.40, 0.35]]
+    positions = []
+    for i, ball in enumerate(balls_right):
+        left = _write_pivot_fit(state, f"20261103_10000{i}", (T_left_right @ np.r_[ball, 1.0])[:3], left_ip)
+        right = _write_pivot_fit(state, f"20261103_11000{i}", ball, right_ip)
+        positions.append({"left": left, "right": right})
+    runs = {r["name"]: r for r in gateway._fr3_pivot_payload(state)["runs"]}
+    assert runs[positions[0]["right"]]["robotIp"] == right_ip
+
+    solve = gateway._solve_arm_arm_edge
+    swapped = [{"left": p["right"], "right": p["left"]} for p in positions]
+    assert "基座是 fr3_base_right，不是 fr3_base" in solve(state, {"positions": swapped})["error"]
+    mixed = [{**positions[0], "right": positions[1]["left"]}, *positions[1:]]
+    assert "混用了两台臂" in solve(state, {"positions": mixed})["error"]
+
+    result = solve(state, {"positions": positions})
+
+    assert result["ok"], result.get("output") or result["error"]
+    payload = gateway._fr3_base_edge_payload(state)
+    candidate = next(c for c in payload["candidates"] if c["name"] == result["armArmEdge"])
+    assert (candidate["from"], candidate["to"]) == ("fr3_base", "fr3_base_right")
+    assert candidate["quality"]["method"] == "armArm" and candidate["quality"]["baselineM"] == pytest.approx(0.66, abs=0.01)
+    assert candidate["label"] == "5 个球位 · 两臂同球"
+    assert candidate["applyBlockers"] == []  # no camera side: the world reference does not apply
+    assert candidate["moveVsLive"] is None  # nothing between the two bases yet
+
+    applied = gateway._apply_fr3_base_edge(state, {"report": result["armArmEdge"]})
+    assert applied["ok"], applied["error"]
+    links = {(l["from"], l["to"]): l for l in applied["links"]}
+    assert set(links) == {("world_a", "fr3_base"), ("fr3_base", "fr3_base_right")}
+    assert links[("fr3_base", "fr3_base_right")]["sigmaMm"] == 0.5
+    assert applied["current"]["world"] == "world_a"  # the datasets' edge is still world -> fr3_base
+    graph = gateway.wp.read_world_graph(state.repo_root)
+    _, hops = gateway.wp.world_transform(graph, "world_a", "fr3_base_right")
+    assert len(hops) == 2
+
+    # a world -> fr3_base_right edge 40 mm off the route through fr3_base does not close the loop: refused
+    T_world_right = np.linalg.inv(T_left_right) @ np.asarray(T_live)
+    _write_edge_candidate(state, "right_far.json", _shift_x(T_world_right.tolist(), 0.04))
+    far = json.loads((tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_far.json").read_text())
+    far["edge"]["to_world_frame_id"] = "fr3_base_right"
+    far["target_node"]["world_frame_id"] = "fr3_base_right"
+    (tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_far.json").write_text(json.dumps(far))
+    refused = gateway._apply_fr3_base_edge(state, {"report": "right_far.json"})
+    assert not refused["ok"] and "do not close" in refused["error"]
+    # one that agrees goes in as the loop's second route
+    near = {**far, "edge": {**far["edge"], "T_to_from": _shift_x(T_world_right.tolist(), 0.001)}}
+    (tmp_path / "outputs" / "calibration" / "fr3_base_registration" / "right_near.json").write_text(json.dumps(near))
+    assert gateway._apply_fr3_base_edge(state, {"report": "right_near.json"})["ok"]
+    assert len(gateway._fr3_base_edge_payload(state)["links"]) == 3
+
+
+def test_a_right_arm_ball_check_is_run_against_the_right_arms_base(tmp_path, monkeypatch):
+    state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        out = Path(command[command.index("--out") + 1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"schema": "fr3_base_ball_check/v1", "positions": [], "edges": [], "ball_edges": {}}))
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path(sys.executable))
+    monkeypatch.setattr(gateway, "_ensure_tracker_sidecars", lambda _state, _pairs, target="": "right")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    right_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")["robot_ip"]
+    left_ip = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "left")["robot_ip"]
+    run_r = _write_pivot_fit(state, "20261103_120000", [0.5, 0.3, 0.1], right_ip)
+    run_l = _write_pivot_fit(state, "20261103_120100", [0.5, 0.3, 0.1], left_ip)
+    ds = state.datasets_root / "hh"
+    (ds / "meta").mkdir(parents=True)
+    (ds / "meta" / "info.json").write_text("{}")
+    (ds / "episodes" / "episode_000000").mkdir(parents=True)
+    (ds / "episodes" / "episode_000000" / "meta.json").write_text(json.dumps({"world_frame": {"status": "ok", "world_frame_id": "world_a"}}))
+    dataset = gateway._fr3_pivot_payload(state)["episodes"][0]["dataset"]
+
+    result = gateway._run_ball_check(state, {"positions": [{"pivot": run_r, "dataset": dataset, "episode": 0}]})
+    assert result["ok"], result["error"]
+    command = captured["command"]
+    assert command[command.index("--base") + 1] == "fr3_base_right"
+
+    both = [{"pivot": run_r, "dataset": dataset, "episode": 0}, {"pivot": run_l, "dataset": dataset, "episode": 0}]
+    assert "混用了两台臂" in gateway._run_ball_check(state, {"positions": both})["error"]
+
+
+def test_the_world_graph_guard_is_recorded_at_start_shown_red_and_confirmed_on_the_page(tmp_path):
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    state, T_live = _fr3_base_edge_repo(tmp_path)
+    _write_edge_candidate(state, "run_b__1.json", _shift_x(T_live, 0.003))
+    gateway._bootstrap_world_graph_guard(state)
+    assert guard.check(state.repo_root)["state"] == guard.OK
+    assert gateway._snapshot(state)["worldGraphGuard"]["state"] == "ok"
+
+    # someone's deploy replaces the graph: the live edge is gone, an older one is back
+    graph_path = state.repo_root / guard.GRAPH_FILE
+    graph = json.loads(graph_path.read_text())
+    graph["edges"][0]["created_utc"] = "2026-09-01T00:00:00Z"
+    graph_path.write_text(json.dumps(graph))
+
+    snap = gateway._snapshot(state)["worldGraphGuard"]
+    assert snap["state"] == "diverged" and len(snap["problems"]) == 2
+    payload = gateway._fr3_base_edge_payload(state)
+    assert payload["graphGuard"]["state"] == "diverged"
+    assert payload["current"]["world"] == "world_a"  # still shown: the panel is where it gets checked
+    # applying would trust the rest of the file too
+    refused = gateway._apply_fr3_base_edge(state, {"report": "run_b__1.json"})
+    assert not refused["ok"] and "不一致" in refused["error"]
+    gateway._bootstrap_world_graph_guard(state)  # a restart says it out loud, and does not re-record
+    assert any("不一致" in e.message for e in state.events) and guard.check(state.repo_root)["state"] == "diverged"
+
+    # confirming what the page showed; a list that is not what is on disk now is refused
+    assert "又变了" in gateway._accept_world_graph(state, {"problems": ["something else"]})["error"]
+    accepted = gateway._accept_world_graph(state, {"problems": snap["problems"]})
+    assert accepted["ok"] and accepted["graphGuard"]["state"] == "ok"
+    assert gateway._apply_fr3_base_edge(state, {"report": "run_b__1.json"})["ok"]
+    assert guard.check(state.repo_root)["reason"] == "applied run_b__1.json on the calibration page"
+
+
 def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypatch):
     state, _ = _fr3_pivot_state(tmp_path, monkeypatch)
     import urllib.request
@@ -8718,7 +9613,7 @@ def test_fr3_pivot_over_http_collects_fits_and_lists_the_run(tmp_path, monkeypat
     try:
         request = urllib.request.Request(
             f"{base}/api/calibration/fr3-pivot/collect",
-            data=json.dumps({"durationS": 20, "note": "http"}).encode(),
+            data=json.dumps({"arm": "left", "durationS": 20, "note": "http"}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -8778,12 +9673,12 @@ def _await_gripper_teleop(state, predicate, timeout_s=10.0):
 
 def test_gripper_teleop_follows_until_exit_and_exit_keeps_the_grip(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch)
-    started = gateway._start_gripper_teleop(state, {})
+    started = gateway._start_gripper_teleop(state, {"arm": "left"})
     assert started["ok"], started["error"]
     assert started["armDeviceId"] == 596523097 and started["graspTriggerClosePct"] == 90
     job = _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
     assert "--arm-device-id 596523097" in job["log"][0] and "--grasp-trigger-close-pct 90" in job["log"][0]
-    assert "已经在遥控" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "已经在遥控" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
 
     # It holds the BOX port: the recorder and a real replay must wait for it.
     with pytest.raises(ValueError, match="FR3 夹爪遥控正在运行"):
@@ -8809,15 +9704,15 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
             return None
 
     state.process = Alive()
-    assert "录制器已连接" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "录制器已连接" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
     state.process = None
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "真机 replay" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
     state.replay_process = None
 
     # A pivot collect holds the FCI (teaching mode), not the BOX: both run at once.
-    assert gateway._start_fr3_pivot(state, {"note": "slow"})["ok"]
-    assert gateway._start_gripper_teleop(state, {})["ok"]
+    assert gateway._start_fr3_pivot(state, {"arm": "left", "note": "slow"})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "left"})["ok"]
     assert gateway._fr3_pivot_job_view(state)["state"] == "collecting"
     gateway._stop_gripper_teleop(state, {})
     gateway._stop_fr3_pivot(state, {})
@@ -8826,12 +9721,30 @@ def test_gripper_teleop_runs_beside_teaching_mode_but_not_beside_the_box_port_ho
 
 def test_gripper_teleop_reports_why_it_could_not_start(tmp_path, monkeypatch):
     state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="13")
-    assert gateway._start_gripper_teleop(state, {})["ok"]
+    assert gateway._start_gripper_teleop(state, {"arm": "left"})["ok"]
     job = _await_gripper_teleop(state, lambda j: j.get("state") == "error")
     assert job["returncode"] == 2 and "没发现 FR3 夹爪 BOX 13" in job["error"]
 
     (tmp_path / gateway.FR3_REPLAY_THOR_CONFIG).write_text("robot: {}\n")
-    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {})["error"]
+    assert "corenetic_device_id" in gateway._start_gripper_teleop(state, {"arm": "left"})["error"]
+
+
+def test_gripper_teleop_panel_shows_the_chosen_arm_s_gripper(tmp_path, monkeypatch):
+    # 11-02: the gripper moved to the right arm and the left flange is bare. The panel read the
+    # default (left) YAML only, so it said "no gripper BOX" and kept Enter off for the right arm.
+    state = _gripper_teleop_state(tmp_path, monkeypatch, device_id="null")
+    right = gateway.fr3_arms.resolve(gateway.fr3_arms.load(), "right")
+    config = tmp_path / right["replay_config"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("robot:\n  corenetic_device_id: 3100715645\ninput:\n  grasp_trigger_close_pct: 85\n")
+
+    assert gateway._gripper_teleop_payload(state)["armDeviceId"] is None
+    shown = gateway._gripper_teleop_payload(state, robot_ip="192.168.1.210")
+    assert shown["armDeviceId"] == 3100715645 and shown["graspTriggerClosePct"] == 85
+    assert gateway._gripper_teleop_payload(state, arm="right")["armDeviceId"] == 3100715645
+    assert gateway._gripper_teleop_payload(state, robot_ip="192.168.1.208")["armDeviceId"] is None  # no such arm
+    refused = gateway._start_gripper_teleop(state, {"arm": "left"})
+    assert "corenetic_device_id" in refused["error"] and refused["armDeviceId"] is None
 
 
 def test_gripper_teleop_over_http(tmp_path, monkeypatch):
@@ -8843,18 +9756,18 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
 
-    def post(route):
+    def post(route, body=b"{}"):
         request = urllib.request.Request(
-            f"{base}{route}", data=b"{}", headers={"Content-Type": "application/json"}, method="POST"
+            f"{base}{route}", data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
         # the BOX-holder check and the log take state.lock: routed inside the locked block this would hang
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
 
     try:
-        started = post("/api/fr3/gripper-teleop/start")
+        started = post("/api/fr3/gripper-teleop/start", json.dumps({"arm": "left"}).encode())
         _await_gripper_teleop(state, lambda j: (j.get("status") or {}).get("state") == "following")
-        with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop", timeout=10) as response:
+        with urllib.request.urlopen(f"{base}/api/fr3/gripper-teleop?robotIp=192.168.11.102", timeout=10) as response:
             running = json.loads(response.read())
         stopped = post("/api/fr3/gripper-teleop/stop")
     finally:
@@ -8862,19 +9775,20 @@ def test_gripper_teleop_over_http(tmp_path, monkeypatch):
         server.server_close()
 
     assert started["ok"], started["error"]
-    assert running["job"]["state"] == "running"
+    assert running["job"]["state"] == "running" and running["armDeviceId"] == 596523097  # the queried arm's YAML
     assert stopped["job"]["state"] == "exited"
 
 
 # --- FR3 move to start ------------------------------------------------------------
 
 _FAKE_MOVE_TO_START_TOOL = '''
+import os
 import sys
 ip = sys.argv[1].split("=", 1)[1]
-if ip == "192.168.11.9":
+if os.environ.get("FAKE_MOVE_TO_START_FAIL"):
     print(f"fr3_move_to_start=FAIL details=Failed to connect to FR3 at {ip}.", file=sys.stderr)
     raise SystemExit(1)
-print(f"fr3_move_to_start=CONNECT robot_ip={ip}")
+print(f"fr3_move_to_start=CONNECT robot_ip={ip} {' '.join(sys.argv[2:])}")
 print("fr3_move_to_start=PASS")
 '''
 
@@ -8893,12 +9807,16 @@ def test_fr3_move_to_start_runs_the_runtime_and_reports_its_failure(tmp_path, mo
     state = _fr3_move_to_start_state(tmp_path, monkeypatch)
     move = gateway._FR3_MOVE_TO_START_ROUTES["/api/robot/move-to-start"]
 
-    done = move(state, {})
+    assert "there is no default arm" in move(state, {})["error"]  # roadmap B2
+    assert "is no FR3" in move(state, {"robotIp": "192.168.11.9"})["error"]
+    done = move(state, {"arm": "left"})
     assert done["ok"], done["error"]
     assert done["robotIp"] == "192.168.11.102" and "robot_ip=192.168.11.102" in done["output"]
+    assert "--start-joints=0.0,-0.7853981633974483,0.0,-2.356194490192345" in done["output"]
 
-    failed = move(state, {"robotIp": "192.168.11.9"})
-    assert not failed["ok"] and "Failed to connect to FR3 at 192.168.11.9" in failed["error"]
+    monkeypatch.setenv("FAKE_MOVE_TO_START_FAIL", "1")
+    failed = move(state, {"robotIp": "192.168.11.102"})
+    assert not failed["ok"] and "Failed to connect to FR3 at 192.168.11.102" in failed["error"]
     assert "IP" in move(state, {"robotIp": "not-an-ip"})["error"]
 
 
@@ -8913,13 +9831,13 @@ def test_fr3_move_to_start_refuses_while_the_fci_is_taken(tmp_path, monkeypatch)
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in move(state, {})["error"]
+    assert "真机 replay" in move(state, {"arm": "left"})["error"]
     state.replay_process_kind = "mujoco"  # the simulator does not hold the FCI
     state.teleop_process = Alive()
-    assert "遥操作" in move(state, {})["error"]
+    assert "遥操作" in move(state, {"arm": "left"})["error"]
     state.teleop_process = None
     state.fr3_pivot_job = {"state": "collecting"}
-    assert "pivot" in move(state, {})["error"]
+    assert "pivot" in move(state, {"arm": "left"})["error"]
 
 
 _FAKE_PIVOT_AUTO_TOOL = '''
@@ -8983,7 +9901,7 @@ def _pivot_auto_state(tmp_path, monkeypatch):
 def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
 
-    captured = gateway._capture_fr3_pivot_centre(state, {"note": "球 A"})
+    captured = gateway._capture_fr3_pivot_centre(state, {"arm": "right", "note": "球 A"})
     assert captured["ok"], captured["error"]
     (centre,) = captured["centres"]
     assert centre["name"] == captured["captured"] and centre["centreMm"] == [550.0, 0.0, 100.0]
@@ -8998,7 +9916,7 @@ def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypa
     assert plan["socketStandMm"] == 1.7 and plan["gripperStandBody"] == "link_gripper_tip_right"
     assert plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
 
-    started = gateway._execute_fr3_pivot(state, {"plan": plan["name"]})
+    started = gateway._execute_fr3_pivot(state, {"arm": "right", "plan": plan["name"]})
     assert started["ok"], started["error"]
     assert started["job"]["mode"] == "auto" and started["job"]["biasMm"] == [3.0, 0.0, 0.0]
     job = _await_pivot(state)
@@ -9010,13 +9928,13 @@ def test_fr3_pivot_auto_captures_plans_and_executes_then_fits(tmp_path, monkeypa
 def test_fr3_pivot_auto_refuses_failed_plans_bad_input_and_a_busy_fci(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
     assert "先取球心" in gateway._plan_fr3_pivot(state, {"centre": "../x_centre.json"})["error"]
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     assert "±5 mm" in gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [9, 0, 0]})["error"]
 
     failed = gateway._plan_fr3_pivot(state, {"centre": centre, "biasMm": [5, 0, 0]})
     assert failed["ok"] and not failed["plans"][0]["passed"]  # written, shown, not runnable
-    assert "没通过演算" in gateway._execute_fr3_pivot(state, {"plan": failed["planned"]})["error"]
-    assert "找不到规划" in gateway._execute_fr3_pivot(state, {"plan": "nope_plan.json"})["error"]
+    assert "没通过演算" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": failed["planned"]})["error"]
+    assert "找不到规划" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": "nope_plan.json"})["error"]
 
     good = gateway._plan_fr3_pivot(state, {"centre": centre})["planned"]
 
@@ -9027,29 +9945,29 @@ def test_fr3_pivot_auto_refuses_failed_plans_bad_input_and_a_busy_fci(tmp_path, 
             return None
 
     state.replay_process, state.replay_process_kind = Alive(), "real"
-    assert "真机 replay" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
-    assert "真机 replay" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    assert "真机 replay" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good})["error"]
+    assert "真机 replay" in gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["error"]
     state.replay_process = None
 
-    assert gateway._execute_fr3_pivot(state, {"plan": good, "note": "slow"})["ok"]
-    assert "已有一次" in gateway._execute_fr3_pivot(state, {"plan": good})["error"]
-    assert "还在进行" in gateway._capture_fr3_pivot_centre(state, {})["error"]
+    assert gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good, "note": "slow"})["ok"]
+    assert "已有一次" in gateway._execute_fr3_pivot(state, {"arm": "right", "plan": good})["error"]
+    assert "还在进行" in gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["error"]
     gateway._stop_fr3_pivot(state, {})
     assert _await_pivot(state)["state"] == "stopped"
 
 
 def test_fr3_pivot_guide_runs_until_finish_then_fits(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    assert "找不到球心" in gateway._guide_fr3_pivot(state, {"centre": "x"})["error"]
-    assert "20–180" in gateway._guide_fr3_pivot(state, {"centre": centre, "durationS": 5})["error"]
-    assert "±5 mm" in gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [0, 7, 0]})["error"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    assert "找不到球心" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": "x"})["error"]
+    assert "20–180" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "durationS": 5})["error"]
+    assert "±5 mm" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "biasMm": [0, 7, 0]})["error"]
     assert "没有正在进行的引导" in gateway._finish_fr3_pivot(state, {})["error"]
 
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "biasMm": [-3, 0, 0], "durationS": 90, "note": "slow"})
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "biasMm": [-3, 0, 0], "durationS": 90, "note": "slow"})
     assert started["ok"], started["error"]
     assert started["job"]["mode"] == "guided" and started["job"]["biasMm"] == [-3.0, 0.0, 0.0]
-    assert "已有一次" in gateway._guide_fr3_pivot(state, {"centre": centre})["error"]
+    assert "已有一次" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre})["error"]
     deadline = time.monotonic() + 5
     while not any("guide: up to 90 s, bias -3 0 0" in line for line in gateway._fr3_pivot_job_view(state)["log"]):
         assert time.monotonic() < deadline
@@ -9077,34 +9995,34 @@ def _guided_fit(state, name, *, rms=1.2, span=22.8, weak=0.12, s=(0.4, -1.5, 6.5
 
 def test_fr3_pivot_guide_anchors_on_the_latest_good_fit_of_the_same_grip(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    assert "先跑一轮不挂球心" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    assert "先跑一轮不挂球心" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})["error"]
 
     _guided_fit(state, "20261013_180847")
     _guided_fit(state, "20261013_181013", span=16.3, weak=0.03)  # newer, barely turned: not used, and says why
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert not anchor["available"] and anchor["run"] == "20261013_181013_pivot.json" and "转得不够" in anchor["reason"]
-    assert "转得不够" in gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
+    assert "转得不够" in gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})["error"]
 
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and anchor["sMm"] == [0.13, -0.53, 7.87]
     assert anchor["fitName"] == "20261013_181645_pivot.fit.json"
 
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})
     assert started["ok"], started["error"]
     assert started["job"]["anchorMm"] == [0.13, -0.53, 7.87]
     job = _await_pivot(state)
     assert any("anchor 0.13 -0.53 7.87 from 20261013_181645_pivot.fit.json" in line for line in job["log"]), job["log"]
     # without the box ticked nothing changes: no --anchor-mm, the frame's origin held as before
-    plain = gateway._guide_fr3_pivot(state, {"centre": centre})
+    plain = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre})
     assert plain["job"]["anchorMm"] == [0.0, 0.0, 0.0]
     assert not any(line.startswith("anchor") for line in _await_pivot(state)["log"])
 
 
 def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, monkeypatch):
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     assert "先跑一轮不挂球心" in gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})["error"]
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     planned = gateway._plan_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
@@ -9116,12 +10034,46 @@ def test_fr3_pivot_plan_turns_about_the_fitted_ball_centre_when_asked(tmp_path, 
 def test_fr3_pivot_probe_plans_without_an_anchor(tmp_path, monkeypatch):
     # the probe is what finds the ball centre: asked with anchorFromFit too, it still turns about the origin
     state = _pivot_auto_state(tmp_path, monkeypatch)
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
     _guided_fit(state, "20261013_181645", s=(0.13, -0.53, 7.87))
     planned = gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "anchorFromFit": True})
     assert planned["ok"], planned["error"]
     (plan,) = planned["plans"]
     assert plan["kind"] == "probe" and plan["anchorMm"] == [0.0, 0.0, 0.0] and plan["anchorFrom"] == ""
+
+
+def test_fr3_pivot_probe_turns_about_a_prior_when_given_one(tmp_path, monkeypatch):
+    # 11-09 16:05: about the origin the probe dragged the cup (the ball ~23 mm out); Desk's EE is the prior
+    state = _pivot_auto_state(tmp_path, monkeypatch)
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    planned = gateway._plan_fr3_pivot(
+        state, {"centre": centre, "probe": True, "priorMm": [-1.4, 0.7, 23.2], "priorFrom": "desk_ee"}
+    )
+    assert planned["ok"], planned["error"]
+    (plan,) = planned["plans"]
+    assert plan["kind"] == "probe" and plan["anchorMm"] == [-1.4, 0.7, 23.2] and plan["anchorFrom"] == "prior: Desk EE"
+    far = gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "priorMm": [0, 0, 46]})
+    assert "超过 45 mm" in far["error"]
+    assert "3 个数" in gateway._plan_fr3_pivot(state, {"centre": centre, "probe": True, "priorMm": [0, 1]})["error"]
+    # a full plan never takes a prior: it turns about a fit or the origin
+    full = gateway._plan_fr3_pivot(state, {"centre": centre, "priorMm": [0, 0, 23]})
+    assert full["ok"] and full["plans"][0]["anchorMm"] == [0.0, 0.0, 0.0]
+
+
+def test_a_centre_lists_where_desks_ee_sits_in_the_socket_frame():
+    # the right arm's 11-09 16:04 centre: Desk set to the new fingertip, 23 mm out along the tool axis
+    centre = {
+        "centre_m": [0.5121437624584804, 0.20132528759228563, 0.4461663468223124],
+        "R": [[0.43745480608219495, -0.1513077955718019, 0.8864193384819576],
+              [-0.11616781499943822, -0.9869912718704766, -0.11114525635291589],
+              [0.8917052940259159, -0.0543523711598758, -0.4493411714448764]],
+        "O_T_EE": [[0.4374547985954714, -0.15131430497816684, 0.8864182268889045, 0.532035605492199],
+                   [-0.11616781301133033, -0.9869904384335728, -0.11115250719266764, 0.1981993633971732],
+                   [0.8917052787650291, -0.05434906918371507, -0.4493415707275643, 0.4344549089317308],
+                   [0.0, 0.0, 0.0, 1.0]],
+    }
+    assert gateway._desk_ee_in_socket_mm(centre) == [-1.4, 0.7, 23.2]
+    assert gateway._desk_ee_in_socket_mm({"centre_m": [0, 0, 0]}) is None
 
 
 def test_fr3_pivot_anchor_follows_the_socket_frame_the_urdf_has_now(tmp_path, monkeypatch):
@@ -9157,8 +10109,8 @@ def test_fr3_pivot_anchor_warns_but_stays_usable_once_the_gripper_teleop_ran_aft
     os.utime(hold, (after, after))  # 10-13: the BOX reboot dropped the insert, teleop re-clamped it
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and "夹持可能变了" in anchor["warning"] and "仍可沿用" in anchor["warning"]
-    centre = gateway._capture_fr3_pivot_centre(state, {})["captured"]
-    started = gateway._guide_fr3_pivot(state, {"centre": centre, "anchorFromFit": True})
+    centre = gateway._capture_fr3_pivot_centre(state, {"arm": "right"})["captured"]
+    started = gateway._guide_fr3_pivot(state, {"arm": "right", "centre": centre, "anchorFromFit": True})
     assert started["ok"], started["error"]
     assert started["job"]["anchorMm"] == [0.4, -1.5, 6.5]
     _await_pivot(state)
@@ -9172,7 +10124,7 @@ def test_fr3_pivot_anchor_warns_but_stays_usable_once_the_gripper_teleop_ran_aft
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert anchor["available"] and "夹爪遥控正在运行" in anchor["warning"]
     state.gripper_teleop_process = None
-    _guided_fit(state, "20261013_181645", rms=4.1, s=(0.1, -0.5, 25.0))
+    _guided_fit(state, "20261013_181645", rms=4.1, s=(0.1, -0.5, 50.0))  # 11-09: 23-36 mm is a real ball now
     anchor = gateway._fr3_pivot_payload(state)["anchor"]
     assert not anchor["available"] and "残差 4.1 mm" in anchor["reason"] and "不像球心" in anchor["reason"]
 
@@ -9203,3 +10155,179 @@ def test_fr3_pivot_joint_fit_takes_the_chosen_runs_and_becomes_the_anchor(tmp_pa
     # a run collected after the joint fit is newer data: its own fit is the anchor again
     _guided_fit(state, "20991231_235959")
     assert gateway._fr3_pivot_payload(state)["anchor"]["run"] == "20991231_235959_pivot.json"
+
+
+def _button_state(tmp_path, monkeypatch, recording_state="armed", role="handheld"):
+    registry = tmp_path / "tools" / "thor" / "box_devices.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"devices": {"3969377039": {"role": role}}}), encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", state=recording_state),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    monkeypatch.setattr(gateway, "_start_episode", lambda _state: calls.append("start"))
+    monkeypatch.setattr(gateway, "_stop_recorder", lambda _state, action: calls.append(action))
+    return state, calls
+
+
+def _press(state, gesture, *, device=3969377039, age_s=0.0):
+    report = {"device_id": device, "gesture": gesture, "mcu_us": 1, "wall_s": time.time() - age_s}
+    gateway._apply_recorder_output(state, "BOX_BUTTON " + json.dumps(report))
+
+
+@pytest.mark.parametrize(
+    ("recording_state", "gesture", "expected"),
+    [
+        ("armed", "single", ["start"]),
+        ("recording", "single", ["save"]),
+        ("review", "single", ["save"]),
+        ("recording", "long", ["discard"]),
+        ("review", "long", ["discard"]),
+        ("recording", "double", []),
+        ("armed", "double", []),
+        ("armed", "long", []),
+        ("saving", "single", []),
+        ("discarding", "long", []),
+        ("connecting", "single", []),
+        ("idle", "single", []),
+    ],
+)
+def test_box_button_does_what_the_recorder_state_makes_it_mean(
+    tmp_path, monkeypatch, recording_state, gesture, expected
+):
+    state, calls = _button_state(tmp_path, monkeypatch, recording_state)
+    _press(state, gesture)
+    assert calls == expected
+
+
+def test_box_button_of_a_box_that_is_not_handheld_does_nothing(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch, role="fr3_gripper")
+    _press(state, "single")
+    _press(state, "single", device=42)  # and one the registry does not know
+    assert calls == []
+
+
+@pytest.mark.parametrize("session", ["calibration_session", "tracker_mount_session", "marker_tcp_session"])
+def test_box_button_leaves_a_capture_that_holds_the_recorder_alone(tmp_path, monkeypatch, session):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    getattr(state, session).active = True
+    getattr(state, session).stage = "capture"
+    _press(state, "single")
+    assert calls == []
+    # a finished session that stays on record must not take the button away
+    getattr(state, session).stage = "done"
+    _press(state, "single")
+    assert calls == ["start"]
+
+
+def test_box_button_press_that_started_cannot_also_stop(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    _press(state, "single")
+    state.recording.state = "recording"
+    _press(state, "single")
+    assert calls == ["start"]
+    state.box_button_last_action_s -= gateway._BOX_BUTTON_COOLDOWN_S
+    _press(state, "single")
+    assert calls == ["start", "save"]
+
+
+def test_box_button_line_that_waited_is_not_acted_on(tmp_path, monkeypatch):
+    state, calls = _button_state(tmp_path, monkeypatch)
+    _press(state, "single", age_s=gateway._BOX_BUTTON_MAX_AGE_S + 1.0)
+    assert calls == []
+
+
+def test_box_button_says_why_a_start_was_refused(tmp_path, monkeypatch):
+    state, _ = _button_state(tmp_path, monkeypatch)
+
+    def refuse(_state):
+        raise RuntimeError("相机和端口的对应关系与标定时不一致")
+
+    monkeypatch.setattr(gateway, "_start_episode", refuse)
+    _press(state, "single")
+    assert any("不一致" in event.message for event in state.events)
+
+
+def test_box_button_goes_through_the_real_start_checks(tmp_path, monkeypatch):
+    class Running:
+        pid = 0
+
+        def poll(self):
+            return None
+
+    state, _ = _button_state(tmp_path, monkeypatch)
+    monkeypatch.undo()
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.process = Running()
+    state.recording.cameraIdentityMismatches = [{"camera": "cam_06", "actual": "a", "expected": "b"}]
+
+    _press(state, "single")
+    assert state.recording.state == "armed" and written == []
+    assert any("未执行" in event.message for event in state.events)
+
+    state.recording.cameraIdentityMismatches = []
+    state.box_button_last_action_s = float("-inf")
+    _press(state, "single")
+    assert state.recording.state == "recording" and written[-1] == "\n"
+
+
+def test_the_right_hand_rig_is_its_own_target_and_its_box_picks_it(tmp_path):
+    repo_root = tmp_path / "repo"
+    target_dir = _install_rig_v9b(repo_root)
+    source_dir = _RIG_V9B_SOURCE.parent
+    for name in (
+        gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG.name,
+        "gripper_rig_v9b_right_marker_layout.json",
+        "marker_to_tcp_calibration_gripper_rig_v9b_right.json",
+    ):
+        shutil.copy2(source_dir / name, target_dir / name)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    right = gateway._marker_tcp_layout_rig(state, "gripper_rig_v9b_right")
+    left = gateway._marker_tcp_layout_rig(state, "gripper_rig_v9b")
+    assert right["cubeName"] == "right" and left["cubeName"] == "left"
+    assert right["dictionary"] == left["dictionary"] == "DICT_6X6_250"
+    layout = json.loads(Path(right["layoutPath"]).read_text())
+    assert sorted(m["id"] for m in layout["markers"]) == [100, 101, 110, 111]
+    # the pads are the paste check's, not the operator's left-to-right read as CAD L/R
+    assert {m["id"]: m["pad"] for m in layout["markers"]} == {
+        100: "R_side", 101: "R_front", 110: "L_front", 111: "L_side"
+    }
+    # the TCP is the mean of two pivot recordings, so the bundle says validated
+    assert right["bundleEntry"]["device_id"] == "box3906437858"
+    bundle = json.loads((target_dir / "marker_to_tcp_calibration_gripper_rig_v9b_right.json").read_text())
+    assert bundle["validated"] is True
+    assert bundle["cubes"]["right"]["expected_pivot_points_mm"]["insert_nov4_socket_centre"] == [0.41, 0.07, 168.5]
+    # each hand-held BOX's pivot is solved on its own rig
+    assert gateway._marker_tcp_rig_for_box(state, "box3906437858") == "gripper_rig_v9b_right"
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039") == "gripper_rig_v9b"
+    assert gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert "gripper_rig_v9b_right" in gateway.MARKER_TCP_RIGS
+
+
+def test_the_arm_held_6d_zero_reads_the_recorder_through_the_gateway(tmp_path: Path) -> None:
+    state = _marker_tcp_gateway_state(tmp_path)
+    cal = gateway._payload_calibration(state)
+    host = cal.host
+    assert "Connect" in host.recorder_box_refusal()  # no recorder process
+    state.device_preview["box"] = {"active": True, "updatedAt": 1.0, "sensors": {"box1/box_imu": {"acc_g": [0, 0, 1]}}}
+    state.box_devices_roster = [{"device_id": 1, "box_id": "box1"}]
+    assert host.box_preview()["sensors"]["box1/box_imu"]["acc_g"] == [0, 0, 1]
+    assert host.box_roster() == [{"device_id": 1, "box_id": "box1"}]
+    assert host.six_d_cali_log() == (False, [])
+    refused = host.trigger_six_d_cali(False, "box1")
+    assert not refused["ok"] and "Connect" in refused["error"]
+    route = gateway._PAYLOAD_CALIBRATION_ROUTES["/api/calibration/fr3-six-d-zero/start"]
+    res = route(state, {"arm": "right", "mode": "dynamic", "confirmed": True})
+    assert not res["ok"] and "zeroReports" in res

@@ -118,6 +118,8 @@ export type RecordingStatus = {
   syncSummary?: string;
   syncReportPath?: string;
   syncWarnings?: string[];
+  // What the running episode misses of the 6D calibration procedure; it records regardless.
+  sixDCaliWarnings?: string[];
   // Whether this Connect asked for the laser tracker. A per-session choice, not
   // a property of the rig: the instrument is shared and admits one client.
   laserTracker?: boolean;
@@ -253,6 +255,8 @@ export type ReplayStatus = {
   pid?: number | null;
   lastOutput?: string;
   mujocoCubeMode?: MujocoCubeMode;
+  // Thor: the arm whose base the last MuJoCo preview planned in ("" = the hand's own arm).
+  mujocoArm?: string;
   mujocoValidation?: MujocoValidation;
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;
@@ -376,6 +380,101 @@ export type LaserReplayRun = {
   };
 };
 
+export type DualFr3Stats = { p50: number; p95: number; max: number };
+
+// One episode's row of meta/dual_fr3_executable.json (tools/fr3/dual_fr3_executability.py, roadmap C4).
+export type DualFr3EpisodeVerdict = {
+  dual_fr3_executable: boolean;
+  reasons: string[];
+  frames?: number;
+  placement_assumed?: boolean;
+  d_safe_mm?: number;
+  retarget_change_position_mm?: { right: DualFr3Stats; left: DualFr3Stats };
+  retarget_change_rotation_deg?: { right: DualFr3Stats; left: DualFr3Stats };
+  t_lr_change_position_mm?: DualFr3Stats;
+  min_arm_arm_gap_mm?: number;
+  mesh_min_gap_mm?: number | null;
+  reference_duration_s?: number;
+  slowdown_vs_nominal?: number | null;
+  scene_fingerprint?: string;
+  // C2's plan for this mode: per arm, the graph edges its targets go through; and the two bases' placement.
+  mode?: {
+    arms?: Record<string, { root?: string; edges?: DualFr3Edge[] }>;
+    placement?: { edges?: DualFr3Edge[]; sigma_mm?: number; assumed?: boolean };
+  };
+};
+
+export type DualFr3Edge = {
+  from_world_frame_id?: string;
+  to_world_frame_id?: string;
+  method?: string;
+  created_utc?: string;
+};
+
+// /api/replay/dual-fr3/job and connect / execute / abort (roadmap D4).
+export type DualReplayState = "connecting" | "at_start" | "executing" | "finished" | "stopped" | "error";
+
+export type DualReplayJob = {
+  state?: DualReplayState;
+  mode?: string;
+  backend?: string;
+  episode?: number;
+  dataset?: string;
+  edges?: Record<string, string[]>;
+  log?: string[];
+  error?: string;
+  report?: {
+    path?: string;
+    backend?: string;
+    startSkewMs?: number;
+    startGapMm?: number;
+    minGapMm?: number;
+    stoppedTogether?: boolean;
+    stop?: string[];
+    arms?: Record<string, { outcome?: string; framesCommanded?: number; framesPlanned?: number }>;
+    /** D2: the arms' clocks fitted; an estimate, not laser-certified. */
+    clock?: { status?: string | null; verdict?: string | null; startSkewMs?: number | null; tLrFromSkewMmP95?: number | null };
+  };
+};
+
+export type DualReplayResponse = {
+  ok: boolean;
+  error: string;
+  job: DualReplayJob;
+  arms: RobotArm[];
+  modes: string[];
+  backends: string[];
+};
+
+// GET /api/robot/arms: tools/fr3/fr3_arms.json (roadmap B2). `required`: every request that drives an
+// arm must name one (Thor); the workstation drives its own FR3 by IP and gets false.
+export type RobotArm = {
+  arm: "right" | "left";
+  inService: boolean;
+  whyNot: string;
+  robotIp: string;
+  gripperBox: number | null;
+  payload: { mass_kg: number; com_m: number[]; source: string } | null;
+  startJointsRad: number[] | null;
+  replayConfig: string;
+};
+
+export type RobotArms = {
+  ok: boolean;
+  required: boolean;
+  arms: RobotArm[];
+  error: string;
+};
+
+export type DualFr3Executability = {
+  datasetRoot: string;
+  episode: number;
+  modes: Record<
+    string,
+    { createdUtc?: string; embodiment?: string; summary: { episodes?: number; executable?: number }; episode: DualFr3EpisodeVerdict | null }
+  >;
+};
+
 export type LaserReplayReport = {
   schema: string;
   runs: LaserReplayRun[];
@@ -491,7 +590,9 @@ export type CollectionTask = {
 // "calibration" is a board sweep recorded by the guided wizard, not a
 // demonstration: it never counts towards a task's episode budget and is never
 // merged into a v3 export.
-export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration";
+// "pseudo_bimanual" pairs two recorded right hands (one mirrored) for the two-arm panels; it has no
+// parquet or video of its own and is never a capture, an export source or training data.
+export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration" | "pseudo_bimanual";
 
 export type RecordedDataset = {
   path: string;
@@ -835,7 +936,7 @@ export type CubeVideoOverlay = {
   usedForFusion: boolean;
 };
 
-export type TrackingTarget = "april_cube" | "hybrid_carrier_v1";
+export type TrackingTarget = "april_cube" | "hybrid_carrier_v1" | "gripper_rig_v9b" | "gripper_rig_v9b_right";
 
 export type TrackingDetectionSummary = {
   target: TrackingTarget;
@@ -1280,7 +1381,9 @@ export type WorldFrameResponse = {
 export type Fr3BaseEdgeQuality = {
   /** singleTag: P0 tag hand-eye; laser: tracker station x FR3 FK fitted to the laser on replays;
    * ball: rigid fit of the ball check's positions (fr3_base_ball_check.py edge). */
-  method?: "singleTag" | "laser" | "ball";
+  method?: "singleTag" | "laser" | "ball" | "armArm";
+  /** armArm: distance between the two bases, metres. */
+  baselineM?: number | null;
   positions?: number | null;
   residualRmsMm?: number | null;
   /** Each ball position predicted from the others: what the verdict rests on. */
@@ -1323,6 +1426,14 @@ export type Fr3BaseEdgeMove = {
   rotationDeg: number;
 };
 
+/** world_graph_guard: "diverged"/"unreadable" stop every route into a robot base until confirmed. */
+export type WorldGraphGuard = {
+  state: "ok" | "diverged" | "unrecorded" | "unreadable" | "";
+  problems: string[];
+  recordedUtc: string;
+  reason?: string;
+};
+
 export type Fr3BaseEdgeResponse = {
   ok: boolean;
   error?: string;
@@ -1343,6 +1454,11 @@ export type Fr3BaseEdgeResponse = {
     edgeCount: number;
     quality: Fr3BaseEdgeQuality;
   } | null;
+  /** Edges into a robot base kept as a record of an old placement; nothing routes through them. */
+  retired?: { label: string; from?: string; to?: string; createdUtc: string; retiredUtc: string; reason: string }[];
+  graphGuard?: WorldGraphGuard;
+  /** Every live edge into a robot base: world -> fr3_base, world -> fr3_base_right, fr3_base -> fr3_base_right. */
+  links?: { from: string; to: string; label: string; createdUtc: string; sigmaMm: number | null; quality: Fr3BaseEdgeQuality }[];
   runs: {
     name: string;
     captures: number;
@@ -1355,6 +1471,9 @@ export type Fr3BaseEdgeResponse = {
   candidates: {
     name: string;
     generatedUtc: string;
+    /** The edge's ends, oriented into the base it measures (from the world, or fr3_base -> fr3_base_right). */
+    from?: string;
+    to?: string;
     label: string;
     p0Run: string;
     verdict: string;
@@ -1483,6 +1602,9 @@ export type BallCheckReport = {
   handheld_shared?: Record<string, { positions: number[]; s_mm?: number[]; s_sigma_mm?: number[]; s_per_position_mm?: number[][]; error?: string }>;
   reference_world?: string;
   world_reference_sha256?: string;
+  /** The base the FR3 centres are in (fr3_base = left arm, fr3_base_right = right); absent on checks before 11-03. */
+  base?: string;
+  robot_ips?: string[];
 };
 
 export type Fr3PivotJob = {
@@ -1550,10 +1672,14 @@ export type Fr3PivotResponse = {
   checked?: string;
   /** A check's ball edge written as a candidate of the FR3-base edge panel. */
   edgeSaved?: string;
+  /** fr3_base -> fr3_base_right from balls both arms pivoted about, written as a candidate. */
+  armArmEdge?: string;
   job: Fr3PivotJob;
   runs: {
     name: string;
     fitName: string;
+    /** The FR3 that turned about the ball: the centre is in that arm's base. */
+    robotIp?: string;
     note: string;
     created: string;
     fk: PivotFitSummary | null;
@@ -1646,6 +1772,8 @@ export type Fr3PivotJointFit = {
   name: string;
   created: string;
   runs: string[];
+  /** The FR3 its runs were collected on; "" when unrecorded or mixed. */
+  robotIp?: string;
   /** One ball centre for all runs (the ball not moved), else one per run. */
   sharedCentre: boolean;
   fk: JointPivotFitSummary | null;
@@ -1661,6 +1789,8 @@ export type Fr3PivotCentre = {
   /** Tool axis above (+) or below (-) level; the cup faces down across it. */
   toolFromLevelDeg: number | null;
   wallProblems: string[];
+  /** Desk's EE origin in corenetic_socket_ee at the capture (mm): the probe's default prior for the ball. */
+  deskEeInSocketMm?: number[] | null;
 };
 
 export type Fr3PivotPlan = {
@@ -1693,6 +1823,60 @@ export type Fr3PivotPlan = {
   anchorMm?: number[] | null;
   notes?: string[];
 };
+
+// Both FR3s home (tools/fr3/dual_fr3_move_to_start.py): Check reads both arms and plans their straight joint
+// paths home against each other and the table; Execute runs the plan; Cancel drops it (or, moving, both FCIs).
+export type DualHomeArmPlan = {
+  moving: boolean;
+  q_now: number[];
+  q_goal: number[];
+  max_joint_move_deg: number;
+  joint: number;
+  min_env_gap_mm: number | null;
+  min_env_with: [string, string] | null;
+};
+
+export type DualHomeOption = { min_gap_mm: number; pair: string[]; where: string };
+
+export type DualHomePlan = {
+  arms: Record<"right" | "left", DualHomeArmPlan>;
+  start_gap_mm: number;
+  d_gate_mm: number;
+  /** what the paths are held to: d_gate, or "never closer than now" when the arms already are */
+  gate_mm: number;
+  d_env_mm: number;
+  options: Record<string, DualHomeOption>;
+  /** arms that move together, stage by stage; [] both at start; null refused */
+  stages: string[][] | null;
+  chosen: string | null;
+  reasons: string[];
+  placement?: { sigma_mm: number; source: string; T_right_left: number[][] };
+  payload?: Record<string, string>;
+  speed_factor?: number;
+  ip?: Record<string, string>;
+};
+
+export type DualHomeArmResult = { ok: boolean; q?: number[]; max_error_deg?: number; error?: string };
+
+export type DualHomeResult = { ok: boolean; chosen?: string; stages: Array<Record<string, DualHomeArmResult>> };
+
+export type DualHomeState = "checking" | "ready" | "moving" | "done" | "cancelled" | "refused" | "failed";
+
+export type DualHomeJob = {
+  state?: DualHomeState;
+  plan?: DualHomePlan | null;
+  result?: DualHomeResult | null;
+  log?: string[];
+  error?: string;
+  startedUnixS?: number;
+  readyUnixS?: number;
+  waitS?: number;
+  endedUnixS?: number;
+  exitCode?: number;
+  cancelRequested?: boolean;
+};
+
+export type DualHomeResponse = { ok: boolean; error: string; job: DualHomeJob };
 
 /** POST /api/robot/move-to-start: panda_py move_to_start() on one FR3, run to completion. */
 export type Fr3MoveToStartResponse = {

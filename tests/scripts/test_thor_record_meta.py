@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 from tools.thor.box_sdk import box_client as bc
@@ -381,6 +382,39 @@ def test_an_ordinary_capture_declares_no_intent_at_all(tmp_path: Path) -> None:
     assert "capture_intent" not in meta
 
 
+def test_the_6d_zero_each_box_ran_under_is_written_into_the_episode_meta(tmp_path: Path, monkeypatch) -> None:
+    # The zero usually happens before the episode; without its attitude the bias it leaves in
+    # fxyz_mxyz cannot be undone offline (box_six_d.zero_bias).
+    thor_record = _load_thor_record_module()
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", tmp_path / "origin.json")
+    thor_record._SIX_D_ZEROS.clear()
+    ctx = {"fxyz_mxyz": [0.1, 0.2, -7.7, -0.18, 0.0, 0.0], "acc_g": [-0.99, 0.09, 0.02],
+           "samples": 15, "wall_s": 1793677000.0, "device_id": 3969377039}
+    thor_record._note_six_d_zero({"box_id": "box3969377039", "ok": True, "method": "cali_6d_force_sensor",
+                                  "zero_context": ctx}, origin=False)
+    # a failed run changes nothing; an origin run without a context still marks the BOX
+    thor_record._note_six_d_zero({"box_id": "box3969377039", "ok": False, "zero_context": None}, origin=False)
+    thor_record._note_six_d_zero({"box_id": "box3100715645", "ok": True, "zero_context": None}, origin=True)
+
+    meta_path = thor_record._write_episode_meta(
+        _minimal_handle(tmp_path), _recorder_config(tmp_path), locked=[6], argus_failed=[],
+        connect_stream_errors=[], box_cfg=bc.BoxFleetConfig(enabled=True),
+        box_snapshots=[{"sensors": {"box3906437858/box_imu": {}, "box_imu": {}}}],
+        stop_reason="save", wallclock_start_utc="2026-11-03T00:00:00+00:00",
+        wallclock_end_utc="2026-11-03T00:00:30+00:00", world_frame={"status": "ok"},
+    )
+    meta = json.loads(meta_path.read_text())
+    thor_record._SIX_D_ZEROS.clear()
+
+    zeros = meta["box_six_d_zero"]
+    assert zeros["3969377039"]["kind"] == "software"
+    assert zeros["3969377039"]["acc_g"] == [-0.99, 0.09, 0.02]
+    assert zeros["3100715645"]["kind"] == "origin"
+    assert meta["box_devices"]["3969377039"] == {"role": "handheld", "hand": "left"}
+    assert meta["box_devices"]["3906437858"] == {"role": "handheld", "hand": "right"}
+    assert meta["box_devices"]["3100715645"] == {"role": "fr3_gripper"}
+
+
 # ---------------------------------------------------------------------------
 # Pruning the cameras a sweep was not for, once the sync gate is done with them
 
@@ -590,3 +624,100 @@ def test_an_unmeasurable_correction_is_null_rather_than_a_reassuring_zero() -> N
     summary = _alignment_summary(thor_record, corrected=[0.0, 1 / 60], raw=None)
 
     assert summary["exposure_correction_ms"] is None
+
+
+def test_connect_never_set_modes_any_fr3_gripper_box_the_registry_names(tmp_path):
+    # 10-31: the v4.1 firmware renumbered every BOX, the YAML's keep_mode id went stale, and each
+    # Connect would have set the arm's gripper BOX to mode 0 (jaw to its own trigger: it opens).
+    tr = _load_thor_record_module()
+    registry = tmp_path / "fr3_arms.json"
+    registry.write_text(json.dumps({"arms": {
+        "right": {"corenetic_device_id": 3100715645},
+        "left": {"corenetic_device_id": None},
+    }}))
+    cfg = bc.fleet_from_yaml_dict({"enabled": True, "keep_mode_device_ids": [596523097]})
+    assert tr._keep_fr3_gripper_box_modes(cfg, registry) == [3100715645]
+    assert cfg.keep_mode_device_ids == [596523097, 3100715645]
+    assert tr._keep_fr3_gripper_box_modes(cfg, registry) == []  # already kept: nothing doubled
+
+    cfg = bc.fleet_from_yaml_dict({"enabled": True, "keep_mode_device_ids": [7]})
+    assert tr._keep_fr3_gripper_box_modes(cfg, tmp_path / "missing.json") == []
+    assert cfg.keep_mode_device_ids == [7]
+    # the repo's own registry names the arm's gripper BOX
+    cfg = bc.fleet_from_yaml_dict({"enabled": True})
+    assert 3100715645 in tr._keep_fr3_gripper_box_modes(cfg)
+
+
+def test_a_second_touch_pad_streaming_gets_a_device_row():
+    # Discovery's one CAP_TOUCH bit announces one pad per finger; the second only streams.
+    tr = _load_thor_record_module()
+    roster = [
+        {"box_id": "box1", "expected_devices": ["box_gripper", "box_touch_left", "box_touch_right"]},
+        {"box_id": "box2", "expected_devices": ["box_gripper"]},
+    ]
+    live = ["box1/box_touch_left", "box1/box_touch_left_1", "box1/box_touch_right_1", "box2/box_gripper", "box2/bogus"]
+    assert tr._add_streaming_sensors_to_roster(roster, live)
+    assert roster[0]["expected_devices"][-2:] == ["box_touch_left_1", "box_touch_right_1"]
+    assert roster[1]["expected_devices"] == ["box_gripper"]
+    assert not tr._add_streaming_sensors_to_roster(roster, live)  # nothing new the second time
+    single = [{"box_id": "", "expected_devices": ["box_touch_left"]}]
+    assert tr._add_streaming_sensors_to_roster(single, ["box_touch_left", "box_touch_left_1"])
+    assert single[0]["expected_devices"] == ["box_touch_left", "box_touch_left_1"]
+
+
+class _SixDPool:
+    def __init__(self, uptimes):
+        self.uptimes = uptimes
+
+    def six_d_uptimes(self):
+        if isinstance(self.uptimes, Exception):
+            raise self.uptimes
+        return self.uptimes
+
+
+def _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool, capture_intent=None):
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", tmp_path / "origin.json")
+    monkeypatch.setattr(thor_record, "_SIX_D_ZEROS", {})
+    thor_record._warn_six_d_calibration(pool, capture_intent)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("SIX_D_CALI_WARN ")]
+    assert len(lines) == 1
+    return json.loads(lines[0].removeprefix("SIX_D_CALI_WARN "))
+
+
+def test_an_episode_is_told_what_it_misses_of_the_6d_procedure_and_only_a_handheld_box(capsys, monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    pool = _SixDPool({3969377039: 7200.0, 3100715645: 7200.0})
+    report = _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool)
+    assert list(report) == ["3969377039"]  # 3100715645 is on the arm
+    assert any("origin" in w for w in report["3969377039"])
+    assert report == thor_record._SIX_D_CALI_WARNINGS
+
+
+def test_the_6d_check_says_nothing_to_a_calibration_capture_and_never_stops_an_episode(capsys, monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    pool = _SixDPool({3969377039: 7200.0})
+    assert _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, pool, capture_intent={"purpose": "pivot"}) == {}
+    assert _six_d_warnings(thor_record, capsys, monkeypatch, tmp_path, _SixDPool(RuntimeError("box gone"))) == {}
+    assert thor_record._SIX_D_CALI_WARNINGS == {}
+
+
+def test_an_origin_outlasts_the_recorder_and_the_zero_after_the_re_power_rechecks_it(monkeypatch, tmp_path):
+    thor_record = _load_thor_record_module()
+    path = tmp_path / "origin.json"
+    monkeypatch.setattr(thor_record, "_SIX_D_ORIGIN_PATH", path)
+    monkeypatch.setattr(thor_record, "_SIX_D_ZEROS", {})
+    now = time.time()
+    fixture = [-1.0, 0.0, -0.05]
+    thor_record._note_six_d_zero(
+        {"ok": True, "method": "origin", "zero_context": {"device_id": 3969377039, "wall_s": now - 100,
+                                                          "mcu_us": 2_000_000_000, "acc_g": fixture}},
+        origin=True,
+    )
+    assert "recheck" not in json.loads(path.read_text())["3969377039"]
+    thor_record._note_six_d_zero(
+        {"ok": True, "method": "zero", "zero_context": {"device_id": 3969377039, "wall_s": now, "mcu_us": 80_000_000,
+                                                        "acc_g": fixture, "fxyz_mxyz_raw": [0.1, 0, -0.2, 0, 0, 0]}},
+        origin=False,
+    )
+    saved = json.loads(path.read_text())["3969377039"]
+    assert saved["kind"] == "origin" and saved["recheck"]["pass"] is True
