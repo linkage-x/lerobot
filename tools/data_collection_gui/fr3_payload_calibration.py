@@ -71,6 +71,8 @@ LOG_LINES = 200
 #: A line a step prints with this prefix becomes one of the job's warnings (shown on the page, not fatal).
 WARNING_PREFIX = "WARNING: "
 LIST_LIMIT = 12
+#: How far back _zero_latest looks for a passing zero (about four days of 30-min dynamic zeros).
+ZERO_LATEST_SCAN = 200
 CAPTURE_DURATION_RANGE_S = (30.0, 900.0)
 _RUN_RE = re.compile(r"^\d{8}_\d{6}_fr3_[a-z_]+\.json$")
 # FR3 TCP pivots (fr3_tcp_pivot.py fit / fit-joint): a measured Desk TCP for desk-config.
@@ -333,6 +335,24 @@ class PayloadCalibration:
                 out.append(s)
         return out
 
+    def _zero_latest(self) -> list[dict[str, Any]]:
+        """The newest passing report per (arm, BOX, mode), over the last ZERO_LATEST_SCAN reports.
+
+        ``zeroReports`` is the newest LIST_LIMIT of any outcome, both arms mixed: at one dynamic zero per
+        30 min this morning's origin falls off it by the afternoon.  The BOX tab dates each arm BOX's
+        zeros from this list instead.
+        """
+        root = self.root / six_d_zero.REPORT_SUBDIR
+        if not root.is_dir():
+            return []
+        latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for path in sorted(root.glob("*.json"), reverse=True)[:ZERO_LATEST_SCAN]:
+            s = six_d_zero.report_summary(path)
+            if not s or not s["pass"]:
+                continue
+            latest.setdefault((str(s["arm"]), str(s["deviceId"]), str(s["mode"])), s)
+        return list(latest.values())
+
     def payload(self) -> dict[str, Any]:
         runs_dir, cap_dir, desk_dir = self._runs_dir(), self._capture_dir(), self._desk_dir()
         runs = []
@@ -381,6 +401,7 @@ class PayloadCalibration:
             "tcpEstimateZM": TCP_ESTIMATE_Z_M,
             "tcpTemplateZM": TCP_TEMPLATE_Z_M,
             "zeroReports": self._zero_reports(),
+            "zeroLatest": self._zero_latest(),
             "zeroPoses": ZERO_POSES,
             "zeroReportRoot": str(six_d_zero.REPORT_SUBDIR),
         }

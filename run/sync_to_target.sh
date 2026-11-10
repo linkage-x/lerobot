@@ -3,6 +3,12 @@
 #
 # Usage:
 #   bash run/sync_to_target.sh [thor|workstation] [rsync options...]
+#   bash run/sync_to_target.sh thor --sandbox NAME [rsync options...]   # your own sandbox on Thor
+#
+# Production (thor -> /home/nvidia/lerobot, workstation -> ~/Code/lerobot) only takes a clean,
+# reviewed tree: no uncommitted or untracked files, and HEAD already merged into origin/box.
+# --maintainer lets a maintainer deploy a clean commit that is not on origin/box yet. A sandbox
+# takes any tree. A dry run (-n) reports what the guard would refuse and carries on.
 #
 # Reports -- loudly, but without blocking -- when the target already has a NEWER
 # sidecar schema than this working tree. Mirroring an old checkout onto a
@@ -25,14 +31,34 @@ fi
 # --refuse-downgrade restores the veto (for CI, or a deploy nobody is watching).
 # --allow-downgrade is accepted and ignored; it is now what happens anyway.
 refuse_downgrade=0
+maintainer=false
+sandbox=""
+dry_run=false
 rsync_args=()
+expect_sandbox_name=false
 for arg in "$@"; do
+  if $expect_sandbox_name; then
+    sandbox="$arg"
+    expect_sandbox_name=false
+    continue
+  fi
   case "$arg" in
     --refuse-downgrade) refuse_downgrade=1 ;;
     --allow-downgrade) ;;  # the default now; swallowed so it never reaches rsync
+    --maintainer) maintainer=true ;;
+    --sandbox) expect_sandbox_name=true ;;
+    --sandbox=*) sandbox="${arg#--sandbox=}" ;;
+    -n|--dry-run) dry_run=true; rsync_args+=("$arg") ;;
     *) rsync_args+=("$arg") ;;
   esac
 done
+if $expect_sandbox_name; then
+  echo "ERROR: --sandbox needs a name" >&2
+  exit 2
+fi
+
+# shellcheck source=run/sandbox_common.sh
+. "$(cd "$(dirname "$0")" && pwd)/sandbox_common.sh"
 
 case "$target" in
   thor)
@@ -50,6 +76,59 @@ case "$target" in
 esac
 
 local_dir="$(cd "$(dirname "$0")/.." && pwd)/"
+
+if [[ -n "$sandbox" ]]; then
+  if [[ "$target" != "thor" ]]; then
+    echo "ERROR: sandboxes exist only on Thor" >&2
+    exit 2
+  fi
+  validate_sandbox_name "$sandbox"
+  remote_dir="$(sandbox_dir "$sandbox")"
+fi
+
+# --- Production guard ---------------------------------------------------------
+#
+# Everyone deploys to the same production tree, and rsync --delete-delay mirrors whatever the
+# deployer's checkout holds: uncommitted edits, stray files, an old branch. That is how Thor lost
+# its metrology four times (10-09, 10-28 and twice on 10-30). Production therefore takes only a
+# clean tree whose HEAD is already on origin/box (reviewed and merged). Sandboxes are where
+# anything else gets tried.
+on_box=null
+if [[ -z "$sandbox" ]]; then
+  guard_problems=()
+  if [[ -n "$(git -C "$local_dir" status --porcelain 2>/dev/null)" ]]; then
+    guard_problems+=("this checkout has uncommitted or untracked files (git status), and rsync would copy them as they are")
+  fi
+  if git -C "$local_dir" fetch --quiet origin box 2>/dev/null; then
+    if git -C "$local_dir" merge-base --is-ancestor HEAD origin/box 2>/dev/null; then
+      on_box=true
+    else
+      on_box=false
+      if ! $maintainer; then
+        guard_problems+=("HEAD $(git -C "$local_dir" rev-parse --short HEAD) is not on origin/box: production only runs reviewed, merged versions")
+      fi
+    fi
+  elif ! $maintainer; then
+    guard_problems+=("could not fetch origin/box, so this cannot check that HEAD has been reviewed and merged")
+  fi
+  if [[ ${#guard_problems[@]} -gt 0 ]]; then
+    if $dry_run; then
+      echo "WARNING: a real sync to ${target} production (${remote_dir}) would be REFUSED:" >&2
+    else
+      echo "ERROR: refusing to deploy to ${target} production (${remote_dir}):" >&2
+    fi
+    printf '         - %s\n' "${guard_problems[@]}" >&2
+    echo "         To try your branch on Thor, deploy it to your own sandbox instead:" >&2
+    echo "           bash run/deploy.sh thor --sandbox <your-name>" >&2
+    echo "         To get it into production, open a pull request to box; a maintainer deploys after merging." >&2
+    if ! $dry_run; then
+      exit 6
+    fi
+  fi
+  if $maintainer && [[ "$on_box" != true ]]; then
+    echo "WARNING: --maintainer: deploying $(git -C "$local_dir" rev-parse --short HEAD), which is not on origin/box, to ${target} production" >&2
+  fi
+fi
 
 # --- Version monotonicity gate (roadmap P0-Now (7)) --------------------------
 #
@@ -150,7 +229,9 @@ remote_probe="$(ssh -o ConnectTimeout=5 "$remote" "mkdir -p '$remote_dir'; $extr
 # `|| true` on both: with `set -o pipefail`, a grep that matches nothing (a
 # target with neither file yet -- a first deploy) is a failed assignment, and
 # `set -e` would turn that into an aborted deploy.
-remote_schema_version="$(printf '%s\n' "$remote_probe" | sed -n '1,/^---POINTERS---$/p' | grep -v '^---POINTERS---$' | tr -d '[:space:]' || true)"
+# awk, not sed '1,/re/': on a first deploy the schema line is empty, so the marker itself is line 1
+# and sed's range would run on to the end of the probe.
+remote_schema_version="$(printf '%s\n' "$remote_probe" | awk '/^---POINTERS---$/ {exit} {print}' | tr -d '[:space:]' || true)"
 remote_pointers="$(printf '%s\n' "$remote_probe" | sed -n '/^---POINTERS---$/,/^---WORLD---$/p' | grep -vE '^---(POINTERS|WORLD)---$' | normalise_pointers || true)"
 remote_world="$(printf '%s\n' "$remote_probe" | sed -n '/^---WORLD---$/,/^---GRAPH---$/p' | grep -vE '^---(WORLD|GRAPH)---$' || true)"
 remote_graph_newest="$(printf '%s\n' "$remote_probe" | sed -n '/^---GRAPH---$/,$p' | grep -v '^---GRAPH---$' | newest_stamp || true)"
@@ -254,6 +335,14 @@ rsync -avz --itemize-changes --delete-delay \
   --exclude='run/run_vite.sh' \
   --exclude='run/restart_gateway.sh' \
   --exclude='run/logs/' \
+  --exclude='/DEPLOYED.json' \
+  --exclude='/.sandbox_port' \
   ${world_excludes[@]+"${world_excludes[@]}"} \
   ${rsync_args[@]+"${rsync_args[@]}"} \
   "$local_dir" "${remote}:${remote_dir}/"
+
+if ! $dry_run; then
+  deployed_release_json "$local_dir" "$sandbox" "$on_box" "$maintainer" \
+    | ssh -o ConnectTimeout=5 "$remote" "cat > '${remote_dir}/DEPLOYED.json'"
+  echo "==> ${remote}:${remote_dir} now runs $(git -C "$local_dir" rev-parse --short HEAD) (DEPLOYED.json)"
+fi

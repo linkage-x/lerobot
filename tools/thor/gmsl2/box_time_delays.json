@@ -18,6 +18,14 @@
       "episodes": 1,
       "range_ms": [9.985, 9.985],
       "source": "thor_gmsl2_11ch_v1_20261106_140916 ep 0, gyro vs the tracked rig on a pivot, peak r 0.99. One episode: replace with the median once real episodes are tracked. Used only for an episode whose own estimate does not correlate"
+    },
+    "box3906437858": {
+      "d_box_ms": 9.6,
+      "cube": "right",
+      "measured": "2026-11-10",
+      "episodes": 5,
+      "range_ms": [9.354, 10.099],
+      "source": "box_realign per-episode estimates (gyro vs the tracked right rig, exposure fraction -0.5, peak r >= 0.8), median 9.566 ms: thor_gmsl2_11ch_v1_20261110_093613 ep 0 9.563 (r 0.983) / ep 1 10.021 (0.893), _100154 ep 0 9.354 (0.961), _102834 ep 0 9.566 (0.992), _20261109_150015 ep 0 10.099 (0.825, one-BOX pivot recording, BOX unnamed). _110238 ep 0 read 10.017 at r 0.696 (too little rotation) and is what the table is for: an episode whose own estimate does not correlate"
     }
   }
 }

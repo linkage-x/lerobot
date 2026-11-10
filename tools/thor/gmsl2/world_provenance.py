@@ -68,8 +68,9 @@ WORLD_GRAPH_FILE = "world_graph.json"
 #: transform being estimated at deploy time; tools/fr3/fr3_act_infer_real_runtime.py
 #: keys on this id.
 FR3_BASE_WORLD_ID = "fr3_base"
-#: ``export_v3 --target-world`` value meaning: FR3_BASE_WORLD_ID when a recorded
-#: edge reaches it from the episodes' world, else the world they were recorded in.
+#: ``export_v3 --target-world`` value the GUI passes: keep the world the episodes were recorded in (and
+#: report which arm bases deployment can reach from it). Until 11-10 it meant FR3_BASE_WORLD_ID whenever an
+#: edge reached it, which tied an export's frame to the graph of the day.
 TARGET_WORLD_AUTO = "auto"
 
 #: Value of ``world_frame["status"]``.
@@ -322,7 +323,7 @@ def read_world_graph(repo_root: Path | str) -> dict[str, Any]:
     into a robot base until someone confirms -- so an old graph brought back by a deploy cannot
     re-express anything silently. Writers strip the key (``register_fr3_base.write_graph``).
     """
-    from tools.thor.gmsl2 import world_graph_guard as guard
+    from tools.thor.gmsl2 import cart_state, world_graph_guard as guard
 
     payload, status = _read_json(Path(repo_root) / WORLD_SUBDIR / WORLD_GRAPH_FILE)
     if payload is None:
@@ -330,6 +331,8 @@ def read_world_graph(repo_root: Path | str) -> dict[str, Any]:
             return {"version": 1, "nodes": [], "edges": []}
         raise RuntimeError(f"{WORLD_SUBDIR / WORLD_GRAPH_FILE} is {status}; restore it from git")
     payload[guard.GRAPH_KEY] = guard.check(repo_root, payload)
+    # whether each cart is still where its edge was solved (cart_state; live_edges drops an edge whose cart moved)
+    payload[cart_state.GRAPH_KEY] = cart_state.read(repo_root)
     return payload
 
 
@@ -563,9 +566,14 @@ def live_edges(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The edges routes may use: every edge that is not :func:`edge_retired`.
 
     While the graph is not the one this machine trusts (``world_graph_guard``), no edge into a robot base
-    either: camera worlds stay connected, nothing is put in an arm's base.
+    either: camera worlds stay connected, nothing is put in an arm's base. Nor an edge into a base whose cart
+    was last seen to have moved since that edge was solved (``cart_state``).
     """
+    from tools.thor.gmsl2 import cart_state, world_graph_guard as guard
+
     edges = [edge for edge in graph.get("edges") or [] if edge_retired(edge) is None]
+    if cart_state.blocked_edges(graph, guard.edge_key):
+        edges = [edge for edge in edges if not cart_state.edge_is_blocked(graph, edge, guard.edge_key)]
     if _guard_blocks(graph) is None:
         return edges
     bases = _base_ids(graph)
@@ -582,12 +590,15 @@ def retired_note(graph: Mapping[str, Any], *worlds: str) -> str:
     For the message of a caller that found no route: "no edge" and "the edge was retired because the base
     moved" ask for the same fix but are different news.
     """
-    from tools.thor.gmsl2 import world_graph_guard as guard
+    from tools.thor.gmsl2 import cart_state, world_graph_guard as guard
 
     lines = []
     blocked = _guard_blocks(graph)
     if blocked is not None and (not worlds or set(worlds) & _base_ids(graph)):
         lines.append(guard.note(blocked))
+    for entry in cart_state.blocked_edges(graph, guard.edge_key).values():
+        if not worlds or entry.get("base") in worlds:
+            lines.append(cart_state.note(entry))
     for edge in graph.get("edges") or []:
         record = edge_retired(edge)
         if record is None:

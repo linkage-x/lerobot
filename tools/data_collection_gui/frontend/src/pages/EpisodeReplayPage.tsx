@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus, RealSensePreviewCameraStatus, ReplayTimeline } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection, userGuideUrl } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { DualFr3ExecutabilityPanel } from "../DualFr3ExecutabilityPanel";
 import { DualFr3HomePanel } from "../DualFr3HomePanel";
@@ -340,6 +340,10 @@ export function RealRobotReplayPanel({
                   selected before replaying on it.
                 </p>
               ) : null}
+              <p className="panel-note">
+                Order: arm → MuJoCo → Preflight → start → Execute; someone at the e-stop throughout.{" "}
+                <a href={userGuideUrl("replay")} target="_blank" rel="noopener noreferrer">使用指南 §7 右臂回放</a>
+              </p>
             </>
           ) : (
             <label className="real-robot-ip-field">
@@ -645,6 +649,53 @@ export function RecordedDatasetList({
   );
 }
 
+
+// An exported dataset is training data copied out of recordings. EE trajectory, IK QC, MuJoCo and
+// real replay all read the recording's trajectory files, so on an export they point back to it.
+export function ExportSourceCard({
+  status,
+  busy,
+  onOpenSource
+}: {
+  status: ReplayStatus;
+  busy: boolean;
+  onOpenSource: () => void;
+}) {
+  const source = status.exportSource ?? null;
+  return (
+    <section className={`panel readiness-card ${source && !source.problem ? "readiness-ready" : "readiness-missing"}`}>
+      <div className="panel-heading">
+        <h2>Exported dataset</h2>
+        <span>training data · checks run on its recording</span>
+      </div>
+      {source ? (
+        <>
+          <p className="panel-note">
+            Episode {status.episode} was exported from <strong>{source.session}</strong> episode{" "}
+            <strong>{source.episode}</strong>. EE trajectory, IK QC, MuJoCo and real replay run on that recording,
+            not on the export: open it to check or replay this episode.
+          </p>
+          {source.problem ? <p className="panel-note error">Note: {source.problem}.</p> : null}
+          <div className="control-row">
+            <button disabled={busy || !source.datasetRoot} onClick={onOpenSource} type="button">
+              Open source recording
+            </button>
+          </div>
+        </>
+      ) : status.exportSource === undefined ? (
+        <p className="panel-note">
+          The gateway does not report where this export came from yet (it is older than this page); EE trajectory,
+          IK QC, MuJoCo and real replay run on the recording it was exported from.
+        </p>
+      ) : (
+        <p className="panel-note error">
+          This export does not record which recording episode {status.episode} came from (meta/export_sources.json),
+          so it cannot be checked or replayed here. Export it again.
+        </p>
+      )}
+    </section>
+  );
+}
 
 export function ReplayReadinessCard({
   status,
@@ -1134,6 +1185,7 @@ export function EpisodeReplayPage({
   onSelectDataset,
   onSelectEpisode,
   onDeleteEpisode,
+  onOpenExportSource,
   onGenerateForActive,
   onOpenProcessing,
   onSaveAnnotation
@@ -1157,6 +1209,7 @@ export function EpisodeReplayPage({
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
   onDeleteEpisode: (episode: number) => void;
+  onOpenExportSource: () => void;
   onGenerateForActive: () => void;
   onOpenProcessing: () => void;
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
@@ -1179,13 +1232,17 @@ export function EpisodeReplayPage({
   return (
     <div className="page-stack">
       <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, MuJoCo validation, and real-robot replay" />
-      <ReplayReadinessCard
-        status={snapshot.replay}
-        processing={matchingProcessing}
-        busy={busy}
-        onGenerate={onGenerateForActive}
-        onOpenProcessing={onOpenProcessing}
-      />
+      {cubeSelection && snapshot.replay.datasetKind === "exported" ? (
+        <ExportSourceCard status={snapshot.replay} busy={busy} onOpenSource={onOpenExportSource} />
+      ) : (
+        <ReplayReadinessCard
+          status={snapshot.replay}
+          processing={matchingProcessing}
+          busy={busy}
+          onGenerate={onGenerateForActive}
+          onOpenProcessing={onOpenProcessing}
+        />
+      )}
       <div className="replay-workspace">
         <RecordedDatasetList
           datasets={snapshot.recordedDatasets}

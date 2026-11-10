@@ -95,7 +95,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Print safe runtime targets without sending robot actions.',
     )
     parser.add_argument('--no-preview', dest='preview', action='store_false', help='Disable preview mode from config.')
+    parser.add_argument(
+        '--arm',
+        choices=('right', 'left'),
+        default=None,
+        help='Which FR3 (tools/fr3/fr3_arms.json); the runtime takes its IP, gripper and tool model from there.',
+    )
     parser.add_argument('--robot-ip', default=None, help='Optional FR3 robot IP override.')
+    parser.add_argument('--corenetic-device-id', type=int, default=None, help="The arm's gripper BOX id override.")
     parser.add_argument('--gripper-port', default=None, help='Optional DAS gripper serial port override.')
     parser.add_argument(
         '--gripper-backend',
@@ -283,8 +290,14 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
     args.preview = bool(_nested(raw, 'runtime', 'preview')) if args.preview is None else args.preview
     args.robot_ip = args.robot_ip or _nested(raw, 'runtime', 'hardware', 'robot_ip')
     args.gripper_port = args.gripper_port or _nested(raw, 'runtime', 'hardware', 'gripper_port')
-    args.gripper_backend = _normalize_gripper_backend(
-        args.gripper_backend or _nested(raw, 'runtime', 'hardware', 'gripper_backend') or 'das'
+    args.arm = args.arm or _nested(raw, 'runtime', 'hardware', 'arm')
+    configured_backend = args.gripper_backend or _nested(raw, 'runtime', 'hardware', 'gripper_backend')
+    # With an arm named, the runtime takes the gripper its replay config drives; 'das' is the
+    # single-arm-era default only for runs that name no arm.
+    args.gripper_backend = (
+        _normalize_gripper_backend(configured_backend)
+        if configured_backend
+        else (None if args.arm else 'das')
     )
     args.gripper_max_width_mm = (
         args.gripper_max_width_mm
@@ -500,7 +513,9 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         'tools/fr3/fr3_act_infer_real_runtime.py',
         f'--checkpoint={shlex.quote(checkpoint)}',
         f'--camera-config={shlex.quote(camera_config)}',
-        f'--gripper-backend={shlex.quote(args.gripper_backend)}',
+        *([f'--gripper-backend={shlex.quote(args.gripper_backend)}'] if args.gripper_backend is not None else []),
+        *([f'--arm={shlex.quote(args.arm)}'] if args.arm else []),
+        *([f'--corenetic-device-id={args.corenetic_device_id}'] if args.corenetic_device_id is not None else []),
         *([f"--dataset-root={shlex.quote(_normalize_workspace_path(args.dataset_root))}"] if args.dataset_root is not None else []),
         *([f'--policy-fps={args.policy_fps}'] if args.policy_fps is not None else []),
         *([f'--max-steps={args.max_steps}'] if args.max_steps is not None else []),

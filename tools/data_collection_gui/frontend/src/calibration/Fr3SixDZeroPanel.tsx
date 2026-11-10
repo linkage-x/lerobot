@@ -4,7 +4,7 @@
 // that attitude: start -> fingertips up (j2/j4/j6 only) -> attitude check -> [origin + re-power + raw check]
 // -> dynamic zero -> start -> two re-check poses with the registered 6D fit -> start. The zeros go through
 // the recorder (the software zero lives in its process), so unlike the 6D fit this needs Connect.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
 import { Modal } from "./ConfirmModal";
@@ -43,10 +43,28 @@ function CheckRows({ checks }: { checks: ZeroCheck[] }) {
   );
 }
 
-export function Fr3SixDZeroPanel({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
+/**
+ * ``fixedArm``: the BOX tab embeds this panel inside an arm BOX's group, for the arm that carries it
+ * (fr3_arms.json corenetic_device_id): the arm is then preselected and cannot be changed here.
+ * ``onJobEnded``: called after a zero job ends, so that group can re-date its zeros.
+ */
+export function Fr3SixDZeroPanel({
+  api,
+  busy,
+  fixedArm,
+  embedded = false,
+  onJobEnded,
+}: {
+  api: DataCollectionGuiApi;
+  busy: boolean;
+  fixedArm?: string;
+  embedded?: boolean;
+  onJobEnded?: () => void;
+}) {
   const arms = useRobotArms();
   const [payload, setPayload] = useState<PayloadCalibrationResponse | null>(null);
-  const [arm, setArm] = useState("");
+  const [armChoice, setArm] = useState("");
+  const arm = fixedArm || armChoice;
   const [mode, setMode] = useState("dynamic");
   const [table, setTable] = useState<{ edgeM: string; topM: string; marginMm: string } | null>(null);
   const [running, setRunning] = useState("");
@@ -73,6 +91,12 @@ export function Fr3SixDZeroPanel({ api, busy }: { api: DataCollectionGuiApi; bus
     const timer = window.setInterval(() => void refresh(), POLL_MS);
     return () => window.clearInterval(timer);
   }, [active, refresh]);
+  // a zero job that just ended has written a report: let the embedding BOX group re-date its zeros
+  const wasActive = useRef(false);
+  useEffect(() => {
+    if (wasActive.current && !active) onJobEnded?.();
+    wasActive.current = active;
+  }, [active, onJobEnded]);
 
   const act = async (label: string, action: string, body: Record<string, unknown> = {}) => {
     setRunning(label);
@@ -95,7 +119,7 @@ export function Fr3SixDZeroPanel({ api, busy }: { api: DataCollectionGuiApi; bus
   const mine = isZeroJob(job);
   const checklist = mode === "origin" ? [...ZERO_CHECKLIST, ORIGIN_ITEM] : ZERO_CHECKLIST;
   const allTicked = checklist.every((c) => ticked[c.id]);
-  const reports = payload?.zeroReports ?? [];
+  const reports = (payload?.zeroReports ?? []).filter((r) => !fixedArm || r.arm === fixedArm);
 
   const runCheck = () => {
     if (!table) return;
@@ -114,7 +138,7 @@ export function Fr3SixDZeroPanel({ api, busy }: { api: DataCollectionGuiApi; bus
   };
 
   return (
-    <section className="panel">
+    <section className={embedded ? "cali-embedded-panel" : "panel"}>
       <div className="cali-result-head">
         <h3>夹爪 6D 零点（机械臂当工装，指尖朝上）</h3>
         <div className="cali-op-actions">
@@ -133,8 +157,15 @@ export function Fr3SixDZeroPanel({ api, busy }: { api: DataCollectionGuiApi; bus
 
       <ol className="cali-steps">
         <li className="cali-step">
-          <div className="cali-step-title">① 选臂和校零方式</div>
-          <ArmPicker arms={arms} value={arm} onChange={setArm} disabled={disabled} label="机械臂" />
+          <div className="cali-step-title">{fixedArm ? "① 选校零方式" : "① 选臂和校零方式"}</div>
+          {fixedArm ? (
+            <span>
+              机械臂 <b>{fixedArm}</b>
+              <span className="cali-muted">（fr3_arms.json 里装着这只 BOX 的臂）</span>
+            </span>
+          ) : (
+            <ArmPicker arms={arms} value={arm} onChange={setArm} disabled={disabled} label="机械臂" />
+          )}
           {armRow && <span className="cali-muted">夹爪 BOX {armRow.gripperBox ?? "未登记"}</span>}
           <div className="payload-choices" role="radiogroup" aria-label="校零方式">
             {(["dynamic", "origin"] as const).map((m) => (

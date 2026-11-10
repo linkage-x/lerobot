@@ -719,9 +719,10 @@ def check_reference(report: dict[str, Any], world_dir: Path) -> None:
 
 def write_graph(graph_path: Path, graph: dict[str, Any]) -> None:
     """Atomically: replay and export read this file while it is being swapped."""
-    from tools.thor.gmsl2 import world_graph_guard as guard
+    from tools.thor.gmsl2 import cart_state, world_graph_guard as guard
 
-    graph = {k: v for k, v in graph.items() if k != guard.GRAPH_KEY}  # the guard's verdict is not part of the graph
+    # the guard's verdict and the carts' state ride along on a read graph; neither is part of it
+    graph = {k: v for k, v in graph.items() if k not in (guard.GRAPH_KEY, cart_state.GRAPH_KEY)}
     temporary = graph_path.with_name(graph_path.name + ".tmp")
     temporary.write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(graph_path)

@@ -11,10 +11,11 @@
 // box_id and bare sensor ids, so `boxGroups` yields one group and every
 // per-box loop degrades to a single row.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataCollectionGuiApi, GuiSnapshot } from "../api";
 import type { BoxCaliLogLine, DeviceStatus } from "../types";
 import { envTargetLabel, fmtTimestamp } from "./config";
+import { userGuideUrl } from "../shared/ui";
 import {
   boxDisplayName,
   boxSensorSuffix,
@@ -46,6 +47,8 @@ import { Fr3PayloadPanel } from "./Fr3PayloadPanel";
 import { Fr3SixDZeroPanel } from "./Fr3SixDZeroPanel";
 import { SixDFitPanel } from "./SixDFitPanel";
 import { CALIBRATION_TABS, readStoredTab, storeTab, type CalibrationTabId } from "./calibrationTabs";
+import type { PayloadCalibrationResponse, ZeroReport } from "./payloadCalibration";
+import { armZeroTimes, boxDeviceNumber, boxRoleRank, resolveBoxRole, type BoxRole } from "./boxRoles";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -54,6 +57,8 @@ const OPERATOR_KEY = "lerobot.calibration.operator";
 // save/discard) are connected-but-not-recording, so they must NOT block — a
 // successful Connect does not mean data is being recorded.
 const RECORDING_BLOCK_STATES = new Set(["recording", "saving", "discarding"]);
+// The BOX roles and the arm-held zero reports change rarely; poll them only while the BOX tab is open.
+const BOX_ROLE_POLL_MS = 15000;
 
 function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(() => Date.now());
@@ -94,6 +99,20 @@ export function CalibrationPage({
   // the BOX calibration logs only matter on the tabs that show them
   const wantsCaliLog = tab === "box" || tab === "log";
 
+  // Which BOX is which (box_devices.json, fr3_arms.json) and when each arm BOX was last zeroed by the
+  // arm route: fetched once for the tab badge, polled while the BOX tab is open.
+  const [payloadCal, setPayloadCal] = useState<PayloadCalibrationResponse | null>(null);
+  const refreshPayloadCal = useCallback(async () => {
+    const next = await api.fetchPayloadCalibration();
+    if (next) setPayloadCal(next);
+  }, [api]);
+  useEffect(() => {
+    void refreshPayloadCal();
+    if (tab !== "box") return;
+    const timer = window.setInterval(() => void refreshPayloadCal(), BOX_ROLE_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [refreshPayloadCal, tab]);
+
   // Live calibration log buffers for the unified log panel.
   useEffect(() => {
     if (!wantsCaliLog) return;
@@ -133,19 +152,37 @@ export function CalibrationPage({
   const boxIds = [...new Set(boxDevices.map((d) => deviceBoxId(d)))];
   const boxIdLabel = boxIds.length ? boxIds.map((b) => b || "默认").join(", ") : "—";
 
-  const boxGroups = boxIds.map((bid) => {
-    const devs = boxDevices.filter((d) => deviceBoxId(d) === bid);
-    return {
-      boxId: bid,
-      devices: devs,
-      force: devs.filter((d) => boxSensorSuffix(d.id) === "box_six_d_force"),
-      touch: devs.filter((d) => boxSensorSuffix(d.id).startsWith("box_touch")),
-    };
-  });
+  const boxGroups: BoxGroup[] = boxIds
+    .map((bid) => {
+      const devs = boxDevices.filter((d) => deviceBoxId(d) === bid);
+      return {
+        boxId: bid,
+        devices: devs,
+        force: devs.filter((d) => boxSensorSuffix(d.id) === "box_six_d_force"),
+        touch: devs.filter((d) => boxSensorSuffix(d.id).startsWith("box_touch")),
+        role: resolveBoxRole(boxDeviceNumber(bid, devs), payloadCal),
+      };
+    })
+    .sort((a, b) => boxRoleRank(a.role) - boxRoleRank(b.role));
+  // An arm's gripper BOX that is not online (recorder not connected): still listed, with its zero
+  // panel and reports, so the arm route is found here whether or not the BOX is up.
+  const offlineArmBoxes = (payloadCal?.arms ?? [])
+    .filter((a) => a.gripperBox != null && !boxGroups.some((g) => g.role.deviceId === String(a.gripperBox)))
+    .map((a) => resolveBoxRole(String(a.gripperBox), payloadCal));
 
   // Per-box, per-kind calibration history (validity + result recall).
   const historyFor = (kind: CalibrationKind, bid: string) =>
     records.filter((r) => r.kind === kind && (r.boxId || "") === bid);
+
+  // When each kind was last done for a BOX. An arm BOX's 6D zeros are dated by the arm route's reports
+  // on Thor; a manual zero from this browser does not count for it (it may have been at any attitude).
+  const zeroReports: ZeroReport[] = [...(payloadCal?.zeroLatest ?? []), ...(payloadCal?.zeroReports ?? [])];
+  const lastRunFor = (kind: CalibrationKind, group: BoxGroup): number | null => {
+    if (group.role.kind === "fr3_gripper" && kind !== "touch") {
+      return armZeroTimes(zeroReports, group.role.arm ?? "", group.role.deviceId)[kind] ?? null;
+    }
+    return historyFor(kind, group.boxId)[0]?.timestamp ?? null;
+  };
 
   const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
     snapshot.recording.state,
@@ -161,19 +198,15 @@ export function CalibrationPage({
   const logEntries = useMemo(() => toLogEntries(forceLog, touchLog), [forceLog, touchLog]);
 
   // BOX tab badge: calibrations past their validity, over every BOX and kind it has
-  const boxOverdue = boxGroups.reduce((n, g) => {
-    const kinds: CalibrationKind[] = [
-      ...(g.force.length ? (["force_origin", "force_dynamic"] as CalibrationKind[]) : []),
-      ...(g.touch.length ? (["touch"] as CalibrationKind[]) : []),
-    ];
-    return (
+  const boxOverdue = boxGroups.reduce(
+    (n, g) =>
       n +
-      kinds.filter((k) => {
-        const st = computeValidity(historyFor(k, g.boxId)[0]?.timestamp ?? null, k).state;
+      groupKinds(g).filter((k) => {
+        const st = computeValidity(lastRunFor(k, g), k, now).state;
         return st === "overdue" || st === "unknown";
-      }).length
-    );
-  }, 0);
+      }).length,
+    0,
+  );
   const badges: Partial<Record<CalibrationTabId, { text: string; tone: "error" | "warning" | "running" }>> = {
     ...(boxOverdue ? { box: { text: String(boxOverdue), tone: "error" as const } } : {}),
     ...(recording ? { overview: { text: "录制中", tone: "warning" as const } } : {}),
@@ -293,13 +326,28 @@ export function CalibrationPage({
 
       {tab === "fr3" && (
         <>
+          <p className="panel-note">
+            把一台臂接入回放（负载 → 球窝核对 → 同球检验 → 换边）的完整步骤和验收标准：{" "}
+            <a href={userGuideUrl("left-arm")} target="_blank" rel="noopener noreferrer">使用指南 §10 启用左臂</a>
+          </p>
           {/* What hangs below the flange, for Desk: every other FR3 panel moves or
               holds the arm with that load configured, so it comes first. */}
           <Fr3PayloadPanel api={api} busy={busy} />
 
-          {/* The gripper BOX's 6D zero with the arm as the vendor's fixture (fingertips up);
-              every 30 min, and before an episode whose 6D is used. */}
-          <Fr3SixDZeroPanel api={api} busy={busy} />
+          {/* The gripper BOX's 6D zero with the arm as the vendor's fixture (fingertips up) lives
+              with that BOX on the BOX tab, next to its readiness and validity. */}
+          <section className="panel">
+            <div className="cali-result-head">
+              <h3>夹爪 6D 零点（机械臂当工装，指尖朝上）</h3>
+              <button className="cali-mini-btn" onClick={() => setTab("box")}>
+                去「BOX 传感器」页
+              </button>
+            </div>
+            <p className="cali-muted">
+              已移到「BOX 传感器」页对应的臂上 BOX 那一组（如「右臂夹爪 BOX」）：那里同时显示这只 BOX 的预热、有效期和零点记录。
+              每 30 分钟一次动态校零，每天第一次做 origin；机械臂会动，要有人守急停。
+            </p>
+          </section>
 
           {/* The one edge that leaves the world for the FR3 base. Every replay and
               fr3_base export goes through it. */}
@@ -318,14 +366,37 @@ export function CalibrationPage({
             <BoxCalibrationGroup
               key={group.boxId || "single"}
               api={api}
+              busy={busy}
               group={group}
               operator={operator}
               guard={guard}
               onRecord={onRecord}
               historyFor={historyFor}
+              lastRunFor={lastRunFor}
               now={now}
               recorderConnected={recorderConnected}
+              onZeroEnded={() => void refreshPayloadCal()}
             />
+          ))}
+
+          {offlineArmBoxes.map((role) => (
+            <section key={role.deviceId} className="panel cali-box-panel cali-box-arm">
+              <div className="panel-heading">
+                <h2>{role.title}</h2>
+                <span>不在线</span>
+              </div>
+              <p className="cali-muted cali-box-role-note">
+                录制器没有 Connect，或这只 BOX 没上电。零点要先在顶栏 Connect（校零经录制器做）；下面的记录照常可看。
+              </p>
+              {role.note ? <p className="cali-warn cali-box-role-note">{role.note}</p> : null}
+              <Fr3SixDZeroPanel
+                api={api}
+                busy={busy}
+                fixedArm={role.arm || undefined}
+                embedded
+                onJobEnded={() => void refreshPayloadCal()}
+              />
+            </section>
           ))}
 
           {boxDevices.length === 0 && (
@@ -372,7 +443,16 @@ type BoxGroup = {
   devices: DeviceStatus[];
   force: DeviceStatus[];
   touch: DeviceStatus[];
+  role: BoxRole;
 };
+
+/** The calibration kinds a BOX has, by the sensors it actually reports. */
+function groupKinds(group: BoxGroup): CalibrationKind[] {
+  return [
+    ...(group.force.length ? (["force_origin", "force_dynamic"] as CalibrationKind[]) : []),
+    ...(group.touch.length ? (["touch"] as CalibrationKind[]) : []),
+  ];
+}
 
 // One BOX device group: its own readiness (connected / warm-up timer / tactile
 // activation / validity), live monitors, and calibration cards. Extracted so the
@@ -380,24 +460,34 @@ type BoxGroup = {
 // hooks — they can't be called inside the boxGroups.map() callback.
 function BoxCalibrationGroup({
   api,
+  busy,
   group,
   operator,
   guard,
   onRecord,
   historyFor,
+  lastRunFor,
   now,
   recorderConnected,
+  onZeroEnded,
 }: {
   api: DataCollectionGuiApi;
+  busy: boolean;
   group: BoxGroup;
   operator: string;
   guard: () => string | null;
   onRecord: (records: CalibrationRecord[]) => void;
   historyFor: (kind: CalibrationKind, bid: string) => CalibrationRecord[];
+  lastRunFor: (kind: CalibrationKind, group: BoxGroup) => number | null;
   now: number;
   recorderConnected: boolean;
+  onZeroEnded: () => void;
 }) {
   const bid = group.boxId;
+  const role = group.role;
+  const onArm = role.kind === "fr3_gripper";
+  // an arm BOX's generic zero cards stay hidden until the operator confirms the arm is fingertips up
+  const [manualZero, setManualZero] = useState(false);
   const hasTouch = group.touch.length > 0;
   const online = group.devices.some((d) => d.state === "running") || recorderConnected;
   const fw = firmwareVersion(group.devices);
@@ -407,11 +497,8 @@ function BoxCalibrationGroup({
   const tactile = useTactileActivation(api, bid, group.touch, hasTouch);
 
   // This box's calibration validity, across only the kinds it actually has.
-  const kinds: CalibrationKind[] = [
-    ...(group.force.length ? (["force_origin", "force_dynamic"] as CalibrationKind[]) : []),
-    ...(hasTouch ? (["touch"] as CalibrationKind[]) : []),
-  ];
-  const validityStates = kinds.map((k) => computeValidity(historyFor(k, bid)[0]?.timestamp ?? null, k).state);
+  const kinds = groupKinds(group);
+  const validityStates = kinds.map((k) => computeValidity(lastRunFor(k, group), k, now).state);
   const needs = validityStates.filter((s) => s === "overdue" || s === "unknown").length;
   const due = validityStates.filter((s) => s === "due_soon").length;
 
@@ -473,7 +560,7 @@ function BoxCalibrationGroup({
       : []),
     {
       id: `${bid}-valid`,
-      label: "必须标定仍在有效期",
+      label: onArm ? "必须标定仍在有效期（6D 零点按机械臂流程的记录算）" : "必须标定仍在有效期",
       state: needs > 0 ? "failed" : due > 0 ? "warning" : kinds.length ? "complete" : "unavailable",
       detail:
         needs > 0 ? `${needs} 项需标定` : due > 0 ? `${due} 项即将过期` : kinds.length ? "全部有效" : "无可标定传感器",
@@ -481,15 +568,17 @@ function BoxCalibrationGroup({
   ];
 
   return (
-    <section className="panel cali-box-panel">
+    <section className={onArm ? "panel cali-box-panel cali-box-arm" : "panel cali-box-panel"}>
       <div className="panel-heading">
-        <h2>{bid ? `BOX ${boxDisplayName(bid)}` : boxDisplayName(bid)}</h2>
+        <h2>{role.deviceId ? role.title : bid ? `BOX ${boxDisplayName(bid)}` : boxDisplayName(bid)}</h2>
         <span>
           固件 {fw}
           {sn ? ` · SN ${sn}` : ""} · {group.devices.filter((d) => d.state === "running").length}/
           {group.devices.length} 在线
         </span>
       </div>
+
+      {role.note ? <p className="cali-warn cali-box-role-note">{role.note}</p> : null}
 
       {/* per-box collection readiness */}
       <ReadinessChecklist items={items} />
@@ -507,8 +596,26 @@ function BoxCalibrationGroup({
         ))}
       </div>
 
+      {/* An arm BOX: its fixture is the arm, fingertips up, so its 6D zero is the arm route. */}
+      {onArm && group.force.length > 0 && (
+        <>
+          <Fr3SixDZeroPanel api={api} busy={busy} fixedArm={role.arm || undefined} embedded onJobEnded={onZeroEnded} />
+          <details className="cali-advanced" onToggle={(e) => !e.currentTarget.open && setManualZero(false)}>
+            <summary className="cali-muted">高级：不动机械臂，直接手动校零（一般不要用）</summary>
+            <p className="cali-warn">
+              手动校零会在机械臂<b>当前</b>的姿态下归零。不在指尖朝上的零点姿态时，之后每个姿态的 6D 读数都会带着偏差，而且不会报错。
+              这里的记录只存在这台电脑的浏览器里，<b>不算进上面的有效期</b>；正常请用上面的机械臂流程。
+            </p>
+            <label className="cali-check">
+              <input type="checkbox" checked={manualZero} onChange={(e) => setManualZero(e.target.checked)} />
+              我确认机械臂已经静止在指尖朝上的零点姿态（例如上面的流程中途停在那里）
+            </label>
+          </details>
+        </>
+      )}
+
       {/* calibration operations for this box */}
-      {group.force.length > 0 && (
+      {group.force.length > 0 && (!onArm || manualZero) && (
         <div className="cali-op-grid">
           <ForceCalibrationCard
             variant="origin"

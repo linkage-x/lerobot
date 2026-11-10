@@ -1,5 +1,6 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  CartCheck,
   WorldGraphGuard,
   CollectionTask,
   EpisodeAnnotation,
@@ -97,6 +98,7 @@ export type GuiSnapshot = {
   datasetExport: DatasetExportStatus;
   /** world_graph.json against the graph this machine last trusted (outputs/world_graph_guard.json). */
   worldGraphGuard?: WorldGraphGuard;
+  cartCheck?: CartCheck;
   recordedDatasets: RecordedDataset[];
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
@@ -415,6 +417,19 @@ export class DataCollectionGuiApi {
       mujocoValidation: defaultMujocoValidation(this.snapshot.replay.datasetRoot ?? this.snapshot.replay.dataset, episode, this.snapshot.replay.fps)
     };
     this.log("info", `Selected replay episode: ${episode}`);
+    return this.getSnapshot();
+  }
+
+  // Exported dataset selected: select the recording (and episode) it came from, where the checks run.
+  async openExportSource(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/replay/open-export-source");
+    if (remote) {
+      return remote;
+    }
+    this.snapshot.replay = {
+      ...this.snapshot.replay,
+      message: "Gateway unavailable; opening the source recording needs the backend"
+    };
     return this.getSnapshot();
   }
 

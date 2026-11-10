@@ -19,7 +19,7 @@
 // FR3 and the handheld pivoted about, at 4+ places): judged by predicting each
 // position from the others. Rigid on purpose -- the camera world's scale is
 // shown, not absorbed; it is fixed at its source and the edge refitted.
-import type { Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse, WorldGraphGuard } from "../types";
+import type { CartCheck, Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse, WorldGraphGuard } from "../types";
 
 type Current = NonNullable<Fr3BaseEdgeResponse["current"]>;
 type Candidate = Fr3BaseEdgeResponse["candidates"][number];
@@ -201,6 +201,30 @@ export function laserSelectionWarnings(station: Station | null, replays: LaserRe
     warnings.push("回放没有分在驻点两侧：它们彼此一致，也说明不了驻点期间跟踪仪没动。");
   }
   return warnings;
+}
+
+/** A cart seen to have moved since its edge was solved: the red banner, one line per base. */
+export function cartBlockingLines(check: CartCheck | null | undefined): string[] {
+  return (check?.bases ?? []).filter((b) => b.blocking).map((b) => b.note);
+}
+
+/**
+ * What only a maintainer can settle: the tags disagree among themselves, the cameras were recalibrated, or the
+ * base was registered again -- the edge is not blocked, but nothing vouches that the cart is where it was.
+ */
+export function cartAttentionLines(check: CartCheck | null | undefined): string[] {
+  const out: string[] = [];
+  for (const b of check?.bases ?? []) {
+    if (b.blocking) continue;
+    if (b.verdict === "inconsistent") {
+      out.push(`${b.base}：车上 tag 彼此对不上（${b.episode}），可能有 tag 被碰歪或贴纸翘起，请维护者检查；车位暂无法确认。`);
+    } else if (b.verdict === "other_calibration") {
+      out.push(`${b.base}：相机重新标定过，车位参考需要维护者重新绑定；在此之前推车不会被发现。`);
+    } else if (b.verdict === "reference_stale" && !b.currentEdge) {
+      out.push(`${b.base}：基座边重新标定过，车位参考还是旧边的，需要维护者重新绑定；在此之前推车不会被发现。`);
+    }
+  }
+  return out;
 }
 
 /** Whether world_graph.json is not the graph this machine trusts: nothing goes into a robot base until confirmed. */

@@ -297,7 +297,7 @@ export function DatasetProcessingPage({
             onClick={() => setTrackingTarget("gripper_rig_v9b_right")}
           >
             <strong>Gripper Rig v9b · 右手</strong>
-            <span>Same holder, ArUco ids 100/101/110/111 (BOX 3906437858); TCP borrowed from the left rig until its own pivot.</span>
+            <span>Same holder, ArUco ids 100/101/110/111 (BOX 3906437858); TCP from its own 11-09 pivots (validated).</span>
           </button>
         </div>
         <p className="panel-note">

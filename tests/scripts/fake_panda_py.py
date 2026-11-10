@@ -8,7 +8,8 @@ not simulated); the state's external torques are zero.
 
 The hostname's suffix sets the arm's behaviour: ``"10.0.0.1"`` is a healthy arm; ``#reflex@S`` makes the
 control loop die on libfranka's error S seconds after the controller started, ``#stall@S`` makes it stop
-without one, ``#m_ee=KG`` is what Desk holds, ``#q=J:RAD`` starts joint J (1-based) there.
+without one, ``#m_ee=KG`` is what Desk holds (``#com=X:Y:Z`` its centre of mass, m), ``#q=J:RAD`` starts
+joint J (1-based) there.
 """
 
 from __future__ import annotations
@@ -78,6 +79,7 @@ class Panda:
         self.behaviour: dict[str, float] = {}
         self.q = Q_READY.copy()
         self.m_ee = 0.0
+        self.F_x_Cee = [0.0, 0.0, 0.0]
         for item in hostname.split("#")[1:]:
             key, _, value = item.replace("=", "@").partition("@")
             if key == "q":
@@ -85,6 +87,8 @@ class Panda:
                 self.q[int(j) - 1] = float(rad)
             elif key == "m_ee":
                 self.m_ee = float(value)
+            elif key == "com":
+                self.F_x_Cee = [float(v) for v in value.split(":")]
             else:
                 self.behaviour[key] = float(value)
         # a robot clock that started a while ago, different per arm
@@ -97,7 +101,7 @@ class Panda:
 
     def _read(self) -> RobotState:
         t = np.floor((time.monotonic() - self._boot) * 1e3) / 1e3
-        return RobotState(q=self.q.tolist(), time=Duration(t), m_ee=self.m_ee)
+        return RobotState(q=self.q.tolist(), time=Duration(t), m_ee=self.m_ee, F_x_Cee=list(self.F_x_Cee))
 
     def get_robot(self):
         return SimpleNamespace(read_once=self._read)

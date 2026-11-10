@@ -277,6 +277,7 @@ button.danger {
   padding: 5px 11px;
 }
 .topbar-btn:hover:not(:disabled) { background: #e2e8ec; }
+.topbar-link { align-self: center; text-decoration: none; }
 .topbar-btn:disabled { cursor: not-allowed; opacity: 0.5; }
 .topbar-btn-primary { background: #0f766e; border-color: #0f766e; color: #fff; }
 .topbar-btn-primary:hover:not(:disabled) { background: #0b5f5a; border-color: #0b5f5a; }
@@ -3452,6 +3453,14 @@ button.danger {
 }
 .cali-box-panel > .cali-monitor-grid,
 .cali-box-panel > .cali-op-grid { margin: 0; }
+/* An arm BOX's group: amber edge (the arm moves), and the arm-held zero panel nested in it. */
+.cali-box-panel.cali-box-arm { border-left-color: #b45309; }
+.cali-embedded-panel {
+  border: 1px dashed #d2d9de;
+  border-radius: 8px;
+  padding: 12px;
+}
+.cali-box-role-note { margin: 0; }
 
 .marker-tcp-panel { border-left: 3px solid #2563eb; }
 .marker-tcp-guide {
@@ -4098,6 +4107,14 @@ button.danger {
 
 /* Gateway command rejections. Rendered outside the snapshot-driven page body so the 1s poll
    cannot overwrite them; dismissed by the operator, not by the next tick. */
+.sandbox-banner {
+  background: #fff4d6;
+  border-bottom: 1px solid #e8c66a;
+  color: #6b4e00;
+  font-size: 13px;
+  padding: 8px 20px;
+}
+
 .command-error {
   align-items: center;
   background: #fdecea;

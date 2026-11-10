@@ -216,6 +216,8 @@ export type PayloadCalibrationResponse = {
   tcpEstimateZM?: number;
   tcpTemplateZM?: number;
   zeroReports?: ZeroReport[];
+  /** newest passing report per (arm, BOX, mode): the BOX tab dates an arm BOX's zeros from it */
+  zeroLatest?: ZeroReport[];
   zeroPoses?: string;
   zeroReportRoot?: string;
 };
@@ -391,11 +393,20 @@ export function fromLocalInput(value: string): number | null {
   return Number.isFinite(t) ? Math.round(t / 1000) : null;
 }
 
-/** Hand-held BOXes first (the usual capture), then the rest. */
-export function captureDeviceChoices(boxes: BoxRegistryEntry[]): { id: string; label: string }[] {
+/**
+ * BOXes that can be turned by hand: handheld first, then any other non-arm role. A BOX on an FR3
+ * gripper (box_devices.json, or named by an arm in fr3_arms.json) is left out -- it cannot be turned
+ * through six faces while mounted; the arm does that (负载辨识 with 6D).
+ */
+export function captureDeviceChoices(
+  boxes: BoxRegistryEntry[],
+  armBoxes: (number | string | null | undefined)[] = [],
+): { id: string; label: string }[] {
+  const onArm = new Set(armBoxes.filter((id) => id != null).map(String));
   const label = (b: BoxRegistryEntry) =>
-    `${b.deviceId} · ${b.role === "handheld" ? `手持 ${b.hand === "left" ? "左" : b.hand === "right" ? "右" : ""}` : b.role === "fr3_gripper" ? "FR3 夹爪" : b.role}`;
-  return [...boxes]
+    `${b.deviceId} · ${b.role === "handheld" ? `手持 ${b.hand === "left" ? "左" : b.hand === "right" ? "右" : ""}` : b.role}`;
+  return boxes
+    .filter((b) => b.role !== "fr3_gripper" && !onArm.has(b.deviceId))
     .sort((a, b) => Number(b.role === "handheld") - Number(a.role === "handheld"))
     .map((b) => ({ id: b.deviceId, label: label(b) }));
 }

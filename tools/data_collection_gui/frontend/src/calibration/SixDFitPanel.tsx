@@ -91,7 +91,10 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
   };
 
   const boxes = payload?.boxes ?? [];
-  const choices = captureDeviceChoices(boxes);
+  const choices = captureDeviceChoices(
+    boxes,
+    (payload?.arms ?? []).map((a) => a.gripperBox),
+  );
   const disabled = busy || running !== "" || active;
   const captureJob = job.kind === "six_d_capture";
   const live = captureJob ? job.capture ?? null : null;
@@ -158,12 +161,13 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
 
       <ol className="cali-steps">
         <li className="cali-step">
-          <div className="cali-step-title">手持采集（任何 BOX）</div>
+          <div className="cali-step-title">手持采集（手持 BOX）</div>
           <p className="cali-muted">
             握住 BOX 本体或手柄，夹爪悬空、不夹东西、开度不动。依次摆出六个姿态，每个<b>静止 2–3 秒</b>，姿态之间最好多停几个中间角度：
             <b>指尖朝上</b>、<b>指尖朝下</b>；夹爪侧放、<b>两指一上一下</b>，再翻 180° 换另一指在上；夹爪侧放、<b>两指并排</b>（一样高），再翻面。
             偏 30° 以内都算，哪个格子没满就补哪个。
             录制器要先 Disconnect（采集独占 BOX 端口）。从拿起那一刻开始计数。
+            装在机械臂上的夹爪 BOX 不在这个列表里：它装着时没法用手翻面，用下一步的 FR3 托举。
           </p>
           <div className="payload-row">
             <label className="cali-field">

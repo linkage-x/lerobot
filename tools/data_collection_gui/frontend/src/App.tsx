@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { graphGuardBlocks, graphGuardLines } from "./calibration/fr3BaseEdge";
+import { cartAttentionLines, cartBlockingLines, graphGuardBlocks, graphGuardLines } from "./calibration/fr3BaseEdge";
 import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
-import { StatusDot, Metric, stateLabel, processingStatusLabel, taskNeedsQcExportConfirmation } from "./shared/ui";
+import { StatusDot, Metric, stateLabel, processingStatusLabel, taskNeedsQcExportConfirmation, userGuideUrl } from "./shared/ui";
 import { CalibrationPage } from "./calibration/CalibrationPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { historyRepo, deviceBoxId } from "./calibration/adapters";
@@ -291,6 +291,7 @@ function App() {
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}
         onDeleteEpisode={(episode) => run(() => api.deleteReplayEpisode(episode))}
+        onOpenExportSource={() => run(() => api.openExportSource())}
         onGenerateForActive={() => replayMatch && queueTrajGenAndOpenProcessing(replayMatch.path)}
         onOpenProcessing={() => navigate("dataset-processing")}
         onSaveAnnotation={(annotation) => run(() => api.saveEpisodeAnnotation(annotation))}
@@ -382,8 +383,21 @@ function App() {
             </span>
           )}
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
+          {!workstationProfile && (
+            <a className="topbar-btn topbar-link" href={userGuideUrl()} target="_blank" rel="noopener noreferrer" title="采集、轨迹生成、回放和左臂标定的使用指南（新标签页）">
+              使用指南
+            </a>
+          )}
         </div>
       </header>
+      {snapshot.deployment.sandbox ? (
+        <div className="sandbox-banner" role="status">
+          <b>沙箱 {snapshot.deployment.sandbox}</b>
+          {snapshot.deployment.release?.commit ? ` · ${snapshot.deployment.release.commit.slice(0, 8)}` : ""}
+          {snapshot.deployment.release?.branch ? ` (${snapshot.deployment.release.branch})` : ""}
+          {" · "}这不是生产网关：相机、BOX、激光跟踪仪和机械臂在这里都不可用，数据是你自己复制进来的副本。
+        </div>
+      ) : null}
       {graphGuardBlocks(snapshot.worldGraphGuard) ? (
         <div className="command-error" role="alert">
           {graphGuardLines(snapshot.worldGraphGuard).map((line, i) => (
@@ -391,6 +405,16 @@ function App() {
           ))}
         </div>
       ) : null}
+      {cartBlockingLines(snapshot.cartCheck).map((line, i) => (
+        <div key={`cart-${i}`} className="command-error" role="alert">
+          <b>{line}</b>
+        </div>
+      ))}
+      {cartAttentionLines(snapshot.cartCheck).map((line, i) => (
+        <div key={`cart-attention-${i}`} className="sandbox-banner" role="status">
+          {line}
+        </div>
+      ))}
       {commandError ? (
         <div className="command-error" role="alert">
           <span>{commandError}</span>

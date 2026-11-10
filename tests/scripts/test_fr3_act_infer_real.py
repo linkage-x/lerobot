@@ -23,7 +23,7 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
     command = fr3_act_infer_real.build_docker_command(args)
     command_text = ' '.join(command)
 
-    assert command[:8] == [
+    assert command[:9] == [
         'docker',
         'compose',
         '--profile',
@@ -31,6 +31,7 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
         '-f',
         str((tmp_path / 'docker' / 'docker-compose.yml').resolve()),
         'run',
+        '-T',
         '--rm',
     ]
     assert 'lerobot-infer-fr3-act' in command
@@ -38,6 +39,24 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
     assert '--checkpoint=/workspace/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000' in command_text
     assert '--camera-config=/workspace/tools/fr3/fr3_act_infer_camera_config.yaml' in command_text
     assert '--camera-key-map' not in command_text
+
+
+def test_build_docker_command_allocates_a_tty_only_for_interactive_rollouts(tmp_path: Path):
+    batch = fr3_act_infer_real.build_docker_command(fr3_act_infer_real.parse_args(['--workspace', str(tmp_path)]))
+    interactive = fr3_act_infer_real.build_docker_command(
+        fr3_act_infer_real.parse_args(['--workspace', str(tmp_path), '--interactive-rollouts'])
+    )
+    assert '-T' in batch[: batch.index('--rm')]
+    assert '-T' not in interactive[: interactive.index('--rm')]
+
+
+def test_build_docker_command_forwards_the_arm_and_leaves_the_gripper_to_it(tmp_path: Path):
+    args = fr3_act_infer_real.parse_args(['--workspace', str(tmp_path), '--arm', 'right'])
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+    assert '--arm=right' in command_text
+    assert '--gripper-backend' not in command_text
+    legacy = fr3_act_infer_real.parse_args(['--workspace', str(tmp_path)])
+    assert '--gripper-backend=das' in ' '.join(fr3_act_infer_real.build_docker_command(legacy))
 
 
 def test_main_dry_run_prints_command(capsys):
@@ -449,8 +468,11 @@ def test_build_policy_observation_maps_state_images_and_tactile_passthrough():
     )
 
     assert np.allclose(observation['observation.state'], [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.4])
-    assert observation['observation.images.left'].shape == (4, 5, 3)
-    assert observation['observation.images.right'].shape == (4, 5, 3)
+    # Camera frames are resized (no crop) to the policy's feature shape.
+    assert observation['observation.images.left'].shape == (480, 640, 3)
+    assert observation['observation.images.right'].shape == (480, 640, 3)
+    assert not observation['observation.images.left'].any()
+    assert np.all(observation['observation.images.right'] == 1)
     assert np.allclose(observation['observation.tactile.left_clean'], 7.0)
     assert np.allclose(observation['observation.tactile.valid_mask'], 1.0)
 
@@ -651,7 +673,7 @@ def test_build_policy_observation_uses_tactile_fallback_for_missing_keys():
     assert np.allclose(observation['observation.tactile.valid_mask'], tactile_fallback['observation.tactile.valid_mask'])
 
 
-def test_convert_absolute_observation_from_E_to_I_matches_fixed_das_extrinsic():
+def test_convert_absolute_observation_from_E_to_I_is_the_identity_without_the_das_extrinsic():
     absolute_observation_e = {
         'ee.x': 0.1811,
         'ee.y': -0.5423,
@@ -665,10 +687,8 @@ def test_convert_absolute_observation_from_E_to_I_matches_fixed_das_extrinsic():
     }
 
     absolute_observation_i = fr3_act_infer_real_runtime.convert_absolute_observation_from_E_to_I(absolute_observation_e)
-    expected_pose_i = (
-        fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_e)
-        @ fr3_act_infer_real_runtime._T_EI
-    )
+    # The fixed DAS-rig E->I extrinsic was dropped (7633d8aa): E and I coincide.
+    expected_pose_i = fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_e)
     actual_pose_i = fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_i)
 
     assert np.allclose(actual_pose_i, expected_pose_i)
@@ -997,29 +1017,41 @@ def _info(world: str = '', link: str | None = None) -> dict:
     return info
 
 
-def _resolve_alignment(requested='auto', policy=None, alignment=None, target='corenetic_gripper_ee'):
+def _resolve_alignment(
+    requested='auto', policy=None, alignment=None, target='corenetic_gripper_ee', base='fr3_base'
+):
     policy = _info() if policy is None else policy
     return fr3_act_infer_real_runtime.resolve_dataset_alignment(
         requested=requested,
         policy_info=policy,
         alignment_info=policy if alignment is None else alignment,
         target_frame_name=target,
+        arm_base_world=base,
     )
 
 
-def test_dataset_alignment_keeps_the_start_pose_estimate_unless_the_training_data_is_in_fr3_base():
+def test_dataset_alignment_takes_camera_world_data_through_the_world_graph():
     fr3 = _info('fr3_base', 'corenetic_gripper_ee')
     camera_world = _info('world_20260928_063531', 'corenetic_gripper_ee')
-    # FR3-native recordings carry no stamp, camera-world exports carry a world id: both keep
-    # the start-pose estimate they have always used.
+    # Camera-world exports (what the GUI writes since 11-10) go through the measured edge by default;
+    # the start-pose estimate is only on request.
+    assert _resolve_alignment(policy=camera_world) == 'world_graph'
+    assert _resolve_alignment(policy=camera_world, base='fr3_base_right') == 'world_graph'
+    assert _resolve_alignment('start_pose', policy=camera_world) == 'start_pose'
+    # Unstamped recordings have no world to look an edge up from.
     assert _resolve_alignment(policy=_info()) == 'start_pose'
-    assert _resolve_alignment(policy=camera_world) == 'start_pose'
-    # fr3_base demos are still moved to the arm by default -- they were mostly recorded out of reach.
+    with pytest.raises(ValueError, match='predates world provenance'):
+        _resolve_alignment('world_graph', policy=_info())
+    # Data already in this arm's base is still moved to the arm by default.
     assert _resolve_alignment(policy=fr3) == 'start_position'
     assert _resolve_alignment('absolute', policy=fr3) == 'absolute'
     assert _resolve_alignment('start_pose', policy=fr3) == 'start_pose'
-    with pytest.raises(ValueError, match='--target-world fr3_base'):
+    with pytest.raises(ValueError, match='--dataset-alignment world_graph'):
         _resolve_alignment('absolute', policy=camera_world)
+    # The left base is not the right one: left-base data on the right arm goes through the graph.
+    assert _resolve_alignment(policy=fr3, base='fr3_base_right') == 'world_graph'
+    with pytest.raises(ValueError, match="this arm's base fr3_base_right"):
+        _resolve_alignment('start_position', policy=fr3, base='fr3_base_right')
 
 
 def test_dataset_alignment_in_fr3_base_requires_the_ik_target_to_be_the_labelled_link():
@@ -1027,6 +1059,97 @@ def test_dataset_alignment_in_fr3_base_requires_the_ik_target_to_be_the_labelled
         _resolve_alignment(policy=_info('fr3_base', 'corenetic_gripper_ee'), target='pika_gripper_ee')
     with pytest.raises(ValueError, match='tcp_frame.link'):
         _resolve_alignment(policy=_info('fr3_base', ''))
+    # The world-graph mode commands the label orientation as is too.
+    with pytest.raises(ValueError, match='--target-frame-name corenetic_socket_ee'):
+        _resolve_alignment(policy=_info('world_a', 'corenetic_socket_ee'), target='pika_gripper_ee')
+
+
+_T_RIGHT_WORLD = [[0.0, -1.0, 0.0, 0.5], [1.0, 0.0, 0.0, -0.2], [0.0, 0.0, 1.0, 0.1], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _graph(*edges):
+    return {'version': 1, 'nodes': [], 'edges': list(edges)}
+
+
+def test_world_graph_alignment_uses_the_live_edge_and_names_it():
+    edge = {'from_world_frame_id': 'world_a', 'to_world_frame_id': 'fr3_base_right', 'T_to_from': _T_RIGHT_WORLD,
+            'method': 'fr3_ball_pivot', 'created_utc': '2026-11-10T03:00:00Z', 'sigma_mm': 3.16}
+    transform, route = fr3_act_infer_real_runtime.world_graph_alignment(_graph(edge), 'world_a', 'fr3_base_right')
+    assert np.allclose(transform, _T_RIGHT_WORLD)
+    assert 'world_a->fr3_base_right' in route and 'solved=2026-11-10T03:00:00Z' in route and 'sigma_mm=3.16' in route
+    live = np.eye(4)
+    live[:3, 3] = [9.0, 9.0, 9.0]  # wherever the arm starts, the edge decides
+    assert np.allclose(
+        fr3_act_infer_real_runtime.dataset_alignment_transform('world_graph', live, np.eye(4), world_graph_tf=transform),
+        _T_RIGHT_WORLD,
+    )
+
+
+def test_world_graph_alignment_refuses_a_retired_edge_rather_than_estimate():
+    edge = {'from_world_frame_id': 'world_a', 'to_world_frame_id': 'fr3_base', 'T_to_from': _T_RIGHT_WORLD,
+            'method': 'test', 'created_utc': '2026-10-15T03:08:47Z',
+            'retired': {'utc': '2026-11-03T08:00:00Z', 'reason': 'both FR3 bases moved'}}
+    with pytest.raises(ValueError, match='retired 2026-11-03T08:00:00Z: both FR3 bases moved'):
+        fr3_act_infer_real_runtime.world_graph_alignment(_graph(edge), 'world_a', 'fr3_base')
+    with pytest.raises(ValueError, match='--dataset-alignment start_pose'):
+        fr3_act_infer_real_runtime.world_graph_alignment(_graph(), 'world_a', 'fr3_base_right')
+
+
+def test_a_dataset_put_in_a_base_through_a_since_retired_edge_is_stale():
+    hop = {'from_world_frame_id': 'world_a', 'to_world_frame_id': 'fr3_base', 'created_utc': '2026-10-15T03:08:47Z',
+           'method': 'test', 'traversed_reversed': False}
+    info = {'world_frame': {'world_frame_id': 'fr3_base', 'edges': [hop]}}
+    edge = {'from_world_frame_id': 'world_a', 'to_world_frame_id': 'fr3_base', 'T_to_from': _T_RIGHT_WORLD,
+            'created_utc': '2026-10-15T03:08:47Z'}
+    assert fr3_act_infer_real_runtime.stale_base_edges(_graph(edge), info) == []
+    retired = {**edge, 'retired': {'utc': '2026-11-03T08:00:00Z', 'reason': 'both FR3 bases moved'}}
+    (line,) = fr3_act_infer_real_runtime.stale_base_edges(_graph(retired), info)
+    assert 'retired 2026-11-03T08:00:00Z: both FR3 bases moved' in line
+
+
+def _arm_args(*argv):
+    return fr3_act_infer_real_runtime.parse_args(['--checkpoint', '/nonexistent', *argv])
+
+
+def test_the_arm_is_named_and_its_tool_comes_from_the_registry():
+    with pytest.raises(ValueError, match='choose an arm'):
+        fr3_act_infer_real_runtime.resolve_arm(_arm_args())
+    args = _arm_args('--arm', 'right')
+    entry = fr3_act_infer_real_runtime.resolve_arm(args)
+    assert entry['arm'] == 'right'
+    assert args.robot_ip == '192.168.1.210'
+    assert args.gripper_backend == 'corenetic'
+    assert args.corenetic_device_id == 3100715645
+    assert str(args.robot_urdf_path).endswith('fr3_corenetic_gripper.urdf')
+    assert args.target_frame_name == 'corenetic_socket_ee'
+    # The IP alone finds the same arm; an IP that is no arm's is refused.
+    assert fr3_act_infer_real_runtime.resolve_arm(_arm_args('--robot-ip', '192.168.1.210'))['arm'] == 'right'
+    with pytest.raises(ValueError, match='192.168.1.208 is no FR3'):
+        fr3_act_infer_real_runtime.resolve_arm(_arm_args('--robot-ip', '192.168.1.208'))
+    with pytest.raises(ValueError, match="not the right arm's gripper BOX"):
+        fr3_act_infer_real_runtime.resolve_arm(_arm_args('--arm', 'right', '--corenetic-device-id', '3906437858'))
+
+
+def test_the_das_start_move_is_only_for_the_das_rig_and_never_in_preview():
+    args = _arm_args('--arm', 'right')
+    fr3_act_infer_real_runtime.resolve_arm(args)
+    assert not fr3_act_infer_real_runtime.das_start_applies(args)  # corenetic arm
+    das = _arm_args('--arm', 'right', '--gripper-backend', 'das')
+    fr3_act_infer_real_runtime.resolve_arm(das)
+    assert fr3_act_infer_real_runtime.das_start_applies(das)
+    das.preview = True
+    assert not fr3_act_infer_real_runtime.das_start_applies(das)
+
+
+def test_an_arm_whose_gripper_box_is_not_wired_in_is_not_driven_unpinned():
+    with pytest.raises(ValueError, match='inference cannot drive'):
+        fr3_act_infer_real_runtime.resolve_arm(_arm_args('--arm', 'left'))
+    with pytest.raises(ValueError, match='may be the handheld one'):
+        fr3_act_infer_real_runtime.resolve_arm(_arm_args('--arm', 'left', '--gripper-backend', 'corenetic'))
+    args = _arm_args('--arm', 'left', '--gripper-backend', 'corenetic', '--corenetic-device-id', '123')
+    fr3_act_infer_real_runtime.resolve_arm(args)
+    assert args.robot_ip == '192.168.11.102'
+    assert args.target_frame_name == 'corenetic_socket_ee'  # same tool as the right arm
 
 
 def test_dataset_alignment_reads_the_training_frame_not_a_re_exported_source():
@@ -1054,3 +1177,71 @@ def test_start_position_alignment_moves_the_demos_without_turning_them():
     legacy = fr3_act_infer_real_runtime.dataset_alignment_transform('start_pose', live, contract)
     assert np.allclose(legacy[:3, :3], rotation)
     assert np.allclose(legacy @ contract, live)
+
+
+def _unlock_args(preview: bool):
+    import argparse
+
+    return argparse.Namespace(preview=preview)
+
+
+def _write_unlock(root: Path, **record) -> None:
+    import json
+
+    (root / 'outputs').mkdir(parents=True, exist_ok=True)
+    (root / fr3_act_infer_real_runtime.REAL_EXECUTION_UNLOCK).write_text(json.dumps(record))
+
+
+_NOW = __import__('datetime').datetime(2026, 11, 10, 9, 0, tzinfo=__import__('datetime').timezone.utc)
+_UNLOCK = {'arm': 'right', 'by': 'maintainer', 'reason': 'L3 trial, checkpoint 060000',
+           'created_utc': '2026-11-10T08:00:00Z', 'expires_utc': '2026-11-10T12:00:00Z'}
+
+
+def test_preview_never_needs_an_unlock(tmp_path: Path):
+    assert fr3_act_infer_real_runtime.real_execution_unlock(_unlock_args(True), 'right', repo_root=tmp_path) is None
+
+
+def test_real_execution_is_locked_without_a_maintainer_unlock(tmp_path: Path):
+    with pytest.raises(fr3_act_infer_real_runtime.RealExecutionLockedError, match='--preview'):
+        fr3_act_infer_real_runtime.real_execution_unlock(_unlock_args(False), 'right', repo_root=tmp_path, now=_NOW)
+
+
+def test_a_bounded_unlock_for_this_arm_lets_it_move(tmp_path: Path):
+    _write_unlock(tmp_path, **_UNLOCK)
+    record = fr3_act_infer_real_runtime.real_execution_unlock(
+        _unlock_args(False), 'right', repo_root=tmp_path, now=_NOW
+    )
+    assert record['by'] == 'maintainer'
+
+
+@pytest.mark.parametrize(
+    ('change', 'arm', 'now_h', 'match'),
+    [
+        ({}, 'left', 9, "for arm 'right'"),  # an unlock for one arm never drives the other
+        ({}, 'right', 13, 'not now'),  # expired
+        ({}, 'right', 7, 'not now'),  # not yet
+        ({'expires_utc': '2026-11-11T08:00:00Z'}, 'right', 9, 'at most 12 h'),  # standing unlock
+        ({'by': ''}, 'right', 9, "'by'"),
+        ({'expires_utc': 'tonight'}, 'right', 9, 'expires_utc'),
+    ],
+)
+def test_an_unlock_that_does_not_fit_keeps_it_locked(tmp_path: Path, change, arm, now_h, match):
+    _write_unlock(tmp_path, **{**_UNLOCK, **change})
+    with pytest.raises(fr3_act_infer_real_runtime.RealExecutionLockedError, match=match):
+        fr3_act_infer_real_runtime.real_execution_unlock(
+            _unlock_args(False), arm, repo_root=tmp_path, now=_NOW.replace(hour=now_h)
+        )
+
+
+def test_main_refuses_real_execution_before_loading_anything(tmp_path: Path, monkeypatch, capsys):
+    import functools
+
+    def no_policy(*_a, **_k):
+        raise AssertionError('nothing may be loaded before the lock is checked')
+
+    unlock = fr3_act_infer_real_runtime.real_execution_unlock
+    monkeypatch.setattr(fr3_act_infer_real_runtime, 'resolve_arm', lambda args: {'arm': 'right'})
+    monkeypatch.setattr(fr3_act_infer_real_runtime, 'real_execution_unlock', functools.partial(unlock, repo_root=tmp_path))
+    monkeypatch.setattr(fr3_act_infer_real_runtime, 'resolve_pretrained_model_dir', no_policy)
+    assert fr3_act_infer_real_runtime.main(['--arm', 'right']) == 2
+    assert '[REFUSED]' in capsys.readouterr().err

@@ -875,9 +875,14 @@ def test_export_refuses_a_target_world_with_no_edge(tmp_path, monkeypatch):
     assert not (exports / "pick_and_place" / "data").exists()
 
 
-def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_path, monkeypatch, capsys):
-    pytest.importorskip("pyarrow")
-    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T, "method": "test"}
+def test_export_auto_target_world_keeps_the_camera_world_even_when_an_edge_reaches_a_base(
+    tmp_path, monkeypatch, capsys
+):
+    # 11-10: an export's frame no longer depends on which arms are registered that day; deployment
+    # composes the edge live then. The export says which arms it can be deployed on.
+    pq = pytest.importorskip("pyarrow.parquet")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-11-10T03:00:00Z"}
     datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
 
     out = export_v3.export_task_to_v3(
@@ -890,12 +895,19 @@ def test_export_auto_target_world_goes_to_fr3_base_when_an_edge_reaches_it(tmp_p
     )
 
     info = json.loads((out / "meta" / "info.json").read_text())
-    assert info["world_frame"]["world_frame_id"] == "fr3_base"
-    # Deployment commands these poses absolutely, so it has to know which link they are on.
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    assert "reexpressed_from" not in info["world_frame"]
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
+    # Deployment commands these poses through the edge, so it has to know which link they are on.
     assert info["tcp_frame"]["link"] == "corenetic_gripper_ee"
     assert info["tcp_frame"]["marker_to_tcp_calibrations"] == ["config_thor/marker_to_tcp_calibration_test.json"]
+    printed = capsys.readouterr().out
+    assert "Keeping the recorded world world_a" in printed
+    assert "Deployable on the right arm (fr3_base_right) via test solved 2026-11-10T03:00:00Z" in printed
+    assert "Not deployable on the left arm (fr3_base) until it is registered: no edge" in printed
     # The GUI shows the last line, so the frame has to be on it.
-    assert "(world frame: fr3_base)" in capsys.readouterr().out.strip().splitlines()[-1]
+    assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
 def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_path, monkeypatch, capsys):
@@ -918,7 +930,7 @@ def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_p
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
     assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
     printed = capsys.readouterr().out
-    assert "No registration edge reaches fr3_base from world_a" in printed
+    assert "Not deployable on the right arm (fr3_base_right) until it is registered: no edge" in printed
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
@@ -945,7 +957,10 @@ def test_export_does_not_re_express_through_a_retired_edge(tmp_path, monkeypatch
     info = json.loads((out / "meta" / "info.json").read_text())
     assert info["world_frame"]["world_frame_id"] == "world_a"
     printed = capsys.readouterr().out
-    assert "WARNING: edge world_a -> fr3_base (solved 2026-10-15T03:08:47Z) retired" in printed
+    assert (
+        "Not deployable on the left arm (fr3_base) until it is registered: edge world_a -> fr3_base "
+        "(solved 2026-10-15T03:08:47Z) retired"
+    ) in printed
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
@@ -976,7 +991,7 @@ def test_export_does_not_re_express_while_the_world_graph_is_not_the_trusted_one
     info = json.loads((out / "meta" / "info.json").read_text())
     assert info["world_frame"]["world_frame_id"] == "world_a"
     printed = capsys.readouterr().out
-    assert "WARNING: world_graph.json 与这台机器上次确认的版本" in printed
+    assert "Not deployable on the left arm (fr3_base) until it is registered: world_graph.json 与这台机器上次确认的版本" in printed
 
 
 # ------------------------------------------------------ label provenance ---

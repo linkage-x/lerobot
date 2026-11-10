@@ -116,14 +116,19 @@ it("round-trips a datetime-local value", () => {
   expect(fromLocalInput("")).toBeNull();
 });
 
-it("puts hand-held BOXes first", () => {
-  const c = captureDeviceChoices([
-    { deviceId: "3100715645", role: "fr3_gripper", records: [] },
-    { deviceId: "3906437858", role: "handheld", hand: "right", records: [] },
-  ]);
-  expect(c[0].id).toBe("3906437858");
+it("offers hand-held BOXes first and never an arm BOX", () => {
+  const c = captureDeviceChoices(
+    [
+      { deviceId: "3100715645", role: "fr3_gripper", records: [] },
+      { deviceId: "555", role: "bench", records: [] },
+      { deviceId: "3906437858", role: "handheld", hand: "right", records: [] },
+      { deviceId: "777", role: "handheld", records: [] },
+    ],
+    [777, null],
+  );
+  // an arm BOX cannot be turned by hand: left out, whether box_devices.json or fr3_arms.json says so
+  expect(c.map((x) => x.id)).toEqual(["3906437858", "555"]);
   expect(c[0].label).toContain("手持 右");
-  expect(c[1].label).toContain("FR3 夹爪");
 });
 
 it("writes the fr3_arms.json payload entry from a Desk fit", () => {

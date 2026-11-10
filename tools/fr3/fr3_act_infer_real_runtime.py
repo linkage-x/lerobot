@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import datetime
 import json
 from pathlib import Path
 import select
@@ -57,11 +58,15 @@ from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.fr3 import fr3_arms  # noqa: E402
+from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
+
 _DEFAULT_CHECKPOINT = _REPO_ROOT / 'outputs/train/2026-03-19/10-48-39_act/checkpoints/060000'
 _DEFAULT_CAMERA_CONFIG = _REPO_ROOT / 'tools/fr3/fr3_act_infer_camera_config.yaml'
-_DEFAULT_ROBOT_IP = '192.168.1.208'
 _DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
-_DEFAULT_GRIPPER_BACKEND = 'das'
 _GRIPPER_BACKEND_CHOICES = ('pika', 'das', 'franka_hand', 'corenetic')
 _DAS_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.xml'
 _PIKA_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml'
@@ -69,6 +74,10 @@ _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/
 _PIKA_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
 _DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
+# Real execution (anything without --preview) is locked until the graded release (L0-L3) and the start-pose
+# button exist; see real_execution_unlock. outputs/ is neither deployed over nor committed.
+REAL_EXECUTION_UNLOCK = Path('outputs/fr3_infer_real_unlock.json')
+REAL_EXECUTION_UNLOCK_MAX_H = 12.0
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_ACTION_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_OPENCV_FOURCC = 'MJPG'
@@ -76,17 +85,15 @@ _DEFAULT_OPENCV_BACKEND = Cv2Backends.V4L2
 _OBS_IMAGES_PREFIX = 'observation.images.'
 _DEFAULT_FIRST_FRAME_MAX_POS_DELTA_MM = 30.0
 _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
-# tools/thor/gmsl2/world_provenance.FR3_BASE_WORLD_ID: a dataset whose info.json
-# world_frame carries this id was re-expressed in the arm's base frame through a
-# measured registration edge, so the rotation of T(B,W_s) is known (identity)
-# rather than read off one start orientation.
-_FR3_BASE_WORLD_ID = 'fr3_base'
 # How T(B,W_s) is obtained:
-#   start_pose     -- all 6 DoF from matching the live start pose to the dataset start contract
-#   start_position -- rotation identity (fr3_base data), translation from the start positions:
+#   world_graph    -- the measured edge of world_graph.json from the dataset's world to the chosen arm's base
+#                     (fr3_arms.BASE_WORLD): the default for camera-world datasets, the frame exports keep
+#   start_pose     -- all 6 DoF from matching the live start pose to the dataset start contract; explicit
+#                     only for stamped datasets, since a start-orientation error turns the whole trajectory
+#   start_position -- rotation identity (data in this arm's base), translation from the start positions:
 #                     the demos are moved to the arm, but not turned by a start-orientation error
-#   absolute       -- identity (fr3_base data): the arm goes where the demos were
-_DATASET_ALIGNMENT_CHOICES = ('auto', 'start_pose', 'start_position', 'absolute')
+#   absolute       -- identity (data in this arm's base): the arm goes where the demos were
+_DATASET_ALIGNMENT_CHOICES = ('auto', 'world_graph', 'start_pose', 'start_position', 'absolute')
 _FR3_BASE_ALIGNMENTS = ('start_position', 'absolute')
 _DEFAULT_MAX_STEP_POS_DELTA_MM = 5.0
 _DEFAULT_MAX_STEP_ROT_DELTA_DEG = 3.0
@@ -206,10 +213,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=_DATASET_ALIGNMENT_CHOICES,
         default='auto',
         help=(
-            "How T(B,W_s) is obtained. 'start_pose': all 6 DoF from the live start pose vs the dataset "
-            "start contract. 'start_position' (fr3_base datasets): measured rotation, translation from the "
-            "start positions. 'absolute' (fr3_base datasets): identity -- only for demos recorded inside the "
-            "arm's reach. 'auto' (default): start_position for fr3_base datasets, else start_pose."
+            "How T(B,W_s) is obtained. 'world_graph': the measured edge from the dataset's world to the "
+            "--arm's base in world_graph.json (refused when it is retired or the graph is not trusted). "
+            "'start_pose': all 6 DoF from the live start pose vs the dataset start contract. "
+            "'start_position' (datasets in this arm's base): identity rotation, translation from the start "
+            "positions. 'absolute' (datasets in this arm's base): identity. 'auto' (default): world_graph for "
+            "camera-world datasets, start_position for datasets in the arm's base, start_pose (with a warning) "
+            "for unstamped ones."
         ),
     )
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
@@ -324,13 +334,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action='store_true',
         help='Run policy and print safe targets without sending robot actions.',
     )
-    parser.add_argument('--robot-ip', default=_DEFAULT_ROBOT_IP)
+    parser.add_argument(
+        '--arm',
+        choices=fr3_arms.ARMS,
+        default=None,
+        help=(
+            f'Which FR3 ({fr3_arms.REGISTRY}); no default. Its IP, gripper BOX, URDF and IK target come from '
+            'the registry and the arm\'s replay config unless given explicitly.'
+        ),
+    )
+    parser.add_argument('--robot-ip', default=None, help='The FR3 instead of --arm; must be a registered arm.')
     parser.add_argument('--gripper-port', default=_DEFAULT_GRIPPER_PORT)
     parser.add_argument(
         '--gripper-backend',
         type=_normalize_gripper_backend,
         choices=_GRIPPER_BACKEND_CHOICES,
-        default=_DEFAULT_GRIPPER_BACKEND,
+        default=None,
+        help="Default: what the arm's replay config drives.",
+    )
+    parser.add_argument(
+        '--corenetic-device-id',
+        type=int,
+        default=None,
+        help="The arm's gripper BOX id; default from the registry. Unpinned, discovery may drive the handheld BOX.",
     )
     parser.add_argument(
         '--gripper-max-width-mm',
@@ -691,18 +717,67 @@ def _world_frame_id(info: dict[str, Any]) -> str:
     return str((info.get('world_frame') or {}).get('world_frame_id') or '')
 
 
+def resolve_arm(args: argparse.Namespace, *, repo_root: Path | str = _REPO_ROOT) -> dict[str, Any]:
+    """The FR3 this run drives, from ``--arm`` / ``--robot-ip`` through tools/fr3/fr3_arms.json; no default arm.
+
+    Fills what was not given explicitly from the registry and the arm's replay config -- the tool model the
+    arm was checked with in replay: ``gripper_backend``, ``corenetic_device_id``, ``robot_urdf_path``,
+    ``target_frame_name``. A corenetic gripper is driven only with its BOX pinned: unpinned, discovery picks
+    by IP order and can drive the handheld BOX (10-09). Returns the registry entry (with ``arm``).
+    """
+    try:
+        entry = fr3_arms.resolve_args(args, repo_root=repo_root)
+        tool = fr3_arms.tool_model(entry, repo_root=repo_root)
+    except fr3_arms.ArmConfigError as exc:
+        raise ValueError(f'{exc} -- pass --arm right or --arm left') from exc
+    arm = entry['arm']
+    yaml_backend = _normalize_gripper_backend(str(tool.get('gripper_backend') or ''))
+    if args.gripper_backend is None:
+        if yaml_backend not in _GRIPPER_BACKEND_CHOICES:
+            why = str(entry.get('no_gripper_why') or '')
+            raise ValueError(
+                f"the {arm} arm's replay config ({entry.get('replay_config')}) drives gripper "
+                f"{tool.get('gripper_backend')!r}, which inference cannot drive" + (f' ({why})' if why else '')
+                + '; wire its gripper into the registry first, or pass --gripper-backend'
+            )
+        args.gripper_backend = yaml_backend
+    if args.gripper_backend == 'corenetic':
+        registered = entry.get('corenetic_device_id')
+        if args.corenetic_device_id is None:
+            args.corenetic_device_id = registered
+        if args.corenetic_device_id is None:
+            raise ValueError(
+                f'the {arm} arm has no gripper BOX in {fr3_arms.REGISTRY} ({entry.get("no_gripper_why") or ""}); '
+                'an unpinned BOX may be the handheld one -- register it, or pass --corenetic-device-id'
+            )
+        if registered is not None and int(args.corenetic_device_id) != int(registered):
+            raise ValueError(
+                f'--corenetic-device-id {args.corenetic_device_id} is not the {arm} arm\'s gripper BOX ({registered})'
+            )
+    # The tool model is the arm's unless the operator picked a different real gripper (a mock in the
+    # replay config stands in for one whose BOX is not wired in yet, on the same tool).
+    if args.gripper_backend == yaml_backend or yaml_backend == 'mock':
+        if args.robot_urdf_path is None and tool.get('urdf_path'):
+            args.robot_urdf_path = Path(str(tool['urdf_path']))
+        if args.target_frame_name is None and tool.get('target_frame_name'):
+            args.target_frame_name = str(tool['target_frame_name'])
+    return entry
+
+
 def resolve_dataset_alignment(
     *,
     requested: str,
     policy_info: dict[str, Any],
     alignment_info: dict[str, Any],
     target_frame_name: str,
+    arm_base_world: str,
 ) -> str:
-    """Pick how T(B,W_s) is obtained; returns one of 'start_pose', 'start_position', 'absolute'.
+    """Pick how T(B,W_s) is obtained; returns 'world_graph', 'start_pose', 'start_position' or 'absolute'.
 
     The frame is read from the dataset the policy was trained on: an IL view copies its
     source's info.json at build time, while the source itself may since have been
-    re-exported in another frame. The fr3_base modes command the label orientation as is,
+    re-exported in another frame. ``arm_base_world`` is the driven arm's base in world_graph.json
+    (fr3_arms.BASE_WORLD). Every mode but start_pose commands the label orientation as is,
     which is only right when the arm's IK target is the link those labels are expressed
     on; start-pose alignment absorbs a mismatch there at the start, these do not.
     """
@@ -718,19 +793,32 @@ def resolve_dataset_alignment(
         )
     if requested == 'start_pose':
         return 'start_pose'
-    if trained_world != _FR3_BASE_WORLD_ID:
-        if requested in _FR3_BASE_ALIGNMENTS:
-            raise ValueError(
-                f"--dataset-alignment {requested} needs a training dataset in {_FR3_BASE_WORLD_ID}, not "
-                f"{trained_world or 'an unstamped frame'}; export it with --target-world fr3_base (the GUI does "
-                'when an edge exists) and retrain'
-            )
-        return 'start_pose'
+    in_arm_base = trained_world == arm_base_world
+    if requested in _FR3_BASE_ALIGNMENTS and not in_arm_base:
+        raise ValueError(
+            f"--dataset-alignment {requested} needs a training dataset in this arm's base {arm_base_world}, not "
+            f"{trained_world or 'an unstamped frame'}; use --dataset-alignment world_graph (the default for a "
+            'dataset stamped with its world)'
+        )
+    if requested == 'auto':
+        if in_arm_base:
+            mode = 'start_position'
+        elif trained_world:
+            mode = 'world_graph'
+        else:
+            return 'start_pose'  # unstamped: there is no world to look an edge up from
+    else:
+        mode = requested
+    if mode == 'world_graph' and not trained_world:
+        raise ValueError(
+            '--dataset-alignment world_graph needs a dataset stamped with the world it was recorded in; this one '
+            'predates world provenance, so only --dataset-alignment start_pose can place it'
+        )
     tcp_link = str((policy_info.get('tcp_frame') or alignment_info.get('tcp_frame') or {}).get('link') or '')
     if not tcp_link:
         raise ValueError(
-            'the training dataset is in fr3_base but does not record a single tcp_frame.link, so it is unknown '
-            'which link the arm must put on those poses; re-export it, or pass --dataset-alignment start_pose'
+            f'the training dataset is in {trained_world} but does not record a single tcp_frame.link, so it is '
+            'unknown which link the arm must put on those poses; re-export it, or pass --dataset-alignment start_pose'
         )
     if tcp_link != target_frame_name:
         raise ValueError(
@@ -738,13 +826,92 @@ def resolve_dataset_alignment(
             f'--robot-urdf-path <URDF containing {tcp_link}> --target-frame-name {tcp_link}, '
             'or --dataset-alignment start_pose to keep estimating the transform'
         )
-    return 'start_position' if requested == 'auto' else requested
+    return mode
+
+
+def _edge_record(graph: dict[str, Any], hop: dict[str, Any]) -> dict[str, Any]:
+    for edge in graph.get('edges') or []:
+        if (
+            str(edge.get('from_world_frame_id') or '') == hop['from_world_frame_id']
+            and str(edge.get('to_world_frame_id') or '') == hop['to_world_frame_id']
+            and str(edge.get('created_utc') or '') == hop['created_utc']
+        ):
+            return edge
+    return {}
+
+
+def world_graph_alignment(graph: dict[str, Any], from_world: str, to_world: str) -> tuple[np.ndarray, str]:
+    """T(B,W_s) from the live edges of world_graph.json, and a line naming each edge it went through.
+
+    ``world_provenance.world_transform`` walks no retired edge, and no edge into a robot base while the graph
+    is not the one this machine trusts (world_graph_guard); either way there is no route and this refuses,
+    saying why, rather than fall back to an estimate the operator did not ask for.
+    """
+    try:
+        found = wp.world_transform(graph, from_world, to_world)
+    except wp.WorldGraphClosureError as exc:
+        raise ValueError(str(exc)) from exc
+    if found is None:
+        note = wp.retired_note(graph, from_world, to_world)
+        raise ValueError(
+            f'no live registration edge connects {from_world} to {to_world} in '
+            f'{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}' + (f':\n{note}\n' if note else '; ')
+            + 'register that arm first (user guide, left-arm calibration), or pass --dataset-alignment start_pose '
+            'to estimate the transform from the start pose (a start-orientation error then turns the whole trajectory)'
+        )
+    transform, hops = found
+    parts = []
+    for hop in hops:
+        edge = _edge_record(graph, hop)
+        sigma = wp.edge_sigma_mm(edge) if edge else None
+        parts.append(
+            f"{hop['from_world_frame_id']}->{hop['to_world_frame_id']}"
+            f"{' (reversed)' if hop['traversed_reversed'] else ''} "
+            f"method={hop['method'] or '?'} solved={hop['created_utc'] or '?'} "
+            f"sigma_mm={'?' if sigma is None else f'{sigma:.2f}'}"
+        )
+    return np.asarray(transform, dtype=np.float64), '; '.join(parts) or f'{from_world} is {to_world}'
+
+
+def stale_base_edges(graph: dict[str, Any], policy_info: dict[str, Any]) -> list[str]:
+    """The edges a dataset was re-expressed into a robot base through that have since been retired.
+
+    Such a dataset is in where that base *was*: replaying it in the base frame puts the arm where the demos
+    were relative to the old placement. One line per retired edge; empty when none (or not re-expressed).
+    """
+    frame = policy_info.get('world_frame') or {}
+    used = frame.get('edges') or []
+    stale = []
+    for hop in used:
+        if not isinstance(hop, dict):
+            continue
+        edge = _edge_record(graph, {
+            'from_world_frame_id': str(hop.get('from_world_frame_id') or ''),
+            'to_world_frame_id': str(hop.get('to_world_frame_id') or ''),
+            'created_utc': str(hop.get('created_utc') or ''),
+        })
+        record = wp.edge_retired(edge) if edge else None
+        if record is not None:
+            stale.append(
+                f"edge {hop.get('from_world_frame_id')} -> {hop.get('to_world_frame_id')} "
+                f"(solved {hop.get('created_utc') or '?'}) retired {record.get('utc') or '?'}: "
+                f"{record.get('reason') or 'no reason recorded'}"
+            )
+    return stale
 
 
 def dataset_alignment_transform(
-    mode: str, current_start_pose: np.ndarray, dataset_start_pose_contract: np.ndarray
+    mode: str,
+    current_start_pose: np.ndarray,
+    dataset_start_pose_contract: np.ndarray,
+    *,
+    world_graph_tf: np.ndarray | None = None,
 ) -> np.ndarray:
-    """T(B,W_s) for a mode returned by resolve_dataset_alignment."""
+    """T(B,W_s) for a mode returned by resolve_dataset_alignment (world_graph: ``world_graph_tf``)."""
+    if mode == 'world_graph':
+        if world_graph_tf is None:
+            raise ValueError('world_graph alignment needs the transform from world_graph_alignment')
+        return np.asarray(world_graph_tf, dtype=np.float64).copy()
     if mode == 'start_pose':
         return current_start_pose @ _invert_pose(dataset_start_pose_contract)
     T_B_Ws = np.eye(4, dtype=np.float64)
@@ -753,6 +920,99 @@ def dataset_alignment_transform(
     elif mode != 'absolute':
         raise ValueError(f'unknown dataset alignment {mode!r}')
     return T_B_Ws
+
+
+class RealExecutionLockedError(RuntimeError):
+    """Inference would drive the arm, and no maintainer has unlocked that for this arm."""
+
+
+def _utc(value: Any, field: str) -> datetime.datetime:
+    if not isinstance(value, str):
+        raise RealExecutionLockedError(f'unlock file: {field} must be a UTC time like 2026-11-10T08:00:00Z')
+    try:
+        return datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.UTC)
+    except ValueError as exc:
+        raise RealExecutionLockedError(f'unlock file: {field}={value!r} is not like 2026-11-10T08:00:00Z') from exc
+
+
+def real_execution_unlock(
+    args: argparse.Namespace,
+    arm: str,
+    *,
+    repo_root: Path | str = _REPO_ROOT,
+    now: datetime.datetime | None = None,
+) -> dict[str, Any] | None:
+    """May this run drive the arm? None for --preview (it never does); the unlock record otherwise.
+
+    The guide tells students that inference stops at --preview until the start-pose button and the graded
+    release exist; this is what makes that hold when someone drops --preview from a command. A maintainer
+    who is present unlocks one arm for a bounded time by writing, on the machine that runs inference,
+    <repo>/outputs/fr3_infer_real_unlock.json:
+
+        {"arm": "right", "by": "<maintainer>", "reason": "<why, which checkpoint>",
+         "created_utc": "2026-11-10T08:00:00Z", "expires_utc": "2026-11-10T12:00:00Z"}
+
+    at most REAL_EXECUTION_UNLOCK_MAX_H hours, and deletes it afterwards. It names the arm so an unlock for
+    one arm never drives the other.
+    """
+    if args.preview:
+        return None
+    path = Path(repo_root) / REAL_EXECUTION_UNLOCK
+    locked = (
+        'real execution of a policy is locked: until the start-pose button and the graded release exist, '
+        'inference runs with --preview only (connects, prints targets, never moves the arm). '
+        'Add --preview, or have a maintainer who is present unlock this arm '
+        '(tools/fr3/fr3_act_infer_real_runtime.py, real_execution_unlock)'
+    )
+    if not path.is_file():
+        raise RealExecutionLockedError(f'{locked}; there is no {REAL_EXECUTION_UNLOCK}.')
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise RealExecutionLockedError(f'{locked}; {REAL_EXECUTION_UNLOCK} is unreadable ({exc}).') from exc
+    if not isinstance(record, dict):
+        raise RealExecutionLockedError(f'{locked}; {REAL_EXECUTION_UNLOCK} is not a JSON object.')
+    if record.get('arm') != arm:
+        raise RealExecutionLockedError(
+            f'{locked}; the unlock is for arm {record.get("arm")!r}, this run drives the {arm} arm.'
+        )
+    for field in ('by', 'reason'):
+        if not str(record.get(field) or '').strip():
+            raise RealExecutionLockedError(f'{locked}; the unlock does not say {field!r}.')
+    created = _utc(record.get('created_utc'), 'created_utc')
+    expires = _utc(record.get('expires_utc'), 'expires_utc')
+    now = now or datetime.datetime.now(datetime.UTC)
+    span_h = (expires - created).total_seconds() / 3600.0
+    if not 0.0 < span_h <= REAL_EXECUTION_UNLOCK_MAX_H:
+        raise RealExecutionLockedError(
+            f'{locked}; the unlock spans {span_h:.1f} h, it may span at most {REAL_EXECUTION_UNLOCK_MAX_H:g} h.'
+        )
+    if not created <= now < expires:
+        raise RealExecutionLockedError(
+            f'{locked}; the unlock is valid {record["created_utc"]} .. {record["expires_utc"]}, not now.'
+        )
+    return record
+
+
+def das_start_applies(args: argparse.Namespace) -> bool:
+    """Is the DAS rig's start joint configuration the move to make before inference?
+
+    Only on that rig: _DAS_START_JOINTS_RAD is the old DAS workstation's start, nothing measured for the
+    corenetic arms, whose start comes from the demos (world_graph alignment puts the policy where the hand
+    was). And never in --preview, which promises not to move the arm.
+    """
+    if not args.move_to_das_start:
+        return False
+    if args.preview:
+        print('[INFO] --preview: not moving the arm to the DAS start configuration.')
+        return False
+    if args.gripper_backend != 'das':
+        print(
+            f'[INFO] gripper {args.gripper_backend}: the DAS start configuration is not this arm\'s; not moving '
+            'there (bring the arm near the demos\' start first).'
+        )
+        return False
+    return True
 
 
 def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
@@ -2994,6 +3254,16 @@ def load_policy_stack(
 
 
 def run_inference(args: argparse.Namespace) -> int:
+    # Which arm first: no policy is loaded for an arm that cannot be named.
+    arm_entry = resolve_arm(args)
+    arm_base_world = fr3_arms.base_world_id(arm_entry['arm'])
+    # ... and whether it may move at all, before anything is loaded.
+    unlock = real_execution_unlock(args, arm_entry['arm'])
+    if unlock is not None:
+        print(
+            f"[WARN] REAL EXECUTION on the {arm_entry['arm']} arm, unlocked by {unlock['by']} until "
+            f"{unlock['expires_utc']} ({unlock['reason']}). Someone must be at the e-stop."
+        )
     pretrained_dir = resolve_pretrained_model_dir(args.checkpoint)
     train_cfg = load_train_config(pretrained_dir)
     dataset_root = resolve_dataset_root(pretrained_dir, train_cfg, args.dataset_root)
@@ -3040,6 +3310,11 @@ def run_inference(args: argparse.Namespace) -> int:
     delta_reference = delta_reference_from_action_names(action_names)
     delta_reconstructor = build_delta_action_reconstructor(action_names)
     robot_init_state = parse_robot_init_state(args.robot_init_state)
+    if args.preview and robot_init_state is not None:
+        # --preview promises not to move the arm; the init-state move (also before each interactive rollout)
+        # would.
+        print('[INFO] --preview: not moving the arm to robot_init_state.')
+        robot_init_state = None
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
     robot_urdf_path, target_frame_name = resolve_robot_tool_model(
         args.gripper_backend,
@@ -3055,7 +3330,23 @@ def run_inference(args: argparse.Namespace) -> int:
         policy_info=policy_dataset_info,
         alignment_info=alignment_dataset_info,
         target_frame_name=target_frame_name,
+        arm_base_world=arm_base_world,
     )
+    trained_world = _world_frame_id(policy_dataset_info)
+    world_graph = wp.read_world_graph(_REPO_ROOT)
+    world_graph_tf: np.ndarray | None = None
+    world_graph_route = ''
+    if dataset_alignment == 'world_graph':
+        world_graph_tf, world_graph_route = world_graph_alignment(world_graph, trained_world, arm_base_world)
+    elif dataset_alignment in _FR3_BASE_ALIGNMENTS:
+        stale = stale_base_edges(world_graph, policy_dataset_info)
+        if stale:
+            raise ValueError(
+                f'the training dataset was put in {trained_world} through an edge that has since been retired -- '
+                'the arm is no longer where it says:\n' + '\n'.join(stale)
+                + '\nRe-export the recording (it now stays in its camera world) and retrain, or pass '
+                '--dataset-alignment start_pose'
+            )
     controller_stiffness = _parse_optional_float_tuple(
         args.controller_stiffness,
         expected_len=7,
@@ -3095,6 +3386,7 @@ def run_inference(args: argparse.Namespace) -> int:
         corenetic_bind_ip=str(args.corenetic_bind_ip),
         corenetic_bind_port=int(args.corenetic_bind_port),
         corenetic_remote_ip=str(args.corenetic_remote_ip),
+        corenetic_device_id=None if args.corenetic_device_id is None else int(args.corenetic_device_id),
         corenetic_remote_port=int(args.corenetic_remote_port),
         corenetic_sdk_dir=str(args.corenetic_sdk_dir),
         corenetic_connect_timeout_s=float(args.corenetic_connect_timeout_s),
@@ -3114,7 +3406,10 @@ def run_inference(args: argparse.Namespace) -> int:
     if robot_init_state is not None and args.move_to_das_start:
         print('[INFO] robot_init_state is set; skipping default move_to_das_start startup motion.')
     else:
-        move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
+        move_to_das_start_if_requested(
+            robot_ip=args.robot_ip,
+            enabled=das_start_applies(args),
+        )
 
     from lerobot.robots.franka_research3 import FrankaResearch3
 
@@ -3141,16 +3436,27 @@ def run_inference(args: argparse.Namespace) -> int:
         print(f'[INFO] alignment_dataset_root={alignment_dataset_root}')
     print(f'[INFO] alignment_state_key={alignment_state_key}')
     print(
+        f"[INFO] arm={arm_entry['arm']} robot_ip={args.robot_ip} base={arm_base_world} "
+        f'gripper={args.gripper_backend}'
+        + (f' gripper_box={args.corenetic_device_id}' if args.gripper_backend == 'corenetic' else '')
+    )
+    print(
         f'[INFO] dataset_alignment={dataset_alignment} '
-        f"trained_world={_world_frame_id(policy_dataset_info) or '<unstamped>'} "
+        f"trained_world={trained_world or '<unstamped>'} "
         f'ik_target={target_frame_name}'
     )
-    if dataset_alignment == 'start_pose' and _world_frame_id(policy_dataset_info).startswith('world_'):
+    if world_graph_route:
+        print(f'[INFO] world_graph_edge={world_graph_route}')
+    if dataset_alignment == 'start_pose' and trained_world:
         print(
-            '[WARN] the training poses are in camera world '
-            f'{_world_frame_id(policy_dataset_info)}; T(B,W_s) will be estimated from one start pose, so a start '
-            'orientation error rotates the whole trajectory about the start. Re-export with --target-world fr3_base '
-            'to take the rotation from the measured edge instead.'
+            f'[WARN] the training poses are in {trained_world}; T(B,W_s) will be estimated from one start pose, so '
+            'a start orientation error rotates the whole trajectory about the start. --dataset-alignment '
+            'world_graph takes it from the measured edge instead.'
+        )
+    elif dataset_alignment == 'start_pose':
+        print(
+            '[WARN] the training dataset carries no world stamp (recorded before world provenance); T(B,W_s) '
+            'is estimated from one start pose, so a start orientation error rotates the whole trajectory.'
         )
     print(f'[INFO] policy_device={device}')
     print(f'[INFO] policy_fps={policy_fps:.3f}')
@@ -3329,7 +3635,10 @@ def run_inference(args: argparse.Namespace) -> int:
             if T_B_Ws is None:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
                 T_B_Ws = dataset_alignment_transform(
-                    dataset_alignment, current_start_pose_i, dataset_start_pose_contract
+                    dataset_alignment,
+                    current_start_pose_i,
+                    dataset_start_pose_contract,
+                    world_graph_tf=world_graph_tf,
                 )
                 start_alignment_stats = summarize_live_start_alignment_to_dataset_starts(
                     alignment_dataset_root,
@@ -3670,7 +3979,12 @@ def run_inference(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    return run_inference(parse_args(argv))
+    args = parse_args(argv)
+    try:
+        return run_inference(args)
+    except RealExecutionLockedError as exc:
+        print(f'[REFUSED] {exc}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':

@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thor 采集回放指南</title>
+<meta name="description" content="Thor GMSL2 手持采集 + FR3 右臂回放系统的使用指南：每日检查、采集、轨迹生成、回放、排障，以及启用左臂的完整标定步骤。">
+<style>
+  :root{
+    --bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--code-bg:#f3f4f6;
+    --accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#b91c1c;--bad-bg:#fef2f2;
+    --hero-a:#111827;--hero-b:#1f2937;--hero-text:#f9fafb;--hero-muted:#d1d5db;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code-bg:#222733;
+      --accent:#60a5fa;--accent-soft:#172338;
+      --ok:#4ade80;--ok-bg:#12271b;--warn:#fbbf24;--warn-bg:#2a2210;--bad:#f87171;--bad-bg:#2c1416;
+      --hero-a:#0b0d12;--hero-b:#1a1f2b;--shadow:0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code-bg:#222733;
+    --accent:#60a5fa;--accent-soft:#172338;
+    --ok:#4ade80;--ok-bg:#12271b;--warn:#fbbf24;--warn-bg:#2a2210;--bad:#f87171;--bad-bg:#2c1416;
+    --hero-a:#0b0d12;--hero-b:#1a1f2b;--shadow:0 8px 24px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;scroll-padding-top:16px}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;font-size:15px}
+  a{color:var(--accent)}
+  .layout{max-width:1240px;margin:0 auto;padding:24px 16px 64px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:24px}
+  nav.toc{position:sticky;top:16px;align-self:start;max-height:calc(100vh - 32px);overflow:auto;font-size:14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:14px}
+  nav.toc b{display:block;margin-bottom:8px}
+  nav.toc ol{margin:0;padding-left:20px}
+  nav.toc li{margin:4px 0}
+  nav.toc a{text-decoration:none;color:var(--text)}
+  nav.toc a:hover{color:var(--accent)}
+  nav.toc .sub{padding-left:14px;list-style:none;font-size:13px}
+  nav.toc .sub a{color:var(--muted)}
+  main{min-width:0}
+  .hero{background:linear-gradient(135deg,var(--hero-a),var(--hero-b));color:var(--hero-text);border-radius:18px;padding:26px 28px;box-shadow:var(--shadow);margin-bottom:18px}
+  .hero h1{margin:0 0 6px;font-size:26px;line-height:1.3}
+  .hero p{margin:4px 0;color:var(--hero-muted)}
+  .hero code{background:rgba(255,255,255,.14);color:var(--hero-text)}
+  .hero .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .hero .chip{border:1px solid rgba(255,255,255,.25);border-radius:999px;padding:2px 10px;font-size:13px;color:var(--hero-text)}
+  section.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:21px;line-height:1.35}
+  h2 .num{color:var(--accent);margin-right:6px}
+  h3{margin:20px 0 8px;font-size:16.5px}
+  h4{margin:14px 0 6px;font-size:15px}
+  p{margin:8px 0}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:10px;margin:12px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  .callout > :first-child{margin-top:0}.callout > :last-child{margin-bottom:0}
+  .scroll{overflow-x:auto;margin:10px 0}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:var(--code-bg);white-space:nowrap;font-weight:600}
+  td.k{white-space:nowrap;font-weight:600}
+  .badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .b-ok{color:var(--ok);background:var(--ok-bg)} .b-warn{color:var(--warn);background:var(--warn-bg)} .b-bad{color:var(--bad);background:var(--bad-bg)} .b-info{color:var(--accent);background:var(--accent-soft)}
+  .muted{color:var(--muted)} .small{font-size:13px}
+  code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);border-radius:6px;padding:1px 5px;font-size:.9em;overflow-wrap:anywhere}
+  kbd{border:1px solid var(--line);border-bottom-width:2px}
+  pre{background:var(--code-bg);border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  pre code{background:none;padding:0}
+  ul,ol{margin:6px 0;padding-left:22px} li{margin:4px 0}
+  ol.steps{counter-reset:s;list-style:none;padding-left:0}
+  ol.steps > li{counter-increment:s;position:relative;padding:10px 12px 10px 48px;border:1px solid var(--line);border-radius:12px;margin:8px 0;background:var(--card)}
+  ol.steps > li::before{content:counter(s);position:absolute;left:12px;top:10px;width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
+  .ui{font-weight:600;white-space:nowrap}
+  .ui::before{content:"［"}.ui::after{content:"］"}
+  .flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:6px;margin:12px 0}
+  .flow .node{flex:1 1 140px;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--card);font-size:13.5px}
+  .flow .node b{display:block;font-size:14px;margin-bottom:2px}
+  .flow .arrow{align-self:center;color:var(--muted);font-weight:700}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+  .stage{border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:14px 0}
+  .stage h3{margin-top:0}
+  .who{font-size:12px;font-weight:700;border-radius:6px;padding:1px 6px;margin-left:6px;vertical-align:middle}
+  .who.op{color:var(--ok);background:var(--ok-bg)} .who.mt{color:var(--warn);background:var(--warn-bg)}
+  details{border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin:8px 0}
+  details summary{cursor:pointer;font-weight:600}
+  footer{color:var(--muted);font-size:13px;text-align:center;margin-top:24px}
+  .theme-toggle{float:right;background:transparent;border:1px solid rgba(255,255,255,.3);color:var(--hero-text);border-radius:8px;padding:2px 10px;cursor:pointer;font-size:13px}
+  @media (max-width: 900px){
+    .layout{grid-template-columns:minmax(0,1fr);padding:16px 16px 48px}
+    nav.toc{position:static;max-height:none}
+    .hero{padding:20px}
+    section.card{padding:16px}
+    ol.steps > li{padding-left:44px}
+    td.k,th{white-space:normal}
+    th,td{padding:7px 6px}
+  }
+  @media print{
+    nav.toc,.theme-toggle{display:none}
+    .layout{display:block;max-width:none;padding:0}
+    section.card,.hero{box-shadow:none;break-inside:auto}
+    body{background:#fff}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc" aria-label="目录">
+  <b>目录</b>
+  <ol>
+    <li><a href="#scope">当前能做什么</a></li>
+    <li><a href="#safety">安全与协作规矩</a></li>
+    <li><a href="#overview">系统一览</a></li>
+    <li><a href="#daily">每天开工检查</a></li>
+    <li><a href="#record">手持采集</a></li>
+    <li><a href="#trajgen">轨迹生成与 QC</a></li>
+    <li><a href="#replay">右臂回放</a></li>
+    <li><a href="#export">导出与训推（未验证）</a></li>
+    <li><a href="#troubleshoot">常见问题</a></li>
+    <li><a href="#left-arm">启用左臂：标定步骤</a>
+      <ul class="sub">
+        <li><a href="#left-prereq">前提</a></li>
+        <li><a href="#left-stages">分阶段步骤</a></li>
+        <li><a href="#left-accept">验收标准汇总</a></li>
+        <li><a href="#left-dual">双臂协同回放</a></li>
+      </ul>
+    </li>
+    <li><a href="#appendix">附录：路径与术语</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="hero">
+  <button class="theme-toggle" type="button" id="themeToggle" aria-label="切换深浅色">深/浅</button>
+  <h1>Thor 手持采集 + FR3 回放 · 使用指南</h1>
+  <p>适用版本：2026-11-10（分支 <code>hph/dual_fr3_bimanual_replay_pr</code>，提交 362289af 之后）。读者：第一次上手这套系统的学生和工程师。</p>
+  <p>这份页面是单个 HTML 文件，可以直接用浏览器打开，不依赖网络；部署后也可以在 GUI 所在地址下以 <code>/user_guide.html</code> 访问。</p>
+  <div class="chips">
+    <span class="chip">右手手持采集 ✓</span>
+    <span class="chip">右臂单臂回放 ✓</span>
+    <span class="chip">左臂采集/回放 ✗（待标定）</span>
+    <span class="chip">双臂协同 ✗</span>
+    <span class="chip">训练/推理 未验证</span>
+  </div>
+</header>
+
+<!-- ================================================================ -->
+<section class="card" id="scope">
+  <h2><span class="num">1</span>当前能做什么</h2>
+  <p>一句话：<b>用右手的手持夹爪录一段示教，生成末端轨迹，再让右边那台 FR3 照着回放一遍。</b>其余功能要么还没打通，要么没验证过，不要当成可用。</p>
+  <div class="scroll"><table>
+    <thead><tr><th>功能</th><th>状态</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td class="k">右手手持采集</td><td><span class="badge b-ok">可用</span></td><td>手持夹爪 rig v9b 右手（ArUco 100/101/110/111，BOX 3906437858），Thor 8 路 GMSL2 相机同步录制。</td></tr>
+      <tr><td class="k">轨迹生成 + QC</td><td><span class="badge b-ok">可用</span></td><td>Dataset Processing 页，检测目标选 <span class="ui">Gripper Rig v9b · 右手</span>。</td></tr>
+      <tr><td class="k">右臂单臂回放</td><td><span class="badge b-ok">可用</span></td><td>FR3 right（192.168.1.210），带 Corenetic 夹爪（BOX 3100715645）。先在 MuJoCo 里预演并通过，再上真机。</td></tr>
+      <tr><td class="k">左臂采集/回放</td><td><span class="badge b-bad">不可用</span></td><td>左臂（192.168.11.102）已装上和右臂相同的末端（夹爪 + 相机），但 FR3 球窝核对、手持同球、双臂同球这三步 pivot 都还没做；它的基座到相机世界的注册边 11-03 已退役。GUI 里能选到左臂，但 MuJoCo / 真机回放会被拒绝。启用方法见 <a href="#left-arm">第 10 节</a>。</td></tr>
+      <tr><td class="k">双臂协同回放</td><td><span class="badge b-bad">不可用</span></td><td>需要两台臂都有注册边，以及两臂之间的相对位置。依赖左臂标定。</td></tr>
+      <tr><td class="k">带头部相机录制</td><td><span class="badge b-warn">暂不使用</span></td><td>当前不带 head 录制，界面里只显示 left / right 两只手。</td></tr>
+      <tr><td class="k">导出 LeRobot 数据集</td><td><span class="badge b-warn">能跑，未验证</span></td><td>导出的标签一律保留在录制时的相机世界系，日志会列出这份数据目前能部署到哪台臂。部署时由推理端按臂名查注册边，这条链路还没在真机上跑过。见 <a href="#export">第 8 节</a>。</td></tr>
+      <tr><td class="k">策略训练 / 推理</td><td><span class="badge b-warn">未验证</span></td><td>本版本没有在这套数据上跑通过训练和部署，不要拿结果下结论。推理目前只有命令行，GUI 入口还在做。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="safety">
+  <h2><span class="num">2</span>安全与协作规矩（先读）</h2>
+  <div class="callout bad">
+    <p><b>机械臂会真的动。</b>任何会让 FR3 运动的按钮（Move to start、Move to trajectory start、Execute、负载辨识采集、pivot 执行），按之前必须有人站在<b>急停</b>旁边全程盯着，工作空间里没有人手、线缆和杂物。碰撞检查只建模了机械臂、夹爪和桌面平面，<b>桌上的东西、线缆和另一台臂都没有建模</b>，要靠人看。</p>
+  </div>
+  <div class="grid2">
+    <div class="callout warn">
+      <p><b>不要自己部署。</b><code>run/deploy.sh</code> 会把你本机的整棵代码树镜像到 Thor，覆盖别人的改动，还可能把只存在于 Thor 上的标定结果（比如刚应用的注册边）抹掉。部署由维护者统一做，且先用 <code>-n</code> 干跑看清会删什么。</p>
+    </div>
+    <div class="callout warn">
+      <p><b>不要手改 Thor 上的代码和配置</b>（<code>/home/nvidia/lerobot</code>）。需要改配置，找维护者在仓库里改、提交、再部署。</p>
+    </div>
+    <div class="callout warn">
+      <p><b>看到顶部红条「world_graph.json 不是受信版本」，停下来找维护者。</b>它说明标定图被改过（常见原因是有人用旧代码部署覆盖了）。这时所有到机器人基座的变换都被禁用，回放会被拒绝。<b>不要</b>点确认。</p>
+    </div>
+    <div class="callout warn">
+      <p><b>不要推动右臂的小车，也不要碰相机支架。</b>右臂的注册边只在 11-10 那次标定时的摆放下成立。如果确实挪过（比如为了录双手示教把车推开），推回后按车上垫块顶紧桌沿、刹车、对准地面记号，然后按下面「推过车之后」做。</p>
+    </div>
+    <div class="callout warn">
+      <p><b>车位自动检查，以及它看不到的情况。</b>右车上贴了 40、42、44 三个 tag。每录完一段，系统会在后台拿这一段和标定时的参考比对车的位置。发现车被推过，就停用右臂的注册边，顶部出现红条「小车被推动过」，导出到基座、MuJoCo 和真机回放都会被拒绝。</p>
+      <p>它<b>只看已经录下的视频</b>：推了车之后没有新录像，系统仍以为车在原位。tag 被挡住、看不全时，结果只是「看不清」，<b>注册边照样可用</b>。所以：</p>
+      <ul>
+        <li><b>推过车之后（哪怕只碰了一下），回放前先录一段 10 秒左右的视频</b>：人别站在车前，车上 40/42/44 和桌面 tag 都要露出来。大约一分钟后看日志里的 <code>cart check fr3_base_right</code>：<code>ok</code> 才能回放。</li>
+        <li>结果是 <code>moved</code>（红条）：车没推回原位。重新推到位再录一段；推不回去就要重新做同球标定，找维护者。</li>
+        <li>结果是 <code>partial</code> 或 <code>unseen</code>：tag 没看全，检查不算数。把挡住 tag 的线缆、杂物挪开，重录。<b>42 号最容易被线缆挡住。</b></li>
+        <li>黄条（tag 彼此对不上、相机或基座边重新标定过）：找维护者，这时推车不会被发现。</li>
+      </ul>
+    </div>
+  </div>
+  <p class="muted small">其他约定：录制前夹爪 BOX 先上电预热 30 分钟；一次只有一个人操作 GUI 的录制器（Connect/Disconnect 是全局的）；做了任何标定，在群里说一声并写进日志。</p>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="overview">
+  <h2><span class="num">3</span>系统一览</h2>
+  <h3>数据怎么走</h3>
+  <div class="flow" role="list">
+    <div class="node" role="listitem"><b>手持夹爪（右手）</b>rig v9b，4 块 ArUco 贴片 + BOX（扳机、6D 力、触觉）</div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node" role="listitem"><b>Thor 录制</b>8 路 GMSL2 相机 + BOX 数据，写成一个 session 数据集</div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node" role="listitem"><b>轨迹生成</b>相机看 marker → 每帧末端位姿（相机世界系），写 sidecar</div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node" role="listitem"><b>换到臂的基座</b>经注册边 world → <code>fr3_base_right</code>，生成该臂用的副本</div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node" role="listitem"><b>IK QC + MuJoCo</b>离线可达性 + 真模型预演</div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node" role="listitem"><b>真机回放</b>FR3 right 跟踪末端轨迹，夹爪按扳机开合</div>
+  </div>
+  <div class="callout">
+    <p><b>两个「选择」发生在不同阶段：</b></p>
+    <ul>
+      <li><b>哪只手</b>在轨迹生成时就定了：选「右手」目标，只认 100/101/110/111 号 marker，输出 <code>state_action.right.csv</code>。画面里出现别的 marker（左手 rig、车上和桌上的 tag）不影响。</li>
+      <li><b>哪台臂</b>在回放时才选：sidecar 一直保存在相机世界系，回放页选了哪台臂，就换到哪台臂的基座里规划和执行。所以同一段数据以后也能给左臂用（等左臂标好）。</li>
+    </ul>
+  </div>
+
+  <h3>硬件与编号</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>设备</th><th>标识</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Thor 采集机</td><td><code>nvidia@192.168.111.122</code></td><td>跑网关（端口 8765）、相机和录制器；代码在 <code>/home/nvidia/lerobot</code>。</td></tr>
+      <tr><td class="k">相机</td><td>GMSL2 cam_01…14</td><td>真正参与标定的是 06/07/08/09/12/13/14 共 7 台；生产外参 <code>calib_20261102_195715</code>（11-04 起）。世界系 id <code>world_20260928_063531</code>。</td></tr>
+      <tr><td class="k">FR3 right</td><td><code>192.168.1.210</code></td><td>基座系 <code>fr3_base_right</code>；夹爪 BOX 3100715645；回放配置 <code>tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml</code>。</td></tr>
+      <tr><td class="k">FR3 left</td><td><code>192.168.11.102</code></td><td>基座系 <code>fr3_base</code>；末端与右臂相同（夹爪 + 相机），夹爪 BOX 还没接进注册表和回放配置；注册边已退役。</td></tr>
+      <tr><td class="k">手持 rig 右手</td><td>ArUco 100/101/110/111</td><td>BOX 3906437858；marker→TCP 常量 11-09 实测并验证（两次录制相差 0.35 mm）。</td></tr>
+      <tr><td class="k">手持 rig 左手</td><td>ArUco 106–109</td><td>BOX 3969377039；marker→TCP 常量 11-06 实测并验证。当前不用于采集。</td></tr>
+      <tr><td class="k">激光跟踪仪（可选）</td><td>—</td><td>用作独立真值（回放误差分析），日常采集回放不需要。</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted small">左右按机器人自己的方向定义：站在底座后面、和机械臂朝同一个方向时的左右。</p>
+
+  <h3>右臂回放的精度预期</h3>
+  <p>world → <code>fr3_base_right</code> 这条边是 11-10 用 4 个球位做的同球检验拟合的：随机误差 p95 约 1.5 mm，另有最多约 3 mm 的竖直方向系统偏差（球垫是软的，FR3 和手按压的深度不同）。合起来在标定覆盖的区域内<b>典型约 3 mm、最大约 5 mm</b>，FR3 自身跟踪误差和相机标签误差另算。</p>
+  <p>标定覆盖的区域（右臂基座系，mm）：x 507…611，y −315…236，z 250…615。<b>示教动作尽量落在这个范围附近</b>，离得越远，旋转误差放大得越多。</p>
+
+  <h3>GUI 页面</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>页面</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Dashboard</td><td>总览：录制器连接、标定就绪、设备健康、数据管线，带跳转。</td></tr>
+      <tr><td class="k">Live Record</td><td>连接录制器、开始/保存/丢弃 episode。</td></tr>
+      <tr><td class="k">Task Library</td><td>任务定义；绑定任务后录制会写进该任务的数据集。</td></tr>
+      <tr><td class="k">Calibration</td><td>7 个页签：概览、BOX 传感器、手持末端、FR3 机械臂、相机、激光跟踪仪、日志与历史。</td></tr>
+      <tr><td class="k">Device Manager</td><td>相机、BOX 等设备的连接和配置状态。</td></tr>
+      <tr><td class="k">Dataset Processing</td><td>轨迹生成队列、QC、日志。</td></tr>
+      <tr><td class="k">Episode Replay</td><td>回看视频和轨迹、MuJoCo 预演、真机回放、标注。</td></tr>
+      <tr><td class="k">Dataset Export</td><td>导出 LeRobot v3 数据集（见第 8 节的限制）。</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted small">Teleoperation 页只在工作站（RealSense + Pika）版本里出现，和本指南无关。</p>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="daily">
+  <h2><span class="num">4</span>每天开工检查</h2>
+  <ol class="steps">
+    <li><b>Thor 和相机。</b>Thor 开机或重启后，相机流可能起不来。在 Thor 上执行：
+      <pre><code>cd ~/lerobot &amp;&amp; ./tools/thor/gmsl2/recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1</code></pre>
+      还不行：Thor 和转接板（12 V/3 A）全部断电至少 3 秒再上电。Thor 关机可能卡约 9 分钟后由看门狗重启，别急着拔电。</li>
+    <li><b>打开 GUI。</b>用维护者给的地址。前端跑在维护者的开发机上，形如 <code>http://&lt;开发机 IP&gt;:&lt;端口&gt;/</code>，端口以维护者通知为准（不一定是 5173）。在开发机本机上打开时，IP 写 <code>localhost</code>。顶部应显示 <span class="ui">Gateway online</span>，并且<b>没有红色警告条</b>。</li>
+    <li><b>Calibration → 概览。</b>看相机自检有没有报漂移、有没有要重做的项。有就停下找维护者，不要带着漂移的相机录数据。</li>
+    <li><b>Device Manager。</b>相机都在线；手持 BOX（3906437858）和右臂夹爪 BOX（3100715645）在线。</li>
+    <li><b>BOX 预热与零点。</b>两只 BOX 上电后预热 30 分钟，然后在 <span class="ui">Calibration → BOX 传感器</span> 做 6D 零点 / origin（每天第一次做 origin，之后动态校准大约 30 分钟一次）。页面按 BOX 分组，两种 BOX 做法不同：
+      <ul>
+        <li><b>手持 BOX</b>（如「手持右 BOX 3906437858」）：放到工装上固定，不要手持，再点该组的「原始零点 / 动态校准」。</li>
+        <li><b>臂上 BOX</b>（「右臂夹爪 BOX 3100715645」，橙色边）：工装就是机械臂本身。用该组里的「夹爪 6D 零点」，机械臂会自动转到指尖朝上再校零，<b>机械臂会动，要有人守急停</b>。不要用「高级：手动校零」——臂不在指尖朝上时会做出错的零点，而且不报错。</li>
+      </ul>
+      每组的「必须标定仍在有效期」变红就要重做；臂上 BOX 的有效期按 Thor 上的零点记录算，换一台电脑看也一样。</li>
+    <li><b>右臂状态。</b>FR3 Desk 里 FCI 已激活、没有报错；右臂小车在原位（垫块顶住桌沿、已刹车），车上 40/42/44 号 tag 没被线缆挡住。今天车被动过的话，先录一段 10 秒的车位检查视频，日志里 <code>cart check fr3_base_right: ok</code> 之后再回放（见第 3 节）。</li>
+  </ol>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="record">
+  <h2><span class="num">5</span>手持采集（Live Record）</h2>
+  <ol class="steps">
+    <li><b>（可选）绑定任务。</b>在 Task Library 激活一个任务，录到的数据会归到该任务的数据集；不绑定就是普通 session。Live Record 页顶部会显示 <span class="ui">Recording for task: …</span>，可以 <span class="ui">Unbind</span>。</li>
+    <li><b>连接录制器。</b><span class="ui">Connect</span>（快捷键 <kbd>C</kbd>，顶栏也有）。连接后录制器、标定和设备预览共用这一个会话。勾了激光跟踪仪的话，要等它 Home 成功才能开录。</li>
+    <li><b>开始一段。</b>手持夹爪放到起始位置、静止 1–2 秒，点 <span class="ui">StartEpisode</span>（<kbd>E</kbd>）。</li>
+    <li><b>做示教动作。</b>注意：
+      <ul>
+        <li>右手 rig 的 4 块贴片尽量让至少 2 台已标定相机同时看到；手、袖子、物体别长时间挡住贴片。</li>
+        <li>动作别太快（1 m/s 量级会丢检测）；在右臂可达、并且尽量靠近上面那块标定覆盖区的范围里做。</li>
+        <li>结束时同样静止 1–2 秒。</li>
+      </ul></li>
+    <li><b>保存或丢弃。</b><span class="ui">Save</span>（<kbd>S</kbd>）保存，<span class="ui">Discard</span>（<kbd>D</kbd>）丢弃，<span class="ui">Exit</span>（<kbd>Esc</kbd>）退出会话。保存后页面出现 <span class="ui">Raw dataset saved</span>，可以直接 <span class="ui">Open in Replay</span>、<span class="ui">Queue Traj Gen</span> 或 <span class="ui">Go to Processing</span>。</li>
+    <li><b>收工。</b>顶栏 <span class="ui">Disconnect</span>。正在写盘时不能断开。</li>
+  </ol>
+  <div class="callout warn"><p><b>保存时提示 0 samples（BOX 没数据）：</b>这一段的力和扳机数据是空的，丢掉重录，并告诉维护者（多半是 BOX 网络或绑定地址问题）。</p></div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="trajgen">
+  <h2><span class="num">6</span>轨迹生成与 QC（Dataset Processing）</h2>
+  <ol class="steps">
+    <li><b>选检测目标。</b>页面上方 <span class="ui">Detection Target</span> 选 <b>Gripper Rig v9b · 右手</b>（ids 100/101/110/111）。选错目标会认错 marker 或解不出位姿。</li>
+    <li><b>生成。</b>在数据集列表里找到刚录的 session，点 <span class="ui">Generate EE Trajectory</span>。状态会经过 queued → running → pose ready，可以点 <span class="ui">View Log</span> 看进度。在 Thor 上本地跑，一段几分钟。</li>
+    <li><b>QC。</b>生成后点 <span class="ui">Run QC</span>。主要看三块：
+      <ul>
+        <li><b>Online Sync Manifest</b>：相机帧和 BOX 数据的时间对齐是否通过。</li>
+        <li><b>Marker detection evidence</b>：每台相机的检测率，看是否大段丢检。</li>
+        <li><b>FR3 offline IK evaluation</b>：这只手的轨迹在对应臂的基座里逐帧求 IK，是否都够得着（<code>fr3_ik_reachability</code>）。</li>
+      </ul>
+      全部通过后状态变成 QC pass，按钮变成 <span class="ui">Open Replay</span>。</li>
+  </ol>
+  <div class="callout"><p>生成失败显示 <span class="ui">Regenerate Trajectory</span>；QC 失败显示 <span class="ui">Re-run QC</span>。重跑前先看日志里的原因，不要反复点。IK 不可达通常说明动作超出了右臂工作空间，这段数据只能丢掉或者重录。</p></div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="replay">
+  <h2><span class="num">7</span>右臂回放（Episode Replay）</h2>
+  <p>顺序固定：<b>先选臂 → MuJoCo 预演并通过 → 预检 → 回到起点 → 执行</b>。每一步都有门禁，前一步没过，后面的按钮是灰的。</p>
+  <ol class="steps">
+    <li><b>选数据和 episode。</b>左侧 <span class="ui">Replay Datasets</span> 选 session，<span class="ui">Episode</span> 区用 Previous / Next / Go 切换。确认显示 <span class="ui">Trajectory: Ready</span>；如果是 Missing，点 <span class="ui">Generate EE Trajectory</span>。</li>
+    <li><b>看一遍数据。</b>Replay Inspector 里有录制视频、<span class="ui">End-effector pose</span> 3D 视图（副标题显示 <code>hands right</code>）和下方 <span class="ui">hand pose trajectories</span> 曲线。检查轨迹完整、没有突然跳变；有大段丢检的 episode 不要回放。</li>
+    <li><b>先选臂。</b>在 <span class="ui">Real Robot Replay</span> 面板的 <span class="ui">Arm</span> 里选 <b>right</b>。MuJoCo 会在<b>所选臂的基座</b>里规划，所以要先选臂、再跑 MuJoCo。</li>
+    <li><b>MuJoCo 预演。</b>在 <span class="ui">MuJoCo EE trajectory replay</span> 面板选 <span class="ui">Right hand</span>，点 <span class="ui">Run MuJoCo · right</span>，等渲染完成后看视频：有没有碰撞、贴桌面、关节翻转、姿态怪异。确认没问题再点 <span class="ui">Pass MuJoCo check</span>，按钮变成 <span class="ui">MuJoCo passed</span>。</li>
+    <li><b>预检。</b>上方 <span class="ui">Replay Controls</span> 点 <span class="ui">Preflight right</span>。它按这台臂自己的配置检查连接和设置（包括 Desk 里的末端负载）。看 <span class="ui">Safety</span> 行和诊断信息，有报错先解决。</li>
+    <li><b>（可选）回 home。</b><span class="ui">Move to start (home)</span>，确认弹窗里点 <span class="ui">Yes, move</span>，机械臂走到预设的起始关节角。</li>
+    <li><b>（可选）其他设置。</b>
+      <ul>
+        <li><span class="ui">Command lead</span>：默认 3 帧（20 fps 下 150 ms），用来抵消机械臂约 155 ms 的跟踪滞后。没有特别理由不要改。</li>
+        <li><span class="ui">Record the laser tracker…</span>：要用激光跟踪仪记录真值时才勾。勾了以后，执行前要把 SMR 从鸟巢里拿出来装到臂上，否则 Execute 会拒绝。</li>
+      </ul></li>
+    <li><b>到轨迹起点。</b>点 <span class="ui">1 · Move to trajectory start</span>，确认弹窗后机械臂移动到轨迹第一帧，<span class="ui">Phase</span> 变成 at start 并保持。</li>
+    <li><b>执行。</b>再看一眼工作空间，急停在手边，点 <span class="ui">2 · Execute trajectory</span>。夹爪按录制时的扳机开合（扳机 ≥ 90% 视为夹紧）。随时可以点 <span class="ui">Abort</span> 或按急停。</li>
+    <li><b>（可选）误差分析。</b>如果录了激光，在回放页做一键分析，看激光测得的末端与期望轨迹的偏差。</li>
+  </ol>
+  <div class="callout warn">
+    <p><b>MuJoCo 没通过但「可审阅」时</b>，会弹出 override 提示（<span class="ui">Yes, proceed</span>）。只有你看过渲染、明白失败原因（比如只是某个指标擦边），并且和维护者确认过，才可以继续。</p>
+  </div>
+  <div class="callout">
+    <p><b>换 episode、换手或换臂之后</b>，MuJoCo 的结果会失效，需要重新跑和通过。面板提示「MuJoCo right was planned in the left arm's base」时，说明预演用的臂和现在选的臂不一致：选好 right 臂再跑一次 MuJoCo。</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="export">
+  <h2><span class="num">8</span>导出与训推（当前未验证）</h2>
+  <div class="callout warn">
+    <p>本版本<b>没有验证</b>「右臂数据 → 导出 → 训练 → 在右臂上推理」这条链路。</p>
+  </div>
+  <h3>坐标系约定（11-10 起）</h3>
+  <ul>
+    <li><b>导出不换坐标系。</b>Dataset Export 页把 QC 通过的数据导出成 LeRobot v3，位姿留在录制时的相机世界系（<code>world_…</code>），不再写进任何一台臂的基座系。这样同一份数据左臂、右臂、双臂都能用；以后某台臂重新标定，已经训练好的策略也不用重新导出。</li>
+    <li><b>导出日志会告诉你能部署到哪台臂。</b>看日志里的这几行：
+      <ul>
+        <li><code>Deployable on the right arm (fr3_base_right) via …</code>：可以部署到右臂。</li>
+        <li><code>Not deployable on the left arm (fr3_base) until it is registered: …</code>：左臂要先按 <a href="#left-arm">第 10 节</a> 完成标定。</li>
+      </ul>
+      这几行只是提示，不会改变导出的数据。</li>
+    <li><b>换到臂的基座系是部署时做的。</b>推理端必须指定 <code>--arm right</code> 或 <code>--arm left</code>，<b>没有默认臂</b>。启动时它会从 <code>tools/fr3/fr3_arms.json</code> 取这台臂的 IP、夹爪 BOX、URDF 和 IK 目标点，再从 <code>world_graph.json</code> 取「相机世界 → 这台臂的基座」那条边，在日志 <code>world_graph_edge=…</code> 里打印这条边的方法、拟合时间和误差。边已退役，或者网页顶上有 world_graph 守卫红条，推理<b>直接拒绝启动</b>，不会悄悄换成别的对齐方式。</li>
+    <li><b>推理开始前臂要在示教起点附近。</b>world_graph 模式下，臂会去示教时手在房间里的实际位置，而不是从臂当前所在的位置开始做。如果臂离示教起点太远，第一帧指令会被拦下，之后每一步限幅约 5 mm，臂会慢慢挪过去。回放页的 <span class="ui">1 · Move to trajectory start</span> 是给回放用的，推理不能用它。推理用的起点按钮还在做：系统会选一条真实示教的起点（medoid），把臂移过去，再自动判断有没有到位，没到位就不让执行。<b>按钮做好之前，推理只能跑 <code>--preview</code>（只看不动），不上真机执行。</b>系统会强制执行这一条：命令里没写 <code>--preview</code> 时，推理脚本会显示 <code>[REFUSED] real execution of a policy is locked</code> 并退出，机械臂不会动。看到这一行，就补上 <code>--preview</code>；不要自己想办法绕过去。</li>
+    <li><b>「用起始姿态估计变换」</b>（<code>--dataset-alignment start_pose</code>）只有显式指定才会用。用了以后，起始姿态差 1°，整条轨迹都会跟着转 1°。只有维护者在场时才用。</li>
+    <li><b>用旧边导出的 <code>fr3_base</code> 数据集。</b>11-10 以前导出的、写在左臂基座系里的数据集，如果当时用的边已经退役，推理会拒绝，并列出是哪条边。重新导出一次就能用（新导出留在相机世界系）。</li>
+    <li>标签链有防混用检查：外参、相机状态、注册边、TCP 定义、BOX 配帧不一致的数据不能混在一个导出里。看到相关报错不要强行加 <code>--allow-mixed-labels</code>。</li>
+  </ul>
+  <h3>现在能做到哪一步</h3>
+  <ul>
+    <li>训练：GUI 只能准备训练视图，训练本身还要另外手动跑。</li>
+    <li>推理：只有命令行 <code>tools/fr3/fr3_act_infer_real_runtime.py</code>。<code>tools/fr3/run_pick_place_infer*.sh</code> 是旧设备（pika 夹爪、海康相机）用的，<b>不要用</b>。</li>
+    <li>GUI 里的分级放行流程还在做：离线对比 → MuJoCo → 真机只看不动 → 真机限幅执行。做好之前，推理只能到「真机只看不动」（<code>--preview</code>）这一级，必须有维护者在场，且有人守着急停。结果里要注明「未验证链路」。</li>
+  </ul>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="troubleshoot">
+  <h2><span class="num">9</span>常见问题</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>现象</th><th>原因</th><th>怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>顶部红条：world_graph.json 不是受信版本</td><td>标定图和 Thor 记录的受信版本不一致，多半是被旧代码部署覆盖。</td><td>停下，找维护者。不要点确认。</td></tr>
+      <tr><td>顶部红条：fr3_base_right 的小车被推动过</td><td>最近一段录像里，右车上的 tag 相对标定时的参考移动超过了 3 mm（按臂的工作空间算），右臂注册边已停用。</td><td>把车推回原位（垫块顶紧、刹车、对记号），录一段 10 秒、车上 tag 和桌面都露出来的视频，检查 <code>ok</code> 后红条自动消失。推不回去就找维护者重新标定。</td></tr>
+      <tr><td>日志 <code>cart check fr3_base_right: partial / unseen</code></td><td>车上 tag 没看全（常见是 42 被线缆挡住、人站在车前）。这一段不能证明车没动。</td><td>挪开遮挡物，重录一段。</td></tr>
+      <tr><td>Preflight 报 <code>there is no default arm</code></td><td>Thor 上每个动作都要明确指定臂。</td><td>先在 Real Robot Replay 里选臂。</td></tr>
+      <tr><td><code>MuJoCo right was planned in the left arm's base…</code></td><td>预演时选的臂和现在选的不同。</td><td>选 right 臂，重新 Run MuJoCo 并通过。</td></tr>
+      <tr><td>选左臂后 MuJoCo/回放被拒绝</td><td>左臂没有注册边（11-03 退役）。</td><td>正常现象。左臂启用见第 10 节。</td></tr>
+      <tr><td><code>…predates world stamps: its poses are in fr3_base as recorded…</code></td><td>世界系戳记上线之前的旧录制，没有戳记，位姿当时直接录在 <code>fr3_base</code>（现在的左臂基座）里。</td><td>这类数据不能在右臂回放，重新录。</td></tr>
+      <tr><td>推理报 <code>choose an arm … there is no default arm</code></td><td>推理没有默认臂。</td><td>加 <code>--arm right</code>。</td></tr>
+      <tr><td>推理报 <code>no live registration edge connects world_… to fr3_base…</code></td><td>选的臂没有在用的注册边（左臂的边 11-03 已退役），或者守卫停用了到基座的边。</td><td>右臂换 <code>--arm right</code>；左臂先做第 10 节；有红条就找维护者。</td></tr>
+      <tr><td>推理报 <code>…put in fr3_base through an edge that has since been retired…</code></td><td>旧数据集是用已退役的边换进左臂基座的。</td><td>在 Dataset Export 页重新导出（新导出留在相机世界系），再重新训练。</td></tr>
+      <tr><td>QC 的 <code>fr3_ik_reachability</code> 失败</td><td>轨迹有帧在右臂够不着的地方。</td><td>看 3D 视图哪里超出；在右臂可达区重录。</td></tr>
+      <tr><td><span class="ui">1 · Move to trajectory start</span> 是灰的</td><td>MuJoCo 没通过 / 不是当前选择的结果 / 没选臂 / 回放已经在进行 / 这是导出后的数据集。</td><td>按第 7 节顺序重做。</td></tr>
+      <tr><td><span class="ui">2 · Execute trajectory</span> 是灰的</td><td>还没到 at start，或勾了激光但跟踪仪没 ready。</td><td>等 Phase 变 at start；激光模式下把 SMR 装到臂上并锁定光束。</td></tr>
+      <tr><td>某几路相机没画面</td><td>Argus 没起来。</td><td>在 Thor 跑 <code>recover_argus.sh</code>；不行就整机断电重启。</td></tr>
+      <tr><td>保存时 0 samples</td><td>BOX 数据没进来。</td><td>丢弃这段；检查 BOX 上电和网络，找维护者。</td></tr>
+      <tr><td>回放时夹爪不动</td><td>夹爪 BOX 没上电或掉电重启过。</td><td>检查 BOX 3100715645 供电，重新预检。</td></tr>
+      <tr><td>功能「刚修好」但界面没变化</td><td>前端改动要部署后才生效，网关改动要重新部署并重启。</td><td>问维护者 Thor 上是不是最新版本。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="left-arm">
+  <h2><span class="num">10</span>启用左臂：完整标定步骤</h2>
+  <p>目标：让左臂（192.168.11.102，基座系 <code>fr3_base</code>）像右臂一样能单独采集和回放，进一步支持双臂协同。整个流程和 11-10 右臂那次相同，核心是一条新的 <b>world → <code>fr3_base</code> 注册边</b>，用「同一个球，FR3 和手持各绕它转一次」的方法测出来，不依赖激光，也不依赖 TCP 定义。</p>
+  <p class="small">标记说明：<span class="who op">操作员</span> 在 GUI 里完成；<span class="who mt">维护者</span> 需要改仓库配置、提交并部署（先 <code>-n</code> 干跑）。</p>
+
+  <div class="stage" id="left-prereq">
+    <h3>前提（缺一个都不要开始）</h3>
+    <ul>
+      <li><b>左臂摆放已最终确定。</b>小车推到最终位置、垫块顶紧桌沿、刹车、画好地面记号。标定之后再挪就要重做。</li>
+      <li><b>相机外参稳定。</b>概览页自检没有漂移；如果近期要重标相机，先标相机再做这一套（换外参后注册边需要复检）。</li>
+      <li><b>左臂末端和右臂一致。</b>现在左臂已装好和右臂同样的夹爪 + 相机。标定时的末端必须和以后回放时完全一致：同样的指尖、同样的插件 nov4、相机在、不带 SMR；中途改了末端，从阶段 3 重来。</li>
+      <li><b>右臂小车不动。</b>整个过程中右臂保持 11-10 的摆放，否则会同时破坏右臂的边。</li>
+      <li><b>刚性球座。</b>11-10 用的是软球垫，导致约 3 mm 的竖直偏差。这次换成刚性支架（或至少是硬垫）。</li>
+    </ul>
+  </div>
+
+  <div id="left-stages">
+  <div class="stage">
+    <h3>阶段 1 · 硬件和网络 <span class="who op">操作员</span><span class="who mt">维护者</span></h3>
+    <ol>
+      <li>检查左臂夹爪和 BOX 的线缆余量（腕部转一整圈不拉扯）；BOX 上电后在 Device Manager 里记下它的 id。</li>
+      <li>FR3 只能从 Thor 的网口访问（工作站不可达）。在 Desk 里确认 FCI 已激活、关节没有超出 FR3 限位（运输姿态可能超限，要先用 Desk 拉出来）。</li>
+      <li><span class="who mt">维护者</span> 改配置并部署（现在注册表里左臂还是「无夹爪 BOX」，回放配置用的是 mock 夹爪）：
+        <ul>
+          <li><code>tools/fr3/fr3_arms.json</code>：<code>arms.left.corenetic_device_id</code> 填夹爪 BOX 的 id，删除 <code>no_gripper_why</code>。</li>
+          <li>左臂回放配置 <code>third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml</code>：<code>gripper_backend: corenetic</code>，<code>corenetic_device_id</code> 同上（两边必须一致，<code>fr3_arms.validate</code> 会检查）。</li>
+        </ul></li>
+    </ol>
+    <p><b>验收：</b>Episode Replay 页 <span class="ui">Preflight left</span> 通过；Device Manager 里该夹爪 BOX 在线；在 <span class="ui">Calibration → FR3 机械臂</span> 的 ⓪ 遥控里能让左臂夹爪开合。</p>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 2 · 夹爪 BOX 预热和零点 <span class="who op">操作员</span></h3>
+    <ol>
+      <li>BOX 上电预热 30 分钟。</li>
+      <li><span class="ui">Calibration → BOX 传感器</span> 里「左臂夹爪 BOX …」那一组（阶段 1 在 <code>fr3_arms.json</code> 填了 <code>corenetic_device_id</code> 之后才会这样显示）：用组里的「夹爪 6D 零点」，模式选 origin（BOX 要重新上电，页面会提示），之后每 30 分钟一次动态校零。机械臂会动，有人守急停。不要用工装、也不要用「高级：手动校零」。</li>
+    </ol>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 3 · 末端负载（Desk 负载）核对 <span class="who op">操作员</span><span class="who mt">维护者</span></h3>
+    <p>位置：<span class="ui">Calibration → FR3 机械臂 → 末端负载辨识</span>。机械臂会自动走一组静止姿态，用关节力矩算出法兰下挂了多重、质心在哪。</p>
+    <p><b>现状（11-10）：</b>左臂末端和右臂是同一套配置，右臂 11-09 的辨识结果（Thor 上 <code>outputs/fr3_payload/desk/20261109_152610/fr3_corenetic_desk_load_no_smr.json</code>）已导入左臂 Desk，拖动时重力补偿正常；<code>fr3_arms.json</code> 也给左臂声明了这组值（注明「未在本臂辨识」），预检会拿左臂 Desk 的读数去比。所以这一阶段只剩一次<b>核对采集</b>（下面第 1–3 步，再看 Fz）；核对不过，或末端换过，再在左臂上完整辨识一次并替换。</p>
+    <ol>
+      <li>勾完面板上的安全清单：臂在 start 姿态、周围清空（另一条臂已转开）、线缆有余量、有人守急停、已记下 Desk 当前负载、录制器已 Disconnect、BOX 已预热、夹爪空载且开度固定。</li>
+      <li>① 机械臂选 <b>left</b>，选末端配置和姿态集（要顺便拟合 6D 就选含「6D」的姿态集）。</li>
+      <li>② 碰撞检查：填实测的桌沿 x、桌面 z（相对左臂基座）和余量，<span class="ui">运行检查</span>，必须通过。</li>
+      <li>③ 开始采集，人全程看着。</li>
+      <li>④ 勾选同一末端配置的采集，生成 Desk 配置，导入 Desk。</li>
+      <li>导入后再采一次核对。</li>
+      <li><span class="who mt">维护者</span> 如果在左臂上重新辨识了，把结果写进 <code>fr3_arms.json</code> 的 <code>arms.left.payload</code>（并改掉 source 里的「未在本臂辨识」），以后预检会对照 Desk 核对。</li>
+    </ol>
+    <p><b>验收：</b>导入 Desk 后复采，日志里 Desk 的 <code>O_F_ext</code> 平均 Fz 在 ±0.2 N 以内。</p>
+    <p class="muted small">参考：右臂 11-09 已做过（夹爪 + 相机、不带 SMR：1.1025 kg，质心 (5.8, −8.1, 42.0) mm），已导入 Desk 并写进 <code>fr3_arms.json</code>，预检会核对 Desk 与声明值（质量差 ≤ 0.05 kg、质心差 ≤ 10 mm）。末端加装或拆下 SMR、相机后要重做。</p>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 4 · 核对左臂的球窝位置 <span class="who op">操作员</span></h3>
+    <p>回放驱动的目标点是 <code>corenetic_socket_ee</code>，即插件 nov4 的球窝中心。两台臂共用同一个夹爪模型，这个点是 11-09 在右臂上实测后写进模型的（在 <code>corenetic_gripper_ee</code> 里约 (−0.96, 2.06, 33.50) mm，离法兰面 205.5 mm）。左臂上要确认它仍然成立。这一步和阶段 5 的第一个球可以合并做。</p>
+    <ol>
+      <li><span class="ui">Calibration → FR3 机械臂 → FR3 球窝 pivot</span>，模式选 <span class="ui">自动规划</span>，机械臂选 left。</li>
+      <li>⓪ 让夹爪夹好插件（夹持方式和以后回放一致）。</li>
+      <li><b>摆球：</b>球心离左臂底座水平 0.45–0.65 m，比桌面高 6 cm 以上。夹爪从侧面伸过去，和「底座→球」方向夹 60–90°，不要正对着往外伸（j6 会贴墙）。</li>
+      <li><b>1 取球心：</b>用 Desk 引导键把夹爪大致水平地伸到球上方，球窝朝下坐到球上，松手后点 <span class="ui">取当前位置为球心</span>（只读关节角，不动）。之后不要再碰机械臂。</li>
+      <li><b>2 试探：</b>「试探先验球心」三个格子<b>留空</b>（模型里的球窝就是实测球心；不要填 Desk EE，11-09 和 11-10 两次因此停机）。<span class="ui">规划试探</span> → 看演算结果 → <span class="ui">执行</span>（约 1–1.5 分钟，起点附近 20° 内 6 个驻点）。</li>
+      <li><b>3 规划 + 演算：</b>试探拟合完成后自动「绕上次拟合的球心转」，<span class="ui">规划 + 演算</span>，演算全过（限位、速度、j6、桌面、支架）后 <span class="ui">执行</span>：14 个驻点，力环约 3 N 压在球上。</li>
+    </ol>
+    <p><b>验收：</b>拟合 rms 约 1 mm 以内；结果表里「corenetic_socket_ee 对不对」一栏，球窝中心应接近 0（1 mm 量级）。如果偏差明显（几毫米），说明左臂这套夹爪/插件和模型不一致，<b>停下找维护者</b>：模型是两臂共用的，不能直接改。</p>
+    <p class="muted small">执行中如果因为外力超限（约 7 N）停机：先看是不是真的接触问题。软垫、先验填错、夹持变了（BOX 重启后重新夹）都会导致停机；换了夹持就重新试探。</p>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 5 · 同球检验，拟合 world → fr3_base <span class="who op">操作员</span></h3>
+    <p>每个球位做两件事：<b>FR3 绕球转</b>（给出球心在 <code>fr3_base</code> 里的位置），然后<b>球不动</b>，<b>手持夹爪绕同一个球转</b>（给出球心在相机世界系里的位置）。多个球位配对后拟合出刚体变换，就是注册边。</p>
+    <h4>球位怎么选</h4>
+    <ul>
+      <li><b>至少 5 个</b>（4 个是能做留一检验的下限；11-10 右臂只有 4 个，而且在一个方向上只撑开 68 mm，单个球就能把旋转带偏 0.7°）。</li>
+      <li>两两相隔约 30 cm，<b>不共线，也不要都在一个平面上</b>：高低要拉开（例如桌面上 6 cm 和抬高 30 cm 以上的都要有）。</li>
+      <li>覆盖以后左臂回放的主要工作区域。</li>
+      <li>每个球位至少 2 台已标定相机能看到手持夹爪的贴片。</li>
+      <li>每个球位都满足阶段 4 的摆球要求（水平 0.45–0.65 m、夹爪从侧面伸入）。</li>
+    </ul>
+    <h4>每个球位的操作</h4>
+    <ol>
+      <li><b>FR3 pivot</b>（左臂，自动规划）：取球心 → 试探 → 规划 + 演算 → 执行。条件允许时，从相差 60–90° 的两个朝向各做一次，在 ② 结果里勾选后 <span class="ui">合并拟合所选</span>（共用一个球心，球心不确定度大约减半）。备注写清楚球位（如「球 A」）。</li>
+      <li><b>把 FR3 移开，球不要动。</b></li>
+      <li><b>手持 pivot</b>：手持夹爪夹插件坐到同一个球上，在 Live Record 正常录一段约 30 秒：先坐稳再开始，俯仰、滚转、绕竖直轴摆都转开，转完再停，全程球窝不离球。手持一侧用右手 rig（11-10 证明它很稳，pivot rms 0.3–0.7 mm）或左手 rig 都可以，因为两边各自拟合杠杆臂，手持的 TCP 常量误差不会进到球心里。</li>
+      <li>在 Dataset Processing 用<b>对应的检测目标</b>生成轨迹（检验时没生成也会自动生成）。</li>
+    </ol>
+    <h4>检验和存候选</h4>
+    <ol>
+      <li><span class="ui">FR3 球窝 pivot → ③ 手持同球</span>：<span class="ui">添加位置</span>，每行配对「FR3 pivot（或合并拟合）↔ 手持 episode」。下拉框会标出没有 world 戳的 episode，不要选这种。</li>
+      <li>点 <span class="ui">检验</span>，看 ④ 检验结果（见下方验收标准）。这一步只计算，不改任何东西。</li>
+      <li>通过后点 <span class="ui">存为候选边</span>，候选写到 <code>outputs/calibration/fr3_base_registration/ball_&lt;check&gt;.json</code>。</li>
+    </ol>
+    <p><b>配对小技巧：</b>球与球之间的距离不依赖注册边。如果不确定哪段手持对应哪个球，比较 FR3 侧和手持侧算出的球间距离（11-10 三对距离相差 0.3–1.3 mm），对得上就是配对正确。</p>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 6 · 应用注册边并固化 <span class="who op">操作员</span><span class="who mt">维护者</span></h3>
+    <ol>
+      <li><span class="ui">Calibration → FR3 机械臂 → FR3 基座注册边</span>，点刷新，找到刚存的候选：看它的留一误差，以及相对现役边的挪动量（左臂现在没有现役边，这一项为空）。</li>
+      <li>确认后应用。如果此时到两台臂基座的路径都存在（例如已有两臂边），系统会做闭环检查：新边和其他路径在各自 sigma 内不一致就拒绝，这通常意味着某台车挪过。</li>
+      <li>应用后，守卫会记录新的受信版本。</li>
+      <li><span class="who mt">维护者</span> <b>立即</b>把 Thor 上的 <code>tools/thor/gmsl2/world/world_graph.json</code> 拷回仓库并提交；否则下一次部署（哪怕是最新代码）会把它冲掉并触发红条。</li>
+      <li><span class="who mt">维护者</span> 在 <code>tools/thor/gmsl2/world/README.md</code> 里补一节「Result：left arm」：球位、配对、残差、留一、覆盖区域和已知偏差，格式参照 11-10 右臂那节。</li>
+    </ol>
+  </div>
+
+  <div class="stage">
+    <h3>阶段 7 · 端到端验证 <span class="who op">操作员</span></h3>
+    <ol>
+      <li><b>用右手数据在左臂上回放</b>（不需要左手 rig）：选一段 QC 通过的右手 episode，Arm 选 left，MuJoCo 选 Right hand 并在左臂基座里预演 → 通过 → <span class="ui">Preflight left</span> → 起点 → 执行。这一步验证左臂的边、负载和夹爪。注意右手录制的动作原本是给右臂的，左臂不一定都够得着，IK/MuJoCo 不过就换一段。</li>
+      <li><b>左手采集：</b>手持左手 rig（106–109，BOX 3969377039），Dataset Processing 目标选 <span class="ui">Gripper Rig v9b · 左手</span>，生成和 QC 后，用 Left hand + left 臂回放。</li>
+      <li>（推荐）勾上激光跟踪仪做一次回放误差分析，作为独立于同球检验的端到端核对。</li>
+    </ol>
+  </div>
+  </div>
+
+  <h3 id="left-accept">验收标准汇总</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>项目</th><th>标准（<span class="badge b-bad">门限</span> 系统会拒绝 / <span class="badge b-info">建议</span> 经验值）</th><th>11-10 右臂参考值</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Desk 负载</td><td><span class="badge b-info">建议</span> 导入后复采 <code>O_F_ext</code> 平均 Fz ±0.2 N</td><td>—</td></tr>
+      <tr><td class="k">FR3 pivot（每个球）</td><td><span class="badge b-info">建议</span> 拟合 rms 约 ≤ 1 mm；球心 σ ≤ 1 mm</td><td>rms 0.9–1.0 mm（C 球 2.7 mm，软垫导致），σ 0.3–1.1 mm</td></tr>
+      <tr><td class="k">球窝模型</td><td><span class="badge b-info">建议</span> 球窝在 <code>corenetic_socket_ee</code> 里接近 0（1 mm 量级）</td><td>右臂实测后已写进模型</td></tr>
+      <tr><td class="k">手持 pivot（每个球）</td><td><span class="badge b-bad">门限</span> ≥ 60 帧解出；≥ 60% 帧在球上（6 mm 内）；残差 p95 ≤ 6 mm；有 world 戳</td><td>rms 0.26–0.65 mm，全部帧在球上，转角 84–92°</td></tr>
+      <tr><td class="k">注册边：拟合残差</td><td><span class="badge b-info">建议</span> rms ≤ 1 mm</td><td>0.83 mm</td></tr>
+      <tr><td class="k">注册边：留一预测</td><td><span class="badge b-bad">门限</span> 每个球 ≤ 6 mm；<span class="badge b-info">建议</span> rms ≤ 3 mm</td><td>rms 3.16、最大 4.68 mm</td></tr>
+      <tr><td class="k">注册边：尺度</td><td><span class="badge b-info">建议</span> ≈ 0（只报告不吸收，明显偏离说明相机世界系尺度有问题）</td><td>+0.09%</td></tr>
+      <tr><td class="k">注册边：旋转稳定性</td><td><span class="badge b-info">建议</span> 去掉任一个球，边的转动 ≤ 0.3°</td><td>0.70°（几何太扁）</td></tr>
+      <tr><td class="k">两臂边（如做）</td><td><span class="badge b-bad">门限</span> ≥ 4 个位置，留一 ≤ 3 mm</td><td>—</td></tr>
+      <tr><td class="k">端到端</td><td><span class="badge b-info">建议</span> MuJoCo 通过；真机回放完整执行；激光误差与右臂同量级</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="left-dual">双臂协同回放还需要什么</h3>
+  <p>两台臂各自有了到相机世界的边以后，双臂回放还要知道两个基座的相对位置，用于两臂之间的碰撞检查。目前 <code>fr3_arms.json</code> 里的摆放是卷尺量的（两基座相距 0.66 m，sigma 20 mm），太粗，建议补一条<b>两臂同球边</b>：</p>
+  <ol>
+    <li>选 ≥ 4 个<b>两台臂都够得着</b>的球位，相隔约 30 cm、不共线。</li>
+    <li>每个球位球不动，左臂和右臂各做一次 pivot（采集时选对臂）。</li>
+    <li><span class="ui">FR3 球窝 pivot → 两臂同球 · fr3_base → fr3_base_right</span>，每行配对左臂 pivot 和右臂 pivot，<span class="ui">解算两臂边</span>。两边都是关节运动学，不经过相机。</li>
+    <li>留一 ≤ 3 mm 才存为候选；在注册边面板里应用，闭环检查会核对它和两条世界边是否一致。</li>
+    <li><span class="who mt">维护者</span> 据此更新 <code>fr3_arms.json</code> 的 <code>placement</code> 和 sigma，提交并部署。</li>
+  </ol>
+  <p>之后在回放页用 <span class="ui">Both hands</span> 和 <span class="ui">Preflight all arms</span> 做双臂回放。左臂边上线后，现有的相机世界系数据集不用重新导出，推理时用 <code>--arm left</code> 就会走左臂这条新边（见 <a href="#export">第 8 节</a>）。</p>
+
+  <div class="callout warn">
+    <p><b>什么时候要重做：</b>任一台车挪过 → 重做那台臂的同球检验（和两臂边）；相机重新标定或支架改动 → 用原来的配对在 GUI 里重跑同球检验，确认边仍在门限内；换指尖、换插件、末端加装东西 → 重做负载（阶段 3）和球窝核对（阶段 4）。</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section class="card" id="appendix">
+  <h2><span class="num">11</span>附录：路径与术语</h2>
+  <h3>关键文件</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>内容</th><th>路径（仓库根目录起）</th></tr></thead>
+    <tbody>
+      <tr><td>臂注册表（IP、夹爪 BOX、回放配置、起始关节、负载、摆放）</td><td><code>tools/fr3/fr3_arms.json</code></td></tr>
+      <tr><td>双臂 embodiment（每台臂的根坐标系）</td><td><code>tools/thor/gmsl2/embodiments/fr3_dual.json</code></td></tr>
+      <tr><td>右臂 / 左臂回放配置</td><td><code>tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml</code><br><code>third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml</code></td></tr>
+      <tr><td>坐标图（注册边）及其说明</td><td><code>tools/thor/gmsl2/world/world_graph.json</code>、<code>tools/thor/gmsl2/world/README.md</code></td></tr>
+      <tr><td>标定图守卫记录（Thor 本机，部署不会动）</td><td><code>outputs/world_graph_guard.json</code></td></tr>
+      <tr><td>FR3 自动 pivot 工具</td><td><code>tools/fr3/fr3_pivot_auto.py</code></td></tr>
+      <tr><td>同球检验结果 / 候选边（Thor）</td><td><code>outputs/calibration/fr3_base_ball_check/</code>、<code>outputs/calibration/fr3_base_registration/</code></td></tr>
+      <tr><td>手持 rig 追踪配置与 marker→TCP 常量</td><td><code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b*_…</code></td></tr>
+      <tr><td>Thor 启动与恢复</td><td><code>tools/thor/README.md</code>、<code>tools/thor/DEPLOYMENT.md</code></td></tr>
+    </tbody>
+  </table></div>
+  <h3>术语</h3>
+  <div class="scroll"><table>
+    <tbody>
+      <tr><td class="k">相机世界系（world）</td><td>由固定相机定义的坐标系，id <code>world_20260928_063531</code>。轨迹生成的结果（sidecar）一直保存在这个系里。</td></tr>
+      <tr><td class="k">基座系</td><td>每台 FR3 自己的 libfranka O 系：左臂 <code>fr3_base</code>，右臂 <code>fr3_base_right</code>。</td></tr>
+      <tr><td class="k">注册边</td><td>world → 某个基座的刚体变换，存在 <code>world_graph.json</code>。回放时用它把轨迹换到臂的基座里。</td></tr>
+      <tr><td class="k">pivot</td><td>让工具绕一个固定点转动，从多组姿态拟合出这个点（同时得到杠杆臂）。</td></tr>
+      <tr><td class="k">球窝 / <code>corenetic_socket_ee</code></td><td>夹爪插件 nov4 上的球窝中心，也是回放驱动的目标点和手持 rig 的 TCP。</td></tr>
+      <tr><td class="k">同球检验</td><td>同一个球，FR3 一侧算出它在基座系的位置，手持一侧算出它在世界系的位置，多个球位配对后检验或拟合注册边。</td></tr>
+      <tr><td class="k">留一（LOO）</td><td>每次去掉一个球，用其余的球拟合，再预测被去掉的那个；比拟合残差更能反映真实误差。</td></tr>
+      <tr><td class="k">sidecar</td><td>轨迹生成写在数据集旁边的位姿文件；每只手一份 <code>state_action.&lt;hand&gt;.csv</code>。给某台臂用的副本在 <code>derived/&lt;sidecar&gt;/&lt;基座&gt;/</code>。</td></tr>
+      <tr><td class="k">world 戳</td><td>录制时写进数据集的世界系和外参版本。没有戳的旧数据不能换到别的基座。</td></tr>
+      <tr><td class="k">守卫（guard）</td><td>Thor 记住它信任的那份坐标图；发现被改动就禁用到基座的边并亮红条。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>2026-11-10 · 与代码同仓库维护：<code>tools/data_collection_gui/frontend/public/user_guide.html</code>。流程或界面有改动时请同步更新本页。</footer>
+
+</main>
+</div>
+<script>
+  (function () {
+    var btn = document.getElementById("themeToggle");
+    var root = document.documentElement;
+    try {
+      var saved = localStorage.getItem("userGuideTheme");
+      if (saved === "dark" || saved === "light") root.setAttribute("data-theme", saved);
+    } catch (e) {}
+    btn.addEventListener("click", function () {
+      var dark = root.getAttribute("data-theme") === "dark" ||
+        (!root.getAttribute("data-theme") && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      var next = dark ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("userGuideTheme", next); } catch (e) {}
+    });
+  })();
+</script>
+</body>
+</html>

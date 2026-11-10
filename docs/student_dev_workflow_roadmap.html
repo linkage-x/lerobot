@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学生开发流程路线图</title>
+<meta name="description" content="学生在各自分支开发、在 Thor 沙箱试跑、由维护者审核发版：第一阶段已完成的内容、已知缺口，以及第二阶段的分项方案与待决策项（2026-11-10）。">
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--code:#f3f4f6;--accent:#2563eb;--warn:#b45309;--warn-bg:#fffbeb;--ok:#15803d;--ok-bg:#ecfdf5}
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code:#222733;--accent:#60a5fa;--warn:#fbbf24;--warn-bg:#2a2210;--ok:#4ade80;--ok-bg:#12271b}}
+  :root[data-theme="dark"]{--bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code:#222733;--accent:#60a5fa;--warn:#fbbf24;--warn-bg:#2a2210;--ok:#4ade80;--ok-bg:#12271b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.7 system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif}
+  main{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+  h1{font-size:26px;margin:8px 0 4px}h2{font-size:19px;margin:0 0 10px}h3{font-size:16px;margin:16px 0 6px}
+  .sub{color:var(--muted);margin:0 0 20px}
+  section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:16px 0}
+  code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:.9em;word-break:break-all}
+  pre{background:var(--code);padding:10px 12px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-top:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}
+  th{color:var(--muted);font-weight:600}.scroll{overflow-x:auto}
+  .done{background:var(--ok-bg);border-left:4px solid var(--ok);padding:10px 14px;border-radius:8px}
+  .ask{background:var(--warn-bg);border-left:4px solid var(--warn);padding:10px 14px;border-radius:8px}
+  .tag{display:inline-block;min-width:3em;font-weight:700;color:var(--accent)}
+  ul,ol{padding-left:1.3em;margin:6px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>学生开发流程路线图</h1>
+<p class="sub">2026-11-10 · 目标：学生拿到完整代码，在自己的分支上借助 AI（Codex / Claude Code 等）实现想法，在 Thor 沙箱里试跑；维护者只审 PR、发版，不再替人部署和排错。</p>
+
+<section>
+  <h2>0 · 原则</h2>
+  <ul>
+    <li><b>开发、试跑、生产三层分开。</b>本地开发不碰 Thor；Thor 上每人一个沙箱；生产只跑审核合并后的 <code>origin/box</code>。</li>
+    <li><b>门禁放在学生代码之外。</b>学生（和他们的 AI）能改分支里的任何检查，所以真正的边界必须在操作系统、网络、GitHub 设置这些分支改不到的地方。代码里的守卫只防误操作。</li>
+    <li><b>可变状态不放在代码树里。</b>部署是"把部署人的工作区镜像过去"，树里只要有现场写入的文件，就会被旧树覆盖。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>1 · 第一阶段（已完成，2026-11-10）</h2>
+  <div class="done">
+  <ul>
+    <li><b>AGENTS.md</b>（Codex 直接读取；<code>CLAUDE.md</code> 用 <code>@AGENTS.md</code> 引用同一份）：开发流程、沙箱用法、安全红线、踩过的坑、何时找维护者。</li>
+    <li><b>Thor 个人沙箱</b>：<code>bash run/deploy.sh thor --sandbox &lt;名字&gt;</code> → <code>/home/nvidia/sandboxes/&lt;名字&gt;</code>，端口 8770–8799 自动分配并固定。网关 <code>--sandbox</code> 对所有碰硬件的接口（录制、预览、BOX、激光跟踪仪、真机回放、机械臂、pivot、负载、标定采集）返回 409；离线功能（轨迹生成、IK QC、MuJoCo、导出、回放查看）可用。GUI 顶部黄条标明沙箱和 commit。2026-11-10 实测：部署、复制数据集、二次部署（端口不变、只重启自己）、MuJoCo 预演通过、删除，生产网关全程不受影响。</li>
+    <li><b><code>run/sandbox.sh</code></b>：list / status / datasets / copy-dataset（复制不链接，保证 Thor 留 30 GB）/ logs / stop / remove。</li>
+    <li><b>部署只停自己的进程</b>：原来 deploy 会杀掉全机所有网关和录制器（沙箱一部署就会把生产停掉），现在只停同目录或同端口的网关；只有生产部署才停录制器。</li>
+    <li><b>生产部署守卫</b>：代码树必须干净、HEAD 必须已在 <code>origin/box</code>，否则拒绝；<code>--maintainer</code> 只放行"尚未合并"，不放行脏树；<code>-n</code> 预演只警告。每次部署写 <code>DEPLOYED.json</code>，快照 <code>deployment.release</code> 可见版本和部署人。</li>
+    <li><b>CODEOWNERS</b>（部署脚本、FR3、world/标定、label provenance、网关需维护者审核）和 <b>box PR CI</b>（<code>.github/workflows/box_checks.yml</code>：网关 / Thor / FR3 测试 + 前端类型检查和单测）。</li>
+  </ul>
+  </div>
+  <h3>第一阶段要生效还需要的手工设置</h3>
+  <ul>
+    <li>GitHub：<code>box</code> 开分支保护（必须 PR、Code Owners 审核、Box checks 通过、禁止 force push）。<b>仓库是公开的、box 当前没有保护</b>，不开保护时"在 origin/box 上"这个守卫没有意义。</li>
+    <li>GitHub：两个私有子模块各一把只读 deploy key（标题 “lerobot CI (box_checks, read-only)”），私钥存在 secret <code>SUBMODULE_KEY_OPENCV_KALIBR</code>、<code>SUBMODULE_KEY_BOX_SDK</code>；轮换方法见 <code>.github/workflows/box_checks.yml</code> 文件头。缺任一个，CI 拉不到子模块、测试会失败。</li>
+    <li>GitHub：把学生加为协作者（推自己的分支需要写权限）。</li>
+    <li>Thor：学生公钥加到 <code>nvidia</code> 账号；确认学生电脑能访问 Thor 的 ssh 和 8770–8799 端口。</li>
+  </ul>
+  <h3>第一阶段的已知缺口（第二阶段解决）</h3>
+  <ul>
+    <li>学生和生产共用 <code>nvidia</code> 账号：能 ssh 就能手工 rsync 覆盖生产，守卫挡不住故意或 AI 自作主张的绕过。</li>
+    <li>沙箱"不碰硬件"写在沙箱自己运行的代码里，分支删掉就失效。</li>
+    <li>需要硬件的功能学生无法自测，只能交给维护者试。</li>
+    <li>沙箱的标定是首次部署时复制的快照，之后不跟随生产更新；world 文件来自学生自己的树。</li>
+    <li><code>gateway.py</code> 整个文件归维护者审核，大部分 PR 都会落到维护者身上。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>2 · 第二阶段分项</h2>
+
+  <h3><span class="tag">P2-1</span>学生独立 Linux 用户（真正的写权限边界）</h3>
+  <ul>
+    <li>Thor 上建学生账号（每人一个，或共用 <code>lerobot-dev</code>，见待决策 1），学生只拿这个账号的 ssh。<code>nvidia</code> 的 <code>authorized_keys</code> 只留维护者。</li>
+    <li>生产树 <code>/home/nvidia/lerobot</code> 对学生不可写；沙箱移到 <code>/home/&lt;学生&gt;/sandboxes</code> 或 <code>/srv/lerobot/sandboxes</code>（<code>THOR_SANDBOX_BASE</code> 一处改）。</li>
+    <li>共享只读资源要能被学生读到：<code>/home/nvidia</code> 现为 750，venv（<code>/home/nvidia/Code/infer/.venv-fr3</code>、<code>opencv_kalibr/.venv</code>）和生产数据集都读不到。方案：venv 挪到 <code>/opt/lerobot/venvs</code>，数据集和标定加只读组 <code>lerobot-data</code>。</li>
+    <li>验收：学生账号 <code>touch /home/nvidia/lerobot/x</code> 失败；<code>run/deploy.sh thor</code>（生产）以学生身份失败于权限而不是脚本；沙箱部署、复制数据集、MuJoCo 照常。</li>
+  </ul>
+
+  <h3><span class="tag">P2-2</span>硬件访问在系统层隔离</h3>
+  <ul>
+    <li>网络：<code>iptables -A OUTPUT -m owner --uid-owner &lt;学生&gt; -d &lt;网段&gt; -j REJECT</code>，覆盖 FR3（192.168.1.0/24 右臂、192.168.11.0/24 左臂）、BOX 网段、激光跟踪仪。规则随开机加载（netfilter-persistent）。</li>
+    <li>相机：查清 nvargus-daemon 的访问控制（socket 权限 / video 组），让学生账号打不开 Argus。需要单独调研。</li>
+    <li>验收：学生账号下 <code>ping</code> FR3、BOX discover、gst Argus 预览都失败；生产网关不受影响。</li>
+  </ul>
+
+  <h3><span class="tag">P2-3</span>硬件占用锁（让沙箱在受控条件下用硬件）</h3>
+  <ul>
+    <li>共享目录里一个租约文件（如 <code>/srv/lerobot/state/hw_lease.json</code>），资源分 <code>cameras</code> / <code>box</code> / <code>laser_tracker</code> / <code>fr3_left</code> / <code>fr3_right</code>；记录持有者（网关目录、端口、用户）、开始时间、心跳。</li>
+    <li>持有者每 10 s 心跳，60 s 无心跳自动释放；生产网关同样遵守（Connect 前申请，Exit 时释放）。</li>
+    <li>GUI 顶栏显示每项硬件当前归谁、用到几点；被占用时按钮置灰并说明。</li>
+    <li>沙箱用硬件需要维护者给该学生授权（与 P2-1/P2-2 配合：授权 = 临时放开该用户的防火墙规则），机械臂仍需 MuJoCo 通过 + 有人守急停 + 推理解锁文件。</li>
+    <li>验收：生产录制中，沙箱 Connect 被拒并显示占用者；生产网关被 kill -9 后 60 s 内锁自动释放。</li>
+  </ul>
+
+  <h3><span class="tag">P2-4</span>可变状态移出代码树</h3>
+  <p>现在仍在代码树里、却在现场被写入的状态：</p>
+  <div class="scroll"><table>
+    <thead><tr><th>状态</th><th>位置</th><th>谁写</th></tr></thead>
+    <tbody>
+      <tr><td>世界参考、world graph（含 fr3_base 边）、桌面基准</td><td><code>tools/thor/gmsl2/world/*.json</code></td><td>标定页</td></tr>
+      <tr><td>world_registration / world_stable_source</td><td>同上（只在 Thor 上，不进 git）</td><td>标定页</td></tr>
+      <tr><td>生产标定指针 <code>intrinsics_run_name</code> / <code>fixed_camera_run_name</code></td><td><code>opencv_kalibr/.../config_thor/*.yaml</code></td><td>标定页 promote</td></tr>
+      <tr><td>BOX d_box 表</td><td><code>tools/thor/gmsl2/box_time_delays.json</code></td><td>人工</td></tr>
+      <tr><td>标定产物、world_graph 守卫、tasks、6D origin</td><td><code>outputs/</code>（已排除同步，但在树内）</td><td>GUI</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>新建状态目录（如 <code>/srv/lerobot/state</code>，环境变量 <code>LEROBOT_STATE_DIR</code>），所有读写经一个解析函数；git 里只保留默认值和历史快照。</li>
+    <li>迁移时双读：状态目录有就用状态目录，没有回落到树内文件并告警；生产迁完后删掉回落。</li>
+    <li>沙箱对状态目录只读（P2-1 的权限保证），需要改 world/标定的实验在沙箱自己的副本里做。</li>
+    <li>验收：从任意旧分支部署生产，world、标定指针、d_box 表都不变；<code>sync_to_target.sh</code> 里"保留 Thor 上更新的 world 文件"那段逻辑可以删除。</li>
+  </ul>
+
+  <h3><span class="tag">P2-5</span>发版自动化</h3>
+  <ul>
+    <li><code>run/release.sh</code>（维护者用）：确认在 box 最新提交、CI 绿、树干净 → <code>-n</code> 预演摘要 → 确认 → 部署 → 学生前端自动切到同版。</li>
+    <li>学生前端改为读 Thor 的 <code>DEPLOYED.json</code> 自动固定版本，不再手动传 commit。</li>
+    <li>之后可以改成打 tag（如 <code>release-20261120-1</code>）触发；部署前检查当前没有录制和真机回放在进行。</li>
+    <li>发版后在群里自动通知版本和变更列表（已有 Feishu 通知工作流可复用）。</li>
+  </ul>
+
+  <h3><span class="tag">P2-6</span>机器人运动服务（中期）</h3>
+  <ul>
+    <li>把真机运动（回放、move-to-start、推理执行）做成常驻服务，始终跑已发布版本；网关和学生代码只能通过接口提交"计划"，服务里做限幅、工作空间检查、MuJoCo 结果核对、急停确认。</li>
+    <li>这样分支里删掉检查也绕不过去；与训推路线图的 L3 放行记录合并设计（见 <code>docs/fr3_train_infer_gui_roadmap.html</code>）。</li>
+  </ul>
+
+  <h3><span class="tag">P2-7</span>CI 与评审负担</h3>
+  <ul>
+    <li>CI 扩充测试集；对改动行跑 <code>ruff check</code>；PR 模板加"是否碰硬件 / 安全门禁"勾选。</li>
+    <li>把 <code>gateway.py</code> 里硬件接口和门禁拆到单独模块，CODEOWNERS 只管这些模块，其余 GUI 功能可由高年级学生互审。</li>
+  </ul>
+
+  <h3><span class="tag">P2-8</span>文档与上手</h3>
+  <ul>
+    <li>学生上手清单：账号、ssh、clone、子模块、本地环境、第一次沙箱部署、提 PR，一个标准练习任务。</li>
+    <li>使用指南加"开发者"一节链接到 AGENTS.md 和本页。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>3 · 建议顺序</h2>
+  <ol>
+    <li>先把第一阶段合进 box，并完成 GitHub / Thor 的手工设置（小范围试用）。</li>
+    <li>P2-1 + P2-2（账号与硬件隔离）：开放给更多人之前必须完成。</li>
+    <li>P2-4（状态移出代码树）：沙箱和发版一多就会出事，排在硬件锁之前。</li>
+    <li>P2-5（发版自动化）。</li>
+    <li>P2-3（硬件占用锁）：学生需要自测硬件功能时再做。</li>
+    <li>P2-6 / P2-7 / P2-8 穿插进行。</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4 · 需要拍板</h2>
+  <div class="ask">
+  <ol>
+    <li><b>学生账号：</b>每人一个 Linux 账号（可追责、可单独授权硬件），还是共用一个 <code>lerobot-dev</code>（管理简单）？</li>
+    <li><b>状态目录放哪：</b><code>/srv/lerobot/state</code>（需 sudo 建）还是 <code>/home/nvidia/lerobot_state</code>？</li>
+    <li><b>沙箱是否最终允许用硬件：</b>如果永远不允许，P2-3 可以只做生产内部的互斥，不做授权。</li>
+    <li><b>发版节奏：</b>固定时间（如每周两次）还是合并即发？</li>
+  </ol>
+  </div>
+</section>
+</main>
+</body>
+</html>

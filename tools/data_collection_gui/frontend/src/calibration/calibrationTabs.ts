@@ -21,9 +21,9 @@ export const CALIBRATION_TABS: CalibrationTab[] = [
   {
     id: "box",
     label: "BOX 传感器",
-    hint: "6D 零点/origin、触觉校准、6D 负载拟合",
+    hint: "6D 零点/origin（手持上工装，臂上由机械臂摆姿态）、触觉校准、6D 负载拟合",
     when: "每次上电（零点）、换末端（6D 拟合）、按有效期",
-    contents: "预热计时、origin、动态校准、触觉校准、6D 负载拟合 K",
+    contents: "按 BOX 分组（手持在前、臂上单列）：预热计时、origin、动态校准、触觉校准、6D 负载拟合 K",
   },
   {
     id: "handheld",
