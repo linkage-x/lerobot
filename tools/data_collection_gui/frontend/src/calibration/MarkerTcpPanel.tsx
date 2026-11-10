@@ -283,6 +283,7 @@ export function MarkerTcpPanel({
   const [staticPath, setStaticPath] = useState("");
   const [cadPath, setCadPath] = useState("");
   const [socketBeyondTcpMm, setSocketBeyondTcpMm] = useState("0");
+  const [rig, setRig] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [formatHelp, setFormatHelp] = useState<FormatHelp | null>(null);
@@ -368,7 +369,7 @@ export function MarkerTcpPanel({
 
       {!session.active ? (
         <>
-          <p className="panel-note">按 BOX ID 采集 UMI cube 的 marker→TCP 样本；不依赖 FR3，也不包含 head cube。</p>
+          <p className="panel-note">按 BOX ID 采集手持末端的 marker→TCP 样本：现役是夹爪 rig v9b（左 106–109 / 右 100/101/110/111），旧的 AprilTag cube 也还能选，解算时在「Marker rig」里定（默认按 BOX 自动选）。不依赖 FR3，也不包含 head cube。</p>
           <MarkerTcpCaptureGuide />
           <div className="control-row">
             <button className="cali-btn-primary" disabled={disabled} onClick={() => call(() => api.startMarkerTcpSession())}>
@@ -457,6 +458,15 @@ export function MarkerTcpPanel({
               />
             </label>
             <label>
+              Marker rig
+              <select value={rig} disabled={disabled} onChange={(event) => setRig(event.target.value)}>
+                <option value="">自动（BOX 装在 rig 上就用 rig，否则 cube）</option>
+                <option value="april_cube">AprilTag cube（BOX 生产 bundle）</option>
+                <option value="gripper_rig_v9b">Gripper Rig v9b 左手（ArUco 106–109）</option>
+                <option value="gripper_rig_v9b_right">Gripper Rig v9b 右手（ArUco 100/101/110/111）</option>
+              </select>
+            </label>
+            <label>
               球心→TCP 偏置 mm
               <input
                 value={socketBeyondTcpMm}
@@ -477,13 +487,26 @@ export function MarkerTcpPanel({
               单点 pivot 只能观测 TCP 原点，观测不到旋转。留空 CAD/真值 JSON 时旋转从现有 production bundle
               继承，并写进 bundle 的 <code>rotation_source</code>；本次解算只更新 translation。
             </p>
+            {rig === "gripper_rig_v9b" ? (
+              <p className="panel-note">
+                Gripper Rig v9b：角点表、字典（DICT_6X6_250）和旋转都取自 rig 自己的 bundle；TCP 是 11-06 实测的
+                插件球窝中心，新的 pivot 结果是<b>核对</b>——完成后会报告拟合点离这个球窝中心多少 mm。
+              </p>
+            ) : null}
+            {rig === "gripper_rig_v9b_right" ? (
+              <p className="panel-note">
+                Gripper Rig v9b 右手：和左手同一个 holder、贴纸 100/101/110/111（从夹爪后方看指尖，从左到右）。TCP 是 11-09
+                两条 pivot 的平均 (0.41, 0.07, 168.50) mm（两条相差 0.35 mm，主要在 z；和左手差 0.6 mm），已标 validated。新的
+                pivot 结果是<b>核对</b>——报告的「离球窝多少 mm」在 0.4 mm 以内算复现。录制开头还没插进球窝的几秒会拉高 rmse，看 p95。
+              </p>
+            ) : null}
           </div>
 
           <div className="control-row">
             <button
               className="cali-btn-primary"
               disabled={disabled || !canSolve}
-              onClick={() => call(() => api.solveMarkerTcpTransform(selectedBoxId, cadPath, socketBeyondTcpMm))}
+              onClick={() => call(() => api.solveMarkerTcpTransform(selectedBoxId, cadPath, socketBeyondTcpMm, rig))}
             >
               解算并写生产 bundle
             </button>

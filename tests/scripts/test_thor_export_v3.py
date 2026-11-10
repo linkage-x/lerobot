@@ -649,6 +649,62 @@ def test_align_touch_rows_keeps_the_detected_width(tmp_path):
         assert all(len(row) == 9 for row in rows[column])
 
 
+def test_a_second_pad_per_finger_gets_columns_only_where_it_was_recorded(tmp_path):
+    # BOX SDK v4.1, 11-02 rig: two pads per finger. One-pad data keeps its schema.
+    one_pad = tmp_path / "one" / "episodes" / "episode_000000"
+    _write_touch_jsonl(one_pad, points=9, tagged=True)
+    assert export_v3._detect_touch_sensors([one_pad]) == ("box_touch_left", "box_touch_right")
+
+    two_pads = tmp_path / "two" / "episodes" / "episode_000000"
+    _write_touch_jsonl(two_pads, points=9, tagged=True)
+    with (two_pads / "box_sensors.jsonl").open("a", encoding="utf-8") as f:
+        for sid, fz in (("box0/box_touch_left_1", 5), ("box0/box_touch_right_1", 7)):
+            data = {"timestamp": 1, "points": 9, "fx_0p1N": [0] * 9, "fy_0p1N": [0] * 9, "fz_0p1N": [fz] * 9}
+            f.write(json.dumps({"sid": sid, "t_rel_s": 0.0, "data": data}) + "\n")
+    sensors = export_v3._detect_touch_sensors([one_pad, two_pads])
+    assert sensors == ("box_touch_left", "box_touch_right", "box_touch_left_1", "box_touch_right_1")
+
+    columns = export_v3._touch_array_columns(sensors)
+    rows, saw = export_v3._align_touch_rows(two_pads, 2, 30, width=9, columns=columns)
+    assert saw and len(rows) == 12
+    assert rows["observation.touch.box_touch_left_1.fz_0p1N"] == [[5.0] * 9] * 2
+    assert rows["observation.touch.box_touch_right_1.fz_0p1N"] == [[7.0] * 9] * 2
+    assert rows["observation.touch.box_touch_left.fz_0p1N"] == [[0.0] * 9] * 2
+    # an episode of the same export without the second pads is zero-filled, not dropped
+    rows, _ = export_v3._align_touch_rows(one_pad, 2, 30, width=9, columns=columns)
+    assert rows["observation.touch.box_touch_right_1.fz_0p1N"] == [[0.0] * 9] * 2
+
+
+def test_one_pad_sessions_keep_their_names_but_never_share_an_export_with_two_pad_ones(tmp_path, capsys):
+    import shutil as _sh
+
+    pytest.importorskip("pyarrow")
+    if _sh.which("ffmpeg") is None and _sh.which("gst-launch-1.0") is None:
+        pytest.skip("no transcoder (ffmpeg / gst-launch-1.0) available")
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    cams = ("cam_00",)
+    world = "world_20260819_031843"
+    old = _make_video_session(datasets, "pick_20261102_101046", {0: 5}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id=world)
+    _write_box_parquet(old, {0: 5}, state_width=len(lr3.BOX_STATE_NAMES_ONE_PAD))
+    new = _make_video_session(datasets, "pick_20261103_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id=world)
+    _write_box_parquet(new, {0: 4}, state_width=len(lr3.BOX_STATE_NAMES))
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets, exports_root=tmp_path / "exports",
+        base_name="local/pick", repo_id="local/pick", task="pick",
+    )
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["features"]["observation.state"]["names"] == list(lr3.BOX_STATE_NAMES_ONE_PAD)
+    assert info["total_episodes"] == 1
+    said = capsys.readouterr().out
+    assert "one touch pad per finger" in said
+    assert "export the two layouts as separate datasets" in said
+
+
 def test_export_refuses_to_mix_two_world_frames(tmp_path):
     # Absolute poses from two coordinate systems concatenated into one training
     # set are wrong in a way no downstream check can see, so the export has to
@@ -866,6 +922,63 @@ def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_p
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
 
 
+def test_export_does_not_re_express_through_a_retired_edge(tmp_path, monkeypatch, capsys):
+    # Both FR3 bases moved after the 10-15 edge was solved: the GUI's auto export keeps the camera world
+    # and says why, and asking for fr3_base outright is refused with the same reason.
+    pytest.importorskip("pyarrow")
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-10-15T03:08:47Z",
+            "retired": {"utc": "2026-11-03T08:00:00Z", "reason": "both FR3 bases moved"}}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
+    kwargs = {
+        "datasets_root": datasets,
+        "exports_root": exports,
+        "base_name": "pick_and_place",
+        "repo_id": "local/pick_and_place",
+        "task": "pick the cube",
+    }
+
+    with pytest.raises(RuntimeError, match="retired 2026-11-03T08:00:00Z: both FR3 bases moved"):
+        export_v3.export_task_to_v3(**kwargs, target_world="fr3_base")
+
+    out = export_v3.export_task_to_v3(**kwargs, target_world="auto")
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    printed = capsys.readouterr().out
+    assert "WARNING: edge world_a -> fr3_base (solved 2026-10-15T03:08:47Z) retired" in printed
+    assert "(world frame: world_a)" in printed.strip().splitlines()[-1]
+
+
+def test_export_does_not_re_express_while_the_world_graph_is_not_the_trusted_one(tmp_path, monkeypatch, capsys):
+    # Thor recorded the graph with the 10-15 edge retired; a deploy brought back one where it is live.
+    pytest.importorskip("pyarrow")
+    from tools.thor.gmsl2 import world_graph_guard as guard
+
+    edge = {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": _EDGE_T,
+            "method": "test", "created_utc": "2026-10-15T03:08:47Z"}
+    datasets, exports = _tracked_world_session(tmp_path, monkeypatch, edges=[edge], tcp_link="corenetic_gripper_ee")
+    repo = tmp_path / "repo"
+    graph_path = repo / guard.GRAPH_FILE
+    trusted = json.loads(graph_path.read_text())
+    guard.record(repo, reason="test", graph={**trusted, "edges": [{**edge, "retired": {"utc": "u", "reason": "moved"}}]})
+    kwargs = {
+        "datasets_root": datasets,
+        "exports_root": exports,
+        "base_name": "pick_and_place",
+        "repo_id": "local/pick_and_place",
+        "task": "pick the cube",
+    }
+
+    with pytest.raises(RuntimeError, match="又成了现役"):
+        export_v3.export_task_to_v3(**kwargs, target_world="fr3_base")
+
+    out = export_v3.export_task_to_v3(**kwargs, target_world="auto")
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["world_frame"]["world_frame_id"] == "world_a"
+    printed = capsys.readouterr().out
+    assert "WARNING: world_graph.json 与这台机器上次确认的版本" in printed
+
+
 # ------------------------------------------------------ label provenance ---
 
 
@@ -970,6 +1083,9 @@ def test_export_records_the_label_chain(tmp_path, monkeypatch):
     assert session["camera_state_px"] == 0.5 and session["tcp_link"] == "corenetic_gripper_ee"
     sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
     assert sources[0]["extrinsics"] == "calib_1014" and sources[0]["camera_state"] == "ok"
+    # the test bundle is not on disk: the left hand exports, marked unvalidated (roadmap A3)
+    assert sources[0]["unvalidated_hands"] == ["left"]
+    assert block["hands"]["left"]["status"] == "unvalidated" and "hands" not in key
 
 
 def test_export_refuses_stale_and_fresh_cameras_together_and_keeps_the_old_export(tmp_path, monkeypatch):
@@ -1051,3 +1167,79 @@ def test_untracked_sessions_do_not_count_as_a_different_chain(tmp_path, monkeypa
     block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
     assert block["sessions"]["pick_and_place_20261014_160000"]["tracked"] is False
     assert block["key"]["extrinsics"] == ["calib_1014"]
+
+
+def test_export_records_each_episode_against_the_table_but_keeps_it_out_of_the_key(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261014_150515": ("calib_1014", "ok")}
+    )
+    monkeypatch.setattr(export_v3, "_TABLE_CHECK_PYTHON", Path("no/such/python3"))
+    clean = json.loads((_export(datasets, exports, overwrite=True) / "meta" / "info.json").read_text())
+    check = clean["label_provenance"]["sessions"]["pick_and_place_20261014_150515"]["table_check"]
+    assert check["verdict"] == "unchecked" and "no/such/python3" in check["why"]
+    moved = {
+        "verdict": "cameras_moved",
+        "episodes": 1,
+        "episodes_checked": 1,
+        "episode_verdicts": {"episode_000000": "cameras_moved"},
+        "cameras_moved": ["cam_09"],
+        "worst_shift_px": {"cam_09": 1.4},
+        "file": "derived/table_check.json",
+    }
+    runs = []
+    monkeypatch.setattr(export_v3, "_table_check", lambda _session, run="": runs.append(run) or dict(moved))
+    lines = []
+    monkeypatch.setattr(export_v3, "_emit", lines.append)
+
+    out = _export(datasets, exports, overwrite=True)  # a warning, not a refusal
+
+    block = json.loads((out / "meta" / "info.json").read_text())["label_provenance"]
+    assert block["sessions"]["pick_and_place_20261014_150515"]["table_check"]["cameras_moved"] == ["cam_09"]
+    assert block["fingerprint"] == clean["label_provenance"]["fingerprint"]
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
+    assert sources[0]["table_check"] == "cameras_moved"
+    assert any(line.startswith("WARNING: pick_and_place_20261014_150515: cameras_moved") for line in lines)
+    # held against the run the session was tracked with: what its labels are on
+    assert runs == [block["sessions"]["pick_and_place_20261014_150515"]["extrinsics"]] and runs[0]
+
+
+def test_the_table_check_runs_in_the_tracker_venv_and_reads_back_what_it_wrote(tmp_path, monkeypatch):
+    import subprocess
+
+    session = tmp_path / "thor_gmsl2_11ch_v1_20261028_090000"
+    session.mkdir()
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", tmp_path)
+    monkeypatch.setenv("PYTHONPATH", "/usr/lib/python3/dist-packages")
+    assert export_v3._table_check(session)["verdict"] == "unchecked"  # no venv
+
+    python = tmp_path / export_v3._TABLE_CHECK_PYTHON
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        out = session / export_v3._TABLE_CHECK_FILE
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"verdict": "ok", "episodes": 2, "episodes_checked": 2, "episodes_detail": {}}))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(export_v3.subprocess, "run", fake_run)
+    check = export_v3._table_check(session)
+    (command, kwargs), = calls
+    assert command[:4] == [str(python), str(tmp_path / export_v3._TABLE_CHECK_SCRIPT), "session", str(session)]
+    # each episode is held against the run it was recorded on, which lives under the repo, not the cwd
+    assert command[command.index("--calibration-root") + 1] == str(tmp_path / "outputs" / "calibration")
+    assert kwargs["stdin"] is subprocess.DEVNULL  # an inherited stdin has ended a recorder session before
+    assert "PYTHONPATH" not in kwargs["env"] and kwargs["env"]["PYTHONNOUSERSITE"] == "1"
+    assert check["verdict"] == "ok" and check["episodes_checked"] == 2 and "episodes_detail" not in check
+    assert "--extrinsics-run" not in command  # untracked: each episode's own record of production
+    export_v3._table_check(session, "calib_1014_extrinsics")
+    assert calls[-1][0][-2:] == ["--extrinsics-run", "calib_1014_extrinsics"]
+
+    monkeypatch.setattr(
+        export_v3.subprocess, "run", lambda c, **k: subprocess.CompletedProcess(c, 2, "", "Traceback\nKeyError: 'x'")
+    )
+    (session / export_v3._TABLE_CHECK_FILE).unlink()
+    assert export_v3._table_check(session) == {"verdict": "unchecked", "why": "KeyError: 'x'"}

@@ -203,3 +203,24 @@ def test_main_returns_nonzero_when_any_check_fails(monkeypatch, capsys):
     assert exit_code == 1
     assert "fr3_record_preflight=FAIL" in captured.out
     assert "fr3_arm" in captured.out
+
+
+def test_the_arm_check_is_followed_by_the_payload_desk_holds(monkeypatch):
+    """Roadmap B2: a Desk load set for the other arm (or the gripper that is away) fails before anything moves."""
+    args = fr3_record_preflight.parse_args(
+        ["--skip-host-imports", "--skip-ping", "--skip-gripper", "--skip-hikrobot", "--robot-ip", "192.168.11.102"]
+    )
+    monkeypatch.setattr(
+        fr3_record_preflight,
+        "_load_runtime_config",
+        lambda *_args: {"robot": {"robot_ip": "192.168.11.102", "gripper_backend": "corenetic"}},
+    )
+    monkeypatch.setattr(fr3_record_preflight, "check_fr3_arm", lambda ip: (True, "connected"))
+    monkeypatch.setattr(fr3_record_preflight, "check_fr3_payload", lambda ip: (False, f"{ip} does NOT match"))
+    results, _ = fr3_record_preflight.run_preflight(args)
+    assert [(r.name, r.ok) for r in results][-2:] == [("fr3_arm", True), ("fr3_payload", False)]
+
+
+def test_the_payload_check_skips_an_fr3_the_registry_does_not_have():
+    ok, details = fr3_record_preflight.check_fr3_payload("192.168.1.208")
+    assert ok and details.startswith("skipped: 192.168.1.208 is no FR3")

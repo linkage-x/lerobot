@@ -4527,3 +4527,275 @@ button.danger {
   max-width: 100%;
   overflow-x: auto;
 }
+
+.dual-fr3-panel .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.dual-fr3-panel .dual-fr3-ok {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.dual-fr3-panel .dual-fr3-no {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+/* Which FR3 (roadmap B2): radio buttons, empty until chosen; an arm out of service stays visible, greyed. */
+.arm-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.arm-picker > span {
+  color: #52616d;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.arm-picker label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.arm-picker .arm-picker-off {
+  color: #9aa5ae;
+}
+
+.arm-picker-prompt {
+  color: #a1560f;
+  font-size: 12px;
+}
+
+/* Two-arm replay (roadmap D4) */
+.dual-fr3-run {
+  border-top: 1px solid #e3e8ec;
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.dual-fr3-run h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+
+.dual-fr3-run-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin-bottom: 8px;
+}
+
+.dual-fr3-run-choices > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.dual-fr3-run-choices span {
+  color: #52616d;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dual-fr3-edges {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  margin: 0 0 8px;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.dual-fr3-log {
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+/* Both FR3s to start: the plan before anything moves */
+.dual-home-panel .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-bottom: 8px;
+}
+
+.dual-home-panel .dual-fr3-ok {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.dual-home-panel .dual-fr3-no {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.dual-home-verdict {
+  font-size: 14px;
+  margin: 8px 0;
+}
+
+.dual-home-reasons,
+.dual-home-results {
+  font-size: 12px;
+  margin: 0 0 8px;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.dual-home-reasons {
+  color: #b91c1c;
+}
+
+.dual-home-chosen td {
+  background: #ecfdf3;
+}
+
+/* --- calibration page: tabs + overview map (CalibrationPage.tsx) --- */
+.cali-tabs {
+  background: #ffffff;
+  border: 1px solid #d2d9de;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.cali-tab {
+  align-items: center;
+  background: transparent;
+  border-color: transparent;
+  color: #43525e;
+  display: inline-flex;
+  gap: 6px;
+  min-height: 34px;
+}
+.cali-tab:hover:not(:disabled) { background: #eef4f3; border-color: transparent; }
+.cali-tab.active { background: #0f766e; border-color: #0f766e; color: #ffffff; }
+.cali-tab.active .nav-badge { background: #ffffff; }
+.cali-map {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.cali-map-card {
+  align-items: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 96px;
+  padding: 10px 12px;
+  text-align: left;
+}
+.cali-map-card strong { align-items: center; display: inline-flex; font-size: 14px; gap: 6px; }
+.cali-map-card span { color: #172026; font-size: 12px; font-weight: 500; }
+.cali-map-card em { color: #7b8791; font-size: 12px; font-style: normal; font-weight: 400; }
+
+/* --- numbered steps inside a panel (Fr3PayloadPanel, SixDFitPanel) --- */
+.cali-steps { display: grid; gap: 10px; list-style: none; margin: 10px 0 0; padding: 0; }
+.cali-step {
+  border: 1px solid #e1e6ea;
+  border-left: 3px solid #0f766e;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.cali-step-title { color: #172026; font-size: 14px; font-weight: 700; }
+.cali-step p { margin: 0; }
+.cali-confirm-list { display: grid; gap: 6px; margin-top: 8px; }
+.payload-row { align-items: flex-end; display: flex; flex-wrap: wrap; gap: 10px; }
+.payload-row .cali-field { align-items: flex-start; flex-direction: column; gap: 3px; }
+.payload-row .cali-field input,
+.cali-step .cali-field input {
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  font: inherit;
+  min-height: 32px;
+  padding: 4px 8px;
+  width: 110px;
+}
+.payload-note input { width: min(420px, 80vw) !important; }
+.cali-step > .cali-field { align-items: flex-start; flex-direction: column; gap: 3px; }
+.payload-choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.payload-choice {
+  align-items: center;
+  border: 1px solid #d2d9de;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 6px;
+  padding: 6px 10px;
+}
+.payload-choice.active { background: #f2faf8; border-color: #0f766e; }
+.payload-line { color: #43525e; font-size: 12px; overflow-wrap: anywhere; }
+.payload-log {
+  background: #0f172a;
+  border-radius: 6px;
+  color: #cbd5e1;
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+}
+.payload-stop { border-color: #b91c1c; color: #b91c1c; margin-left: auto; }
+.payload-runs { border-collapse: collapse; font-size: 12px; width: 100%; }
+.payload-runs th, .payload-runs td { border-bottom: 1px solid #eef1f3; padding: 4px 6px; text-align: left; vertical-align: top; }
+.payload-run-off { color: #9aa5ae; }
+.payload-verdict-ok { color: #0b5f5a; font-weight: 650; }
+.payload-verdict-warn { color: #8a5a12; }
+.payload-verdict-bad { color: #8d2d12; font-weight: 650; }
+.payload-figures { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+.payload-figures div { display: flex; flex-direction: column; gap: 2px; }
+.payload-figures span { color: #7b8791; font-size: 11px; }
+.payload-figures strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+.payload-figures small { color: #7b8791; font-size: 11px; }
+.payload-desks { display: grid; gap: 8px; }
+.face-grid { display: grid; gap: 8px; grid-template-columns: repeat(6, minmax(70px, 1fr)); }
+.face-tile {
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 2px;
+  justify-items: center;
+  padding: 6px;
+}
+.face-tile .progress { margin: 2px 0; width: 100%; }
+.face-tile strong { font-size: 15px; }
+.face-tile span { color: #60707c; font-size: 11px; font-variant-numeric: tabular-nums; }
+.face-tile.done { background: #f2faf8; border-color: #b6ded8; }
+@media (max-width: 640px) {
+  .face-grid { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* A preview badge outside a camera preview (panel headings, table cells) sits in the flow:
+   absolutely positioned there it landed in the page's top-left corner. */
+.panel .cali-preview-badge { display: inline-block; position: static; }
+.panel .camera-tile-media .cali-preview-badge { position: absolute; }
+.cali-step .cali-muted { font-size: 13px; }
+
+/* FR3 pivot results: ten runs in view, the rest scroll under a sticky header (Fr3PivotPanel RUNS_VISIBLE). */
+.fr3-pivot-runs-scroll {
+  overflow-y: auto;
+}
+
+.fr3-pivot-runs-scroll thead th {
+  background: #fff;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}

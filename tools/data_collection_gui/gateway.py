@@ -32,10 +32,13 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
+from tools.data_collection_gui import fr3_payload_calibration as payload_cal
+from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
 from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
+from tools.thor.gmsl2 import world_graph_guard
 from tools.thor.gmsl2 import world_provenance as wp
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -103,6 +106,20 @@ DEFAULT_EE_TRAJECTORY_CONFIG = Path(
 HYBRID_CARRIER_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/hybrid_carrier_tracking_in_robot_base_thor.yaml"
 )
+# Gripper-holder V3 marker rig (v9b, ArUco DICT_6X6_250 ids 106-109). Its corner
+# table and rig->TCP bundle are generated from the CAD descriptor and the measured
+# socket centre by metrology.cli.export_marker_rig_layout; the config names both.
+GRIPPER_RIG_V9B_TARGET = "gripper_rig_v9b"
+GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_tracking_in_robot_base_thor.yaml"
+)
+# The same holder on the right hand-held gripper (BOX 3906437858), ids 100/101/110/111,
+# target `right`; its own corner table (pads from the 11-09 paste check) and bundle (TCP
+# from its own 11-09 pivots, the mean of two recordings 0.35 mm apart, validated).
+GRIPPER_RIG_V9B_RIGHT_TARGET = "gripper_rig_v9b_right"
+GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_right_tracking_in_robot_base_thor.yaml"
+)
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -122,7 +139,21 @@ TRACKING_TARGETS = {
         "config": HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
         "algorithm": "hybrid_carrier_v1_anchors_facets",
     },
+    GRIPPER_RIG_V9B_TARGET: {
+        "label": "Gripper Rig v9b left (ArUco 106-109)",
+        "config": GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
+        "algorithm": "marker_layout_rig_corner_ba",
+    },
+    GRIPPER_RIG_V9B_RIGHT_TARGET: {
+        "label": "Gripper Rig v9b right (ArUco 100/101/110/111)",
+        "config": GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
+        "algorithm": "marker_layout_rig_corner_ba",
+    },
 }
+# Rigs the marker->TCP pivot solve accepts. The cube's corner table is resolved
+# from the production cube template; a layout rig ships its own table, its own
+# dictionary and its own CAD bundle, all named by its tracking config.
+MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET, GRIPPER_RIG_V9B_RIGHT_TARGET)
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -183,6 +214,8 @@ class RecordingStatus:
     syncSummary: str = ""
     syncReportPath: str = ""
     syncWarnings: list[str] = field(default_factory=list)
+    # What the running episode misses of the 6D calibration procedure; it records regardless.
+    sixDCaliWarnings: list[str] = field(default_factory=list)
     # Whether this Connect asked for the laser tracker. The instrument is shared
     # and booked by other people, so this is a per-session choice rather than a
     # property of the rig, and the UI has to be able to turn it off on the days
@@ -244,8 +277,12 @@ class ReplayStatus:
     lastOutput: str = ""
     mujocoCubeMode: str = DEFAULT_MUJOCO_CUBE_MODE
     mujocoValidation: dict[str, Any] = field(default_factory=dict)
+    # Thor: the arm whose base the last MuJoCo preview planned in ("" = each hand in its own arm's base).
+    mujocoArm: str = ""
     realCubeMode: str = "right"
     realRobotIp: str = ""
+    # Thor: the arm (tools/fr3/fr3_arms.json) the last real replay or preflight was explicitly given.
+    realArm: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
     # Frames each pose command runs ahead of the trajectory (replay.pose_command_lead_frames) in
     # the last real replay started; the panel starts from it.
@@ -515,10 +552,20 @@ class GatewayState:
     fr3_pivot_process: subprocess.Popen[str] | None = None
     fr3_pivot_job: dict[str, Any] = field(default_factory=dict)
     fr3_pivot_lock: Lock = field(default_factory=Lock)
+    # calibration page: FR3 end-effector load + BOX 6D payload fit (fr3_payload_calibration.py)
+    payload_calibration: Any = None
     # FR3 gripper teleop from the handheld BOX (tools/fr3/fr3_gripper_teleop.py); same pattern.
     gripper_teleop_process: subprocess.Popen[str] | None = None
     gripper_teleop_job: dict[str, Any] = field(default_factory=dict)
     gripper_teleop_lock: Lock = field(default_factory=Lock)
+    # Two-arm replay (roadmap D4): tools/fr3/dual_fr3_replay_runtime.py, Connect -> at frame 0 -> Execute.
+    dual_replay_process: subprocess.Popen[str] | None = None
+    dual_replay_job: dict[str, Any] = field(default_factory=dict)
+    dual_replay_lock: Lock = field(default_factory=Lock)
+    # Both FR3s home (tools/fr3/dual_fr3_move_to_start.py): Check -> the plan -> Execute.
+    dual_home_process: subprocess.Popen[str] | None = None
+    dual_home_job: dict[str, Any] = field(default_factory=dict)
+    dual_home_lock: Lock = field(default_factory=Lock)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -541,6 +588,7 @@ class GatewayState:
     log_dir: Path | None = None
     gateway_log_path: Path | None = None
     recorder_log_path: Path | None = None
+    box_button_last_action_s: float = float("-inf")
     device_preview: dict[str, Any] = field(default_factory=dict)
     # BOX 6D force-sensor calibration: the recorder streams CALI_LOG/CALI_DONE
     # lines on stdout after a `cali_6dforce` stdin command; the reader thread
@@ -972,6 +1020,8 @@ _BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
     # and is reported per frame as `model`; keep the static label neutral.
     "box_touch_left": "BOX touch pad L",
     "box_touch_right": "BOX touch pad R",
+    "box_touch_left_1": "BOX touch pad L2",
+    "box_touch_right_1": "BOX touch pad R2",
 }
 
 
@@ -1547,6 +1597,10 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
         return "calibration"
     except (OSError, ValueError):
         pass
+    # Two recorded right hands, one mirrored: for the two-arm panels only, never a capture, an export
+    # or training data.
+    if _pseudo_bimanual_pairs(_load_dataset_info(dataset_root)):
+        return "pseudo_bimanual"
     try:
         resolved.relative_to(_task_exports_root(state).resolve())
     except (OSError, ValueError):
@@ -1559,7 +1613,7 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
 # recording, and a calibration sweep is instrument data with no demonstration in
 # it at all. Both would otherwise take the slot the moment they are written --
 # the sweep on every single wizard run.
-_NOT_A_FRESH_CAPTURE_KINDS = frozenset({"training_view", "calibration"})
+_NOT_A_FRESH_CAPTURE_KINDS = frozenset({"training_view", "calibration", "pseudo_bimanual"})
 
 
 def _can_claim_latest_capture(dataset_kind: str) -> bool:
@@ -1976,6 +2030,16 @@ def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
     return info if isinstance(info, dict) else {}
 
 
+def _pseudo_bimanual_pairs(info: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pairs of a pseudo_bimanual session (tools/fr3/pseudo_bimanual.py): two recorded right-hand
+    episodes standing in for two hands. It holds no parquet and no videos -- only the pairs, their hand
+    trajectories and two-arm verdicts -- so it is listed for the two-arm panels by its pairs."""
+    block = info.get("pseudo_bimanual")
+    if not isinstance(block, dict):
+        return []
+    return [pair for pair in block.get("pairs") or [] if isinstance(pair, dict) and "episode" in pair]
+
+
 def _feature_names(info: dict[str, Any], column: str) -> list[str]:
     feature = (info.get("features") or {}).get(column) or {}
     names = feature.get("names") if isinstance(feature, dict) else None
@@ -2100,6 +2164,9 @@ def _dataset_replay_meta(state: GatewayState, dataset_root: Path, info: dict[str
 
 
 def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = None) -> list[int]:
+    pairs = _pseudo_bimanual_pairs(info or _load_dataset_info(dataset_root))
+    if pairs:
+        return sorted(int(pair["episode"]) for pair in pairs)
     if _has_gmsl2_episodes(dataset_root):
         indices = []
         for d in _gmsl2_episode_dirs(dataset_root):
@@ -2579,6 +2646,8 @@ def _dataset_is_complete(dataset_root: Path) -> bool:
     info = _load_dataset_info(dataset_root)
     if not info:
         return False
+    if _pseudo_bimanual_pairs(info):
+        return True
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
         return False
@@ -3521,6 +3590,9 @@ def _register_world(
     args = ["register", "--current", str(bundle), "--calibration-id", state.calibration.extrinsicsRun or ""]
     if assume_stable:
         args += ["--assume-stable", *assume_stable]
+    anchor = _table_anchor_for(bundle)
+    if anchor is not None:
+        args += ["--anchor", str(anchor)]
     if apply_result:
         island = _exported_island(state, bundle)
         if island:
@@ -3566,6 +3638,94 @@ def _world_registration_for_export(state: GatewayState, bundle: Path) -> dict[st
     if not result.get("ok"):
         return None
     return result.get("registration")
+
+
+# --- Table anchor (roadmap B5', 10-28) -------------------------------------------
+#
+# Camera consensus carries the world across a recalibration, and is blind to the
+# one motion that matters most: the whole rig moving as one. The table tags 45-49
+# are fixed since 10-27 and mechanically independent of the rig, so each new
+# bundle is also placed in the world by them alone (cart_redock_check.py anchor,
+# against the frozen table_datum.json). world_registration then reports how far
+# the two placements disagree (common_mode), and can reconnect a solve whose
+# cameras all moved. Advisory by construction: a failed or missing anchor only
+# means that motion stays unobserved, as it was before.
+#
+# The same file keeps where every camera saw the table during the capture. It is
+# copied into the exported run, and episodes recorded on that run are checked
+# against it (cart_redock_check.py session, run by export_v3).
+_TABLE_ANCHOR_SCRIPT = Path("tools") / "thor" / "gmsl2" / "cart_redock_check.py"
+_TABLE_DATUM_FILE = "table_datum.json"
+_TABLE_ANCHOR_FILE = "table_anchor.json"
+# 10-27 185829 (8 cameras x 5402 frames, 120 read each): 22 s on the workstation
+_TABLE_ANCHOR_TIMEOUT_S = 900
+
+
+def _table_anchor_for(bundle: Path, *, measured_only: bool = True) -> Path | None:
+    """The table anchor measured for exactly this bundle, if there is one.
+
+    Matched by the bundle's hash, not by sitting in the same directory: a
+    re-solve into the same run directory must not inherit the last anchor.
+    """
+    path = bundle.parent / _TABLE_ANCHOR_FILE
+    data = _read_json_file(path)
+    if not data or (measured_only and data.get("status") != "measured"):
+        return None
+    try:
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return path if (data.get("bundle") or {}).get("sha256") == digest else None
+
+
+def _measure_table_anchor(state: GatewayState, python: Path, capture: Path, bundle: Path) -> Path | None:
+    """Place a fresh bundle in the world by the table tags; never fails the solve."""
+    out = bundle.parent / _TABLE_ANCHOR_FILE
+    out.unlink(missing_ok=True)
+    datum = _world_root(state) / _TABLE_DATUM_FILE
+    if not datum.is_file():
+        state.log("info", f"Table anchor: no {_TABLE_DATUM_FILE}, whole-rig motion stays unobserved")
+        return None
+    command = [
+        str(python), str(state.repo_root / _TABLE_ANCHOR_SCRIPT), "anchor", str(capture),
+        "--bundle", str(bundle), "--datum", str(datum), "--out", str(out),
+    ]
+    # numpy + cv2 only; an inherited PYTHONPATH could put another numpy first
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    state.calibration.message = "桌面锚点…"
+    try:
+        proc = subprocess.run(
+            command, cwd=str(state.repo_root), env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=_TABLE_ANCHOR_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        state.log("warn", f"Table anchor failed: {exc}")
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    summary = next((line for line in lines if line.startswith("table anchor")), "")
+    if proc.returncode not in (0, 2) or not summary:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        state.log("warn", f"Table anchor failed: {tail[-1] if tail else proc.returncode}")
+        return None
+    state.log("info" if proc.returncode == 0 else "warn", f"Table anchor: {summary.removeprefix('table anchor ')}")
+    return _table_anchor_for(bundle)
+
+
+def _log_common_mode(state: GatewayState, summary_path: Path) -> None:
+    """Say what the exported registration found about the whole rig, warning when it moved."""
+    world = (_read_json_file(summary_path) or {}).get("world") or {}
+    common = world.get("common_mode") or {}
+    if not common.get("observable") or "translation_mm" not in common:
+        state.log("info", "World registration: no table anchor, whole-rig motion not observable")
+        return
+    line = (
+        f"table anchor {common['translation_mm']:.2f} mm / {common['rotation_deg']:.3f} deg "
+        f"from the camera consensus ({world.get('world_continuity_state', '?')})"
+    )
+    if common.get("drifted"):
+        state.log("warn", f"World registration: {line} -- the rig (or the table) moved as a whole")
+    else:
+        state.log("info", f"World registration: {line}")
 
 
 # --- FR3 base registration edge (world -> fr3_base) ----------------------------
@@ -3619,19 +3779,6 @@ def _rotation_angle_deg(R: list[list[float]]) -> float:
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
 
 
-def _edge_T_fr3_base_world(edge: dict[str, Any]) -> list[list[float]] | None:
-    """``T_fr3_base_world`` of a direct edge, whichever way it was written."""
-    try:
-        T = [[float(v) for v in row] for row in edge["T_to_from"]]
-    except (KeyError, TypeError, ValueError):
-        return None
-    if str(edge.get("to_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
-        return T
-    if str(edge.get("from_world_frame_id")) == wp.FR3_BASE_WORLD_ID:
-        return wp._rigid_inverse(T)
-    return None
-
-
 def _edge_is_laser(edge: dict[str, Any]) -> bool:
     return str(edge.get("method") or "").startswith(register_fr3_base.LASER_METHOD)
 
@@ -3644,9 +3791,46 @@ def _edge_is_ball(edge: dict[str, Any]) -> bool:
     return str(edge.get("method") or "").startswith(_BALL_EDGE_METHOD)
 
 
+# fr3_arm_arm_ball.METHOD: the two FR3 bases joined by balls both arms pivoted about (B3)
+_ARM_ARM_METHOD = "fr3_arm_arm_ball"
+# The right FR3's root (embodiments/fr3_dual.json) -- a base before any edge reaches it.
+_RIGHT_FR3_ROOT = "fr3_base_right"
+_ARM_ARM_SCRIPT = Path("tools") / "thor" / "gmsl2" / "fr3_arm_arm_ball.py"
+
+
+def _edge_is_arm_arm(edge: dict[str, Any]) -> bool:
+    return str(edge.get("method") or "").startswith(_ARM_ARM_METHOD)
+
+
+def _edge_pair(edge: dict[str, Any], bases: set[str]) -> tuple[str, str]:
+    """``(source, target)`` of an edge into a robot base: target is the base (the right one for base to base)."""
+    a, b = str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or "")
+    if b in bases and (a not in bases or _edge_is_arm_arm(edge)):
+        return a, b
+    if a in bases and b not in bases:
+        return b, a
+    return a, b
+
+
+def _edge_T_oriented(edge: dict[str, Any], source: str, target: str) -> list[list[float]] | None:
+    """``T_target_source`` of a direct edge between ``source`` and ``target``, whichever way it was written."""
+    try:
+        T = [[float(v) for v in row] for row in edge["T_to_from"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    ends = (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
+    if ends == (source, target):
+        return T
+    if ends == (target, source):
+        return wp._rigid_inverse(T)
+    return None
+
+
 def _edge_label(edge: dict[str, Any]) -> str:
     """What the edge was measured from, in a few words: the P0 run, the station and the replays, or the balls."""
     source = edge.get("source") or {}
+    if _edge_is_arm_arm(edge):
+        return f"{len(source.get('positions') or [])} 个球位 · 两臂同球"
     if _edge_is_ball(edge):
         return f"{len(source.get('positions') or [])} 个球位 · {Path(str(source.get('ball_check') or '')).stem}"
     if _edge_is_laser(edge):
@@ -3672,6 +3856,18 @@ def _edge_quality_summary(edge: dict[str, Any]) -> dict[str, Any]:
                 "edgeShiftDeg": shift.get("rotation_deg"),
             }
         )
+    if _edge_is_arm_arm(edge):
+        return {
+            "method": "armArm",
+            "positions": quality.get("positions"),
+            "residualRmsMm": quality.get("residual_rms_mm"),
+            "leaveOneOutRmsMm": quality.get("leave_one_out_rms_mm"),
+            "leaveOneOutMaxMm": quality.get("leave_one_out_max_mm"),
+            "rotationSpreadDeg": quality.get("rotation_spread_deg"),
+            "baselineM": quality.get("baseline_m"),
+            "extentMm": quality.get("extent_mm"),
+            "folds": [],
+        }
     if _edge_is_ball(edge):
         return {
             "method": "ball",
@@ -3825,16 +4021,47 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         graph = wp.read_world_graph(repo)
     except RuntimeError as exc:
         graph, error = {}, str(exc)
+    # Every robot base: the graph's own robot_base nodes, and the two FR3 roots before they have an edge.
+    bases = wp._robot_bases(graph) | {wp.FR3_BASE_WORLD_ID, _RIGHT_FR3_ROOT}
+
+    def _ends(edge: dict[str, Any]) -> tuple[str, str]:
+        return str(edge.get("from_world_frame_id") or ""), str(edge.get("to_world_frame_id") or "")
+
+    touching = [edge for edge in graph.get("edges") or [] if set(_ends(edge)) & bases]
+    # A retired edge is a record of where the base was, not the live edge: nothing routes through it.
+    live_edges = [edge for edge in touching if wp.edge_retired(edge) is None]
+    # "current" stays the world -> fr3_base edge (the left arm's, the datasets' frame); the others are links
     direct = [
         edge
-        for edge in graph.get("edges") or []
-        if wp.FR3_BASE_WORLD_ID in (str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id")))
+        for edge in live_edges
+        if wp.FR3_BASE_WORLD_ID in _ends(edge) and not set(_ends(edge)) <= bases
+    ]
+    retired = [
+        {
+            "label": _edge_label(edge),
+            "from": _edge_pair(edge, bases)[0],
+            "to": _edge_pair(edge, bases)[1],
+            "createdUtc": edge.get("created_utc", ""),
+            "retiredUtc": str((wp.edge_retired(edge) or {}).get("utc") or ""),
+            "reason": str((wp.edge_retired(edge) or {}).get("reason") or ""),
+        }
+        for edge in touching
+        if wp.edge_retired(edge) is not None
+    ]
+    links = [
+        {
+            "from": _edge_pair(edge, bases)[0],
+            "to": _edge_pair(edge, bases)[1],
+            "label": _edge_label(edge),
+            "createdUtc": edge.get("created_utc", ""),
+            "sigmaMm": wp.edge_sigma_mm(edge),
+            "quality": _edge_quality_summary(edge),
+        }
+        for edge in live_edges
     ]
     current: dict[str, Any] | None = None
-    T_current: list[list[float]] | None = None
     if direct:
         edge = direct[-1]
-        T_current = _edge_T_fr3_base_world(edge)
         source = edge.get("source") or {}
         world = (
             str(edge.get("from_world_frame_id"))
@@ -3885,9 +4112,12 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         edge = report.get("edge") or {}
         source = edge.get("source") or {}
         run_name = Path(str(source.get("p0_run") or "")).name
-        T_new = _edge_T_fr3_base_world(edge)
+        pair = _edge_pair(edge, bases)
+        live_same = [e for e in live_edges if set(_ends(e)) == set(pair)]
+        T_new = _edge_T_oriented(edge, *pair)
+        T_live = _edge_T_oriented(live_same[-1], *pair) if live_same else None
         move = None
-        if T_new is not None and T_current is not None:
+        if T_new is not None and T_live is not None:
             if "workspace_points_base_m" in report:
                 # where the replays put the TCP, or where the balls were: the workspace this edge was measured in
                 points = report.get("workspace_points_base_m") or []
@@ -3895,18 +4125,20 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
                 if run_name not in positions:
                     positions[run_name] = _p0_run_tool_positions(runs_root / run_name)
                 points = positions[run_name]
-            move = _edge_move_in_workspace(T_new, T_current, points)
+            move = _edge_move_in_workspace(T_new, T_live, points)
         same_as_live = (
-            current is not None
-            and source == (direct[-1].get("source") or {})
+            bool(live_same)
+            and source == (live_same[-1].get("source") or {})
             and move is not None
             and move["maxMm"] < 0.01
         )
-        world = str(edge.get("from_world_frame_id") or "")
+        world = pair[0]
         blockers = []
         if report.get("verdict") != "ok":
             blockers.append("判定未通过")
-        if world != reference_id:
+        if _edge_is_arm_arm(edge):
+            pass  # base to base, FK only: no camera world to have changed
+        elif world != reference_id:
             blockers.append(f"解算时的世界系是 {world}，当前基准是 {reference_id or '—'}")
         elif source.get("world_reference_sha256") != reference_sha:
             blockers.append("world_reference.json 在解算之后改过，需要重新解算")
@@ -3916,6 +4148,8 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
             {
                 "name": path.name,
                 "generatedUtc": report.get("generated_utc", ""),
+                "from": pair[0],
+                "to": pair[1],
                 "label": _edge_label(edge),
                 "p0Run": run_name,
                 "verdict": report.get("verdict", ""),
@@ -3934,6 +4168,14 @@ def _fr3_base_edge_payload(state: GatewayState) -> dict[str, Any]:
         "error": error,
         "referenceWorld": reference_id,
         "current": current,
+        "retired": retired,
+        "links": links,
+        "graphGuard": {
+            "state": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("state") or ""),
+            "problems": list((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("problems") or []),
+            "recordedUtc": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("recorded_utc") or ""),
+            "reason": str((graph.get(world_graph_guard.GRAPH_KEY) or {}).get("reason") or ""),
+        },
         "runs": runs,
         "candidates": candidates,
         "runsRoot": str(_P0_RUNS_SUBDIR),
@@ -4062,18 +4304,81 @@ def _apply_fr3_base_edge(state: GatewayState, body: dict[str, Any]) -> dict[str,
     try:
         register_fr3_base.check_reference(report, world_dir)
         graph = wp.read_world_graph(state.repo_root)
-        updated = register_fr3_base.apply_report(report, graph, replace=True)
+        guard = graph.get(world_graph_guard.GRAPH_KEY)
+        if world_graph_guard.blocks(guard):
+            # applying would trust whatever else changed in the file too: confirm the graph first
+            raise ValueError(world_graph_guard.note(guard))
+        # close_loop: with world -> both bases and the arm-arm edge the graph has a loop; the new edge goes
+        # in only if every route between its ends agrees within the edges' sigmas (world_closures)
+        updated = register_fr3_base.apply_report(report, graph, replace=True, close_loop=True)
         register_fr3_base.write_graph(graph_path, updated)
+        world_graph_guard.record(state.repo_root, reason=f"applied {name} on the calibration page")
     except (ValueError, RuntimeError, OSError) as exc:
         return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
-    run = _edge_label(report.get("edge") or {})
+    edge = report.get("edge") or {}
+    run = _edge_label(edge)
+    ends = f"{edge.get('from_world_frame_id')} -> {edge.get('to_world_frame_id')}"
     with state.lock:
         state.log(
             "warn",
-            f"world -> fr3_base edge replaced by {run} ({name}); every fr3_base replay and export from now on uses it. "
+            f"{ends} edge replaced by {run} ({name}); every replay and export through it from now on uses it. "
             f"{_WORLD_SUBDIR / _WORLD_GRAPH_FILE} changed on this machine only -- copy it back into the repo and commit.",
         )
     return {**_fr3_base_edge_payload(state), "ok": True, "applied": name}
+
+
+def _accept_world_graph(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Trust the world graph on disk as it is now (world_graph_guard), after a person checked what changed.
+
+    ``problems`` must be the list the page showed: a graph that changed again since is not what was looked at.
+    """
+    status = world_graph_guard.check(state.repo_root)
+    shown = body.get("problems")
+    if isinstance(shown, list) and [str(p) for p in shown] != status["problems"]:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": "world_graph.json 在你查看之后又变了，刷新后重新核对"}
+    try:
+        world_graph_guard.record(state.repo_root, reason="confirmed on the calibration page")
+    except (OSError, world_graph_guard.WorldGraphGuardError) as exc:
+        return {**_fr3_base_edge_payload(state), "ok": False, "error": str(exc)}
+    with state.lock:
+        state.log(
+            "warn",
+            "world_graph.json confirmed as trusted on the calibration page"
+            + (f" despite: {'; '.join(status['problems'])}" if status["problems"] else ""),
+        )
+    return {**_fr3_base_edge_payload(state), "ok": True}
+
+
+def _bootstrap_world_graph_guard(state: GatewayState) -> None:
+    """At gateway start: record the graph the first time; afterwards say loudly when it is not the trusted one."""
+    status = world_graph_guard.check(state.repo_root)
+    if status["state"] == world_graph_guard.UNRECORDED:
+        try:
+            world_graph_guard.record(state.repo_root, reason="first gateway start with the world graph guard")
+        except (OSError, world_graph_guard.WorldGraphGuardError) as exc:
+            state.log("warn", f"world graph guard: could not record the graph ({exc})")
+            return
+        state.log("info", "world graph guard: recorded the current world_graph.json as trusted")
+    elif world_graph_guard.blocks(status):
+        state.log("error", world_graph_guard.note(status))
+
+
+def _world_graph_guard_status(state: GatewayState) -> dict[str, Any]:
+    """For the snapshot: the guard's verdict, re-read only when either file changed."""
+    paths = (state.repo_root / world_graph_guard.GRAPH_FILE, state.repo_root / world_graph_guard.GUARD_FILE)
+    try:
+        key = tuple(p.stat().st_mtime_ns if p.exists() else 0 for p in paths)
+    except OSError:
+        key = (-1, -1)
+    cached = _WORLD_GRAPH_GUARD_CACHE.get(str(state.repo_root))
+    if cached is None or cached[0] != key:
+        status = world_graph_guard.check(state.repo_root)
+        cached = (key, {"state": status["state"], "problems": status["problems"], "recordedUtc": status["recorded_utc"]})
+        _WORLD_GRAPH_GUARD_CACHE[str(state.repo_root)] = cached
+    return cached[1]
+
+
+_WORLD_GRAPH_GUARD_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
 
 # Outside the state lock (see the POST handler): the solve runs for minutes.
@@ -4081,6 +4386,7 @@ _FR3_BASE_EDGE_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[s
     "/api/calibration/fr3-base-edge/solve": _solve_fr3_base_edge,
     "/api/calibration/fr3-base-edge/solve-laser": _solve_fr3_base_laser_edge,
     "/api/calibration/fr3-base-edge/apply": _apply_fr3_base_edge,
+    "/api/calibration/world-graph/accept": _accept_world_graph,
 }
 
 
@@ -4115,7 +4421,11 @@ _FR3_PIVOT_ANCHOR_MAX_RMS_MM = 3.0
 _FR3_PIVOT_ANCHOR_MAX_SIGMA_MM = 3.0
 _FR3_PIVOT_ANCHOR_MIN_SPAN_DEG = 20.0
 _FR3_PIVOT_ANCHOR_MIN_WEAK = 0.1
-_FR3_PIVOT_ANCHOR_MAX_MM = 20.0
+# 11-09: the 44 mm fingertips put the ball 23-36 mm out from corenetic_socket_ee (fr3_pivot_auto's
+# GUIDE_MAX_ANCHOR_MM, the same number).
+_FR3_PIVOT_ANCHOR_MAX_MM = 45.0
+# The probe's prior (plan --probe --anchor-mm): where it guesses the ball before any fit. Its labels.
+_FR3_PIVOT_PRIOR_FROM = {"desk_ee": "prior: Desk EE", "manual": "prior: entered"}
 # corenetic_socket_ee is a pure translation of corenetic_gripper_ee in this URDF (the one the tool fits
 # with). A fit's socket_frame is relative to the frame as it was when fitted (10-14 it moved from z -10.3
 # to the pivot's own value), so the anchor re-expresses the fit's corenetic_gripper_ee value in today's.
@@ -4157,6 +4467,8 @@ def _fr3_pivot_runs(state: GatewayState) -> list[dict[str, Any]]:
                 "name": path.name,
                 "commanded": (fit or {}).get("commanded"),
                 "fitName": _fr3_pivot_fit_path(path).name if fit else "",
+                # which arm turned about the ball: its base is the one the centre is in
+                "robotIp": str((fit or {}).get("robot_ip") or ""),
                 "note": str((fit or {}).get("note") or ""),
                 "created": str((fit or {}).get("created") or ""),
                 "fk": (fit or {}).get("fk"),
@@ -4184,6 +4496,7 @@ def _fr3_pivot_joints(state: GatewayState) -> list[dict[str, Any]]:
                 "name": path.name,
                 "created": str(report.get("created") or ""),
                 "runs": list(report.get("runs") or []),
+                "robotIp": _pivot_fit_robot_ip(path),
                 "sharedCentre": bool(report.get("shared_centre")),
                 "fk": report.get("fk"),
                 "socketFrame": socket or None,
@@ -4255,9 +4568,25 @@ def _fr3_pivot_centres(state: GatewayState) -> list[dict[str, Any]]:
                 "centreMm": [round(float(x) * 1e3, 1) for x in centre.get("centre_m") or []],
                 "toolFromLevelDeg": centre.get("tool_from_level_deg"),
                 "wallProblems": list(centre.get("wall_problems") or []),
+                "deskEeInSocketMm": _desk_ee_in_socket_mm(centre),
             }
         )
     return out
+
+
+def _desk_ee_in_socket_mm(centre: dict[str, Any]) -> list[float] | None:
+    """Desk's EE origin in corenetic_socket_ee at the capture (mm): R^T (EE - socket), both in the file.
+    With Desk set to the fingertip estimate this is the probe's prior for the ball."""
+    try:
+        R = [[float(v) for v in row] for row in centre["R"]]
+        ee = [float(row[3]) for row in centre["O_T_EE"][:3]]
+        c = [float(v) for v in centre["centre_m"]]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if len(R) != 3 or any(len(row) != 3 for row in R) or len(c) != 3:
+        return None
+    d = [ee[i] - c[i] for i in range(3)]
+    return [round(1e3 * sum(R[i][j] * d[i] for i in range(3)), 1) for j in range(3)]
 
 
 def _fr3_pivot_plans(state: GatewayState) -> list[dict[str, Any]]:
@@ -4313,7 +4642,8 @@ def _fr3_pivot_payload(state: GatewayState) -> dict[str, Any]:
         "centres": _fr3_pivot_centres(state),
         "plans": _fr3_pivot_plans(state),
         "joints": _fr3_pivot_joints(state),
-        "robotIp": _real_robot_ip(state),
+        "robotIp": _real_robot_ip(state) if state.profile == "workstation" else "",
+        "arms": _robot_arms_payload(state)["arms"],
         "defaultDurationS": _FR3_PIVOT_DEFAULT_DURATION_S,
         "guideDefaultS": _FR3_PIVOT_GUIDE_DEFAULT_S,
         "guideRangeS": list(_FR3_PIVOT_GUIDE_RANGE_S),
@@ -4342,6 +4672,8 @@ def _fr3_pivot_fci_holder(state: GatewayState) -> str:
         recorder = state.process
         if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
             return "FR3 录制器已连接"
+    if state.payload_calibration is not None:
+        return state.payload_calibration.fci_user()
     return ""
 
 
@@ -4414,7 +4746,7 @@ def _watch_fr3_pivot(state: GatewayState, process: subprocess.Popen[str], run: P
 def _start_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Teaching mode for ``durationS``, the arm moved about the ball by hand; then fit."""
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
         duration = float(body.get("durationS") or _FR3_PIVOT_DEFAULT_DURATION_S)
     except (TypeError, ValueError) as exc:
         return _fr3_pivot_refusal(state, str(exc))
@@ -4516,7 +4848,7 @@ def _run_fr3_pivot_tool(state: GatewayState, command: list[str], timeout_s: floa
 def _capture_fr3_pivot_centre(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Read only: the socket seated on the ball, its FK is the centre the plan pivots about."""
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except ValueError as exc:
         return _fr3_pivot_refusal(state, str(exc))
     busy = _fr3_pivot_busy(state) or _fr3_pivot_fci_holder(state)
@@ -4547,6 +4879,11 @@ def _plan_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     # The plan turns about the fitted ball centre too, as guide holds it there. A probe is what finds it.
     probe = bool(body.get("probe"))
     anchor_args: list[str] = ["--probe"] if probe else []
+    if probe and body.get("priorMm") is not None:
+        prior = _fr3_pivot_prior(body)
+        if isinstance(prior, str):
+            return _fr3_pivot_refusal(state, prior)
+        anchor_args += ["--anchor-mm", *[f"{x:g}" for x in prior[0]], "--anchor-from", prior[1]]
     if body.get("anchorFromFit") and not probe:
         anchor = _fr3_pivot_anchor(state)
         if not anchor["available"]:
@@ -4575,7 +4912,7 @@ def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, A
     if not summary.get("passed"):
         return _fr3_pivot_refusal(state, "这个规划没通过演算，不能执行")
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except ValueError as exc:
         return _fr3_pivot_refusal(state, str(exc))
     holder = _fr3_pivot_fci_holder(state)
@@ -4607,6 +4944,20 @@ def _execute_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, A
         state.log("warn", f"FR3 planned pivot executing on {robot_ip}: {name} -> {run.name}")
     Thread(target=_watch_fr3_pivot, args=(state, process, run), daemon=True, name=f"fr3-pivot-{process.pid}").start()
     return _fr3_pivot_payload(state)
+
+
+def _fr3_pivot_prior(body: dict[str, Any]) -> tuple[list[float], str] | str:
+    """The probe's prior ball centre in corenetic_socket_ee (mm) and its label, or why not."""
+    try:
+        prior = [float(x) for x in body.get("priorMm") or []]
+    except (TypeError, ValueError):
+        return "先验球心要是 3 个数"
+    if len(prior) != 3 or not all(math.isfinite(x) for x in prior):
+        return "先验球心要是 3 个数"
+    if math.hypot(*prior) > _FR3_PIVOT_ANCHOR_MAX_MM:
+        return f"先验球心离球窝坐标系 {math.hypot(*prior):.1f} mm，超过 {_FR3_PIVOT_ANCHOR_MAX_MM:g} mm"
+    label = _FR3_PIVOT_PRIOR_FROM.get(str(body.get("priorFrom") or ""), _FR3_PIVOT_PRIOR_FROM["manual"])
+    return prior, label
 
 
 def _fr3_pivot_bias(body: dict[str, Any]) -> list[float] | str:
@@ -4707,7 +5058,7 @@ def _guide_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str, Any
         return _fr3_pivot_refusal(state, bias)
     try:
         duration = float(body.get("durationS") or _FR3_PIVOT_GUIDE_DEFAULT_S)
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        robot_ip = _drive_target(state, body.get("arm"), body.get("robotIp"))["robot_ip"]
     except (TypeError, ValueError) as exc:
         return _fr3_pivot_refusal(state, str(exc))
     lo, hi = _FR3_PIVOT_GUIDE_RANGE_S
@@ -4841,6 +5192,49 @@ def _fit_joint_fr3_pivot(state: GatewayState, body: dict[str, Any]) -> dict[str,
     return {**_fr3_pivot_payload(state), "jointFitted": out.name, "output": output}
 
 
+def _pivot_fit_robot_ip(fit: Path) -> str:
+    """The FR3 a pivot fit was collected on (fr3_base_ball_check.fit_robot_ip, stdlib): a joint fit's runs must agree."""
+    report = _read_json_file(fit) or {}
+    own = str(report.get("robot_ip") or "")
+    if own or not report.get("runs"):
+        return own
+    sibling_fits = [_read_json_file(fit.parent.parent / (str(run).removesuffix(".json") + ".fit.json")) for run in report.get("runs") or []]
+    # an aborted run has no fit of its own; the others say which arm
+    ips = {str(sibling.get("robot_ip") or "") for sibling in sibling_fits if sibling}
+    return ips.pop() if len(ips) == 1 else ""
+
+
+def _resolve_pivot_fit(state: GatewayState, pivot: str) -> Path | None:
+    """A pivot run's fit, or a joint fit by name; ``None`` when it is neither."""
+    run = _fr3_pivot_run_path(state, pivot)
+    fit = _fr3_pivot_fit_path(run) if run is not None else _fr3_pivot_joint_root(state) / pivot
+    if not (run is not None or _FR3_PIVOT_JOINT_RE.match(pivot)) or not fit.is_file():
+        return None
+    return fit
+
+
+def _pivot_base(state: GatewayState, fits: list[Path]) -> tuple[str, str, str]:
+    """``(arm, robot_ip, root)`` all these pivot fits were collected on; ValueError if unknown or mixed.
+
+    The FR3 centre of a pivot is in the base of the arm that turned about the ball, so that arm's root
+    (embodiments/fr3_dual.json) is the base a ball edge from these pivots ends in.
+    """
+    ips = {_pivot_fit_robot_ip(fit) for fit in fits}
+    if "" in ips:
+        unknown = [fit.name for fit in fits if not _pivot_fit_robot_ip(fit)]
+        raise ValueError(f"这些 pivot 没有记下是哪台臂采的：{', '.join(unknown)}")
+    if len(ips) != 1:
+        raise ValueError(f"混用了两台臂的 pivot（{', '.join(sorted(ips))}）；每台臂单独做")
+    robot_ip = ips.pop()
+    arm = fr3_arms.arm_for_ip(fr3_arms.load(repo_root=state.repo_root), robot_ip)
+    if arm is None:
+        raise ValueError(f"{robot_ip} 不是 fr3_arms.json 里在役的臂")
+    root = _arm_root(state, arm)
+    if not root:
+        raise ValueError(f"{arm} 臂在 {_DUAL_FR3_EMBODIMENT} 里没有 root")
+    return arm, robot_ip, root
+
+
 def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """Every edge -- live and each candidate report -- against the balls both pivots found."""
     raw = body.get("positions")
@@ -4849,15 +5243,17 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     known = {(row["dataset"], int(row["episode"])) for row in _ball_check_episodes(state)}
     args: list[str] = []
     pairs: list[tuple[Path, int]] = []
+    fits: list[Path] = []
     for i, item in enumerate(raw, start=1):
         if not isinstance(item, dict):
             return _fr3_pivot_refusal(state, f"第 {i} 个位置不是对象")
         # one run's fit, or a joint fit of several runs on this ball (one shared centre: steadier)
         pivot = str(item.get("pivot") or "").strip()
         run = _fr3_pivot_run_path(state, pivot)
-        fit = _fr3_pivot_fit_path(run) if run is not None else _fr3_pivot_joint_root(state) / pivot
-        if not (run is not None or _FR3_PIVOT_JOINT_RE.match(pivot)) or not fit.is_file():
+        fit = _resolve_pivot_fit(state, pivot)
+        if fit is None:
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{item.get('pivot')!r} 不是一次已拟合的 FR3 pivot 或合并拟合")
+        fits.append(fit)
         if run is None and not (_read_json_file(fit) or {}).get("shared_centre"):
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{pivot} 是每次一个球心的合并拟合，不是一个球位置")
         try:
@@ -4869,6 +5265,11 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
             return _fr3_pivot_refusal(state, f"第 {i} 个位置：{dataset} episode {episode} 不在最近的录制里")
         args += ["--position", str(fit), dataset, str(episode)]
         pairs.append((Path(dataset), episode))
+    try:
+        _, _, base = _pivot_base(state, fits)
+    except ValueError as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    args += ["--base", base]
     if not _BALL_CHECK_LOCK.acquire(blocking=False):
         return _fr3_pivot_refusal(state, "已有一次同球检验在运行")
     try:
@@ -4912,6 +5313,72 @@ def _run_ball_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]
     with state.lock:
         state.log("info", f"FR3 base ball check written: {out.name}")
     return {**_fr3_pivot_payload(state), "checked": out.name, "output": output}
+
+
+def _solve_arm_arm_edge(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """fr3_base -> fr3_base_right from balls both arms pivoted about (B3): a candidate of the FR3 base panel.
+
+    ``positions``: ``[{"left": pivot, "right": pivot}, ...]``, each a fitted run or a shared-centre joint
+    fit; every left pivot must be the left arm's and every right the right arm's (by the IP each recorded).
+    """
+    raw = body.get("positions")
+    if not isinstance(raw, list) or not raw:
+        return _fr3_pivot_refusal(state, "至少要一个球位置：同一个球上左臂一次 pivot、右臂一次 pivot")
+    args: list[str] = []
+    sides: dict[str, list[Path]] = {"left": [], "right": []}
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            return _fr3_pivot_refusal(state, f"第 {i} 个位置不是对象")
+        pair = []
+        for side in ("left", "right"):
+            pivot = str(item.get(side) or "").strip()
+            fit = _resolve_pivot_fit(state, pivot)
+            if fit is None:
+                return _fr3_pivot_refusal(state, f"第 {i} 个位置的{'左' if side == 'left' else '右'}臂：{pivot!r} 不是已拟合的 pivot")
+            sides[side].append(fit)
+            pair.append(str(fit))
+        args += ["--position", *pair]
+    ips = {}
+    for side in ("left", "right"):
+        try:
+            arm, robot_ip, root = _pivot_base(state, sides[side])
+        except ValueError as exc:
+            return _fr3_pivot_refusal(state, f"{'左' if side == 'left' else '右'}臂这一列：{exc}")
+        expected = wp.FR3_BASE_WORLD_ID if side == "left" else _RIGHT_FR3_ROOT
+        if root != expected:
+            return _fr3_pivot_refusal(state, f"{'左' if side == 'left' else '右'}臂这一列是 {arm} 臂（{robot_ip}）的 pivot，基座是 {root}，不是 {expected}")
+        ips[side] = robot_ip
+    out = _fr3_base_edge_reports_root(state) / f"armarm_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    try:
+        python = _marker_tcp_python(state)
+        proc = subprocess.run(
+            [
+                str(python),
+                str(state.repo_root / _ARM_ARM_SCRIPT),
+                *args,
+                "--left-ip", ips["left"],
+                "--right-ip", ips["right"],
+                "--out", str(out),
+            ],
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fr3_pivot_refusal(state, str(exc))
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    report = _read_json_file(out) if out.is_file() else None
+    if proc.returncode not in (0, 2) or not report or "edge" not in report:
+        # nothing to compare or apply: not left in the candidates
+        out.unlink(missing_ok=True)
+        return {**_fr3_pivot_refusal(state, output.splitlines()[-1] if output else f"exit {proc.returncode}"), "output": output}
+    with state.lock:
+        state.log("info", f"FR3 arm-arm ball edge written: {out.name} ({report.get('verdict')})")
+    return {**_fr3_pivot_payload(state), "armArmEdge": out.name, "output": output}
 
 
 _BALL_CHECK_NAME_RE = re.compile(r"^check_[0-9A-Za-z_]+\.json$")
@@ -4960,6 +5427,7 @@ _FR3_PIVOT_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, 
     "/api/calibration/fr3-pivot/fit-joint": _fit_joint_fr3_pivot,
     "/api/calibration/fr3-pivot/check": _run_ball_check,
     "/api/calibration/fr3-pivot/ball-edge": _save_ball_edge,
+    "/api/calibration/fr3-pivot/arm-arm-edge": _solve_arm_arm_edge,
 }
 
 
@@ -4992,10 +5460,10 @@ def _gripper_teleop_running(state: GatewayState) -> bool:
     return process is not None and process.poll() is None
 
 
-def _gripper_teleop_settings(state: GatewayState) -> dict[str, Any]:
-    """Arm BOX id and the grasp rule, from the real replay YAML (the same gripper, the same rule)."""
+def _gripper_teleop_settings(state: GatewayState, replay_config: str | None = None) -> dict[str, Any]:
+    """Arm BOX id and the grasp rule, from the arm's real replay YAML (the same gripper, the same rule)."""
     try:
-        config = _load_yaml(state.repo_root / FR3_REPLAY_THOR_CONFIG)
+        config = _load_yaml(state.repo_root / (replay_config or FR3_REPLAY_THOR_CONFIG))
     except (OSError, RuntimeError, ValueError):
         config = {}
     robot = config.get("robot") if isinstance(config.get("robot"), dict) else {}
@@ -5015,18 +5483,27 @@ def _gripper_teleop_job_view(state: GatewayState) -> dict[str, Any]:
     return job
 
 
-def _gripper_teleop_payload(state: GatewayState) -> dict[str, Any]:
+def _gripper_teleop_payload(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    """The panel's view; ``arm``/``robot_ip`` name whose gripper (its replay YAML), as start does.
+
+    Without one, the default replay YAML's -- the left arm's, whose flange is bare since 11-02, so the
+    panel would read "no gripper BOX" and keep Enter disabled for the right arm that has it.
+    """
+    config: str | None = None
+    if str(arm or "").strip() or str(robot_ip or "").strip():
+        with suppress(ValueError):
+            config = _drive_target(state, arm, robot_ip).get("replay_config") or None
     return {
         "ok": True,
         "error": "",
         "job": _gripper_teleop_job_view(state),
-        **_gripper_teleop_settings(state),
+        **_gripper_teleop_settings(state, config),
         "hold": _read_json_file(_gripper_teleop_root(state) / "hold.json"),
     }
 
 
-def _gripper_teleop_refusal(state: GatewayState, message: str) -> dict[str, Any]:
-    return {**_gripper_teleop_payload(state), "ok": False, "error": message}
+def _gripper_teleop_refusal(state: GatewayState, message: str, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    return {**_gripper_teleop_payload(state, arm, robot_ip), "ok": False, "error": message}
 
 
 def _gripper_teleop_box_holder(state: GatewayState) -> str:
@@ -5038,11 +5515,117 @@ def _gripper_teleop_box_holder(state: GatewayState) -> str:
         replay = state.replay_process
         if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
             return "真机 replay 正在运行，它在控制 FR3 夹爪"
+    if state.payload_calibration is not None:
+        return state.payload_calibration.box_port_user()
     return ""
 
 
 def _gripper_teleop_conflict() -> str:
     return "FR3 夹爪遥控正在运行，它占着 BOX 端口（:15000）；先在标定页退出遥控"
+
+
+def _box_port_conflict(state: GatewayState) -> str:
+    """Why Connect / a real replay cannot take the BOX port now (teleop, a 6D capture, a payload run), or ""."""
+    if _gripper_teleop_running(state):
+        return _gripper_teleop_conflict()
+    if state.payload_calibration is not None:
+        return state.payload_calibration.box_port_user()
+    return ""
+
+
+# --- FR3 end-effector load + BOX 6D payload fit (calibration page) -----------
+
+
+def _payload_calibration(state: GatewayState) -> payload_cal.PayloadCalibration:
+    if state.payload_calibration is None:
+
+        def log(level: str, message: str) -> None:
+            with state.lock:
+                state.log(level, message)
+
+        def box_port_holder() -> str:
+            # everything but this module's own job, which the module checks itself
+            if _gripper_teleop_running(state):
+                return _gripper_teleop_conflict()
+            with state.lock:
+                recorder = state.process
+                if recorder is not None and recorder.poll() is None:
+                    return "录制器已连接，它占着 BOX 端口（:15000）；先 Disconnect"
+                replay = state.replay_process
+                if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+                    return "真机 replay 正在运行，它在控制 FR3 夹爪"
+            return ""
+
+        def fci_holder() -> str:
+            with state.lock:
+                replay = state.replay_process
+                if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+                    return "真机 replay 正在运行"
+                teleop = state.teleop_process
+                if teleop is not None and teleop.poll() is None:
+                    return "FR3 遥操作正在运行"
+                recorder = state.process
+                if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
+                    return "FR3 录制器已连接"
+            with state.fr3_pivot_lock:
+                if state.fr3_pivot_job.get("state") in ("collecting", "fitting"):
+                    return "FR3 pivot 正在采集"
+            return ""
+
+        def resolve_arm(arm: str) -> dict[str, Any]:
+            return _drive_target(state, arm or None, None)
+
+        def recorder_box_refusal() -> str:
+            with state.lock:
+                recorder = state.process
+                if recorder is None or recorder.poll() is not None:
+                    return "录制器没有连接；先 Connect"
+                if not _state_is_gmsl2(state):
+                    return "当前录制器不是 GMSL2/BOX 录制器"
+            return ""
+
+        def box_preview() -> dict[str, Any]:
+            box = state.device_preview.get("box")
+            return dict(box) if isinstance(box, dict) else {}
+
+        def six_d_cali_log() -> tuple[bool, list[dict[str, Any]]]:
+            with state.box_cali_lock:
+                return state.box_cali_running, [dict(e) for e in state.box_cali_log]
+
+        state.payload_calibration = payload_cal.PayloadCalibration(
+            payload_cal.Host(
+                repo_root=state.repo_root,
+                python=lambda: _mujoco_replay_python(state),
+                env=lambda: _real_preflight_env(state),
+                resolve_arm=resolve_arm,
+                arms=lambda: _robot_arms_payload(state)["arms"],
+                fci_holder=fci_holder,
+                box_port_holder=box_port_holder,
+                log=log,
+                recorder_box_refusal=recorder_box_refusal,
+                box_preview=box_preview,
+                box_roster=lambda: list(state.box_devices_roster or []),
+                trigger_six_d_cali=lambda origin, box_id: _trigger_box_six_d_force_cali(
+                    state, origin=origin, box_id=box_id
+                ),
+                six_d_cali_log=six_d_cali_log,
+            )
+        )
+    return state.payload_calibration
+
+
+_PAYLOAD_CALIBRATION_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/calibration/fr3-payload/check": lambda state, body: _payload_calibration(state).check(body),
+    "/api/calibration/fr3-payload/collect": lambda state, body: _payload_calibration(state).collect(body),
+    "/api/calibration/fr3-payload/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/fr3-payload/desk": lambda state, body: _payload_calibration(state).desk(body),
+    "/api/calibration/fr3-six-d-zero/start": lambda state, body: _payload_calibration(state).zero_start(body),
+    "/api/calibration/fr3-six-d-zero/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/six-d/capture": lambda state, body: _payload_calibration(state).capture_start(body),
+    "/api/calibration/six-d/stop": lambda state, body: _payload_calibration(state).stop(),
+    "/api/calibration/six-d/fit": lambda state, body: _payload_calibration(state).refit(body),
+    "/api/calibration/six-d/register": lambda state, body: _payload_calibration(state).register(body),
+}
 
 
 def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -5078,13 +5661,18 @@ def _watch_gripper_teleop(state: GatewayState, process: subprocess.Popen[str]) -
 
 
 def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
-    del body
-    settings = _gripper_teleop_settings(state)
+    arm, robot_ip = body.get("arm"), body.get("robotIp")
+    try:  # whose gripper: never a default (roadmap B2)
+        target = _drive_target(state, arm, robot_ip)
+    except ValueError as exc:
+        return _gripper_teleop_refusal(state, str(exc))
+    config = target.get("replay_config") or FR3_REPLAY_THOR_CONFIG
+    settings = _gripper_teleop_settings(state, config)
     if settings["armDeviceId"] is None:
-        return _gripper_teleop_refusal(state, f"{FR3_REPLAY_THOR_CONFIG} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）")
+        return _gripper_teleop_refusal(state, f"{config} 里没有 robot.corenetic_device_id（FR3 夹爪 BOX）", arm, robot_ip)
     holder = _gripper_teleop_box_holder(state)
     if holder:
-        return _gripper_teleop_refusal(state, holder)
+        return _gripper_teleop_refusal(state, holder, arm, robot_ip)
     command = [
         str(_mujoco_replay_python(state)),
         str(state.repo_root / _GRIPPER_TELEOP_SCRIPT),
@@ -5127,16 +5715,16 @@ def _start_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str
                     "error": "",
                 }
     if refusal or process is None:
-        return _gripper_teleop_refusal(state, refusal)
+        return _gripper_teleop_refusal(state, refusal, arm, robot_ip)
     with state.lock:
         state.log("info", f"FR3 gripper teleop started (arm BOX {settings['armDeviceId']})")
     Thread(target=_watch_gripper_teleop, args=(state, process), daemon=True, name=f"gripper-teleop-{process.pid}").start()
-    return _gripper_teleop_payload(state)
+    return _gripper_teleop_payload(state, arm, robot_ip)
 
 
 def _stop_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     """SIGINT: the script sends the last command, leaves the arm's BOX in control mode, exits."""
-    del body
+    arm, robot_ip = body.get("arm"), body.get("robotIp")
     with state.gripper_teleop_lock:
         process = state.gripper_teleop_process
         if process is not None and process.poll() is None:
@@ -5146,13 +5734,13 @@ def _stop_gripper_teleop(state: GatewayState, body: dict[str, Any]) -> dict[str,
         else:
             process = None
     if process is None:
-        return _gripper_teleop_refusal(state, "没有在遥控")
+        return _gripper_teleop_refusal(state, "没有在遥控", arm, robot_ip)
     with suppress(subprocess.TimeoutExpired):
         process.wait(timeout=_GRIPPER_TELEOP_STOP_WAIT_S)
     deadline = time.monotonic() + 1.0  # let the reader thread record the exit
     while time.monotonic() < deadline and _gripper_teleop_job_view(state).get("state") == "running":
         time.sleep(0.02)
-    return _gripper_teleop_payload(state)
+    return _gripper_teleop_payload(state, arm, robot_ip)
 
 
 _GRIPPER_TELEOP_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
@@ -5174,15 +5762,19 @@ _FR3_MOVE_TO_START_LOCK = Lock()
 
 def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
     try:
-        robot_ip = _validated_robot_ip(str(body.get("robotIp") or _real_robot_ip(state)), "Robot IP")
+        target = _drive_target(state, body.get("arm"), body.get("robotIp"))
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "robotIp": "", "output": ""}
+    robot_ip = target["robot_ip"]
+    start = target.get("start_joints_rad")
     refusal = {"ok": False, "robotIp": robot_ip, "output": ""}
     holder = _fr3_pivot_fci_holder(state)
     if not holder:
         with state.fr3_pivot_lock:
             if state.fr3_pivot_job.get("state") == "collecting":
                 holder = "FR3 pivot 采集正在进行"
+    if not holder and _dual_home_live(state):
+        holder = "双臂归位正在进行"
     if holder:
         return {**refusal, "error": f"{holder}，它占着 FR3 的 FCI；先停掉再归位"}
     if not _FR3_MOVE_TO_START_LOCK.acquire(blocking=False):
@@ -5194,6 +5786,7 @@ def _fr3_move_to_start(state: GatewayState, body: dict[str, Any]) -> dict[str, A
             str(_mujoco_replay_python(state)),
             str(state.repo_root / _FR3_MOVE_TO_START_SCRIPT),
             f"--robot-ip={robot_ip}",
+            *([f"--start-joints={','.join(repr(float(v)) for v in start)}"] if start else []),
         ]
         try:
             proc = subprocess.run(
@@ -5252,7 +5845,11 @@ _TRACKING_CONFIG = (
 )
 # Trackers that read the same camera rig. Promotion keeps them on the run
 # _TRACKING_CONFIG points at; they are never the authority on what is live.
-_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,)
+_FOLLOWER_TRACKING_CONFIGS = (
+    HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
+    GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
+    GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
+)
 
 
 def _load_active_calibration_runs(state: GatewayState) -> None:
@@ -5600,6 +6197,14 @@ def _promote_calibration(
 
 class StaleCalibrationError(RuntimeError):
     """Trajectory generation would silently use a calibration that is not the newest."""
+
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+class OtherTrackingTargetsError(RuntimeError):
+    """The dataset's sidecar already holds trajectories of a target this run does not produce."""
 
     def __init__(self, message: str, detail: dict[str, Any]) -> None:
         super().__init__(message)
@@ -6139,6 +6744,19 @@ def _resolve_marker_tcp_calibration_file(state: GatewayState, raw_path: str) -> 
     return path
 
 
+def _box_numeric_id(box_id: str) -> str:
+    """The firmware device_id in ``box123`` or ``123``; empty for anything else, e.g. a serial."""
+    match = re.fullmatch(r"(?:box)?(\d+)", str(box_id or "").strip())
+    return match.group(1) if match else ""
+
+
+def _box_registry_hand(state: GatewayState, box_id: str) -> str:
+    """Which hand tools/thor/box_devices.json says this handheld BOX is held in, if any."""
+    registry = _read_json_file(state.repo_root / "tools" / "thor" / "box_devices.json") or {}
+    entry = (registry.get("devices") or {}).get(_box_numeric_id(box_id)) or {}
+    return str(entry.get("hand") or "") if entry.get("role") == "handheld" else ""
+
+
 def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, dict[str, Any], Path | None]:
     target = str(box_id or "").strip()
     default_path = _default_marker_tcp_bundle_path(state)
@@ -6150,12 +6768,23 @@ def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, 
         for name, entry in cubes.items():
             if isinstance(entry, dict) and str(entry.get("device_id", "")).strip() == target:
                 return str(name), entry, default_path
+        # The bundle's ids are as old as its pivot, and the v4.1 firmware renumbered every BOX.
+        # The registry knows the hand a handheld BOX is held in, which is what names its cube.
+        hand = _box_registry_hand(state, target)
+        if hand and isinstance(cubes.get(hand), dict):
+            return hand, cubes[hand], default_path
     legacy = target.lower()
     if legacy in {"left", "right"}:
         return legacy, {}, default_path
     raise ValueError(
-        f"默认 production marker→TCP bundle 中找不到 BOX ID {target!r}。"
-        "请先登记该 BOX，或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
+        f"默认 production marker→TCP bundle 里没有 BOX {target!r} 的 cube，box_devices.json 也没登记它是哪只手。"
+        + (
+            "这个名字是出厂序列号，所有 BOX 都一样，认不出是哪一台；请更新前端后重新选择 BOX。"
+            if not _box_numeric_id(target)
+            else ""
+        )
+        + "夹爪 rig 请在面板选 rig，或把这只 BOX 写进 rig bundle 的 device_id；cube 请登记该 BOX，"
+        "或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
     )
 
 
@@ -6383,6 +7012,24 @@ def _marker_tcp_saved_samples(session: MarkerTcpSession, box_id: str) -> list[Ma
     return sorted(samples, key=lambda item: (item.datasetRoot, item.episodeIndex, item.id))
 
 
+def _marker_tcp_correct_episodes(state: GatewayState, session_name: str, samples: list[MarkerTcpSample]) -> None:
+    """Point each sample at the episode whose meta.json says it is that sample.
+
+    ``episodeIndex`` is the recorder's running save count when the sample started, and that
+    count is session-wide across capture roots: a calibration episode saved under another root
+    moves it without adding an episode to this dataset. The episode's own capture intent
+    is the record that cannot drift. A sample from before the intent carried ``sample_id``
+    matches nothing and keeps its index.
+    """
+    for sample in samples:
+        episodes = _resolve_user_path(state, sample.datasetRoot) / "episodes"
+        for meta_path in sorted(episodes.glob("episode_*/meta.json")):
+            intent = (_read_json_file(meta_path) or {}).get("capture_intent") or {}
+            if intent.get("session_id") == session_name and intent.get("sample_id") == sample.id:
+                sample.episodeIndex = int(meta_path.parent.name.removeprefix("episode_"))
+                break
+
+
 def _marker_tcp_subset_dataset(
     state: GatewayState,
     *,
@@ -6487,6 +7134,105 @@ def _marker_tcp_aruco_dictionary(state: GatewayState) -> str:
             f"cube_tracker.aruco_dictionary 未设置：{state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG}"
         )
     return dictionary
+
+
+def _marker_tcp_layout_rig(state: GatewayState, rig: str) -> dict[str, Any]:
+    """Everything a layout rig's pivot solve needs, read from its tracking config.
+
+    The config is the one place that names the rig's corner table and bundle, so
+    the solve reads them from there instead of carrying a second copy of either
+    path -- a solve on one table and a production run on another would agree
+    on nothing while both looked fine.
+    """
+    spec = TRACKING_TARGETS.get(rig)
+    if spec is None:
+        raise ValueError(f"unknown rig {rig!r}")
+    config_rel = Path(spec["config"])
+    cfg = _load_yaml_mapping(state.repo_root / config_rel)
+    tracker = cfg.get("cube_tracker") if isinstance(cfg.get("cube_tracker"), dict) else {}
+    cubes = tracker.get("cubes") if isinstance(tracker.get("cubes"), list) else []
+    if len(cubes) != 1 or not isinstance(cubes[0], dict):
+        raise ValueError(f"{config_rel}: a layout rig config must track exactly one rig")
+    cube_name = str(cubes[0].get("name") or "").strip().lower()
+    layout_raw = str(cubes[0].get("marker_layout_path") or tracker.get("marker_layout_path") or "").strip()
+    if not cube_name or not layout_raw:
+        raise ValueError(f"{config_rel}: cube_tracker.cubes[0] needs name and marker_layout_path")
+    layout_path = Path(layout_raw)
+    if not layout_path.is_absolute():
+        # Resolved like the tracker does: relative to hikon_cube_tracking_offline/.
+        layout_path = (state.repo_root / config_rel).parents[1] / layout_path
+    if not layout_path.is_file():
+        raise FileNotFoundError(f"{rig} 的 marker layout 不存在：{layout_path}")
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    dictionary = str(layout.get("aruco_dictionary") or "").strip()
+    if not dictionary:
+        raise ValueError(f"{layout_path}: layout declares no aruco_dictionary")
+    ee_cfg = cfg.get("ee_from_cube") if isinstance(cfg.get("ee_from_cube"), dict) else {}
+    bundle_raw = str(ee_cfg.get("marker_to_tcp_calibration_path") or "").strip()
+    if not bundle_raw:
+        raise ValueError(f"{config_rel}: ee_from_cube.marker_to_tcp_calibration_path is required")
+    bundle_path = _resolve_user_path(state, bundle_raw)
+    bundle = _load_marker_tcp_calibration_bundle(bundle_path)
+    entry = bundle["cubes"].get(cube_name)
+    if not isinstance(entry, dict) or "T_cube_tcp" not in entry:
+        raise ValueError(f"{bundle_path}: no T_cube_tcp for rig {cube_name!r}")
+    return {
+        "rig": rig,
+        "configPath": str(config_rel),
+        "cubeName": cube_name,
+        "layoutPath": str(layout_path),
+        "dictionary": dictionary,
+        "markerSizeSource": str(layout.get("marker_size_source") or ""),
+        "bundlePath": bundle_path,
+        "bundleEntry": entry,
+    }
+
+
+def _marker_tcp_rig_for_box(state: GatewayState, box_id: str) -> str:
+    """The target a BOX's pivot is solved on when the operator did not name one.
+
+    A layout rig's bundle names the BOX mounted on it. That has to win over the BOX registry,
+    which calls the same BOX a left-hand handheld and so resolves it to the cube `left`
+    (11-06: a rig pivot solved with the cube's dictionary found no rig marker, and all the
+    operator saw was "no fused samples").
+    """
+    for rig in MARKER_TCP_RIGS:
+        if rig == DEFAULT_TRACKING_TARGET or not (state.repo_root / TRACKING_TARGETS[rig]["config"]).is_file():
+            continue
+        if str(_marker_tcp_layout_rig(state, rig)["bundleEntry"].get("device_id") or "").strip() == box_id:
+            return rig
+    return DEFAULT_TRACKING_TARGET
+
+
+def _marker_tcp_cad_check(pivot_report: dict[str, Any], bundle_entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Where the pivot landed against the bundle's expected pivot points.
+
+    A rig's bundle carries the points a new pivot has to land on: a CAD point, or the
+    socket centre an earlier pivot measured. The distance is the error of the whole
+    chain -- print, paste, extrinsics, detection -- in one number.
+    """
+    fit = pivot_report.get("fit") if isinstance(pivot_report, dict) else None
+    p_fit = fit.get("p_cube_mm") if isinstance(fit, dict) else None
+    expected = bundle_entry.get("expected_pivot_points_mm") if isinstance(bundle_entry, dict) else None
+    if not isinstance(p_fit, list) or len(p_fit) != 3 or not isinstance(expected, dict):
+        return None
+    rows = []
+    for name, point in expected.items():
+        if isinstance(point, list) and len(point) == 3:
+            delta = [float(p_fit[i]) - float(point[i]) for i in range(3)]
+            rows.append({
+                "name": str(name),
+                "expectedMm": [float(v) for v in point],
+                "deltaMm": delta,
+                "distanceMm": math.sqrt(sum(d * d for d in delta)),
+            })
+    if not rows:
+        return None
+    return {
+        "pivotFitMm": [float(v) for v in p_fit],
+        "points": rows,
+        "nearest": min(rows, key=lambda row: row["distanceMm"]),
+    }
 
 
 def _marker_tcp_layout_command(
@@ -6655,6 +7401,7 @@ def _marker_tcp_record_sample(
                 return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
             if state.recording.state in {"idle", "error"}:
                 return {"ok": False, "error": "相机还没连接。请先到「采集」页 Connect，再回来采 marker→TCP 样本。"}
+            sample_id = f"sample_{len(session.samples) + 1:03d}"
             if _state_is_gmsl2(state):
                 # Why this episode exists, in its own meta.json. On disk a pivot
                 # sample is nine videos like any other, and the tracker-mount
@@ -6664,6 +7411,7 @@ def _marker_tcp_record_sample(
                     capture_intent={
                         "purpose": "calibration_marker_tcp",
                         "session_id": session.sessionName,
+                        "sample_id": sample_id,
                         "box_id": box_id_norm,
                         "condition": condition_text,
                         "protocol": _MARKER_TCP_PIVOT_PROTOCOL,
@@ -6673,7 +7421,7 @@ def _marker_tcp_record_sample(
                 _start_episode(state)
             tracker_on = bool(state.recording.laserTracker)
             sample = MarkerTcpSample(
-                id=f"sample_{len(session.samples) + 1:03d}",
+                id=sample_id,
                 side=target_label,
                 condition=condition_text,
                 boxId=box_id_norm,
@@ -6789,6 +7537,7 @@ def _run_marker_tcp_solve(
     box_id: str = "",
     cad_path: str = "",
     socket_beyond_tcp_mm: str = "0",
+    rig: str = "",
     background: bool = True,
 ) -> dict[str, Any]:
     """Validate the request, then run the solve chain off the request thread.
@@ -6810,10 +7559,22 @@ def _run_marker_tcp_solve(
         return {"ok": False, "error": "已有解算在进行中，请等它结束"}
     try:
         box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id)
-        cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        rig_name = str(rig or "").strip().lower() or _marker_tcp_rig_for_box(state, box_id_norm)
+        if rig_name not in MARKER_TCP_RIGS:
+            raise ValueError(f"未知 rig {rig_name!r}；可选 {list(MARKER_TCP_RIGS)}")
+        layout_rig = None if rig_name == DEFAULT_TRACKING_TARGET else _marker_tcp_layout_rig(state, rig_name)
+        if layout_rig is None:
+            cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        else:
+            # A layout rig has one entry, in its own bundle, whichever BOX is being solved.
+            cube_name = layout_rig["cubeName"]
+            existing_entry = layout_rig["bundleEntry"]
+            existing_bundle_path = layout_rig["bundlePath"]
+            target_label = f"{target_label} · {TRACKING_TARGETS[rig_name]['label']}"
         samples = _marker_tcp_saved_samples(session, box_id_norm)
         if not samples:
             return {"ok": False, "error": f"{target_label} 没有 saved 样本，先录制并保存至少 1 段 pivot 数据"}
+        _marker_tcp_correct_episodes(state, session.sessionName, samples)
         try:
             socket_mm = float(str(socket_beyond_tcp_mm or "0").strip())
         except ValueError as exc:
@@ -6851,6 +7612,7 @@ def _run_marker_tcp_solve(
         "rotation": rotation,
         "rotation_source": rotation_source,
         "truth_note": truth_note,
+        "layout_rig": layout_rig,
     }
     if not background:
         return _marker_tcp_solve_worker(state, plan)
@@ -6879,33 +7641,41 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
     rotation = plan["rotation"]
     rotation_source = plan["rotation_source"]
     truth_note = plan["truth_note"]
+    layout_rig = plan.get("layout_rig")
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         solve_dir = Path(session.sessionRoot) / f"solve_{_marker_tcp_slug(box_id_norm)}_{timestamp}"
         solve_dir.mkdir(parents=True, exist_ok=True)
         log_path = solve_dir / "solve.log"
         python_bin = _marker_tcp_python(state)
-        tracking_config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+        tracking_config_path = state.repo_root / (
+            DEFAULT_EE_TRAJECTORY_CONFIG if layout_rig is None else Path(layout_rig["configPath"])
+        )
         subset_root, episode_map = _marker_tcp_subset_dataset(state, solve_dir=solve_dir, samples=samples)
         episodes = [int(entry["subsetEpisodeIndex"]) for entry in episode_map]
         cameras = _marker_tcp_tracking_cameras(state, subset_root, episodes)
 
-        # 1. Resolve the layout. The cube geometry did not change when the rig
-        #    moved, so the corner table comes from the production cube template
-        #    rather than being re-estimated; only its placement can come from CAD.
         layout_path = solve_dir / DEFAULT_MARKER_LAYOUT_NAME
-        _run_marker_tcp_command(
-            state,
-            _marker_tcp_layout_command(
+        if layout_rig is not None:
+            # 1'. A layout rig's corner table is already the production one, cut
+            #     from CAD; copy it so the solve directory names what it solved on.
+            shutil.copy2(layout_rig["layoutPath"], layout_path)
+        else:
+            # 1. Resolve the layout. The cube geometry did not change when the rig
+            #    moved, so the corner table comes from the production cube template
+            #    rather than being re-estimated; only its placement can come from CAD.
+            _run_marker_tcp_command(
                 state,
-                python_bin=python_bin,
-                cube_name=cube_name,
-                out_path=layout_path,
-                cad_path=truth_path if _cad_declares_rig_placement(truth_path, cube_name) else None,
-            ),
-            label=f"解算 {target_label}: resolve marker layout",
-            log_path=log_path,
-        )
+                _marker_tcp_layout_command(
+                    state,
+                    python_bin=python_bin,
+                    cube_name=cube_name,
+                    out_path=layout_path,
+                    cad_path=truth_path if _cad_declares_rig_placement(truth_path, cube_name) else None,
+                ),
+                label=f"解算 {target_label}: resolve marker layout",
+                log_path=log_path,
+            )
         if not layout_path.is_file():
             raise FileNotFoundError(f"resolved marker layout was not written: {layout_path}")
         rotation, rig_frame_composed = _compose_rig_rotation(rotation, layout_path)
@@ -6918,6 +7688,7 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         # 2. Detect once, cache the corners, then track. Splitting these is what
         #    lets a re-solve skip the expensive half.
         detections_path = solve_dir / "detections.npz"
+        dictionary = _marker_tcp_aruco_dictionary(state) if layout_rig is None else layout_rig["dictionary"]
         _run_marker_tcp_command(
             state,
             [
@@ -6931,7 +7702,7 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
                 "--cameras",
                 *cameras,
                 "--dictionary",
-                _marker_tcp_aruco_dictionary(state),
+                dictionary,
                 "--out",
                 str(detections_path),
             ],
@@ -6967,6 +7738,12 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         )
         if not tracking_run_dir.is_dir():
             raise FileNotFoundError(f"tracking run was not written: {tracking_run_dir}")
+        tracking_summary = _read_json_file(tracking_run_dir / "tracking_summary.json") or {}
+        if tracking_summary.get("num_frames_success") == 0:
+            raise ValueError(
+                f"{target_label}：按 {dictionary} 在 {len(cameras)} 台相机上没解出任何一帧位姿，"
+                "这段录的多半不是这个目标。请确认面板的 Marker rig 和实物一致，并且 marker 在画面里。"
+            )
 
         bundle_path = solve_dir / "marker_to_tcp_calibration.json"
         if existing_bundle_path is not None and existing_bundle_path.is_file():
@@ -7006,6 +7783,10 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         if not bundle_path.is_file():
             raise FileNotFoundError(f"marker→TCP bundle was not written: {bundle_path}")
         pivot_report = json.loads(pivot_report_path.read_text(encoding="utf-8")) if pivot_report_path.is_file() else {}
+        cad_check = (
+            None if layout_rig is None
+            else _marker_tcp_cad_check(pivot_report, layout_rig["bundleEntry"])
+        )
         summary_path = solve_dir / "solve_summary.json"
         solve_summary = {
             "schema": "marker_tcp_gui_solve/v1",
@@ -7033,6 +7814,8 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
             "primaryFit": pivot_report.get("primary_fit", ""),
             "pivotP95Mm": (pivot_report.get("fit") or {}).get("residual_mm", {}).get("p95") if isinstance(pivot_report, dict) else None,
             "logPath": str(log_path),
+            "rig": DEFAULT_TRACKING_TARGET if layout_rig is None else layout_rig["rig"],
+            "cadCheck": cad_check,
         }
         _write_marker_tcp_json(summary_path, solve_summary)
 
@@ -7046,9 +7829,14 @@ def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[
         session.stage = "capture"
         p95 = solve_summary.get("pivotP95Mm")
         warning = "；注意 socket 在 episode 间移动" if solve_summary["socketMovedBetweenEpisodes"] else ""
+        cad_text = ""
+        if cad_check and cad_check.get("nearest"):
+            nearest = cad_check["nearest"]
+            cad_text = f"，pivot 点离 {nearest['name']} {nearest['distanceMm']:.2f} mm"
         session.message = (
             f"marker→TCP 解算完成：{target_label} -> {bundle_path}"
             + (f"，pivot p95={float(p95):.2f} mm" if isinstance(p95, (int, float)) else "")
+            + cad_text
             + warning
         )
         state.log("info", f"Marker→TCP solve written: {bundle_path}")
@@ -7546,7 +8334,7 @@ def _ensure_tracker_sidecars(
         ep_dirs = [dataset / "episodes" / f"episode_{ep:06d}" for ep in sorted(episodes)]
         if any(_marker_tcp_sidecar_is_current(dataset, cube, ep_dirs) for cube in cubes):
             continue
-        _queue_traj_gen(state, dataset)
+        _queue_traj_gen(state, dataset, tracking_target=_tracking_target_for_episodes(state, dataset, sorted(episodes)))
         job = _await_traj_gen(state, dataset, on_progress=lambda _text: None)
         if job.get("status") != "complete":
             raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
@@ -7560,6 +8348,29 @@ def _ensure_tracker_sidecars(
     if solved[best] == 0:
         raise RuntimeError("这些段里哪个 cube 都没解出一帧——相机看不到钢片所在的 BOX？")
     return best
+
+
+def _tracking_target_for_episodes(state: GatewayState, dataset: Path, episodes: list[int]) -> str:
+    """The tracker to label these episodes with: the rig their hand-held BOX is mounted on.
+
+    As the marker->TCP solve picks it (``_marker_tcp_rig_for_box``). Generating with the cube's tracker
+    by default, a ball check on a rig v9b pivot (11-09: the right rig, BOX 3906437858) would track an
+    AprilTag cube that is not there. The cube's tracker when the episodes name no hand-held BOX, or
+    BOXes on different targets.
+    """
+    targets: set[str] = set()
+    for episode in episodes:
+        meta = _read_json_file(dataset / "episodes" / f"episode_{int(episode):06d}" / "meta.json") or {}
+        devices = meta.get("box_devices") if isinstance(meta.get("box_devices"), dict) else {}
+        for box_id, info in devices.items():
+            if not isinstance(info, dict) or info.get("role") != "handheld":
+                continue
+            key = str(box_id).strip().lower()
+            try:
+                targets.add(_marker_tcp_rig_for_box(state, key if key.startswith("box") else f"box{key}"))
+            except (OSError, ValueError, KeyError):
+                targets.add(DEFAULT_TRACKING_TARGET)
+    return targets.pop() if len(targets) == 1 else DEFAULT_TRACKING_TARGET
 
 
 def _tracker_row_pairs(state: GatewayState, rows: list[dict[str, str]]) -> list[tuple[Path, int]]:
@@ -7810,6 +8621,7 @@ def _run_marker_tcp_tracker_check(
         if mount_fit is not None and not mount_fit.is_file():
             raise FileNotFoundError(f"lever-arm JSON 不存在: {mount_fit}")
         samples = [s for s in _marker_tcp_saved_samples(session, box_id_norm) if s.condition == condition]
+        _marker_tcp_correct_episodes(state, session.sessionName, samples)
         if not samples:
             raise ValueError(f"{target_label} · {condition} 没有 saved 样本")
         mount_id = _marker_tcp_slug(f"{box_id_norm}_{condition}")
@@ -9898,6 +10710,8 @@ def _run_extrinsics_calibration(
     ]
     if not _run("多相机联合 BA…", bundle_args, 3600):
         return
+    # Before the registration, so it and the export both see it.
+    _measure_table_anchor(state, python, dataset, work / "extrinsics_report.json")
 
     # Experiment mode stops here: the numbers are the deliverable and the
     # production pointers are left exactly as they were. Skipping the export
@@ -9946,6 +10760,9 @@ def _run_extrinsics_calibration(
             # run re-inherits its error every time (7.9 mm RMS / 2.17 deg for the
             # 0720 legacy frame); registering onto W does not.
             export_args += ["--world-reference", str(world_reference)]
+            anchor = _table_anchor_for(work / "extrinsics_report.json")
+            if anchor is not None:
+                export_args += ["--anchor", str(anchor)]
             if str(registration.get("world_continuity_state")) not in {"CONTINUOUS", "RECONNECTED"}:
                 # A new island is the *safe* direction: the old world_frame_id keeps
                 # meaning what it meant, and this run says plainly that it is not in
@@ -9986,6 +10803,15 @@ def _run_extrinsics_calibration(
             _repoint_intrinsics_json(target)
         if port_serials:
             _write_calibration_identity(calib_root / f"{run_name}_extrinsics", run_name, port_serials)
+        # Measured or not, the capture's table pixels are what this run's episodes are checked against.
+        capture_pixels = _table_anchor_for(work / "extrinsics_report.json", measured_only=False)
+        if capture_pixels is not None:
+            try:
+                shutil.copy2(capture_pixels, calib_root / f"{run_name}_extrinsics" / _TABLE_ANCHOR_FILE)
+            except OSError as exc:
+                state.log("warn", f"Could not keep the table pixels with {run_name}: {exc}")
+        if world_reference.is_file() and registration is not None:
+            _log_common_mode(state, calib_root / f"{run_name}_extrinsics" / "summary.json")
 
     report_path = work / "extrinsics_report.json"
     try:
@@ -10008,6 +10834,19 @@ def _run_extrinsics_calibration(
     if fitted_intrinsics is not None:
         _annotate_intrinsics_coverage(cameras, fitted_intrinsics)
     failed = [c for c in cameras if c["status"] == "fail"]
+    # A view dropped before the bundle is a frame the operator might want to
+    # look at, not a fault; a bundle stopped by its budget is a number that may
+    # still move. Neither is visible in the per-camera RMSE.
+    rejected_views = report.get("rejected_views") or []
+    if rejected_views:
+        state.log(
+            "info",
+            f"BA dropped {len(rejected_views)} view(s) whose own PnP failed: "
+            + ", ".join(f"{v.get('camera')}@{v.get('frame')}" for v in rejected_views[:10]),
+        )
+    not_converged = report.get("converged") is False
+    if not_converged:
+        state.log("warn", f"BA stopped before converging after {report.get('nfev')} evaluations: {report.get('termination')}")
     state.calibration.cameras = cameras
     state.calibration.state = "failed" if failed else "complete"
     _finish_solve_progress(state, complete=True)
@@ -10045,6 +10884,8 @@ def _run_extrinsics_calibration(
         f"BA 重投影 {float(report.get('rmse_px', float('nan'))):.4f} px，"
         f"{report.get('num_frames', 0)} 帧 / {len(cameras)} 相机"
         + ("；有相机残差过大" if failed else "")
+        + (f"；剔除 {len(rejected_views)} 个 PnP 失败的视角" if rejected_views else "")
+        + ("；BA 未收敛" if not_converged else "")
         + ("" if export_production else "。实验模式：未导出，生产标定未改动。")
     )
     state.log(
@@ -10977,11 +11818,23 @@ def _save_annotation(state: GatewayState, payload: dict[str, Any]) -> None:
 # in the world the session was recorded in -- for world_20260928_063531 that is the
 # camera island (cam_14 at the origin), not the arm's base -- so anything that hands
 # them to the FR3 (MuJoCo preview, offline IK QC, real replay) reads this copy instead.
+# One directory per base, named after it (fr3_base/, fr3_base_right/): the copy the arm commanding
+# in that base replays. by_arm/ holds each hand in its own arm's base (IK QC, two-robot preview).
 FR3_BASE_TRAJECTORY_SUBDIR = "fr3_base"
+FR3_BY_ARM_TRAJECTORY_SUBDIR = "by_arm"
+_FR3_ROOT_DIR_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
-def _fr3_base_trajectory_dir_path(dataset_root: Path) -> Path:
-    return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / FR3_BASE_TRAJECTORY_SUBDIR
+def _fr3_trajectory_dir_path(dataset_root: Path, root: str = FR3_BASE_TRAJECTORY_SUBDIR) -> Path:
+    if not _FR3_ROOT_DIR_NAME.fullmatch(root):
+        raise ValueError(f"not a base frame id: {root!r}")
+    return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / root
+
+
+def _fr3_trajectory_dirs(dataset_root: Path) -> list[Path]:
+    """Every FR3-facing copy directory of the dataset (each has a frame.json)."""
+    sidecar = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+    return sorted(p.parent for p in sidecar.glob("*/frame.json"))
 
 
 DATASET_GRIPPER_WIDTH_NAME = "box_gripper.distance_m"
@@ -10995,15 +11848,67 @@ FR3_REPLAY_STATE_COLUMNS = {
 }
 
 
-def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | None:
-    """Write the sidecar's state_action CSVs re-expressed in fr3_base; return their dir.
+def _fr3_embodiment_arms(repo_root: Path) -> dict[str, dict[str, Any]]:
+    """The arms of embodiments/fr3_dual.json (``arm -> spec``, in file order); {} without it."""
+    try:
+        description = json.loads((repo_root / _DUAL_FR3_EMBODIMENT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    arms = description.get("arms") if isinstance(description, dict) else None
+    return {str(name): spec for name, spec in (arms or {}).items() if isinstance(spec, dict)}
 
-    None when no episode has a ``world_frame`` block at all: those predate world
-    provenance, when the tracker's world *was* the robot base, so their poses go to the
-    FR3 as recorded. Raises when a block is not ``ok`` (the world is unknown, not the
-    base) or a stamped world has no registration edge to fr3_base -- handing such poses
-    to the arm unchanged drives it to coordinates of another frame, and MuJoCo would
-    even call that reachable.
+
+def _fr3_hand_roots(repo_root: Path) -> dict[str, str]:
+    """``hand -> root`` of the arm that replays that hand (embodiments/fr3_dual.json); {} without it."""
+    roots: dict[str, str] = {}
+    for arm in _fr3_embodiment_arms(repo_root).values():
+        if not arm.get("root"):
+            continue
+        for hand in arm.get("hands") or []:
+            roots.setdefault(str(hand), str(arm["root"]))
+    return roots
+
+
+def _episode_transforms_to(
+    graph: dict[str, Any], worlds: dict[int, str], root: str
+) -> tuple[dict[int, list[list[float]]], dict[str, Any]] | str:
+    """Every episode's ``T_root_world`` and the routes used, or why ``root`` cannot be reached."""
+    transforms: dict[int, list[list[float]]] = {}
+    routes: dict[str, Any] = {}
+    for index, world in worlds.items():
+        if world == root:
+            transforms[index] = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+            continue
+        found = wp.world_transform(graph, world, root)
+        if found is None:
+            retired = wp.retired_note(graph, world, root)
+            return (
+                f"episode {index} was recorded in {world} and no registration edge in "
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {root}; "
+                "its poses cannot be given to the FR3" + (f"\n{retired}" if retired else "")
+            )
+        transforms[index] = found[0]
+        routes[world] = {"T_root_world": found[0], "edges": found[1]}
+    return transforms, routes
+
+
+def _prepare_fr3_trajectory(dataset_root: Path, repo_root: Path, root: str | None = None) -> Path | None:
+    """Write each sidecar state_action CSV re-expressed in an FR3 base; return the directory of the copies.
+
+    ``root`` given: every hand in that base, in ``<sidecar>/<root>/`` -- the copy one arm replays, whichever
+    hand it is (the left arm may replay a right-hand recording), and the one its MuJoCo preview checks.
+    ``root`` None: each hand in the base of its own arm (embodiments/fr3_dual.json: the right hand in
+    fr3_base_right), else the first other base the graph reaches, in ``<sidecar>/by_arm/`` -- for the
+    offline IK QC and the two-robot MuJoCo preview. Until 11-10 every hand went to fr3_base; that day the
+    right arm was registered while fr3_base's edge stayed retired, and every right-hand check failed on a
+    base it never needed. ``frame.json`` names each file's base (``roots``) and, for a hand no base is
+    reachable for, why (``refused``); that hand's copy is removed, never left behind in another frame.
+
+    None when no episode has a ``world_frame`` block at all: those predate world provenance, when the
+    tracker's world *was* the robot base (fr3_base), so their poses go to the FR3 as recorded. Raises when
+    a block is not ``ok`` (the world is unknown, not the base) or no hand reaches any base -- handing such
+    poses to the arm unchanged drives it to coordinates of another frame, and MuJoCo would even call that
+    reachable.
     """
     sidecar = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
     blocks: dict[int, Any] = {}
@@ -11015,9 +11920,7 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         blocks[index] = _load_json_file(meta_path).get("world_frame")
     if all(block is None for block in blocks.values()):
         return None
-    graph = wp.read_world_graph(repo_root)
-    transforms: dict[int, list[list[float]]] = {}
-    routes: dict[str, Any] = {}
+    worlds: dict[int, str] = {}
     for index, block in blocks.items():
         world = wp.world_frame_id_of(block)
         if not world:
@@ -11025,20 +11928,31 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
                 f"episode {index} of {dataset_root.name} has no usable world stamp "
                 f"({wp.describe(block)}); its frame is unknown, so it cannot be replayed on the FR3"
             )
-        if world == wp.FR3_BASE_WORLD_ID:
-            transforms[index] = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
-            continue
-        found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
-        if found is None:
-            raise RuntimeError(
-                f"episode {index} was recorded in {world} and no registration edge in "
-                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {wp.FR3_BASE_WORLD_ID}; "
-                "its poses cannot be given to the FR3"
-            )
-        transforms[index] = found[0]
-        routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
-    out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
-    written = []
+        worlds[index] = world
+    graph = wp.read_world_graph(repo_root)
+    reached: dict[str, tuple[dict[int, list[list[float]]], dict[str, Any]] | str] = {}
+
+    def reach(base: str) -> tuple[dict[int, list[list[float]]], dict[str, Any]] | str:
+        if base not in reached:
+            reached[base] = _episode_transforms_to(graph, worlds, base)
+        return reached[base]
+
+    if root is None:
+        own = _fr3_hand_roots(repo_root)
+        bases = [str(arm.get("root")) for arm in _fr3_embodiment_arms(repo_root).values() if arm.get("root")]
+        bases.append(wp.FR3_BASE_WORLD_ID)
+
+        def candidates(hand: str) -> list[str]:
+            return list(dict.fromkeys(base for base in (own.get(hand), *bases) if base))
+
+        out_dir = _fr3_trajectory_dir_path(dataset_root, FR3_BY_ARM_TRAJECTORY_SUBDIR)
+    else:
+
+        def candidates(hand: str) -> list[str]:
+            return [root]
+
+        out_dir = _fr3_trajectory_dir_path(dataset_root, root)
+    out_dir.mkdir(parents=True, exist_ok=True)
     sources: dict[str, str] = {}
     recorded = _dataset_state_values(
         dataset_root,
@@ -11047,17 +11961,34 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         sources=sources,
     )
     carried: dict[str, dict[str, int]] = {column: {} for column in FR3_REPLAY_STATE_COLUMNS}
+    roots: dict[str, str] = {}
+    routes: dict[str, Any] = {}
+    refused: dict[str, str] = {}
     for src in sorted(sidecar.glob("state_action.*.csv")):
-        wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
-        for column, name in FR3_REPLAY_STATE_COLUMNS.items():
-            carried[column][src.name] = _fill_state_column(out_dir / src.name, column, recorded.get(name, {}))
-        written.append(src.name)
+        hand = src.name.removeprefix("state_action.").removesuffix(".csv")
+        reasons: list[str] = []
+        for base in candidates(hand):
+            found = reach(base)
+            if isinstance(found, str):
+                reasons.append(found)
+                continue
+            transforms, routes[base] = found
+            wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
+            for column, name in FR3_REPLAY_STATE_COLUMNS.items():
+                carried[column][src.name] = _fill_state_column(out_dir / src.name, column, recorded.get(name, {}))
+            roots[src.name] = base
+            break
+        else:
+            (out_dir / src.name).unlink(missing_ok=True)  # never leave a stale copy in another frame
+            refused[src.name] = f"{hand} hand: " + "\n".join(reasons)
     (out_dir / "frame.json").write_text(
         json.dumps(
             {
-                "world_frame_id": wp.FR3_BASE_WORLD_ID,
+                "root": root,
+                "roots": roots,
+                "refused": refused,
                 "from": routes,
-                "files": written,
+                "files": sorted(roots),
                 "gripper_width": {
                     "source": f"observation.state[{sources.get(DATASET_GRIPPER_WIDTH_NAME, DATASET_GRIPPER_WIDTH_NAME)}]",
                     "rows": carried["gripper_width_m"],
@@ -11071,7 +12002,36 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         ),
         encoding="utf-8",
     )
+    if refused and not roots:
+        raise RuntimeError("\n".join(refused.values()))
     return out_dir
+
+
+def _fr3_copy_root(copy_dir: Path, cube: str) -> str:
+    """The base ``cube`` is in inside an FR3-facing copy directory ("" when that copy has no such file)."""
+    frame = _load_json_file(copy_dir / "frame.json")
+    return str((frame.get("roots") or {}).get(f"state_action.{cube}.csv") or "")
+
+
+def _fr3_trajectory_csv(dataset_root: Path, repo_root: Path, cube: str, root: str | None = None) -> Path:
+    """``cube``'s state_action CSV in ``root`` (None: in its own arm's base), written now.
+
+    Raises with the reason when that base is not reachable for it. A dataset from before world stamps is
+    in fr3_base as recorded, and in no other base.
+    """
+    fr3_dir = _prepare_fr3_trajectory(dataset_root, repo_root, root)
+    name = f"state_action.{cube}.csv"
+    if fr3_dir is None:
+        if root not in (None, wp.FR3_BASE_WORLD_ID):
+            raise RuntimeError(
+                f"{dataset_root.name} predates world stamps: its poses are in {wp.FR3_BASE_WORLD_ID} as "
+                f"recorded, and no edge takes them to {root}"
+            )
+        return dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME / name
+    refused = _load_json_file(fr3_dir / "frame.json").get("refused") or {}
+    if name in refused:
+        raise RuntimeError(refused[name])
+    return fr3_dir / name
 
 
 FR3_REPLAY_THOR_CONFIG = Path(
@@ -11089,13 +12049,19 @@ def _fr3_replay_robot_config(repo_root: Path) -> dict[str, Any]:
 
 
 def _fr3_arm_box_ids(repo_root: Path) -> set[str]:
-    """Column prefixes (``box<device id>``) of the BOX mounted on the FR3, per the real replay YAML.
+    """Column prefixes (``box<device id>``) of the BOXes mounted on the FR3s (fr3_arms.json, every arm
+    that names one, plus the real replay YAML's).
 
-    The recorder discovers every BOX on the network, so a session recorded with the arm's BOX
+    The recorder discovers every BOX on the network, so a session recorded with an arm's BOX
     powered also carries that BOX's (idle) jaw and trigger; it is never the operator's.
     """
-    device_id = _fr3_replay_robot_config(repo_root).get("corenetic_device_id")
-    return {f"box{device_id}"} if device_id not in (None, "") else set()
+    device_ids = {_fr3_replay_robot_config(repo_root).get("corenetic_device_id")}
+    try:
+        registry = json.loads((repo_root / fr3_arms.REGISTRY).read_text(encoding="utf-8"))
+        device_ids |= {arm.get("corenetic_device_id") for arm in (registry.get("arms") or {}).values()}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {f"box{device_id}" for device_id in device_ids if device_id not in (None, "")}
 
 
 def _fr3_replay_target_frame(repo_root: Path) -> str:
@@ -11207,13 +12173,6 @@ def _fill_state_column(csv_path: Path, column: str, values: dict[tuple[int, int]
     return carried
 
 
-def _fr3_trajectory_csv(dataset_root: Path, repo_root: Path, cube: str) -> Path:
-    """The state_action CSV of ``cube`` in the frame the FR3 commands in."""
-    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
-    root = fr3_dir if fr3_dir is not None else dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
-    return root / f"state_action.{cube}.csv"
-
-
 def _run_fr3_ik_qc(
     dataset_root: Path,
     *,
@@ -11234,10 +12193,15 @@ def _run_fr3_ik_qc(
             "cubes": [],
         }
     try:
-        fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
+        # each hand in its own arm's base (another arm's while its own is unregistered)
+        fr3_dir = _prepare_fr3_trajectory(dataset_root, repo_root)
     except RuntimeError as exc:
         return {"status": "fail", "message": str(exc), "cubes": []}
+    refused: dict[str, str] = {}
+    bases: dict[str, str] = {}
     if fr3_dir is not None:
+        frame = _load_json_file(fr3_dir / "frame.json")
+        refused, bases = frame.get("refused") or {}, frame.get("roots") or {}
         cube_paths = {cube: fr3_dir / path.name for cube, path in cube_paths.items()}
 
     script_path = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
@@ -11251,6 +12215,9 @@ def _run_fr3_ik_qc(
 
     cube_results: list[dict[str, Any]] = []
     for cube, csv_path in cube_paths.items():
+        if csv_path.name in refused:
+            cube_results.append({"cube": cube, "status": "fail", "message": refused[csv_path.name]})
+            continue
         try:
             with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
                 has_valid_pose = any(_pose_from_csv_row(row) is not None for row in csv.DictReader(csv_file))
@@ -11359,7 +12326,9 @@ def _run_fr3_ik_qc(
             "message": (
                 f"{reachable_trajectories}/{total_trajectories} trajectories reachable; "
                 f"{reachable_ratio * 100.0:.2f}% poses reachable"
+                + (f" (in {bases[csv_path.name]})" if csv_path.name in bases else "")
             ),
+            "base": bases.get(csv_path.name, wp.FR3_BASE_WORLD_ID),
             "numTargets": int(summary.get("num_targets") or 0),
             "numUnreachableTargets": unreachable_targets,
             "numUnreachableTrajectories": unreachable_trajectories,
@@ -11804,18 +12773,50 @@ def _tracking_calibration_stamp(state: GatewayState, config_path: Path) -> dict[
     return out
 
 
+def _other_tracking_targets(dataset_root: Path, config_path: Path) -> dict[str, Any] | None:
+    """What the tracker would refuse over: other targets' trajectories in the sidecar this run writes.
+
+    Same rule as the tracker (metrology.sidecar_targets), asked before launching so the GUI
+    can ask the operator instead of showing a failed job a few seconds later.
+    """
+    cfg = _load_yaml_mapping(config_path)
+    tracker = cfg.get("cube_tracker") if isinstance(cfg.get("cube_tracker"), dict) else {}
+    cubes = tracker.get("cubes")
+    if not isinstance(cubes, list):
+        return None  # single-target naming carries no target name to compare
+    run_targets = [str(cube.get("name")) for cube in cubes if isinstance(cube, dict) and cube.get("name")]
+    save_cfg = cfg.get("save_to_dataset") if isinstance(cfg.get("save_to_dataset"), dict) else {}
+    sidecar_dir = dataset_root / str(save_cfg.get("sidecar_dir") or f"derived/{DEFAULT_TRAJ_SIDECAR_NAME}")
+    if str(_METROLOGY_ROOT) not in sys.path:
+        sys.path.insert(0, str(_METROLOGY_ROOT))
+    from metrology import sidecar_targets
+
+    others = sidecar_targets.other_targets(sidecar_dir, run_targets)
+    if not others:
+        return None
+    return {
+        "message": sidecar_targets.refusal_message(sidecar_dir, others, run_targets),
+        "sidecarDir": str(sidecar_dir),
+        "runTargets": sorted(run_targets),
+        "otherTargets": {name: len(files) for name, files in sorted(others.items())},
+        "supersededDir": str(sidecar_dir / sidecar_targets.SUPERSEDED_DIRNAME),
+    }
+
+
 def _ee_trajectory_command(
     state: GatewayState,
     dataset_root: Path,
     *,
     marker_to_tcp_calibration_path: Path | None = None,
     tracking_target: str = DEFAULT_TRACKING_TARGET,
+    supersede_other_targets: bool = False,
 ) -> list[str]:
     runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
     if marker_to_tcp_calibration_path is not None and tracking_target != DEFAULT_TRACKING_TARGET:
         raise ValueError(
-            "marker-to-TCP override is cube-only; Hybrid Carrier V1 uses its versioned CAD socket bundle"
+            "marker-to-TCP override is cube-only; Hybrid Carrier V1 and the gripper rig use the "
+            "versioned bundle their tracking config names"
         )
     config_path = state.repo_root / Path(target_spec["config"])
     if not runner_path.is_file():
@@ -11826,7 +12827,7 @@ def _ee_trajectory_command(
         config_path = _write_ee_trajectory_override_config(
             state, dataset_root, marker_to_tcp_calibration_path, base_config_path=config_path
         )
-    return [
+    command = [
         "bash",
         str(runner_path),
         "--dataset-root",
@@ -11836,6 +12837,9 @@ def _ee_trajectory_command(
         "--tracking-target",
         tracking_target,
     ]
+    if supersede_other_targets:
+        command.append("--supersede-other-targets")
+    return command
 
 
 def _update_traj_gen_meta(
@@ -12014,6 +13018,7 @@ def _queue_traj_gen(
     marker_to_tcp_calibration_path: Path | None = None,
     tracking_target: str = DEFAULT_TRACKING_TARGET,
     allow_stale_calibration: bool = False,
+    supersede_other_targets: bool = False,
 ) -> None:
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
     # Checked here rather than only in the HTTP handler so that every path into
@@ -12022,6 +13027,10 @@ def _queue_traj_gen(
         gate = _stale_calibration_gate(state)
         if gate:
             raise StaleCalibrationError(gate["message"], gate)
+    if not supersede_other_targets:
+        conflict = _other_tracking_targets(dataset_root, state.repo_root / Path(target_spec["config"]))
+        if conflict:
+            raise OtherTrackingTargetsError(conflict["message"], conflict)
     key = str(dataset_root)
     with state.lock:
         running = state.processing_processes.get(key)
@@ -12042,6 +13051,7 @@ def _queue_traj_gen(
             dataset_root,
             marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
             tracking_target=tracking_target,
+            supersede_other_targets=supersede_other_targets,
         )
         marker_path_text = "" if marker_to_tcp_calibration_path is None else str(marker_to_tcp_calibration_path)
         launched_config_path = Path(command[command.index("--config") + 1])
@@ -12213,8 +13223,11 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
         is_gmsl2 = _has_gmsl2_episodes(dataset_root)
+        pairs = _pseudo_bimanual_pairs(info)
         if is_gmsl2:
             total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+        elif pairs:
+            total_episodes, total_frames = len(pairs), sum(int(pair.get("frames") or 0) for pair in pairs)
         else:
             total_episodes = int(info.get("total_episodes") or 0)
             total_frames = int(info.get("total_frames") or 0)
@@ -12228,7 +13241,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
                 "totalFrames": total_frames,
-                "dataStatus": _recorded_dataset_status(dataset_root),
+                "dataStatus": "loaded" if pairs else _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
                 **_training_view_item_fields(dataset_root, dataset_kind),
@@ -13214,6 +14227,56 @@ def _load_hybrid_carrier_overlay_model(
     }
 
 
+def _load_marker_layout_overlay_model(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """Overlay geometry for a plain marker-layout rig, in the carrier overlay's shape.
+
+    The rig is nothing but its corner table, so the model drawn over the video is
+    each layout marker's square projected through the per-camera pose, next to
+    the corners that camera actually detected -- a quarter-turned or misplaced
+    sticker shows up as a square that does not sit on its marker.
+    """
+    tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
+    if str(tracker_summary.get("pose_estimation_mode") or "") != "marker_layout_pnp":
+        return None
+    corner_ba = summary.get("corner_ba") if isinstance(summary.get("corner_ba"), dict) else {}
+    layouts = corner_ba.get("marker_layouts_by_cube") if isinstance(corner_ba.get("marker_layouts_by_cube"), dict) else {}
+    for entry in layouts.values():
+        if not isinstance(entry, dict):
+            continue
+        # `path` is the corner table's file. `source` is only a path for a layout file
+        # without provenance of its own (MarkerLayout.from_json lets the file's `source`
+        # win), so it is the fallback for summaries written before `path` existed.
+        layout = {}
+        for candidate in (entry.get("path"), entry.get("source")):
+            try:
+                found = bool(candidate) and Path(str(candidate)).is_file()
+            except OSError:  # a stringified provenance dict can exceed NAME_MAX/PATH_MAX
+                found = False
+            if found:
+                layout = _load_json_file(Path(str(candidate)))
+                break
+        facets: list[dict[str, Any]] = []
+        anchors: list[dict[str, Any]] = []
+        for marker in layout.get("markers") or []:
+            if not isinstance(marker, dict):
+                continue
+            points = _carrier_points(marker.get("corners_rig"), 1.0)
+            if len(points) != 4:
+                continue
+            ax, ay, az = (points[1][i] - points[0][i] for i in range(3))
+            bx, by, bz = (points[3][i] - points[0][i] for i in range(3))
+            # (BL - TL) x (TR - TL): TL->TR is image-right and TL->BL image-down, so this is
+            # the outward normal the back-face test in the overlay expects.
+            normal = (by * az - bz * ay, bz * ax - bx * az, bx * ay - by * ax)
+            label = f"id {marker.get('id')}"
+            anchors.append({"id": marker.get("id"), "name": label, "points": points})
+            facets.append({"name": label, "colour": "white", "points": points, "normal": normal})
+        if anchors:
+            return {"carrierId": str(layout.get("layout_id") or entry.get("layout_id") or "marker_rig"),
+                    "anchors": anchors, "facets": facets}
+    return None
+
+
 def _hybrid_carrier_overlay_from_row(
     row: dict[str, Any],
     *,
@@ -13346,7 +14409,7 @@ def _read_video_cube_overlays(
     tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
     cube_size_m = float((tracker_summary.get("cube_size_cm") or DEFAULT_CUBE_SIZE_M * 100.0)) / 100.0
     camera_model = str(tracker_summary.get("camera_model") or "rational")
-    carrier_model = _load_hybrid_carrier_overlay_model(state, summary)
+    carrier_model = _load_hybrid_carrier_overlay_model(state, summary) or _load_marker_layout_overlay_model(summary)
     overlays: dict[int, dict[str, list[dict[str, Any]]]] = {}
     active_streams = summary.get("active_streams") if isinstance(summary.get("active_streams"), list) else []
     for stream in active_streams:
@@ -15069,6 +16132,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "tasks": _tasks_with_progress(state),
         "activeTaskId": state.active_task_id or "",
         "datasetExport": asdict(state.dataset_export),
+        "worldGraphGuard": _world_graph_guard_status(state),
     }
 
 
@@ -15455,9 +16519,71 @@ def _ensure_log_dir(path: Path) -> Path:
     return path
 
 
+# BOX_LIVE is the recorder's 10 Hz telemetry feed to this gateway, not a message
+# for a person: on 2026-10-25 it was 2.15 of a 2.27 GB day's log and, with the
+# rest of the directory, filled Thor's disk. The log keeps one a minute, and
+# every change of validity, so a box dropping out still shows in it.
+_BOX_LIVE_LOG_INTERVAL_S = 60.0
+# A session past this rotates to ``<log>.1``, replacing the previous part: a
+# crash leaves its evidence at the end, so the tail is the part worth keeping.
+_RECORDER_LOG_MAX_BYTES = 256 * 1024 * 1024
+# Each Connect deletes the oldest recorder logs (plain, rotated or gzipped)
+# beyond this, so the directory has a ceiling whatever the recorder prints.
+_RECORDER_LOG_DIR_BUDGET_BYTES = 10 * 1024**3
+
+
+def _prune_recorder_logs(log_dir: Path, budget_bytes: int = _RECORDER_LOG_DIR_BUDGET_BYTES) -> list[Path]:
+    entries: list[tuple[float, int, Path]] = []
+    for path in log_dir.glob("recorder_*"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            entries.append((stat.st_mtime, stat.st_size, path))
+    total = sum(size for _, size, _ in entries)
+    removed: list[Path] = []
+    for _, size, path in sorted(entries):
+        if total <= budget_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed.append(path)
+    return removed
+
+
 def _new_recorder_log_path(state: GatewayState) -> Path:
     log_dir = _ensure_log_dir(state.log_dir or _default_log_dir(state.repo_root))
+    removed = _prune_recorder_logs(log_dir)
+    if removed:
+        state.log(
+            "info",
+            f"Deleted {len(removed)} oldest recorder logs to keep {log_dir} under "
+            f"{_RECORDER_LOG_DIR_BUDGET_BYTES // 1024**3} GiB",
+        )
     return log_dir / f"recorder_{_timestamp_for_log()}.log"
+
+
+def _append_recorder_log(path: Path | None, line: str) -> None:
+    if path is None:
+        return
+    try:
+        if path.stat().st_size >= _RECORDER_LOG_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+            _append_line(path, f"# rotated past {_RECORDER_LOG_MAX_BYTES} bytes; the part before is {path.name}.1")
+    except OSError:
+        pass
+    _append_line(path, line)
+
+
+def _box_live_validity(raw: str) -> bool | None:
+    try:
+        return bool(json.loads(raw.removeprefix("BOX_LIVE ")).get("valid"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _append_line(path: Path | None, line: str) -> None:
@@ -15621,8 +16747,9 @@ def _connect_recorder(
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
-    if _gripper_teleop_running(state):
-        raise ValueError(_gripper_teleop_conflict())
+    conflict = _box_port_conflict(state)
+    if conflict:
+        raise ValueError(conflict)
 
     is_workstation = state.profile == "workstation"
     if backend is not None:
@@ -15683,6 +16810,11 @@ def _connect_recorder(
     state.recording.pid = state.process.pid
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
+    # A new recorder counts from zero and only says so after its first save; until then the
+    # last session's count would read as this session's next episode (11-06: a pivot sample
+    # recorded as episode 1 of a dataset whose only episode is 0).
+    state.recording.savedEpisodes = 0
+    state.recording.episodeIndex = 0
     state.recording.message = (
         f"Starting FR3 {state.recording.backend} recorder"
         if is_workstation
@@ -15704,6 +16836,7 @@ def _connect_recorder(
     state.recording.cameraIdentityExpectedFrom = ""
     state.recording.syncReportPath = ""
     state.recording.syncWarnings = []
+    state.recording.sixDCaliWarnings = []
     state.recorder_log_path = recorder_log_path
     _append_line(recorder_log_path, f"# command: {' '.join(command)}")
     _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
@@ -16242,9 +17375,18 @@ def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) ->
     # writes — freezing preview production and the stale-preview watchdog.
     # Now the reader only appends to the log file and hands the line to a queue
     # that a dedicated consumer applies under the lock.
+    box_live_logged_s = float("-inf")
+    box_live_valid: bool | None = None
     for line in process.stdout:
         raw = line.rstrip("\n")
-        _append_line(state.recorder_log_path, raw)
+        if not raw.startswith("BOX_LIVE "):
+            _append_recorder_log(state.recorder_log_path, raw)
+        else:
+            now = time.monotonic()
+            valid = _box_live_validity(raw)
+            if valid != box_live_valid or now - box_live_logged_s >= _BOX_LIVE_LOG_INTERVAL_S:
+                _append_recorder_log(state.recorder_log_path, raw)
+                box_live_logged_s, box_live_valid = now, valid
         output = raw.strip()
         if not output:
             continue
@@ -16676,8 +17818,105 @@ def _apply_camera_identity(state: GatewayState, identity: dict[str, Any]) -> Non
         _set_device_state(state, m["camera"], "error", detail)
 
 
+# (recorder state, gesture) -> what the button on a handheld BOX does. Discarding is the one that
+# cannot be taken back, so it takes the gesture that cannot happen by accident. A double click
+# marks a moment of the episode; the recorder has already kept it for meta.json.
+_BOX_BUTTON_ACTIONS = {
+    ("armed", "single"): "start",
+    ("recording", "single"): "save",
+    ("review", "single"): "save",
+    ("recording", "long"): "discard",
+    ("review", "long"): "discard",
+    ("recording", "double"): "mark",
+}
+_BOX_BUTTON_GESTURES = {"single": "单击", "double": "双击", "long": "长按"}
+# Long enough that a press meant to start cannot also stop what it started.
+_BOX_BUTTON_COOLDOWN_S = 1.0
+# A line that waited this long behind a held lock no longer says what the operator wants now.
+_BOX_BUTTON_MAX_AGE_S = 2.0
+
+
+def _box_button_capture_owner(state: GatewayState) -> str:
+    """Which capture holds the recorder. The button would not be aimed at it: an episode started
+    here clears the capture's redirect and lands in the task dataset."""
+    for name, session in (
+        ("相机标定", state.calibration_session),
+        ("跟踪仪站位", state.tracker_mount_session),
+        ("marker→TCP", state.marker_tcp_session),
+    ):
+        if session.active and session.stage == "capture":
+            return name
+    return ""
+
+
+def _apply_box_button(state: GatewayState, report: dict[str, Any]) -> None:
+    """Do what a gesture on a handheld BOX means now. Runs under ``state.lock``, as the Live Record
+    routes do, and through the same calls, so the button skips none of their checks."""
+    gesture = str(report.get("gesture") or "")
+    name = _BOX_BUTTON_GESTURES.get(gesture, gesture)
+    device = str(report.get("device_id") or "")
+    registry = _read_json_file(state.repo_root / "tools" / "thor" / "box_devices.json") or {}
+    role = str(((registry.get("devices") or {}).get(device) or {}).get("role") or "")
+    if role != "handheld":
+        state.log("info", f"BOX 按钮：box{device} 不是手持 BOX（{role or '未登记'}），{name}已忽略")
+        return
+    if not _state_is_gmsl2(state):
+        return
+    age_s = time.time() - float(report.get("wall_s") or 0.0)
+    if age_s > _BOX_BUTTON_MAX_AGE_S:
+        state.log("warn", f"BOX 按钮：{name}等了 {age_s:.1f} s 才处理，已忽略，请重按")
+        return
+    owner = _box_button_capture_owner(state)
+    if owner:
+        state.log("warn", f"BOX 按钮：{owner}采集中，{name}已忽略")
+        return
+    recording_state = state.recording.state
+    action = _BOX_BUTTON_ACTIONS.get((recording_state, gesture))
+    if action is None:
+        state.log("info", f"BOX 按钮：{name}在 {recording_state} 状态下无动作")
+        return
+    if action == "mark":
+        state.log("info", "BOX 按钮：已打点")
+        return
+    now = time.monotonic()
+    if now - state.box_button_last_action_s < _BOX_BUTTON_COOLDOWN_S:
+        state.log("info", f"BOX 按钮：{name}紧跟上一次操作，已忽略")
+        return
+    state.box_button_last_action_s = now
+    try:
+        if action == "start":
+            _start_episode(state)
+        else:
+            _stop_recorder(state, action)
+    except Exception as exc:  # noqa: BLE001 - nobody is waiting on a response to read a raised error
+        state.log("warn", f"BOX 按钮：{name}未执行：{exc}")
+        return
+    state.log("info", f"BOX 按钮：{name} -> {action}")
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("BOX_BUTTON "):
+        try:
+            report = json.loads(output.removeprefix("BOX_BUTTON ").strip())
+        except ValueError:
+            state.log("warn", "recorder: malformed BOX_BUTTON payload")
+            return
+        if isinstance(report, dict):
+            _apply_box_button(state, report)
+        return
+    if output.startswith("SIX_D_CALI_WARN "):
+        try:
+            report = json.loads(output.removeprefix("SIX_D_CALI_WARN ").strip())
+        except ValueError:
+            state.log("warn", "recorder: malformed SIX_D_CALI_WARN payload")
+            return
+        state.recording.sixDCaliWarnings = [
+            f"BOX {device_id}：{warning}" for device_id, found in report.items() for warning in found
+        ]
+        for warning in state.recording.sixDCaliWarnings:
+            state.log("warn", f"6D calibration: {warning}")
         return
     if output.startswith("LT_BEAM_BROKEN "):
         state.recording.laserTrackerBeamBroken = output.removeprefix("LT_BEAM_BROKEN ").strip() == "1"
@@ -17008,6 +18247,475 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
     )
 
 
+DUAL_FR3_EXECUTABLE_FILE = Path("meta") / "dual_fr3_executable.json"
+#: Both FR3s as one robot (roadmap G1): each arm's base, hands and TCP.
+_DUAL_FR3_EMBODIMENT = Path("tools") / "thor" / "gmsl2" / "embodiments" / "fr3_dual.json"
+
+
+def _dual_fr3_executability_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """One episode's two-arm verdicts (roadmap C4), per replay mode; None when the dataset has none.
+
+    Written by tools/fr3/dual_fr3_executability.py next to info.json; read-only here. The gateway does not
+    import that tool: it needs numpy and runs in the FR3 environment, the gateway in Thor's system python.
+    """
+    data = _load_json_file(dataset_root / DUAL_FR3_EXECUTABLE_FILE)
+    if not data:
+        return None
+    modes = {}
+    for mode, block in (data.get("modes") or {}).items():
+        if not isinstance(block, dict):
+            continue
+        modes[mode] = {
+            "createdUtc": block.get("created_utc"),
+            "embodiment": block.get("embodiment"),
+            "summary": block.get("summary") or {},
+            "episode": (block.get("episodes") or {}).get(str(int(episode))),
+        }
+    return {"datasetRoot": str(dataset_root), "episode": int(episode), "modes": modes}
+
+
+# --- Two-arm replay (roadmap D4) -----------------------------------------------
+#
+# The operator's half of tools/fr3/dual_fr3_replay_runtime.py: Connect starts it on the selected episode's
+# C3 reference path (one mode), it moves both arms to frame 0 and waits; Execute says "go" on its stdin;
+# Abort says "abort" there while it waits, or SIGTERMs it once the arms run (one stop word for both, the
+# runtime's own fault path). Only an episode C4 called executable in that mode is started. "fake" drives
+# the runtime's fake arms -- the coordination, gates and timelines, on this machine; "real" drives the two
+# FR3s of fr3_arms.json by joint position control, refused until both are in service (the runtime says why).
+
+_DUAL_REPLAY_SCRIPT = Path("tools") / "fr3" / "dual_fr3_replay_runtime.py"
+_DUAL_REPLAY_SUBDIR = Path("outputs") / "fr3" / "dual_fr3_replay"
+_DUAL_REPLAY_MODES = ("absolute", "relative")
+_DUAL_REPLAY_BACKENDS = ("fake", "real")
+_DUAL_REPLAY_AT_START = "DUAL_REPLAY_AT_TRAJECTORY_START"
+_DUAL_REPLAY_REPORT = "DUAL_REPLAY_REPORT "
+_DUAL_REPLAY_LOG_LINES = 200
+_DUAL_REPLAY_STOP_WAIT_S = 5.0
+
+
+def _dual_replay_live(state: GatewayState) -> bool:
+    process = state.dual_replay_process
+    return process is not None and process.poll() is None
+
+
+def _dual_replay_job_view(state: GatewayState) -> dict[str, Any]:
+    with state.dual_replay_lock:
+        job = dict(state.dual_replay_job)
+        job["log"] = list(job.get("log") or [])[-40:]
+    return job
+
+
+def _dual_replay_payload(state: GatewayState, error: str = "") -> dict[str, Any]:
+    return {
+        "ok": not error,
+        "error": error,
+        "job": _dual_replay_job_view(state),
+        "arms": _robot_arms_payload(state)["arms"],
+        "modes": list(_DUAL_REPLAY_MODES),
+        "backends": list(_DUAL_REPLAY_BACKENDS),
+    }
+
+
+def _dual_replay_report_summary(path: Path) -> dict[str, Any]:
+    report = _load_json_file(path)
+    if not report:
+        return {}
+    stop = report.get("stop") or {}
+    return {
+        "path": str(path),
+        "backend": report.get("backend"),
+        "startSkewMs": report.get("start_skew_ms"),
+        "startGapMm": report.get("start_gap_mm"),
+        "minGapMm": report.get("min_gap_mm"),
+        "stoppedTogether": report.get("stopped_together"),
+        "stop": [str(e.get("reason") or "") for e in stop.get("events") or []],
+        # D2 (dual_fr3_clock): the arms' clocks fitted, the execution skew, and its cost on T_LR -- estimates
+        "clock": {
+            "status": (report.get("clock") or {}).get("status"),
+            "verdict": (report.get("clock") or {}).get("verdict"),
+            "startSkewMs": (report.get("clock") or {}).get("start_skew_ms"),
+            "tLrFromSkewMmP95": ((report.get("clock") or {}).get("t_lr_error_mm") or {}).get("from_skew_p95"),
+        },
+        "arms": {
+            name: {
+                "outcome": row.get("outcome"),
+                "framesCommanded": row.get("frames_commanded"),
+                "framesPlanned": row.get("frames_planned"),
+            }
+            for name, row in (report.get("arms") or {}).items()
+        },
+    }
+
+
+def _watch_dual_replay(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    report = ""
+    for raw in process.stdout:
+        line = raw.rstrip()
+        with state.dual_replay_lock:
+            job = state.dual_replay_job
+            job.setdefault("log", []).append(line)
+            del job["log"][:-_DUAL_REPLAY_LOG_LINES]
+            if line.startswith(_DUAL_REPLAY_AT_START) and job.get("state") == "connecting":
+                job["state"] = "at_start"
+            elif line.startswith("refused:"):
+                job["error"] = line.removeprefix("refused:").strip()
+            elif line.startswith(_DUAL_REPLAY_REPORT):
+                report = line.removeprefix(_DUAL_REPLAY_REPORT).strip()
+    code = process.wait()
+    summary = _dual_replay_report_summary(Path(report)) if report else {}
+    with state.dual_replay_lock:
+        job = state.dual_replay_job
+        job["exitCode"] = code
+        job["report"] = summary
+        if code != 0 or not summary:
+            job["state"] = "error"
+            job["error"] = job.get("error") or f"exit {code}"
+        elif summary.get("stop"):
+            job["state"] = "stopped"
+        else:
+            job["state"] = "finished"
+        job["endedUnixS"] = time.time()
+        if state.dual_replay_process is process:
+            state.dual_replay_process = None
+    with state.lock:
+        state.log("info" if job["state"] == "finished" else "warn", f"two-arm replay {job['state']}: {job.get('error') or report}")
+
+
+def _dual_replay_edges(row: dict[str, Any]) -> dict[str, list[str]]:
+    """Per arm, the graph edges its targets go through (C2's plan in the C4 verdict), as one line each."""
+    arms = (row.get("mode") or {}).get("arms") or {}
+    return {
+        arm: [
+            f"{e.get('from_world_frame_id')} -> {e.get('to_world_frame_id')} ({e.get('method') or '?'})"
+            for e in spec.get("edges") or []
+        ]
+        for arm, spec in arms.items()
+    }
+
+
+def _dual_replay_connect(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Connect: start the runtime on the selected episode; both arms go to frame 0 and wait for Execute."""
+    mode = str(body.get("mode") or "").strip().lower()
+    backend = str(body.get("backend") or "").strip().lower()
+    if mode not in _DUAL_REPLAY_MODES:
+        return _dual_replay_payload(state, f"mode must be one of {', '.join(_DUAL_REPLAY_MODES)}")
+    if backend not in _DUAL_REPLAY_BACKENDS:
+        return _dual_replay_payload(state, f"backend must be one of {', '.join(_DUAL_REPLAY_BACKENDS)}")
+    dataset_root = state.selected_replay_root
+    episode = int(state.replay.episode)
+    if dataset_root is None:
+        return _dual_replay_payload(state, "no dataset selected")
+    verdicts = _dual_fr3_executability_payload(dataset_root, episode) or {}
+    row = ((verdicts.get("modes") or {}).get(mode) or {}).get("episode")
+    if not row:
+        return _dual_replay_payload(
+            state, f"episode {episode} has no {mode} verdict: run tools/fr3/dual_fr3_executability.py --mode {mode}"
+        )
+    if not row.get("dual_fr3_executable"):
+        return _dual_replay_payload(
+            state, f"episode {episode} is not executable in {mode}: " + "; ".join(row.get("reasons") or [])
+        )
+    if backend == "real":
+        holder = _fr3_pivot_fci_holder(state) or ("双臂归位正在进行" if _dual_home_live(state) else "")
+        if holder:
+            return _dual_replay_payload(state, f"{holder}，它占着 FCI")
+    out = state.repo_root / _DUAL_REPLAY_SUBDIR
+    command = [
+        str(_mujoco_replay_python(state)),
+        str(state.repo_root / _DUAL_REPLAY_SCRIPT),
+        str(dataset_root),
+        "--episode", str(episode),
+        "--retarget", mode,
+        "--backend", backend,
+        "--out", str(out),
+    ]  # fmt: skip
+    refusal, process = "", None
+    with state.dual_replay_lock:
+        if _dual_replay_live(state):
+            refusal = "a two-arm replay is already running"
+        else:
+            out.mkdir(parents=True, exist_ok=True)
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(state.repo_root),
+                    env=_real_preflight_env(state),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,  # an abort signals the runtime, never the gateway
+                )
+            except OSError as exc:
+                refusal = str(exc)
+            else:
+                state.dual_replay_process = process
+                state.dual_replay_job = {
+                    "state": "connecting",
+                    "mode": mode,
+                    "backend": backend,
+                    "dataset": str(dataset_root),
+                    "episode": episode,
+                    "verdict": {"dSafeMm": row.get("d_safe_mm"), "minGapMm": row.get("min_arm_arm_gap_mm")},
+                    "edges": _dual_replay_edges(row),
+                    "startedUnixS": time.time(),
+                    "pid": process.pid,
+                    "log": [],
+                    "error": "",
+                    "report": {},
+                }
+    if refusal or process is None:
+        return _dual_replay_payload(state, refusal)
+    with state.lock:
+        state.log("warn", f"two-arm replay ({backend}, {mode}) connecting: episode {episode} of {dataset_root.name}")
+    Thread(target=_watch_dual_replay, args=(state, process), daemon=True, name=f"dual-replay-{process.pid}").start()
+    return _dual_replay_payload(state)
+
+
+def _dual_replay_execute(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Execute: both arms are at frame 0; one "go", one start time for both."""
+    del body
+    with state.dual_replay_lock:
+        process = state.dual_replay_process
+        if not _dual_replay_live(state) or state.dual_replay_job.get("state") != "at_start":
+            error = "both arms must be at frame 0 (Connect first, and wait for it)"
+        else:
+            error = ""
+            try:
+                assert process is not None and process.stdin is not None
+                process.stdin.write("go\n")
+                process.stdin.flush()
+                state.dual_replay_job["state"] = "executing"
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+    return _dual_replay_payload(state, error)
+
+
+def _dual_replay_abort(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Abort: "abort" while the arms wait at frame 0; SIGTERM otherwise (the runtime stops both)."""
+    del body
+    with state.dual_replay_lock:
+        process = state.dual_replay_process
+        if not _dual_replay_live(state):
+            return {**_dual_replay_payload(state, "no two-arm replay is running")}
+        state.dual_replay_job["abortRequested"] = True
+        # Blocked on stdin only at frame 0; moving there or running, the signal reaches the coordinator.
+        waiting = state.dual_replay_job.get("state") == "at_start"
+        try:
+            if waiting and process.stdin is not None:
+                process.stdin.write("abort\n")
+                process.stdin.flush()
+            else:
+                process.send_signal(signal.SIGTERM)
+        except (OSError, ValueError):
+            process.send_signal(signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_DUAL_REPLAY_STOP_WAIT_S)
+    return _dual_replay_payload(state)
+
+
+_DUAL_REPLAY_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/replay/dual-fr3/connect": _dual_replay_connect,
+    "/api/replay/dual-fr3/execute": _dual_replay_execute,
+    "/api/replay/dual-fr3/abort": _dual_replay_abort,
+}
+
+
+# --- Both FR3s home ----------------------------------------------------------
+#
+# The operator's half of tools/fr3/dual_fr3_move_to_start.py. Check starts it: both arms are read (each held by
+# its own FCI session from then on), their straight joint paths home are checked against each other and the
+# table, and the plan -- together, one after the other, or refused -- comes back for the operator to read.
+# Execute says "go" on its stdin (the runtime re-reads both arms and refuses if either moved); Cancel says
+# "abort" while it waits, and while the arms move it ends the process group, which drops both FCI sessions --
+# the arms then stop on libfranka's reflex, the user stop is quicker. A plan nobody answers lapses after the
+# runtime's WAIT_FOR_GO_S.
+
+_DUAL_HOME_SCRIPT = Path("tools") / "fr3" / "dual_fr3_move_to_start.py"
+_DUAL_HOME_PLAN = "DUAL_HOME_PLAN "
+_DUAL_HOME_READY = "DUAL_HOME_READY"
+_DUAL_HOME_RESULT = "DUAL_HOME_RESULT "
+_DUAL_HOME_LOG_LINES = 200
+_DUAL_HOME_STOP_WAIT_S = 5.0
+#: how long the runtime waits for Execute after the plan (dual_fr3_move_to_start.WAIT_FOR_GO_S); the page counts it down
+_DUAL_HOME_WAIT_S = 120.0
+
+
+def _dual_home_live(state: GatewayState) -> bool:
+    process = state.dual_home_process
+    return process is not None and process.poll() is None
+
+
+def _dual_home_payload(state: GatewayState, error: str = "") -> dict[str, Any]:
+    with state.dual_home_lock:
+        job = dict(state.dual_home_job)
+        job["log"] = list(job.get("log") or [])[-40:]
+    return {"ok": not error, "error": error, "job": job}
+
+
+def _dual_home_fci_holder(state: GatewayState) -> str:
+    """Whatever else would want an arm's FCI while both are homed, or ""."""
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return holder
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") == "collecting":
+            return "FR3 pivot 采集正在进行"
+    with state.dual_replay_lock:
+        if _dual_replay_live(state):
+            return "双臂 replay 正在运行"
+    if _FR3_MOVE_TO_START_LOCK.locked():
+        return "单臂 move to start 正在进行"
+    return ""
+
+
+def _watch_dual_home(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip()
+        with state.dual_home_lock:
+            job = state.dual_home_job
+            if line.startswith(_DUAL_HOME_PLAN):
+                with suppress(json.JSONDecodeError):
+                    job["plan"] = json.loads(line.removeprefix(_DUAL_HOME_PLAN))
+                continue
+            if line.startswith(_DUAL_HOME_RESULT):
+                with suppress(json.JSONDecodeError):
+                    job["result"] = json.loads(line.removeprefix(_DUAL_HOME_RESULT))
+                continue
+            job.setdefault("log", []).append(line)
+            del job["log"][:-_DUAL_HOME_LOG_LINES]
+            if line.startswith(_DUAL_HOME_READY) and job.get("state") == "checking":
+                job["state"] = "ready"
+                job["readyUnixS"] = time.time()
+                job["waitS"] = _DUAL_HOME_WAIT_S
+            elif line.startswith("refused:"):
+                job["error"] = line.removeprefix("refused:").strip()
+    code = process.wait()
+    with state.dual_home_lock:
+        job = state.dual_home_job
+        job["exitCode"] = code
+        result = job.get("result") or {}
+        if code == 0 and (result.get("ok") or job.get("state") == "checking"):
+            # checking -> exit 0 without a prompt: both arms were already at their start joints
+            job["state"] = "done"
+        elif code == 3 or job.get("cancelRequested"):
+            job["state"] = "cancelled"
+        elif code == 2:
+            job["state"] = "refused"
+        else:
+            job["state"] = "failed"
+            job["error"] = job.get("error") or f"exit {code}"
+        job["endedUnixS"] = time.time()
+        if state.dual_home_process is process:
+            state.dual_home_process = None
+        final = job["state"]
+    with state.lock:
+        state.log("info" if final == "done" else "warn", f"both FR3s home: {final} {job.get('error') or ''}".strip())
+
+
+def _dual_home_check(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Check: read both arms and plan; the runtime then waits for Execute."""
+    del body
+    holder = _dual_home_fci_holder(state)
+    if holder:
+        return _dual_home_payload(state, f"{holder}，它占着 FCI；先停掉再归位")
+    command = [str(_mujoco_replay_python(state)), str(state.repo_root / _DUAL_HOME_SCRIPT)]
+    refusal, process = "", None
+    with state.dual_home_lock:
+        if _dual_home_live(state):
+            refusal = "双臂归位已在进行"
+        else:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(state.repo_root),
+                    env=_real_preflight_env(state),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,  # a cancel signals the runtime and its arms, never the gateway
+                )
+            except OSError as exc:
+                refusal = str(exc)
+            else:
+                state.dual_home_process = process
+                state.dual_home_job = {
+                    "state": "checking",
+                    "startedUnixS": time.time(),
+                    "pid": process.pid,
+                    "plan": None,
+                    "result": None,
+                    "log": [],
+                    "error": "",
+                }
+    if refusal or process is None:
+        return _dual_home_payload(state, refusal)
+    with state.lock:
+        state.log("warn", "both FR3s home: checking")
+    Thread(target=_watch_dual_home, args=(state, process), daemon=True, name=f"dual-home-{process.pid}").start()
+    return _dual_home_payload(state)
+
+
+def _dual_home_execute(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Execute: the plan the operator read; the runtime re-reads both arms before either moves."""
+    del body
+    with state.dual_home_lock:
+        process = state.dual_home_process
+        plan = state.dual_home_job.get("plan") or {}
+        if not _dual_home_live(state) or state.dual_home_job.get("state") != "ready":
+            error = "先 Check，等计划出来再执行"
+        elif not plan.get("stages"):
+            error = "计划不让动"
+        else:
+            error = ""
+            try:
+                assert process is not None and process.stdin is not None
+                process.stdin.write("go\n")
+                process.stdin.flush()
+                state.dual_home_job["state"] = "moving"
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+    if not error:
+        with state.lock:
+            state.log("warn", f"both FR3s home: moving ({plan.get('chosen')})")
+    return _dual_home_payload(state, error)
+
+
+def _dual_home_cancel(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """Cancel: "abort" while the plan waits; while the arms move, end the process group (both FCIs drop)."""
+    del body
+    with state.dual_home_lock:
+        process = state.dual_home_process
+        if not _dual_home_live(state) or process is None:
+            return _dual_home_payload(state, "没有在归位")
+        state.dual_home_job["cancelRequested"] = True
+        waiting = state.dual_home_job.get("state") in ("checking", "ready")
+        try:
+            if waiting and process.stdin is not None:
+                process.stdin.write("abort\n")
+                process.stdin.flush()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_DUAL_HOME_STOP_WAIT_S)
+    return _dual_home_payload(state)
+
+
+_DUAL_HOME_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[str, Any]]] = {
+    "/api/robot/dual-home/check": _dual_home_check,
+    "/api/robot/dual-home/execute": _dual_home_execute,
+    "/api/robot/dual-home/cancel": _dual_home_cancel,
+}
+
+
 def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
     """The FR3 replay report, shaped as the inspector's preview payload.
 
@@ -17084,7 +18792,21 @@ def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[
     ]
 
 
-def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: str | None = None) -> list[str]:
+def _mujoco_preview_root(state: GatewayState, arm: str, cube_mode: str) -> str | None:
+    """The base a MuJoCo preview of ``cube_mode`` plans in: the selected arm's, so the arm that later replays
+    it executes the copy that was checked; None (each hand in its own arm's base) for "both" or no arm."""
+    arm = str(arm or "").strip().lower()
+    if not arm or cube_mode == "both":
+        return None
+    root = _arm_root(state, arm)
+    if not root:
+        raise ValueError(f"the {arm} arm has no base in {_DUAL_FR3_EMBODIMENT}")
+    return root
+
+
+def _mujoco_replay_command(
+    state: GatewayState, dataset_root: Path, cube_mode: str | None = None, arm: str = ""
+) -> list[str]:
     if state.profile == "workstation":
         return _fr3_mujoco_replay_command(state, dataset_root)
     selected_cube_mode = str(cube_mode or state.replay.mujocoCubeMode or DEFAULT_MUJOCO_CUBE_MODE)
@@ -17092,7 +18814,20 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
     report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
     video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
-    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    root = _mujoco_preview_root(state, arm, selected_cube_mode)
+    fr3_dir = _prepare_fr3_trajectory(dataset_root, state.repo_root, root)
+    if fr3_dir is None and root not in (None, wp.FR3_BASE_WORLD_ID):
+        raise RuntimeError(
+            f"{dataset_root.name} predates world stamps: its poses are in {wp.FR3_BASE_WORLD_ID} as recorded, "
+            f"so only the arm commanding in it can replay them, not the {arm} arm ({root})"
+        )
+    if fr3_dir is not None:
+        # a hand no base reaches has no copy; planning it would read nothing, or a stale file
+        refused = _load_json_file(fr3_dir / "frame.json").get("refused") or {}
+        cubes = ("left", "right") if selected_cube_mode == "both" else (selected_cube_mode,)
+        blocked = [refused[name] for name in (f"state_action.{cube}.csv" for cube in cubes) if name in refused]
+        if blocked:
+            raise RuntimeError("\n".join(blocked))
     command = [
         str(_mujoco_replay_python(state)),
         str(
@@ -17130,6 +18865,21 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         "--no-viewer",
     ]
     return command
+
+
+def _mujoco_checked_root(dataset_root: Path, episode: int, cube: str) -> str:
+    """The base the stored MuJoCo preview of ``cube`` planned in ("" without one): the copy it read.
+
+    A preview of the dataset itself (no world stamps) is in fr3_base, as recorded.
+    """
+    report = _load_json_file(_mujoco_preview_report_path(dataset_root, episode, cube))
+    read = str(report.get("dataset_root") or "")
+    if not read:
+        return ""
+    read_path = Path(read)
+    if read_path.resolve() == dataset_root.resolve():
+        return wp.FR3_BASE_WORLD_ID
+    return _fr3_copy_root(read_path, cube)
 
 
 def _mujoco_trajectory_start_joints(dataset_root: Path, episode: int, cube: str) -> list[float]:
@@ -17171,7 +18921,7 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         raise RuntimeError(f"MuJoCo report exists but its native video is missing: {video_path}")
     if Path(str(report.get("dataset_root") or "")).resolve() not in {
         dataset_root.resolve(),
-        _fr3_base_trajectory_dir_path(dataset_root).resolve(),
+        *(path.resolve() for path in _fr3_trajectory_dirs(dataset_root)),
     }:
         raise RuntimeError("MuJoCo report belongs to a different dataset.")
     if int(report.get("episode_index", -1)) != int(state.replay.episode):
@@ -17294,8 +19044,9 @@ def _real_replay_command(
     # itself and depend on an unrelated self-SSH key. Invoke the same underlying
     # replay runtime locally with the exact selected sidecar and episode.
     # Same FR3-frame copy the MuJoCo validation ran on, so the arm executes what was checked.
-    csv_path = _fr3_trajectory_csv(dataset_root, state.repo_root, cube_mode)
-    frame = _load_json_file(csv_path.parent / "frame.json") if csv_path.parent.name == FR3_BASE_TRAJECTORY_SUBDIR else {}
+    # in the base of the arm at robot_ip, whichever hand it is (an IP that is no arm's: fr3_base, as before)
+    csv_path = _fr3_trajectory_csv(dataset_root, state.repo_root, cube_mode, _ip_root(state, robot_ip))
+    frame = _load_json_file(csv_path.parent / "frame.json")
     if (frame.get("gripper_width") or {}).get("rows", {}).get(csv_path.name) == 0:
         # 10-13: the replay ran start to end with the gripper never commanded and nothing said so.
         state.log(
@@ -17313,13 +19064,8 @@ def _real_replay_command(
             / "replay_cube_pose_in_robot_base.py"
         ),
         "--config_path",
-        str(
-            state.repo_root
-            / "third_party"
-            / "opencv_kalibr"
-            / "fr3_data_collection_replay"
-            / "replay_cube_pose_in_robot_base.thor.yaml"
-        ),
+        # The arm's own YAML: its gripper backend and BOX differ (11-02 the gripper went to the right arm).
+        str(state.repo_root / _arm_replay_config(state, robot_ip)),
         "--input.source=csv",
         f"--input.csv_path={csv_path}",
         "--input.pose_prefix=state",
@@ -17358,6 +19104,75 @@ def _real_replay_command(
     return command
 
 
+def _arm_replay_config(state: GatewayState, robot_ip: str) -> Path:
+    """The replay YAML of the arm at ``robot_ip`` (fr3_arms.json); the left arm's when the IP is no arm's.
+
+    Real replay only starts on a registered arm (:func:`_drive_target`), so the fallback is for callers
+    that build a command without one.
+    """
+    try:
+        registry = fr3_arms.load(repo_root=state.repo_root)
+    except (OSError, ValueError):
+        return FR3_REPLAY_THOR_CONFIG
+    arm = fr3_arms.arm_for_ip(registry, str(robot_ip))
+    config = ((registry.get("arms") or {}).get(arm) or {}).get("replay_config") if arm else None
+    return Path(config) if config else FR3_REPLAY_THOR_CONFIG
+
+
+def _robot_arms_payload(state: GatewayState) -> dict[str, Any]:
+    """``/api/robot/arms``: every FR3 of tools/fr3/fr3_arms.json, and whether a request must name one.
+
+    The workstation drives its own FR3, which is not in the registry; it keeps its IP box.
+    """
+    required = state.profile != "workstation"
+    try:
+        arms = fr3_arms.summary(fr3_arms.load(repo_root=state.repo_root))
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "required": required, "arms": [], "error": str(exc)}
+    return {"ok": True, "required": required, "arms": arms, "error": ""}
+
+
+def _drive_target(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> dict[str, Any]:
+    """The FR3 a request drives, as ``{"arm", "robot_ip", ...its fr3_arms.json entry}``.
+
+    Thor (roadmap B2): the request names the arm, or an IP that is a registered arm's; neither is refused
+    (fr3_arms.ArmConfigError, a ValueError) -- with two FR3s a default is the wrong one moving. The
+    workstation's FR3 is not in the registry and keeps the IP it was given or configured.
+    """
+    if state.profile == "workstation":
+        return {"arm": "", "robot_ip": _validated_robot_ip(str(robot_ip or _real_robot_ip(state)), "Robot IP")}
+    if str(robot_ip or "").strip():
+        _validated_robot_ip(str(robot_ip), "Robot IP")
+    registry = fr3_arms.load(repo_root=state.repo_root)
+    return fr3_arms.resolve(registry, str(arm or "") or None, str(robot_ip or "") or None)
+
+
+def _drive_targets(state: GatewayState, arm: Any = None, robot_ip: Any = None) -> list[dict[str, Any]]:
+    """:func:`_drive_target`, with ``arm=both`` meaning every arm in service (the preflight checks each)."""
+    if str(arm or "").strip().lower() == "both" and state.profile != "workstation":
+        registry = fr3_arms.load(repo_root=state.repo_root)
+        return [fr3_arms.resolve(registry, name) for name in fr3_arms.in_service(registry)]
+    return [_drive_target(state, arm, robot_ip)]
+
+
+def _ip_root(state: GatewayState, robot_ip: str) -> str:
+    """The base the arm at ``robot_ip`` commands in (fr3_arms.json -> fr3_dual.json); fr3_base for no arm's IP."""
+    try:
+        arm = fr3_arms.arm_for_ip(fr3_arms.load(repo_root=state.repo_root), str(robot_ip))
+    except (OSError, ValueError):
+        arm = None
+    return (_arm_root(state, arm) if arm else "") or wp.FR3_BASE_WORLD_ID
+
+
+def _arm_root(state: GatewayState, arm: str) -> str:
+    """The base an arm commands in (embodiments/fr3_dual.json); "" when it has none."""
+    try:
+        description = json.loads((state.repo_root / _DUAL_FR3_EMBODIMENT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(((description.get("arms") or {}).get(arm) or {}).get("root") or "")
+
+
 def _real_robot_ip(state: GatewayState) -> str:
     replay = _replay_config(state.config)
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
@@ -17370,16 +19185,14 @@ def _real_robot_ip(state: GatewayState) -> str:
     )
 
 
-def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
+def _real_preflight_command(
+    state: GatewayState, robot_ip: str | None = None, replay_config: str | None = None
+) -> list[str]:
     replay = _replay_config(state.config)
     config_path = (
         state.config_path
         if state.profile == "workstation"
-        else state.repo_root
-        / "third_party"
-        / "opencv_kalibr"
-        / "fr3_data_collection_replay"
-        / "replay_cube_pose_in_robot_base.thor.yaml"
+        else state.repo_root / (replay_config or FR3_REPLAY_THOR_CONFIG)
     )
     command = [
         str(
@@ -17425,15 +19238,19 @@ def _real_preflight_env(state: GatewayState) -> dict[str, str]:
     return env
 
 
-def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = None) -> None:
+def _run_real_preflight(state: GatewayState, targets: Iterable[dict[str, Any]] | None = None) -> None:
+    """Hardware checks of each target (``_drive_target`` results); on Thor there is no default arm to check."""
     replay = _replay_config(state.config)
     if not _bool_config(replay, "real_preflight_enabled", True):
         state.log("warn", "Real-robot preflight skipped by replay.real_preflight_enabled=false")
         return
     timeout_s = _float_config(replay, "real_preflight_timeout_s", DEFAULT_REAL_PREFLIGHT_TIMEOUT_S)
-    targets = list(dict.fromkeys(robot_ips or [_real_robot_ip(state)]))
-    for robot_ip in targets:
-        command = _real_preflight_command(state, robot_ip)
+    targets = list(targets) if targets is not None else _drive_targets(state)
+    for target in targets:
+        robot_ip = str(target["robot_ip"])
+        command = _real_preflight_command(state, robot_ip, target.get("replay_config"))
+        if target.get("arm"):
+            _append_real_replay_log(state, "preflight", f"{target['arm']} arm")
         state.replay.message = f"Running real-robot preflight checks for {robot_ip}"
         _append_real_replay_log(state, "preflight", f"checking robot {robot_ip}")
         _append_real_replay_log(state, "preflight", f"config={next(arg.split('=', 1)[1] for arg in command if arg.startswith('--config-path='))}")
@@ -17498,6 +19315,8 @@ def _require_mujoco_validation(
         raise RuntimeError(
             "Real-robot replay is disabled for exported datasets because exported action is next-frame observation.state, not a verified robot command stream."
         )
+    if _dataset_kind(state, dataset_root) == "pseudo_bimanual":
+        raise RuntimeError("A pseudo_bimanual pair replays on two arms only: use the Two-Arm Executability panel.")
     selected_cube = str(cube_mode or state.replay.mujocoCubeMode)
     if not _mujoco_validation_is_for_active_episode(state, dataset_root) and not (
         allow_failed_override
@@ -17522,9 +19341,14 @@ def _mujoco_recommendation_suffix(state: GatewayState, dataset_root: Path) -> st
     return "MuJoCo replay is strongly recommended before Preflight and still required before Real Robot"
 
 
-def _preflight_replay(state: GatewayState) -> None:
+def _preflight_replay(state: GatewayState, arm: str = "", robot_ip: str = "") -> None:
+    """``arm`` is right, left, or both (every arm in service); on Thor a preflight that names none is refused."""
     dataset_root = _require_replay_dataset(state)
-    _run_real_preflight(state)
+    targets = _drive_targets(state, arm, robot_ip)
+    _run_real_preflight(state, targets)
+    if len(targets) == 1:
+        state.replay.realArm = str(targets[0].get("arm") or "")
+        state.replay.realRobotIp = str(targets[0]["robot_ip"])
     state.replay.state = "armed"
     state.replay.safety = "ready"
     state.replay.message = (
@@ -17550,7 +19374,9 @@ def _start_dry_run_replay(state: GatewayState) -> None:
     state.log("info", state.replay.message)
 
 
-def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE) -> None:
+def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE, arm: str = "") -> None:
+    """``arm``: the arm the replay panel has selected -- the preview plans in its base (none: the hand's own
+    arm's), and real replay later refuses an arm whose base is not the one checked."""
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "MuJoCo replay is already running"
         return
@@ -17575,8 +19401,9 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
                 "Run Generate EE Trajectory first."
             )
 
+    command = _mujoco_replay_command(state, dataset_root, cube_mode, arm)
     state.replay.mujocoCubeMode = cube_mode
-    command = _mujoco_replay_command(state, dataset_root, cube_mode)
+    state.replay.mujocoArm = "" if cube_mode == "both" else str(arm or "").strip().lower()
     state.replay.mujocoValidation = _new_mujoco_validation(
         state,
         status="running",
@@ -17771,6 +19598,7 @@ def _start_real_replay(
     override_mujoco_failure: bool = False,
     record_tracker: bool = False,
     command_lead_frames: Any = None,
+    arm: str = "",
 ) -> None:
     """Thor: step 1 of a real replay -- move the arm to the trajectory start and hold there.
 
@@ -17782,8 +19610,9 @@ def _start_real_replay(
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
-    if _gripper_teleop_running(state):
-        raise ValueError(_gripper_teleop_conflict())
+    conflict = _box_port_conflict(state)
+    if conflict:
+        raise ValueError(conflict)
 
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
@@ -17836,7 +19665,21 @@ def _start_real_replay(
                 f"{expected_link}; select the end effector that matches the tracked gripper."
             )
 
-    selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
+    target = _drive_target(state, arm, robot_ip)
+    if not workstation:
+        # Either arm replays either hand, in its own base: the copy it executes is the hand re-expressed in
+        # that base, and the MuJoCo preview that cleared it (and planned its start joints) must have planned
+        # in the same base -- another arm's plan is another arm's coordinates.
+        root = _arm_root(state, target["arm"]) or _ip_root(state, target["robot_ip"])
+        _fr3_trajectory_csv(dataset_root, state.repo_root, cube_mode, root)  # raises when no edge reaches it
+        checked = _mujoco_checked_root(dataset_root, state.replay.episode, cube_mode)
+        if checked != root:
+            raise ValueError(
+                f"MuJoCo checked the {cube_mode} trajectory in {checked or 'no base'}, but the "
+                f"{target['arm'] or target['robot_ip']} arm commands in {root}; select that arm and run "
+                f"MuJoCo {cube_mode} again"
+            )
+    selected_ip = target["robot_ip"]
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
 
     # Re-run hardware checks against the exact IP selected in this panel;
@@ -17844,13 +19687,14 @@ def _start_real_replay(
     _start_realsense_preview(state, dataset_root)
     _append_real_replay_log(state, "camera", "RealSense monitor requested")
     try:
-        _run_real_preflight(state, [selected_ip])
+        _run_real_preflight(state, [target])
     except Exception:
         _stop_realsense_preview(state)
         raise
     state.replay.safety = "ready"
     state.replay.realCubeMode = cube_mode
     state.replay.realRobotIp = selected_ip
+    state.replay.realArm = str(target.get("arm") or "")
     state.replay.realEndEffectorMode = end_effector_mode
     state.replay.realCommandLeadFrames = command_lead_frames
     state.replay.mujocoOverrideAccepted = bool(
@@ -18374,8 +20218,33 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/fr3-pivot":
             _json_response(self, HTTPStatus.OK, _fr3_pivot_payload(self.server.state))
             return
+        if path == "/api/calibration/fr3-payload":
+            _json_response(self, HTTPStatus.OK, _payload_calibration(self.server.state).payload())
+            return
+        if path == "/api/calibration/fr3-payload/desk-file":
+            desk_file = _payload_calibration(self.server.state).desk_file(
+                query.get("desk", [""])[0], query.get("name", [""])[0]
+            )
+            if desk_file is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "no such desk config"})
+                return
+            data = desk_file.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", f'attachment; filename="{desk_file.name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/api/fr3/gripper-teleop":
-            _json_response(self, HTTPStatus.OK, _gripper_teleop_payload(self.server.state))
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                _gripper_teleop_payload(
+                    self.server.state, query.get("arm", [""])[0], query.get("robotIp", [""])[0]
+                ),
+            )
             return
         if path == "/api/calibration/intrinsics-coverage":
             _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
@@ -18607,6 +20476,33 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 _json_response(self, HTTPStatus.OK, timeline)
                 return
+            if path == "/api/robot/arms":
+                _json_response(self, HTTPStatus.OK, _robot_arms_payload(self.server.state))
+                return
+            if path == "/api/replay/dual-fr3/job":
+                _json_response(self, HTTPStatus.OK, _dual_replay_payload(self.server.state))
+                return
+            if path == "/api/robot/dual-home":
+                _json_response(self, HTTPStatus.OK, _dual_home_payload(self.server.state))
+                return
+            if path == "/api/replay/dual-fr3":
+                try:
+                    episode = int(query.get("episode", ["0"])[0])
+                except ValueError:
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
+                    return
+                requested = query.get("path", [""])[0]
+                dataset_root = _resolve_known_dataset(self.server.state, requested) or self.server.state.selected_replay_root
+                payload = None if dataset_root is None else _dual_fr3_executability_payload(dataset_root, episode)
+                if payload is None:
+                    _json_response(
+                        self,
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "No two-arm verdict for this dataset: run tools/fr3/dual_fr3_executability.py."},
+                    )
+                    return
+                _json_response(self, HTTPStatus.OK, payload)
+                return
             if path == "/api/replay/mujoco-preview":
                 requested = query.get("path", [""])[0]
                 cube_mode = str(query.get("cube", [DEFAULT_MUJOCO_CUBE_MODE])[0]).strip().lower()
@@ -18792,12 +20688,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 allow_stale = (
                     query.get("allow_stale_calibration", query.get("allowStaleCalibration", [""]))[0] or ""
                 ).strip() in {"1", "true", "yes"}
+                supersede = (
+                    query.get("supersede_other_targets", query.get("supersedeOtherTargets", [""]))[0] or ""
+                ).strip() in {"1", "true", "yes"}
                 _queue_traj_gen(
                     state,
                     dataset_root,
                     marker_to_tcp_calibration_path=marker_tcp_path,
                     allow_stale_calibration=allow_stale,
                     tracking_target=tracking_target,
+                    supersede_other_targets=supersede,
                 )
                 with state.lock:
                     response = _snapshot(state)
@@ -18813,6 +20713,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         "hint": "先在标定中心提升，或带 allow_stale_calibration=1 明确用旧标定生成。",
                     },
                 )
+            except OtherTrackingTargetsError as exc:
+                _json_response(
+                    self,
+                    HTTPStatus.CONFLICT,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "otherTrackingTargets": exc.detail,
+                        "hint": "确认数据集录的是哪种目标；确要换成本目标，带 supersede_other_targets=1，旧轨迹会挪到 _superseded/ 下，不删除。",
+                    },
+                )
             except NotImplementedError as exc:
                 _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
             except Exception as exc:  # noqa: BLE001
@@ -18825,8 +20736,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             or _CROSS_CAMERA_ROUTES.get(path)
             or _FR3_BASE_EDGE_ROUTES.get(path)
             or _FR3_PIVOT_ROUTES.get(path)
+            or _PAYLOAD_CALIBRATION_ROUTES.get(path)
             or _GRIPPER_TELEOP_ROUTES.get(path)
             or _FR3_MOVE_TO_START_ROUTES.get(path)
+            or _DUAL_REPLAY_ROUTES.get(path)
+            or _DUAL_HOME_ROUTES.get(path)
         )
         if tracker_fit is not None:
             # Outside the state lock: a fit can first have to generate the
@@ -18888,10 +20802,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/preflight":
-                    preflight_ip = query.get("robot_ip", [""])[0].strip()
-                    if preflight_ip:
-                        self.server.state.replay.realRobotIp = _validated_robot_ip(preflight_ip, "Robot IP")
-                    _preflight_replay(self.server.state)
+                    _preflight_replay(
+                        self.server.state, query.get("arm", [""])[0].strip(), query.get("robot_ip", [""])[0].strip()
+                    )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/select-dataset":
@@ -18910,6 +20823,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _start_mujoco_replay(
                         self.server.state,
                         query.get("cube", [DEFAULT_MUJOCO_CUBE_MODE])[0],
+                        query.get("arm", [""])[0],
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
@@ -18931,6 +20845,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         record_tracker=str(query.get("record_tracker", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
                         command_lead_frames=query.get("lead_frames", [None])[0],
+                        arm=query.get("arm", [""])[0],
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
@@ -19074,6 +20989,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             query.get("socket_beyond_tcp_mm", query.get("socketBeyondTcpMm", ["0"]))[0]
                             or "0"
                         ).strip(),
+                        rig=(query.get("rig", [""])[0] or "").strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
@@ -19388,6 +21304,7 @@ def main() -> None:
     )
     if state.profile == "workstation":
         _probe_workstation_devices(state)
+    _bootstrap_world_graph_guard(state)
     server = DataCollectionGuiServer((args.host, args.port), state)
     _start_background_workers(state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")

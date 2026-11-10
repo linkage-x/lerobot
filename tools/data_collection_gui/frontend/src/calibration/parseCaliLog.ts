@@ -179,7 +179,54 @@ function evalAxis(axis: ForceAxis, value: number, limits: ForceAxisLimits): Axis
 
 /** Evaluate a whole force vector against the active per-axis thresholds. */
 export function evaluateForce(vec: ForceVec, limits: ForceAxisLimits): ForceEval {
-  const axes = FORCE_AXES.map((axis) => evalAxis(axis, vec[axis], limits));
+  return summarize(FORCE_AXES.map((axis) => evalAxis(axis, vec[axis], limits)));
+}
+
+/** Per-axis tolerance of a "target"-style limit set, read off the spec's own numbers. */
+function axisTolerance(axis: ForceAxis, limits: ForceAxisLimits): number {
+  if (axis === "fx") return limits.fxMaxN;
+  if (axis === "fy") return limits.fyMaxN;
+  if (axis === "fz") return limits.fz.mode === "target" ? limits.fz.tolN : limits.fz.maxN;
+  if (axis === "mx") return limits.mx.mode === "target" ? limits.mx.tolN : limits.mx.maxN;
+  return limits.momentMaxNm;
+}
+
+/**
+ * Dynamic (software-zero) acceptance at whatever attitude the BOX rests in.
+ *
+ * The spec's numbers (Fz -7.784, Mx -0.168, the other four ~0) are the payload's weight as the
+ * sensor sees it gripper-down. Tilt the BOX and that same weight leaks into Fx/Fy/My/Mz: 5 deg
+ * already puts 0.68 N on Fx and 0.04 N*m on My (0.7935 kg x 9.81 x the 56.5 mm CoM lever), so the
+ * fixed numbers really test "is it within ~1.3 deg of vertical", which a handheld BOX standing on its
+ * own feet does not meet (11-03, left collector: acc (-0.997, 0.094, 0.025), every failing axis is
+ * that tilt to the mN*m). The SDK publishes the payload model at the live IMU attitude as
+ * `fxyz_mxyz_gravity`; compare against it with the spec's tolerances. Gripper-down it IS the spec,
+ * and its norm is always the payload weight, so a run that zeroed the load away still fails.
+ */
+export function evaluateForceAgainstLoad(vec: ForceVec, load: ForceVec, limits: ForceAxisLimits): ForceEval {
+  return summarize(
+    FORCE_AXES.map((axis) => {
+      const label = FORCE_AXIS_LABELS[axis];
+      const kind: "force" | "moment" = axis.startsWith("m") ? "moment" : "force";
+      const tol = axisTolerance(axis, limits);
+      const value = vec[axis];
+      const expected = load[axis];
+      const pass = Math.abs(value - expected) <= tol;
+      const unit = kind === "moment" ? "N·m" : "N";
+      const digits = kind === "moment" ? 3 : 2;
+      return {
+        axis,
+        label,
+        value,
+        kind,
+        pass,
+        reason: pass ? "" : `${label} 偏离当前姿态下的负载重力 ${expected.toFixed(digits)} ± ${tol} ${unit}`,
+      };
+    }),
+  );
+}
+
+function summarize(axes: AxisEval[]): ForceEval {
   const firstFail = axes.find((a) => !a.pass) ?? null;
   return {
     axes,

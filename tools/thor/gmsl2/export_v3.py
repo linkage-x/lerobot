@@ -48,6 +48,7 @@ import csv
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -86,13 +87,25 @@ _POSE7_NAN = [math.nan] * 7
 # with `points`. This is only the fallback for frames archived before that tag
 # existed; the real width is detected per export by _detect_touch_width().
 _TOUCH_SAMPLE_WIDTH_DEFAULT = 239
-_TOUCH_SENSOR_KEYS = ("box_touch_left", "box_touch_right")
+# One pad per finger always gets columns (zero-filled when absent, as before). The
+# second pad on a finger (box_client's ``_1`` sensors, BOX SDK v4.1; the 11-02 rig
+# has two per finger) gets its own columns only in an export whose episodes carry
+# it, so exports of one-pad data keep their schema.
+_TOUCH_BASE_SENSOR_KEYS = ("box_touch_left", "box_touch_right")
+_TOUCH_EXTRA_SENSOR_KEYS = ("box_touch_left_1", "box_touch_right_1")
+_TOUCH_SENSOR_KEYS = (*_TOUCH_BASE_SENSOR_KEYS, *_TOUCH_EXTRA_SENSOR_KEYS)
 _TOUCH_ARRAY_KEYS = ("fx_0p1N", "fy_0p1N", "fz_0p1N")
-_TOUCH_ARRAY_COLUMNS = tuple(
-    (f"observation.touch.{sensor}.{axis}", sensor, axis)
-    for sensor in _TOUCH_SENSOR_KEYS
-    for axis in _TOUCH_ARRAY_KEYS
-)
+
+
+def _touch_array_columns(sensors: tuple[str, ...]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (f"observation.touch.{sensor}.{axis}", sensor, axis)
+        for sensor in sensors
+        for axis in _TOUCH_ARRAY_KEYS
+    )
+
+
+_TOUCH_ARRAY_COLUMNS = _touch_array_columns(_TOUCH_BASE_SENSOR_KEYS)
 
 
 
@@ -294,6 +307,39 @@ def _detect_touch_width(ep_dirs: list[Path]) -> int:
     return max(widths)
 
 
+def _detect_touch_sensors(ep_dirs: list[Path]) -> tuple[str, ...]:
+    """Touch sensors one export gets columns for: both fingers' first pad, plus each
+    second pad any of its episodes recorded."""
+
+    found: set[str] = set()
+    for ep_dir in ep_dirs:
+        path = ep_dir / "box_sensors.jsonl"
+        if not path.is_file() or len(found) == len(_TOUCH_EXTRA_SENSOR_KEYS):
+            continue
+        try:
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    # Substring test before parsing: the file is mostly 480 Hz 6D rows.
+                    # The sid is bare ("box_touch_left_1") or namespaced ("box7/box_touch_left_1").
+                    if not any(
+                        sensor not in found and (f'"{sensor}"' in line or f'/{sensor}"' in line)
+                        for sensor in _TOUCH_EXTRA_SENSOR_KEYS
+                    ):
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sensor = _touch_sensor_key(str(row.get("sid") or "")) if isinstance(row, dict) else None
+                    if sensor in _TOUCH_EXTRA_SENSOR_KEYS:
+                        found.add(sensor)
+                        if len(found) == len(_TOUCH_EXTRA_SENSOR_KEYS):
+                            break
+        except OSError:
+            continue
+    return (*_TOUCH_BASE_SENSOR_KEYS, *(sensor for sensor in _TOUCH_EXTRA_SENSOR_KEYS if sensor in found))
+
+
 def _touch_array_from_data(data: Any, axis: str, width: int) -> list[float] | None:
     if not isinstance(data, dict):
         return None
@@ -389,14 +435,15 @@ def _align_touch_rows(
     *,
     pts_offset_s: float = 0.0,
     width: int = _TOUCH_SAMPLE_WIDTH_DEFAULT,
+    columns: tuple[tuple[str, str, str], ...] = _TOUCH_ARRAY_COLUMNS,
 ) -> tuple[dict[str, list[list[float]]], bool]:
     touch_samples = _load_touch_samples(ep_dir, width)
-    touch_rows: dict[str, list[list[float]]] = {column: [] for column, _, _ in _TOUCH_ARRAY_COLUMNS}
+    touch_rows: dict[str, list[list[float]]] = {column: [] for column, _, _ in columns}
     zero = [0.0] * width
     saw_sample = any(touch_samples.values())
     for frame_index in range(n_frames):
         target_s = pts_offset_s + frame_index / max(int(fps), 1)
-        for column, sensor, axis in _TOUCH_ARRAY_COLUMNS:
+        for column, sensor, axis in columns:
             sample = _nearest_touch_sample(touch_samples.get(sensor, []), target_s)
             touch_rows[column].append(list(sample.get(axis, zero)) if sample is not None else list(zero))
     return touch_rows, saw_sample
@@ -1174,9 +1221,106 @@ def _session_labels(episodes: list[EpisodeSource]) -> dict[str, dict[str, Any]]:
     for src in episodes:
         metas.setdefault(src.session_dir, {})[src.local_index] = _load_meta(src.ep_dir)
     return {
-        session_dir.name: lp.session_labels(session_dir, _tracking_run_dir(session_dir), episode_metas)
+        session_dir.name: lp.session_labels(session_dir, _tracking_run_dir(session_dir), episode_metas, _REPO_ROOT)
         for session_dir, episode_metas in metas.items()
     }
+
+
+_TABLE_CHECK_SCRIPT = Path("tools/thor/gmsl2/cart_redock_check.py")
+# numpy + cv2: the tracker's venv on Thor; this exporter runs in the system python, which has neither.
+_TABLE_CHECK_PYTHON = Path("third_party/opencv_kalibr/.venv/bin/python3")
+_TABLE_CHECK_FILE = Path("derived") / "table_check.json"
+_TABLE_CHECK_TIMEOUT_S = 1800
+_TABLE_CHECK_FLAGGED = ("table_or_all_cameras_moved", "cameras_moved")
+_TABLE_CHECK_KEPT = (
+    "verdict",
+    "episodes",
+    "episodes_checked",
+    "episode_verdicts",
+    "cameras_moved",
+    "tags_bumped",
+    "corners_off",
+    "worst_shift_px",
+    "cameras_without_a_table_tag",
+    "extrinsics_runs",
+    "extrinsics_runs_unreferenced",
+    "references",
+    "datum",
+    "settings",
+)
+
+
+def _table_check(session_dir: Path, extrinsics_run: str = "") -> dict[str, Any]:
+    """The session's cameras against the fixed table tags 45-49 (``cart_redock_check.py session``).
+
+    Per episode and camera: are the table tags still where the camera saw them when the extrinsics
+    the episode was recorded on were captured (the run's own ``table_anchor.json``; for the datum's
+    run, the table datum), in pixels (0.6 px ~ 0.035 deg; the tracker's corner-BA camera_state
+    resolves ~0.2 deg and needs a cube in view).  Recorded and warned about, never refused on and never part of the
+    label key: the limit is provisional, a moved table leaves the labels alone, and a field added to
+    the key would part every export from the ones made before it.  The episodes already read are
+    kept in ``derived/table_check.json``, so only new ones are decoded.  ``extrinsics_run`` is the run the
+    session was tracked with, when it was: the labels' extrinsics, which need not be the run production loaded
+    while recording.
+    """
+    python = _REPO_ROOT / _TABLE_CHECK_PYTHON
+    if not python.is_file():
+        return {"verdict": "unchecked", "why": f"no {_TABLE_CHECK_PYTHON} (numpy + cv2) here"}
+    command = [
+        str(python),
+        str(_REPO_ROOT / _TABLE_CHECK_SCRIPT),
+        "session",
+        str(session_dir),
+        "--write",
+        "--calibration-root",
+        str(_REPO_ROOT / "outputs" / "calibration"),
+    ]
+    if extrinsics_run:
+        command += ["--extrinsics-run", extrinsics_run]
+    # The venv's own numpy/cv2 only: an inherited PYTHONPATH (the gateway adds the repo and passes on its
+    # own) could put another numpy ahead of the venv's C extensions.  The script imports nothing else.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    env["PYTHONNOUSERSITE"] = "1"
+    try:
+        proc = subprocess.run(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_TABLE_CHECK_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"verdict": "unchecked", "why": f"table check did not run: {exc}"}
+    path = session_dir / _TABLE_CHECK_FILE
+    if proc.returncode not in (0, 1) or not path.is_file():
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"verdict": "unchecked", "why": tail[-1] if tail else f"table check exited {proc.returncode}"}
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"verdict": "unchecked", "why": f"{path}: {exc}"}
+    return {**{k: result.get(k) for k in _TABLE_CHECK_KEPT}, "file": str(path)}
+
+
+def _describe_table_check(check: dict[str, Any]) -> str:
+    if check.get("why"):
+        return f"{check['verdict']} ({check['why']})"
+    line = f"{check['verdict']} ({check.get('episodes_checked')}/{check.get('episodes')} episodes)"
+    if check.get("cameras_moved"):
+        line += f", moved {','.join(check['cameras_moved'])}"
+    if check.get("tags_bumped"):
+        line += f", bumped tags {check['tags_bumped']}"
+    if check.get("corners_off"):
+        off = (f"{n.removeprefix('cam_')}:{','.join(map(str, t))}" for n, t in check["corners_off"].items())
+        line += f", corners off {' '.join(off)}"
+    worst = check.get("worst_shift_px") or {}
+    if worst:
+        line += ", worst " + " ".join(f"{n.removeprefix('cam_')}:{v:.2f}" for n, v in worst.items()) + " px"
+    if check.get("extrinsics_runs_unreferenced"):
+        line += f" (no table pixels for {','.join(check['extrinsics_runs_unreferenced'])})"
+    return line
 
 
 def _describe_labels(labels: dict[str, Any]) -> str:
@@ -1255,13 +1399,11 @@ def export_task_to_v3(
     if first_snapshots and first_snapshot_box_ids != ("",):
         box_state_names = list(lr3.box_state_names(first_snapshot_box_ids))
         box_ts_names = list(lr3.box_timestamp_names(first_snapshot_box_ids))
-        state_width = len(box_state_names)
-        ts_width = len(box_ts_names)
 
-    # Prefer the recorder's already-synced session parquet when it already has
-    # the selected schema. Export no longer re-derives BOX rows from raw jsonl or
-    # low-rate meta snapshots; the recording path owns BOX↔camera alignment.
-    if state_width == 0 and first_box:
+    # The recorder's already-synced session parquet decides the width. Export no
+    # longer re-derives BOX rows from raw jsonl or low-rate meta snapshots; the
+    # recording path owns BOX↔camera alignment.
+    if first_box:
         sample_row = None
         if first.local_index in first_box and first_box[first.local_index]:
             sample_row = first_box[first.local_index][0]
@@ -1273,8 +1415,25 @@ def export_task_to_v3(
         if sample_row is not None:
             state_width = len(sample_row["observation.state"])
             ts_width = len(sample_row.get("box.timestamps", []))
+    if state_width == 0 and first_snapshots and first_snapshot_box_ids != ("",):
+        state_width = len(box_state_names)
+        ts_width = len(box_ts_names)
 
     has_box = state_width > 0
+
+    # Sessions recorded before the fingertip pads joined observation.state
+    # (2026-11-03) have the same channels minus the trailing box_touch_*_1 ones,
+    # so they keep their names -- but they are a different layout, and the
+    # per-episode loop below refuses to put the two into one dataset.
+    if has_box and len(box_state_names) != state_width:
+        one_pad = lr3.box_state_names(first_snapshot_box_ids, one_pad=True)
+        if len(one_pad) == state_width:
+            box_state_names = list(one_pad)
+            box_ts_names = list(lr3.box_timestamp_names(first_snapshot_box_ids, one_pad=True))
+            _emit(
+                f"NOTE: one touch pad per finger in observation.state ({state_width} channels, "
+                "recorded before 2026-11-03); the fingertip pads are not in it"
+            )
 
     # The recorded parquet width wins, but a width that disagrees with the
     # current BOX_STATE_NAMES means the session predates a schema change (e.g.
@@ -1296,6 +1455,7 @@ def export_task_to_v3(
         )
 
     touch_width = _detect_touch_width([src.ep_dir for src in episodes])
+    touch_columns = _touch_array_columns(_detect_touch_sensors([src.ep_dir for src in episodes]))
     touch_model = lr3.touch_model_for_point_count(touch_width)
     _emit(
         f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, "
@@ -1334,11 +1494,11 @@ def export_task_to_v3(
     # deployment skip guessing that transform from one start pose. Without an edge
     # the recorded world is kept -- the stamp below says so, and deployment falls
     # back to start-pose alignment on any dataset not stamped fr3_base.
+    world_graph = wp.read_world_graph(_REPO_ROOT)
     if target_world == wp.TARGET_WORLD_AUTO:
         reachable = bool(world_frame_id) and (
             world_frame_id == wp.FR3_BASE_WORLD_ID
-            or wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, wp.FR3_BASE_WORLD_ID)
-            is not None
+            or wp.world_transform(world_graph, world_frame_id, wp.FR3_BASE_WORLD_ID) is not None
         )
         target_world = wp.FR3_BASE_WORLD_ID if reachable else None
         if not reachable:
@@ -1346,6 +1506,9 @@ def export_task_to_v3(
                 f"No registration edge reaches {wp.FR3_BASE_WORLD_ID} from "
                 f"{world_frame_id or 'unstamped episodes'}; keeping the recorded world"
             )
+            retired = wp.retired_note(world_graph, wp.FR3_BASE_WORLD_ID)
+            if retired:
+                _emit(f"WARNING: {retired}")
 
     output_world_frame = source_world_frame
     T_target_source: list[list[float]] | None = None
@@ -1354,11 +1517,12 @@ def export_task_to_v3(
             raise RuntimeError(
                 f"cannot re-express in {target_world}: the source episodes carry no world frame id"
             )
-        found = wp.world_transform(wp.read_world_graph(_REPO_ROOT), world_frame_id, target_world)
+        found = wp.world_transform(world_graph, world_frame_id, target_world)
         if found is None:
+            retired = wp.retired_note(world_graph, world_frame_id, target_world)
             raise RuntimeError(
                 f"no registration edge connects {world_frame_id} to {target_world} in "
-                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}"
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE}" + (f"\n{retired}" if retired else "")
             )
         T_target_source, edges_used = found
         output_world_frame = wp.reexpressed_world_frame(
@@ -1376,6 +1540,18 @@ def export_task_to_v3(
     session_labels = _session_labels(episodes)
     for session, labels in session_labels.items():
         _emit(f"Labels: {session}: {_describe_labels(labels)}")
+    for session_dir in sorted({src.session_dir for src in episodes}):
+        labels = session_labels[session_dir.name]
+        tracked_run = str(labels.get("extrinsics") or "") if labels.get("tracked") else ""
+        check = _table_check(session_dir, tracked_run)
+        labels["table_check"] = check
+        _emit(f"Cameras vs table datum: {session_dir.name}: {_describe_table_check(check)}")
+        if check["verdict"] in _TABLE_CHECK_FLAGGED:
+            _emit(
+                f"WARNING: {session_dir.name}: {check['verdict']} since the table datum was frozen; "
+                "labels from a moved camera are off by what its extrinsics no longer describe "
+                f"(details: {check.get('file')})"
+            )
     mixed_fields = lp.assert_single_session_chain(session_labels, allow_mixed=allow_mixed_labels)
     if mixed_fields:
         _emit(
@@ -1383,7 +1559,7 @@ def export_task_to_v3(
             "(--allow-mixed-labels); the dataset records it and training will not combine it"
         )
     label_provenance = lp.provenance_block(output_world_frame, session_labels, mixed_fields)
-    for warning in lp.label_warnings(label_provenance["key"]):
+    for warning in lp.label_warnings(label_provenance["key"]) + lp.hand_warnings(label_provenance):
         _emit(f"WARNING: {warning}")
     if check_only:
         _emit(
@@ -1410,7 +1586,7 @@ def export_task_to_v3(
         ts_width=ts_width,
         ts_names=box_ts_names if ts_width else None,
         pose_columns=pose_columns,
-        touch_columns=_TOUCH_ARRAY_COLUMNS,
+        touch_columns=touch_columns,
         touch_width=touch_width,
         world_frame=output_world_frame,
         tcp_frame=_dataset_tcp_frame(episodes) if pose_columns else None,
@@ -1471,6 +1647,13 @@ def export_task_to_v3(
                         f"  note: {src.ep_dir.name} box grid {box_grid_len} vs camera {n_frames}; "
                         f"aligned by frame_index"
                     )
+            elif box_rows:
+                _emit(
+                    f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: its observation.state has "
+                    f"{parquet_width} channels, the first episode's {state_width} (one touch pad per finger "
+                    "vs two, before/after 2026-11-03?); export the two layouts as separate datasets"
+                )
+                continue
             else:
                 _emit(
                     f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: "
@@ -1507,6 +1690,7 @@ def export_task_to_v3(
             fps,
             pts_offset_s=_gmsl2_pts_offset_s(meta),
             width=touch_width,
+            columns=touch_columns,
         )
         if not touch_samples_found:
             _emit(f"  note: {src.ep_dir.name} has no box_sensors.jsonl touch arrays; exported touch columns are zero-filled")
@@ -1530,6 +1714,16 @@ def export_task_to_v3(
                 "exported_world_frame_id": wp.world_frame_id_of(output_world_frame),
                 "extrinsics": session_labels[src.session_dir.name].get("extrinsics", ""),
                 "camera_state": session_labels[src.session_dir.name].get("camera_state", lp.UNTRACKED),
+                "table_check": (
+                    (session_labels[src.session_dir.name]["table_check"].get("episode_verdicts") or {}).get(
+                        src.ep_dir.name, "unchecked"
+                    )
+                ),
+                "unvalidated_hands": sorted(
+                    cube
+                    for cube, check in (session_labels[src.session_dir.name].get("hands") or {}).items()
+                    if check.get("status") == lp.UNVALIDATED
+                ),
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",

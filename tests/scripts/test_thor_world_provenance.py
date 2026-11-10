@@ -152,6 +152,51 @@ def test_repo_reference_is_readable() -> None:
     assert block["world_frame_id"] in {node["world_frame_id"] for node in graph["nodes"]}
 
 
+def _write_tracking_config(root: Path, text: str) -> Path:
+    path = root / wp.PRODUCTION_TRACKING_CONFIG
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_production_calibration_is_read_from_the_pointers_not_the_last_registration(tmp_path: Path) -> None:
+    assert wp.read_production_calibration(tmp_path)["status"] == wp.STATUS_MISSING
+    _write_tracking_config(
+        tmp_path,
+        "calibration:\n"
+        "  # the reasoning stays in comments\n"
+        "  intrinsics_run_name: calib_20261027_173815_intrinsics\n"
+        "  fixed_camera_run_name: 'calib_20261027_173815_extrinsics'  # promoted 10-27\n"
+        "  auxiliary_marker_run_name: \"\"\n",
+    )
+
+    block = wp.read_production_calibration(tmp_path)
+
+    assert block["status"] == wp.STATUS_OK
+    assert block["extrinsics_run"] == "calib_20261027_173815_extrinsics"
+    assert block["intrinsics_run"] == "calib_20261027_173815_intrinsics"
+    assert block["config_path"] == str(wp.PRODUCTION_TRACKING_CONFIG) and len(block["config_sha256"]) == 64
+
+
+def test_production_calibration_with_a_doubled_pointer_is_incomplete_not_guessed(tmp_path: Path) -> None:
+    _write_tracking_config(
+        tmp_path,
+        "intrinsics_run_name: a_intrinsics\nfixed_camera_run_name: a_extrinsics\nfixed_camera_run_name: b_extrinsics\n",
+    )
+
+    block = wp.read_production_calibration(tmp_path)
+
+    assert block["status"] == wp.STATUS_INCOMPLETE and "extrinsics_run" not in block
+
+
+def test_repo_production_calibration_is_readable() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    if not (repo_root / wp.PRODUCTION_TRACKING_CONFIG).is_file():
+        pytest.skip("opencv_kalibr submodule not checked out")
+    block = wp.read_production_calibration(repo_root)
+    assert block["status"] == wp.STATUS_OK and block["extrinsics_run"].endswith("_extrinsics")
+
+
 def test_lr3_writer_stamps_info_json(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
@@ -332,11 +377,125 @@ def test_unconnected_worlds_have_no_transform_not_an_identity() -> None:
     assert wp.world_transform({"edges": []}, "a", "b") is None
 
 
+def test_a_retired_edge_connects_nothing_and_says_why() -> None:
+    # 10-15 world -> fr3_base edge; both bases moved by 10-26. Data re-expressed in a base is for the arm
+    # where it stands now, so the old edge must not route anything -- whenever the data was recorded.
+    retired = {**_edge("a", "fr3_base", _rz(10)), "created_utc": "2026-10-15T03:08:47Z",
+               wp.RETIRED_KEY: {"utc": "2026-11-03T08:00:00Z", "reason": "both FR3 bases moved"}}
+    graph = {"edges": [retired]}
+    assert wp.world_transform(graph, "a", "fr3_base") is None
+    assert wp.world_closures(graph, "a", "fr3_base") == []
+    assert wp.live_edges(graph) == []
+    note = wp.retired_note(graph, "fr3_base")
+    assert note == "edge a -> fr3_base (solved 2026-10-15T03:08:47Z) retired 2026-11-03T08:00:00Z: both FR3 bases moved"
+    assert wp.retired_note(graph, "elsewhere") == ""
+    # a live edge added beside it is the one used, and no closure is checked against the retired one
+    graph["edges"].append(_edge("a", "fr3_base", _rz(-20)))
+    transform, hops = wp.world_transform(graph, "a", "fr3_base")
+    assert transform == _rz(-20)
+    assert len(hops) == 1
+    # a retired edge's matrix is not even parsed: it is a record, not an input
+    assert wp.world_transform({"edges": [{**retired, "T_to_from": "garbage"}]}, "a", "fr3_base") is None
+
+
+def test_the_checked_in_fr3_base_edge_is_retired() -> None:
+    # Both bases moved (confirmed 2026-10-26); until the base is registered again, nothing may be
+    # re-expressed in fr3_base. Replace this test when a new edge is applied.
+    # The FR3 base enters as an edge, not as a redefinition of the world: the reference keeps naming
+    # the camera island, and the base stays a node of the graph while its edge is retired.
+    repo = Path(__file__).resolve().parents[2]
+    graph = wp.read_world_graph(repo)
+    world = wp.read_world_provenance(repo)["world_frame_id"]
+    assert wp.FR3_BASE_WORLD_ID in {node["world_frame_id"] for node in graph["nodes"]}
+    found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
+    if found is None:
+        assert f"{world} -> {wp.FR3_BASE_WORLD_ID} (solved 2026-10-15T03:08:47Z) retired" in wp.retired_note(graph)
+    else:
+        assert found[1][-1]["to_world_frame_id"] == wp.FR3_BASE_WORLD_ID
+        assert "2026-10-15T03:08:47Z" not in [hop["created_utc"] for hop in found[1]], "predates the base move"
+
+
 def test_a_non_rigid_edge_is_refused() -> None:
     bad = _rz(10)
     bad[0][0] *= 1.01
     with pytest.raises(ValueError, match="not a rigid transform"):
         wp.world_transform({"edges": [_edge("a", "b", bad)]}, "a", "b")
+
+
+def _loop(world_to_left_error_mm: float = 0.0) -> dict:
+    """world -> right base (ball edge) -> left base (arm-arm, explicit sigma), and world -> left base."""
+    np = pytest.importorskip("numpy")
+    w_to_r = np.asarray(_rz(90, (1.2, 0.0, 0.7)))
+    r_to_l = np.asarray(_rz(0, (0.0, -0.8, 0.0)))
+    w_to_l = r_to_l @ w_to_r
+    w_to_l[0, 3] += world_to_left_error_mm * 1e-3
+    ball = _edge("world", "fr3_base", w_to_r.tolist())
+    ball["method"] = "fr3_ball_pivot_check: five balls"
+    ball["quality"] = {"leave_one_out_rms_mm": 1.0}
+    arm_arm = _edge("fr3_base", "fr3_base_left", r_to_l.tolist())
+    arm_arm["sigma_mm"] = 0.5
+    laser = _edge("world", "fr3_base_left", w_to_l.tolist())
+    laser["method"] = "fr3_laser_station_fk: station x FK"
+    laser["quality"] = {"station": {"translation_sigma_mm": 1.0, "rotation_sigma_deg": 0.0}}
+    return {"edges": [laser, ball, arm_arm]}
+
+
+def test_edge_sigma_is_read_from_what_each_method_reports() -> None:
+    graph = _loop()
+    laser, ball, arm_arm = graph["edges"]
+    assert wp.edge_method_kind(ball) == "same_ball" and wp.edge_sigma_mm(ball) == 1.0
+    assert wp.edge_method_kind(laser) == "laser_station" and wp.edge_sigma_mm(laser) == pytest.approx(1.0)
+    assert wp.edge_sigma_mm(arm_arm) == 0.5
+    assert wp.edge_sigma_mm(_edge("a", "b", _rz(0))) is None
+    hand_eye = {"method": "fr3_single_tag_hand_eye: tag 6", "quality": {"out_of_sample_tag_centre_p95_mm": 4.0}}
+    assert wp.edge_method_kind(hand_eye) == "hand_eye" and wp.edge_sigma_mm(hand_eye) == 2.0
+
+
+def test_a_consistent_loop_takes_the_route_whose_edges_claim_least_error() -> None:
+    np = pytest.importorskip("numpy")
+    graph = _loop(world_to_left_error_mm=1.0)
+    T, hops = wp.world_transform(graph, "world", "fr3_base_left")
+    # direct laser edge: sigma 1.0; through the right base: sqrt(1.0^2 + 0.5^2) -- the laser edge wins
+    assert [h["to_world_frame_id"] for h in hops] == ["fr3_base_left"]
+    assert np.allclose(T, graph["edges"][0]["T_to_from"])
+    (closure,) = wp.world_closures(graph, "world", "fr3_base_left")
+    assert closure["ok"] and closure["disagreement_mm"] == pytest.approx(1.0, abs=1e-6)
+    assert closure["threshold_mm"] == pytest.approx(wp.CLOSURE_K * math.sqrt(1.0 + 1.0 + 0.25))
+
+
+def test_an_edge_off_by_more_than_the_loop_allows_is_refused_on_every_route() -> None:
+    # 3.5 x sqrt(1 + 1 + 0.25) = 5.25 mm allowed
+    graph = _loop(world_to_left_error_mm=8.0)
+    for a, b in (("world", "fr3_base_left"), ("fr3_base", "fr3_base_left"), ("world", "fr3_base")):
+        with pytest.raises(wp.WorldGraphClosureError, match="do not close"):
+            wp.world_transform(graph, a, b)
+    # a pair the loop does not join is not held hostage by it
+    assert wp.world_transform(graph, "fr3_base", "fr3_base") is not None
+
+
+def test_one_route_is_taken_as_before_and_has_no_closures() -> None:
+    graph = _loop()
+    graph["edges"] = graph["edges"][1:]
+    assert wp.world_closures(graph, "world", "fr3_base_left") == []
+    _, hops = wp.world_transform(graph, "world", "fr3_base_left")
+    assert [h["to_world_frame_id"] for h in hops] == ["fr3_base", "fr3_base_left"]
+
+
+def test_route_disagreement_is_read_over_the_workspace_at_the_robot_end() -> None:
+    assert wp.route_disagreement_mm(_rz(0), _rz(0)) == 0.0
+    assert wp.route_disagreement_mm(_rz(0, (0.002, 0, 0)), _rz(0)) == pytest.approx(2.0)
+    # a turn about z moves the workspace corner farthest from the axis: (0.7, +-0.4)
+    assert wp.route_disagreement_mm(_rz(0.1), _rz(0)) == pytest.approx(math.radians(0.1) * math.hypot(0.7, 0.4) * 1e3)
+    # the same pair read in the source frame: a shift there is the turned shift
+    turned = wp.route_disagreement_mm(_rz(90, (0.002, 0, 0)), _rz(90), read_in="from")
+    assert turned == pytest.approx(2.0)
+
+
+def test_a_loop_through_a_far_camera_world_is_read_at_the_base_not_at_the_world_origin() -> None:
+    graph = _loop(world_to_left_error_mm=0.0)
+    graph["nodes"] = [{"world_frame_id": "fr3_base_left", "reason": "robot_base"}]
+    (row,) = wp.world_closures(graph, "fr3_base_left", "world")
+    assert row["read_in"] == "fr3_base_left"
 
 
 def test_transform_pose7_matches_the_matrix_product() -> None:
@@ -362,17 +521,6 @@ def test_transform_pose7_matches_the_matrix_product() -> None:
         assert np.allclose(mat(out), np.asarray(T) @ mat(pose), atol=1e-12)
     nan_pose = [float("nan")] * 7
     assert all(v != v for v in wp.transform_pose7(_rz(10), nan_pose))
-
-
-def test_repo_graph_reaches_the_fr3_base_from_the_current_world() -> None:
-    # The FR3 base enters as an edge, not as a redefinition of the world: the
-    # reference keeps naming the camera island and the graph says how to get out.
-    repo = Path(__file__).resolve().parents[2]
-    block = wp.read_world_provenance(repo)
-    found = wp.world_transform(wp.read_world_graph(repo), block["world_frame_id"], "fr3_base")
-    assert found is not None
-    T, path = found
-    assert path and path[-1]["to_world_frame_id"] == "fr3_base"
 
 
 def test_reexpress_pose_csv_moves_every_pose_group_by_its_episode(tmp_path):

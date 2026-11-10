@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,7 +44,9 @@ class _Imu:
 @dataclass
 class _Trigger:
     timestamp: int = 0
-    distance: float = 0.0  # SDK calls this "distance" but it's travel pct
+    depth_percent: float = 0.0  # v4.1: effective (zeroed) squeeze depth, 0..100
+    raw_depth_percent: float = 0.0
+    locked: int = 0
 
 
 @dataclass
@@ -61,9 +64,22 @@ class _TouchForce:
 
 @dataclass
 class _Touch:
+    """Stand-in for v4.1 ``TouchSensorSample``: ``forces`` is exactly point_count long."""
     timestamp: int = 0
     total_force: _TouchForce = field(default_factory=_TouchForce)
-    forces: tuple = field(default_factory=lambda: tuple(_TouchForce() for _ in range(239)))
+    forces: tuple = field(default_factory=lambda: tuple(_TouchForce() for _ in range(9)))
+
+    @property
+    def point_count(self) -> int:
+        return len(self.forces)
+
+
+def _terminals(left: _Touch | None = None, right: _Touch | None = None, touch_device_id: int = 1):
+    """Build v4.1 ``SensorCache.touch``: per terminal ``{touch_device_id: sample}``."""
+    return (
+        {touch_device_id: left} if left is not None else {},
+        {touch_device_id: right} if right is not None else {},
+    )
 
 
 @dataclass
@@ -94,11 +110,9 @@ class _SensorCache:
     liwp_timestemp: int = 0  # SDK typo preserved
     device_id: int = 0  # the device that produced this frame (v4 attribution)
     data: _AllSensor = field(default_factory=_AllSensor)
-    # Two-element touch array, exactly like the SDK struct (AllSensor carries no
-    # touch members). Default is a zero-timestamp pair -> both pads dropped.
-    touch_sensor_data: tuple = field(
-        default_factory=lambda: (_Touch(), _Touch())
-    )
+    # v4.1: one dict per touch terminal (0 = left, 1 = right), keyed by
+    # touch_device_id. Default: nothing cached on either terminal.
+    touch: tuple = field(default_factory=lambda: ({}, {}))
 
 
 @dataclass
@@ -194,7 +208,11 @@ class _FakeBox:
             return 0, self.snaps_by_id[device_id]
         if self.snaps:
             return 0, self.snaps[0]
-        return 4, _SensorCache(valid=0)
+        return 4, None  # v4.1: a failed read hands back no snapshot
+
+    def get_system_status(self, device_id, timeout_ms=200):
+        self.system_status_calls = getattr(self, "system_status_calls", []) + [(device_id, timeout_ms)]
+        return 0, types.SimpleNamespace(status_code=0b100011, error_code=(1 << 6) | (1 << 12))
 
     def set_btn_key_action_observer(self, callback):
         self.btn_key_action_observer = callback
@@ -259,11 +277,13 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
             gripper_data=_Gripper(timestamp=10, distance=0.04),
             gripper_speed=0.0125,
             imu_data=_Imu(),  # timestamp=0 -> dropped
-            trigger_data=_Trigger(timestamp=20, distance=42.0),
+            trigger_data=_Trigger(
+                timestamp=20, depth_percent=42.0, raw_depth_percent=45.5, locked=1
+            ),
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
             six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
         ),
-        touch_sensor_data=(
+        touch=_terminals(
             _Touch(
                 timestamp=40,
                 total_force=_TouchForce(fx=7, fy=-8, fz=9),
@@ -272,7 +292,7 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
                     for i in range(239)
                 ),
             ),
-            _Touch(timestamp=0),  # dropped
+            _Touch(timestamp=0),  # cached but never stamped -> dropped
         ),
     )
     out = box_client.decode_sensor_cache(snap)
@@ -289,9 +309,15 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
     assert force["source"] == "filtered"
     assert force["fxyz_mxyz"] == [10, 20, 30, 40, 50, 60]
     assert force["fxyz_mxyz_raw"] == [1, 2, 3, 4, 5, 6]
+    trigger = out["sensors"]["box_trigger"]
+    assert trigger == {
+        "timestamp": 20, "travel_pct": 42.0, "raw_travel_pct": 45.5, "locked": True,
+    }
     touch = out["sensors"]["box_touch_left"]
     assert touch["total_force_0p1N"] == [7, -8, 9]
     assert len(touch["fx_0p1N"]) == 239 == len(touch["fy_0p1N"]) == len(touch["fz_0p1N"])
+    assert touch["model"] == box_client.TOUCH_MODEL_PAXINI_L5325
+    assert touch["touch_device_id"] == 1
 
 
 def test_decode_sensor_cache_falls_back_to_raw_six_d_when_filter_absent():
@@ -339,10 +365,10 @@ def test_decode_changed_sensors_skips_unchanged_touch_payload(monkeypatch):
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
             six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
         ),
-        touch_sensor_data=(_Touch(timestamp=40), _Touch(timestamp=41)),
+        touch=_terminals(_Touch(timestamp=40), _Touch(timestamp=41)),
     )
 
-    def fail_touch_decode(_touch):
+    def fail_touch_decode(*_args):
         raise AssertionError("unchanged touch payload should not be decoded")
 
     monkeypatch.setattr(box_client, "_decode_touch", fail_touch_decode)
@@ -352,10 +378,8 @@ def test_decode_changed_sensors_skips_unchanged_touch_payload(monkeypatch):
     assert out["sensors"]["box_six_d_force"]["timestamp"] == 31
 
 
-def test_decode_sensor_cache_reads_touch_from_the_cache_level_array():
-    # touch_sensor_data[0]/[1] are left/right; the flattened
-    # data.touch_sensor_data_first/_sec members the v3 bundles also carried are
-    # gone from the struct and must not be consulted.
+def test_decode_sensor_cache_reads_touch_per_terminal():
+    # v4.1 SensorCache.touch[0]/[1] are the left/right terminals.
     array_left = _Touch(
         timestamp=101,
         forces=tuple(_TouchForce(fx=1, fy=2, fz=3) for _ in range(239)),
@@ -364,7 +388,7 @@ def test_decode_sensor_cache_reads_touch_from_the_cache_level_array():
         timestamp=202,
         forces=tuple(_TouchForce(fx=-1, fy=-2, fz=4) for _ in range(239)),
     )
-    snap = _SensorCache(touch_sensor_data=(array_left, array_right))
+    snap = _SensorCache(touch=_terminals(array_left, array_right))
 
     out = box_client.decode_sensor_cache(snap)
     timestamps = box_client._decode_sensor_timestamps(snap)
@@ -481,8 +505,9 @@ def _force_box_factory(
     *,
     with_cali,
     with_origin=False,
+    acc=None,
 ):
-    """Fake Box that publishes a 6D force sample; optionally exposes cali()."""
+    """Fake Box that publishes a 6D force sample (and an IMU one with ``acc``); optionally exposes cali()."""
     calls: list[str] = []
 
     class _Box(_FakeBox):
@@ -501,7 +526,10 @@ def _force_box_factory(
         b.snaps.append(
             _SensorCache(
                 valid=1,
-                data=_AllSensor(six_d_force_data=_SixD(timestamp=7, data=tuple(force))),
+                data=_AllSensor(
+                    six_d_force_data=_SixD(timestamp=7, data=tuple(force)),
+                    imu_data=_Imu(timestamp=8, acc=tuple(acc)) if acc is not None else _Imu(),
+                ),
             ),
         )
         return b
@@ -626,6 +654,24 @@ def test_calibrate_six_d_force_invokes_sdk_and_reports_before_after(fake_box_mod
     assert result["error"] is None
     assert result["before"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert result["after"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_calibrate_six_d_force_reports_the_attitude_it_zeroed_at(fake_box_module):
+    # The offline payload model needs the attitude of the zero to undo the bias it leaves.
+    fake_box_module.Box, _ = _force_box_factory(with_cali=True, acc=(-0.99, 0.1, 0.02))
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01))
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        ctx = client.calibrate_six_d_force()["zero_context"]
+    finally:
+        client.stop()
+
+    assert ctx["fxyz_mxyz"] == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert ctx["acc_g"] == pytest.approx([-0.99, 0.1, 0.02])
+    assert ctx["samples"] >= 2
+    assert ctx["wall_s"] > 0
 
 
 def test_calibrate_six_d_force_origin_invokes_origin_sdk_method(fake_box_module):
@@ -779,6 +825,74 @@ def test_cleanup_session_csv_respects_disable_flag(tmp_path):
     assert f.exists()  # cleanup disabled -> file kept
 
 
+def _write_sdk_conf(path, **values) -> None:
+    lines = ["# box_collection_sdk 运行时配置", "sensor_csv_enabled=1"]
+    lines += [f"{k}={v}  # trailing comment" for k, v in values.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_cleanup_removes_v41_session_dirs_created_this_session(tmp_path, monkeypatch):
+    # v4.1 writes <cwd>/<sensor_csv_output_dir>/session_<ts>/*.csv per Box.start().
+    conf = tmp_path / "box_sdk.conf"
+    _write_sdk_conf(conf, sensor_csv_output_dir="sensor_data")
+    monkeypatch.setenv("BOX_SDK_CONFIG", str(conf))
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    root = cwd / "sensor_data"
+    old = root / "session_20261101_100000"
+    old.mkdir(parents=True)
+    (old / "imu.csv").write_text("old")
+
+    client = box_client.BoxClient(box_client.BoxClientConfig())
+    client._csv_dir = cwd
+    client._pre_session_csv = box_client._snapshot_session_csv(cwd)
+    new = root / "session_20261102_120000"
+    new.mkdir()
+    (new / "touch_points_0.csv").write_text("session")
+    (root / "notes.txt").write_text("not ours")
+
+    client._cleanup_session_csv()
+
+    assert not new.exists()
+    assert (old / "imu.csv").exists()  # an earlier session's output is left alone
+    assert (root / "notes.txt").exists()
+
+
+def test_cleanup_drops_output_root_it_created_and_honours_absolute_dir(tmp_path, monkeypatch):
+    out_root = tmp_path / "abs_out"
+    conf = tmp_path / "box_sdk.conf"
+    _write_sdk_conf(conf, sensor_csv_output_dir=str(out_root))
+    monkeypatch.setenv("BOX_SDK_CONFIG", str(conf))
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+
+    client = box_client.BoxClient(box_client.BoxClientConfig())
+    client._csv_dir = cwd
+    client._pre_session_csv = box_client._snapshot_session_csv(cwd)
+    session = out_root / "session_20261102_120000"
+    session.mkdir(parents=True)
+    (session / "gripper.csv").write_text("x")
+
+    client._cleanup_session_csv()
+
+    assert not out_root.exists()  # created by this session and empty again
+    assert not (cwd / "sensor_data").exists()
+
+
+def test_sdk_csv_root_defaults_when_config_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_SDK_CONFIG", str(tmp_path / "missing.conf"))
+    assert box_client._sdk_csv_session_root(tmp_path) == tmp_path / "sensor_data"
+    monkeypatch.delenv("BOX_SDK_CONFIG")
+    assert box_client._sdk_csv_session_root(tmp_path) == tmp_path / "sensor_data"
+
+
+def test_vendored_conf_keeps_sensor_csv_off():
+    conf = box_client.Path(box_client.__file__).resolve().parent / "box_sdk.conf"
+    values = box_client._sdk_config_values(conf)
+    assert values["sensor_csv_enabled"] == "0"
+    assert values["sensor_csv_output_dir"] == "sensor_data"
+
+
 # --- multi-box scaffolding --------------------------------------------------
 
 
@@ -863,6 +977,20 @@ def _preloaded_box_factory(distance: float):
     return _factory
 
 
+def test_box_pool_dates_each_box_power_on_from_its_mcu_clock(fake_box_module):
+    pool = box_client.BoxPool(box_client.BoxFleetConfig(boxes=[box_client.BoxClientConfig(box_id="")]))
+
+    def stub(device_id, sensors):
+        return types.SimpleNamespace(_effective_device_id=lambda: device_id, read=lambda: {"sensors": sensors})
+
+    pool._clients = [
+        ("a", stub(7, {"box_six_d_force": {"timestamp": 81_000_000}})),
+        ("b", stub(8, {"box_imu": {"timestamp": 5}})),  # no 6D sensor
+        ("c", stub(None, {"box_six_d_force": {"timestamp": 1}})),  # not identified yet
+    ]
+    assert pool.six_d_uptimes() == {7: 81.0}
+
+
 def test_box_pool_single_empty_id_delegates_without_namespacing(fake_box_module):
     fake_box_module.Box = _preloaded_box_factory(0.05)  # type: ignore[assignment]
     fleet = box_client.BoxFleetConfig(
@@ -894,7 +1022,7 @@ class _MultiDeviceBox(_FakeBox):
 
     def get_sensor_cache(self, device_id=None):
         if device_id is None:
-            return 4, _SensorCache(valid=0)
+            return 4, None
         self._ts[device_id] = self._ts.get(device_id, 0) + 1
         return 0, _SensorCache(
             valid=1,
@@ -1100,12 +1228,15 @@ def test_caps_to_sensor_ids_expands_touch_and_keeps_canonical_order():
     assert box_client.caps_to_sensor_ids(box_client.CAP_TOUCH) == [
         "box_touch_left", "box_touch_right",
     ]
-    # All caps -> full KNOWN_SENSOR_IDS in canonical order.
+    # All caps -> KNOWN_SENSOR_IDS in canonical order, less the second pads: one
+    # CAP_TOUCH bit cannot say how many pads a finger has, so those surface once they stream.
     all_caps = (
         box_client.CAP_GRIPPER | box_client.CAP_IMU | box_client.CAP_TRIGGER
         | box_client.CAP_6D_FORCE | box_client.CAP_TOUCH
     )
-    assert box_client.caps_to_sensor_ids(all_caps) == list(box_client.KNOWN_SENSOR_IDS)
+    assert box_client.caps_to_sensor_ids(all_caps) == [
+        sid for sid in box_client.KNOWN_SENSOR_IDS if sid not in ("box_touch_left_1", "box_touch_right_1")
+    ]
 
 
 def test_discover_boxes_returns_empty_when_wheel_missing(monkeypatch):
@@ -1175,6 +1306,56 @@ def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):
     assert pub["capability_names"] == ["box_gripper", "box_imu"]
 
 
+def test_discover_boxes_drops_a_box_answering_twice(fake_box_module):
+    # v4.1 on Thor (2026-11-02) listed device 3100715645 @ 192.168.1.207 twice,
+    # which built two views polling the same box under one namespace.
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=3100715645, ip="192.168.1.207"),
+        _FakeDiscovered(device_id=3100715645, ip="192.168.1.207"),
+        _FakeDiscovered(device_id=42, ip="192.168.1.208"),
+    ]
+    found = box_client.discover_boxes()
+    assert [d.device_id for d in found] == [3100715645, 42]
+
+
+def test_discover_boxes_unions_rounds_that_each_see_one_box(fake_box_module):
+    # Thor 2026-11-02 (v4.1, collection + execution box): every broadcast
+    # answered with exactly one of the two boxes, alternating.
+    rounds = iter([
+        [_FakeDiscovered(device_id=3100715645, ip="192.168.1.207")],
+        [_FakeDiscovered(device_id=3906437858, ip="192.168.1.150", fw_version=3),
+         _FakeDiscovered(device_id=3906437858, ip="192.168.1.150", fw_version=2)],
+        [_FakeDiscovered(device_id=3100715645, ip="192.168.1.207")],
+        [_FakeDiscovered(device_id=3906437858, ip="192.168.1.150")],
+        [],
+    ])
+    calls = []
+
+    def _discover(**kw):
+        calls.append(kw)
+        return next(rounds)
+
+    fake_box_module.discover = _discover
+    found = box_client.discover_boxes()
+    assert [(d.device_id, d.ip) for d in found] == [
+        (3906437858, "192.168.1.150"), (3100715645, "192.168.1.207"),
+    ]
+    assert found[0].fw_version == 3  # first answer for a device wins
+    assert len(calls) == 4  # rounds 3 and 4 added nothing new -> stop
+
+
+def test_discover_boxes_keeps_trying_while_nothing_answers(fake_box_module):
+    calls = []
+
+    def _discover(**kw):
+        calls.append(kw)
+        return []
+
+    fake_box_module.discover = _discover
+    assert box_client.discover_boxes(retries=3) == []
+    assert len(calls) == 3
+
+
 def test_discovery_forwards_so_path_when_sdk_lives_in_the_wheel(fake_box_module):
     # Deployed on Thor, box_sdk is imported straight out of the vendored .whl, so
     # its own library resolver looks inside the zip (<...>.whl/box_sdk/lib) and
@@ -1195,7 +1376,8 @@ def test_discovery_forwards_so_path_when_sdk_lives_in_the_wheel(fake_box_module)
     client = box_client.BoxClient(cfg, so_path="/lib/libbox_controller.so")
     assert client.start() is True
     try:
-        assert seen == ["/lib/libbox_controller.so"]
+        # every broadcast round (answers are unioned over several) carries it
+        assert seen and set(seen) == {"/lib/libbox_controller.so"}
         assert client._device_id == 7
         # device_id learned -> address registered and startup_mode actually applied
         assert client._raw_box.registered == [(7, "192.168.2.60", 15000)]
@@ -1215,7 +1397,7 @@ def test_box_pool_duplicate_serials_namespace_by_device_id(fake_box_module):
 
         def get_sensor_cache(self, device_id=None):
             if device_id is None:
-                return 4, _SensorCache(valid=0)
+                return 4, None
             self._ts[device_id] = self._ts.get(device_id, 0) + 1
             return 0, _SensorCache(
                 valid=1,
@@ -1300,95 +1482,141 @@ def test_ensure_box_sdk_importable_prefers_vendored_wheel(tmp_path, monkeypatch)
 
 # --------------------------------------------------------------- touch pads ---
 #
-# The BOX SDK carries every touch pad in one fixed 239-slot array regardless of
-# what is fitted: for the 3x3 M2020 pads the .so parses the M2020 TLVs and
-# fill_touch_from_m2020() writes 9 real taxels into slots 0..8, leaving 230 zeros.
-# The pad is identified from the link-stream ids, not from the array.
+# SDK v4.1 frames are self-describing: each TouchSensorSample carries exactly
+# the taxels its pad reported, and both pad families share link streams
+# 0x0002/0x0003, so the frame length is the only evidence of the pad.
 
 
-def test_touch_model_identified_from_link_stream_ids():
-    m2020 = [
-        {"tlv_type": 0x0008, "samples_total": 16937},
-        {"tlv_type": 0x0009, "samples_total": 16937},
-        {"tlv_type": 0x0007, "samples_total": 136007},  # 6D force, ignored
-    ]
-    paxini = [
-        {"tlv_type": 0x0002, "samples_total": 900},
-        {"tlv_type": 0x0003, "samples_total": 900},
-    ]
-
-    assert box_client.touch_model_from_link_stats(m2020) == box_client.TOUCH_MODEL_M2020
-    assert box_client.touch_model_from_link_stats(paxini) == box_client.TOUCH_MODEL_PAXINI_L5325
-    # No touch stream at all, and streams that never carried a sample, are not
-    # evidence about the fitted pad.
-    assert box_client.touch_model_from_link_stats([{"tlv_type": 0x0006, "samples_total": 5}]) is None
-    assert box_client.touch_model_from_link_stats([{"tlv_type": 0x0008, "samples_total": 0}]) is None
-    assert box_client.touch_model_from_link_stats([]) is None
-    # A rig reporting both pad families is a hardware fault, not something to
-    # average over; the caller keeps the untruncated fallback.
-    assert box_client.touch_model_from_link_stats(m2020 + paxini) is None
-
-
-def test_decode_touch_cuts_the_frame_to_the_pad_actually_fitted():
-    frame = _Touch(
+def test_decode_touch_tags_the_pad_its_frame_length_identifies():
+    m2020_frame = _Touch(
         timestamp=40,
         total_force=_TouchForce(fx=7, fy=-8, fz=9),
-        # Mimic fill_touch_from_m2020: 9 real taxels, 230 zero slots after them.
-        forces=tuple(
-            _TouchForce(fx=i + 1, fy=-(i + 1), fz=(i + 1) * 3) if i < 9 else _TouchForce()
-            for i in range(239)
-        ),
+        forces=tuple(_TouchForce(fx=i + 1, fy=-(i + 1), fz=(i + 1) * 3) for i in range(9)),
     )
-    snap = _SensorCache(touch_sensor_data=(frame, _Touch(timestamp=0)))
+    odd_frame = _Touch(timestamp=41, forces=tuple(_TouchForce() for _ in range(64)))
+    snap = _SensorCache(touch=_terminals(m2020_frame, odd_frame, touch_device_id=3))
 
-    m2020 = box_client.decode_sensor_cache(snap, box_client.TOUCH_MODEL_M2020)["sensors"]["box_touch_left"]
+    sensors = box_client.decode_sensor_cache(snap)["sensors"]
+    m2020 = sensors["box_touch_left"]
     assert m2020["model"] == box_client.TOUCH_MODEL_M2020
     assert m2020["points"] == 9
-    assert len(m2020["fz_0p1N"]) == 9 == len(m2020["fx_0p1N"]) == len(m2020["fy_0p1N"])
     assert m2020["fz_0p1N"] == [3, 6, 9, 12, 15, 18, 21, 24, 27]
-    # total_force is its own MCU-side aggregate, not a sum over the slots.
+    # total_force is its own MCU-side aggregate, not a sum over the taxels.
     assert m2020["total_force_0p1N"] == [7, -8, 9]
+    assert m2020["touch_device_id"] == 3
 
-    # An unresolved pad is passed through at the full slot count rather than
-    # truncated on a guess.
-    unknown = box_client.decode_sensor_cache(snap)["sensors"]["box_touch_left"]
-    assert unknown["model"] == "unknown"
-    assert unknown["points"] == 239
-    assert len(unknown["fz_0p1N"]) == 239
+    # A length no known pad has is passed through whole and tagged unknown.
+    odd = sensors["box_touch_right"]
+    assert odd["model"] == "unknown"
+    assert odd["points"] == 64 == len(odd["fz_0p1N"])
+
+
+def test_two_pads_per_finger_record_as_their_own_sensors():
+    # 11-02 rig: each finger carries two pads, touch_device_id 0 and 1. The first keeps the
+    # pre-v4.1 id (a one-pad rig records what it always did), the second gets ``_1``.
+    box_client._warned_multi_touch.clear()
+    snap = _SensorCache(
+        touch=(
+            {1: _Touch(timestamp=11), 0: _Touch(timestamp=10)},
+            {0: _Touch(timestamp=20), 1: _Touch(timestamp=21)},
+        )
+    )
+    sensors = box_client.decode_sensor_cache(snap)["sensors"]
+    assert {sid: (d["touch_device_id"], d["timestamp"]) for sid, d in sensors.items() if "touch" in sid} == {
+        "box_touch_left": (0, 10),
+        "box_touch_left_1": (1, 11),
+        "box_touch_right": (0, 20),
+        "box_touch_right_1": (1, 21),
+    }
+    stamps = box_client._decode_sensor_timestamps(snap)
+    assert [stamps[sid] for sid in box_client.TOUCH_SENSOR_IDS] == [10, 11, 20, 21]
+    # The recording path decodes only what changed: one pad's new frame, not its neighbour's.
+    changed = box_client._decode_changed_sensors(snap, {"box_touch_right_1"})["sensors"]
+    assert list(changed) == ["box_touch_right_1"] and changed["box_touch_right_1"]["timestamp"] == 21
+    assert not box_client._warned_multi_touch
+
+
+def test_a_third_pad_on_a_finger_is_dropped_with_one_warning(caplog):
+    box_client._warned_multi_touch.clear()
+    snap = _SensorCache(
+        touch=(
+            {7: _Touch(timestamp=70), 2: _Touch(timestamp=20), 5: _Touch(timestamp=50)},
+            {},
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="box_client"):
+        for _ in range(3):
+            out = box_client.decode_sensor_cache(snap)
+    assert out["sensors"]["box_touch_left"]["touch_device_id"] == 2
+    assert out["sensors"]["box_touch_left_1"]["touch_device_id"] == 5
+    assert not any(d.get("touch_device_id") == 7 for d in out["sensors"].values())
+    assert "box_touch_right" not in out["sensors"]
+    assert box_client._decode_sensor_timestamps(snap)["box_touch_right_1"] == 0
+    warnings = [r for r in caplog.records if "reports 3 devices" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_a_second_pad_gets_a_status_row_once_it_streams():
+    # Discovery's one CAP_TOUCH bit cannot announce it, so it is not in expected_devices.
+    cfg = box_client.BoxClientConfig(enabled=True, box_id="box0",
+                                     expected_devices=list(box_client.caps_to_sensor_ids(box_client.CAP_TOUCH)))
+    client = box_client.BoxClient(cfg)
+    with client._lock:
+        assert "box_touch_left_1" not in client._status_locked()["sensor_status"]
+        client._last_seen_at_s["box_touch_left_1"] = time.monotonic()
+        assert client._status_locked()["sensor_status"]["box_touch_left_1"]["fresh"]
 
 
 def test_touch_point_count_round_trips_through_the_model_table():
     assert box_client.touch_point_count(box_client.TOUCH_MODEL_M2020) == 9
     assert box_client.touch_point_count(box_client.TOUCH_MODEL_PAXINI_L5325) == 239
-    # Unknown/unresolved keeps the widest frame the SDK can hand over.
-    assert box_client.touch_point_count(None) == box_client.TOUCH_SDK_SLOT_COUNT
-    assert box_client.touch_point_count("nope") == box_client.TOUCH_SDK_SLOT_COUNT
+    assert box_client.touch_point_count(None) is None
+    assert box_client.touch_point_count("nope") is None
     assert box_client.touch_model_for_point_count(9) == box_client.TOUCH_MODEL_M2020
     assert box_client.touch_model_for_point_count(239) == box_client.TOUCH_MODEL_PAXINI_L5325
     assert box_client.touch_model_for_point_count(64) is None
 
 
-def test_recorded_touch_frames_keep_one_width_for_the_whole_session():
-    # Latch-once: link stats arriving mid-session must not switch the frame
-    # width underneath an in-flight recording and write ragged arrays.
+def test_touch_model_latches_on_first_frame_and_link_stats_do_not_move_it(caplog):
     cfg = box_client.BoxClientConfig(enabled=True, box_id="box0")
     client = box_client.BoxClient(cfg)
     assert client._touch_model is None
 
-    client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0008, samples_total=10)])
-    assert client._touch_model == box_client.TOUCH_MODEL_M2020
-
+    # v4.1 publishes both pads on 0x0002/0x0003: link stats are not evidence.
     client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0002, samples_total=10)])
+    assert client._touch_model is None
+
+    with client._lock:
+        client._note_touch_models_locked(
+            {"box_touch_left": {"model": box_client.TOUCH_MODEL_M2020, "points": 9}}
+        )
     assert client._touch_model == box_client.TOUCH_MODEL_M2020
 
+    with caplog.at_level(logging.WARNING, logger="box_client"), client._lock:
+        for _ in range(2):
+            client._note_touch_models_locked(
+                {"box_touch_right": {"model": box_client.TOUCH_MODEL_PAXINI_L5325, "points": 239}}
+            )
+    assert client._touch_model == box_client.TOUCH_MODEL_M2020
+    assert len([r for r in caplog.records if "touch_model is m2020" in r.getMessage()]) == 1
 
-def test_pinned_touch_model_wins_over_autodetect():
+
+def test_pinned_touch_model_is_reported_before_any_frame():
     cfg = box_client.BoxClientConfig(enabled=True, touch_model=box_client.TOUCH_MODEL_M2020)
     client = box_client.BoxClient(cfg)
     assert client._touch_model == box_client.TOUCH_MODEL_M2020
 
-    client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0002, samples_total=10)])
-    assert client._touch_model == box_client.TOUCH_MODEL_M2020
-
     with pytest.raises(ValueError, match="unknown touch_model"):
         box_client.BoxClientConfig(enabled=True, touch_model="l5325")
+
+
+def test_system_status_decodes_named_bits():
+    out = box_client.system_status_to_dict(
+        0, types.SimpleNamespace(status_code=0b100011, error_code=(1 << 6) | (1 << 12))
+    )
+    assert out["rc"] == 0
+    assert out["status"] == ["system_initialized", "six_d_force_ready", "trigger_ready"]
+    assert out["errors"] == ["six_d_force_collision", "unknown_bits_0x00001000"]
+    assert box_client.system_status_to_dict(5, None) == {
+        "rc": 5, "status_code": None, "error_code": None, "status": [], "errors": [],
+    }

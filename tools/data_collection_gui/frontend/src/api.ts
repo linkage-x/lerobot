@@ -1,5 +1,6 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  WorldGraphGuard,
   CollectionTask,
   EpisodeAnnotation,
   CalibrationStatus,
@@ -35,6 +36,10 @@ import type {
   RealEndEffectorMode,
   MujocoPreview,
   LaserReplayReport,
+  DualFr3Executability,
+  RobotArms,
+  DualHomeResponse,
+  DualReplayResponse,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -50,6 +55,7 @@ import type {
   TrackerMountChainResponse,
   TrackerValidateResponse,
 } from "./types";
+import type { PayloadCalibrationResponse } from "./calibration/payloadCalibration";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
@@ -89,6 +95,8 @@ export type GuiSnapshot = {
   trackerMountSession?: TrackerMountSession;
   markerTcp?: MarkerTcpSession;
   datasetExport: DatasetExportStatus;
+  /** world_graph.json against the graph this machine last trusted (outputs/world_graph_guard.json). */
+  worldGraphGuard?: WorldGraphGuard;
   recordedDatasets: RecordedDataset[];
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
@@ -343,8 +351,10 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async preflightReplay(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/replay/preflight");
+  // arm: right, left or both (every arm in service); Thor refuses a preflight that names none (roadmap B2).
+  async preflightReplay(arm = ""): Promise<GuiSnapshot> {
+    const query = arm ? `?${new URLSearchParams({ arm }).toString()}` : "";
+    const remote = await this.postRemoteSnapshot(`/api/replay/preflight${query}`);
     if (remote) {
       return remote;
     }
@@ -424,8 +434,11 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async startMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}`);
+  // arm: the arm selected for real replay; the preview plans in its base (empty: each hand's own arm's).
+  async startMujocoReplay(cubeMode: MujocoCubeMode, arm = ""): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(
+      `/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}&arm=${encodeURIComponent(arm)}`
+    );
     if (remote) {
       return remote;
     }
@@ -505,6 +518,78 @@ export class DataCollectionGuiApi {
       return { report, availableRuns: report.availableRuns ?? [] };
     } catch {
       return { report: null, availableRuns: [] };
+    }
+  }
+
+  // null when the dataset has no two-arm verdicts yet (tools/fr3/dual_fr3_executability.py writes them).
+  async fetchRobotArms(): Promise<RobotArms | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/arms`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as RobotArms) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchDualReplayJob(): Promise<DualReplayResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/replay/dual-fr3/job`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as DualReplayResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Two-step two-arm replay (roadmap D4): connect (both arms to frame 0) -> execute; abort at any time.
+  async dualReplay(
+    action: "connect" | "execute" | "abort",
+    body: Record<string, unknown> = {}
+  ): Promise<DualReplayResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/replay/dual-fr3/${action}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      return response.ok ? ((await response.json()) as DualReplayResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchDualHome(): Promise<DualHomeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/dual-home`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as DualHomeResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Both FR3s home: check (read both, plan) -> execute; cancel at any time.
+  async dualHome(action: "check" | "execute" | "cancel"): Promise<DualHomeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/robot/dual-home/${action}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      });
+      return response.ok ? ((await response.json()) as DualHomeResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchDualFr3Executability(datasetPath: string, episode: number): Promise<DualFr3Executability | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/dual-fr3?path=${encodeURIComponent(datasetPath)}&episode=${episode}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return null;
+      return (await response.json()) as DualFr3Executability;
+    } catch {
+      return null;
     }
   }
 
@@ -646,7 +731,27 @@ export class DataCollectionGuiApi {
     if (markerTcpCalibrationPath.trim()) {
       params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
     }
-    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
+    // 409 with otherTrackingTargets: the dataset already has another target's trajectories
+    // (cube vs gripper rig). Ask before moving them aside; the gateway never does it unasked.
+    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`, async (payload) => {
+      const detail = payload.otherTrackingTargets as { otherTargets?: Record<string, number>; supersededDir?: string } | undefined;
+      if (!detail) {
+        return null;
+      }
+      const others = Object.entries(detail.otherTargets ?? {})
+        .map(([name, count]) => `${name}（${count} 个文件）`)
+        .join("、");
+      const ok = window.confirm(
+        `这个数据集已经有 ${others} 的轨迹，不是这次选的目标（${trackingTarget}）生成的。\n\n` +
+          `先确认数据集录的是哪种目标。确定要换成本目标吗？旧轨迹会挪到 ${detail.supersededDir ?? "_superseded/"} 下，不删除。`
+      );
+      if (!ok) {
+        this.log("info", `Traj-gen cancelled: ${path} already has ${others}`);
+        return structuredClone(this.snapshot);
+      }
+      params.set("supersede_other_targets", "1");
+      return this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
+    });
     if (remote) {
       return remote;
     }
@@ -937,12 +1042,14 @@ export class DataCollectionGuiApi {
   async solveMarkerTcpTransform(
     boxId: string,
     cadPath: string,
-    socketBeyondTcpMm: string
+    socketBeyondTcpMm: string,
+    rig: string = ""
   ): Promise<{ ok: boolean; error?: string }> {
     const params = new URLSearchParams({
       box_id: boxId,
       cad_path: cadPath,
-      socket_beyond_tcp_mm: socketBeyondTcpMm
+      socket_beyond_tcp_mm: socketBeyondTcpMm,
+      rig
     });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
@@ -1396,8 +1503,21 @@ export class DataCollectionGuiApi {
   }
 
   // Survey + dwells + route + checks: a minute or two.
-  async planFr3Pivot(centre: string, biasMm: number[], anchorFromFit = false, probe = false): Promise<Fr3PivotResponse | null> {
-    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", { centre, biasMm, anchorFromFit, probe });
+  // ``prior`` (probe only): the ball centre in corenetic_socket_ee the probe turns about before any fit.
+  async planFr3Pivot(
+    centre: string,
+    biasMm: number[],
+    anchorFromFit = false,
+    probe = false,
+    prior: { mm: number[]; from: "desk_ee" | "manual" } | null = null
+  ): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/plan", {
+      centre,
+      biasMm,
+      anchorFromFit,
+      probe,
+      ...(prior ? { priorMm: prior.mm, priorFrom: prior.from } : {}),
+    });
   }
 
   // Moves the real FR3 along a plan that passed: the panel confirms first.
@@ -1441,14 +1561,35 @@ export class DataCollectionGuiApi {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/check", { positions });
   }
 
+  /** Trust world_graph.json as it is now; ``problems`` is what the page showed (refused if it changed since). */
+  async acceptWorldGraph(problems: string[]): Promise<Fr3BaseEdgeResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/world-graph/accept`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ problems }),
+      });
+      return (await response.json()) as Fr3BaseEdgeResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  /** fr3_base -> fr3_base_right from balls both arms pivoted about (B3), written as a candidate report. */
+  async solveFr3ArmArmEdge(positions: { left: string; right: string }[]): Promise<Fr3PivotResponse | null> {
+    return this.fr3PivotPost("/api/calibration/fr3-pivot/arm-arm-edge", { positions });
+  }
+
   /** Write a check's ball edge as a candidate report; swapping it in is the FR3-base edge panel's. */
   async saveFr3BallEdge(check: string): Promise<Fr3PivotResponse | null> {
     return this.fr3PivotPost("/api/calibration/fr3-pivot/ball-edge", { check });
   }
 
-  async fetchGripperTeleop(): Promise<GripperTeleopResponse | null> {
+  // robotIp: whose gripper the panel shows (its replay YAML's BOX); none = the default YAML's.
+  async fetchGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    const query = robotIp ? `?robotIp=${encodeURIComponent(robotIp)}` : "";
     try {
-      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop`, {
+      const response = await fetch(`${this.apiBase}/api/fr3/gripper-teleop${query}`, {
         headers: { Accept: "application/json" }
       });
       return response.ok ? ((await response.json()) as GripperTeleopResponse) : null;
@@ -1458,20 +1599,21 @@ export class DataCollectionGuiApi {
   }
 
   // The FR3's gripper follows the handheld BOX; exit leaves it holding (no release).
-  async startGripperTeleop(): Promise<GripperTeleopResponse | null> {
-    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start");
+  // robotIp: whose gripper (roadmap B2: the gateway refuses none on Thor).
+  async startGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/start", { robotIp });
   }
 
-  async stopGripperTeleop(): Promise<GripperTeleopResponse | null> {
-    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop");
+  async stopGripperTeleop(robotIp = ""): Promise<GripperTeleopResponse | null> {
+    return this.gripperTeleopPost("/api/fr3/gripper-teleop/stop", { robotIp });
   }
 
-  private async gripperTeleopPost(path: string): Promise<GripperTeleopResponse | null> {
+  private async gripperTeleopPost(path: string, body: Record<string, unknown> = {}): Promise<GripperTeleopResponse | null> {
     try {
       const response = await fetch(`${this.apiBase}${path}`, {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: "{}"
+        body: JSON.stringify(body)
       });
       const payload = (await response.json()) as Partial<GripperTeleopResponse>;
       if (!response.ok && !payload.job) return null;
@@ -1479,6 +1621,43 @@ export class DataCollectionGuiApi {
     } catch {
       return null;
     }
+  }
+
+  // --- FR3 end-effector load + BOX 6D payload fit (calibration page) ---
+  async fetchPayloadCalibration(): Promise<PayloadCalibrationResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/fr3-payload`, {
+        headers: { Accept: "application/json" }
+      });
+      return response.ok ? ((await response.json()) as PayloadCalibrationResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // check | collect | stop | desk, six-d/{capture,stop,fit,register}, fr3-six-d-zero/{start,stop}. A collect or a zero moves the arm:
+  // the panel confirms first, and the gateway refuses it without a passing check-poses.
+  async payloadCalibrationPost(action: string, body: Record<string, unknown> = {}): Promise<PayloadCalibrationResponse | null> {
+    const path =
+      action.startsWith("six-d/") || action.startsWith("fr3-six-d-zero/")
+        ? `/api/calibration/${action}`
+        : `/api/calibration/fr3-payload/${action}`;
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json()) as Partial<PayloadCalibrationResponse>;
+      if (!response.ok && !payload.runs) return null;
+      return payload as PayloadCalibrationResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  payloadDeskFileUrl(desk: string, name: string): string {
+    return `${this.apiBase}/api/calibration/fr3-payload/desk-file?desk=${encodeURIComponent(desk)}&name=${encodeURIComponent(name)}`;
   }
 
   private async fr3PivotPost(path: string, body: Record<string, unknown>): Promise<Fr3PivotResponse | null> {
@@ -1783,12 +1962,26 @@ export class DataCollectionGuiApi {
     }
   }
 
-  private async postRemoteSnapshot(endpoint: string): Promise<GuiSnapshot | null> {
+  private async postRemoteSnapshot(
+    endpoint: string,
+    onConflict?: (payload: Record<string, unknown>) => Promise<GuiSnapshot | null>
+  ): Promise<GuiSnapshot | null> {
     try {
       const response = await fetch(`${this.apiBase}${endpoint}`, {
         method: "POST",
         headers: { Accept: "application/json" }
       });
+      if (response.status === 409 && onConflict) {
+        const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+        const handled = await onConflict(payload);
+        if (handled) {
+          return handled;
+        }
+        const message = typeof payload.error === "string" ? payload.error : `HTTP ${response.status}`;
+        this.applyRemoteCommandError(endpoint, message);
+        this.usingRemote = true;
+        return structuredClone(this.snapshot);
+      }
       if (!response.ok) {
         const message = await this.remoteErrorMessage(response);
         this.applyRemoteCommandError(endpoint, message);

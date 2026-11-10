@@ -54,6 +54,29 @@ re-solved (`calib_20261014_180431`) and registered back onto
 [Recalibration by camera centres](#recalibration-by-camera-centres-2026-10-15)).
 The id did not change.
 
+On 2026-11-04 two more revisions went in, in this order:
+
+- `calib_20261027_173815_extrinsics`, production since 10-27, whose promotion
+  had not written a revision: the reference still held the 10-14 poses, so the
+  next registration saw only 03/13/14 as stable (`degraded_cluster`). Replayed
+  with the 10-27 export's `--assume-stable` (03/06/07/13/14, 0.71 mm RMS);
+  08/09/12 re-placed.
+- `calib_20261102_195715_extrinsics`, a colleague's nine-camera solve after the
+  BOX-mount change (`outputs/box_mount_recalibration_20261102_195715` on Thor,
+  gauge cam_09, its own solver and validation). Its `T_cam09_cam` were
+  converted to a bundle report (`outputs/metrology/calib_20261102_195715/
+  extrinsics_report.json`, no RMSE: the solve is not ours) and exported with
+  `--world-reference`. cam_02 is left out: production has no lens for it. The
+  consensus was ambiguous (cam_09 moved only 2.5 mm / 0.65°, inside the
+  tolerance, so {03,08,09,12,14} was as large as {03,08,12,13,14}); resolved
+  with `--assume-stable cam_03 cam_08 cam_12 cam_13 cam_14` from the pairwise
+  comparison of ten solves (03/13/14 unmoved since 10-14, 08/12 since 10-27).
+  CONTINUOUS, 0.65 mm RMS (max 0.77); 06/07/09 re-placed (06 ≈ 20 mm / 2.9°,
+  07 ≈ 35 mm / 2.1°, 09 on its new bracket). The capture's table anchor is
+  `insufficient` (no table tag seen by the same two cameras in it and the
+  datum), so the common mode is not observed for this solve. Promoted through
+  the gateway (extrinsics only; the lenses are those of 10-27).
+
 ### The FR3 base (2026-10-09)
 
 `fr3_base` is a node with one edge, `world_20260928_063531 -> fr3_base`. It is
@@ -113,6 +136,154 @@ The edge is valid only while the rig cameras stay at their 0928 poses and the
 FR3 is not re-mounted. A new island or a moved arm needs a new P0 capture and
 `register_fr3_base.py solve` → `apply`. `apply` refuses a second edge between
 worlds that are already connected.
+
+**Retired 2026-11-03.** Both FR3 bases were moved after the edge was solved
+(confirmed 10-26; the day of the move is unknown), so the 10-15 edge is kept in
+`world_graph.json` under `"retired": {utc, reason}` and nothing routes through
+it: `export_v3 --target-world auto` (the GUI) keeps the camera world and prints
+the reason, `--target-world fr3_base`, the MuJoCo/IK/real replay and the
+pseudo-bimanual builder refuse with it, and training on a dataset exported
+through it warns. It is retired outright rather than by recording date: poses
+are put in a base for the arm to run them where it stands *now*, which is not
+where the edge says, whenever the demo was recorded. `register_fr3_base.py
+retire --from-world <world> --reason "<what moved>"` retires an edge; at the
+final placement re-register and `apply` the new edge (`--replace` files the
+retired one under its `supersedes`).
+
+### Two arms: `fr3_base_right` and the arm-arm edge (2026-11-03)
+
+`embodiments/fr3_dual.json` gives each FR3 its own root: the left arm
+(192.168.11.102) is `fr3_base`, the right (192.168.1.210) `fr3_base_right`.
+Three edges can reach them, all from the calibration page:
+
+- **world → fr3_base** and **world → fr3_base_right**: the ball check, one arm
+  at a time. The base comes from the pivots themselves -- each fit records the
+  `robot_ip` it was collected on (a joint fit, its runs'), the gateway maps it
+  through `fr3_arms.json` and the embodiment to the arm's root and passes
+  `fr3_base_ball_check.py --base`; a check that mixes the two arms' pivots is
+  refused.
+- **fr3_base → fr3_base_right**: `fr3_arm_arm_ball.py` (B3). The same balls
+  pivoted about by both arms, FK on both sides (no camera, no TCP), rigid fit
+  over ≥ 4 positions judged by leave-one-out (≤ 3 mm), `sigma_mm` = its
+  leave-one-out rms (≥ 0.5 mm). `register_fr3_base.check_reference` passes it:
+  no camera pose went into it.
+
+The panel applies any of them with `close_loop`: once the world reaches both
+bases and the arm-arm edge exists, a new edge goes in only if every route
+between its ends agrees within the edges' sigmas (`world_closures`), so a
+moved cart or a bad registration is refused instead of picked silently.
+
+As of 2026-11-10 the live edges are **world → fr3_base_right** (four balls,
+see [Right arm, four balls](#result-2026-11-10-right-arm-four-balls)); world →
+fr3_base is still retired and there is no arm-arm edge.
+
+The GUI hands a trajectory to an FR3 through a copy re-expressed in that arm's
+base, one directory per base under `derived/<sidecar>/`: `fr3_base/` for the
+left arm, `fr3_base_right/` for the right. Either arm replays either hand: the
+MuJoCo preview plans in the base of the arm selected in the replay panel, and
+real replay refuses an arm whose base is not the one the preview planned in
+(its start joints and coordinates belong to that base), using the arm's own
+replay YAML. `by_arm/` puts each hand in its own arm's base
+(`embodiments/fr3_dual.json`), or another arm's while its own is unregistered;
+the offline IK check and the two-robot preview read it. Each `frame.json` names
+every file's base (`roots`) and the hands no edge reaches it for (`refused`,
+with the copy removed). Until 2026-11-10 every hand went to `fr3_base`, so the
+right hand failed `fr3_ik_reachability` on the retired edge. A recording from
+before world stamps is in `fr3_base` as recorded and replays on the left arm
+only.
+
+The two-arm replay (C2–C4) reaches each arm's base through the graph on its
+own; it also needs the bases' placement relative to each other, for the
+collision checks. With `fr3_base` retired it is refused, as is any left-arm
+replay, until the left arm gets its own ball edge. Exports
+(`export_v3 --target-world`) still take `fr3_base` as the dataset frame (C0).
+
+### The guard against a graph brought back by a deploy (2026-11-03)
+
+A deploy mirrors the deployer's tree, `world_graph.json` included: a tree
+without the retirement revives the 10-15 edge, and an edge applied on the
+calibration page (Thor's copy only) is dropped. `world_graph_guard.py` keeps the
+graph this machine trusts in `outputs/world_graph_guard.json`, which no deploy
+touches: written at the gateway's first start with the guard, whenever the page
+applies an edge, by `register_fr3_base apply/retire` on this checkout, and on
+confirmation. `read_world_graph` compares every read against it; when the edges
+differ (an edge revived, lost, edited or unknown) no edge into a robot base is
+walked -- exports keep the camera world, explicit `fr3_base` exports, replays
+and the pseudo-bimanual builder refuse with the list of differences -- the GUI
+shows a red banner, and the page refuses to apply anything until someone checks
+and confirms (`python -m tools.thor.gmsl2.world_graph_guard check|accept` from a
+shell). It cannot stop a deploy of a tree from before the guard (the checking
+code goes too), but its record outlives that deploy.
+
+After applying an edge on Thor, still copy `world_graph.json` back into the repo
+and commit: otherwise the next deploy, even of a current tree, trips the guard.
+
+### The table datum (`table_datum.json`, 2026-10-27)
+
+Tags 45–49 (DICT_6X6_50, 76 mm black edge) are stuck flat on the table and are
+fixed from 2026-10-27 on. `table_datum.json` is one capture of them in
+`world_20260928_063531`: the corners each tag triangulated to with
+`calib_20261027_173815`, each camera's pixel corners of every table tag it
+saw, and that calibration's K, D and pose for those cameras (`anchor_cameras`).
+Written by `cart_redock_check.py freeze-datum` from
+`thor_gmsl2_11ch_v1_20261027_165415` (45/46/47/48 triangulated; 49 is seen by
+cam_12 only; cam_06/08/14 see none). That episode has since been deleted on
+Thor; the file holds everything the checks use.
+
+It is what the camera-only mechanisms above cannot provide: a reference that is
+mechanically independent of the camera rig.
+
+- **Camera pixels** say which camera moved since the capture, without any
+  calibration: `cart_redock_check.py cameras <measurement>`. Two captures 2.5 h
+  apart moved no table tag by more than 0.44 px in any camera.
+- **Every recorded episode** is checked against the table pixels of the
+  calibration it was recorded on: the run's own `table_anchor.json` (see below)
+  or, for `calib_20261027_173815`, the datum.
+  `cart_redock_check.py session <dataset…> --write` reads the first ~0.5 s of
+  each camera that sees a table tag and writes `derived/table_check.json`
+  (incremental: only episodes whose videos changed are decoded again).
+  `export_v3` runs it for each session it exports (in the opencv_kalibr venv)
+  and records the session summary under `label_provenance.sessions.<name>.table_check`
+  and each episode's verdict in `export_sources.json`. A moved camera is a
+  warning, not a refusal, and the result is not part of the label key: the
+  0.6 px limit (~0.035°, against ~0.2° for the corner-BA `camera_state`) is
+  provisional, and a key field would part every export from the earlier ones.
+  `other_calibration` means the episode was recorded on extrinsics that have no
+  table pixels of their own (older than 2026-10-28, other than the datum's), so
+  steady pixels do not say its labels fit. cam_06/08/14 are not covered;
+  `camera_state` still is their only check.
+- **Every new calibration is anchored to the table** (2026-10-28). After the
+  bundle adjustment the gateway runs `cart_redock_check.py anchor <capture>
+  --bundle <extrinsics_report.json>`: the table tags in the calibration sweep
+  (120 frames per camera across it) are triangulated with the bundle, the
+  datum's pixels with `anchor_cameras`, from the same cameras on both sides, and
+  fitted rigidly. That is `T_world_session` from the table alone, written next
+  to the bundle as `table_anchor.json` and passed to `world_registration
+  register` and `export_production_calibration --anchor`. The registration then
+  reports `common_mode` (how far the table puts the solve from where camera
+  consensus does; `drifted` past 10 mm / 0.75°) instead of "not observable", and
+  a solve whose cameras all moved is reconnected (`RECONNECTED`) instead of
+  becoming a new island. Advisory: a missing or failed anchor only leaves that
+  motion unobserved. The file also keeps where every camera saw the table
+  during the sweep; the gateway copies it into the exported extrinsics run, and
+  that is what the episodes recorded on the run are checked against, so a
+  camera that moved before the recalibration is not flagged forever after.
+  Validated on `calib_20261027_185829` (a sweep that was never exported, solved
+  on the workstation): anchor and consensus agree to 0.36 mm / 0.13° at the
+  table centre (0.08–0.17° over other tag and camera choices; two solves of the
+  rig differ per camera by 0.01–0.17°). The same sweep shows cam_09 1.0–1.8 px
+  off the datum two hours after it was frozen (all others ≤ 0.46 px): its slow
+  nod is still going on.
+
+It does not redefine the world: the id stays, and the corners are measured
+values in it, not the printed geometry (the triangulated edges read 74.3–74.9
+mm against 76 mm on the calipers, a detector bias that only cancels in
+differences). Tracked for the same reason as the reference: the capture it came
+from lives under `outputs/`. Replacing it (a tag re-stuck, the table moved)
+needs `--replace` and records what it replaced. The table itself must stay put,
+and the carts dock with a spacer pressed against its edge: if docking shifts
+the table, every camera sees every table tag move and the check refuses. The
+5x push-away/push-back repeats will show whether it does.
 
 ## Correcting a stamp that is wrong
 
@@ -223,6 +394,12 @@ definition. A ball fixed to the table is pivoted about twice:
   socket frame of later fits is ~0. The end-to-end replay error carries that
   5 mm again until the edge is fixed. Output:
   `outputs/fr3_tcp_pivot/joint/*_joint.json`.
+  On 2026-11-09 the right FR3's gripper had the 44 mm fingertips holding insert
+  nov4. The commanded pivot (`tools/fr3/fr3_pivot_auto.py`: a probe, then 14
+  dwells anchored on it, 57°) put the ball at (−0.96, 2.06, 33.50) mm in
+  `corenetic_gripper_ee` (σ ≤ 0.41 mm), 205.5 mm from the flange face, and
+  `corenetic_socket_ee` is now that point. Its fits (`*_pivot.fit.json`) carry
+  `c_base_mm` like a `fit` report.
 - **The handheld UMI**, about the same ball, recorded as an ordinary episode.
   Production's labels, fitted as a pivot, give the ball `b` in the camera world.
 
@@ -517,3 +694,100 @@ difference. Consequences:
 - For 3 mm the extrinsics must hold during a capture: check the camera heads
   and brackets, and look at the corner BA RMSE before and after each capture
   that matters (above ~1 px, recalibrate).
+
+### Result, 2026-11-10: right arm, four balls
+
+The first edge into `fr3_base_right` (192.168.1.210), live since 2026-11-10
+02:49 UTC (`world_graph.json`; the guard recorded it). Check
+`outputs/calibration/fr3_base_ball_check/check_20261110T024842Z.json`,
+candidate `outputs/calibration/fr3_base_registration/ball_check_20261110T024842Z.json`
+(both on Thor).
+
+**Data.** Four ball positions, each pivoted about by the right FR3 (commanded
+pivot, `fr3_pivot_auto.py execute`, insert nov4) and by the handheld right
+rig v9b (ArUco 100/101/110/111 only; `gripper_rig_v9b_right`, the sidecar holds
+only `right`). The handheld episodes were paired to the balls by ball-to-ball
+distance, which needs no edge: A–B 509.3 mm handheld vs 509.0 mm FK, C–A 339.2
+vs 339.7, C–B 315.7 vs 314.4.
+
+| Ball | In fr3_base_right (mm) | FR3 side | Handheld side |
+|---|---|---|---|
+| A | (544, 192, 424) | joint fit of `20261110_092258` + `092520` (`joint/20261110_104831_joint.json`) | `thor_gmsl2_11ch_v1_20261110_093613` ep 0 |
+| B | (507, −315, 433) | joint fit of `094223` + `094501` (`joint/20261110_104832_joint.json`) | `…_093613` ep 1 |
+| C | (611, −81, 615) | `095636`, aborted at 190.8 s in `return`, all 13 dwells done; samples up to the stall kept (`20261110_095636_pivot.trim.json` / `.trim.fit.json`) | `…_100154` ep 0 |
+| D | (611, 236, 250) | `102516` | `…_102834` ep 0 |
+
+`095636` stopped on a 7.1 N spike that was not contact: the execute loop
+stalled 0.46 s in a Python full garbage collection (every execute run has one
+~0.4 s stall at ~48.7 s; long runs hit a second), the arm held its last
+command, and the plan index, taken from the wall clock, jumped ahead by up to
+1.7° of joint motion when the loop resumed. Trimming the last 10 samples does
+not change its fit. Fixed the same day in `fr3_pivot_auto.py`: no garbage
+collection inside the execute and guide loops (`hold_gc`), and the plan's
+clock advances at most `EXECUTE_MAX_CLOCK_STEP_S` per tick, so a stall pauses
+the plan. A run records its stalls in `loop_stalls`.
+
+**Result.** Rigid Kabsch, handheld `s` shared over the four positions:
+
+- Residual 0.93 / 0.77 / 0.94 / 0.64 mm (rms 0.83). Leave one out 1.69 /
+  4.68 / 2.94 / 2.57 mm (rms 3.16, max 4.68, under the 6 mm gate). Dropping
+  one ball turns the edge by up to 0.70°. Scale +0.09 %, i.e. none.
+- The balls span 472 × 213 × 68 mm (singular values). The thin third
+  direction is why one held-out ball moves the rotation by 0.7°: a fifth ball
+  off that plane would steady it.
+- The handheld rig is the strong side: pivot rms 0.26–0.65 mm, every frame
+  on the ball, 84–92° of turn, shared `s` (0.76, −0.11, 0.18) mm. The rig's
+  marker→TCP constant puts the TCP within 0.8 mm of the socket centre.
+- The FR3 side is the weak one: centre σ 0.7–1.1 mm at A, B and C (pivot rms
+  0.9–1.0 mm, and 2.7 mm for C) against 0.3 mm at D.
+
+**Accuracy.** "Workspace" below is the box the four balls span in the base
+frame, (507…611, −315…236, 250…615) mm. Outside it, the rotation error grows
+with distance.
+
+| Source | Size | How it was found |
+|---|---|---|
+| Random, from the fits' own σ | p95 1.0 mm (worst point 1.5 mm), rotation 0.2° | Monte Carlo of the Kabsch fit with each centre's jackknife σ |
+| Random, from the residual (σ 0.68 mm per axis) | p95 1.5 mm (worst point 2.3 mm), rotation 0.36° | same, point noise from the 6-dof residual |
+| Leave one out (empirical) | rms 3.2 mm, max 4.7 mm | each ball predicted from the other three |
+| Soft ball pad (systematic, vertical) | up to ~3 mm | see below |
+
+So the edge has about 1.5 mm (p95) of random error, plus a vertical bias of
+up to about 3 mm that this data cannot remove. Together that is about 3 mm
+typical and up to about 5 mm inside the box, which is what leave one out
+shows. The FR3's own tracking error and the labels' own error come on top.
+
+**The soft pad.** The ball sits on a soft pad. The FR3 pivot's force loop
+pushes the command down until the press reads 3 N. That loop moved the
+command by up to 4–5.5 mm, and the socket's FK height followed the command
+almost exactly: in `095636` the fit residual's z correlates with the commanded
+shift at 0.994, and with the shift taken out its residual falls from 2.69 to
+0.53 mm over a 164° span. The ball itself moved. The handheld is pressed by
+hand, by a different amount. The two sides therefore see the ball at
+different heights, and that difference goes into the edge's vertical
+translation. The residuals do not show it, because the bias is common to
+every ball. Refitting with the commanded shift taken out of the FR3's FK
+(an analysis model: it assumes the ball follows the command 1:1):
+
+| FR3 centres | Residual rms | Leave one out rms | Edge moves vs live (mean / max over the box) |
+|---|---|---|---|
+| As fitted (live edge) | 0.83 mm | 3.16 mm | — |
+| Shift removed, per ball | 0.46 mm | 1.30 mm | 2.6 / 2.8 mm, (−0.2, +2.5, 0.0) mm in world, 0.12° |
+| Shift removed, one `s` for all balls | 0.64 mm | 2.00 mm | 2.9 / 3.3 mm, (−0.3, +2.8, −0.1) mm, 0.20° |
+| As fitted, one `s` for all balls | 1.19 mm | 2.83 mm | 0.9 / 1.8 mm |
+
+World +y is fr3_base_right −z (down). With the shift out, the FR3's
+per-ball `s` also agrees better (its z 32.4–33.5 against 32.2–33.8 mm). The
+truth lies between the live edge (ball pressed ~3–4 mm, as by the FR3) and
+the corrected edge (ball unloaded), wherever the hand pressed it. The live
+edge was kept as fitted, and the candidate report carries the caveat
+(`warnings`, and `edge.quality.systematic_z_note` in `world_graph.json`).
+To remove it: put the ball on a rigid stand, or have the FR3 pivot press with
+a fixed shift and record the hand's force; then re-pivot and refit.
+
+**Keeping it valid.** The edge holds while the right arm's cart and the rig
+cameras stay where they were on 2026-11-10 (extrinsics
+`calib_20261102_195715`, world reference revision of 11-04). The ball check is
+rerun from the GUI with the same four pairs. The C position's trimmed fit is
+not a run name the GUI lists, so it is passed to `fr3_base_ball_check.py` by
+hand, as here.

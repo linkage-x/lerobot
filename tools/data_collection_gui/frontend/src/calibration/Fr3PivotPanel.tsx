@@ -5,9 +5,11 @@
 // ordinary recording. The FR3 half settles corenetic_socket_ee on its own; the
 // two together score every edge -- live, single-tag, laser -- at the ball,
 // without the laser or any TCP definition. See fr3Pivot.ts for the wording.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import type { BallCheckReport, Fr3PivotResponse } from "../types";
+import { ArmPicker, useRobotArms } from "../shared/ArmPicker";
+import { armIp } from "../shared/robotArms";
 import { Modal } from "./ConfirmModal";
 import { Fr3PivotAutoSteps } from "./Fr3PivotAutoSteps";
 import { GripperTeleopBox } from "./GripperTeleopBox";
@@ -27,15 +29,20 @@ import {
   jointFitLines,
   jobStatusText,
   pivotFitWarnings,
+  checkBaseLabel,
+  mixedArmWarning,
   positionDraftWarnings,
   rankedEdges,
   socketFrameVerdict,
   type PositionDraft,
 } from "./fr3Pivot";
 import { fmtNum } from "./fr3BaseEdge";
+import { Fr3ArmArmEdge } from "./Fr3ArmArmEdge";
 
 const POLL_MS = 1000;
 const LOG_TAIL = 14;
+/** Pivot runs shown before the results table scrolls. */
+const RUNS_VISIBLE = 10;
 
 export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
   const [payload, setPayload] = useState<Fr3PivotResponse | null>(null);
@@ -43,6 +50,9 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
   const [robotIp, setRobotIp] = useState("");
+  const arms = useRobotArms();
+  // Thor: the arm from fr3_arms.json, chosen here every time (roadmap B2; B3 pivots both arms).
+  const [arm, setArm] = useState("");
   const [durationS, setDurationS] = useState("");
   const [note, setNote] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -94,12 +104,35 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
   const pickedRuns = picked.filter((name) => runs.some((r) => r.name === name));
   const togglePicked = (name: string, on: boolean) =>
     setPicked((names) => (on ? [...names.filter((n) => n !== name), name] : names.filter((n) => n !== name)));
+  // The runs table shows RUNS_VISIBLE rows and scrolls for the rest. Rows differ in height (warnings, notes), so the
+  // limit is the measured bottom of the last visible row, re-measured when the table reflows.
+  const runsScrollRef = useRef<HTMLDivElement>(null);
+  const [runsMaxHeight, setRunsMaxHeight] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const box = runsScrollRef.current;
+    if (!box) return;
+    const measure = () => {
+      const rows = box.querySelectorAll("tbody tr");
+      if (rows.length <= RUNS_VISIBLE) {
+        setRunsMaxHeight(null);
+        return;
+      }
+      const last = rows[RUNS_VISIBLE - 1] as HTMLElement;
+      setRunsMaxHeight(Math.ceil(last.getBoundingClientRect().bottom - box.getBoundingClientRect().top + box.scrollTop) + 1);
+    };
+    measure();
+    const table = box.querySelector("table");
+    if (!table || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(table);
+    return () => observer.disconnect();
+  }, [runs.length]);
   const episodes = payload?.episodes ?? [];
-  const ip = robotIp || payload?.robotIp || "";
+  const ip = arms?.required ? armIp(arms, arm) : robotIp || payload?.robotIp || "";
   const duration = Number(durationS || payload?.defaultDurationS || 45);
   const [lo, hi] = payload?.durationRangeS ?? [15, 180];
   const disabled = busy || running !== "";
-  const draftWarnings = positionDraftWarnings(drafts, runs, episodes);
+  const draftWarnings = [...positionDraftWarnings(drafts, runs, episodes), mixedArmWarning(drafts, runs, joints)].filter(Boolean);
   const completeDrafts = drafts.filter((d) => d.pivot && d.episodeKey);
   const checks = payload?.checks ?? [];
   const shown: BallCheckReport | null = checks.find((c) => c.name === checkName) ?? checks[0] ?? null;
@@ -134,7 +167,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
         两边都各自拟合杠杆臂，所以和 TCP 定义、跟踪仪站位、激光都无关。
       </p>
 
-      <GripperTeleopBox api={api} busy={busy} />
+      <GripperTeleopBox api={api} busy={busy} armRequired={Boolean(arms?.required)} arm={arm} robotIp={ip} />
 
       <div className="cali-result-box">
         <div className="cali-result-box-head">
@@ -151,9 +184,13 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
           <button className={mode === "teach" ? "cali-btn-primary" : "cali-mini-btn"} disabled={active} onClick={() => setMode("teach")}>
             示教（手扶）
           </button>
-          <label className="cali-muted">
-            FR3 IP <input value={ip} disabled={disabled || active} onChange={(e) => setRobotIp(e.target.value)} size={14} />
-          </label>
+          {arms?.required ? (
+            <ArmPicker arms={arms} value={arm} onChange={setArm} disabled={disabled || active} label="FR3" />
+          ) : (
+            <label className="cali-muted">
+              FR3 IP <input value={ip} disabled={disabled || active} onChange={(e) => setRobotIp(e.target.value)} size={14} />
+            </label>
+          )}
           <label className="cali-muted">
             备注 <input value={note} disabled={disabled || active} onChange={(e) => setNote(e.target.value)} placeholder="球 A" size={12} />
           </label>
@@ -221,6 +258,11 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
           <span className="cali-muted">{payload?.runsRoot ?? "outputs/fr3_tcp_pivot"}</span>
         </div>
         {runs.length ? (
+          <div
+            className="fr3-pivot-runs-scroll"
+            ref={runsScrollRef}
+            style={runsMaxHeight ? { maxHeight: runsMaxHeight } : undefined}
+          >
           <table className="metric-table">
             <thead>
               <tr>
@@ -291,6 +333,7 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
               })}
             </tbody>
           </table>
+          </div>
         ) : (
           <p className="cali-muted">还没有 FR3 pivot 采集。</p>
         )}
@@ -461,9 +504,11 @@ export function Fr3PivotPanel({ api, busy }: { api: DataCollectionGuiApi; busy: 
       ) : null}
       {edgeSaved ? (
         <p>
-          已存为候选边 <code>{edgeSaved}</code>：到「world → fr3_base 注册边」面板点刷新，和现役边比较挪动量后再换边。
+          已存为候选边 <code>{edgeSaved}</code>：到「FR3 基座注册边」面板点刷新，和现役边比较挪动量后再换边。
         </p>
       ) : null}
+
+      <Fr3ArmArmEdge api={api} payload={payload} arms={arms} disabled={disabled} running={running === "armArm"} act={act} />
 
       {error ? <pre className="cali-warn">{error}</pre> : null}
       {output ? <pre className="marker-tcp-example">{output}</pre> : null}
@@ -529,6 +574,7 @@ function BallCheckResult({
         </select>
       </div>
       <p>{ballCheckVerdict(report)}</p>
+      <p className="cali-muted">{checkBaseLabel(report)}</p>
       {ranked.length ? (
         <table className="metric-table">
           <thead>

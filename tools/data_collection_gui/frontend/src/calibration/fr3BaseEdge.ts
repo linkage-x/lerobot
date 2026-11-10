@@ -19,7 +19,7 @@
 // FR3 and the handheld pivoted about, at 4+ places): judged by predicting each
 // position from the others. Rigid on purpose -- the camera world's scale is
 // shown, not absorbed; it is fixed at its source and the edge refitted.
-import type { Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse } from "../types";
+import type { Fr3BaseEdgeMove, Fr3BaseEdgeQuality, Fr3BaseEdgeResponse, WorldGraphGuard } from "../types";
 
 type Current = NonNullable<Fr3BaseEdgeResponse["current"]>;
 type Candidate = Fr3BaseEdgeResponse["candidates"][number];
@@ -35,11 +35,23 @@ export function runLabel(path: string): string {
 }
 
 export function methodLabel(q: Fr3BaseEdgeQuality): string {
+  if (q.method === "armArm") return "两臂同球";
   return q.method === "laser" ? "激光" : q.method === "ball" ? "同球检验" : "单 tag";
+}
+
+/** "a → b" of an edge; a candidate written before 11-03 has no ends and is world → fr3_base. */
+export function edgeEnds(from?: string, to?: string): string {
+  return `${from || "world"} → ${to || "fr3_base"}`;
 }
 
 /** The numbers that judge an edge, by how it was measured. */
 export function qualitySummary(q: Fr3BaseEdgeQuality): string {
+  if (q.method === "armArm") {
+    return (
+      `${q.positions ?? "—"} 个球位 · 两基座相距 ${fmtNum(q.baselineM, 3, " m")} · 留一预测 rms ${fmtNum(q.leaveOneOutRmsMm, 2, " mm")} / ` +
+      `最差 ${fmtNum(q.leaveOneOutMaxMm, 2, " mm")} · 拟合残差 rms ${fmtNum(q.residualRmsMm, 2, " mm")}`
+    );
+  }
   if (q.method === "ball") {
     const scale = q.scalePct == null ? "" : ` · 相机 world 尺度 ${q.scalePct >= 0 ? "+" : ""}${fmtNum(q.scalePct, 2, "%")}（未吸收）`;
     const arm = q.handheldS === "per-position" ? " · 手持各自杠杆臂" : "";
@@ -71,9 +83,23 @@ export function liveEdgeSummary(current: Current | null): string {
 }
 
 /** What is wrong with the live edge itself, worded as what it does to the FR3. */
-export function liveEdgeWarnings(current: Current | null, referenceWorld: string): string[] {
+export function liveEdgeWarnings(
+  current: Current | null,
+  referenceWorld: string,
+  retired: NonNullable<Fr3BaseEdgeResponse["retired"]> = []
+): string[] {
+  const retiredLines = retired.map(
+    (r) =>
+      `已停用的边 ${r.from ? `${edgeEnds(r.from, r.to)} · ` : ""}${r.label || "—"}（${r.createdUtc || "—"} 解出，` +
+      `${r.retiredUtc || "—"} 停用）：${r.reason || "未写原因"}`
+  );
   if (!current) {
-    return ["world_graph.json 里没有到 fr3_base 的边：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝。"];
+    return [
+      retired.length
+        ? "到 fr3_base 的边已停用（底座挪过）：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝，GUI 导出保留相机世界系；需要在臂的新位置重新注册。"
+        : "world_graph.json 里没有到 fr3_base 的边：MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都会被拒绝。",
+      ...retiredLines,
+    ];
   }
   const warnings: string[] = [];
   if (!current.fromReferenceWorld) {
@@ -123,12 +149,15 @@ export function verdictLabel(candidate: Candidate): string {
   return candidate.verdict === "ok" ? "通过" : "未通过";
 }
 
-export function applyConfirmation(candidate: Candidate, current: Current | null): string {
+export function applyConfirmation(candidate: Candidate, _current: Current | null): string {
   const move = candidate.moveVsLive;
+  const ends = edgeEnds(candidate.from, candidate.to);
+  const base = candidate.to || "fr3_base";
   return (
-    `把 world → fr3_base 换成 ${candidate.label}（${methodLabel(candidate.quality)}）解出的边` +
-    (move && current ? `：在这一轮的工作区里，它把 fr3_base 下的每个位姿平均挪 ${move.meanNormMm.toFixed(1)} mm（最大 ${move.maxMm.toFixed(1)} mm）。` : "。") +
-    "之后的 MuJoCo 预览、IK QC、真机 replay 和导出到 fr3_base 都改走新边；已经导出的数据集和做过的 replay 分析仍是旧边的结果。" +
+    `把 ${ends} 换成 ${candidate.label}（${methodLabel(candidate.quality)}）解出的边` +
+    (move ? `：在这一轮的工作区里，它把 ${base} 下的每个位姿平均挪 ${move.meanNormMm.toFixed(1)} mm（最大 ${move.maxMm.toFixed(1)} mm）。` : "（这对两端之间还没有现役边）。") +
+    "之后经过这对坐标系的 MuJoCo 预览、IK QC、真机 replay 和导出都改走新边；已经导出的数据集和做过的 replay 分析仍是旧边的结果。" +
+    "图里如果因此出现两条路线（world 分别到两台臂 + 两臂之间），会先检查它们是否闭合，不闭合就拒绝。" +
     "旧边保存在新边的 supersedes 里。改动只发生在这台机器的 world_graph.json：请拷回仓库并提交。"
   );
 }
@@ -172,4 +201,19 @@ export function laserSelectionWarnings(station: Station | null, replays: LaserRe
     warnings.push("回放没有分在驻点两侧：它们彼此一致，也说明不了驻点期间跟踪仪没动。");
   }
   return warnings;
+}
+
+/** Whether world_graph.json is not the graph this machine trusts: nothing goes into a robot base until confirmed. */
+export function graphGuardBlocks(guard: WorldGraphGuard | null | undefined): boolean {
+  return guard?.state === "diverged" || guard?.state === "unreadable";
+}
+
+/** The red banner's text: what it stops, then what changed. Empty while the graph is trusted. */
+export function graphGuardLines(guard: WorldGraphGuard | null | undefined): string[] {
+  if (!guard || !graphGuardBlocks(guard)) return [];
+  return [
+    `world_graph.json 与这台机器上次确认的版本（${guard.recordedUtc || "—"}）不一致：确认之前，导出不换算到基座系，` +
+      "真机 / 双臂 replay 和 MuJoCo 预览到基座都会被拒绝。到「标定 → FR3 基座注册边」核对后确认。",
+    ...guard.problems,
+  ];
 }

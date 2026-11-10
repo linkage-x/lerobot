@@ -30,17 +30,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.fr3 import fr3_record
+from tools.fr3 import fr3_arms, fr3_record
 
 
 DEFAULT_SERVICE = "lerobot-user"
-DEFAULT_ROBOT_IP = "192.168.11.102"
 DEFAULT_RUNTIME = "docker"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run FR3 move_to_start inside Docker or on the host.")
-    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="FR3 controller IP address.")
+    fr3_arms.add_arguments(parser)
     parser.add_argument(
         "--runtime",
         choices=("docker", "host"),
@@ -64,6 +63,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _start_joints(args: argparse.Namespace) -> list[str]:
+    """The resolved arm's start (fr3_arms.json) as the runtime's --start-joints; none before main resolved it."""
+    start = getattr(args, "start_joints_rad", None)
+    return [f"--start-joints={','.join(repr(float(v)) for v in start)}"] if start else []
+
+
 def build_docker_command(args: argparse.Namespace) -> list[str]:
     workspace = args.workspace.resolve()
     compose_file = args.compose_file.resolve() if args.compose_file is not None else workspace / "docker" / "docker-compose.yml"
@@ -73,6 +78,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "/lerobot/.venv/bin/python",
         "tools/fr3/fr3_move_to_start_runtime.py",
         f"--robot-ip={args.robot_ip}",
+        *_start_joints(args),
     ]
     return [
         "docker",
@@ -97,11 +103,17 @@ def build_host_command(args: argparse.Namespace) -> list[str]:
         str(host_python),
         str(runtime_script),
         f"--robot-ip={args.robot_ip}",
+        *_start_joints(args),
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        args.start_joints_rad = fr3_arms.resolve_args(args)["start_joints_rad"]
+    except fr3_arms.ArmConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     workspace = args.workspace.resolve()
     if args.runtime == "host":
         command = build_host_command(args)

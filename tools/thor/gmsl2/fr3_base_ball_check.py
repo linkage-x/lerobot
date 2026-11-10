@@ -17,6 +17,11 @@ in that tool's frame), so a wrong ``corenetic_socket_ee`` or a wrong marker->TCP
 constant moves ``s``, not the ball.  No laser and no station either -- which is
 what makes this a referee between a single-tag edge and a laser edge.
 
+Which base: each FR3 pivot was collected on one arm, and its centre is in that arm's base. The base is
+``--base`` (``fr3_base``, the left arm's, by default; ``fr3_base_right`` for the right arm), and every
+position of a check must come from the same arm (the ``robot_ip`` its fit records): a check that mixes
+the two arms' centres is not a registration of either.
+
 One ball position checks the edge's translation where the ball was; positions
 ~0.3 m apart also see its rotation (1 deg is 5 mm at 0.3 m).  With three or more
 non-collinear positions the pairs are a registration of their own, reported as
@@ -201,40 +206,86 @@ def _conditioning_warnings(who: str, row: dict[str, Any], sigma_gate_mm: float) 
     return out
 
 
-def position_row(
-    fr3_fit: dict[str, Any], fr3_fit_name: str, dataset: Path, episode: int, *, cube: str = "", sidecar_name: str = SIDECAR_NAME
-) -> dict[str, Any]:
-    """One ball position: the FR3 pivot's centre in fr3_base, the handheld pivot's centre in the world."""
-    row: dict[str, Any] = {"fr3_pivot": fr3_fit_name, "dataset": dataset.name, "episode": episode, "reasons": [], "warnings": []}
+def fit_robot_ip(fr3_fit: dict[str, Any], fit_path: Path | None = None) -> str:
+    """The FR3 a pivot fit was collected on: its own ``robot_ip``, or for a joint fit its runs' (they must agree).
+
+    A joint fit (``fit-joint``) does not record the IP; its runs' fits (``<run>.fit.json`` next to the
+    runs, one directory up from ``joint/``) do. ``""`` when nothing says, or the runs disagree.
+    """
+    own = str(fr3_fit.get("robot_ip") or "")
+    if own or fr3_fit.get("schema") != FR3_JOINT_SCHEMA or fit_path is None:
+        return own
+    ips = set()
+    for run in fr3_fit.get("runs") or []:
+        sibling = fit_path.parent.parent / (str(run).removesuffix(".json") + ".fit.json")
+        try:
+            ips.add(str(json.loads(sibling.read_text(encoding="utf-8")).get("robot_ip") or ""))
+        except (OSError, ValueError):
+            continue  # an aborted run has no fit of its own; the others say which arm
+    return ips.pop() if len(ips) == 1 else ""
+
+
+def fr3_centre(fr3_fit: dict[str, Any], fr3_fit_name: str) -> tuple[dict[str, Any] | None, list[str], list[str], list[str] | None]:
+    """An FR3 pivot fit's ball centre in its base: ``(fr3 row, reasons, warnings, runs of a joint fit)``."""
+    reasons: list[str] = []
+    runs = None
     fk = dict(fr3_fit.get("fk") or {})
     if fr3_fit.get("schema") == FR3_JOINT_SCHEMA and "c_base_mm" in fk:
         if not fr3_fit.get("shared_centre") or len(fk["c_base_mm"]) != 1:
-            row["reasons"].append(f"{fr3_fit_name} 是每次一个球心的合并拟合，不是一个球位置；用共用球心的合并拟合")
+            reasons.append(f"{fr3_fit_name} 是每次一个球心的合并拟合，不是一个球位置；用共用球心的合并拟合")
             fk.pop("c_base_mm")
         else:
             fk["c_base_mm"] = fk["c_base_mm"][0]
             fk["c_sigma_mm"] = (fk.get("c_sigma_mm") or [None])[0]
-            row["fr3_runs"] = list(fr3_fit.get("runs") or [])
+            runs = list(fr3_fit.get("runs") or [])
     if "c_base_mm" not in fk:
-        if not row["reasons"]:
-            row["reasons"].append(f"{fr3_fit_name} 不是 fr3_tcp_pivot.py fit / fit-joint 的结果（没有 fk.c_base_mm）")
-    else:
-        row["fr3"] = {
-            "s_mm": fk.get("s_ee_mm"),
-            "s_sigma_mm": fk.get("s_sigma_mm"),
-            "centre_mm": fk["c_base_mm"],
-            "centre_sigma_mm": fk.get("c_sigma_mm") or [float("nan")] * 3,
-            "residual_rms_mm": fk.get("residual_rms_mm"),
-            "residual_p95_mm": fk.get("residual_p95_mm"),
-            "n_used": fk.get("n_used"),
-            "n_total": fk.get("n_total"),
-            "span_deg": fk.get("span_deg"),
-            "weak_singular": fk.get("weak_singular"),
-        }
-        socket = fr3_fit.get("socket_frame") or {}
-        if "s_ee_mm" in socket:
-            row["fr3"]["s_in_socket_frame_mm"] = socket["s_ee_mm"]
-        row["warnings"] += _conditioning_warnings("FR3 pivot", row["fr3"], GATE_FR3_CENTRE_SIGMA_MM)
+        if not reasons:
+            reasons.append(f"{fr3_fit_name} 不是 fr3_tcp_pivot.py fit / fit-joint 的结果（没有 fk.c_base_mm）")
+        return None, reasons, [], runs
+    row = {
+        "s_mm": fk.get("s_ee_mm"),
+        "s_sigma_mm": fk.get("s_sigma_mm"),
+        "centre_mm": fk["c_base_mm"],
+        "centre_sigma_mm": fk.get("c_sigma_mm") or [float("nan")] * 3,
+        "residual_rms_mm": fk.get("residual_rms_mm"),
+        "residual_p95_mm": fk.get("residual_p95_mm"),
+        "n_used": fk.get("n_used"),
+        "n_total": fk.get("n_total"),
+        "span_deg": fk.get("span_deg"),
+        "weak_singular": fk.get("weak_singular"),
+    }
+    socket = fr3_fit.get("socket_frame") or {}
+    if "s_ee_mm" in socket:
+        row["s_in_socket_frame_mm"] = socket["s_ee_mm"]
+    return row, reasons, _conditioning_warnings("FR3 pivot", row, GATE_FR3_CENTRE_SIGMA_MM), runs
+
+
+def position_row(
+    fr3_fit: dict[str, Any],
+    fr3_fit_name: str,
+    dataset: Path,
+    episode: int,
+    *,
+    cube: str = "",
+    sidecar_name: str = SIDECAR_NAME,
+    robot_ip: str = "",
+) -> dict[str, Any]:
+    """One ball position: the FR3 pivot's centre in its base, the handheld pivot's centre in the world."""
+    row: dict[str, Any] = {
+        "fr3_pivot": fr3_fit_name,
+        "robot_ip": robot_ip or str(fr3_fit.get("robot_ip") or ""),
+        "dataset": dataset.name,
+        "episode": episode,
+        "reasons": [],
+        "warnings": [],
+    }
+    fr3, reasons, warnings, runs = fr3_centre(fr3_fit, fr3_fit_name)
+    row["reasons"] += reasons
+    row["warnings"] += warnings
+    if runs is not None:
+        row["fr3_runs"] = runs
+    if fr3 is not None:
+        row["fr3"] = fr3
 
     world = _episode_world(dataset, episode)
     row["world"] = world
@@ -427,8 +478,8 @@ def ball_edge(rows: list[dict[str, Any]], world: str, *, handheld_s: str = "shar
     }
 
 
-def _report_edge(path: Path) -> tuple[str, str, np.ndarray, bool] | None:
-    """``(label, source world, T_fr3_base_world, fitted on balls)`` of a register_fr3_base.py candidate report."""
+def _report_edge(path: Path, base: str = wp.FR3_BASE_WORLD_ID) -> tuple[str, str, np.ndarray, bool] | None:
+    """``(label, source world, T_base_world, fitted on balls)`` of a register_fr3_base.py candidate report."""
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
         edge = report["edge"]
@@ -437,16 +488,28 @@ def _report_edge(path: Path) -> tuple[str, str, np.ndarray, bool] | None:
         return None
     src, dst = str(edge.get("from_world_frame_id")), str(edge.get("to_world_frame_id"))
     from_balls = str(edge.get("method") or "").startswith(BALL_EDGE_METHOD)
-    if dst == wp.FR3_BASE_WORLD_ID:
+    if dst == base:
         return path.name, src, T, from_balls
-    if src == wp.FR3_BASE_WORLD_ID:
+    if src == base:
         return path.name, dst, np.linalg.inv(T), from_balls
     return None
 
 
 def check(
-    rows: list[dict[str, Any]], graph: dict[str, Any], candidate_reports: list[Path], *, handheld_s: str = "shared"
+    rows: list[dict[str, Any]],
+    graph: dict[str, Any],
+    candidate_reports: list[Path],
+    *,
+    handheld_s: str = "shared",
+    base: str = wp.FR3_BASE_WORLD_ID,
 ) -> dict[str, Any]:
+    ips = sorted({r.get("robot_ip") or "" for r in rows if r["usable"]} - {""})
+    if len(ips) > 1:
+        # the centres are in two different bases: no single edge maps them all
+        for row in rows:
+            if row["usable"]:
+                row["reasons"].append(f"这次检验混用了两台臂的 pivot（{', '.join(ips)}）；每台臂单独做一次同球检验")
+                row["usable"] = False
     worlds = sorted({r["world"] for r in rows if r["usable"]})
     shared = {}
     if handheld_s == "shared":
@@ -455,7 +518,7 @@ def check(
         row.pop("_poses", None)
     edges = []
     for world in worlds:
-        live = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
+        live = wp.world_transform(graph, world, base)
         if live is not None:
             hops = live[1]
             edges.append(
@@ -468,9 +531,9 @@ def check(
                 }
             )
     for path in candidate_reports:
-        found = _report_edge(path)
+        found = _report_edge(path, base)
         if found is None:
-            edges.append({"name": path.name, "error": "不是一个 world <-> fr3_base 的候选报告"})
+            edges.append({"name": path.name, "error": f"不是一个 world <-> {base} 的候选报告"})
             continue
         label, world, T, from_balls = found
         if world not in worlds:
@@ -481,6 +544,8 @@ def check(
     return {
         "schema": SCHEMA,
         "generated_utc": _now_iso(),
+        "base": base,
+        "robot_ips": ips,
         "handheld_s": handheld_s,
         "handheld_shared": shared,
         "positions": rows,
@@ -494,13 +559,15 @@ def _sha256(path: Path) -> str:
 
 
 def edge_report(
-    check_report: dict[str, Any], check_path: str, world: str, *, target_world: str = wp.FR3_BASE_WORLD_ID
+    check_report: dict[str, Any], check_path: str, world: str, *, target_world: str | None = None
 ) -> dict[str, Any]:
     """A check's ball edge as a register_fr3_base.py candidate report (``apply`` / the calibration page take it).
 
     ``world_reference_sha256`` is the one the check ran against: the handheld centres are only valid with
     the camera poses their labels were made with, and ``apply`` refuses the report once that file changes.
     """
+    # the base the check's FR3 centres are in (checks before 11-03 were all fr3_base)
+    target_world = target_world or str(check_report.get("base") or wp.FR3_BASE_WORLD_ID)
     be = (check_report.get("ball_edges") or {}).get(world)
     if not be or "error" in be:
         raise ValueError(f"{check_path} has no ball edge in {world}" + (f": {be['error']}" if be else ""))
@@ -525,7 +592,7 @@ def edge_report(
             "T_to_from": np.linalg.inv(T_world_base).tolist(),
             "covariance_6x6": None,
             "method": (
-                f"{BALL_EDGE_METHOD}: a ball fixed to the table, pivoted about by the FR3 (FK; centre in fr3_base) "
+                f"{BALL_EDGE_METHOD}: a ball fixed to the table, pivoted about by the FR3 (FK; centre in {target_world}) "
                 f"and by the handheld UMI (production labels, cameras at their {world} poses; centre in the world, "
                 f"handheld s {be.get('handheld_s')}) at {len(positions)} positions; rigid Kabsch, no scale"
             ),
@@ -536,6 +603,7 @@ def edge_report(
                     for p in positions
                 ],
                 "world_reference_sha256": sha,
+                "robot_ips": list(check_report.get("robot_ips") or []),
             },
             "quality": {
                 "positions": be["positions"],
@@ -560,7 +628,8 @@ def edge_report(
             "calibration_id": "",
             "parent_world_frame_id": None,
             "reason": "robot_base",
-            "definition": "FR3 base frame (libfranka O frame) of the arm at its current mount",
+            "definition": "FR3 base frame (libfranka O frame) of the arm at its current mount"
+            + (f" ({', '.join(check_report.get('robot_ips') or [])})" if check_report.get("robot_ips") else ""),
         },
         # where the balls were: the workspace this edge was measured in ("how far does it move the live edge")
         "workspace_points_base_m": [np.round(np.asarray(p["fr3"]["centre_mm"]) / 1e3, 5).tolist() for p in positions],
@@ -593,7 +662,7 @@ def _edge_main(argv: list[str]) -> int:
     args.out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     q = report["edge"]["quality"]
     print(
-        f"ball edge {world} -> fr3_base: {q['positions']} positions, residual rms {q['residual_rms_mm']} mm, "
+        f"ball edge {world} -> {report['edge']['to_world_frame_id']}: {q['positions']} positions, residual rms {q['residual_rms_mm']} mm, "
         f"leave-one-out rms {q['leave_one_out_rms_mm']} / max {q['leave_one_out_max_mm']} mm"
     )
     print(f"verdict: {report['verdict']}" + (f" ({'; '.join(report['reasons'])})" if report["reasons"] else ""))
@@ -632,6 +701,12 @@ def main(argv: list[str] | None = None) -> int:
         help="one handheld lever arm for all positions (default; the insert does not change), or one each",
     )
     parser.add_argument("--candidate", action="append", type=Path, default=[], help="register_fr3_base.py report to check too")
+    parser.add_argument(
+        "--base",
+        default=wp.FR3_BASE_WORLD_ID,
+        help="the base the FR3 pivots' centres are in: the arm's root (embodiments/fr3_dual.json), "
+        "fr3_base for the left arm, fr3_base_right for the right",
+    )
     parser.add_argument("--datasets-root", type=Path, default=None)
     parser.add_argument("--world-dir", type=Path, default=None, help="default: tools/thor/gmsl2/world")
     parser.add_argument("--sidecar", default=SIDECAR_NAME)
@@ -646,8 +721,18 @@ def main(argv: list[str] | None = None) -> int:
         fit_path = Path(fit_raw).resolve()
         fr3_fit = json.loads(fit_path.read_text(encoding="utf-8"))
         dataset = _resolve_dataset(dataset_raw, args.datasets_root)
-        rows.append(position_row(fr3_fit, fit_path.name, dataset, int(episode_raw), cube=args.cube, sidecar_name=args.sidecar))
-    report = check(rows, graph, args.candidate, handheld_s=args.handheld_s)
+        rows.append(
+            position_row(
+                fr3_fit,
+                fit_path.name,
+                dataset,
+                int(episode_raw),
+                cube=args.cube,
+                sidecar_name=args.sidecar,
+                robot_ip=fit_robot_ip(fr3_fit, fit_path),
+            )
+        )
+    report = check(rows, graph, args.candidate, handheld_s=args.handheld_s, base=args.base)
     reference_path = world_dir / wp.WORLD_REFERENCE_FILE
     if reference_path.is_file():
         report["reference_world"] = str(json.loads(reference_path.read_text(encoding="utf-8")).get("world_frame_id") or "")
@@ -662,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         fr3, hh = row["fr3"], row["handheld"]
         print(
-            f"{head}: ball in fr3_base {fr3['centre_mm']} mm, in {row['world']} {hh['centre_mm']} mm; "
+            f"{head}: ball in {args.base} {fr3['centre_mm']} mm, in {row['world']} {hh['centre_mm']} mm; "
             f"handheld s {hh['s_mm']} mm (residual p95 {hh['residual_p95_mm']} mm, span {hh['span_deg']} deg)"
         )
         if "handheld_shared" in row:

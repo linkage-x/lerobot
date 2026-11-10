@@ -6,7 +6,8 @@ The camera EE trajectories put their TCP at the socket of insert v2 (bundle 0929
 definition) and label it with corenetic_gripper_ee's axes. That socket sits at (1.45, -0.78, -5.06) mm
 in corenetic_gripper_ee: the FR3 pivot about a fixed ball on 10-14, confirmed by a caliper (flange face
 -> socket 166.9 mm). Driving corenetic_gripper_ee onto the trajectory therefore placed every replayed
-pose 5 mm too far along the tool. The real replay, its MuJoCo preview and the IK QC must all drive
+pose 5 mm too far along the tool. 11-09 the 44 mm fingertips hold insert nov4, whose ball the FR3
+pivot puts at (-0.96, 2.06, 33.50) mm in corenetic_gripper_ee (205.5 mm from the flange face). The real replay, its MuJoCo preview and the IK QC must all drive
 the same socket frame, and must keep the EE axes so that no replayed orientation changes.
 """
 
@@ -28,7 +29,7 @@ THOR_CONFIGS = (
     REPLAY / "replay_cube_pose_in_robot_base.thor.yaml",
     REPO / "third_party/opencv_kalibr/verification/verify_fr3_cube_pose_ik.thor.yaml",
 )
-SOCKET_IN_EE_M = np.array([0.00145, -0.00078, -0.00506])
+SOCKET_IN_EE_M = np.array([-0.00096, 0.00206, 0.0335])
 PROBE_Q = (0.31, -0.52, 0.18, -2.05, 0.12, 1.83, 0.71)
 
 
@@ -91,8 +92,8 @@ def test_replay_contract_accepts_the_socket_frame_only_as_a_pure_translation(tmp
     turned = tmp_path / "turned.urdf"
     turned.write_text(
         URDF.read_text().replace(
-            '<origin rpy="0 0 0" xyz="0.00145 -0.00078 -0.00506" />',
-            '<origin rpy="0 0 0.1" xyz="0.00145 -0.00078 -0.00506" />',
+            '<origin rpy="0 0 0" xyz="-0.00096 0.00206 0.03350" />',
+            '<origin rpy="0 0 0.1" xyz="-0.00096 0.00206 0.03350" />',
         )
     )
     with pytest.raises(ValueError, match="pure translation"):

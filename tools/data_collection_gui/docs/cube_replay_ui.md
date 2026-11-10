@@ -54,12 +54,23 @@ passed `right` run, which left Move to trajectory start greyed out.
 A stored validation is only restored for the robot model it ran on: it records a
 digest of `fr3_corenetic_gripper.urdf` and `.xml`. MuJoCo plans the start joints
 for the model's TCP, so after any model change (2026-10-12: the TCP moved from
-191 to 172 mm below the flange; 2026-10-13: `corenetic_socket_ee` added) run MuJoCo again.
+191 to 172 mm below the flange; 2026-10-13: `corenetic_socket_ee` added; 2026-11-09: it moved
+38.6 mm out to the nov4 ball) run MuJoCo again.
 
 The trajectory is driven by the frame named in `robot.target_frame_name` of
 `replay_cube_pose_in_robot_base.thor.yaml`. The gateway passes the same frame to
-MuJoCo (`--target-frame-name`), and the IK QC config uses it too. Since 2026-10-13 it is
-`corenetic_socket_ee`: the pivot insert's socket centre, (1.45, −0.78, −5.06) mm
+MuJoCo (`--target-frame-name`), and the IK QC config uses it too. It is `corenetic_socket_ee`.
+
+Since 2026-11-09 that frame is the ball centre of pivot insert nov4 held by the 44 mm fingertips
+(fingers on the stop faces): (−0.96, 2.06, 33.50) mm in `corenetic_gripper_ee`, same axes, 205.5 mm
+from the flange face. The right FR3 pivoted about a fixed ball (`fr3_pivot_auto.py`: a probe, then
+14 dwells anchored on it, 57°), σ ≤ 0.41 mm, rms 0.94 mm. The handheld rig v9b's TCP is the same
+physical point, measured by its own pivot, so rig labels replay onto it directly. Labels made on
+insert v2 (the cube, bundle 0929) mark a different point: replayed on this model they are about
+38 mm off along the tool. The model is shared by both arms, so an arm whose gripper does not hold
+nov4 on the 44 mm fingertips needs its own frame.
+
+From 2026-10-13 to 2026-11-08 it was the insert-v2 socket centre on the old fingertips, (1.45, −0.78, −5.06) mm
 in `corenetic_gripper_ee` (5 mm up the tool axis), with the same axes. Until 2026-10-14 it was
 z −10.3 mm, fitted end to end with the laser tracker; that fit had absorbed about 5 mm of the
 world → fr3_base edge. The FR3 pivot about a fixed ball and a caliper (flange face → socket

@@ -25,6 +25,10 @@ already understands so the existing GUI plumbing keeps working:
   * ``Episode length <S>s``                        → length this episode runs
   * ``Episode saved. Total saved episodes: N/<budget>``
   * ``Episode discarded`` / ``Recording stopped``
+  * ``BOX_BUTTON <json>``                          → a gesture on a BOX button; the
+                                                     gateway decides what it does
+  * ``SIX_D_CALI_WARN <json>``                     → what this episode misses of the 6D
+                                                     calibration procedure, by device id
 
 stdin commands accepted (the gateway writes lines to our stdin):
 
@@ -89,6 +93,8 @@ from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.gmsl2 import laser_tracker_session as lts  # noqa: E402
 from tools.thor.gmsl2 import camera_eeprom as ce  # noqa: E402
 from tools.thor.gmsl2 import tracker_live_geometry as tlg  # noqa: E402
+from tools.thor.gmsl2 import box_button as bb  # noqa: E402
+from tools.thor.gmsl2 import box_six_d  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -114,9 +120,50 @@ class StdinCommand:
     raw: str
 
 
+_EMIT_LOCK = threading.Lock()
+
+
 def _emit(text: str) -> None:
-    """Single point for protocol lines so flushing is consistent."""
-    print(text, flush=True)
+    """Single point for protocol lines so flushing is consistent.
+
+    One write under a lock: this is called from the stdin, calibration and SDK threads as well as
+    the main loop, and ``print`` writes the text and the newline separately, which glued two lines
+    into one the gateway could parse as neither (``Episode 0 readyTOUCHCALI_LOG ...``, 11-06).
+    """
+    with _EMIT_LOCK:
+        sys.stdout.write(f"{text}\n")
+        sys.stdout.flush()
+
+
+def _watch_box_button(box: Any) -> list[dict[str, Any]]:
+    """Report each BOX button gesture to the gateway; returns the list double clicks collect in.
+
+    The recorder only says what was pressed. What a gesture does depends on what the session is
+    doing, which is the gateway's to know (``gateway._apply_box_button``). A double click needs
+    nothing from it but the moment, so that is kept here for the episode's meta.json.
+    """
+    decoders: dict[int, bb.ButtonGestures] = {}
+    marks: list[dict[str, Any]] = []
+
+    def on_event(event: dict[str, Any]) -> None:
+        device_id = int(event["device_id"])
+        gesture = decoders.setdefault(device_id, bb.ButtonGestures()).feed(
+            int(event["event"]), int(event["timestamp"])
+        )
+        if gesture is None:
+            return
+        report = {
+            "device_id": device_id,
+            "gesture": gesture,
+            "mcu_us": int(event["timestamp"]),
+            "wall_s": float(event["received_wall_time_s"]),
+        }
+        if gesture == bb.DOUBLE:
+            marks.append(report)
+        _emit("BOX_BUTTON " + json.dumps(report, separators=(",", ":")))
+
+    box.set_button_callback(on_event)
+    return marks
 
 
 # BOX 采集板 v3.1 firmware + v3.4 SDK nominal stream rates. A box that answers
@@ -126,6 +173,8 @@ def _emit(text: str) -> None:
 BOX_SENSOR_NOMINAL_HZ = {
     "box_touch_left": 60.0,
     "box_touch_right": 60.0,
+    "box_touch_left_1": 60.0,  # the second pad on a finger (SDK v4.1), when fitted
+    "box_touch_right_1": 60.0,
     "box_gripper": 120.0,
     "box_trigger": 120.0,
     "box_imu": 240.0,
@@ -248,6 +297,28 @@ def _streaming_sensor_ids(observed_rates: dict[str, float]) -> list[str]:
     return sorted(sid for sid, hz in observed_rates.items() if hz > 0)
 
 
+def _add_streaming_sensors_to_roster(roster: list[dict[str, Any]], live_sids: list[str]) -> bool:
+    """Append to each roster entry's ``expected_devices`` the known sensors it streams but did
+    not announce; True when anything was added (so the GUI gets a row for it).
+
+    Discovery maps the vendor's single CAP_TOUCH bit to one pad per finger; a second pad
+    (BOX SDK v4.1, ``box_touch_*_1``) only shows up in the observed rates. ``live_sids`` are
+    bare for a single unnamespaced BOX and ``<box_id>/<sid>`` otherwise.
+    """
+    changed = False
+    for entry in roster:
+        if not isinstance(entry, dict):
+            continue
+        box_id = str(entry.get("box_id") or "")
+        expected = entry.setdefault("expected_devices", [])
+        for live in live_sids:
+            owner, _, bare = live.rpartition("/")
+            if owner == box_id and bare in bc.KNOWN_SENSOR_IDS and bare not in expected:
+                expected.append(bare)
+                changed = True
+    return changed
+
+
 def _box_stream_health(
     observed_rates: dict[str, float],
     *,
@@ -351,6 +422,104 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
 # up threads on a blocked SDK.
 _CALI_LOCK = threading.Lock()
 
+# The last 6D zero of each BOX in this recorder process, keyed by device id. A software zero leaves
+# a bias in fxyz_mxyz that depends on the attitude it ran at (box_six_d.zero_bias); the zero usually
+# happens before the episode, so every episode's meta.json carries the record it was recorded under.
+# An origin calibration is recorded too, as kind "origin": the readings after it are unusable for
+# compensation until the next software zero replaces it.
+_SIX_D_ZEROS: dict[str, dict[str, Any]] = {}
+_SIX_D_ZEROS_LOCK = threading.Lock()
+_BOX_LABEL_ID_RE = re.compile(r"^box(\d+)$")
+# The last origin of each BOX, on disk: it is done once a day and lives in the MCU, so unlike the
+# software zero (held by the SDK in this process) it outlasts a re-Connect.
+_SIX_D_ORIGIN_PATH = _REPO_ROOT / "outputs" / "box_six_d_origin.json"
+# What the current episode misses of the calibration procedure, by device id; lands in its meta.json.
+_SIX_D_CALI_WARNINGS: dict[str, list[str]] = {}
+
+
+def _read_six_d_origins() -> dict[str, dict[str, Any]]:
+    try:
+        return json.loads(_SIX_D_ORIGIN_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("6D origin record %s unreadable: %s", _SIX_D_ORIGIN_PATH, exc)
+        return {}
+
+
+def _write_six_d_origin(key: str, record: dict[str, Any]) -> None:
+    try:
+        origins = {**_read_six_d_origins(), key: record}
+        _SIX_D_ORIGIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SIX_D_ORIGIN_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(origins, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(_SIX_D_ORIGIN_PATH)
+    except OSError as exc:
+        logger.warning("6D origin record %s not written: %s", _SIX_D_ORIGIN_PATH, exc)
+
+
+def _note_six_d_zero(res: dict[str, Any], *, origin: bool) -> None:
+    if not res.get("ok"):
+        return
+    ctx = dict(res.get("zero_context") or {})
+    did = ctx.get("device_id")
+    if did is None:
+        m = _BOX_LABEL_ID_RE.match(str(res.get("box_id") or ""))
+        did = int(m.group(1)) if m else None
+    key = str(int(did)) if did is not None else (res.get("box_id") or "box")
+    record = {"kind": "origin" if origin else "software", "method": res.get("method"), **ctx}
+    record.setdefault("wall_s", time.time())
+    with _SIX_D_ZEROS_LOCK:
+        _SIX_D_ZEROS[key] = record
+        last_origin = _read_six_d_origins().get(key)
+        updated = record if origin else last_origin and box_six_d.with_recheck(last_origin, record)
+        if updated:
+            _write_six_d_origin(key, updated)
+
+
+def _warn_six_d_calibration(box: bc.BoxPool, capture_intent: Any) -> None:
+    """Say what the starting episode misses of the 6D calibration procedure; it records regardless.
+
+    Handheld BOXes only: the fixture and the procedure are theirs, an arm's BOX never leaves the arm.
+    A calibration capture (``capture_intent``) does not use the 6D channel, so it is not told.
+    """
+    warnings: dict[str, list[str]] = {}
+    if capture_intent is None:
+        try:
+            registry = box_six_d.load_registry()
+            origins = _read_six_d_origins()
+            zeros = _six_d_zeros_snapshot()
+            for device_id, uptime_s in box.six_d_uptimes().items():
+                key = str(device_id)
+                if (box_six_d.device_entry(registry, device_id) or {}).get("role") != "handheld":
+                    continue
+                found = box_six_d.calibration_warnings(
+                    origins.get(key), zeros.get(key), now_s=time.time(), uptime_s=uptime_s
+                )
+                if found:
+                    warnings[key] = found
+        except Exception as exc:  # noqa: BLE001 - a warning must never stop the episode
+            logger.warning("6D calibration check failed: %s", exc)
+    _SIX_D_CALI_WARNINGS.clear()
+    _SIX_D_CALI_WARNINGS.update(warnings)
+    _emit("SIX_D_CALI_WARN " + json.dumps(warnings, separators=(",", ":")))
+
+
+def _six_d_zeros_snapshot() -> dict[str, dict[str, Any]]:
+    with _SIX_D_ZEROS_LOCK:
+        return json.loads(json.dumps(_SIX_D_ZEROS))
+
+
+def _box_device_ids(box_snapshots: list[dict[str, Any]], zeros: dict[str, Any]) -> list[int]:
+    """BOX ids an episode saw: ``box<id>/`` sensor prefixes (several BOXes) plus the zeroed ones."""
+    ids = {int(k) for k in zeros if k.isdigit()}
+    for snap in box_snapshots:
+        for sid in (snap.get("sensors") or {}) if isinstance(snap, dict) else ():
+            m = _BOX_LABEL_ID_RE.match(str(sid).split("/", 1)[0])
+            if m and "/" in str(sid):
+                ids.add(int(m.group(1)))
+    return sorted(ids)
+
 
 def _run_six_d_force_cali(
     box: bc.BoxPool, *, origin: bool = False, box_id: str = ""
@@ -382,6 +551,7 @@ def _run_six_d_force_cali(
         ok_all = bool(results)
         for res in results:
             label = res.get("box_id") or "box"
+            _note_six_d_zero(res, origin=origin)
             if res.get("ok"):
                 _emit(
                     f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
@@ -401,6 +571,33 @@ def _run_six_d_force_cali(
         _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
     finally:
         _CALI_LOCK.release()
+
+
+_FR3_ARMS_REGISTRY = _REPO_ROOT / "tools" / "fr3" / "fr3_arms.json"
+
+
+def _keep_fr3_gripper_box_modes(box_cfg: bc.BoxFleetConfig, registry: Path = _FR3_ARMS_REGISTRY) -> list[int]:
+    """Add every FR3 gripper BOX named in fr3_arms.json to ``keep_mode_device_ids``; return what was added.
+
+    Connect set_mode(startup_mode)s every BOX it finds, and on an arm's BOX that opens the jaw
+    (mode 0 hands it to that BOX's own trigger). The YAML list went stale once already: the v4.1
+    firmware renumbered every BOX (10-31), so 596523097 stopped matching the arm's gripper and
+    every Connect dropped its mode. The registry is what real replay and teleop drive, so it is
+    kept current; reading it here keeps the two from drifting apart. Best effort: an unreadable
+    registry leaves the YAML list as it is.
+    """
+    try:
+        arms = (json.loads(registry.read_text(encoding="utf-8")).get("arms") or {}).values()
+        ids = {int(arm["corenetic_device_id"]) for arm in arms if arm.get("corenetic_device_id") is not None}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        logger.warning("FR3 arm registry %s unreadable (%s); keep_mode_device_ids stays %s",
+                       registry, exc, box_cfg.keep_mode_device_ids)
+        return []
+    added = sorted(ids - {int(i) for i in box_cfg.keep_mode_device_ids})
+    if added:
+        box_cfg.keep_mode_device_ids = [*box_cfg.keep_mode_device_ids, *added]
+        logger.info("BOX: FR3 gripper BOX(es) %s from %s are never set_mode()d", added, registry.name)
+    return added
 
 
 def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
@@ -854,6 +1051,7 @@ def _write_episode_meta(
     world_frame: dict[str, Any],
     capture_intent: dict[str, Any] | None = None,
     camera_identity: dict[str, Any] | None = None,
+    production_calibration: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -899,6 +1097,10 @@ def _write_episode_meta(
         # frozen reference on disk at record time (see world_provenance.py); it
         # is the one field here that cannot be reconstructed afterwards.
         "world_frame": world_frame,
+        # The calibration production loaded when the session connected (world_provenance.
+        # read_production_calibration) -- not world_frame.last_registration, which only says what the
+        # last continuity check ran on.  Tracking may later use another run; its summary says which.
+        "production_calibration": production_calibration or {},
         "video": {
             "recorder_backend": cfg.cameras.recorder_backend,
             "fps": cfg.cameras.fps,
@@ -994,6 +1196,21 @@ def _write_episode_meta(
             "config": asdict(box_cfg),
             "snapshots": box_snapshots,
         }
+        # The 6D zero each BOX was recorded under (attitude + reading), so the external wrench can be
+        # recomputed offline with a per-BOX payload model (box_six_d.compensate_episode). Absent =
+        # no 6D zero in this recorder process since Connect.
+        zeros = _six_d_zeros_snapshot()
+        if zeros:
+            meta["box_six_d_zero"] = zeros
+        if _SIX_D_CALI_WARNINGS:
+            meta["box_six_d_calibration_warnings"] = dict(_SIX_D_CALI_WARNINGS)
+        try:
+            roles = box_six_d.box_roles(box_six_d.load_registry(), _box_device_ids(box_snapshots, zeros))
+        except (OSError, ValueError) as exc:
+            logger.warning("BOX registry unreadable (%s); meta has no box_devices", exc)
+            roles = {}
+        if roles:
+            meta["box_devices"] = roles
     if capture_intent:
         # Why this episode was recorded, as declared by whoever asked for it
         # (the calibration wizard names the camera whose sweep this is). Like
@@ -1495,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    _keep_fr3_gripper_box_modes(box_cfg)
     # Tri-state on purpose: the yaml declares the hardware and defaults to off,
     # --laser-tracker / --no-laser-tracker is the GUI toggle for this session,
     # and "neither flag" means "whatever the file says".
@@ -1515,6 +1733,14 @@ def main(argv: list[str] | None = None) -> int:
     # dataset across two worlds without the dataset saying so.
     world_frame = wp.read_world_provenance(repo_root)
     _emit(wp.describe(world_frame))
+    production_calibration = wp.read_production_calibration(repo_root)
+    _emit(
+        f"Production calibration: {production_calibration.get('extrinsics_run')} / "
+        f"{production_calibration.get('intrinsics_run')}"
+        if production_calibration["status"] == wp.STATUS_OK
+        else f"WARNING: Production calibration {production_calibration['status']} "
+        f"({production_calibration['config_path']})"
+    )
 
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
@@ -1570,6 +1796,7 @@ def main(argv: list[str] | None = None) -> int:
     # incoming UDP packet (see tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
+    button_marks = _watch_box_button(box) if box_started else []
     # The tracker lives on another machine and is booked by other people, so it
     # must never stop nine cameras from recording: start() returns False instead
     # of raising, and every use below is guarded by the flag.
@@ -1612,6 +1839,9 @@ def main(argv: list[str] | None = None) -> int:
         # emit "Box devices: (none)" -> gateway flips all box rows to red.
         rates = box.observed_rates()
         live_sids = _streaming_sensor_ids(rates)
+        if roster and _add_streaming_sensors_to_roster(roster, live_sids):
+            # A finger's second touch pad: discovery's one CAP_TOUCH bit could not announce it.
+            _emit("BOX_DEVICES_JSON " + json.dumps(roster, separators=(",", ":")))
         _emit(f"Box devices: {', '.join(live_sids) if live_sids else '(none)'}")
         if live_sids:
             parts = [f"{sid}={rates[sid]:.0f}" for sid in live_sids]
@@ -2158,6 +2388,7 @@ def main(argv: list[str] | None = None) -> int:
                         "power-cycle the box, and reconnect."
                     )
                 box.start_recording(t_start)
+                _warn_six_d_calibration(box, capture_intent)
             # Anchored to the same t_start the cameras use, so the tracker's
             # episode and the video share one wall-clock origin even though the
             # samples themselves are stamped by the controller and married to
@@ -2330,6 +2561,7 @@ def main(argv: list[str] | None = None) -> int:
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
                     world_frame, capture_intent, camera_identity,
+                    production_calibration=production_calibration,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for
@@ -2365,6 +2597,9 @@ def main(argv: list[str] | None = None) -> int:
                         box_ids=episode_boxes,
                     ),
                 }
+                marks = bb.episode_marks(button_marks, t_start, capture_end_wall_s)
+                if marks:
+                    annotations["button_marks"] = marks
                 if frame_sync_payload is not None:
                     annotations["argus_frame_sync"] = frame_sync_payload
                 if online_sync_payload is not None:

@@ -281,6 +281,24 @@ export function DatasetProcessingPage({
             <strong>0907 Hybrid Carrier V1</strong>
             <span>ArUco 30/31/32 anchors plus red/green/blue CAD-facet refinement.</span>
           </button>
+          <button
+            className={trackingTarget === "gripper_rig_v9b" ? "tracking-target-card active" : "tracking-target-card"}
+            aria-pressed={trackingTarget === "gripper_rig_v9b"}
+            disabled={busy}
+            onClick={() => setTrackingTarget("gripper_rig_v9b")}
+          >
+            <strong>Gripper Rig v9b · 左手</strong>
+            <span>4 pads, ArUco DICT_6X6_250 ids 106–109; CAD corner table + measured socket TCP.</span>
+          </button>
+          <button
+            className={trackingTarget === "gripper_rig_v9b_right" ? "tracking-target-card active" : "tracking-target-card"}
+            aria-pressed={trackingTarget === "gripper_rig_v9b_right"}
+            disabled={busy}
+            onClick={() => setTrackingTarget("gripper_rig_v9b_right")}
+          >
+            <strong>Gripper Rig v9b · 右手</strong>
+            <span>Same holder, ArUco ids 100/101/110/111 (BOX 3906437858); TCP borrowed from the left rig until its own pivot.</span>
+          </button>
         </div>
         <p className="panel-note">
           目标必须显式选择：错误的字典和几何模型可能得到“无检测”，不能靠文件名猜测物理夹具。
@@ -394,7 +412,9 @@ export function DatasetProcessingPage({
                 value={
                   (selected.trackingTarget ?? "april_cube") === "hybrid_carrier_v1"
                     ? "CAD socket origin"
-                    : selected.markerTcpCalibrationPath || "default"
+                    : selected.trackingTarget === "gripper_rig_v9b" || selected.trackingTarget === "gripper_rig_v9b_right"
+                      ? "rig bundle"
+                      : selected.markerTcpCalibrationPath || "default"
                 }
               />
             </div>

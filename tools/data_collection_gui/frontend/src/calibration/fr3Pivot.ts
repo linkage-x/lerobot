@@ -23,6 +23,7 @@ import type {
 import { fmtNum } from "./fr3BaseEdge";
 
 type Run = Fr3PivotResponse["runs"][number];
+type JointFit = NonNullable<Fr3PivotResponse["joints"]>[number];
 type Episode = Fr3PivotResponse["episodes"][number];
 
 /** Below these the centre and the lever arm trade off (same gates as the tool's warning). */
@@ -257,6 +258,54 @@ export function positionDraftWarnings(drafts: PositionDraft[], runs: Run[], epis
   return out;
 }
 
+// --- which base: the arm that turned about the ball --------------------------------------------
+
+/** The base a check's FR3 centres are in; checks before 11-03 carry none and were the left arm's fr3_base. */
+export function checkBaseLabel(report: BallCheckReport): string {
+  const base = report.base || "fr3_base";
+  const ips = report.robot_ips?.length ? `（${report.robot_ips.join(", ")}）` : "";
+  return `FR3 一侧的球心在 ${base}${ips}，存成候选边是 world → ${base}`;
+}
+
+/** A ball check's positions must all be one arm's pivots (their centres are in that arm's base). */
+export function mixedArmWarning(drafts: PositionDraft[], runs: Run[], joints: JointFit[]): string {
+  const ips = new Set(
+    drafts
+      .filter((d) => d.pivot)
+      .map((d) => runs.find((r) => r.name === d.pivot)?.robotIp ?? joints.find((j) => j.name === d.pivot)?.robotIp ?? "")
+      .filter(Boolean)
+  );
+  return ips.size > 1 ? `选了两台臂的 pivot（${[...ips].join(", ")}）：一次同球检验只能是一台臂的，检验会拒绝` : "";
+}
+
+// --- arm-arm ball edge (fr3_arm_arm_ball.py, roadmap B3) ----------------------------------------
+
+export type ArmArmDraft = { left: string; right: string };
+export const ARM_ARM_MIN_POSITIONS = 4;
+
+/** The fitted pivots of one arm (by the IP each fit records): single runs and shared-centre joint fits. */
+export function pivotsOfArm(runs: Run[], joints: JointFit[], ip: string): { runs: Run[]; joints: JointFit[] } {
+  if (!ip) return { runs: [], joints: [] };
+  return {
+    runs: runs.filter((r) => r.fk && r.robotIp === ip),
+    joints: joints.filter((j) => j.sharedCentre && j.robotIp === ip),
+  };
+}
+
+export function armArmDraftWarnings(drafts: ArmArmDraft[], leftIp: string, rightIp: string): string[] {
+  const out: string[] = [];
+  if (!leftIp || !rightIp) out.push("fr3_arms.json 里要有在役的左臂和右臂");
+  const complete = drafts.filter((d) => d.left && d.right);
+  if (complete.length < ARM_ARM_MIN_POSITIONS) {
+    out.push(`要 ≥ ${ARM_ARM_MIN_POSITIONS} 个球位（每个由其余的预测，留一检验）；现在 ${complete.length} 个`);
+  }
+  for (const side of ["left", "right"] as const) {
+    const names = complete.map((d) => d[side]);
+    if (new Set(names).size < names.length) out.push(`${side === "left" ? "左" : "右"}臂同一次 pivot 用在了两个位置`);
+  }
+  return out;
+}
+
 // --- planned pivot (fr3_pivot_auto.py) ---------------------------------------------------------
 
 /** The +-3 mm pair is the proof the ball, not the command, decided the fit. */
@@ -292,7 +341,10 @@ export function planSummaryText(plan: Fr3PivotPlan): string {
 
 // "14 个驻点，每个驻点误差 0.5 mm 时球窝 σ ≤ 0.27 mm，"
 function dwellText(plan: Fr3PivotPlan): string {
-  if (plan.kind === "probe") return `试探：${plan.dwells ?? 0} 个驻点、离起点不远，跑完的拟合给完整规划当球心，`;
+  if (plan.kind === "probe") {
+    const prior = plan.anchorFrom && isAnchored(plan.anchorMm) ? `，绕先验球心 ${fmtVec(plan.anchorMm)} mm（${priorLabel(plan.anchorFrom)}）` : "";
+    return `试探：${plan.dwells ?? 0} 个驻点、离起点不远${prior}，跑完的拟合给完整规划当球心，`;
+  }
   if (plan.kind !== "dwells" || !plan.dwells) return "";
   const s = plan.sigmaPerUnit?.s;
   const sigma = s && s.length ? `，每个驻点误差 0.5 mm 时球窝 σ ≤ ${(0.5 * maxOf(s)).toFixed(2)} mm` : "";
@@ -368,4 +420,28 @@ export function biasConsistency(runs: Run[]): BiasPairVerdict[] {
     out.push({ centre, runs: [a.name, b.name], dBiasMm: dBias, dCentreMm: dCentre, dSocketMm: dSocket, seated, text });
   }
   return out;
+}
+
+// The probe's prior: where it guesses the ball (corenetic_socket_ee, mm) before any fit. 11-09 the new
+// fingertips put it 38.6 mm out along the tool axis; 11-10 that measured point is the model's socket, so the page
+// leaves the prior empty (about the origin) and shows Desk's EE (15 mm short of the ball) only for reference.
+export const PROBE_PRIOR_MAX_MM = 45;
+
+export function priorLabel(anchorFrom: string | undefined): string {
+  if (anchorFrom === "prior: Desk EE") return "取自 Desk EE";
+  if (anchorFrom === "prior: entered") return "手填";
+  return anchorFrom || "";
+}
+
+/** The prior to send from the three fields, or why not; "desk_ee" while they still read Desk's EE. */
+export function probePrior(
+  fields: string[],
+  deskEeMm: number[] | null | undefined
+): { mm: number[]; from: "desk_ee" | "manual" } | string {
+  const mm = fields.map((f) => (f.trim() === "" ? NaN : Number(f)));
+  if (mm.length !== 3 || mm.some((x) => !Number.isFinite(x))) return "先验球心要填 3 个数（mm）";
+  const n = Math.hypot(...mm);
+  if (n > PROBE_PRIOR_MAX_MM) return `先验球心离球窝坐标系 ${n.toFixed(1)} mm，超过 ${PROBE_PRIOR_MAX_MM} mm`;
+  const same = !!deskEeMm && deskEeMm.length === 3 && deskEeMm.every((x, i) => Math.abs(x - mm[i]) < 0.05);
+  return { mm, from: same ? "desk_ee" : "manual" };
 }

@@ -325,3 +325,62 @@ def test_edge_writes_the_ball_edge_as_a_candidate_apply_accepts(tmp_path, capsys
     check.write_text(json.dumps(old))
     assert bc.main(["edge", "--check", str(check), "--world", "world_a", "--out", str(out)]) == 2
     assert "哈希" in json.loads(out.read_text())["reasons"][0]
+
+
+def test_a_right_arm_check_scores_and_writes_the_world_to_fr3_base_right_edge(tmp_path, capsys):
+    # The right FR3's pivots put the balls in its own base: the check runs with --base fr3_base_right, scores
+    # that base's live edge (not fr3_base's), and its ball edge is a candidate for world -> fr3_base_right.
+    world = tmp_path / "world"
+    world.mkdir()
+    (world / "world_reference.json").write_text(json.dumps({"world_frame_id": "world_a"}))
+    graph = {
+        "nodes": [{"world_frame_id": "world_a"}, {"world_frame_id": "fr3_base"}, {"world_frame_id": "fr3_base_right"}],
+        "edges": [
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "method": "fr3_single_tag_hand_eye",
+             "T_to_from": np.eye(4).tolist(), "created_utc": "left"},
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "method": "fr3_single_tag_hand_eye",
+             "T_to_from": np.linalg.inv(LIVE_ERROR @ T_WORLD_BASE).tolist(), "created_utc": "right"},
+        ],
+    }
+    (world / "world_graph.json").write_text(json.dumps(graph))
+    dataset = tmp_path / "ds"
+    args = []
+    for i, ball in enumerate(FOUR_BALLS):
+        _handheld_episode(dataset, i, ball, np.zeros(3))
+        fit = tmp_path / f"p{i}.fit.json"
+        fit.write_text(json.dumps({**_fr3_fit(ball), "robot_ip": "192.168.1.210"}))
+        args += ["--position", str(fit), str(dataset), str(i)]
+    check = tmp_path / "check_r.json"
+    assert bc.main([*args, "--base", "fr3_base_right", "--world-dir", str(world), "--out", str(check)]) == 0
+    report = json.loads(check.read_text())
+    assert report["base"] == "fr3_base_right" and report["robot_ips"] == ["192.168.1.210"]
+    live = report["edges"][0]
+    assert live["created_utc"] == "right" and live["rms_mm"] > 4.0  # the right base's live edge, off by LIVE_ERROR
+
+    out = tmp_path / "ball_check_r.json"
+    assert bc.main(["edge", "--check", str(check), "--out", str(out)]) == 0
+    edge = json.loads(out.read_text())["edge"]
+    assert (edge["from_world_frame_id"], edge["to_world_frame_id"]) == ("world_a", "fr3_base_right")
+    assert "centre in fr3_base_right" in edge["method"]
+    assert "ball edge world_a -> fr3_base_right" in capsys.readouterr().out
+
+
+def test_a_check_mixing_the_two_arms_pivots_is_refused(tmp_path):
+    rows = _rows(tmp_path, FOUR_BALLS)
+    rows[0]["robot_ip"], rows[1]["robot_ip"] = "192.168.11.102", "192.168.1.210"
+    report = bc.check(rows, _graph(np.eye(4)), [])
+    assert not any(r["usable"] for r in report["positions"])
+    assert "混用了两台臂" in report["positions"][2]["reasons"][-1]
+    assert report["ball_edges"] == {}
+
+
+def test_a_joint_fit_takes_its_arm_from_its_runs(tmp_path):
+    (tmp_path / "joint").mkdir()
+    for run, ip in (("a_pivot.json", "192.168.1.210"), ("b_pivot.json", "192.168.1.210"), ("c_pivot.json", "192.168.11.102")):
+        (tmp_path / run.replace(".json", ".fit.json")).write_text(json.dumps({"robot_ip": ip}))
+    joint = {"schema": bc.FR3_JOINT_SCHEMA, "runs": ["a_pivot.json", "b_pivot.json"]}
+    path = tmp_path / "joint" / "j.json"
+    assert bc.fit_robot_ip(joint, path) == "192.168.1.210"
+    assert bc.fit_robot_ip({**joint, "runs": ["a_pivot.json", "c_pivot.json"]}, path) == ""  # mixed: unknown
+    assert bc.fit_robot_ip({**joint, "runs": ["a_pivot.json", "aborted_pivot.json"]}, path) == "192.168.1.210"
+    assert bc.fit_robot_ip({"robot_ip": "192.168.11.102"}) == "192.168.11.102"

@@ -17,13 +17,14 @@ import type { BoxCaliLog, BoxCaliLogLine, DeviceStatus } from "../types";
 import {
   CALIBRATION_TIMEOUT_MS,
   CALI_LOG_POLL_MS,
+  ORIGIN_RECHECK,
   PREVIEW_POLL_MS,
   STABILITY,
   TOUCH_TOLERANCE,
   type CalibrationKind,
   type ForceAxisLimits,
 } from "./config";
-import { evaluateForce, parseCaliLog } from "./parseCaliLog";
+import { evaluateForce, evaluateForceAgainstLoad, parseCaliLog } from "./parseCaliLog";
 import {
   deviceBoxId,
   softwareVersion,
@@ -97,6 +98,8 @@ export type WorkflowApi = {
   begin: () => void;
   confirm: () => void;
   confirmReboot: () => void;
+  /** What the re-check after an origin is waiting for. */
+  recheckDetail: string;
   cancel: () => void;
   reset: () => void;
 };
@@ -175,6 +178,84 @@ export function evaluateStability(
   };
 }
 
+/** One device's re-check after an origin; `baselineUs`/`baselineMs` date the MCU clock at the origin. */
+export type OriginRecheck = {
+  baselineUs: number | null;
+  baselineMs: number;
+  lastUs: number | null;
+  uptimeS: number | null;
+  rebooted: boolean;
+  firstSampleMs: number | null;
+  samples: ForceVec[];
+};
+
+export function newOriginRecheck(sensor: Record<string, unknown> | null | undefined, nowMs: number): OriginRecheck {
+  const us = Number(sensor?.["timestamp"]);
+  return {
+    baselineUs: Number.isFinite(us) && us > 0 ? us : null,
+    baselineMs: nowMs,
+    lastUs: null,
+    uptimeS: null,
+    rebooted: false,
+    firstSampleMs: null,
+    samples: [],
+  };
+}
+
+/**
+ * Take one preview sample into the re-check. Only raw counts, the channel the origin zeroes: the
+ * software zero sits in fxyz_mxyz in the recorder's process, so a BOX power cycle does not clear it.
+ * A sample counts only if the MCU clock moved since the last one, because a BOX that is off leaves
+ * its last sample in the preview, and only once that clock shows the BOX really restarted.
+ */
+export function addRecheckSample(
+  recheck: OriginRecheck,
+  sensor: Record<string, unknown> | null | undefined,
+  nowMs: number,
+): void {
+  const us = Number(sensor?.["timestamp"]);
+  if (!Number.isFinite(us) || us <= 0) return;
+  const advanced = recheck.lastUs != null && us > recheck.lastUs;
+  recheck.lastUs = us;
+  if (!advanced || recheck.baselineUs == null) return;
+  const unbrokenUs = recheck.baselineUs + (nowMs - recheck.baselineMs) * 1000;
+  if (us >= unbrokenUs - ORIGIN_RECHECK.rebootSlackS * 1e6) return;
+  recheck.rebooted = true;
+  recheck.uptimeS = us / 1e6;
+  if (recheck.uptimeS < ORIGIN_RECHECK.minUptimeS) return;
+  const raw = forceVecFromSensor(sensor, "fxyz_mxyz_raw");
+  if (!raw) return;
+  recheck.firstSampleMs ??= nowMs;
+  recheck.samples.push(raw);
+}
+
+export function recheckDone(recheck: OriginRecheck, nowMs: number): boolean {
+  return (
+    recheck.firstSampleMs != null &&
+    recheck.samples.length >= ORIGIN_RECHECK.minSamples &&
+    nowMs - recheck.firstSampleMs >= ORIGIN_RECHECK.windowMs
+  );
+}
+
+export function medianForce(samples: ForceVec[]): ForceVec {
+  const median = (axis: keyof ForceVec) => {
+    const sorted = samples.map((s) => s[axis]).sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  };
+  return { fx: median("fx"), fy: median("fy"), fz: median("fz"), mx: median("mx"), my: median("my"), mz: median("mz") };
+}
+
+export function recheckProgress(rechecks: OriginRecheck[]): string {
+  if (rechecks.some((r) => !r.rebooted)) return "等待 BOX 重新上电…（BOX 留在工装上）";
+  const waiting = rechecks.filter((r) => (r.uptimeS ?? 0) < ORIGIN_RECHECK.minUptimeS);
+  if (waiting.length > 0) {
+    const uptimeS = Math.min(...waiting.map((r) => r.uptimeS ?? 0));
+    return `已重新上电 ${uptimeS.toFixed(0)} s，满 ${ORIGIN_RECHECK.minUptimeS} s 后开始采样`;
+  }
+  return "正在采样 raw…";
+}
+
 export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   const [state, setState] = useState<CaliMachineState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -183,6 +264,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   const [forceResults, setForceResults] = useState<ForceBoxResult[]>([]);
   const [touchResults, setTouchResults] = useState<TouchSideResult[]>([]);
   const [overallPass, setOverallPass] = useState<boolean | null>(null);
+  const [recheckDetail, setRecheckDetail] = useState("");
 
   // Timers / mutable run context held in refs so effects stay stable.
   const stabilityTimer = useRef<number | null>(null);
@@ -190,6 +272,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   const samples = useRef<StabilitySample[]>([]);
   const logTimer = useRef<number | null>(null);
   const logStartIndex = useRef(0);
+  const rechecks = useRef(new Map<string, OriginRecheck>());
   const calibrateDeadline = useRef(0);
   const mounted = useRef(true);
   const cfgRef = useRef(cfg);
@@ -285,20 +368,25 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   logLinesRef.current = logLines;
 
   // --- final validation: parse log + fall back to live for after-values -----
-  const validate = useCallback(async () => {
+  // `rechecked`: the post-re-power raw of each device, which then replaces both the log's "after"
+  // (written before the power cycle) and the live fxyz_mxyz.
+  const validate = useCallback(async (rechecked?: Map<string, ForceVec>) => {
     setState("validating");
     const { api, sampleDevices, sampleKind, limits, kind, operator, onRecord } = cfgRef.current;
 
     // Live snapshot per box for fallback / touch residuals.
-    const liveByBox = new Map<string, { force: ForceVec | null; net: number | null; residual: number | null }>();
-    const liveByDevice = new Map<string, { force: ForceVec | null; net: number | null; residual: number | null; label: string; boxId: string }>();
+    type LiveEntry = { force: ForceVec | null; load: ForceVec | null; net: number | null; residual: number | null };
+    const liveByBox = new Map<string, LiveEntry>();
+    const liveByDevice = new Map<string, LiveEntry & { label: string; boxId: string }>();
     await Promise.all(
       sampleDevices.map(async (dev) => {
         const preview = await api.fetchBoxPreview(dev.id);
         const sensor = preview?.sensor ?? null;
         const fz = numberArray(sensor?.["fz_0p1N"]);
         const entry = {
-          force: forceVecFromSensor(sensor),
+          force: rechecked?.get(dev.id) ?? forceVecFromSensor(sensor),
+          // the SDK's payload-weight model at the live attitude (v4.0+); null on older SDKs
+          load: forceVecFromSensor(sensor, "fxyz_mxyz_gravity"),
           net: touchNetForceN(fz),
           residual: touchMaxResidual0p1N(fz),
         };
@@ -312,10 +400,15 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
     const records: CalibrationRecord[] = [];
 
     if (sampleKind === "force" && limits) {
-      const singleLiveForce = liveByBox.size === 1 ? [...liveByBox.values()][0]?.force ?? null : null;
+      // dynamic: judged against the payload weight at the attitude the BOX rests in (see
+      // evaluateForceAgainstLoad); origin, or an SDK without the model: the fixed spec numbers
+      const judge = (vec: ForceVec, load: ForceVec | null | undefined) =>
+        kind === "force_dynamic" && load ? evaluateForceAgainstLoad(vec, load, limits) : evaluateForce(vec, limits);
+      const singleLive = liveByBox.size === 1 ? [...liveByBox.values()][0] ?? null : null;
       const results: ForceBoxResult[] = parsed.results.map((r) => {
-        const after = r.after ?? liveByBox.get(r.boxId)?.force ?? singleLiveForce;
-        const evaluation = after ? evaluateForce(after, limits) : null;
+        const live = liveByBox.get(r.boxId) ?? singleLive;
+        const after = rechecked ? live?.force ?? null : r.after ?? live?.force ?? null;
+        const evaluation = after ? judge(after, live?.load) : null;
         const pass = (r.ok !== false) && !!evaluation?.pass;
         records.push({
           id: `${Date.now()}-${r.boxId}-${kind}`,
@@ -335,7 +428,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
       // If the log yielded no per-box lines, fall back to live-only evaluation.
       if (results.length === 0) {
         for (const [id, entry] of liveByDevice) {
-          const evaluation = entry.force ? evaluateForce(entry.force, limits) : null;
+          const evaluation = entry.force ? judge(entry.force, entry.load) : null;
           const pass = !!evaluation?.pass;
           results.push({ boxId: entry.boxId, ok: null, error: null, before: null, after: entry.force, evaluation, pass });
           records.push({
@@ -419,6 +512,10 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
         if (logTimer.current != null) window.clearInterval(logTimer.current);
         logTimer.current = null;
         if (requiresReboot) {
+          const { api, sampleDevices } = cfgRef.current;
+          const now = Date.now();
+          const previews = await Promise.all(sampleDevices.map((d) => api.fetchBoxPreview(d.id)));
+          rechecks.current = new Map(sampleDevices.map((d, i) => [d.id, newOriginRecheck(previews[i]?.sensor, now)]));
           setState("waiting_for_reboot");
         } else {
           validate();
@@ -447,22 +544,31 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
 
   const confirmReboot = useCallback(() => {
     if (stateRef.current !== "waiting_for_reboot") return;
-    // reconnecting: wait for a device to report a fresh live sample again.
+    // reconnecting: wait for every device to come back from the power cycle and give its raw.
     setState("reconnecting");
     const started = Date.now();
+    let finished = false;
     const poll = async () => {
       const { api, sampleDevices } = cfgRef.current;
       const previews = await Promise.all(sampleDevices.map((d) => api.fetchBoxPreview(d.id)));
-      const anyActive = previews.some((p) => p?.active);
-      if (!mounted.current) return;
-      if (anyActive) {
+      if (!mounted.current || finished || stateRef.current !== "reconnecting") return;
+      const now = Date.now();
+      sampleDevices.forEach((d, i) => {
+        const recheck = rechecks.current.get(d.id);
+        if (recheck) addRecheckSample(recheck, previews[i]?.sensor, now);
+      });
+      const all = [...rechecks.current.values()];
+      setRecheckDetail(recheckProgress(all));
+      if (all.length > 0 && all.every((r) => recheckDone(r, now))) {
+        finished = true;
         if (logTimer.current != null) window.clearInterval(logTimer.current);
         logTimer.current = null;
-        validate();
-      } else if (Date.now() - started > CALIBRATION_TIMEOUT_MS) {
+        validate(new Map([...rechecks.current].map(([id, r]) => [id, medianForce(r.samples)])));
+      } else if (now - started > ORIGIN_RECHECK.timeoutMs) {
+        finished = true;
         if (logTimer.current != null) window.clearInterval(logTimer.current);
         logTimer.current = null;
-        setError("重新连接超时，请检查 BOX 是否已重新上电");
+        setError("没有读到重新上电后的 raw，请确认 BOX 确实断电重启过、录制器仍在连接");
         setState("failed");
       }
     };
@@ -496,6 +602,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
     begin,
     confirm,
     confirmReboot,
+    recheckDetail,
     cancel,
     reset,
   };

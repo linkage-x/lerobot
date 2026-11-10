@@ -11,6 +11,7 @@ import {
   CALIBRATION_KIND_LABELS,
   DYNAMIC_FORCE_LIMITS,
   ORIGIN_FORCE_LIMITS,
+  ORIGIN_RECHECK,
   TOUCH_TOLERANCE,
   fmtDuration,
   fmtN,
@@ -170,11 +171,12 @@ export function CalibrationResultPanel({
 
 // --- reboot step (origin only) -----------------------------------------------
 function RebootStep({ wf }: { wf: WorkflowApi }) {
+  if (wf.state === "reconnecting") return <p className="cali-reboot">{wf.recheckDetail}</p>;
   if (wf.state !== "waiting_for_reboot") return null;
   return (
     <div className="cali-reboot">
       <p>
-        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。重启并等待重新连接后将自动复核原始数据。
+        <b>请给 BOX 重新上电</b>，原始零点写入 MCU 后需断电重启才能生效。BOX 留在工装上，上电满 {ORIGIN_RECHECK.minUptimeS} 秒后自动采样复核 raw。
       </p>
       <button className="cali-btn-primary" onClick={() => wf.confirmReboot()}>
         我已重新上电，开始复核
@@ -280,7 +282,8 @@ export function ForceCalibrationCard({
         </div>
       ) : (
         <div className="cali-info">
-          动态校准后 Fz 应落在 <b>-7.784 ± 0.5 N</b>、Mx 应落在 <b>-0.168 ± 0.01 N·m</b>（保留负载，不应接近 0）；|Fx|,|Fy| ≤ 0.5 N，|My|,|Mz| ≤ 0.01 N·m。
+          动态校准后读数应等于负载（夹爪）在当前姿态下的重力（保留负载，不应接近 0），力 ± 0.5 N、力矩 ± 0.01 N·m。
+          夹爪朝下时就是 Fz <b>-7.784</b>、Mx <b>-0.168</b>、其余 ≈ 0；放歪了负载会分到 Fx/Fy/My/Mz 上，按 SDK 给出的当前姿态重力比，不算失败。
         </div>
       )}
 

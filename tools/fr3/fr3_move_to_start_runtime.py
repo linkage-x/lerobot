@@ -25,12 +25,17 @@ import subprocess
 import sys
 
 
-DEFAULT_ROBOT_IP = "192.168.1.206"
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Move the FR3 arm to the SDK start pose.")
-    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="FR3 controller IP address.")
+    parser = argparse.ArgumentParser(description="Move the FR3 arm to its start pose.")
+    # No default IP: with two arms the wrong one is the one that moves (roadmap B2). Callers resolve it
+    # from tools/fr3/fr3_arms.json (fr3_move_to_start.py --arm, the gateway).
+    parser.add_argument("--robot-ip", required=True, help="FR3 controller IP address.")
+    parser.add_argument(
+        "--start-joints",
+        default=None,
+        help="7 comma-separated joint angles (rad), the arm's start in fr3_arms.json; default panda_py's start",
+    )
     return parser.parse_args(argv)
 
 
@@ -75,7 +80,14 @@ def main(argv: list[str] | None = None) -> int:
                 "or retry with "
                 f"`python tools/fr3/fr3_move_to_start.py --runtime host --robot-ip={args.robot_ip}`."
             ) from exc
-        robot.move_to_start()
+        if args.start_joints:
+            start = [float(v) for v in args.start_joints.split(",")]
+            if len(start) != 7:
+                raise ValueError(f"--start-joints needs 7 angles, got {len(start)}")
+            print(f"fr3_move_to_start=TARGET q={start}")
+            robot.move_to_joint_position(start)
+        else:
+            robot.move_to_start()
         state = robot.get_state()
         q = getattr(state, "q", None)
         if q is None:
