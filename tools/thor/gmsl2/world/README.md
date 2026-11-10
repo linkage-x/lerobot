@@ -173,6 +173,10 @@ bases and the arm-arm edge exists, a new edge goes in only if every route
 between its ends agrees within the edges' sigmas (`world_closures`), so a
 moved cart or a bad registration is refused instead of picked silently.
 
+As of 2026-11-10 the live edges are **world → fr3_base_right** (four balls,
+see [Right arm, four balls](#result-2026-11-10-right-arm-four-balls)); world →
+fr3_base is still retired and there is no arm-arm edge.
+
 ### The guard against a graph brought back by a deploy (2026-11-03)
 
 A deploy mirrors the deployer's tree, `world_graph.json` included: a tree
@@ -369,6 +373,12 @@ definition. A ball fixed to the table is pivoted about twice:
   socket frame of later fits is ~0. The end-to-end replay error carries that
   5 mm again until the edge is fixed. Output:
   `outputs/fr3_tcp_pivot/joint/*_joint.json`.
+  On 2026-11-09 the right FR3's gripper had the 44 mm fingertips holding insert
+  nov4. The commanded pivot (`tools/fr3/fr3_pivot_auto.py`: a probe, then 14
+  dwells anchored on it, 57°) put the ball at (−0.96, 2.06, 33.50) mm in
+  `corenetic_gripper_ee` (σ ≤ 0.41 mm), 205.5 mm from the flange face, and
+  `corenetic_socket_ee` is now that point. Its fits (`*_pivot.fit.json`) carry
+  `c_base_mm` like a `fit` report.
 - **The handheld UMI**, about the same ball, recorded as an ordinary episode.
   Production's labels, fitted as a pivot, give the ball `b` in the camera world.
 
@@ -663,3 +673,97 @@ difference. Consequences:
 - For 3 mm the extrinsics must hold during a capture: check the camera heads
   and brackets, and look at the corner BA RMSE before and after each capture
   that matters (above ~1 px, recalibrate).
+
+### Result, 2026-11-10: right arm, four balls
+
+The first edge into `fr3_base_right` (192.168.1.210), live since 2026-11-10
+02:49 UTC (`world_graph.json`; the guard recorded it). Check
+`outputs/calibration/fr3_base_ball_check/check_20261110T024842Z.json`,
+candidate `outputs/calibration/fr3_base_registration/ball_check_20261110T024842Z.json`
+(both on Thor).
+
+**Data.** Four ball positions, each pivoted about by the right FR3 (commanded
+pivot, `fr3_pivot_auto.py execute`, insert nov4) and by the handheld right
+rig v9b (ArUco 100/101/110/111 only; `gripper_rig_v9b_right`, the sidecar holds
+only `right`). The handheld episodes were paired to the balls by ball-to-ball
+distance, which needs no edge: A–B 509.3 mm handheld vs 509.0 mm FK, C–A 339.2
+vs 339.7, C–B 315.7 vs 314.4.
+
+| Ball | In fr3_base_right (mm) | FR3 side | Handheld side |
+|---|---|---|---|
+| A | (544, 192, 424) | joint fit of `20261110_092258` + `092520` (`joint/20261110_104831_joint.json`) | `thor_gmsl2_11ch_v1_20261110_093613` ep 0 |
+| B | (507, −315, 433) | joint fit of `094223` + `094501` (`joint/20261110_104832_joint.json`) | `…_093613` ep 1 |
+| C | (611, −81, 615) | `095636`, aborted at 190.8 s in `return`, all 13 dwells done; samples up to the stall kept (`20261110_095636_pivot.trim.json` / `.trim.fit.json`) | `…_100154` ep 0 |
+| D | (611, 236, 250) | `102516` | `…_102834` ep 0 |
+
+`095636` stopped on a 7.1 N spike that was not contact: the execute loop
+stalled 0.46 s in a Python full garbage collection (every execute run has one
+~0.4 s stall at ~48.7 s; long runs hit a second), the arm held its last
+command, and the plan index, taken from the wall clock, jumped ahead by up to
+1.7° of joint motion when the loop resumed. Trimming the last 10 samples does
+not change its fit.
+
+**Result.** Rigid Kabsch, handheld `s` shared over the four positions:
+
+- Residual 0.93 / 0.77 / 0.94 / 0.64 mm (rms 0.83). Leave one out 1.69 /
+  4.68 / 2.94 / 2.57 mm (rms 3.16, max 4.68, under the 6 mm gate). Dropping
+  one ball turns the edge by up to 0.70°. Scale +0.09 %, i.e. none.
+- The balls span 472 × 213 × 68 mm (singular values). The thin third
+  direction is why one held-out ball moves the rotation by 0.7°: a fifth ball
+  off that plane would steady it.
+- The handheld rig is the strong side: pivot rms 0.26–0.65 mm, every frame
+  on the ball, 84–92° of turn, shared `s` (0.76, −0.11, 0.18) mm. The rig's
+  marker→TCP constant puts the TCP within 0.8 mm of the socket centre.
+- The FR3 side is the weak one: centre σ 0.7–1.1 mm at A, B and C (pivot rms
+  0.9–1.0 mm, and 2.7 mm for C) against 0.3 mm at D.
+
+**Accuracy.** "Workspace" below is the box the four balls span in the base
+frame, (507…611, −315…236, 250…615) mm. Outside it, the rotation error grows
+with distance.
+
+| Source | Size | How it was found |
+|---|---|---|
+| Random, from the fits' own σ | p95 1.0 mm (worst point 1.5 mm), rotation 0.2° | Monte Carlo of the Kabsch fit with each centre's jackknife σ |
+| Random, from the residual (σ 0.68 mm per axis) | p95 1.5 mm (worst point 2.3 mm), rotation 0.36° | same, point noise from the 6-dof residual |
+| Leave one out (empirical) | rms 3.2 mm, max 4.7 mm | each ball predicted from the other three |
+| Soft ball pad (systematic, vertical) | up to ~3 mm | see below |
+
+So the edge has about 1.5 mm (p95) of random error, plus a vertical bias of
+up to about 3 mm that this data cannot remove. Together that is about 3 mm
+typical and up to about 5 mm inside the box, which is what leave one out
+shows. The FR3's own tracking error and the labels' own error come on top.
+
+**The soft pad.** The ball sits on a soft pad. The FR3 pivot's force loop
+pushes the command down until the press reads 3 N. That loop moved the
+command by up to 4–5.5 mm, and the socket's FK height followed the command
+almost exactly: in `095636` the fit residual's z correlates with the commanded
+shift at 0.994, and with the shift taken out its residual falls from 2.69 to
+0.53 mm over a 164° span. The ball itself moved. The handheld is pressed by
+hand, by a different amount. The two sides therefore see the ball at
+different heights, and that difference goes into the edge's vertical
+translation. The residuals do not show it, because the bias is common to
+every ball. Refitting with the commanded shift taken out of the FR3's FK
+(an analysis model: it assumes the ball follows the command 1:1):
+
+| FR3 centres | Residual rms | Leave one out rms | Edge moves vs live (mean / max over the box) |
+|---|---|---|---|
+| As fitted (live edge) | 0.83 mm | 3.16 mm | — |
+| Shift removed, per ball | 0.46 mm | 1.30 mm | 2.6 / 2.8 mm, (−0.2, +2.5, 0.0) mm in world, 0.12° |
+| Shift removed, one `s` for all balls | 0.64 mm | 2.00 mm | 2.9 / 3.3 mm, (−0.3, +2.8, −0.1) mm, 0.20° |
+| As fitted, one `s` for all balls | 1.19 mm | 2.83 mm | 0.9 / 1.8 mm |
+
+World +y is fr3_base_right −z (down). With the shift out, the FR3's
+per-ball `s` also agrees better (its z 32.4–33.5 against 32.2–33.8 mm). The
+truth lies between the live edge (ball pressed ~3–4 mm, as by the FR3) and
+the corrected edge (ball unloaded), wherever the hand pressed it. The live
+edge was kept as fitted, and the candidate report carries the caveat
+(`warnings`, and `edge.quality.systematic_z_note` in `world_graph.json`).
+To remove it: put the ball on a rigid stand, or have the FR3 pivot press with
+a fixed shift and record the hand's force; then re-pivot and refit.
+
+**Keeping it valid.** The edge holds while the right arm's cart and the rig
+cameras stay where they were on 2026-11-10 (extrinsics
+`calib_20261102_195715`, world reference revision of 11-04). The ball check is
+rerun from the GUI with the same four pairs. The C position's trimmed fit is
+not a run name the GUI lists, so it is passed to `fr3_base_ball_check.py` by
+hand, as here.

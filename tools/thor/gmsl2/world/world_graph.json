@@ -30,6 +30,14 @@
       "reason": "robot_base",
       "definition": "FR3 base frame (libfranka O frame) of the arm at its current mount",
       "created_utc": "2026-10-09T06:55:38Z"
+    },
+    {
+      "world_frame_id": "fr3_base_right",
+      "calibration_id": "",
+      "parent_world_frame_id": null,
+      "reason": "robot_base",
+      "definition": "FR3 base frame (libfranka O frame) of the arm at its current mount (192.168.1.210)",
+      "created_utc": "2026-11-10T02:49:19Z"
     }
   ],
   "edges": [
@@ -410,6 +418,111 @@
         "utc": "2026-11-03T08:13:42Z",
         "reason": "Both FR3 bases were moved after this edge was solved (user confirmed 2026-10-26 evening; the exact day of the move is unknown): 192.168.11.102 (this edge's arm, now 'left') and the new arm 192.168.1.210 are on carts and not yet at their final placement. ball_check_20261015T030840Z no longer describes where the arm stands; re-register the base at its final placement (ball check / P0) and apply the new edge."
       }
+    },
+    {
+      "from_world_frame_id": "world_20260928_063531",
+      "to_world_frame_id": "fr3_base_right",
+      "T_to_from": [
+        [
+          0.03472753991208961,
+          0.012900676407610275,
+          -0.9993135496529005,
+          1.237070137926698
+        ],
+        [
+          0.9990255489265705,
+          -0.027701051148653743,
+          0.03435992370808089,
+          0.2718796941681395
+        ],
+        [
+          -0.027238769495329593,
+          -0.9995330031136976,
+          -0.013850094689008493,
+          0.7182133223457745
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "covariance_6x6": null,
+      "method": "fr3_ball_pivot_check: a ball fixed to the table, pivoted about by the FR3 (FK; centre in fr3_base_right) and by the handheld UMI (production labels, cameras at their world_20260928_063531 poses; centre in the world, handheld s shared) at 4 positions; rigid Kabsch, no scale",
+      "source": {
+        "ball_check": "outputs/calibration/fr3_base_ball_check/check_20261110T024842Z.json",
+        "positions": [
+          {
+            "fr3_pivot": "20261110_104831_joint.json",
+            "fr3_runs": [
+              "20261110_092258_pivot.json",
+              "20261110_092520_pivot.json"
+            ],
+            "dataset": "thor_gmsl2_11ch_v1_20261110_093613",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261110_104832_joint.json",
+            "fr3_runs": [
+              "20261110_094223_pivot.json",
+              "20261110_094501_pivot.json"
+            ],
+            "dataset": "thor_gmsl2_11ch_v1_20261110_093613",
+            "episode": 1
+          },
+          {
+            "fr3_pivot": "20261110_095636_pivot.trim.fit.json",
+            "fr3_runs": null,
+            "dataset": "thor_gmsl2_11ch_v1_20261110_100154",
+            "episode": 0
+          },
+          {
+            "fr3_pivot": "20261110_102516_pivot.fit.json",
+            "fr3_runs": null,
+            "dataset": "thor_gmsl2_11ch_v1_20261110_102834",
+            "episode": 0
+          }
+        ],
+        "world_reference_sha256": "15ccd080ade5e0c61a08494bc0b42a3099f96244c1b9fcccc7ced3baf71e0c91",
+        "robot_ips": [
+          "192.168.1.210"
+        ]
+      },
+      "quality": {
+        "positions": 4,
+        "extent_mm": [
+          472.1,
+          213.0,
+          67.9
+        ],
+        "residual_mm": [
+          0.93,
+          0.77,
+          0.94,
+          0.64
+        ],
+        "residual_rms_mm": 0.83,
+        "leave_one_out_mm": [
+          1.69,
+          4.68,
+          2.94,
+          2.57
+        ],
+        "leave_one_out_rms_mm": 3.16,
+        "leave_one_out_max_mm": 4.68,
+        "rotation_spread_deg": 0.697,
+        "scale_pct": 0.089,
+        "handheld_s": "shared",
+        "handheld_shared_s_mm": [
+          0.757,
+          -0.106,
+          0.178
+        ],
+        "systematic_z_note": "soft ball pad: the FR3 force loop pressed the ball 3-5 mm down, the handheld press differs; refitting with the commanded press shift removed moves the edge 2.6 mm mean / 2.8 mm max over the balls' box, almost all vertical (world +y = fr3_base_right -z), leave-one-out rms 3.16 -> 1.30 mm. Random part (Monte Carlo): workspace p95 1.0-1.5 mm. Expect up to ~3 mm vertical bias until the pad is rigid. 2026-11-10, tools/thor/gmsl2/world/README.md"
+      },
+      "valid_while": "the rig cameras stay at their world_20260928_063531 poses and the FR3 is not re-mounted; either change, or a fix of the camera world's scale, needs the ball check run again and the edge refitted",
+      "created_utc": "2026-11-10T02:49:19Z"
     }
   ]
 }
