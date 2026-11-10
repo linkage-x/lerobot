@@ -867,17 +867,16 @@
     <parent link="link_lt_gripper_tcp" />
     <child link="corenetic_gripper_ee" />
   </joint>
-  <!-- socket centre of the pivot insert v2 held by the sensor fingertips (35 mm pad gap): the point the
-       camera EE trajectories label (bundle 0929 puts the TCP at the socket, d = 0 by definition). Real
-       replay, its MuJoCo preview and the IK QC drive this frame. EE axes, (1.45, -0.78, -5.06) mm:
-       the FR3 pivot about a fixed ball, 2026-10-14, 9 runs fitted together (fr3_tcp_pivot.py fit-joint),
-       sigma (0.27, 0.26, 0.35) mm, leave-one-run-out <= 0.36 mm; a caliper reads flange face -> socket
-       centre 166.9 mm (171.99 - 5.06 = 166.93). Until then this was z -10.3, fitted end to end by the laser
-       tracker (replay vs recording, 10-12 / 10-13); that fit had absorbed ~5 mm of the world -> fr3_base
-       edge's error along the tool axis. Not from CAD: the finger meshes sit 9 mm long on the tool axis. -->
+  <!-- ball centre of the pivot insert nov4 held by the 44 mm fingertips (stop faces home): the point
+       replay, its MuJoCo preview and the IK QC drive, the same physical point the handheld rig v9b's TCP
+       is (its own pivot, 168.5 mm from its link_sensor_ft). EE axes, (-0.96, 2.06, 33.50) mm: the FR3
+       pivot about a fixed ball, 2026-11-09 17:31 (fr3_pivot_auto, 14 dwells anchored on the 17:26 probe),
+       span 57 deg, sigma (0.41, 0.37, 0.27) mm, rms 0.94 mm; the probe alone (-1.09, 2.28, 33.65). That is
+       205.5 mm from the flange face, 15.5 mm beyond Desk's EE estimate 190.16 (a caliper by eye read ~190).
+       Until 11-09 this was (1.45, -0.78, -5.06): insert v2 on the old 35 mm-gap fingertips (pivot 10-14). -->
   <link name="corenetic_socket_ee" />
   <joint name="corenetic_socket_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0.00145 -0.00078 -0.00506" />
+    <origin rpy="0 0 0" xyz="-0.00096 0.00206 0.03350" />
     <parent link="corenetic_gripper_ee" />
     <child link="corenetic_socket_ee" />
   </joint>

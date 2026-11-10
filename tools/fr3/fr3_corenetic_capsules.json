@@ -2,9 +2,9 @@
   "schema": "fr3_capsules/v1",
   "model": {
     "xml": "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml",
-    "sha256": "76dacc7e58204dff579c1223d1175ea6819de0f5d1a7eead1a6481adeefa8a0f",
+    "sha256": "1650ef654bd5c24da349be91aab7826e95b81bb14f48a20cf6a5ce1e424934a0",
     "files": {
-      "fr3_corenetic_gripper.xml": "27e28ee25c29c03033eab368d67d4bf556464a9305f92d21a926c5d3556ca165",
+      "fr3_corenetic_gripper.xml": "a5aace60814396146fe9b62c64c21dbea2c6f3653a4345bd4fc8027afa034be3",
       "assets/link0_0.obj": "28bb76a006bb9d2c44db0d820fdccec3e65c81f3b56733c9caa22a1da76f6bd5",
       "assets/link0_1.obj": "43ffda3294d0a83e32c99cf708b19ce2bbca179fa5a86e0b25da8611c7a4f362",
       "assets/link0_2.obj": "b0d62fb962194aada53ee5446868a96a4f89139668b7df9676a25695d4bef557",

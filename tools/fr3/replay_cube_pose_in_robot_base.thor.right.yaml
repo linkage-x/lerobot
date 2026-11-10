@@ -12,7 +12,8 @@ robot:
   corenetic_device_id: 3100715645
   allow_mock_gripper: true
   urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
-  # The pivot insert's socket centre, (1.45, -0.78, -5.06) mm in corenetic_gripper_ee (FR3 pivot, 10-14):
+  # The pivot insert's ball centre, (-0.96, 2.06, 33.50) mm in corenetic_gripper_ee (nov4 on the 44 mm
+  # fingertips, FR3 pivot 11-09; insert v2 was (1.45, -0.78, -5.06), 10-14):
   # the point the camera EE trajectories label (see the URDF). Real replay, MuJoCo preview and IK QC agree.
   target_frame_name: corenetic_socket_ee
   ik_solver: hirol_gaussian_newton
