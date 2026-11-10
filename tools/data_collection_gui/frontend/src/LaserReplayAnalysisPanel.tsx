@@ -123,7 +123,7 @@ export function LaserReplayAnalysisPanel({
       </div>
       <div className="control-row laser-analysis-controls">
         <label>
-          <span>Cube</span>
+          <span>Hand</span>
           <select value={cube} disabled={running} onChange={(event) => setCube(event.target.value as RealCubeMode)}>
             <option value="right">right</option>
             <option value="left">left</option>
