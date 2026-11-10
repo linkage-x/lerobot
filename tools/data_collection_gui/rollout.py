@@ -97,6 +97,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_TRIALS",
     "FR3_GRASP_LOOP_MAX_POLICY_STEPS",
     "FR3_GRASP_LOOP_SEED",
+    "FR3_GRASP_LOOP_LIGHTING",
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
@@ -471,6 +472,14 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     # Where the pegs go and arm B's draws. Blank leaves the runtime's 0, which every page run
     # used until 10-20: the 150 trials of 10-19 were 58 positions, the first 42 three times over.
     _set_optional_int_env(options, raw, "graspLoopSeed", "FR3_GRASP_LOOP_SEED", minimum=0)
+    # The lighting label on each trial row (blank = the runtime's "lab"); changeable mid-run from
+    # the panel. Only a label: nothing the loop does depends on it.
+    lighting = _optional_text(raw.get("graspLoopLighting"))
+    if lighting:
+        label = lighting_label(lighting)
+        if label is None:
+            raise RolloutError("graspLoopLighting is a short label: letters, digits and _ only, e.g. lab, lamp_moved, lamp_off.")
+        options["FR3_GRASP_LOOP_LIGHTING"] = label
     # Finish a halted run instead of starting a new one: the same file, from the trial after its
     # last finished one, on the same pegs. The runtime refuses a seed, arm or checkpoint that differs.
     resume = _optional_text(raw.get("graspLoopResume"))
@@ -1311,7 +1320,7 @@ GRASP_LOOP_START_LEAD_S = 1800.0
 # The runtime options a grasp loop's own record decides. Everything else on the form (the RTC
 # knobs, recording, the policy server) is only in what the page sent.
 _GRASP_LOOP_RECORD_OPTIONS = (
-    "graspLoopTrials", "graspLoopMaxPolicySteps", "graspLoopSeed", "graspLoopAttended",
+    "graspLoopTrials", "graspLoopMaxPolicySteps", "graspLoopSeed", "graspLoopLighting", "graspLoopAttended",
     "graspLoopArms", "graspLoopInsertPose", "graspLoopFunnelTakeoverDzMm",
     "graspLoopFunnelCorrective", "graspLoopAfterClose", "graspLoopFunnelLateFraction",
     "graspLoopFunnelLateDzMm", "graspLoopFunnelKeepLowPolicy",
@@ -1327,6 +1336,29 @@ def _grasp_loop_first_start(path: Path) -> dict[str, Any] | None:
         if isinstance(row, dict) and row.get("kind") == "run_start":
             return row
     return None
+
+
+def _grasp_loop_last_lighting(path: Path) -> str:
+    last = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == "trial" and row.get("lighting"):
+            last = str(row["lighting"])
+    return last
+
+
+# `grasp_loop.lighting_label`, kept here so the page does not import the loop (numpy, rotations).
+_LIGHTING_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def lighting_label(value: Any) -> str | None:
+    text = str(value if value is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return "lab"
+    return text if _LIGHTING_RE.match(text) else None
 
 
 def _checkpoint_id_from_policy(policy: Any) -> str:
@@ -1394,6 +1426,8 @@ def grasp_loop_resume_params(
     options["graspLoopTrials"] = int(request.get("trials", 40))
     options["graspLoopMaxPolicySteps"] = int(request.get("maxPolicySteps", 450))
     options["graspLoopSeed"] = str(int(request.get("seed", 0)))
+    # Where the run left off, not where it started: the last label a trial row carries.
+    options["graspLoopLighting"] = _grasp_loop_last_lighting(path) or str(first.get("lighting") or "")
     options["graspLoopAttended"] = bool(request.get("attended", False))
     options["graspLoopArms"] = str(request.get("arms") or "A")
     options["graspLoopFunnelCorrective"] = bool(request.get("funnelCorrective", False))
@@ -1477,6 +1511,17 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
             "arms": fields.get("arms", "A"),
             "out": fields.get("out", ""),
             "insert": fields.get("insert", "off") not in ("", "off"),
+            "lighting": fields.get("lighting", ""),
+        }
+    if "grasp_loop_lighting=" in line:
+        return {"type": "lighting", "lighting": fields.get("grasp_loop_lighting", "")}
+    if "grasp_loop_confirm " in line:
+        agrees = fields.get("agrees", "-")
+        return {
+            "type": "confirm",
+            "trial": int(fields.get("trial", "0")),
+            "outcome": fields.get("outcome", ""),
+            "agrees": {"1": True, "0": False}.get(agrees),
         }
     if "grasp_loop=halted" in line:
         return {"type": "halted", "reason": fields.get("reason", ""), "details": line.split("details=", 1)[-1][:400]}
@@ -1505,6 +1550,9 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
             "trialS": _grasp_number(fields.get("trial_s")),
             # End-to-end runs only: 1 in the hole, 0 not, "-" a held grasp nobody graded.
             "inserted": {"1": True, "0": False}.get(fields.get("inserted", "")),
+            "lighting": fields.get("lighting") or None,
+            "inferP50Ms": _grasp_number(fields.get("infer_p50_ms")),
+            "inferP95Ms": _grasp_number(fields.get("infer_p95_ms")),
         }
     return {}
 
@@ -1528,6 +1576,9 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         # already called it out; both cleared when the search ends.
         "insertSearching": False,
         "outEarlyRequested": False,
+        # The label the next trial starts under, and the people's checks by trial number.
+        "lighting": "",
+        "confirmations": {},
         "done": False,
         "halted": "",
         "haltDetails": "",
@@ -1539,7 +1590,15 @@ def apply_grasp_loop_event(progress: dict[str, Any], event: dict[str, Any]) -> d
         state.update(
             planned=event["planned"], attended=event["attended"], out=event["out"],
             arms=event.get("arms", "A"), insert=bool(event.get("insert", False)),
+            lighting=event.get("lighting", ""),
         )
+    elif kind == "lighting":
+        state["lighting"] = event["lighting"]
+    elif kind == "confirm":
+        state["confirmations"] = {
+            **state["confirmations"],
+            str(event["trial"]): {"outcome": event["outcome"], "agrees": event["agrees"]},
+        }
     elif kind == "trial_start":
         state.update(currentTrial=event["trial"], voidRequested=False, insertSearching=False, outEarlyRequested=False)
     elif kind == "trial":

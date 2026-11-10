@@ -5014,3 +5014,39 @@ def test_a_remote_deployment_cannot_be_deleted_as_a_checkpoint(tmp_path: Path):
 
     with pytest.raises(checkpoint_backend.CheckpointError, match="another machine"):
         gateway._guard_checkpoint_deletion(state, [REMOTE_ID])
+
+
+def test_lighting_and_confirmations_reach_the_page_and_go_out_as_words():
+    progress: dict = {}
+    for line in (
+        "[INFO] grasp_loop=configured trials=3 strokes=1 held_width=0.025 max_policy_steps=600 attended=True arms=A lighting=lab out=x.jsonl",
+        "[INFO] grasp_loop_trial trial=0 arm=A verdict=held width_lifted=0.3 close_above_target_mm=-5.0 lateral_mm=2.0 trial_s=40.0 lighting=lab infer_p50_ms=210.5 infer_p95_ms=260.0",
+        "[INFO] grasp_loop_lighting=lamp_off",
+        "[INFO] grasp_loop_confirm trial=0 outcome=empty agrees=0",
+    ):
+        progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
+    assert progress["lighting"] == "lamp_off"
+    assert progress["trials"][0]["lighting"] == "lab"
+    assert progress["trials"][0]["inferP95Ms"] == 260.0
+    assert progress["confirmations"] == {"0": {"outcome": "empty", "agrees": False}}
+
+    class State:
+        class rollout:
+            graspLoop = progress
+
+    assert gateway._grasp_loop_evidence_word(State, "grasp_lighting", "Lamp moved") == b"lighting lamp_moved\n"
+    assert gateway._grasp_loop_evidence_word(State, "grasp_confirm", {"outcome": "in", "trial": 0}) == b"confirm in 0\n"
+    with pytest.raises(ValueError, match="not finished"):
+        gateway._grasp_loop_evidence_word(State, "grasp_confirm", {"outcome": "in", "trial": 1})
+    with pytest.raises(ValueError):
+        gateway._grasp_loop_evidence_word(State, "grasp_confirm", {"outcome": "maybe", "trial": 0})
+    with pytest.raises(ValueError):
+        gateway._grasp_loop_evidence_word(State, "grasp_lighting", "a;b")
+
+
+def test_the_lighting_option_is_a_checked_label():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    assert sanitize({"graspLoopLighting": "Lamp-Moved"}) == {"FR3_GRASP_LOOP_LIGHTING": "lamp_moved"}
+    assert sanitize({"graspLoopLighting": ""}) == {}
+    with pytest.raises(rollout_backend.RolloutError):
+        sanitize({"graspLoopLighting": "a;b"})

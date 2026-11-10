@@ -27,6 +27,7 @@
 #     FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY (1 = with whole trials, keep the policy's low steps for the relabel)
 #     FR3_GRASP_LOOP_AFTER_CLOSE (script | teacher | policy: who inserts after the close; blank = script)
 #     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
+#     FR3_GRASP_LOOP_LIGHTING (lighting label on each trial row: lab | lamp_moved | lamp_off | ...; blank = lab)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
 #   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
 #   place it elsewhere): expert spans and the handback gap in mm, the number to read before the
@@ -498,6 +499,8 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_MAX_POLICY_STEPS-}" ]]; then grasp_loop_args+=(--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"); fi
     # Where the pegs go and arm B's draws: a paired A/B shares one, recordings each need a new one (blank = 0).
     if [[ -n "${FR3_GRASP_LOOP_SEED-}" ]]; then grasp_loop_args+=(--grasp-loop-seed "${FR3_GRASP_LOOP_SEED}"); fi
+    # The lighting label each trial row carries (blank = lab; stdin `lighting <label>` changes it mid-run).
+    if [[ -n "${FR3_GRASP_LOOP_LIGHTING-}" ]]; then grasp_loop_args+=(--grasp-loop-lighting "${FR3_GRASP_LOOP_LIGHTING}"); fi
     # v14 step 4: carry each held grasp into the hole (blank = grasp only, as steps 1-2).
     if [[ -n "${FR3_GRASP_LOOP_INSERT_POSE-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-pose "${FR3_GRASP_LOOP_INSERT_POSE}"); fi
     # Arm B: how high above the peg the funnel takes over, "h" or "low,high" mm (blank = 60).

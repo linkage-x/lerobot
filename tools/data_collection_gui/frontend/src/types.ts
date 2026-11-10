@@ -1297,7 +1297,33 @@ export type GraspLoopTrial = {
   trialS: number | null;
   /** End-to-end runs: in the hole (operator's answer), not, or null for an ungraded insertion. */
   inserted?: boolean | null;
+  /** The lighting label the trial ran under ("lab" by default). */
+  lighting?: string | null;
+  /** Inference wall time over the policy's segment, nearest-rank percentiles in ms. */
+  inferP50Ms?: number | null;
+  inferP95Ms?: number | null;
 };
+
+/** A person's outcome for a finished trial, given whenever, never waited for. */
+export type GraspLoopConfirmOutcome = "in" | "out" | "held" | "empty";
+
+export type RolloutControlCommand =
+  | "start"
+  | "stop"
+  | "home"
+  | "quit"
+  | "takeover"
+  | "grasp_stop"
+  | "grasp_continue"
+  | "grasp_in"
+  | "grasp_out"
+  | "grasp_void"
+  | "grasp_out_early"
+  | "grasp_lighting"
+  | "grasp_confirm";
+
+/** `grasp_lighting`: the label; `grasp_confirm`: the outcome and the trial it is about. */
+export type RolloutControlArg = string | { outcome: GraspLoopConfirmOutcome; trial: number };
 
 export type GraspLoopProgress = {
   planned: number;
@@ -1324,6 +1350,11 @@ export type GraspLoopProgress = {
    *  possible; and whether one has been given. Both reset when the search ends. */
   insertSearching?: boolean;
   outEarlyRequested?: boolean;
+  /** The label the next trial starts under. */
+  lighting?: string;
+  /** The people's checks, by trial number; `agrees` against the loop's own verdict, null when
+   *  the two speak about different things. */
+  confirmations?: Record<string, { outcome: string; agrees: boolean | null }>;
   done: boolean;
   halted: string;
   haltDetails: string;
@@ -1699,6 +1730,8 @@ export type RolloutRuntimeOptions = {
   graspLoopMaxPolicySteps?: number;
   /** Peg positions and arm B's per-trial draws, as typed (the gateway checks it); the runtime's 0 when absent. */
   graspLoopSeed?: string;
+  /** The lighting label on each trial row: lab (default), lamp_moved, lamp_off, or a short label. */
+  graspLoopLighting?: string;
   /** Finish a halted run (grasp_YYYYmmdd_HHMMSS) instead of starting one: same file, same pegs, from
    *  the trial after its last finished one. The runtime refuses another seed, arm or checkpoint. */
   graspLoopResume?: string;

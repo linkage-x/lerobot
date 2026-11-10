@@ -6843,21 +6843,61 @@ def _request_recording_scene_reset(state: GatewayState, payload: dict[str, Any])
     return {"ok": True, "sceneReset": request_payload, "snapshot": _snapshot(state)}
 
 
-def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
+_GRASP_CONFIRM_OUTCOMES = ("in", "out", "held", "empty")
+
+
+def _grasp_loop_evidence_word(state: GatewayState, command: str, arg: Any) -> bytes:
+    """`lighting <label>` or `confirm <outcome> <trial>` for the grasp loop's pipe.
+
+    Neither is ever waited for by the loop, so neither is gated on what it is doing: a label
+    applies from the next trial's start, a confirmation to the trial it names."""
+
+    if command == "grasp_lighting":
+        label = rollout_backend.lighting_label(arg)
+        if label is None:
+            raise ValueError("Lighting is a short label: letters, digits and _ only, e.g. lab, lamp_moved, lamp_off.")
+        return f"lighting {label}\n".encode()
+    payload = arg if isinstance(arg, dict) else {}
+    outcome = str(payload.get("outcome") or "")
+    if outcome not in _GRASP_CONFIRM_OUTCOMES:
+        raise ValueError(f"A confirmation is one of {', '.join(_GRASP_CONFIRM_OUTCOMES)}.")
+    try:
+        trial = int(payload.get("trial"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A confirmation names the trial it is about.") from exc
+    finished = {int(t.get("trial", -1)) for t in state.rollout.graspLoop.get("trials") or []}
+    if trial not in finished:
+        raise ValueError(f"Trial {trial} has not finished in this run, so there is nothing to confirm.")
+    return f"confirm {outcome} {trial}\n".encode()
+
+
+def _send_rollout_control(state: GatewayState, command: str, arg: Any = None) -> dict[str, Any]:
     """Write one control word to the rollout's stdin.
 
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
-    so a word here is exactly a keypress there.
+    so a word here is exactly a keypress there. `arg` is the label of `grasp_lighting` and the
+    `{"outcome", "trial"}` of `grasp_confirm`.
     """
     allowed = {
         "start", "stop", "home", "quit", "takeover",
         "grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void", "grasp_out_early",
+        "grasp_lighting", "grasp_confirm",
     }
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("No rollout is running.")
+    if command in ("grasp_lighting", "grasp_confirm"):
+        if state.rollout.mode != "grasp_loop":
+            raise ValueError("That control only applies to the grasp loop.")
+        word = _grasp_loop_evidence_word(state, command, arg)
+        try:
+            process.stdin.write(word)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
+        return {"ok": True, "rollout": asdict(state.rollout)}
     if command in ("grasp_stop", "grasp_continue", "grasp_in", "grasp_out", "grasp_void", "grasp_out_early"):
         # The grasp loop is not interactive -- it runs its own trials -- but it does read a few
         # words on the same pipe: stop at the next trial boundary, "the peg is back", in an
@@ -14915,7 +14955,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         _json_response(
                             self,
                             HTTPStatus.OK,
-                            _send_rollout_control(state, str(body.get("command") or "")),
+                            _send_rollout_control(state, str(body.get("command") or ""), body.get("arg")),
                         )
                     return
                 if path == "/api/scene-reset/mask":

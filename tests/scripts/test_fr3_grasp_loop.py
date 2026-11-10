@@ -2567,3 +2567,107 @@ def test_the_hole_estimate_takes_the_seat_less_the_offset_and_ignores_far_or_mis
     ]
     assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx((PICK[0] + 0.002, PICK[1]))
     assert grasp_loop.teacher_hole_xy(request, []) == pytest.approx(PICK[:2])
+
+
+# ------------------------------------------------------------- trial evidence (11-10) ---
+
+
+def test_latency_is_summarised_by_nearest_rank_in_ms():
+    assert grasp_loop.latency_summary_ms([]) is None
+    summary = grasp_loop.latency_summary_ms([0.1] * 19 + [0.5])
+    # 20 samples: p95 is the 19th, not an interpolation towards the one slow chunk.
+    assert summary == {"n": 20, "p50": 100.0, "p95": 100.0, "max": 500.0}
+    assert grasp_loop.latency_summary_ms([0.2, float("nan"), -1.0])["n"] == 1
+
+
+def test_lighting_labels_default_to_lab_and_refuse_anything_but_a_short_token():
+    assert grasp_loop.lighting_label("") == "lab"
+    assert grasp_loop.lighting_label(" Lamp-Moved ") == "lamp_moved"
+    assert grasp_loop.lighting_label("lamp off") == "lamp_off"
+    assert grasp_loop.lighting_label("a;b") is None
+    assert grasp_loop.lighting_label("x" * 33) is None
+
+
+def test_the_control_channel_takes_lighting_and_confirmations_without_waiting_for_them():
+    from tools.fr3.grasp_loop import GraspLoopControl
+
+    lines: list[str] = []
+    control = GraspLoopControl(
+        iter(["lighting lamp_moved", "lighting a;b", "confirm in", "confirm out 3", "confirm maybe", "confirm in x"]),
+        log=lines.append,
+    )
+    assert control.lighting() == "lab"
+    control._read()
+    assert control.lighting() == "lamp_moved"
+    taken = control.take_confirmations()
+    assert [(c["outcome"], c["trial"]) for c in taken] == [("in", None), ("out", 3)]
+    assert control.take_confirmations() == []
+    assert sum("confirm_refused" in line for line in lines) == 2
+    assert any("lighting_refused" in line for line in lines)
+
+
+def test_a_confirmation_without_a_number_is_about_the_last_trial_finished_before_it():
+    rows = [{"kind": "trial", "trial": 0, "endedAt": 10.0}, {"kind": "trial", "trial": 1, "endedAt": 20.0}]
+    assert grasp_loop.confirmation_trial(15.0, rows) == 0
+    assert grasp_loop.confirmation_trial(25.0, rows) == 1
+    assert grasp_loop.confirmation_trial(5.0, rows) is None
+
+
+def test_confirmations_are_checked_against_the_verdict_they_speak_about():
+    held_in = {"kind": "trial", "trial": 0, "verdict": "held", "inserted": True}
+    empty = {"kind": "trial", "trial": 1, "verdict": "empty"}
+    assert grasp_loop.confirmation_agrees("in", held_in) is True
+    assert grasp_loop.confirmation_agrees("out", held_in) is False
+    assert grasp_loop.confirmation_agrees("in", empty) is None
+    assert grasp_loop.confirmation_agrees("held", empty) is False
+    summary = grasp_loop.summarize_confirmations(
+        [held_in, empty],
+        [{"trial": 0, "outcome": "in"}, {"trial": 1, "outcome": "held"}, {"trial": 1, "outcome": "empty"}],
+    )
+    # The last word on a trial counts.
+    assert summary == {"confirmed": 2, "of": 2, "disagree": []}
+
+
+def test_the_loop_records_lighting_latency_and_confirmations_and_never_waits_for_them(tmp_path):
+    robot = GraspRig()
+    out = tmp_path / "g.jsonl"
+    lighting = {"now": "lab"}
+    confirms: list[dict] = []
+    latency: list[float] = []
+    policy = _policy(robot, [("grasp", 0.0), ("grasp", 0.02), ("grasp", 0.0)])
+
+    def trial(index, handover):
+        latency.extend([0.08, 0.09, 0.30])
+        if index == 1:
+            # Given during trial 1 with no number: it is about trial 0, the last one finished.
+            confirms.append({"outcome": "empty", "trial": None, "receivedAt": time.time()})
+            lighting["now"] = "lamp_off"
+        return policy(index, handover)
+
+    def take_latency():
+        taken = list(latency)
+        latency.clear()
+        return taken
+
+    def take_confirms():
+        taken = list(confirms)
+        confirms.clear()
+        return taken
+
+    result = run_grasp_loop(
+        robot, _request(trials=3), run_policy_trial=trial, out_path=out,
+        wait_for_operator=_put_back(robot, []),
+        lighting=lambda: lighting["now"], inference_latency_s=take_latency, take_confirmations=take_confirms,
+    )
+    rows = _trials(out)
+    assert [r["lighting"] for r in rows] == ["lab", "lab", "lamp_off"]
+    assert all(r["inferenceMs"] == {"n": 3, "p50": 90.0, "p95": 300.0, "max": 300.0} for r in rows)
+    assert all("endedAt" in r for r in rows)
+    confirm_rows = [json.loads(line) for line in out.read_text().splitlines() if '"confirm"' in line]
+    assert [(c["trial"], c["outcome"], c["agrees"]) for c in confirm_rows] == [(0, "empty", False)]
+    summary = result["summary"]
+    assert summary["lighting"] == {"lab": 2, "lamp_off": 1}
+    assert summary["inferenceMs"]["n"] == 9
+    assert summary["confirmations"] == {"confirmed": 1, "of": 3, "disagree": [0]}
+    start = json.loads(out.read_text().splitlines()[0])
+    assert start["kind"] == "run_start" and start["lighting"] == "lab"

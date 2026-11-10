@@ -132,6 +132,7 @@ from tools.fr3.grasp_loop import (
     GRASP_LOOP_INSERT_PRESS_CAP_N,
     GRASP_LOOP_INSERT_SEARCH_ORDER,
     GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
+    GRASP_LOOP_LIGHTING_DEFAULT,
     GRASP_LOOP_MAX_POLICY_STEPS,
     GRASP_LOOP_PICK_XYZ,
     GRASP_LOOP_TARGET_Z,
@@ -141,6 +142,7 @@ from tools.fr3.grasp_loop import (
     command_notifier,
     grasp_loop_notify_command,
     keeps_trial_recording,
+    lighting_label,
     load_mask_strokes,
     run_grasp_loop,
     grasp_is_held,
@@ -498,6 +500,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--grasp-loop-held-width', type=float, default=GRASP_LOOP_HELD_WIDTH)
     parser.add_argument('--grasp-loop-max-policy-steps', type=int, default=GRASP_LOOP_MAX_POLICY_STEPS)
     parser.add_argument('--grasp-loop-seed', type=int, default=0)
+    parser.add_argument(
+        '--grasp-loop-lighting',
+        default=GRASP_LOOP_LIGHTING_DEFAULT,
+        help=(
+            'The lighting each trial row is labelled with until stdin `lighting <label>` changes it: '
+            'lab (default: ceiling lights, lamp where it stands), lamp_moved, lamp_off, or any short label.'
+        ),
+    )
     parser.add_argument(
         '--grasp-loop-arms',
         choices=GRASP_LOOP_ARMS,
@@ -4786,6 +4796,29 @@ def _expand_observation_batch(observation: dict[str, Any], samples: int) -> dict
     return expanded
 
 
+class InferenceLatencyLog:
+    """Wall time of every inference the rollout ran, for the grasp loop's per-trial p50/p95.
+
+    Appended from the async planner's thread as well as the control loop, hence the lock; the
+    loop takes the whole list at the edges of each policy segment (`take`)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: list[float] = []
+
+    def add(self, seconds: float) -> None:
+        with self._lock:
+            self._samples.append(float(seconds))
+
+    def take(self) -> list[float]:
+        with self._lock:
+            taken, self._samples = self._samples, []
+        return taken
+
+
+INFERENCE_LATENCY = InferenceLatencyLog()
+
+
 def predict_action_chunk_for_rollout(
     observation: dict[str, np.ndarray],
     *,
@@ -4959,10 +4992,12 @@ class AsyncActionChunkPlanner:
                     observation_snapshot,
                     **predict_kwargs,
                 )
+                latency_s = time.perf_counter() - started_at_s
+                INFERENCE_LATENCY.add(latency_s)
                 result = AsyncActionChunkPlanResult(
                     original_actions=original_actions,
                     processed_actions=processed_actions,
-                    latency_s=time.perf_counter() - started_at_s,
+                    latency_s=latency_s,
                     action_index_before_inference=int(action_index_before_inference),
                     guidance_delay_steps=int(guidance_delay_steps),
                     observation_step=int(observation_step),
@@ -5327,6 +5362,7 @@ def advance_rtc_queue(
                 action_sample_offset=0,
             )
             chunk_latency_s = time.perf_counter() - chunk_start_t
+            INFERENCE_LATENCY.add(chunk_latency_s)
             _rtc_latency_tracker(rtc_state, phase.action_samples).add(chunk_latency_s)
             # No queued actions are consumed while the main thread blocks here. Skipping
             # by wall-clock latency would jump into the middle of the new chunk and create
@@ -5909,6 +5945,9 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
+            if lighting_label(args.grasp_loop_lighting) is None:
+                raise ValueError(f'--grasp-loop-lighting {args.grasp_loop_lighting!r}: letters, digits and _ only')
+            args.grasp_loop_lighting = lighting_label(args.grasp_loop_lighting)
         except (OSError, ValueError, SceneResetError, TerminalServoError) as exc:
             raise SystemExit(f'--grasp-loop-* is not usable: {exc}') from exc
         print(
@@ -5917,6 +5956,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             f'max_policy_steps={grasp_loop_request.maxPolicySteps} '
             f'attended={grasp_loop_request.attended} '
             f'arms={grasp_loop_request.arms} '
+            f'lighting={args.grasp_loop_lighting} '
             + (
                 'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_search_order=%s '
                 'insert_follow_seat=%d insert_via_home=%d '
@@ -6627,6 +6667,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 action_queue = rtc_state['queue']
                 temporal_offset_used = 0
             else:
+                predict_start_t = time.perf_counter()
                 action_tensor = predict_action(
                     policy_observation,
                     policy=policy,
@@ -6637,6 +6678,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                     task=task_prompt,
                     robot_type=robot.name,
                 )
+                INFERENCE_LATENCY.add(time.perf_counter() - predict_start_t)
                 temporal_offset_used = int(temporal_offset_state.get('current_offset', int(args.act_temporal_action_offset)))
                 action_tensor = select_temporal_ensemble_offset_action(
                     action_tensor,
@@ -7254,7 +7296,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         elif grasp_loop_request is not None:
             stop_file = StopFile(grasp_loop_out.with_suffix('.STOP'))
             stop_file.clear()
-            control = GraspLoopControl(sys.stdin)
+            control = GraspLoopControl(sys.stdin, lighting=str(args.grasp_loop_lighting))
             control.start()
             print(
                 f'[INFO] grasp_loop=brakes boundary_stop=`touch {stop_file.path}` or stdin `stop` '
@@ -7352,6 +7394,9 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 notify=command_notifier(grasp_loop_notify_command(args.grasp_loop_notify_cmd)),
                 keep_policy_segment=keep_grasp_segment,
                 policy=str(args.checkpoint),
+                lighting=control.lighting,
+                inference_latency_s=INFERENCE_LATENCY.take,
+                take_confirmations=control.take_confirmations,
             )
             finish_grasp_write()
         else:

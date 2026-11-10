@@ -21,6 +21,8 @@ import type {
   RolloutRtcMode,
   RolloutActionAggregate,
   RolloutRtcSchedule,
+  RolloutControlArg,
+  RolloutControlCommand,
   RolloutRun,
   RolloutRuntimeOptions,
   SceneResetRequest,
@@ -159,6 +161,8 @@ export function RolloutPage() {
   const [graspLoopMaxPolicySteps, setGraspLoopMaxPolicySteps] = useState("600");
   // 10-20: every page run was seed 0 until this box, so recordings repeated the same pegs.
   const [graspLoopSeed, setGraspLoopSeed] = useState("0");
+  // 11-10: the label each trial row carries; the policy's close leans on the gripper's shadow.
+  const [graspLoopLighting, setGraspLoopLighting] = useState("lab");
   // 10-23: a halted run used to cost the whole run -- a new one starts the seed's pegs again.
   const [graspLoopResume, setGraspLoopResume] = useState("");
   const graspLoopResumeRef = useRef<HTMLInputElement | null>(null);
@@ -322,6 +326,7 @@ export function RolloutPage() {
       // As typed: the gateway refuses what is not a whole number >= 0, rather than this page
       // quietly running seed 0 again.
       graspLoopSeed: modeId === "grasp_loop" ? graspLoopSeed.trim() || undefined : undefined,
+      graspLoopLighting: modeId === "grasp_loop" ? graspLoopLighting.trim() || undefined : undefined,
       graspLoopResume: modeId === "grasp_loop" ? graspLoopResume.trim() || undefined : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
@@ -398,6 +403,7 @@ export function RolloutPage() {
       graspLoopTrials,
       graspLoopMaxPolicySteps,
       graspLoopSeed,
+      graspLoopLighting,
       graspLoopResume,
       graspLoopAttended,
       graspLoopArms,
@@ -595,6 +601,7 @@ export function RolloutPage() {
       if (options.graspLoopMaxPolicySteps !== undefined)
         setGraspLoopMaxPolicySteps(String(options.graspLoopMaxPolicySteps));
       if (options.graspLoopSeed !== undefined) setGraspLoopSeed(String(options.graspLoopSeed));
+      if (options.graspLoopLighting !== undefined) setGraspLoopLighting(options.graspLoopLighting || "lab");
       if (options.graspLoopAttended !== undefined) setGraspLoopAttended(options.graspLoopAttended);
       if (options.graspLoopArms !== undefined) setGraspLoopArms(options.graspLoopArms);
       if (options.graspLoopInsertPose !== undefined) setGraspLoopInsertPose(options.graspLoopInsertPose);
@@ -783,10 +790,8 @@ export function RolloutPage() {
     }
   };
 
-  const onControl = async (
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early"
-  ) => {
-    const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
+  const onControl = async (command: RolloutControlCommand, arg?: RolloutControlArg) => {
+    const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command, arg));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
   };
 
@@ -1041,7 +1046,7 @@ export function RolloutPage() {
             <GraspLoopPanel
               run={run}
               busy={busy}
-              onControl={(command) => void onControl(command)}
+              onControl={(command, arg) => void onControl(command, arg)}
               onResume={async (name) => {
                 const note = await resumeGraspLoop(name);
                 // The box sits far down the form, and filling it out of sight read as a dead
@@ -1564,6 +1569,17 @@ export function RolloutPage() {
             <p className="hint">
               同一个种子，第 N 条的销位和 B 臂抽签每次都一样。配对 A/B 两边用同一个种子；录数据每一轮都换一个没用过的，
               否则只是把同样的位置再录一遍（10-19 的 150 条都是 0，只有 58 个不同位置）。评测想看没见过的位置，也要避开录数据用过的种子。
+            </p>
+            <label className="field">
+              <span>光照条件（只是记录标签，可在运行中改）</span>
+              <select value={graspLoopLighting} onChange={(event) => setGraspLoopLighting(event.target.value)} disabled={isLive}>
+                <option value="lab">lab · 实验室灯光（默认）</option>
+                <option value="lamp_moved">lamp_moved · 台灯移开</option>
+                <option value="lamp_off">lamp_off · 台灯关闭</option>
+              </select>
+            </label>
+            <p className="hint">
+              每条试次记录都带上这个标签，循环本身不受影响。策略合手时看夹爪影子，所以换了灯光的结果要分开读；配对测试时在面板上切换，从下一条开始生效。
             </p>
             <label className="field">
               <span>续跑哪一轮（留空 = 新开一轮）</span>

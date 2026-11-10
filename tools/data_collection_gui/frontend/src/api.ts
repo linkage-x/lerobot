@@ -39,6 +39,8 @@ import type {
   Checkpoint,
   CheckpointListing,
   RolloutOutcomeEntry,
+  RolloutControlArg,
+  RolloutControlCommand,
   RolloutRun,
   RolloutStartRequest,
   RolloutStatusPayload,
@@ -1099,10 +1101,11 @@ export class DataCollectionGuiApi {
    *  its own. The page sends it because a rollout the gateway launched has its stdin held as a
    *  pipe, which no keyboard backend can read: the `t` key a terminal operator would press does
    *  not exist here, and without this the browser session has no way to hold the arm still. */
-  async controlRollout(
-    command: "start" | "stop" | "home" | "quit" | "takeover" | "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early"
-  ) {
-    return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
+  async controlRollout(command: RolloutControlCommand, arg?: RolloutControlArg) {
+    return this.trainingPost<{ rollout?: RolloutRun }>(
+      "/api/rollout/control",
+      arg === undefined ? { command } : { command, arg }
+    );
   }
 
   async resetRolloutScene(request: SceneResetRequest): Promise<SceneResetResult> {

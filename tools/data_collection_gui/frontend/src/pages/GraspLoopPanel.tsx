@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { GraspLoopProgress, RolloutRun } from "../types";
+import type { GraspLoopConfirmOutcome, GraspLoopProgress, GraspLoopTrial, RolloutControlArg, RolloutControlCommand, RolloutRun } from "../types";
 import { armRates, gateReading, medianByVerdict, wilsonInterval } from "./graspLoop";
 
 const VERDICT_COLORS: Record<string, string> = {
@@ -29,6 +29,64 @@ const VERDICT_LABELS: Record<string, string> = {
   voided: "作废（销倒了）"
 };
 
+const LIGHTING_LABELS: Record<string, string> = {
+  lab: "实验室灯光",
+  lamp_moved: "台灯移开",
+  lamp_off: "台灯关闭"
+};
+
+const CONFIRM_LABELS: Record<string, string> = { in: "进", out: "没进", held: "抓住", empty: "空" };
+
+function nearestRank(values: number[], q: number): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
+}
+
+/** The person's check on one finished trial: two small buttons until given, then what was given.
+ *  Never waited for -- the loop goes on either way. */
+function ConfirmCell({
+  trial,
+  insert,
+  given,
+  busy,
+  onConfirm
+}: {
+  trial: GraspLoopTrial;
+  insert: boolean;
+  given?: { outcome: string; agrees: boolean | null };
+  busy: boolean;
+  onConfirm?: (outcome: GraspLoopConfirmOutcome) => void;
+}) {
+  // An insertion is what end-to-end runs are about; a grasp-only trial is held or not.
+  const pair: GraspLoopConfirmOutcome[] = insert && trial.verdict === "held" ? ["in", "out"] : ["held", "empty"];
+  return (
+    <span style={{ whiteSpace: "nowrap" }}>
+      {given && (
+        <span
+          title={given.agrees === false ? "与自动判定不一致" : given.agrees ? "与自动判定一致" : ""}
+          style={{ color: given.agrees === false ? "#e53e3e" : given.agrees ? "#38a169" : undefined, marginRight: 4 }}
+        >
+          {CONFIRM_LABELS[given.outcome] ?? given.outcome}
+          {given.agrees === false ? " ≠" : given.agrees ? " ✓" : ""}
+        </span>
+      )}
+      {onConfirm &&
+        pair.map((outcome) => (
+          <button
+            key={outcome}
+            type="button"
+            disabled={busy}
+            style={{ padding: "0 6px", fontSize: 11, marginRight: 2 }}
+            onClick={() => onConfirm(outcome)}
+          >
+            {CONFIRM_LABELS[outcome]}
+          </button>
+        ))}
+    </span>
+  );
+}
+
 function fmt(value: number | null | undefined, digits = 1): string {
   return typeof value === "number" ? value.toFixed(digits) : "—";
 }
@@ -48,7 +106,7 @@ export function GraspLoopPanel({
 }: {
   run: RolloutRun;
   busy: boolean;
-  onControl: (command: "grasp_stop" | "grasp_continue" | "grasp_in" | "grasp_out" | "grasp_void" | "grasp_out_early") => void;
+  onControl: (command: RolloutControlCommand, arg?: RolloutControlArg) => void;
   /** Put the form back the way this run was started, its "resume" box filled, so Start finishes
    *  it. Resolves to what the operator is told. */
   onResume?: (name: string) => Promise<string>;
@@ -75,6 +133,12 @@ export function GraspLoopPanel({
   const multiArm = rates.length > 1 || (progress.arms ?? "A") !== "A";
   const current = progress.currentTrial;
   const runName = (progress.out.split("/").pop() ?? "").replace(/\.jsonl$/, "");
+  const confirmations = progress.confirmations ?? {};
+  const confirmedCount = Object.keys(confirmations).length;
+  const disagreeCount = Object.values(confirmations).filter((c) => c.agrees === false).length;
+  // Pooled over the trials' own p95s and p50s: the exact run-wide figure is in the run_end row.
+  const p95s = progress.trials.map((t) => t.inferP95Ms).filter((v): v is number => typeof v === "number");
+  const p50s = progress.trials.map((t) => t.inferP50Ms).filter((v): v is number => typeof v === "number");
 
   return (
     <div className="subcard">
@@ -212,6 +276,23 @@ export function GraspLoopPanel({
           <div className="hint">横向误差（mm, 中位）</div>
           <strong>抓住 {fmt(lateral.held)} · 没抓住 {fmt(lateral.notHeld)}</strong>
         </div>
+        {p95s.length > 0 && (
+          <div>
+            <div className="hint">推理延迟（ms，各条中位 / p95 的中位）</div>
+            <strong>
+              {fmt(nearestRank(p50s, 0.5), 0)} / {fmt(nearestRank(p95s, 0.5), 0)}
+            </strong>
+            <div className="hint">最差一条 p95 {fmt(Math.max(...p95s), 0)}</div>
+          </div>
+        )}
+        {confirmedCount > 0 && (
+          <div>
+            <div className="hint">人工确认</div>
+            <strong>
+              {confirmedCount} 条 · 不一致 {disagreeCount}
+            </strong>
+          </div>
+        )}
         <div>
           <div className="hint">现在</div>
           <strong>
@@ -269,6 +350,28 @@ export function GraspLoopPanel({
       )}
 
       {live && !progress.done && (
+        <div className="row-actions" style={{ marginBottom: 8, alignItems: "center" }}>
+          <span>光照：</span>
+          <select
+            value={progress.lighting || "lab"}
+            disabled={busy}
+            onChange={(event) => onControl("grasp_lighting", event.target.value)}
+            title="Only a label on the trial rows, from the next trial's start; nothing the loop does depends on it."
+          >
+            {Object.entries(LIGHTING_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+            {progress.lighting && !(progress.lighting in LIGHTING_LABELS) && (
+              <option value={progress.lighting}>{progress.lighting}</option>
+            )}
+          </select>
+          <span className="hint">改了从下一条开始记。表格最后一列可以补人工确认（可选，不会让循环停下等你）。</span>
+        </div>
+      )}
+
+      {live && !progress.done && (
         <div className="row-actions" style={{ marginBottom: 8 }}>
           <button
             type="button"
@@ -296,6 +399,9 @@ export function GraspLoopPanel({
               <th>合手高度 mm</th>
               <th>横向 mm</th>
               <th>用时 s</th>
+              <th>光照</th>
+              <th>推理 p95 ms</th>
+              <th>人工确认</th>
             </tr>
           </thead>
           <tbody>
@@ -313,6 +419,21 @@ export function GraspLoopPanel({
                 <td>{fmt(trial.closeAboveTargetMm)}</td>
                 <td>{fmt(trial.lateralMm)}</td>
                 <td>{fmt(trial.trialS, 0)}</td>
+                <td>{trial.lighting ? LIGHTING_LABELS[trial.lighting] ?? trial.lighting : "—"}</td>
+                <td>{fmt(trial.inferP95Ms, 0)}</td>
+                <td>
+                  <ConfirmCell
+                    trial={trial}
+                    insert={Boolean(progress.insert)}
+                    given={confirmations[String(trial.trial)]}
+                    busy={busy}
+                    onConfirm={
+                      live && !progress.done && trial.verdict !== "voided"
+                        ? (outcome) => onControl("grasp_confirm", { outcome, trial: trial.trial })
+                        : undefined
+                    }
+                  />
+                </td>
               </tr>
             ))}
           </tbody>

@@ -338,6 +338,18 @@ GRASP_LOOP_LET_GO_XY_M = 0.004
 # in. One is the noise of a 3.5 mm search grid; the hole creeps over days, not trials.
 GRASP_LOOP_HOLE_WINDOW = 5
 
+# Trial conditions and evidence (11-10). Lighting is a label on every trial row: the policy's low
+# close leans on the gripper's shadow (11-05 S1 probe), so a lamp moved or off is a condition a
+# result has to be read under. "lab" -- the room's ceiling lights, lamp where it always stands --
+# is the default; the page offers the presets, a terminal may type any short label.
+GRASP_LOOP_LIGHTING_DEFAULT = "lab"
+GRASP_LOOP_LIGHTING_PRESETS = ("lab", "lamp_moved", "lamp_off")
+GRASP_LOOP_LIGHTING_MAX_LEN = 32
+# A person's word on a finished trial, given whenever they like and never waited for: the
+# automatic verdict is a guess (R3: 6 "in" were on the gear face), this is the check on it.
+# in/out grade an insertion, held/empty a grasp-only trial.
+GRASP_LOOP_CONFIRM_OUTCOMES = ("in", "out", "held", "empty")
+
 
 @dataclass(frozen=True)
 class GraspLoopRequest:
@@ -1860,6 +1872,82 @@ class TargetSequence:
         return self._drawn[trial]
 
 
+def lighting_label(value: Any) -> str | None:
+    """A lighting label as rows record it, or None for one that is not usable: lower case,
+    letters, digits and underscores, at most GRASP_LOOP_LIGHTING_MAX_LEN. Blank is the default."""
+
+    text = str(value if value is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return GRASP_LOOP_LIGHTING_DEFAULT
+    if len(text) > GRASP_LOOP_LIGHTING_MAX_LEN or not all(c.isalnum() or c == "_" for c in text) or not text.isascii():
+        return None
+    return text
+
+
+def latency_summary_ms(samples_s: Iterable[float]) -> dict[str, Any] | None:
+    """p50/p95/max of inference wall times (s) in ms, with the count; None for no samples.
+
+    Nearest-rank percentiles: with a few dozen chunks a trial, an interpolated p95 would be a value
+    no chunk took."""
+
+    values = sorted(float(v) * 1000.0 for v in samples_s if v is not None and math.isfinite(float(v)) and float(v) >= 0.0)
+    if not values:
+        return None
+
+    def rank(q: float) -> float:
+        return values[max(0, math.ceil(q * len(values)) - 1)]
+
+    return {"n": len(values), "p50": round(rank(0.50), 1), "p95": round(rank(0.95), 1), "max": round(values[-1], 1)}
+
+
+def confirmation_trial(received_at: float, rows: Iterable[dict[str, Any]]) -> int | None:
+    """The trial a confirmation without a trial number is about: the last one finished before it
+    was given (its row's `endedAt`). Resolved by time, not at the moment the loop gets round to
+    it, because by then the next trial may have finished too."""
+
+    best: tuple[float, int] | None = None
+    for row in rows:
+        ended = row.get("endedAt")
+        if row.get("kind", "trial") != "trial" or ended is None or float(ended) > received_at:
+            continue
+        if best is None or float(ended) >= best[0]:
+            best = (float(ended), int(row["trial"]))
+    return None if best is None else best[1]
+
+
+def confirmation_agrees(outcome: str, row: dict[str, Any]) -> bool | None:
+    """Whether a person's outcome agrees with what the loop recorded; None when the two do not
+    speak about the same thing (in/out on a grasp-only trial, or a trial with no such verdict)."""
+
+    if outcome in ("in", "out"):
+        inserted = row.get("inserted")
+        return None if inserted is None else (outcome == "in") == bool(inserted)
+    if outcome in ("held", "empty"):
+        verdict = row.get("verdict")
+        return None if verdict not in ("held", "empty") else outcome == verdict
+    return None
+
+
+def summarize_confirmations(rows: Iterable[dict[str, Any]], confirms: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """The person's checks against the loop's verdicts: the last word on each trial counts."""
+
+    by_trial = {int(r["trial"]): r for r in rows if r.get("kind", "trial") == "trial"}
+    last: dict[int, dict[str, Any]] = {}
+    for confirm in confirms:
+        if confirm.get("trial") is not None:
+            last[int(confirm["trial"])] = confirm
+    disagree = sorted(t for t, c in last.items() if t in by_trial and confirmation_agrees(str(c["outcome"]), by_trial[t]) is False)
+    return {"confirmed": len(last), "of": len(by_trial), "disagree": disagree}
+
+
+def lighting_counts(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row.get("kind", "trial") == "trial" and row.get("lighting"):
+            counts[str(row["lighting"])] = counts.get(str(row["lighting"]), 0) + 1
+    return counts
+
+
 class GraspLoopControl:
     """The loop's control channel: one word per line on a stream, normally the process's stdin.
 
@@ -1877,14 +1965,28 @@ class GraspLoopControl:
         void          the staged peg fell over: end this trial's policy segment and record it
                       "voided". Cleared at each trial's start, so it applies to the trial in
                       flight only, and ignored once the segment is over.
+        lighting L    the lighting from the next trial's start on (`lighting_label`); never waited
+                      for, and the run starts on the launch's (default "lab")
+        confirm O [N] a person's outcome O (GRASP_LOOP_CONFIRM_OUTCOMES) for trial N, or without N
+                      for the last trial finished when it was given; never waited for, written
+                      as a "confirm" row (`confirmation_trial`)
 
     A stream that closes (stdin from /dev/null under setsid) answers any wait with "nobody is
     there", which is what an unattended run needs.
     """
 
-    def __init__(self, stream: Any, *, log: Callable[[str], None] = lambda message: print(message, flush=True)):
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        log: Callable[[str], None] = lambda message: print(message, flush=True),
+        lighting: str = GRASP_LOOP_LIGHTING_DEFAULT,
+    ):
         self._stream = stream
         self._log = log
+        self._lighting = lighting_label(lighting) or GRASP_LOOP_LIGHTING_DEFAULT
+        self._confirms: list[dict[str, Any]] = []
+        self._confirms_lock = threading.Lock()
         self._stop = threading.Event()
         self._void = threading.Event()
         self._out_early = threading.Event()
@@ -1899,6 +2001,26 @@ class GraspLoopControl:
         try:
             for raw in self._stream:
                 word = str(raw).strip().lower()
+                parts = word.split()
+                if parts and parts[0] == "lighting":
+                    label = lighting_label(" ".join(parts[1:]))
+                    if label is None:
+                        self._log(f"[WARN] grasp_loop_lighting_refused value={' '.join(parts[1:])[:40]}")
+                    else:
+                        self._lighting = label
+                        self._log(f"[INFO] grasp_loop_lighting={label}")
+                    continue
+                if parts and parts[0] == "confirm":
+                    outcome = parts[1] if len(parts) > 1 else ""
+                    trial: int | None = None
+                    if len(parts) > 2 and parts[2].isdigit():
+                        trial = int(parts[2])
+                    if outcome not in GRASP_LOOP_CONFIRM_OUTCOMES or len(parts) > 3 or (len(parts) == 3 and trial is None):
+                        self._log(f"[WARN] grasp_loop_confirm_refused value={word[:40]}")
+                        continue
+                    with self._confirms_lock:
+                        self._confirms.append({"outcome": outcome, "trial": trial, "receivedAt": time.time()})
+                    continue
                 if word in ("stop", "quit"):
                     if not self._stop.is_set():
                         self._log("[INFO] grasp_loop_stop=requested")
@@ -1924,6 +2046,14 @@ class GraspLoopControl:
 
     def stop_requested(self) -> bool:
         return self._stop.is_set()
+
+    def lighting(self) -> str:
+        return self._lighting
+
+    def take_confirmations(self) -> list[dict[str, Any]]:
+        with self._confirms_lock:
+            taken, self._confirms = self._confirms, []
+        return taken
 
     def void_requested(self) -> bool:
         return self._void.is_set()
@@ -1997,6 +2127,9 @@ def run_grasp_loop(
     notify: Callable[[str], None] = lambda message: None,
     keep_policy_segment: Callable[[int, dict[str, Any]], dict[str, Any] | None] | None = None,
     policy: str | None = None,
+    lighting: Callable[[], str] | None = None,
+    inference_latency_s: Callable[[], list[float]] | None = None,
+    take_confirmations: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
@@ -2028,6 +2161,12 @@ def run_grasp_loop(
     verdict is known: the runtime's recorder decides from it whether the policy segment it buffered
     becomes training data, and what it returns is kept in the row as `dataset`. It runs with the
     arm parked, so a slow video encode costs time, never control.
+
+    Evidence, none of it waited for (11-10): `lighting` is read at each trial's start and kept in
+    the row; `inference_latency_s` is asked right after the policy's segment for the wall times
+    of the inferences it ran, kept as p50/p95/max (`latency_summary_ms`); `take_confirmations`
+    hands over the people's outcomes given since it was last asked, each written as a "confirm"
+    row (`confirmation_trial`). The run's end summary carries all three.
     """
 
     if wait_for_operator is not None:
@@ -2050,6 +2189,12 @@ def run_grasp_loop(
     insert_aim = next_insert_aim(request, done)
 
     def write(row: dict[str, Any]) -> None:
+        if row.get("kind") == "trial":
+            # When it finished: what a confirmation without a trial number is matched against,
+            # and the time of day a drift is read along. Not rounded: a confirmation given
+            # within the same millisecond as a row's write is about the trial before it, and a
+            # rounded stamp would put that trial's end before the confirmation's own time.
+            row.setdefault("endedAt", time.time())
         with out_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
@@ -2064,11 +2209,37 @@ def run_grasp_loop(
         if kept is not None:
             row["dataset"] = kept
 
+    confirms = _rows_of_kind(out_path, "confirm")
+    run_latency_s: list[float] = []
+
+    def drain_confirmations() -> None:
+        if take_confirmations is None:
+            return
+        for given in take_confirmations():
+            received_at = float(given.get("receivedAt") or time.time())
+            trial_n = given.get("trial")
+            if trial_n is None:
+                trial_n = confirmation_trial(received_at, done)
+            if trial_n is None:
+                log(f"[WARN] grasp_loop_confirm_refused value={given.get('outcome')} reason=no_finished_trial")
+                continue
+            confirm = {"kind": "confirm", "trial": int(trial_n), "outcome": str(given["outcome"]), "at": received_at}
+            target_row = next((r for r in reversed(done) if int(r.get("trial", -1)) == int(trial_n)), None)
+            agrees = None if target_row is None else confirmation_agrees(confirm["outcome"], target_row)
+            confirm["agrees"] = agrees
+            write(confirm)
+            confirms.append(confirm)
+            log(
+                f"[INFO] grasp_loop_confirm trial={trial_n} outcome={confirm['outcome']} "
+                f"agrees={'-' if agrees is None else int(agrees)}"
+            )
+
     force_trace = force_trace_path(out_path)
     set_force_trace_path(force_trace)
     write({
         "kind": "run_start", "at": time.time(), "request": _request_record(request), "resumedAfter": len(done),
         "startTrial": start, "policy": policy,
+        "lighting": None if lighting is None else lighting(),
     })
     log(
         f"[INFO] grasp_loop=start trials={request.trials} resumed_after={len(done)} start_trial={start} "
@@ -2086,6 +2257,7 @@ def run_grasp_loop(
         else:
             trial, redos = redo, redos + 1
         redo = None
+        drain_confirmations()
         # Voided trials are replaced, so they do not count towards the plan.
         if sum(1 for r in done if r.get("verdict") != "voided") >= request.trials:
             break
@@ -2099,6 +2271,7 @@ def run_grasp_loop(
         try:
             target = targets[trial]
             started = time.perf_counter()
+            trial_lighting = None if lighting is None else lighting()
             log(f"[INFO] grasp_loop_trial_start trial={trial} target={target[0]:.4f},{target[1]:.4f}")
 
             # ---- stage the peg at `target`, arm homed ------------------------------------------
@@ -2203,7 +2376,11 @@ def run_grasp_loop(
                     else ""
                 )
             )
+            if inference_latency_s is not None:
+                inference_latency_s()  # nothing the staging ran belongs to this trial's policy
             status = run_policy_trial(trial, handover)
+            latency_s = [] if inference_latency_s is None else list(inference_latency_s())
+            run_latency_s.extend(latency_s)
             row = {
                 "kind": "trial",
                 "trial": trial,
@@ -2220,6 +2397,10 @@ def run_grasp_loop(
                 "stagedS": round(staged_s, 1),
                 "stagedSnapshots": staged_snapshots,
             }
+            if trial_lighting is not None:
+                row["lighting"] = trial_lighting
+            if inference_latency_s is not None:
+                row["inferenceMs"] = latency_summary_ms(latency_s)
             if request.insertServo is not None:
                 # End to end: anything short of a peg in the hole is a miss of the whole task.
                 row["inserted"] = False
@@ -2371,6 +2552,12 @@ def run_grasp_loop(
                 f"width_lifted={row.get('widthLifted')} close_above_target_mm={row.get('closeAboveTargetMm')} "
                 f"lateral_mm={row.get('lateralMm')} trial_s={row['trialS']}"
                 + (f" inserted={_flag(row['inserted'])}" if "inserted" in row else "")
+                + (f" lighting={row['lighting']}" if row.get("lighting") else "")
+                + (
+                    f" infer_p50_ms={row['inferenceMs']['p50']} infer_p95_ms={row['inferenceMs']['p95']}"
+                    if row.get("inferenceMs")
+                    else ""
+                )
             )
         except Exception as exc:  # noqa: BLE001 - a motion fault ends the run, it must not end it silently
 
@@ -2462,7 +2649,15 @@ def run_grasp_loop(
         # Never end a run holding the peg in the air: put it down where it came from.
         place_held_peg(robot, request, peg_xyz, place_z=held_place_z, gripper=held_gripper, request_id="grasp_loop_park")
     set_force_trace_path(None)
+    drain_confirmations()
     summary = summarize_grasp_loop(done)
+    if lighting is not None:
+        summary["lighting"] = lighting_counts(done)
+    if inference_latency_s is not None:
+        # This session's inferences only: a resumed run's earlier ones are in their trial rows.
+        summary["inferenceMs"] = latency_summary_ms(run_latency_s)
+    if take_confirmations is not None or confirms:
+        summary["confirmations"] = summarize_confirmations(done, confirms)
     write({"kind": "run_end", "at": time.time(), "halted": halted, "summary": summary})
     e2e = summary.get("endToEnd") or {}
     notify(
@@ -2472,6 +2667,20 @@ def run_grasp_loop(
     )
     log(f"[INFO] grasp_loop=done halted={halted or 'no'} summary={json.dumps(summary, sort_keys=True)}")
     return {"halted": halted, "summary": summary}
+
+
+def _rows_of_kind(path: Path, kind: str) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == kind:
+            rows.append(row)
+    return rows
 
 
 def force_trace_path(out_path: Path) -> Path:
