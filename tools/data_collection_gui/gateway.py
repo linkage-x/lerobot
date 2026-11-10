@@ -11723,15 +11723,59 @@ FR3_REPLAY_STATE_COLUMNS = {
 }
 
 
+def _fr3_hand_roots(repo_root: Path) -> dict[str, str]:
+    """``hand -> root`` of the arm that replays that hand (embodiments/fr3_dual.json); {} without it."""
+    try:
+        description = json.loads((repo_root / _DUAL_FR3_EMBODIMENT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    roots: dict[str, str] = {}
+    for arm in (description.get("arms") or {}).values():
+        if not isinstance(arm, dict) or not arm.get("root"):
+            continue
+        for hand in arm.get("hands") or []:
+            roots.setdefault(str(hand), str(arm["root"]))
+    return roots
+
+
+def _episode_transforms_to(
+    graph: dict[str, Any], worlds: dict[int, str], root: str
+) -> tuple[dict[int, list[list[float]]], dict[str, Any]] | str:
+    """Every episode's ``T_root_world`` and the routes used, or why ``root`` cannot be reached."""
+    transforms: dict[int, list[list[float]]] = {}
+    routes: dict[str, Any] = {}
+    for index, world in worlds.items():
+        if world == root:
+            transforms[index] = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+            continue
+        found = wp.world_transform(graph, world, root)
+        if found is None:
+            retired = wp.retired_note(graph, world, root)
+            return (
+                f"episode {index} was recorded in {world} and no registration edge in "
+                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {root}; "
+                "its poses cannot be given to the FR3" + (f"\n{retired}" if retired else "")
+            )
+        transforms[index] = found[0]
+        routes[world] = {"T_root_world": found[0], "edges": found[1]}
+    return transforms, routes
+
+
 def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | None:
-    """Write the sidecar's state_action CSVs re-expressed in fr3_base; return their dir.
+    """Write each sidecar state_action CSV re-expressed in the base of the arm that replays it; return their dir.
+
+    A hand goes to its own arm's root (embodiments/fr3_dual.json: the right hand to fr3_base_right), else
+    to fr3_base -- the one arm that replayed either hand before there were two. 11-10 the right arm was
+    registered (world -> fr3_base_right) while fr3_base's edge stayed retired, and every right-hand check
+    failed on a base it never needed. ``frame.json`` names each file's root (``roots``), and a hand no
+    root is reachable for is left out with the reason (``refused``); :func:`_fr3_trajectory_root` turns
+    that into an error for whoever asks for that hand.
 
     None when no episode has a ``world_frame`` block at all: those predate world
     provenance, when the tracker's world *was* the robot base, so their poses go to the
     FR3 as recorded. Raises when a block is not ``ok`` (the world is unknown, not the
-    base) or a stamped world has no registration edge to fr3_base -- handing such poses
-    to the arm unchanged drives it to coordinates of another frame, and MuJoCo would
-    even call that reachable.
+    base) or no hand reaches any root -- handing such poses to the arm unchanged drives it to
+    coordinates of another frame, and MuJoCo would even call that reachable.
     """
     sidecar = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
     blocks: dict[int, Any] = {}
@@ -11743,9 +11787,7 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         blocks[index] = _load_json_file(meta_path).get("world_frame")
     if all(block is None for block in blocks.values()):
         return None
-    graph = wp.read_world_graph(repo_root)
-    transforms: dict[int, list[list[float]]] = {}
-    routes: dict[str, Any] = {}
+    worlds: dict[int, str] = {}
     for index, block in blocks.items():
         world = wp.world_frame_id_of(block)
         if not world:
@@ -11753,21 +11795,18 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
                 f"episode {index} of {dataset_root.name} has no usable world stamp "
                 f"({wp.describe(block)}); its frame is unknown, so it cannot be replayed on the FR3"
             )
-        if world == wp.FR3_BASE_WORLD_ID:
-            transforms[index] = [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
-            continue
-        found = wp.world_transform(graph, world, wp.FR3_BASE_WORLD_ID)
-        if found is None:
-            retired = wp.retired_note(graph, world, wp.FR3_BASE_WORLD_ID)
-            raise RuntimeError(
-                f"episode {index} was recorded in {world} and no registration edge in "
-                f"{wp.WORLD_SUBDIR / wp.WORLD_GRAPH_FILE} reaches {wp.FR3_BASE_WORLD_ID}; "
-                "its poses cannot be given to the FR3" + (f"\n{retired}" if retired else "")
-            )
-        transforms[index] = found[0]
-        routes[world] = {"T_fr3_base_world": found[0], "edges": found[1]}
+        worlds[index] = world
+    graph = wp.read_world_graph(repo_root)
+    hand_roots = _fr3_hand_roots(repo_root)
+    reached: dict[str, tuple[dict[int, list[list[float]]], dict[str, Any]] | str] = {}
+
+    def reach(root: str) -> tuple[dict[int, list[list[float]]], dict[str, Any]] | str:
+        if root not in reached:
+            reached[root] = _episode_transforms_to(graph, worlds, root)
+        return reached[root]
+
     out_dir = sidecar / FR3_BASE_TRAJECTORY_SUBDIR
-    written = []
+    out_dir.mkdir(parents=True, exist_ok=True)
     sources: dict[str, str] = {}
     recorded = _dataset_state_values(
         dataset_root,
@@ -11776,17 +11815,34 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         sources=sources,
     )
     carried: dict[str, dict[str, int]] = {column: {} for column in FR3_REPLAY_STATE_COLUMNS}
+    roots: dict[str, str] = {}
+    routes: dict[str, Any] = {}
+    refused: dict[str, str] = {}
     for src in sorted(sidecar.glob("state_action.*.csv")):
-        wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
-        for column, name in FR3_REPLAY_STATE_COLUMNS.items():
-            carried[column][src.name] = _fill_state_column(out_dir / src.name, column, recorded.get(name, {}))
-        written.append(src.name)
+        hand = src.name.removeprefix("state_action.").removesuffix(".csv")
+        candidates = list(dict.fromkeys(r for r in (hand_roots.get(hand), wp.FR3_BASE_WORLD_ID) if r))
+        reasons: list[str] = []
+        for root in candidates:
+            found = reach(root)
+            if isinstance(found, str):
+                reasons.append(found)
+                continue
+            transforms, routes[root] = found
+            wp.reexpress_pose_csv(src, out_dir / src.name, transforms)
+            for column, name in FR3_REPLAY_STATE_COLUMNS.items():
+                carried[column][src.name] = _fill_state_column(out_dir / src.name, column, recorded.get(name, {}))
+            roots[src.name] = root
+            break
+        else:
+            (out_dir / src.name).unlink(missing_ok=True)  # never leave a stale copy in another frame
+            refused[src.name] = f"{hand} hand: " + "\n".join(reasons)
     (out_dir / "frame.json").write_text(
         json.dumps(
             {
-                "world_frame_id": wp.FR3_BASE_WORLD_ID,
+                "roots": roots,
+                "refused": refused,
                 "from": routes,
-                "files": written,
+                "files": sorted(roots),
                 "gripper_width": {
                     "source": f"observation.state[{sources.get(DATASET_GRIPPER_WIDTH_NAME, DATASET_GRIPPER_WIDTH_NAME)}]",
                     "rows": carried["gripper_width_m"],
@@ -11800,7 +11856,21 @@ def _prepare_fr3_base_trajectory(dataset_root: Path, repo_root: Path) -> Path | 
         ),
         encoding="utf-8",
     )
+    if refused and not roots:
+        raise RuntimeError("\n".join(refused.values()))
     return out_dir
+
+
+def _fr3_trajectory_root(dataset_root: Path, repo_root: Path, cube: str) -> str:
+    """The base ``cube``'s FR3-facing copy is in (written now); raises with the reason when it has none."""
+    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
+    if fr3_dir is None:
+        return wp.FR3_BASE_WORLD_ID  # recorded before world stamps, in the base itself
+    frame = _load_json_file(fr3_dir / "frame.json")
+    name = f"state_action.{cube}.csv"
+    if name in (frame.get("refused") or {}):
+        raise RuntimeError(frame["refused"][name])
+    return str((frame.get("roots") or {}).get(name) or wp.FR3_BASE_WORLD_ID)
 
 
 FR3_REPLAY_THOR_CONFIG = Path(
@@ -11943,9 +12013,10 @@ def _fill_state_column(csv_path: Path, column: str, values: dict[tuple[int, int]
 
 
 def _fr3_trajectory_csv(dataset_root: Path, repo_root: Path, cube: str) -> Path:
-    """The state_action CSV of ``cube`` in the frame the FR3 commands in."""
-    fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
-    root = fr3_dir if fr3_dir is not None else dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
+    """The state_action CSV of ``cube`` in the base of the arm that replays it (raises when it has none)."""
+    _fr3_trajectory_root(dataset_root, repo_root, cube)
+    fr3_dir = _fr3_base_trajectory_dir_path(dataset_root)
+    root = fr3_dir if (fr3_dir / "frame.json").is_file() else dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
     return root / f"state_action.{cube}.csv"
 
 
@@ -11972,7 +12043,9 @@ def _run_fr3_ik_qc(
         fr3_dir = _prepare_fr3_base_trajectory(dataset_root, repo_root)
     except RuntimeError as exc:
         return {"status": "fail", "message": str(exc), "cubes": []}
+    refused: dict[str, str] = {}
     if fr3_dir is not None:
+        refused = _load_json_file(fr3_dir / "frame.json").get("refused") or {}
         cube_paths = {cube: fr3_dir / path.name for cube, path in cube_paths.items()}
 
     script_path = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
@@ -11986,6 +12059,9 @@ def _run_fr3_ik_qc(
 
     cube_results: list[dict[str, Any]] = []
     for cube, csv_path in cube_paths.items():
+        if csv_path.name in refused:
+            cube_results.append({"cube": cube, "status": "fail", "message": refused[csv_path.name]})
+            continue
         try:
             with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
                 has_valid_pose = any(_pose_from_csv_row(row) is not None for row in csv.DictReader(csv_file))
@@ -18566,6 +18642,13 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
     report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
     video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
     fr3_dir = _prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    if fr3_dir is not None:
+        # a hand no base reaches has no copy; planning it would read nothing, or a stale file
+        refused = _load_json_file(fr3_dir / "frame.json").get("refused") or {}
+        cubes = ("left", "right") if selected_cube_mode == "both" else (selected_cube_mode,)
+        blocked = [refused[name] for name in (f"state_action.{cube}.csv" for cube in cubes) if name in refused]
+        if blocked:
+            raise RuntimeError("\n".join(blocked))
     command = [
         str(_mujoco_replay_python(state)),
         str(
@@ -18786,13 +18869,8 @@ def _real_replay_command(
             / "replay_cube_pose_in_robot_base.py"
         ),
         "--config_path",
-        str(
-            state.repo_root
-            / "third_party"
-            / "opencv_kalibr"
-            / "fr3_data_collection_replay"
-            / "replay_cube_pose_in_robot_base.thor.yaml"
-        ),
+        # The arm's own YAML: its gripper backend and BOX differ (11-02 the gripper went to the right arm).
+        str(state.repo_root / _arm_replay_config(state, robot_ip)),
         "--input.source=csv",
         f"--input.csv_path={csv_path}",
         "--input.pose_prefix=state",
@@ -18829,6 +18907,21 @@ def _real_replay_command(
             ]
         )
     return command
+
+
+def _arm_replay_config(state: GatewayState, robot_ip: str) -> Path:
+    """The replay YAML of the arm at ``robot_ip`` (fr3_arms.json); the left arm's when the IP is no arm's.
+
+    Real replay only starts on a registered arm (:func:`_drive_target`), so the fallback is for callers
+    that build a command without one.
+    """
+    try:
+        registry = fr3_arms.load(repo_root=state.repo_root)
+    except (OSError, ValueError):
+        return FR3_REPLAY_THOR_CONFIG
+    arm = fr3_arms.arm_for_ip(registry, str(robot_ip))
+    config = ((registry.get("arms") or {}).get(arm) or {}).get("replay_config") if arm else None
+    return Path(config) if config else FR3_REPLAY_THOR_CONFIG
 
 
 def _robot_arms_payload(state: GatewayState) -> dict[str, Any]:
@@ -19366,13 +19459,15 @@ def _start_real_replay(
 
     target = _drive_target(state, arm, robot_ip)
     if not workstation:
-        # One arm replays a recording in its own base, and the dataset is in fr3_base (the left arm's
-        # since 10-26, roadmap C0). Another arm's targets go through the world graph -- the two-arm replay's job.
+        # One arm replays a hand in its own base. The FR3-facing copy puts each hand in its arm's root
+        # (the right hand in fr3_base_right once that is registered, else fr3_base), so the arm must
+        # be the one whose base the copy is in; anything else drives it to another arm's coordinates.
         root = _arm_root(state, target["arm"])
-        if root != wp.FR3_BASE_WORLD_ID:
+        trajectory_root = _fr3_trajectory_root(dataset_root, state.repo_root, cube_mode)
+        if root != trajectory_root:
             raise ValueError(
-                f"the {target['arm']} arm commands in {root or '?'}, the dataset is in {wp.FR3_BASE_WORLD_ID}; "
-                "replay it from the two-arm panel, which moves its targets through the world graph"
+                f"the {target['arm']} arm commands in {root or '?'}, the {cube_mode} trajectory is in "
+                f"{trajectory_root}; replay it on the arm whose base that is, or from the two-arm panel"
             )
     selected_ip = target["robot_ip"]
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")

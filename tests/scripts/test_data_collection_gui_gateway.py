@@ -1938,7 +1938,99 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
     assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real
     row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
-    assert json.loads((fr3_dir / "frame.json").read_text())["from"]["world_a"]["T_fr3_base_world"] == edge_matrix
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["from"]["fr3_base"]["world_a"]["T_root_world"] == edge_matrix
+    assert frame["roots"] == {"state_action.right.csv": "fr3_base"} and frame["refused"] == {}
+
+
+def _two_arm_stamped_dataset(tmp_path, edges):
+    """A stamped dataset with a left and a right hand, the repo's dual-FR3 description and ``edges``."""
+    state, dataset_root = _stamped_replay_dataset(tmp_path, edges=edges)
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    (sidecar / "state_action.left.csv").write_text((sidecar / "state_action.right.csv").read_text(), encoding="utf-8")
+    graph_path = state.repo_root / "tools" / "thor" / "gmsl2" / "world" / "world_graph.json"
+    graph = json.loads(graph_path.read_text())
+    graph["nodes"].append({"world_frame_id": "fr3_base_right"})
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+    embodiment = state.repo_root / gateway._DUAL_FR3_EMBODIMENT
+    embodiment.parent.mkdir(parents=True, exist_ok=True)
+    embodiment.write_text((Path(__file__).resolve().parents[2] / gateway._DUAL_FR3_EMBODIMENT).read_text())
+    return state, dataset_root
+
+
+def test_each_hand_goes_to_the_base_of_the_arm_that_replays_it(tmp_path):
+    # 11-10: world -> fr3_base_right went live while fr3_base's edge stayed retired; the IK check
+    # failed the right hand on fr3_base, a base the right arm never commands in.
+    edge_matrix = [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge_matrix}],
+    )
+    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
+    stale = fr3_dir / "state_action.left.csv"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("left over from an earlier edge\n")
+
+    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "right") == "fr3_base_right"
+    row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
+    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    frame = json.loads((fr3_dir / "frame.json").read_text())
+    assert frame["roots"] == {"state_action.right.csv": "fr3_base_right"}
+    # the left hand reaches neither its arm's base nor any other: refused with the reason, no stale copy
+    assert "reaches fr3_base;" in frame["refused"]["state_action.left.csv"]
+    assert not stale.exists()
+    with pytest.raises(RuntimeError, match="left hand: episode 0 was recorded in world_a"):
+        gateway._fr3_trajectory_root(dataset_root, state.repo_root, "left")
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
+        gateway._mujoco_replay_command(state, dataset_root, "left")
+    with pytest.raises(RuntimeError, match="left hand"):
+        gateway._mujoco_replay_command(state, dataset_root, "both")
+    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
+
+
+def test_a_hand_falls_back_to_fr3_base_while_its_own_arm_is_unregistered(tmp_path):
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
+    )
+    # one FR3 replayed either hand before there were two; that still holds until the right is registered
+    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "right") == "fr3_base"
+    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "left") == "fr3_base"
+
+
+def test_the_right_arm_replays_the_right_hand_in_its_own_base_with_its_own_config(tmp_path, monkeypatch):
+    edge = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge}],
+    )
+    _write_planned_mujoco_start(dataset_root, "right")
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.210")
+    config = command[command.index("--config_path") + 1]
+    assert config == str(state.repo_root / "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml")
+    left = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
+    assert left[left.index("--config_path") + 1] == str(state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG)
+
+    # the start guard lets the right arm through, and refuses the left arm the right hand's base
+    monkeypatch.setattr(gateway, "_require_mujoco_validation", lambda *a, **k: dataset_root)
+    monkeypatch.setattr(gateway, "_read_sidecar_cube_poses", lambda *a: {"right": [object()]})
+    monkeypatch.setattr(gateway, "_trajectory_tcp_link", lambda *a: "")
+    monkeypatch.setattr(gateway, "_box_port_conflict", lambda *a: "")
+    state.replay.mujocoValidation = {"cubeMode": "right"}
+
+    class PastTheGuardError(Exception):
+        pass
+
+    def stop(*_a, **_k):
+        raise PastTheGuardError
+
+    monkeypatch.setattr(gateway, "_start_realsense_preview", stop)
+    with pytest.raises(PastTheGuardError):
+        gateway._start_real_replay(state, "right", arm="right")
+    with pytest.raises(ValueError, match="left arm commands in fr3_base, the right trajectory is in fr3_base_right"):
+        gateway._start_real_replay(state, "right", arm="left")
 
 
 def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):

@@ -177,6 +177,18 @@ As of 2026-11-10 the live edges are **world → fr3_base_right** (four balls,
 see [Right arm, four balls](#result-2026-11-10-right-arm-four-balls)); world →
 fr3_base is still retired and there is no arm-arm edge.
 
+The GUI's FR3-facing copy of a trajectory (`derived/.../fr3_base/`, read by the
+offline IK check, the MuJoCo preview and single-arm real replay) puts each hand
+in the base of the arm that replays it (`embodiments/fr3_dual.json`: the right
+hand to `fr3_base_right`), falling back to `fr3_base` while that arm is not
+registered. `frame.json` names each file's base (`roots`) and the hands no base
+is reachable for (`refused`). Single-arm real replay runs on the arm whose base
+that is, with that arm's replay YAML. Until 2026-11-10 every hand went to
+`fr3_base`, so the right hand failed `fr3_ik_reachability` on the retired edge.
+Exports (`export_v3 --target-world`) and the two-arm replay still take
+`fr3_base` as the dataset frame (roadmap C0), so they cannot use the right edge
+alone yet.
+
 ### The guard against a graph brought back by a deploy (2026-11-03)
 
 A deploy mirrors the deployer's tree, `world_graph.json` included: a tree
@@ -701,7 +713,10 @@ stalled 0.46 s in a Python full garbage collection (every execute run has one
 ~0.4 s stall at ~48.7 s; long runs hit a second), the arm held its last
 command, and the plan index, taken from the wall clock, jumped ahead by up to
 1.7° of joint motion when the loop resumed. Trimming the last 10 samples does
-not change its fit.
+not change its fit. Fixed the same day in `fr3_pivot_auto.py`: no garbage
+collection inside the execute and guide loops (`hold_gc`), and the plan's
+clock advances at most `EXECUTE_MAX_CLOCK_STEP_S` per tick, so a stall pauses
+the plan. A run records its stalls in `loop_stalls`.
 
 **Result.** Rigid Kabsch, handheld `s` shared over the four positions:
 
