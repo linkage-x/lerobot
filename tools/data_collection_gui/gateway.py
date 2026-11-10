@@ -112,6 +112,13 @@ GRIPPER_RIG_V9B_TARGET = "gripper_rig_v9b"
 GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_tracking_in_robot_base_thor.yaml"
 )
+# The same holder on the right hand-held gripper (BOX 3906437858), ids 100/101/110/111,
+# target `right`; its own corner table (pads from the 11-09 paste check) and bundle (TCP
+# from its own 11-09 pivots, the mean of two recordings 0.35 mm apart, validated).
+GRIPPER_RIG_V9B_RIGHT_TARGET = "gripper_rig_v9b_right"
+GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_right_tracking_in_robot_base_thor.yaml"
+)
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -132,15 +139,20 @@ TRACKING_TARGETS = {
         "algorithm": "hybrid_carrier_v1_anchors_facets",
     },
     GRIPPER_RIG_V9B_TARGET: {
-        "label": "Gripper Rig v9b (ArUco 106-109)",
+        "label": "Gripper Rig v9b left (ArUco 106-109)",
         "config": GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
+        "algorithm": "marker_layout_rig_corner_ba",
+    },
+    GRIPPER_RIG_V9B_RIGHT_TARGET: {
+        "label": "Gripper Rig v9b right (ArUco 100/101/110/111)",
+        "config": GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
         "algorithm": "marker_layout_rig_corner_ba",
     },
 }
 # Rigs the marker->TCP pivot solve accepts. The cube's corner table is resolved
 # from the production cube template; a layout rig ships its own table, its own
 # dictionary and its own CAD bundle, all named by its tracking config.
-MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET)
+MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET, GRIPPER_RIG_V9B_RIGHT_TARGET)
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -5681,7 +5693,11 @@ _TRACKING_CONFIG = (
 )
 # Trackers that read the same camera rig. Promotion keeps them on the run
 # _TRACKING_CONFIG points at; they are never the authority on what is live.
-_FOLLOWER_TRACKING_CONFIGS = (HYBRID_CARRIER_EE_TRAJECTORY_CONFIG, GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG)
+_FOLLOWER_TRACKING_CONFIGS = (
+    HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
+    GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
+    GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
+)
 
 
 def _load_active_calibration_runs(state: GatewayState) -> None:
@@ -8166,7 +8182,7 @@ def _ensure_tracker_sidecars(
         ep_dirs = [dataset / "episodes" / f"episode_{ep:06d}" for ep in sorted(episodes)]
         if any(_marker_tcp_sidecar_is_current(dataset, cube, ep_dirs) for cube in cubes):
             continue
-        _queue_traj_gen(state, dataset)
+        _queue_traj_gen(state, dataset, tracking_target=_tracking_target_for_episodes(state, dataset, sorted(episodes)))
         job = _await_traj_gen(state, dataset, on_progress=lambda _text: None)
         if job.get("status") != "complete":
             raise RuntimeError(f"{dataset.name} 的 EE 轨迹生成失败：{job.get('message') or job.get('status')}")
@@ -8180,6 +8196,29 @@ def _ensure_tracker_sidecars(
     if solved[best] == 0:
         raise RuntimeError("这些段里哪个 cube 都没解出一帧——相机看不到钢片所在的 BOX？")
     return best
+
+
+def _tracking_target_for_episodes(state: GatewayState, dataset: Path, episodes: list[int]) -> str:
+    """The tracker to label these episodes with: the rig their hand-held BOX is mounted on.
+
+    As the marker->TCP solve picks it (``_marker_tcp_rig_for_box``). Generating with the cube's tracker
+    by default, a ball check on a rig v9b pivot (11-09: the right rig, BOX 3906437858) would track an
+    AprilTag cube that is not there. The cube's tracker when the episodes name no hand-held BOX, or
+    BOXes on different targets.
+    """
+    targets: set[str] = set()
+    for episode in episodes:
+        meta = _read_json_file(dataset / "episodes" / f"episode_{int(episode):06d}" / "meta.json") or {}
+        devices = meta.get("box_devices") if isinstance(meta.get("box_devices"), dict) else {}
+        for box_id, info in devices.items():
+            if not isinstance(info, dict) or info.get("role") != "handheld":
+                continue
+            key = str(box_id).strip().lower()
+            try:
+                targets.add(_marker_tcp_rig_for_box(state, key if key.startswith("box") else f"box{key}"))
+            except (OSError, ValueError, KeyError):
+                targets.add(DEFAULT_TRACKING_TARGET)
+    return targets.pop() if len(targets) == 1 else DEFAULT_TRACKING_TARGET
 
 
 def _tracker_row_pairs(state: GatewayState, rows: list[dict[str, str]]) -> list[tuple[Path, int]]:

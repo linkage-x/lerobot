@@ -8281,6 +8281,35 @@ def test_a_capture_nobody_tracked_is_tracked_before_the_fit(tmp_path, monkeypatc
     assert queued == [dataset]
 
 
+@_real_sidecar_ensure
+def test_a_rig_pivot_nobody_tracked_is_tracked_with_its_boxs_rig(tmp_path, monkeypatch):
+    """11-09: the right rig's pivot (BOX 3906437858) has no AprilTag cube for the default tracker."""
+    dataset = tmp_path / "ds"
+    meta = dataset / "episodes" / "episode_000000" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    meta.write_text(json.dumps({"box_devices": {"3906437858": {"role": "handheld", "hand": "right"}}}))
+    os.utime(meta, (time.time() + 60,) * 2)
+    rigs = {"box3906437858": "gripper_rig_v9b_right"}
+    monkeypatch.setattr(gateway, "_marker_tcp_rig_for_box", lambda _s, box: rigs.get(box, gateway.DEFAULT_TRACKING_TARGET))
+    queued: list[str] = []
+
+    def track(_state, root, tracking_target=gateway.DEFAULT_TRACKING_TARGET, **_kw):
+        queued.append(tracking_target)
+        _sidecar(root, "right", [(0, True)])
+        os.utime(gateway._marker_tcp_sidecar_path(root, "right"), (time.time() + 120,) * 2)
+
+    monkeypatch.setattr(gateway, "_queue_traj_gen", track)
+    monkeypatch.setattr(gateway, "_await_traj_gen", lambda *a, **k: {"status": "complete"})
+    state = _tracker_mount_state(tmp_path)
+    assert gateway._ensure_tracker_sidecars(state, [(dataset, 0)]) == "right"
+    assert queued == ["gripper_rig_v9b_right"]
+    # a BOX on no rig, or none named: the cube's tracker as before
+    meta.write_text(json.dumps({"box_devices": {"3969000000": {"role": "handheld"}}}))
+    assert gateway._tracking_target_for_episodes(state, dataset, [0]) == gateway.DEFAULT_TRACKING_TARGET
+    meta.write_text("{}")
+    assert gateway._tracking_target_for_episodes(state, dataset, [0]) == gateway.DEFAULT_TRACKING_TARGET
+
+
 def test_a_tracker_fit_route_does_not_hold_the_gateway(tmp_path, monkeypatch):
     """A fit can wait minutes on a traj-gen job; snapshots must keep answering."""
     import urllib.request
@@ -10066,3 +10095,59 @@ def test_box_button_goes_through_the_real_start_checks(tmp_path, monkeypatch):
     state.box_button_last_action_s = float("-inf")
     _press(state, "single")
     assert state.recording.state == "recording" and written[-1] == "\n"
+
+
+def test_the_right_hand_rig_is_its_own_target_and_its_box_picks_it(tmp_path):
+    repo_root = tmp_path / "repo"
+    target_dir = _install_rig_v9b(repo_root)
+    source_dir = _RIG_V9B_SOURCE.parent
+    for name in (
+        gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG.name,
+        "gripper_rig_v9b_right_marker_layout.json",
+        "marker_to_tcp_calibration_gripper_rig_v9b_right.json",
+    ):
+        shutil.copy2(source_dir / name, target_dir / name)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    right = gateway._marker_tcp_layout_rig(state, "gripper_rig_v9b_right")
+    left = gateway._marker_tcp_layout_rig(state, "gripper_rig_v9b")
+    assert right["cubeName"] == "right" and left["cubeName"] == "left"
+    assert right["dictionary"] == left["dictionary"] == "DICT_6X6_250"
+    layout = json.loads(Path(right["layoutPath"]).read_text())
+    assert sorted(m["id"] for m in layout["markers"]) == [100, 101, 110, 111]
+    # the pads are the paste check's, not the operator's left-to-right read as CAD L/R
+    assert {m["id"]: m["pad"] for m in layout["markers"]} == {
+        100: "R_side", 101: "R_front", 110: "L_front", 111: "L_side"
+    }
+    # the TCP is the mean of two pivot recordings, so the bundle says validated
+    assert right["bundleEntry"]["device_id"] == "box3906437858"
+    bundle = json.loads((target_dir / "marker_to_tcp_calibration_gripper_rig_v9b_right.json").read_text())
+    assert bundle["validated"] is True
+    assert bundle["cubes"]["right"]["expected_pivot_points_mm"]["insert_nov4_socket_centre"] == [0.41, 0.07, 168.5]
+    # each hand-held BOX's pivot is solved on its own rig
+    assert gateway._marker_tcp_rig_for_box(state, "box3906437858") == "gripper_rig_v9b_right"
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039") == "gripper_rig_v9b"
+    assert gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert "gripper_rig_v9b_right" in gateway.MARKER_TCP_RIGS
+
+
+def test_the_arm_held_6d_zero_reads_the_recorder_through_the_gateway(tmp_path: Path) -> None:
+    state = _marker_tcp_gateway_state(tmp_path)
+    cal = gateway._payload_calibration(state)
+    host = cal.host
+    assert "Connect" in host.recorder_box_refusal()  # no recorder process
+    state.device_preview["box"] = {"active": True, "updatedAt": 1.0, "sensors": {"box1/box_imu": {"acc_g": [0, 0, 1]}}}
+    state.box_devices_roster = [{"device_id": 1, "box_id": "box1"}]
+    assert host.box_preview()["sensors"]["box1/box_imu"]["acc_g"] == [0, 0, 1]
+    assert host.box_roster() == [{"device_id": 1, "box_id": "box1"}]
+    assert host.six_d_cali_log() == (False, [])
+    refused = host.trigger_six_d_cali(False, "box1")
+    assert not refused["ok"] and "Connect" in refused["error"]
+    route = gateway._PAYLOAD_CALIBRATION_ROUTES["/api/calibration/fr3-six-d-zero/start"]
+    res = route(state, {"arm": "right", "mode": "dynamic", "confirmed": True})
+    assert not res["ok"] and "zeroReports" in res
