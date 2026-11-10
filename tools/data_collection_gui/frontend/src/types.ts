@@ -255,6 +255,8 @@ export type ReplayStatus = {
   pid?: number | null;
   lastOutput?: string;
   mujocoCubeMode?: MujocoCubeMode;
+  // Thor: the arm whose base the last MuJoCo preview planned in ("" = the hand's own arm).
+  mujocoArm?: string;
   mujocoValidation?: MujocoValidation;
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;

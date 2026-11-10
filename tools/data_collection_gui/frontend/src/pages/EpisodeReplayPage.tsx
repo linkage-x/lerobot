@@ -217,10 +217,20 @@ export function RealRobotReplayPanel({
     (validation.cubeMode ?? status.mujocoCubeMode) === mode;
   const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
+  // Either arm replays either hand, in its own base; MuJoCo must have planned in that same base
+  // (no arm chosen then = the hand's own arm, which carries the hand's name).
+  const mujocoArm = status.mujocoArm || mode;
+  const mujocoArmMismatch = armRequired && Boolean(arm) && mujocoArm !== arm;
   const active = status.state === "replaying" || status.state === "sim_replay";
   const twoArmOnly = status.datasetKind === "pseudo_bimanual";
   const disabled =
-    busy || active || status.datasetKind === "exported" || twoArmOnly || !validationDecisionAvailable || !ipValid;
+    busy ||
+    active ||
+    status.datasetKind === "exported" ||
+    twoArmOnly ||
+    !validationDecisionAvailable ||
+    !ipValid ||
+    mujocoArmMismatch;
   const phase = status.realPhase ?? "";
   const trackerState = status.realTrackerState ?? "";
   const trackerBlocksExecute = Boolean(status.realRecordTracker) && trackerState !== "ready";
@@ -322,7 +332,15 @@ export function RealRobotReplayPanel({
             <div><span>End effector</span><strong>{REAL_REPLAY_GRIPPER_LABELS[endEffectorMode]} · {targetFrame}</strong></div>
           </div>
           {armRequired ? (
-            <ArmPicker arms={arms} value={arm} onChange={onArmChange} disabled={busy || active} />
+            <>
+              <ArmPicker arms={arms} value={arm} onChange={onArmChange} disabled={busy || active} />
+              {mujocoArmMismatch ? (
+                <p className="panel-note real-robot-home-error">
+                  MuJoCo {mode} was planned in the {mujocoArm} arm's base; run MuJoCo {mode} again with the {arm} arm
+                  selected before replaying on it.
+                </p>
+              ) : null}
+            </>
           ) : (
             <label className="real-robot-ip-field">
               <span>Robot IP</span>
@@ -1123,7 +1141,7 @@ export function EpisodeReplayPage({
   snapshot: GuiSnapshot;
   busy: boolean;
   onPreflight: (arm: string) => void;
-  onMujocoReplay: (mode: MujocoCubeMode) => void;
+  onMujocoReplay: (mode: MujocoCubeMode, arm: string) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
   onRealReplay: (
     mode: RealCubeMode,
@@ -1195,7 +1213,7 @@ export function EpisodeReplayPage({
         revision={snapshot.replay.revision ?? 0}
         mujocoMode={mujocoMode}
         onMujocoModeChange={setMujocoMode}
-        onRunMujoco={onMujocoReplay}
+        onRunMujoco={(mode) => onMujocoReplay(mode, arm)}
         onApproveMujoco={onApproveMujoco}
         replayStatus={snapshot.replay}
         busy={busy}

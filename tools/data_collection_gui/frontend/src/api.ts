@@ -434,8 +434,11 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async startMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}`);
+  // arm: the arm selected for real replay; the preview plans in its base (empty: each hand's own arm's).
+  async startMujocoReplay(cubeMode: MujocoCubeMode, arm = ""): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(
+      `/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}&arm=${encodeURIComponent(arm)}`
+    );
     if (remote) {
       return remote;
     }

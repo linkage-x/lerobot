@@ -177,17 +177,26 @@ As of 2026-11-10 the live edges are **world → fr3_base_right** (four balls,
 see [Right arm, four balls](#result-2026-11-10-right-arm-four-balls)); world →
 fr3_base is still retired and there is no arm-arm edge.
 
-The GUI's FR3-facing copy of a trajectory (`derived/.../fr3_base/`, read by the
-offline IK check, the MuJoCo preview and single-arm real replay) puts each hand
-in the base of the arm that replays it (`embodiments/fr3_dual.json`: the right
-hand to `fr3_base_right`), falling back to `fr3_base` while that arm is not
-registered. `frame.json` names each file's base (`roots`) and the hands no base
-is reachable for (`refused`). Single-arm real replay runs on the arm whose base
-that is, with that arm's replay YAML. Until 2026-11-10 every hand went to
-`fr3_base`, so the right hand failed `fr3_ik_reachability` on the retired edge.
-Exports (`export_v3 --target-world`) and the two-arm replay still take
-`fr3_base` as the dataset frame (roadmap C0), so they cannot use the right edge
-alone yet.
+The GUI hands a trajectory to an FR3 through a copy re-expressed in that arm's
+base, one directory per base under `derived/<sidecar>/`: `fr3_base/` for the
+left arm, `fr3_base_right/` for the right. Either arm replays either hand: the
+MuJoCo preview plans in the base of the arm selected in the replay panel, and
+real replay refuses an arm whose base is not the one the preview planned in
+(its start joints and coordinates belong to that base), using the arm's own
+replay YAML. `by_arm/` puts each hand in its own arm's base
+(`embodiments/fr3_dual.json`), or another arm's while its own is unregistered;
+the offline IK check and the two-robot preview read it. Each `frame.json` names
+every file's base (`roots`) and the hands no edge reaches it for (`refused`,
+with the copy removed). Until 2026-11-10 every hand went to `fr3_base`, so the
+right hand failed `fr3_ik_reachability` on the retired edge. A recording from
+before world stamps is in `fr3_base` as recorded and replays on the left arm
+only.
+
+The two-arm replay (C2–C4) reaches each arm's base through the graph on its
+own; it also needs the bases' placement relative to each other, for the
+collision checks. With `fr3_base` retired it is refused, as is any left-arm
+replay, until the left arm gets its own ball edge. Exports
+(`export_v3 --target-world`) still take `fr3_base` as the dataset frame (C0).
 
 ### The guard against a graph brought back by a deploy (2026-11-03)
 

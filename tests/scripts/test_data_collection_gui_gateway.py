@@ -1907,12 +1907,13 @@ def _stamped_replay_dataset(tmp_path: Path, *, edges: list[dict]) -> tuple[gatew
     return state, dataset_root
 
 
-def _write_planned_mujoco_start(dataset_root, cube, episode=0):
-    """A MuJoCo preview report carrying the start joints the real replay is handed."""
+def _write_planned_mujoco_start(dataset_root, cube, episode=0, read=None):
+    """A MuJoCo preview report carrying the start joints the real replay is handed; ``read`` is the copy it planned on."""
     report_path = gateway._mujoco_preview_report_path(dataset_root, episode, cube)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps({
+            "dataset_root": str(read or ""),
             "initial_joints": "trajectory_start",
             "robots": {cube: {"trajectory_start": {"feasible": True, "joints_rad": [0.1] * 7}}},
         }),
@@ -1927,19 +1928,22 @@ def test_fr3_facing_replays_read_the_trajectory_in_fr3_base(tmp_path):
         tmp_path,
         edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": edge_matrix}],
     )
-    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
+    fr3_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+    by_arm = gateway._fr3_trajectory_dir_path(dataset_root, gateway.FR3_BY_ARM_TRAJECTORY_SUBDIR)
 
     mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
     _write_planned_mujoco_start(dataset_root, "right")
     real = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.99")
 
     # The camera-world sidecar is never what the arm (simulated or real) is given.
-    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
-    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(by_arm)
+    assert gateway._fr3_copy_root(by_arm, "right") == "fr3_base"
+    assert f"--input.csv_path={fr3_dir / 'state_action.right.csv'}" in real  # an IP that is no arm's: fr3_base
     row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
     frame = json.loads((fr3_dir / "frame.json").read_text())
     assert frame["from"]["fr3_base"]["world_a"]["T_root_world"] == edge_matrix
+    assert frame["root"] == "fr3_base"
     assert frame["roots"] == {"state_action.right.csv": "fr3_base"} and frame["refused"] == {}
 
 
@@ -1966,27 +1970,35 @@ def test_each_hand_goes_to_the_base_of_the_arm_that_replays_it(tmp_path):
         tmp_path,
         edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge_matrix}],
     )
-    fr3_dir = gateway._fr3_base_trajectory_dir_path(dataset_root)
-    stale = fr3_dir / "state_action.left.csv"
+    by_arm = gateway._fr3_trajectory_dir_path(dataset_root, gateway.FR3_BY_ARM_TRAJECTORY_SUBDIR)
+    right_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base_right")
+    left_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+
+    assert gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "right") == by_arm / "state_action.right.csv"
+    row = next(csv.DictReader((by_arm / "state_action.right.csv").open()))
+    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
+    # the left hand's own arm is unregistered: the other arm, which can replay it, is where it is checked
+    frame = json.loads((by_arm / "frame.json").read_text())
+    assert frame["roots"] == {"state_action.left.csv": "fr3_base_right", "state_action.right.csv": "fr3_base_right"}
+    assert frame["refused"] == {}
+
+    # the left arm's base is reached by nothing: its copy is refused, with the reason, and no stale file stays
+    stale = left_dir / "state_action.left.csv"
     stale.parent.mkdir(parents=True)
     stale.write_text("left over from an earlier edge\n")
-
-    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "right") == "fr3_base_right"
-    row = next(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
-    assert [float(row[k]) for k in ("state_x_m", "state_y_m", "state_z_m")] == pytest.approx([0.8, 2.1, 3.3])
-    frame = json.loads((fr3_dir / "frame.json").read_text())
-    assert frame["roots"] == {"state_action.right.csv": "fr3_base_right"}
-    # the left hand reaches neither its arm's base nor any other: refused with the reason, no stale copy
-    assert "reaches fr3_base;" in frame["refused"]["state_action.left.csv"]
-    assert not stale.exists()
     with pytest.raises(RuntimeError, match="left hand: episode 0 was recorded in world_a"):
-        gateway._fr3_trajectory_root(dataset_root, state.repo_root, "left")
+        gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "left", "fr3_base")
+    assert not stale.exists()
     with pytest.raises(RuntimeError, match="reaches fr3_base;"):
-        gateway._mujoco_replay_command(state, dataset_root, "left")
-    with pytest.raises(RuntimeError, match="left hand"):
-        gateway._mujoco_replay_command(state, dataset_root, "both")
-    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right")
-    assert mujoco[mujoco.index("--dataset-root") + 1] == str(fr3_dir)
+        gateway._mujoco_replay_command(state, dataset_root, "right", "left")
+
+    # the right arm previews either hand in its own base; "both" puts each hand on an arm that reaches it
+    for cube in ("right", "left"):
+        mujoco = gateway._mujoco_replay_command(state, dataset_root, cube, "right")
+        assert mujoco[mujoco.index("--dataset-root") + 1] == str(right_dir)
+    assert gateway._fr3_copy_root(right_dir, "left") == "fr3_base_right"
+    both = gateway._mujoco_replay_command(state, dataset_root, "both", "right")
+    assert both[both.index("--dataset-root") + 1] == str(by_arm)
 
 
 def test_a_hand_falls_back_to_fr3_base_while_its_own_arm_is_unregistered(tmp_path):
@@ -1996,29 +2008,17 @@ def test_a_hand_falls_back_to_fr3_base_while_its_own_arm_is_unregistered(tmp_pat
         edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity}],
     )
     # one FR3 replayed either hand before there were two; that still holds until the right is registered
-    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "right") == "fr3_base"
-    assert gateway._fr3_trajectory_root(dataset_root, state.repo_root, "left") == "fr3_base"
+    by_arm = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
+    assert gateway._fr3_copy_root(by_arm, "right") == "fr3_base"
+    assert gateway._fr3_copy_root(by_arm, "left") == "fr3_base"
 
 
-def test_the_right_arm_replays_the_right_hand_in_its_own_base_with_its_own_config(tmp_path, monkeypatch):
-    edge = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
-    state, dataset_root = _two_arm_stamped_dataset(
-        tmp_path,
-        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge}],
-    )
-    _write_planned_mujoco_start(dataset_root, "right")
-    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.210")
-    config = command[command.index("--config_path") + 1]
-    assert config == str(state.repo_root / "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml")
-    left = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
-    assert left[left.index("--config_path") + 1] == str(state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG)
-
-    # the start guard lets the right arm through, and refuses the left arm the right hand's base
+def _guarded_real_start(monkeypatch, state, dataset_root):
+    """``_start_real_replay`` up to its arm/base guard: past it, it raises PastTheGuardError."""
     monkeypatch.setattr(gateway, "_require_mujoco_validation", lambda *a, **k: dataset_root)
-    monkeypatch.setattr(gateway, "_read_sidecar_cube_poses", lambda *a: {"right": [object()]})
+    monkeypatch.setattr(gateway, "_read_sidecar_cube_poses", lambda *a: {"right": [object()], "left": [object()]})
     monkeypatch.setattr(gateway, "_trajectory_tcp_link", lambda *a: "")
     monkeypatch.setattr(gateway, "_box_port_conflict", lambda *a: "")
-    state.replay.mujocoValidation = {"cubeMode": "right"}
 
     class PastTheGuardError(Exception):
         pass
@@ -2027,10 +2027,64 @@ def test_the_right_arm_replays_the_right_hand_in_its_own_base_with_its_own_confi
         raise PastTheGuardError
 
     monkeypatch.setattr(gateway, "_start_realsense_preview", stop)
-    with pytest.raises(PastTheGuardError):
+    return PastTheGuardError
+
+
+def test_the_right_arm_replays_the_right_hand_in_its_own_base_with_its_own_config(tmp_path, monkeypatch):
+    edge = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[{"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": edge}],
+    )
+    right_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base_right")
+    gateway._mujoco_replay_command(state, dataset_root, "right", "right")
+    _write_planned_mujoco_start(dataset_root, "right", read=right_dir)
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.1.210")
+    config = command[command.index("--config_path") + 1]
+    assert config == str(state.repo_root / "tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml")
+    assert f"--input.csv_path={right_dir / 'state_action.right.csv'}" in command
+    # the left arm's IP: its own YAML, and its own (unreachable) base -- never the right arm's copy
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
+        gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
+
+    # the start guard lets the right arm through, and refuses the left arm: no edge reaches its base
+    past = _guarded_real_start(monkeypatch, state, dataset_root)
+    state.replay.mujocoValidation = {"cubeMode": "right"}
+    with pytest.raises(past):
         gateway._start_real_replay(state, "right", arm="right")
-    with pytest.raises(ValueError, match="left arm commands in fr3_base, the right trajectory is in fr3_base_right"):
+    with pytest.raises(RuntimeError, match="reaches fr3_base;"):
         gateway._start_real_replay(state, "right", arm="left")
+
+
+def test_either_arm_replays_either_hand_once_both_bases_are_registered(tmp_path, monkeypatch):
+    identity = [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    shifted = [[1.0, 0, 0, 0.5], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    state, dataset_root = _two_arm_stamped_dataset(
+        tmp_path,
+        edges=[
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base", "T_to_from": identity},
+            {"from_world_frame_id": "world_a", "to_world_frame_id": "fr3_base_right", "T_to_from": shifted},
+        ],
+    )
+    left_dir = gateway._fr3_trajectory_dir_path(dataset_root, "fr3_base")
+    # the left arm replays a right-hand recording: previewed and executed in the left arm's base
+    mujoco = gateway._mujoco_replay_command(state, dataset_root, "right", "left")
+    assert mujoco[mujoco.index("--dataset-root") + 1] == str(left_dir)
+    _write_planned_mujoco_start(dataset_root, "right", read=left_dir)
+    command = gateway._real_replay_command(state, dataset_root, "right", "192.168.11.102")
+    assert f"--input.csv_path={left_dir / 'state_action.right.csv'}" in command
+    assert command[command.index("--config_path") + 1] == str(state.repo_root / gateway.FR3_REPLAY_THOR_CONFIG)
+    row = next(csv.DictReader((left_dir / "state_action.right.csv").open()))
+    right_row = next(csv.DictReader(gateway._fr3_trajectory_csv(dataset_root, state.repo_root, "right", "fr3_base_right").open()))
+    assert float(right_row["state_x_m"]) - float(row["state_x_m"]) == pytest.approx(0.5)
+
+    past = _guarded_real_start(monkeypatch, state, dataset_root)
+    state.replay.mujocoValidation = {"cubeMode": "right"}
+    with pytest.raises(past):
+        gateway._start_real_replay(state, "right", arm="left")
+    # the right arm is refused the left arm's plan: another base's start joints and coordinates
+    with pytest.raises(ValueError, match="checked the right trajectory in fr3_base, but the right arm commands in fr3_base_right; select that arm and run MuJoCo right again"):
+        gateway._start_real_replay(state, "right", arm="right")
 
 
 def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
@@ -2067,7 +2121,7 @@ def test_fr3_base_trajectory_carries_the_recorded_box_gripper_opening(tmp_path):
         data_dir / "file-000.parquet",
     )
 
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
 
     rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(r["gripper_width_m"]) for r in rows[:2]] == pytest.approx([0.0887, 0.0323])
@@ -2121,7 +2175,7 @@ def test_fr3_base_trajectory_reads_the_handheld_box_when_the_arm_box_was_recorde
         data_dir / "file-000.parquet",
     )
 
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
 
     rows = list(csv.DictReader((fr3_dir / "state_action.right.csv").open()))
     assert [float(r["gripper_width_m"]) for r in rows] == pytest.approx([0.0887, 0.0326])
@@ -2132,7 +2186,7 @@ def test_fr3_base_trajectory_reads_the_handheld_box_when_the_arm_box_was_recorde
 
     # Without knowing which BOX is on the arm there are two candidates: nothing is guessed.
     replay_yaml.write_text("robot: {}\n", encoding="utf-8")
-    fr3_dir = gateway._prepare_fr3_base_trajectory(dataset_root, state.repo_root)
+    fr3_dir = gateway._prepare_fr3_trajectory(dataset_root, state.repo_root)
     assert json.loads((fr3_dir / "frame.json").read_text())["gripper_width"]["rows"] == {"state_action.right.csv": 0}
 
 

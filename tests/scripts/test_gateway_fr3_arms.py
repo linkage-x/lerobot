@@ -64,14 +64,14 @@ def test_the_preflight_runs_against_the_arm_s_own_config(tmp_path: Path) -> None
     assert "--robot-ip=192.168.11.103" in command
 
 
-def test_single_arm_replay_is_only_for_the_arm_whose_base_the_trajectory_is_in(tmp_path: Path, monkeypatch) -> None:
+def test_a_recording_from_before_world_stamps_replays_only_on_the_arm_in_fr3_base(tmp_path: Path, monkeypatch) -> None:
     state = _state(tmp_path)
     monkeypatch.setattr(gateway, "_require_mujoco_validation", lambda *a, **k: state.selected_replay_root)
     monkeypatch.setattr(gateway, "_read_sidecar_cube_poses", lambda *a: {"left": [object()], "right": [object()]})
     monkeypatch.setattr(gateway, "_trajectory_tcp_link", lambda *a: "")
     state.replay.mujocoValidation = {"cubeMode": "right"}
-    # no world stamps: recorded in the robot base itself, fr3_base (the left arm's)
-    with pytest.raises(ValueError, match="right arm commands in fr3_base_right, the right trajectory is in fr3_base;"):
+    # no world stamps: recorded in the robot base itself, fr3_base (the left arm's), and in no other
+    with pytest.raises(RuntimeError, match="predates world stamps: its poses are in fr3_base as recorded, and no edge takes them to fr3_base_right"):
         gateway._start_real_replay(state, "right", arm="right")
 
 
