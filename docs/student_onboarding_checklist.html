@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学生上手清单</title>
+<meta name="description" content="新同学从拿到账号到提出第一个 PR 的逐项清单：维护者开通、本地环境、第一次 Thor 沙箱、标准练习任务、常见报错（2026-11-11，路线图 P2-8）。">
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--code:#f3f4f6;--accent:#2563eb;--warn:#b45309;--warn-bg:#fffbeb;--ok:#15803d;--ok-bg:#ecfdf5;--bad:#b91c1c;--bad-bg:#fef2f2}
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code:#222733;--accent:#60a5fa;--warn:#fbbf24;--warn-bg:#2a2210;--ok:#4ade80;--ok-bg:#12271b;--bad:#f87171;--bad-bg:#2a1414}}
+  :root[data-theme="dark"]{--bg:#0f1115;--card:#171a21;--text:#e5e7eb;--muted:#9ca3af;--line:#2a2f3a;--code:#222733;--accent:#60a5fa;--warn:#fbbf24;--warn-bg:#2a2210;--ok:#4ade80;--ok-bg:#12271b;--bad:#f87171;--bad-bg:#2a1414}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.7 system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif}
+  main{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+  h1{font-size:26px;margin:8px 0 4px}h2{font-size:19px;margin:0 0 10px}h3{font-size:16px;margin:16px 0 6px}
+  .sub{color:var(--muted);margin:0 0 20px}
+  section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:16px 0}
+  code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:.9em;word-break:break-all}
+  pre{background:var(--code);padding:10px 12px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-top:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}
+  th{color:var(--muted);font-weight:600}.scroll{overflow-x:auto}
+  .ok{background:var(--ok-bg);border-left:4px solid var(--ok);padding:10px 14px;border-radius:8px}
+  .ask{background:var(--warn-bg);border-left:4px solid var(--warn);padding:10px 14px;border-radius:8px}
+  .no{background:var(--bad-bg);border-left:4px solid var(--bad);padding:10px 14px;border-radius:8px}
+  ul,ol{padding-left:1.3em;margin:6px 0}
+  ul.check{list-style:none;padding-left:0}
+  ul.check li{display:flex;gap:8px;align-items:flex-start;margin:4px 0}
+  ul.check input{margin-top:6px;flex:none}
+  .who{display:inline-block;font-size:12px;font-weight:700;padding:0 6px;border-radius:4px;margin-right:4px;border:1px solid var(--line);color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>学生上手清单</h1>
+<p class="sub">2026-11-11 · 从拿到账号到第一个 PR 被审，大约半天。按顺序做，每一步做完再往下。规则以 <code>AGENTS.md</code> 为准，本页只讲怎么上手；后续计划见 <code>docs/student_dev_workflow_roadmap.html</code>。</p>
+
+<section>
+  <h2>0 · 先记住三件事</h2>
+  <div class="no">
+  <ol>
+    <li><b>生产永远不碰。</b>Thor 上 <code>/home/nvidia/lerobot</code>（端口 8765）是大家录数据用的。不往里部署，不改里面的文件，不重启它的网关，不传 <code>--maintainer</code>。你只用自己的沙箱。</li>
+    <li><b>机器人不由你（或你的 AI）启动。</b>真机回放、pivot、负载辨识、move-to-start、双臂回零、真机推理：必须有人守急停，由维护者操作。不创建 <code>outputs/fr3_infer_real_unlock.json</code>。</li>
+    <li><b>门禁挡住你时，报告原因，不要"修"门禁。</b>MuJoCo / IK QC、world graph 红条、cart check、label provenance、部署守卫、沙箱硬件守卫都一样。标定和 world 文件不经维护者不改。</li>
+  </ol>
+  </div>
+</section>
+
+<section>
+  <h2>1 · 维护者先开通（每位同学一次）</h2>
+  <div class="ask" style="margin-bottom:10px"><b>第一次给任何同学 write 之前（一次性）：</b>GitHub 没有"只能写自己分支"的权限，write 能推所有<b>没有保护</b>的分支，还能在自己分支上改 workflow，读到仓库 secrets（仓库是公开的，Actions 日志也公开）。所以先：
+    <ul>
+      <li><code>main</code> 和其他长期分支加保护（必须 PR、禁止 force push 和删除）；</li>
+      <li>没在用的仓库 secret 删掉；CI 用的子模块 deploy key 移进只允许 <code>box</code> 使用的 environment，学生分支上的 workflow 读不到。</li>
+    </ul>
+  </div>
+  <p>同学把 <b>GitHub 用户名</b>和 <b>ssh 公钥</b>（<code>~/.ssh/id_ed25519.pub</code>）发给维护者。维护者逐项开通：</p>
+  <ul class="check">
+    <li><input type="checkbox"><span><span class="who">维护者</span><code>linkage-x/lerobot</code> 设为 <b>write</b>。read 只能从 fork 提 PR，而 fork 的 PR 在 CI 里拿不到子模块密钥，测试必挂、永远合不进去。<br><code>gh api -X PUT repos/linkage-x/lerobot/collaborators/&lt;login&gt; -f permission=push</code></span></li>
+    <li><input type="checkbox"><span><span class="who">维护者</span>两个私有子模块 <code>linkage-x/opencv_kalibr</code>、<code>linkage-x/box-sdk</code> 至少 <b>read</b>，否则 <code>git submodule update</code> 失败。</span></li>
+    <li><input type="checkbox"><span><span class="who">维护者</span>公钥追加到 Thor <code>nvidia@192.168.111.122:~/.ssh/authorized_keys</code>，注释里写上名字，方便以后移除。</span></li>
+    <li><input type="checkbox"><span><span class="who">维护者</span>确认同学电脑在实验室网络里，能连到 Thor 的 22 端口和 8770–8799（沙箱网关端口）。</span></li>
+    <li><input type="checkbox"><span><span class="who">维护者</span>拉进开发群，告诉同学：找维护者走哪个渠道，生产多久发一次版。</span></li>
+  </ul>
+  <div class="ask" style="margin-top:10px">现在大家共用 <code>nvidia</code> 账号：能 ssh 上 Thor 的人，技术上能覆盖生产，守卫只防误操作。独立账号和硬件隔离（路线图 P2-1 / P2-2）做完之前，只给小范围、当面讲过第 0 节的同学开通。</div>
+</section>
+
+<section>
+  <h2>2 · 本地环境</h2>
+  <p>需要：Linux 或 macOS，<code>git</code>，<a href="https://docs.astral.sh/uv/"><code>uv</code></a>，Node.js 22（含 npm），以及你用的 AI 编码工具（Codex / Claude Code / Cursor…）。</p>
+  <ul class="check">
+    <li><input type="checkbox"><span>GitHub 账号已配 ssh key：<code>ssh -T git@github.com</code> 显示你的用户名。</span></li>
+    <li><input type="checkbox"><span>克隆仓库，从 <code>box</code> 开自己的分支，拉子模块：</span></li>
+  </ul>
+<pre>git clone git@github.com:linkage-x/lerobot.git
+cd lerobot
+git fetch origin
+git switch -c &lt;名字&gt;/onboarding origin/box
+git submodule update --init --recursive</pre>
+  <ul class="check">
+    <li><input type="checkbox"><span>Python 测试环境（与 CI 相同的依赖，够跑网关 / Thor / FR3 的测试；训练、推理另装）：</span></li>
+  </ul>
+<pre>uv venv -p 3.12 .venv
+uv pip install -p .venv/bin/python pytest pyyaml numpy scipy pyarrow av opencv-python-headless
+PYTHONPATH=src .venv/bin/python -m pytest -q --noconftest tests/scripts/test_data_collection_gui_gateway.py</pre>
+  <p style="color:var(--muted);margin:4px 0 10px"><code>--noconftest</code>：上游 LeRobot 的 conftest 会导入 torch，这些测试用不到。</p>
+  <ul class="check">
+    <li><input type="checkbox"><span>前端：</span></li>
+  </ul>
+<pre>cd tools/data_collection_gui/frontend
+npm ci
+npx tsc --noEmit &amp;&amp; npm test
+cd -</pre>
+  <ul class="check">
+    <li><input type="checkbox"><span>能登上 Thor：<code>ssh nvidia@192.168.111.122 hostname</code>。只用来部署沙箱，不在上面手工改东西。</span></li>
+    <li><input type="checkbox"><span>让你的 AI 工具在仓库根目录打开，并确认它读到了规则：问它"在沙箱里能不能调用真机回放？""能不能部署到生产？"，它应该引用 <code>AGENTS.md</code> 回答"不能"。答不上来就先让它读 <code>AGENTS.md</code>（Claude Code 通过 <code>CLAUDE.md</code> 自动加载，Codex 直接读 <code>AGENTS.md</code>）。</span></li>
+  </ul>
+</section>
+
+<section>
+  <h2>3 · 第一次进沙箱</h2>
+  <p>沙箱名用自己的名字（小写字母开头，2–24 位小写字母、数字、<code>-</code>、<code>_</code>，如 <code>zhangsan</code>）。以后一直用这个名字，端口会固定下来。</p>
+<pre>bash run/deploy.sh thor --sandbox &lt;名字&gt;</pre>
+  <ul class="check">
+    <li><input type="checkbox"><span>输出里有 <code>gateway started (… port 87xx, sandbox &lt;名字&gt;)</code>，然后本地前端启动在 <code>http://localhost:5173/</code>（被占用时 vite 换下一个端口，看输出）。第一次部署会从生产复制一份标定，要等一会儿。</span></li>
+    <li><input type="checkbox"><span>浏览器打开 GUI，顶部有黄条 <b>沙箱 &lt;名字&gt;</b> 和你的 commit。没有黄条就说明连的不是你的沙箱，立刻停下来问。</span></li>
+    <li><input type="checkbox"><span>复制一个<b>小</b>数据集进来（Thor 的磁盘也存着所有录制）：</span></li>
+  </ul>
+<pre>bash run/sandbox.sh datasets              # 生产里可复制的数据集和大小，可加过滤词
+bash run/sandbox.sh copy-dataset &lt;名字&gt; &lt;数据集&gt;
+bash run/sandbox.sh status &lt;名字&gt;         # 端口、版本、数据集、占用空间</pre>
+  <ul class="check">
+    <li><input type="checkbox"><span>在 GUI 里对这个数据集走一遍离线流程：轨迹生成 → IK QC → MuJoCo 预演 → 回放查看。卡住时看日志：<code>bash run/sandbox.sh logs &lt;名字&gt;</code>。</span></li>
+    <li><input type="checkbox"><span>亲眼确认硬件被拒：点一个需要相机 / BOX / 机械臂的按钮（如相机预览、BOX 连接），GUI 报错，内容是 <code>sandbox '&lt;名字&gt;' does not touch hardware: …</code>（HTTP 409）。这是预期行为，不要改它。</span></li>
+    <li><input type="checkbox"><span>本地前端用 Ctrl-C 关掉即可；沙箱网关在 Thor 上继续跑，不用时 <code>bash run/sandbox.sh stop &lt;名字&gt;</code>。</span></li>
+  </ul>
+</section>
+
+<section>
+  <h2>4 · 标准练习任务（走一遍完整的 PR 流程）</h2>
+  <p>目的是熟悉流程，不是写功能。练习 PR 以草稿提交，维护者看过就关掉，不合并。</p>
+  <ol>
+    <li>在 <code>&lt;名字&gt;/onboarding</code> 分支上，让 AI 帮你在 GUI 里做一个肉眼能看到的小改动：比如沙箱黄条（<code>tools/data_collection_gui/frontend/src/App.tsx</code> 里"沙箱"那一行）后面加上 <code>· 练习</code>。要求它只改这一处，不格式化别的代码。</li>
+    <li>本地跑 <code>npx tsc --noEmit &amp;&amp; npm test</code>（在前端目录），通过后提交。commit message 写"为什么"，例如 <code>chore(gui): onboarding exercise, mark my sandbox banner</code>。</li>
+    <li>重新部署沙箱：<code>bash run/deploy.sh thor --sandbox &lt;名字&gt;</code>，在 GUI 里看到改动，黄条里的 commit 变成新的。</li>
+    <li>推分支、开<b>草稿</b> PR，目标分支选 <b>box</b>：
+<pre>git push -u origin &lt;名字&gt;/onboarding
+gh pr create --draft --base box --title "练习：&lt;名字&gt; 上手" --body "上手练习，不合并"</pre></li>
+    <li>等 CI 两项（<i>Gateway / Thor / FR3 tests</i>、<i>GUI frontend</i>）变绿。PR 页面会显示需要维护者审核：<code>run/</code>、<code>tools/fr3/</code>、world/标定、<code>gateway.py</code> 等路径归 CODEOWNERS，改到这些地方一定会落到维护者手里。</li>
+    <li>把下面三样发给维护者，维护者看过后关闭 PR：PR 链接；<code>bash run/sandbox.sh status &lt;名字&gt;</code> 的输出；MuJoCo 预演通过的截图。</li>
+  </ol>
+  <div class="ok" style="margin-top:10px">做完这一节就算上手完成。之后的真实任务照同样的流程：<code>git switch -c &lt;名字&gt;/&lt;主题&gt; origin/box</code> → 本地测试 → 沙箱试跑 → PR 到 box → 维护者审核、合并、发版。一个 PR 只做一件事。</div>
+</section>
+
+<section>
+  <h2>5 · 常见报错</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>现象</th><th>原因</th><th>怎么办</th></tr></thead>
+    <tbody>
+      <tr><td><code>git submodule update</code> 报 <code>Repository not found</code></td><td>没有子模块仓库的读权限</td><td>找维护者开 <code>opencv_kalibr</code> / <code>box-sdk</code> 的 read（第 1 节）</td></tr>
+      <tr><td><code>git push</code> 报 403</td><td>主仓库只有 read</td><td>找维护者改成 write；不要改成从 fork 提 PR（CI 会因子模块失败）</td></tr>
+      <tr><td>部署拒绝：树不干净 / 不在 <code>origin/box</code></td><td>你在部署生产（漏了 <code>--sandbox</code>）</td><td>加上 <code>--sandbox &lt;名字&gt;</code>。不要提交、不要传 <code>--maintainer</code> 来"让它过"</td></tr>
+      <tr><td>沙箱名报错</td><td>名字不合规或是保留名</td><td>用小写的自己的名字</td></tr>
+      <tr><td><code>no free sandbox port in 8770-8799</code></td><td>30 个端口用完</td><td><code>bash run/sandbox.sh list</code> 看谁的沙箱不用了，在群里说；只删自己的</td></tr>
+      <tr><td>GUI 一直报莫名其妙的错 / 接口 404</td><td>前端和网关版本不一致</td><td>重新 <code>deploy.sh --sandbox</code>，让两边是同一个 commit；看 <code>/api/snapshot</code> 里的 <code>deployment.release</code></td></tr>
+      <tr><td>某个按钮返回 409 <code>does not touch hardware</code></td><td>沙箱没有硬件，预期行为</td><td>离线部分在沙箱做完，需要硬件的部分找维护者试</td></tr>
+      <tr><td>CI 里你没碰过的测试挂了</td><td>可能是 <code>box</code> 本身或环境问题</td><td>不要删测试、不要跳过，贴链接问维护者</td></tr>
+      <tr><td>复制数据集提示空间不足</td><td>Thor 至少留 30 GB 给录制</td><td>删掉自己不用的副本，挑小一点的数据集</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>6 · 日常习惯</h2>
+  <ul>
+    <li>每次开新任务都从最新的 <code>origin/box</code> 开分支；长期分支定期 <code>git rebase origin/box</code>（只 rebase 自己的分支）。</li>
+    <li>测试只跑你改到的文件对应的测试（<code>AGENTS.md</code> 第 5 节），lint 用 <code>uvx ruff@0.14.1 check &lt;文件&gt;</code>；不要整文件格式化。</li>
+    <li>mock 里的 pid 一定用真实整数，不要用裸 <code>MagicMock</code>：<code>os.killpg(MagicMock())</code> 会变成 <code>kill(-1)</code>，整个桌面会被注销。</li>
+    <li>沙箱里的数据集用完就删，长时间不用的沙箱 <code>bash run/sandbox.sh remove &lt;名字&gt; --yes</code>。</li>
+    <li>拿不准是否安全时先问。问一句很便宜，机械臂走错一步、丢一个数据集都很贵。</li>
+  </ul>
+</section>
+</main>
+</body>
+</html>
