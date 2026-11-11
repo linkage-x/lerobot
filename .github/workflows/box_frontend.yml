@@ -1,0 +1,38 @@
+# GUI frontend checks for every pull request into box. Needs no secrets, so it runs as a plain
+# pull_request (the PR's own copy of this file). Kept apart from box_checks.yml (pull_request_target):
+# a job skipped by an event filter still reports its check as passed.
+name: Box frontend
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - box
+
+permissions:
+  contents: read
+
+concurrency:
+  group: box-frontend-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: GUI frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tools/data_collection_gui/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/data_collection_gui/frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit -p .
+      - run: npm test
