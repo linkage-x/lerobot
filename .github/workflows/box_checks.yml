@@ -1,25 +1,35 @@
-# Checks every pull request into box (the reviewed branch production is deployed from).
+# Python checks for every pull request into box (the reviewed branch production is deployed from).
 #
 # The submodules (opencv_kalibr, box-sdk) are private and the tests read fr3_arms.json, replay configs
 # and the tracker from them. Each is cloned with its own read-only deploy key (one key cannot be a deploy
-# key on two repositories). Two repository secrets hold the private keys:
-#   SUBMODULE_KEY_OPENCV_KALIBR  -> deploy key "lerobot CI (box_checks, read-only)" on linkage-x/opencv_kalibr
-#   SUBMODULE_KEY_BOX_SDK        -> deploy key "lerobot CI (box_checks, read-only)" on linkage-x/box-sdk
+# key on two repositories). The private keys are secrets of the environment "box-ci", which only the
+# box branch may use:
+#   SUBMODULE_KEY_OPENCV_KALIBR  -> deploy key "lerobot CI (box-ci environment, read-only)" on linkage-x/opencv_kalibr
+#   SUBMODULE_KEY_BOX_SDK        -> deploy key "lerobot CI (box-ci environment, read-only)" on linkage-x/box-sdk
 # To rotate: ssh-keygen -t ed25519, add the .pub as a read-only deploy key on that repository, put the
-# private key in the secret. Pull requests from forks get no secrets, so their Python job cannot clone.
+# private key in the environment secret (gh secret set NAME --env box-ci).
+#
+# Why pull_request_target: students have write access, and a workflow on any branch they push can read
+# repository secrets. Environment secrets limited to box are only handed to runs whose workflow file
+# comes from box, which pull_request_target guarantees (it runs box's copy of this file, never the PR's).
+# Pull requests from forks are skipped. The PR's code is checked out explicitly; the keys are deleted before any of it runs, the checkout keeps
+# no token, and no cache is written (a run here would write box's cache scope).
+# A pull_request_target run reports its check on box's commit, so the job also sets the required status
+# "Gateway / Thor / FR3 tests" on the PR's head commit itself. The frontend job is in box_frontend.yml.
 name: Box checks
 
 on:
   workflow_dispatch:
-  pull_request:
+  pull_request_target:
     branches:
       - box
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
-  group: box-checks-${{ github.head_ref || github.run_id }}
+  group: box-checks-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -27,10 +37,26 @@ jobs:
     name: Gateway / Thor / FR3 tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Never for forks: anyone can open one against this public repository, and its code would run next
+    # to the private submodules. A fork PR gets no status here, so the required check keeps it unmergeable.
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    environment: box-ci
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      STATUS_CONTEXT: Gateway / Thor / FR3 tests
     steps:
+      - name: Mark the PR head pending
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state=pending \
+            -f context="$STATUS_CONTEXT" -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.HEAD_SHA }}
           lfs: false
+          persist-credentials: false
       - name: Private submodules (one deploy key each)
         env:
           KEY_OPENCV_KALIBR: ${{ secrets.SUBMODULE_KEY_OPENCV_KALIBR }}
@@ -61,7 +87,15 @@ jobs:
           git config --global url."git@github-opencv_kalibr:linkage-x/opencv_kalibr".insteadOf "git@github.com:linkage-x/opencv_kalibr"
           git config --global url."git@github-box_sdk:linkage-x/box-sdk".insteadOf "git@github.com:linkage-x/box-sdk"
           git submodule update --init --recursive --depth 1
+      - name: Remove the keys before running the PR's code
+        if: always()
+        run: |
+          rm -rf ~/.ssh
+          git config --global --unset-all url."git@github-opencv_kalibr:linkage-x/opencv_kalibr".insteadOf || true
+          git config --global --unset-all url."git@github-box_sdk:linkage-x/box-sdk".insteadOf || true
       - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
       - name: Test environment
         run: |
           # named .venv like a developer's checkout: the gateway looks for <repo>/.venv/bin/python
@@ -82,23 +116,13 @@ jobs:
             tests/scripts/test_thor_cart_redock_check.py \
             tests/scripts/test_thor_world_provenance.py \
             tests/scripts/test_fr3_arms.py
-
-  frontend:
-    name: GUI frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: tools/data_collection_gui/frontend
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          lfs: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: tools/data_collection_gui/frontend/package-lock.json
-      - run: npm ci --no-audit --no-fund
-      - run: npx tsc --noEmit -p .
-      - run: npm test
+      - name: Report the result on the PR head
+        if: always() && github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in success) state=success ;; cancelled) state=error ;; *) state=failure ;; esac
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state="$state" \
+            -f context="$STATUS_CONTEXT" -f description="$JOB_STATUS" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
