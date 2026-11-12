@@ -105,6 +105,11 @@ if [[ -x "$SDK_DIR/boost_clock.sh" ]]; then
   run bash "$SDK_DIR/boost_clock.sh" || true
 fi
 
+echo "==> Checking the trigger pad is driven by the PWM GPIO"
+# Lives in the repo's sdk/ even when --sdk points at the vendor pack.
+run sh "${SCRIPT_DIR}/sdk/ensure_trigger_pad.sh" \
+  || echo "WARNING: trigger pad not in GPIO mode -- cameras will free-run, hardware sync will fail" >&2
+
 echo "==> Programming PWM @ ${FPS}Hz on ${PWM_CHIP}/pwm${PWM_ID} (sync clock)"
 PERIOD_NS=$(awk -v fps="$FPS" 'BEGIN { printf "%d", 1000000000 / fps }')
 DUTY_NS=$(( PERIOD_NS / 2 ))

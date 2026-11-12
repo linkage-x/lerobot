@@ -10,6 +10,7 @@ trigger driven by the Jetson's own PWM.
 | File | Purpose |
 | --- | --- |
 | `setup_sync.sh` | Replacement for the SDK's `load_modules.sh` + `pwm.sh`. Loads the GMSL2 + AR0234 kernel modules, boosts VI/ISP/NVCSI/EMC clocks, programs `pwmchip6/pwm0` to the chosen sync frequency, and sets every channel to slave-trigger via `v4l2-ctl`. |
+| `sdk/ensure_trigger_pad.sh` | Checks (and with `fix`, sets) that the trigger pad PDD7 is in GPIO mode so the PWM reaches the SG16A board; called by `pwm.sh` and `setup_sync.sh`. |
 | `thor_gmsl2_11ch_example.yaml` | Recorder config with 11 GMSL2 cameras (no grippers / tactiles). Used by `tools/handheld/handheld_record.py` and by `tools/data_collection_gui/gateway.py`. |
 
 The actual Python driver lives at `src/lerobot/cameras/gmsl2/`. Registered draccus
@@ -133,6 +134,16 @@ venv (Thor's stock python3 works).
 * All cameras free-run at slightly different rates -> `--master-id` is set or
   PWM is off. Re-run `setup_sync.sh` without `--master-id`, then verify
   `cat /sys/class/pwm/pwmchip6/pwm0/enable` prints `1`.
+* PWM is armed (`enable` = 1), `trig_mode=1` is set, yet every camera runs at
+  exactly 16.660 ms (its own frame time) instead of averaging the PWM's
+  16.6667 ms, and cameras started at different times keep a constant
+  offset, so the online-sync recorder cannot form SOF clusters -> the trigger
+  pad `SOC_GPIO25_PDD7` is in SFIO mode and the pwm-gpio never reaches the
+  board. The flashed pinmux decides this, so a cloned or re-flashed Thor can
+  boot that way (thor2, 2026-11-12). `sudo sh sdk/ensure_trigger_pad.sh check`
+  tells; `pwm.sh` and `setup_sync.sh` run it in fix mode before arming the
+  PWM. A locked sensor shows 16.660 / 16.674 ms alternating intervals in
+  `sof_tsc_ns` (it waits for each edge); a free-running one never shows 16.674.
 * `connect()` warmup never produces a frame -> check the bus log line emitted by
   the driver (`GStreamer ERROR:`) for an Argus daemon error and inspect
   `/var/log/syslog` for CSI / TPG complaints.
