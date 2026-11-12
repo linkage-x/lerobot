@@ -32,6 +32,11 @@ if [ ! -d "$PWM_DIR" ]; then
     exit 1
 fi
 
+# The PWM only reaches the board when the trigger pad is in GPIO mode; a Thor
+# whose flashed pinmux leaves it in SFIO mode free-runs every camera.
+sh "$(dirname "$0")/ensure_trigger_pad.sh" \
+    || echo "WARNING: trigger pad not in GPIO mode -- cameras will free-run, hardware sync will fail" >&2
+
 # period = round(1e9 / fps); duty = period / 2 (50%)
 PERIOD_NS=$(awk -v fps="$FPS" 'BEGIN { printf "%d", 1000000000 / fps }')
 DUTY_NS=$(( PERIOD_NS / 2 ))
