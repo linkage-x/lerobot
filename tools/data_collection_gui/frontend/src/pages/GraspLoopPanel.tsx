@@ -134,6 +134,9 @@ export function GraspLoopPanel({
   const current = progress.currentTrial;
   const runName = (progress.out.split("/").pop() ?? "").replace(/\.jsonl$/, "");
   const confirmations = progress.confirmations ?? {};
+  // Attended, the loop already stops for a person's in/out at every insertion: a second column
+  // for the same word is noise. Unattended runs keep it (optional, never waited for).
+  const showConfirm = !progress.attended;
   const confirmedCount = Object.keys(confirmations).length;
   const disagreeCount = Object.values(confirmations).filter((c) => c.agrees === false).length;
   // Pooled over the trials' own p95s and p50s: the exact run-wide figure is in the run_end row.
@@ -367,7 +370,9 @@ export function GraspLoopPanel({
               <option value={progress.lighting}>{progress.lighting}</option>
             )}
           </select>
-          <span className="hint">改了从下一条开始记。表格最后一列可以补人工确认（可选，不会让循环停下等你）。</span>
+          <span className="hint">
+            改了从下一条开始记。{showConfirm && "表格最后一列可以补人工确认（可选，不会让循环停下等你）。"}
+          </span>
         </div>
       )}
 
@@ -401,7 +406,7 @@ export function GraspLoopPanel({
               <th>用时 s</th>
               <th>光照</th>
               <th>推理 p95 ms</th>
-              <th>人工确认</th>
+              {showConfirm && <th>人工确认</th>}
             </tr>
           </thead>
           <tbody>
@@ -421,19 +426,21 @@ export function GraspLoopPanel({
                 <td>{fmt(trial.trialS, 0)}</td>
                 <td>{trial.lighting ? LIGHTING_LABELS[trial.lighting] ?? trial.lighting : "—"}</td>
                 <td>{fmt(trial.inferP95Ms, 0)}</td>
-                <td>
-                  <ConfirmCell
-                    trial={trial}
-                    insert={Boolean(progress.insert)}
-                    given={confirmations[String(trial.trial)]}
-                    busy={busy}
-                    onConfirm={
-                      live && !progress.done && trial.verdict !== "voided"
-                        ? (outcome) => onControl("grasp_confirm", { outcome, trial: trial.trial })
-                        : undefined
-                    }
-                  />
-                </td>
+                {showConfirm && (
+                  <td>
+                    <ConfirmCell
+                      trial={trial}
+                      insert={Boolean(progress.insert)}
+                      given={confirmations[String(trial.trial)]}
+                      busy={busy}
+                      onConfirm={
+                        live && !progress.done && trial.verdict !== "voided"
+                          ? (outcome) => onControl("grasp_confirm", { outcome, trial: trial.trial })
+                          : undefined
+                      }
+                    />
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
