@@ -19,6 +19,10 @@ export type DeployedRelease = {
   /** The commit is on origin/box (a reviewed, merged version). */
   onBox: boolean | null;
   sandbox: string | null;
+  /** The run/targets/ machine deploy.sh wrote this tree to (absent from deploys before 11-11). */
+  target?: string | null;
+  /** The recording station that machine belongs to. */
+  station?: string | null;
 };
 
 export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator" | "laser_tracker";

@@ -2,10 +2,10 @@
 # Incrementally replace repository files on a deployment target.
 #
 # Usage:
-#   bash run/sync_to_target.sh [thor|workstation] [rsync options...]
-#   bash run/sync_to_target.sh thor --sandbox NAME [rsync options...]   # your own sandbox on Thor
+#   bash run/sync_to_target.sh TARGET [rsync options...]            # TARGET from run/targets/ (required)
+#   bash run/sync_to_target.sh TARGET --sandbox NAME [rsync options...]   # your own sandbox on a Thor
 #
-# Production (thor -> /home/nvidia/lerobot, workstation -> ~/Code/lerobot) only takes a clean,
+# Production (the target's repo_dir, e.g. thor1 -> /home/nvidia/lerobot) only takes a clean,
 # reviewed tree: no uncommitted or untracked files, and HEAD already merged into origin/box.
 # --maintainer lets a maintainer deploy a clean commit that is not on origin/box yet. A sandbox
 # takes any tree. A dry run (-n) reports what the guard would refuse and carries on.
@@ -18,8 +18,8 @@
 # failure.
 set -euo pipefail
 
-target="${1:-thor}"
-if [[ $# -gt 0 ]]; then
+target="${1:-}"
+if [[ $# -gt 0 && "$target" != -* ]]; then
   shift
 fi
 
@@ -60,30 +60,33 @@ fi
 # shellcheck source=run/sandbox_common.sh
 . "$(cd "$(dirname "$0")" && pwd)/sandbox_common.sh"
 
-case "$target" in
-  thor)
-    remote="nvidia@192.168.111.122"
-    remote_dir="/home/nvidia/lerobot"
-    ;;
-  workstation)
-    remote="hph@192.168.100.155"
-    remote_dir="/home/hph/Code/lerobot"
-    ;;
-  *)
-    echo "ERROR: unknown deployment target '$target' (expected thor or workstation)" >&2
-    exit 2
-    ;;
-esac
+require_target_name "$target"
+resolve_target "$target"
+target="$TARGET_NAME"
+remote="$TARGET_SSH"
+remote_dir="$TARGET_DIR"
 
 local_dir="$(cd "$(dirname "$0")/.." && pwd)/"
 
 if [[ -n "$sandbox" ]]; then
-  if [[ "$target" != "thor" ]]; then
-    echo "ERROR: sandboxes exist only on Thor" >&2
+  if [[ "$TARGET_SANDBOXES" != true ]]; then
+    echo "ERROR: ${target} has no sandboxes (run/targets/${target}.json); they exist only on Thor targets" >&2
     exit 2
   fi
   validate_sandbox_name "$sandbox"
   remote_dir="$(sandbox_dir "$sandbox")"
+fi
+
+require_target_identity
+
+# Until each station keeps its own calibration (run/targets/README.md, "per-station files"), the
+# world, camera-identity and tracking-config files in this tree are those of the machine whose
+# target file says calibration_in_tree. Anywhere else they describe someone else's cameras.
+if [[ "$TARGET_CALIBRATION_IN_TREE" != true && "$TARGET_PROFILE" == thor ]]; then
+  echo "WARNING: ${target}'s cameras are not the ones this tree's calibration describes" >&2
+  echo "         (tools/thor/gmsl2/world/*.json, camera_identity_expected.json, the tracking config)." >&2
+  echo "         Connect refuses to record when the camera serials do not match; do not promote or" >&2
+  echo "         export labels on ${target} until it has been calibrated as its own station." >&2
 fi
 
 # --- Production guard ---------------------------------------------------------
@@ -119,7 +122,7 @@ if [[ -z "$sandbox" ]]; then
     fi
     printf '         - %s\n' "${guard_problems[@]}" >&2
     echo "         To try your branch on Thor, deploy it to your own sandbox instead:" >&2
-    echo "           bash run/deploy.sh thor --sandbox <your-name>" >&2
+    echo "           bash run/deploy.sh ${target} --sandbox <your-name>" >&2
     echo "         To get it into production, open a pull request to box; a maintainer deploys after merging." >&2
     if ! $dry_run; then
       exit 6

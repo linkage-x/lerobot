@@ -36,16 +36,21 @@ run there. **Never deploy to it, never edit files in it, never restart its gatew
 production deploy unless the tree is clean and HEAD is already on `origin/box`; do not work around that, and
 never pass `--maintainer` (it is for maintainers deploying a reviewed commit).
 
+There is more than one Thor. Machines are listed in `run/targets/` (`python3 run/targets.py list`); `thor` means
+`thor1`. Every script needs the machine named; there is no default. Every Thor has its own production tree, the
+same rules and its own sandboxes. Never put a machine address into a script; add or change the target file
+(`run/targets/README.md`).
+
 Your sandbox is a separate directory on Thor with its own gateway port:
 
 ```bash
-bash run/deploy.sh thor --sandbox <your-name>      # sync your tree, start your gateway, open the GUI locally
-bash run/sandbox.sh datasets [filter]              # production datasets you may copy (with sizes)
-bash run/sandbox.sh copy-dataset <your-name> <dataset>...
-bash run/sandbox.sh status <your-name>             # port, version, datasets, size
-bash run/sandbox.sh logs <your-name>               # gateway log
-bash run/sandbox.sh stop <your-name>
-bash run/sandbox.sh list                           # everyone's sandboxes and free disk
+bash run/deploy.sh thor --sandbox <your-name>           # sync your tree, start your gateway, open the GUI locally
+bash run/sandbox.sh thor datasets [filter]              # production datasets you may copy (with sizes)
+bash run/sandbox.sh thor copy-dataset <your-name> <dataset>...
+bash run/sandbox.sh thor status <your-name>             # port, version, datasets, size
+bash run/sandbox.sh thor logs <your-name>               # gateway log
+bash run/sandbox.sh thor stop <your-name>
+bash run/sandbox.sh thor list                           # everyone's sandboxes and free disk
 ```
 
 - A sandbox **has no hardware**: cameras (one Argus slot), BOXes, the laser tracker and the FR3 arms belong to

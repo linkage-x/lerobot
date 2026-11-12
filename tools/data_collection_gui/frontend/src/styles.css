@@ -201,6 +201,11 @@ button.danger {
   font-size: 22px;
 }
 
+.topbar-target {
+  color: #60707c;
+  font-weight: 500;
+}
+
 .topbar p,
 .panel-note,
 .device-row p {

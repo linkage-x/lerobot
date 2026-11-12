@@ -1,0 +1,15 @@
+{
+  "station": null,
+  "user": "hph",
+  "address": "192.168.100.155",
+  "hostname": "tele-MS-7E07",
+  "repo_dir": "/home/hph/Code/lerobot",
+  "profile": "workstation",
+  "config": "tools/fr3/fr3_record_config.yaml",
+  "gateway_port": 8765,
+  "sandboxes": false,
+  "calibration_in_tree": false,
+  "box_net_addr": null,
+  "aliases": [],
+  "note": "FR3 + Pika teleop workstation (MuJoCo viewer on its own display)."
+}
