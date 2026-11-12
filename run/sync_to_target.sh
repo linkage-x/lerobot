@@ -82,7 +82,13 @@ require_target_identity
 # Until each station keeps its own calibration (run/targets/README.md, "per-station files"), the
 # world, camera-identity and tracking-config files in this tree are those of the machine whose
 # target file says calibration_in_tree. Anywhere else they describe someone else's cameras.
-if [[ "$TARGET_CALIBRATION_IN_TREE" != true && "$TARGET_PROFILE" == thor ]]; then
+if [[ "$TARGET_CALIBRATION_IN_TREE" != true && "$TARGET_PROFILE" == thor \
+      && ! -e "$local_dir/tools/thor/gmsl2/world/world_reference.json" \
+      && ! -e "$local_dir/tools/thor/gmsl2/camera_identity_expected.json" ]]; then
+  # A station release cut carries no calibration at all, so there is nothing to mismatch.
+  echo "NOTE: this tree has no camera/world calibration; recording works, EE trajectories, labels" >&2
+  echo "      and arm replay need ${target}'s own calibration first." >&2
+elif [[ "$TARGET_CALIBRATION_IN_TREE" != true && "$TARGET_PROFILE" == thor ]]; then
   echo "WARNING: ${target}'s cameras are not the ones this tree's calibration describes" >&2
   echo "         (tools/thor/gmsl2/world/*.json, camera_identity_expected.json, the tracking config)." >&2
   echo "         Connect refuses to record when the camera serials do not match; do not promote or" >&2
