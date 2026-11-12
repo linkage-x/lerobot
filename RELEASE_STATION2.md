@@ -16,7 +16,7 @@ that lab's cameras, table, carts, BOXes and FR3 arms and are wrong on any other 
 | `tools/thor/gmsl2/box_time_delays.json`, `cart_tags.json` | BOX timing calibration, cart AprilTag layout |
 | `tools/thor/gmsl2/embodiments/*.json`, `tools/fr3/fr3_arms.json`, `tools/fr3/desk_templates/`, `tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml` | FR3 arm registry, embodiments, Desk payload, replay config |
 | `third_party/opencv_kalibr`: marker→TCP calibrations, `*_tracking_in_robot_base_thor.yaml`, FR3 calibration/replay/eval configs with arm addresses | tool and tracking calibration, arm configs |
-| `docs/rig0818_vs_hybrid_carrier_v1/simulator/inputs/cameras_0804_fisheye.json` | a camera calibration used by a simulation study |
+| `docs/rig0818_vs_hybrid_carrier_v1/` | a simulation study built on the originating lab's camera poses and trajectories |
 
 `tools/thor/box_devices.json` is kept as an empty registry: add this station's BOXes there once
 they are characterised. Recording does not need any of the removed files; the recorder and the
