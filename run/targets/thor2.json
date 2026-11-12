@@ -1,15 +1,15 @@
 {
   "station": "station2",
   "user": "nvidia",
-  "address": "192.168.111.123",
+  "address": "CHANGE-ME",
   "hostname": "upai-thor2",
   "repo_dir": "/home/nvidia/lerobot",
   "profile": "thor",
-  "config": "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml",
+  "config": "tools/thor/gmsl2/thor_gmsl2_station2_4ch.yaml",
   "gateway_port": 8765,
   "sandboxes": true,
   "calibration_in_tree": false,
   "box_net_addr": null,
   "aliases": [],
-  "note": "Second Thor, an independent station (own cameras and BOXes). Shipped as a clone of thor1's image (hostname upai-pro03, renamed 2026-11-11). Not calibrated: the world/camera-identity files in this tree describe thor1's cameras. config is thor1's until thor2 has its own camera config."
+  "note": "Thor2 (hostname upai-thor2), handed over 2026-11. Set address to its wired address on your network. box_net_addr stays null for BOX firmware v4.1+ (DHCP, discovered); set it to \"192.168.2.45/24\" only for BOXes with the old fixed-address firmware."
 }

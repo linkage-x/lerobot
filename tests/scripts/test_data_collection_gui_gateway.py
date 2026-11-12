@@ -24,8 +24,15 @@ from tools.data_collection_gui import gateway
 
 @pytest.fixture(autouse=True)
 def _repo_arm_registry(monkeypatch):
-    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2)."""
-    registry = gateway.fr3_arms.load()
+    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2).
+
+    A station release ships without that file (no arms); tests that need arms then fail on
+    their own instead of every test erroring in this fixture.
+    """
+    try:
+        registry = gateway.fr3_arms.load()
+    except FileNotFoundError:
+        registry = {"schema": "fr3_arms/v1", "arms": {}}
     monkeypatch.setattr(gateway.fr3_arms, "load", lambda path=None, repo_root=None: registry)
 
 
