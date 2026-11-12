@@ -37,6 +37,23 @@ sudo apt install -y \
 | `v4l-utils` | GMSL2 录制时 v4l2-ctl push 控件 | hardware_sync 启用时报错（默认禁用时不影响） |
 | `python3-pip` | 安装 pyarrow / box_sdk wheel | `pip: command not found` |
 
+### 1.1 L4T 锁版本，不要随手 `apt upgrade`
+
+相机驱动（厂商包里的 `.ko`、替换进系统的模块、ISP/NITO 文件）是按 L4T **38.2.1**
+（内核 `6.8.12-tegra`）配的；NVIDIA 的 apt 源里已经有 38.2.2。一次 `apt upgrade`
+会整体升级 L4T，覆盖厂商模块，表现是相机突然不出帧，很难联想到是升级导致的。
+所以每台 Thor 都把已装的 `nvidia-l4t-*` hold 住（2026-11-11 起 thor1/thor2 都已 hold）：
+
+```bash
+sudo apt-mark hold $(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'nvidia-l4t-*' | awk '$1=="ii"{print $2}')
+apt-mark showhold | grep -c ^nvidia-l4t-     # 应等于已装的 nvidia-l4t-* 个数
+```
+
+- 装新包时如果 apt 想拉 38.2.2 的依赖（例如 `nvidia-l4t-gstreamer`），按现有机器的版本写死：
+  `sudo apt install pkg=<版本>`，先 `apt-get -s install …` 确认没有 `nvidia-l4t-*` 被升级。
+- 真要升 L4T：是维护者的决定，要连同厂商驱动、ISP 文件和仓库 `tools/thor/gmsl2/sdk/` 一起换，
+  先在非生产的那台上验证相机和硬同步，再 `apt-mark unhold`。
+
 ## 2. BOX SDK 兼容 symlink
 
 SDK 的 `.so` 是按旧 soname 编的（`libtinyxml2.so.9` / `liburdfdom_model.so.3.0`），
