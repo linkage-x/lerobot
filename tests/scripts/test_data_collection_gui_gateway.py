@@ -10492,6 +10492,16 @@ def test_snapshot_reports_what_deploy_wrote(tmp_path):
     release = gateway._snapshot(state)["deployment"]["release"]
     assert release["commit"] == "abc123" and release["onBox"] is True
     assert gateway._snapshot(state)["deployment"]["sandbox"] is None
+    # Older deploys wrote no target; the GUI then shows none rather than guessing a machine.
+    assert release["target"] is None and release["station"] is None
+
+
+def test_snapshot_reports_which_machine_deploy_targeted(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    state.devices = []
+    (tmp_path / "DEPLOYED.json").write_text(json.dumps({"commit": "abc123", "target": "thor2", "station": "station2"}))
+    release = gateway._snapshot(state)["deployment"]["release"]
+    assert release["target"] == "thor2" and release["station"] == "station2"
 
 
 def _cart_repo(tmp_path: Path) -> gateway.GatewayState:

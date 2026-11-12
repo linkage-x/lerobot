@@ -249,13 +249,13 @@ bash ~/lerobot/run/run_vite.sh &
 开发机改完代码后一条命令完成 同步 → 重启 gateway → 启动前端：
 
 ```bash
-bash run/deploy.sh              # 全流程：sync + restart gateway + start vite
-bash run/deploy.sh --sync-only  # 只同步代码，不重启/不启前端
-bash run/deploy.sh --no-frontend # 同步 + 重启 gateway，不启前端
+bash run/deploy.sh thor1               # 全流程：sync + restart gateway + start vite（必须写明目标，见 run/targets/）
+bash run/deploy.sh thor1 --sync-only   # 只同步代码，不重启/不启前端
+bash run/deploy.sh thor1 --no-frontend # 同步 + 重启 gateway，不启前端
 ```
 
 脚本执行：
-1. `rsync` 增量同步到 `nvidia@192.168.111.122:~/lerobot`（~1s）；EE-trajectory 标定目录 best-effort 同步，缺失只告警，需硬校验时使用 `REQUIRE_EE_CALIBRATION=1 bash run/deploy.sh`
+1. `rsync` 增量同步到 `nvidia@192.168.111.122:~/lerobot`（~1s）；EE-trajectory 标定目录 best-effort 同步，缺失只告警，需硬校验时使用 `REQUIRE_EE_CALIBRATION=1 bash run/deploy.sh thor1`
 2. SSH 到 Thor：kill 旧 gateway → `ensure_box_net.sh` → `setup_env.sh` → 后台启动 gateway
 3. 本地 `npm run dev` 启动 vite，代理 → `192.168.111.122:8765`
 4. 浏览器打开 `http://localhost:5173/`

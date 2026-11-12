@@ -341,7 +341,16 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>{deployment.label}</h1>
+          <h1>
+            {deployment.label}
+            {snapshot.deployment.release?.target ? (
+              <span className="topbar-target" title="run/deploy.sh 部署到的机器（run/targets/）与所属工位">
+                {" · "}
+                {snapshot.deployment.release.target}
+                {snapshot.deployment.release.station ? ` (${snapshot.deployment.release.station})` : ""}
+              </span>
+            ) : null}
+          </h1>
           <p>
             {workstationProfile
               ? `FR3 + Pika · SpaceMouse · ${snapshot.devices.filter((d) => d.kind === "camera").length} RealSense cameras`
