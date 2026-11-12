@@ -1338,6 +1338,56 @@ def test_out_keeps_hold_takes_the_peg_back_to_its_table_spot_and_regrips_it_ther
     assert result["summary"]["endToEnd"]["inserted"] == 1
 
 
+@pytest.mark.parametrize("reseat", [False, True])
+def test_a_peg_back_from_a_miss_eases_in_the_fingers_on_the_table_before_the_regrip_only_when_asked(
+    tmp_path, _fast_servo, reseat, monkeypatch
+):
+    """11-11: a miss leaves the peg crooked in the fingers; let go at once it falls. With
+    reseatAfterMiss the fingers first ease to just wider than the peg, on the table, and wait."""
+
+    holds = []
+    real_hold = grasp_loop.traced_hold
+
+    def hold(robot, request_id, name, seconds, *args, **kwargs):
+        holds.append((name, seconds))
+        return real_hold(robot, request_id, name, seconds, *args, **kwargs)
+
+    monkeypatch.setattr(grasp_loop, "traced_hold", hold)
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo(), reseatAfterMiss=reseat),
+        run_policy_trial=_policy(robot, [("grasp", 0.0), ("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["out", "in"], []),
+    )
+    rows = _trials(out)
+    assert [r["inserted"] for r in rows] == [False, True]
+    assert rows[0]["regripWidth"] == GraspRig.HELD_WIDTH and rows[1]["staging"] == "regrip"
+    loose = GraspRig.HELD_WIDTH + grasp_loop.GRASP_LOOP_RESEAT_LOOSEN
+    eased = [i for i, a in enumerate(robot.actions) if float(a["gripper.pos"]) == pytest.approx(loose)]
+    # Neither the clean insertion (trial 1) nor any other set-down eases.
+    assert "reseat" not in rows[1]
+    if not reseat:
+        assert not eased and "reseat" not in rows[0]
+        assert not [h for h in holds if h[0] == "reseat_dwell"]
+        return
+    record = rows[0]["reseat"]
+    assert record["widthHeld"] == GraspRig.HELD_WIDTH and record["loosenTo"] == pytest.approx(loose)
+    assert record["regripped"] is True
+    assert all("trial_000_reseat" in p for p in record["snapshots"])
+    # Eased at the table spot, low, and the full open comes after it at the same place.
+    first = robot.actions[eased[0]]
+    assert first["ee.z"] < TARGET_Z + 0.02
+    opened = next(i for i in range(eased[-1], len(robot.actions)) if float(robot.actions[i]["gripper.pos"]) >= 0.5)
+    assert math.dist(
+        (robot.actions[opened]["ee.x"], robot.actions[opened]["ee.y"]), (first["ee.x"], first["ee.y"])
+    ) < 0.002
+    # Eased, then held there for the dwell before anything opens.
+    assert [h for h in holds if h[0] == "reseat_dwell"] == [("reseat_dwell", grasp_loop.GRASP_LOOP_RESEAT_DWELL_S)]
+
+
 def test_nobody_grading_lets_the_servos_seated_verdict_decide(tmp_path, _fast_servo):
     robot = _insert_rig()
     out = tmp_path / "e2e.jsonl"

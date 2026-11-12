@@ -4564,6 +4564,18 @@ def test_the_bottom_teacher_switch_reaches_the_launcher_only_with_arm_b_an_inser
     assert "grasp_loop_args+=(--grasp-loop-funnel-bottom-teacher)" in launcher
 
 
+def test_the_reseat_switch_reaches_the_launcher_only_with_an_insert_pose():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    raw = {"graspLoopArms": "A", "graspLoopInsertPose": "0.3597,-0.1328,0.058", "graspLoopReseatAfterMiss": True}
+    assert sanitize(raw)["FR3_GRASP_LOOP_RESEAT_AFTER_MISS"] == "1"
+    assert "FR3_GRASP_LOOP_RESEAT_AFTER_MISS" not in sanitize({**raw, "graspLoopReseatAfterMiss": False})
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopInsertPose"):
+        sanitize({**raw, "graspLoopInsertPose": ""})
+    assert "FR3_GRASP_LOOP_RESEAT_AFTER_MISS" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert "grasp_loop_args+=(--grasp-loop-reseat-after-miss)" in launcher
+
+
 def test_the_late_takeover_settings_reach_the_launcher_only_with_the_corrective_funnel():
     """11-03 mass collection: how many trials the funnel takes late, how low, and keeping the
     policy's low steps (whole trials only) for the offline relabel."""

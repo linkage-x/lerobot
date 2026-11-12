@@ -605,6 +605,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-reseat-after-miss',
+        action='store_true',
+        help=(
+            'After a held peg misses the hole (it comes back crooked in the fingers): set it down, '
+            'ease the fingers to just wider than the peg and wait so it stands up, then open and '
+            're-grip as usual. Off: the plain set-down, after which the re-grip comes back empty.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-funnel-bottom-teacher',
         action='store_true',
         help=(
@@ -5953,6 +5962,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 funnelLateDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_late_dz_mm),
                 funnelKeepLowPolicy=bool(args.grasp_loop_funnel_keep_low_policy),
                 funnelBottomTeacher=bool(args.grasp_loop_funnel_bottom_teacher),
+                reseatAfterMiss=bool(args.grasp_loop_reseat_after_miss),
                 afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
@@ -5995,6 +6005,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 else ''
             )
             + f'funnel_bottom_teacher={int(grasp_loop_request.funnelBottomTeacher)} '
+            + f'reseat_after_miss={int(grasp_loop_request.reseatAfterMiss)} '
             + f'after_close={grasp_loop_request.afterClose} '
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )

@@ -223,6 +223,16 @@ GRASP_LOOP_CLOSE_STILL_TIMEOUT_S = 2.0
 # is kinder to the gripper cable. It takes joint 7 from 0.785 to about 2.36 rad, 0.66 rad inside
 # its 3.016 limit; the regrip always starts from home, so it does not stack on a policy's turn.
 GRASP_LOOP_REGRIP_TURN_RAD = math.pi / 2
+# `reseatAfterMiss` (11-11): a peg the hole did not take comes back crooked in the fingers. The
+# rim-face press (-9..-12 N peak; -3..-4 for a peg that goes in) levers it about the fingers'
+# contact: in all 13 held misses of runs 111514/130238 the side still after the search shows it
+# 20-30 deg off the tool axis, against 17/17 straight before the descent. Set down like that and
+# let go, it falls over, so the re-grip came back empty every time (17/17; a person each). Set
+# down, the fingers first ease to just wider than the peg they hold (the measured width plus
+# this, in gripper units: 0.31 is the 16 mm peg, so ~3 mm) and wait, with the peg's foot on the
+# table: unclamped, its foot turns flat and it stands up between them; then the usual open.
+GRASP_LOOP_RESEAT_LOOSEN = 0.06
+GRASP_LOOP_RESEAT_DWELL_S = 1.0
 GRASP_LOOP_TURN_S = 1.5
 GRASP_LOOP_UNTOUCHED_XY_M = 0.040
 GRASP_LOOP_UNTOUCHED_Z_M = 0.025
@@ -403,6 +413,9 @@ class GraspLoopRequest:
     # Arm B: the bottom teacher (GRASP_LOOP_BOTTOM_*, `funnel_config`). Not with funnelCorrective:
     # one demonstration per recording, so a finetune on it changes one thing.
     funnelBottomTeacher: bool = False
+    # After a held peg misses the hole: let it stand up in eased fingers before the re-grip
+    # (GRASP_LOOP_RESEAT_LOOSEN). Off: the plain set-down, which comes back empty.
+    reseatAfterMiss: bool = False
     seed: int = 0
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -1133,6 +1146,9 @@ def set_down_and_regrip(
     place_z: float,
     gripper: float,
     request_id: str,
+    reseat: bool = False,
+    reseat_snapshot: Callable[[], list[str]] | None = None,
+    reseat_record: dict[str, Any] | None = None,
 ) -> tuple[float, tuple[float, float, float]]:
     """Put a peg held in the policy's grip down under the lift, and take it again the script's way.
 
@@ -1140,6 +1156,10 @@ def set_down_and_regrip(
     home, so the re-grip is at the start orientation rather than whatever the policy's wrist
     was; then the reset's own pick at the measured release point. Answers the lifted width and
     where the fingers opened.
+
+    With `reseat` (a peg back from a missed insertion), the fingers ease off before they open,
+    so the crooked peg stands up first (GRASP_LOOP_RESEAT_LOOSEN). `reseat_snapshot` saves the
+    cameras after the wait; `reseat_record` gets what was done.
     """
 
     step_request = request.step_request(request_id)
@@ -1148,6 +1168,17 @@ def set_down_and_regrip(
     place = (xyz[0], xyz[1], place_z)
     _check_xyz_in_workspace(place, "descend_8cm_to_place", low, high)
     cap = _settled_descent(robot, step_request, "descend_8cm_to_place", place, rotvec, gripper)
+    if reseat:
+        _here, _rotvec, width = _observation_xyz_rotvec_gripper(robot)
+        loose = min(request.openGripper, float(width) + GRASP_LOOP_RESEAT_LOOSEN)
+        # Still toward the place height: as the peg's foot turns flat the fingers may slide down
+        # it, no lower than they closed on it standing (place_z is the close plus a margin).
+        _run_step(robot, step_request, "reseat_loosen", place, rotvec, loose)
+        traced_hold(robot, step_request.requestId, "reseat_dwell", GRASP_LOOP_RESEAT_DWELL_S, request.controlPeriodS)
+        snapshots = [] if reseat_snapshot is None else reseat_snapshot()
+        if reseat_record is not None:
+            reseat_record.update({"widthHeld": round(float(width), 4), "loosenTo": round(loose, 4), "snapshots": snapshots})
+        gripper = loose
     released = _open_and_settle(robot, request, step_request, place, rotvec, cap=cap, gripper=gripper)
     _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
     _move_to_start(robot)
@@ -2562,6 +2593,10 @@ def run_grasp_loop(
                         return_to_table(robot, request, peg_xyz, insert_rotvec, request_id=request_id)
                 if regrip:
                     assert handover.closeXyz is not None
+                    # A peg back from the hole (the insert's own row, or the rescue's) is crooked.
+                    missed = "insert" in row or "rescue" in row
+                    reseat = request.reseatAfterMiss and missed
+                    reseat_record: dict[str, Any] = {}
                     # Re-gripped now rather than at the next trial's staging, so a run that ends
                     # here parks a peg in the script's grip like any other.
                     width, set_down = set_down_and_regrip(
@@ -2571,8 +2606,16 @@ def run_grasp_loop(
                         # After an insertion the peg is on the script's full close, not the policy's.
                         gripper=request.closedGripper if "insert" in row else float(handover.commandedGripper),
                         request_id=request_id,
+                        reseat=reseat,
+                        reseat_snapshot=(
+                            None if snapshot_dir is None
+                            else lambda stem=f"trial_{trial:03d}_reseat": save_camera_frames(robot, snapshot_dir, stem)
+                        ),
+                        reseat_record=reseat_record,
                     )
                     regripped = grasp_is_held(width, request.closedGripper, held_width=request.heldWidth, blocked_margin=request.blockedMargin)
+                    if reseat:
+                        row["reseat"] = {**reseat_record, "regripped": regripped}
                     row["regripWidth"] = round(width, 4)
                     log(f"[INFO] grasp_loop_regrip trial={trial} width={width:.3f} held={regripped}")
                     if regripped:

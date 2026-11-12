@@ -26,6 +26,7 @@
 #     FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM (with corrective: late takeover height, "h" or "low,high"; blank = 15,40)
 #     FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY (1 = with whole trials, keep the policy's low steps for the relabel)
 #     FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER (1 = arm B descends beside the peg and slides across at the bottom)
+#     FR3_GRASP_LOOP_RESEAT_AFTER_MISS (1 = a held peg back from a missed insertion stands up in eased fingers before the re-grip)
 #     FR3_GRASP_LOOP_AFTER_CLOSE (script | teacher | policy: who inserts after the close; blank = script)
 #     FR3_GRASP_LOOP_SEED (peg positions and arm B's draws; blank = 0)
 #     FR3_GRASP_LOOP_LIGHTING (lighting label on each trial row: lab | lamp_moved | lamp_off | ...; blank = lab)
@@ -515,6 +516,8 @@ case "$mode" in
     if [[ "${FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-keep-low-policy); fi
     # Arm B: the bottom teacher -- down beside the peg, across to it at the bottom, close (unset = off).
     if [[ "${FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-funnel-bottom-teacher); fi
+    # After a missed insertion: let the crooked peg stand up before the re-grip (unset = off).
+    if [[ "${FR3_GRASP_LOOP_RESEAT_AFTER_MISS-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-reseat-after-miss); fi
     # Past the close: the recorded insertion teacher, or the policy itself (blank = the scripted insertion).
     if [[ -n "${FR3_GRASP_LOOP_AFTER_CLOSE-}" ]]; then grasp_loop_args+=(--grasp-loop-after-close "${FR3_GRASP_LOOP_AFTER_CLOSE}"); fi
     # Arm B's funnel steps as training data, one episode per held grasp (blank = not recorded).

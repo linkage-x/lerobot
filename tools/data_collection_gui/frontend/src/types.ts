@@ -1760,6 +1760,8 @@ export type RolloutRuntimeOptions = {
   graspLoopFunnelKeepLowPolicy?: boolean;
   /** Arm B: the bottom teacher (11-11) -- down 3-12 mm beside the peg, across to it at the bottom, close. Not with graspLoopFunnelCorrective. */
   graspLoopFunnelBottomTeacher?: boolean;
+  /** After a held peg misses the hole: let the crooked peg stand up in eased fingers before the re-grip (11-11). Needs graspLoopInsertPose. */
+  graspLoopReseatAfterMiss?: boolean;
   /** Past the close: the scripted insertion, the recorded insertion teacher, or the policy. Not script: needs graspLoopInsertPose. */
   graspLoopAfterClose?: "script" | "teacher" | "policy";
 };

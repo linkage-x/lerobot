@@ -110,6 +110,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM",
     "FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY",
     "FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER",
+    "FR3_GRASP_LOOP_RESEAT_AFTER_MISS",
     "FR3_GRASP_LOOP_AFTER_CLOSE",
     "FR3_GRASP_LOOP_OUT",
 )
@@ -561,6 +562,11 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if not insert_pose:
             raise RolloutError("graspLoopFunnelBottomTeacher offsets fixture-staged pegs only: set graspLoopInsertPose so held pegs go back through the fixture.")
         options["FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER"] = "1"
+    # A held peg back from a missed insertion stands up in eased fingers before the re-grip.
+    if _parse_bool_field(raw.get("graspLoopReseatAfterMiss", False), "graspLoopReseatAfterMiss"):
+        if not insert_pose:
+            raise RolloutError("graspLoopReseatAfterMiss acts after a missed insertion: set graspLoopInsertPose.")
+        options["FR3_GRASP_LOOP_RESEAT_AFTER_MISS"] = "1"
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         root = _optional_text(raw.get("graspLoopDatasetRoot"))
@@ -1450,6 +1456,7 @@ def grasp_loop_resume_params(
             options["graspLoopFunnelLateDzMm"] = _mm(late_dz[0]) if late_dz[0] == late_dz[1] else f"{_mm(late_dz[0])},{_mm(late_dz[1])}"
     options["graspLoopFunnelKeepLowPolicy"] = bool(request.get("funnelKeepLowPolicy", False))
     options["graspLoopFunnelBottomTeacher"] = bool(request.get("funnelBottomTeacher", False))
+    options["graspLoopReseatAfterMiss"] = bool(request.get("reseatAfterMiss", False))
     dz = request.get("funnelAlignDzMm")
     if isinstance(dz, list) and len(dz) == 2:
         low, high = dz

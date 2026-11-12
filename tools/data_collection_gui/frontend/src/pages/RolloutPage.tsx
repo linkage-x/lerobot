@@ -186,6 +186,8 @@ export function RolloutPage() {
   const [graspLoopFunnelKeepLowPolicy, setGraspLoopFunnelKeepLowPolicy] = useState(false);
   // 11-11: the bottom teacher -- the low lateral correction no recording has had.
   const [graspLoopFunnelBottomTeacher, setGraspLoopFunnelBottomTeacher] = useState(false);
+  // 11-11: a peg back from a missed insertion is crooked in the fingers; let it stand up before the re-grip.
+  const [graspLoopReseatAfterMiss, setGraspLoopReseatAfterMiss] = useState(false);
   // 10-30: who inserts after the close. The teacher records the insertion; the policy is the e2e test.
   const [graspLoopAfterClose, setGraspLoopAfterClose] = useState<"script" | "teacher" | "policy">("script");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
@@ -366,6 +368,8 @@ export function RolloutPage() {
         modeId === "grasp_loop" && graspLoopArms !== "A" && !graspLoopFunnelCorrective && graspLoopInsertPose.trim()
           ? graspLoopFunnelBottomTeacher
           : undefined,
+      graspLoopReseatAfterMiss:
+        modeId === "grasp_loop" && graspLoopInsertPose.trim() && graspLoopReseatAfterMiss ? true : undefined,
       graspLoopAfterClose:
         modeId === "grasp_loop" && graspLoopInsertPose.trim() && graspLoopAfterClose !== "script"
           ? graspLoopAfterClose
@@ -424,6 +428,7 @@ export function RolloutPage() {
       graspLoopFunnelLateDzMm,
       graspLoopFunnelKeepLowPolicy,
       graspLoopFunnelBottomTeacher,
+      graspLoopReseatAfterMiss,
       graspLoopAfterClose
     ]
   );
@@ -595,6 +600,7 @@ export function RolloutPage() {
         setGraspLoopFunnelKeepLowPolicy(options.graspLoopFunnelKeepLowPolicy);
       if (options.graspLoopFunnelBottomTeacher !== undefined)
         setGraspLoopFunnelBottomTeacher(options.graspLoopFunnelBottomTeacher);
+      setGraspLoopReseatAfterMiss(options.graspLoopReseatAfterMiss ?? false);
       setGraspLoopAfterClose(options.graspLoopAfterClose ?? "script");
       if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
       if (options.daggerDatasetRoot !== undefined)
@@ -1739,6 +1745,20 @@ export function RolloutPage() {
               3–12 mm（75% 在 +x 侧，y 在 ±3 mm 内），竖直降到离销 −6…+2 mm，再以 0.015 m/s 水平移到销正上方，不抬起，然后合爪。
               只在从夹具摆放的 trial 上偏心（regrip/repick 的销位置记录偏约 5 mm，照常居中）。手指一旦顶到东西就竖直退到上方，
               改为普通居中抓取并在行里标记。需要填插入位姿（抓到的销插回夹具，下一条才是夹具摆放）；与纠偏示范互斥；只跑 A 时不可用。
+            </p>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopReseatAfterMiss}
+                onChange={(event) => setGraspLoopReseatAfterMiss(event.target.checked)}
+                disabled={isLive || !graspLoopInsertPose.trim()}
+              />
+              <span>插入失败后先扶正再重抓：放到桌上后爪子只松到比销略宽，等销立正，再张开重抓</span>
+            </label>
+            <p className="hint">
+              11-11：没插进的销碰过孔沿面，在指间歪了 20–30°（13/13），直接放下松手就倒，重抓 17/17 抓空，每次都要人放回。
+              开启后：落桌 → 爪子松到"夹持宽度 + 约 3 mm"并等 1 s → 拍一张 reseat 快照 → 照常张开、回 home、重抓。
+              重抓成功的话下一条是 regrip 摆放（销位置记录偏约 5 mm）；没成功和现在一样请人放回夹具。不影响本条 trial 的结果。
             </p>
             <label className="checkbox">
               <input
