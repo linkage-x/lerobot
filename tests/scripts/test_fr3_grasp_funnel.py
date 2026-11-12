@@ -16,7 +16,17 @@ import pytest
 
 import tools.fr3.grasp_loop as grasp_loop
 import tools.fr3.scene_reset as scene_reset
-from tools.fr3.grasp_funnel import ALIGN, CLOSE, DESCEND, FUNNEL_ALIGN_Z_SLACK_M, SEARCH, FunnelConfig, GraspFunnel
+from tools.fr3.grasp_funnel import (
+    ALIGN,
+    CLOSE,
+    DESCEND,
+    FUNNEL_ALIGN_Z_SLACK_M,
+    RETREAT,
+    SEARCH,
+    SLIDE,
+    FunnelConfig,
+    GraspFunnel,
+)
 from tools.fr3.grasp_loop import GraspHandover, arm_for_trial, completed_trials, run_grasp_loop, summarize_grasp_loop
 
 from tests.scripts.test_fr3_grasp_loop import GraspRig, _put_back, _request
@@ -443,3 +453,120 @@ def test_no_policy_step_is_flagged_without_a_lift_height():
     funnel = GraspFunnel(FunnelConfig(pegXyz=PEG))
     _simulate(funnel, (PEG[0], PEG[1] + 0.02, PEG[2] + 0.01), start=(PEG[0], PEG[1] + 0.02, 0.20))
     assert funnel.lowPolicySteps == 0
+
+
+# ---- bottom teacher (11-11) ------------------------------------------------------------------
+
+
+def _bottom(offset=(9.0, 2.0), slide_dz=-2.0, **overrides):
+    return GraspFunnel(FunnelConfig(pegXyz=PEG, bottomOffsetMm=offset, bottomSlideDzMm=slide_dz, **overrides))
+
+
+def test_the_bottom_teacher_descends_beside_the_peg_and_slides_across_at_the_bottom_without_lifting():
+    """The labels R4 lacks: off-centre at the bottom, then sideways to the peg at that height."""
+
+    funnel = _bottom()
+    _simulate(funnel, (PEG[0] + 0.03, PEG[1], PEG[2] + 0.02), start=(PEG[0] + 0.03, PEG[1], 0.20))
+    assert funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 1.0
+    assert funnel.bottomAbandoned == ""
+    slide_z = PEG[2] - 0.002
+    bottom_xy = (PEG[0] + 0.009, PEG[1] + 0.002)
+    descend = [r for r in funnel.steps if r["funnel_state"] == DESCEND and r["teacher_phase"] == "offset"]
+    # Straight down at the offset, all the way to the slide height.
+    assert descend and all(r["executed_action"][:2] == pytest.approx(bottom_xy, abs=1e-9) for r in descend)
+    slide = [r for r in funnel.steps if r["funnel_state"] == SLIDE]
+    assert all(r["teacher_phase"] == "slide" for r in slide)
+    # At one height throughout, 0.5 mm a step: 9.2 mm is ~19 steps of correction.
+    assert all(r["executed_action"][2] == pytest.approx(slide_z, abs=1e-9) for r in slide)
+    assert 17 <= len(slide) <= 20
+    offsets = [math.hypot(r["executed_action"][0] - PEG[0], r["executed_action"][1] - PEG[1]) for r in slide]
+    assert offsets == sorted(offsets, reverse=True)
+    # Never up once the descent began (the "lift" mode R9 taught), and the close at the usual height.
+    after = funnel.steps[funnel.descendStartStep:]
+    zs = [r["executed_action"][2] for r in after]
+    assert all(b <= a + 1e-12 for a, b in zip(zs, zs[1:]))
+    assert zs[-1] == pytest.approx(funnel.config.closeXyz[2], abs=1e-9)
+    record = funnel.trial_record()
+    assert record["bottomOffsetMm"] == [9.0, 2.0] and record["bottomSlideDzMm"] == -2.0
+    assert record["slideStartOffsetMm"][0] == pytest.approx(9.0, abs=1.5)
+    assert record["slideStartStep"] < record["slideEndStep"] < record["funnelCloseStep"]
+    assert record["bottomAbandoned"] == ""
+    assert {r["teacher_phase"] for r in funnel.steps if r["funnel_state"] == SEARCH} == {""}
+    assert funnel.steps[-1]["teacher_phase"] == "centred"
+
+
+def test_a_slide_at_the_close_height_closes_where_it_ends():
+    funnel = _bottom(offset=(-5.0, 0.0), slide_dz=-6.0)
+    _simulate(funnel, (PEG[0], PEG[1], PEG[2] + 0.02), start=(PEG[0], PEG[1], 0.20))
+    assert funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 1.0
+    slide = [r for r in funnel.steps if r["funnel_state"] == SLIDE]
+    assert slide and all(r["executed_action"][2] == pytest.approx(funnel.config.closeXyz[2]) for r in slide)
+    assert all(r["executed_action"][0] <= PEG[0] + 1e-12 for r in slide)
+
+
+def test_a_finger_on_the_peg_top_during_the_offset_descent_goes_straight_up_then_grasps_centred():
+    """A wrong peg record puts a finger on the peg top: the arm stands at +20 mm while its command
+    goes on down. Up at once, then the plain funnel, and the row says the teacher gave up."""
+
+    funnel = _bottom(offset=(9.0, 0.0), slide_dz=-6.0)
+    top = PEG[2] + 0.020
+
+    def finger_on_top(step, xyz):
+        if funnel.state in (DESCEND, SLIDE) and funnel.bottomActive and xyz[2] < top:
+            return (xyz[0], xyz[1], top)
+        return xyz
+
+    _simulate(funnel, (PEG[0] + 0.03, PEG[1], PEG[2] + 0.02), start=(PEG[0] + 0.03, PEG[1], 0.20), push=finger_on_top)
+    assert funnel.bottomAbandoned == "contact"
+    contact = next(i for i, r in enumerate(funnel.steps) if r["transition_reason"] == "contact_bottom")
+    # The contact step already commands up, and the arm goes up to the lift height before anything sideways.
+    assert funnel.steps[contact]["executed_action"][2] > funnel.steps[contact - 1]["executed_action"][2]
+    retreat = [r for r in funnel.steps if r["funnel_state"] == RETREAT]
+    assert retreat and all(r["executed_action"][:2] == funnel.steps[contact]["executed_action"][:2] for r in retreat)
+    # Pushing on stops within a few steps of the finger stopping (6 mm of lag).
+    stalled = next(i for i, r in enumerate(funnel.steps) if r["ee_xyz"][2] <= top + 1e-9)
+    assert contact - stalled <= 8
+    assert funnel.state == CLOSE and funnel.xyErrorAtCloseMm <= 1.0
+    assert not [r for r in funnel.steps[contact:] if r["funnel_state"] == SLIDE]
+    assert {r["teacher_phase"] for r in funnel.steps[contact:]} == {"abandoned"}
+    assert funnel.trial_record()["bottomAbandoned"] == "contact"
+
+
+def test_an_arm_with_a_standing_offset_from_its_command_is_not_taken_for_a_contact():
+    """The rig's arm stands a few mm from its command at rest; contact is the change in that."""
+
+    funnel = _bottom(offset=(-10.0, 3.0), slide_dz=-6.0)
+
+    def standing_offset(step, xyz):
+        return (xyz[0] + 0.0015, xyz[1] - 0.001, xyz[2] - 0.0015) if funnel.active else xyz
+
+    _simulate(funnel, (PEG[0], PEG[1], PEG[2] + 0.02), start=(PEG[0], PEG[1], 0.20), push=standing_offset)
+    assert funnel.bottomAbandoned == "" and funnel.slideEndStep is not None and funnel.state == CLOSE
+
+
+def test_the_arm_sagging_below_its_command_on_the_slide_is_not_taken_for_a_contact():
+    """Pilot 161252 trial 9: 3-4 mm above the command while descending, ~2.5 mm below it while
+    sliding. A -6 mm swing in z, and nothing a finger can do pushes an arm down."""
+
+    funnel = _bottom(offset=(11.0, 2.5), slide_dz=1.0)
+
+    # The simulated arm closes 0.4 of its error a step, so a push p a step stands it p / 0.4 off:
+    # descending, ~3.5 mm above its command (with the walk's own trail) and 2 mm short in x;
+    # sliding, 2.8 mm below it and 1.5 mm off in y. The pilot's numbers.
+    def descend_high_slide_low(step, xyz):
+        if funnel.state == DESCEND and funnel.bottomActive:
+            return (xyz[0] - 0.0008, xyz[1], xyz[2] + 0.0008)
+        if funnel.state == SLIDE:
+            return (xyz[0], xyz[1] + 0.0006, xyz[2] - 0.00112)
+        return xyz
+
+    _simulate(funnel, (PEG[0], PEG[1], PEG[2] + 0.02), start=(PEG[0], PEG[1], 0.20), push=descend_high_slide_low)
+    assert funnel.bottomAbandoned == "" and funnel.slideEndStep is not None and funnel.state == CLOSE
+
+
+def test_without_an_offset_the_funnel_records_no_teacher_fields():
+    funnel = GraspFunnel(FunnelConfig(pegXyz=PEG))
+    _simulate(funnel, (PEG[0] + 0.03, PEG[1], PEG[2] + 0.02), start=(PEG[0] + 0.03, PEG[1], 0.20))
+    assert funnel.state == CLOSE and "bottomOffsetMm" not in funnel.trial_record()
+    assert {r["teacher_phase"] for r in funnel.steps} == {""}
+    assert not [r for r in funnel.steps if r["funnel_state"] in (SLIDE, RETREAT)]

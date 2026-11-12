@@ -109,6 +109,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_FUNNEL_LATE_FRACTION",
     "FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM",
     "FR3_GRASP_LOOP_FUNNEL_KEEP_LOW_POLICY",
+    "FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER",
     "FR3_GRASP_LOOP_AFTER_CLOSE",
     "FR3_GRASP_LOOP_OUT",
 )
@@ -551,6 +552,15 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
             options["FR3_GRASP_LOOP_FUNNEL_LATE_DZ_MM"] = ",".join(f"{value:g}" for value in numbers)
     elif any(_optional_text(raw.get(key)) for key in ("graspLoopFunnelLateFraction", "graspLoopFunnelLateDzMm")):
         raise RolloutError("graspLoopFunnelLateFraction / graspLoopFunnelLateDzMm shape the corrective funnel: turn graspLoopFunnelCorrective on.")
+    # Arm B's bottom teacher: down beside the peg, across at the bottom. One demonstration a run.
+    if _parse_bool_field(raw.get("graspLoopFunnelBottomTeacher", False), "graspLoopFunnelBottomTeacher"):
+        if (grasp_arms or "A") == "A":
+            raise RolloutError("graspLoopFunnelBottomTeacher shapes arm B's funnel: choose arm B or AB.")
+        if options.get("FR3_GRASP_LOOP_FUNNEL_CORRECTIVE") == "1":
+            raise RolloutError("graspLoopFunnelBottomTeacher and graspLoopFunnelCorrective are two demonstrations: record them apart.")
+        if not insert_pose:
+            raise RolloutError("graspLoopFunnelBottomTeacher offsets fixture-staged pegs only: set graspLoopInsertPose so held pegs go back through the fixture.")
+        options["FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER"] = "1"
     # Blank here, filled by `build_rollout_command` with the checkpoint's funnel dataset.
     if _parse_bool_field(raw.get("graspLoopRecord", False), "graspLoopRecord"):
         root = _optional_text(raw.get("graspLoopDatasetRoot"))
@@ -1439,6 +1449,7 @@ def grasp_loop_resume_params(
         if isinstance(late_dz, list) and len(late_dz) == 2:
             options["graspLoopFunnelLateDzMm"] = _mm(late_dz[0]) if late_dz[0] == late_dz[1] else f"{_mm(late_dz[0])},{_mm(late_dz[1])}"
     options["graspLoopFunnelKeepLowPolicy"] = bool(request.get("funnelKeepLowPolicy", False))
+    options["graspLoopFunnelBottomTeacher"] = bool(request.get("funnelBottomTeacher", False))
     dz = request.get("funnelAlignDzMm")
     if isinstance(dz, list) and len(dz) == 2:
         low, high = dz

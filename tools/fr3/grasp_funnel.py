@@ -49,6 +49,20 @@ Below `liftDzMm` a policy that stops (it closes when it stops, copying the settl
 as well, and so is one the arm cannot follow (`lowContactMm`): the fingers are on something, and
 pushing on would tip the peg.
 
+Bottom teacher (11-11, `bottomOffsetMm`, off by default): the policy's close leans on the
+gripper's shadow as its "at the bottom" cue, and once that fires it stops moving sideways
+(nearx_dd, 11-07). The labels taught it so: every training frame within 60 mm of a close is
+centred (|x| p90 1.9 mm), because every expert above -- this funnel included -- lines up first
+and descends straight. So here ALIGN goes to a drawn point `bottomOffsetMm` off the peg instead,
+DESCEND goes straight down there to `bottomSlideDzMm`, and SLIDE moves across to the peg's XY at
+that height, at `slideSpeedMS`, without lifting; then the usual descent to the close height,
+settle and close. The fingers stay open across the peg throughout, which P0 measured as safe out
+to +-12 mm on either axis at dz = -6. Below `FUNNEL_CENTRED_DZ_MM` the arm is watched: if it
+stands more than `bottomContactMm` further from its command than it did when the descent began
+(sideways, or above it: an arm below its command has met nothing),
+a finger is on something, and RETREAT takes it straight up to `upZ`, after which the trial is an
+ordinary centred funnel flagged `bottomAbandoned`.
+
 Where the funnel takes over is `alignDzMm` above the peg. At the v14 (3) 60 mm the policy has
 already done its aiming: on 09-30 (344 B trials) it arrived there a median 41 mm off the peg,
 with its y aim only 0.66 of the peg's (regression to the training mean), and 82% of its lateral
@@ -75,6 +89,8 @@ from typing import Any
 SEARCH = "SEARCH"
 ALIGN = "ALIGN"
 DESCEND = "DESCEND"
+SLIDE = "SLIDE"
+RETREAT = "RETREAT"
 CLOSE = "CLOSE"
 
 # v14 (3). Each is argued there; restated here only as the number.
@@ -113,6 +129,17 @@ FUNNEL_CENTRED_DZ_MM = 35.0
 # stood still in z while the command went on down, slid 22 mm sideways for 35 steps, and the peg
 # was knocked over. This threshold would have taken over 6 steps into that contact.
 FUNNEL_LOW_CONTACT_MM = 6.0
+# Bottom teacher: the sideways speed at the bottom. 0.5 mm a step at 30 Hz, so a 3-12 mm offset
+# is 6-24 recorded frames of correction rather than the 2-7 the align speed would leave.
+FUNNEL_SLIDE_SPEED_M_S = 0.015
+# The bottom teacher's contact watch is `FUNNEL_LOW_CONTACT_MM` of *change* in (measured - command)
+# from its first step below `FUNNEL_CENTRED_DZ_MM`. Pilot 084815's 30 funnels, below +35 mm: a
+# 1 mm/step descent trails 2.7 mm in z (p95 3.1), stopped 0.15 mm, so arriving at the bottom
+# changes the lag by ~2.6 mm and a 0.5 mm/step slide adds ~1.4; a finger on the peg top grows it
+# 1 mm a step. The only changes past 6 mm there were lifts (z lag -6 mm), which the teacher has none of.
+# Pilot 161252 (11-11, 11 trials) put that estimate wrong in z: the arm sags ~2 mm *below* its
+# command while sliding, so the z change reached -5.5 mm (one false abandon). Down never counts
+# now; up stayed <= +0.8 mm and sideways <= 2.2 mm there.
 
 
 @dataclass(frozen=True)
@@ -134,6 +161,11 @@ class FunnelConfig:
     liftDzMm: float | None = None
     lowContactMm: float | None = None
     settleBeforeDescend: bool = True
+    # Bottom teacher (module docstring). None is every other funnel.
+    bottomOffsetMm: tuple[float, float] | None = None
+    bottomSlideDzMm: float = FUNNEL_CLOSE_DZ_MM
+    slideSpeedMS: float = FUNNEL_SLIDE_SPEED_M_S
+    bottomContactMm: float = FUNNEL_LOW_CONTACT_MM
     closedBelow: float = 0.5
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -158,6 +190,16 @@ class FunnelConfig:
         if self.liftDzMm is None:
             return self.alignZ
         return max(self.alignZ, self.pegXyz[2] + self.liftDzMm / 1000.0)
+
+    @property
+    def slideZ(self) -> float:
+        return self.pegXyz[2] + self.bottomSlideDzMm / 1000.0
+
+    @property
+    def bottomXy(self) -> tuple[float, float] | None:
+        if self.bottomOffsetMm is None:
+            return None
+        return (self.pegXyz[0] + self.bottomOffsetMm[0] / 1000.0, self.pegXyz[1] + self.bottomOffsetMm[1] / 1000.0)
 
     @property
     def closeXyz(self) -> tuple[float, float, float]:
@@ -227,6 +269,14 @@ class GraspFunnel:
     # than teach (`dagger_step_role`'s `policy_off_course`).
     lowPolicyStep: bool = False
     lowPolicySteps: int = 0
+    # Bottom teacher readings.
+    slideStartStep: int | None = None
+    slideEndStep: int | None = None
+    slideStartOffsetMm: tuple[float, float] | None = None
+    bottomAbandoned: str = ""
+    # (measured - commanded) when the watch began: the arm's standing offset from its command,
+    # which a contact is measured against rather than against zero.
+    lagBaseline: tuple[float, float, float] | None = None
 
     def _speed_mm_s(self, xyz: tuple[float, float, float]) -> float:
         if self.previousXyz is None:
@@ -243,6 +293,30 @@ class GraspFunnel:
     def _enter(self, state: str) -> None:
         self.state = state
         self.quietSteps = 0
+
+    @property
+    def bottomActive(self) -> bool:
+        """The bottom teacher still has its offset to slide off: not yet across, not abandoned."""
+
+        return self.config.bottomOffsetMm is not None and not self.bottomAbandoned and self.slideEndStep is None
+
+    def _bottom_contact(self, ee_xyz: tuple[float, float, float]) -> bool:
+        """Below the fingertips' clearance, the arm stands further from its last command than it
+        did when the watch began (the first step down there): a finger is on the peg or the table."""
+
+        cfg = self.config
+        if self.previousCommand is None or ee_xyz[2] > cfg.centredZ:
+            return False
+        lag = tuple(ee_xyz[k] - self.previousCommand[k] for k in range(3))
+        if self.lagBaseline is None:
+            self.lagBaseline = lag  # type: ignore[assignment]
+            return False
+        change = [lag[k] - self.lagBaseline[k] for k in range(3)]
+        # Only up counts in z: a finger on something holds the arm above its command, nothing
+        # holds it below. Pilot 161252 (11-11): the arm trails ~3 mm above a 1 mm/step descent and
+        # sags ~2 mm below the command while sliding, a -5.5 mm swing that alone tripped trial 9.
+        change[2] = max(change[2], 0.0)
+        return math.hypot(*change) * 1000.0 > cfg.bottomContactMm
 
     def step(
         self,
@@ -331,6 +405,7 @@ class GraspFunnel:
                     and (settled or not cfg.settleBeforeDescend)
                 ):
                     transition = "aligned"
+                    self.lagBaseline = None
                     self.descendStartStep = step_idx
                     self.xyErrorAtDescendStartMm = round(xy_err, 1)
                     self.residualAtDescendStartMm = round(_xy_error_mm(self.setpoint, peg), 1)
@@ -343,8 +418,28 @@ class GraspFunnel:
                 if _off_path_mm(ee_xyz, start_xy, (peg[0], peg[1])) > cfg.captureXyMm:
                     transition = "left_capture"
                     self.realigns += 1
+                    if self.bottomActive:
+                        self.bottomAbandoned = "left_capture"
                     self.alignGoalXy = (peg[0], peg[1])
                     self._enter(ALIGN)
+                elif self.bottomActive and self._bottom_contact(ee_xyz):
+                    transition = "contact_bottom"
+                    self.bottomAbandoned = "contact"
+                    self._enter(RETREAT)
+                elif self.bottomActive:
+                    # Straight down at the offset, to the slide height.
+                    speed = cfg.fastDescendSpeedMS if self.setpoint[2] > cfg.slowBelowZ + 1e-9 else cfg.descendSpeedMS
+                    goal = (self.setpoint[0], self.setpoint[1], cfg.slideZ)
+                    self.setpoint, arrived = _walk(self.setpoint, goal, speed * cfg.controlPeriodS)
+                    if arrived:
+                        # No settle: a pause at the bottom is what a checkpoint copies as a hover.
+                        transition = "at_slide_height"
+                        self.slideStartStep = step_idx
+                        self.slideStartOffsetMm = (
+                            round((ee_xyz[0] - peg[0]) * 1000.0, 1),
+                            round((ee_xyz[1] - peg[1]) * 1000.0, 1),
+                        )
+                        self._enter(SLIDE)
                 else:
                     speed = cfg.fastDescendSpeedMS if self.setpoint[2] > cfg.slowBelowZ + 1e-9 else cfg.descendSpeedMS
                     goal = cfg.closeXyz
@@ -359,6 +454,32 @@ class GraspFunnel:
                         self.closeXyz = tuple(ee_xyz)  # type: ignore[assignment]
                         self.xyErrorAtCloseMm = round(xy_err, 1)
                         self._enter(CLOSE)
+            elif self.state == SLIDE:
+                if self._bottom_contact(ee_xyz):
+                    transition = "contact_bottom"
+                    self.bottomAbandoned = "contact"
+                    self._enter(RETREAT)
+                else:
+                    # Across to the peg at the bottom, never up: the correction the labels lack.
+                    goal = (peg[0], peg[1], self.setpoint[2])
+                    self.setpoint, arrived = _walk(self.setpoint, goal, cfg.slideSpeedMS * cfg.controlPeriodS)
+                    if arrived:
+                        transition = "slid_to_peg"
+                        self.slideEndStep = step_idx
+                        # The rest is the plain funnel's: down to the close height over the peg.
+                        self.alignGoalXy = (peg[0], peg[1])
+                        self._enter(DESCEND)
+            elif self.state == RETREAT:
+                goal = (self.setpoint[0], self.setpoint[1], cfg.upZ)
+                self.setpoint, arrived = _walk(self.setpoint, goal, cfg.alignSpeedMS * cfg.controlPeriodS)
+                if arrived:
+                    transition = "retreated"
+                    self.alignGoalXy = (peg[0], peg[1])
+                    self._enter(ALIGN)
+            if self.state == RETREAT and transition == "contact_bottom":
+                # The step the contact is read on already goes up, not on into it.
+                goal = (self.setpoint[0], self.setpoint[1], cfg.upZ)
+                self.setpoint, _ = _walk(self.setpoint, goal, cfg.alignSpeedMS * cfg.controlPeriodS)
             if self.state == CLOSE:
                 executed_gripper = cfg.closedGripper
             executed_xyz = self.setpoint
@@ -401,6 +522,7 @@ class GraspFunnel:
                 "executed_gripper": executed_gripper,
                 "descend_blocked": descend_blocked,
                 "grasp_triggered": transition == "settled_at_close_height",
+                "teacher_phase": self._teacher_phase(),
             }
         )
         return executed
@@ -412,6 +534,8 @@ class GraspFunnel:
 
         cfg = self.config
         peg = cfg.pegXyz
+        if cfg.bottomXy is not None:
+            return cfg.bottomXy
         lifting = xy_err > cfg.captureXyMm and ee_xyz[2] < cfg.upZ - FUNNEL_ALIGN_Z_SLACK_M
         self.lifted = lifting and cfg.liftDzMm is not None and cfg.upZ > cfg.alignZ
         across_z = cfg.upZ if xy_err > cfg.captureXyMm else ee_xyz[2]
@@ -420,6 +544,19 @@ class GraspFunnel:
             return (peg[0], peg[1])
         scale = residual / xy_err
         return (peg[0] + (ee_xyz[0] - peg[0]) * scale, peg[1] + (ee_xyz[1] - peg[1]) * scale)
+
+    def _teacher_phase(self) -> str:
+        """The bottom teacher's phase this step, for masking a view later: 'offset' (aligning to or
+        descending at the offset -- straight down beside the peg, no label to teach above the
+        slide height), 'slide', 'centred' (after the slide), 'abandoned', or '' (not the teacher)."""
+
+        if self.config.bottomOffsetMm is None or self.state == SEARCH:
+            return ""
+        if self.bottomAbandoned:
+            return "abandoned"
+        if self.state == SLIDE:
+            return "slide"
+        return "offset" if self.slideEndStep is None else "centred"
 
     @property
     def active(self) -> bool:
@@ -453,4 +590,16 @@ class GraspFunnel:
             "lifted": self.lifted,
             "lowPolicySteps": self.lowPolicySteps,
             "pegSource": cfg.pegSource,
+            **(
+                {}
+                if cfg.bottomOffsetMm is None
+                else {
+                    "bottomOffsetMm": [round(v, 1) for v in cfg.bottomOffsetMm],
+                    "bottomSlideDzMm": round(cfg.bottomSlideDzMm, 1),
+                    "slideStartStep": self.slideStartStep,
+                    "slideEndStep": self.slideEndStep,
+                    "slideStartOffsetMm": None if self.slideStartOffsetMm is None else list(self.slideStartOffsetMm),
+                    "bottomAbandoned": self.bottomAbandoned,
+                }
+            ),
         }

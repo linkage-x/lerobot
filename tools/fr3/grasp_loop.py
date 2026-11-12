@@ -272,6 +272,20 @@ GRASP_LOOP_CORRECTIVE_LIFT_DZ_MM = 45.0
 # funnel has run at (10-20 onward, R7's 69 late trials of 113314 all held), with `lowContactMm`
 # watching the fingers. Above 320 it is not late.
 GRASP_LOOP_CORRECTIVE_LATE_DZ_RANGE_MM = (15.0, 320.0)
+# `funnelBottomTeacher` (11-11): arm B descends beside the peg and slides across to it at the
+# bottom (`grasp_funnel` bottom teacher), the low lateral correction no recording so far has: R4's
+# training frames within 60 mm of a close are centred (|x| p90 1.9 mm) and its low correction
+# stops once the gripper's shadow says "bottom" (nearx_dd 11-07). The offset is drawn per trial:
+# |x| in the range, +x on the fraction of trials (R4 arrives +x of near pegs and must come back
+# -x: offline gate C "near +x" is exactly dz <= 35 mm, ox > 3 mm), y small either way (the
+# fingers centre y by themselves, and P0 measured +-12 mm on either axis as safe at dz = -6).
+# The slide height is drawn from the close height up to the low end of where the shadow cue
+# fires. Only fixture-staged trials get an offset: a regrip or repick records the peg ~5 mm off
+# in x (regrip-staged peg records, 10-30), which would teach a slide to the wrong place.
+GRASP_LOOP_BOTTOM_OFFSET_X_MM = (3.0, 12.0)
+GRASP_LOOP_BOTTOM_PLUS_X_FRACTION = 0.75
+GRASP_LOOP_BOTTOM_OFFSET_Y_MM = 3.0
+GRASP_LOOP_BOTTOM_SLIDE_DZ_MM = (FUNNEL_CLOSE_DZ_MM, 2.0)
 # Heights above the peg at which the policy's aim is read (`aimXyAboveMm`): where it is still
 # travelling, where it has mostly arrived, and the funnel's v14 (3) takeover.
 GRASP_LOOP_AIM_HEIGHTS_MM = (150, 100, 60)
@@ -386,6 +400,9 @@ class GraspLoopRequest:
     # states the policy fails from; R7 dropped 1369 of them (median 17 a late trial). Never train
     # on such a recording without the relabel: the policy's own action there is the error.
     funnelKeepLowPolicy: bool = False
+    # Arm B: the bottom teacher (GRASP_LOOP_BOTTOM_*, `funnel_config`). Not with funnelCorrective:
+    # one demonstration per recording, so a finetune on it changes one thing.
+    funnelBottomTeacher: bool = False
     seed: int = 0
     openGripper: float = 1.0
     closedGripper: float = 0.0
@@ -440,12 +457,29 @@ def funnel_align_dz_mm(request: GraspLoopRequest, trial: int) -> float:
     return random.Random(f"{request.seed}:{trial}:funnel_align_dz").uniform(low, high)
 
 
-def funnel_config(request: GraspLoopRequest, trial: int, peg_xyz: tuple[float, float, float]) -> FunnelConfig:
+def bottom_teacher_draw(request: GraspLoopRequest, trial: int) -> tuple[tuple[float, float], float]:
+    """This trial's bottom-teacher offset (x, y mm from the peg) and slide height (mm above it),
+    from their own stream, so a resumed run draws the same."""
+
+    rng = random.Random(f"{request.seed}:{trial}:funnel_bottom")
+    magnitude = rng.uniform(*GRASP_LOOP_BOTTOM_OFFSET_X_MM)
+    sign = 1.0 if rng.random() < GRASP_LOOP_BOTTOM_PLUS_X_FRACTION else -1.0
+    offset_y = rng.uniform(-GRASP_LOOP_BOTTOM_OFFSET_Y_MM, GRASP_LOOP_BOTTOM_OFFSET_Y_MM)
+    slide_dz = rng.uniform(*GRASP_LOOP_BOTTOM_SLIDE_DZ_MM)
+    return (sign * magnitude, offset_y), slide_dz
+
+
+def funnel_config(
+    request: GraspLoopRequest, trial: int, peg_xyz: tuple[float, float, float], *, staging: str = "fixture"
+) -> FunnelConfig:
     """Arm B's funnel for this trial. The corrective draws come from their own streams, so the
     takeover height of a trial that is not late is the one `funnel_align_dz_mm` always drew."""
 
     align_dz = funnel_align_dz_mm(request, trial)
     corrective: dict[str, Any] = {}
+    if request.funnelBottomTeacher and staging == "fixture":
+        offset, slide_dz = bottom_teacher_draw(request, trial)
+        corrective = {"bottomOffsetMm": offset, "bottomSlideDzMm": slide_dz}
     if request.funnelCorrective:
         if random.Random(f"{request.seed}:{trial}:funnel_late").random() < request.funnelLateFraction:
             low, high = (float(v) for v in request.funnelLateDzMm)
@@ -492,6 +526,17 @@ def validate_grasp_loop_request(
         raise SceneResetError("funnelMaxSteps must be positive.")
     if request.funnelCorrective and "B" not in request.arms:
         raise SceneResetError("funnelCorrective shapes arm B's funnel; a run of arm A alone has none.")
+    if request.funnelBottomTeacher and "B" not in request.arms:
+        raise SceneResetError("funnelBottomTeacher shapes arm B's funnel; a run of arm A alone has none.")
+    if request.funnelBottomTeacher and request.funnelCorrective:
+        raise SceneResetError(
+            "funnelBottomTeacher and funnelCorrective are two different demonstrations: record them apart."
+        )
+    if request.funnelBottomTeacher and request.insertServo is None:
+        raise SceneResetError(
+            "funnelBottomTeacher offsets fixture-staged pegs only, and a grasp-only run regrips nearly every "
+            "peg it held: give it insertServo, so each held peg goes back through the fixture."
+        )
     low_dz, high_dz = (float(v) for v in request.funnelAlignDzMm)
     min_dz, max_dz = GRASP_LOOP_FUNNEL_ALIGN_DZ_RANGE_MM
     if not min_dz <= low_dz <= high_dz <= max_dz:
@@ -1100,9 +1145,10 @@ def set_down_and_regrip(
     step_request = request.step_request(request_id)
     xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
     low, high = _robot_workspace_bounds(robot)
-    _check_xyz_in_workspace((xyz[0], xyz[1], place_z), "descend_8cm_to_place", low, high)
-    cap = _settled_descent(robot, step_request, "descend_8cm_to_place", (xyz[0], xyz[1], place_z), rotvec, gripper)
-    released = _open_and_settle(robot, request, step_request, (xyz[0], xyz[1], place_z), rotvec, cap=cap, gripper=gripper)
+    place = (xyz[0], xyz[1], place_z)
+    _check_xyz_in_workspace(place, "descend_8cm_to_place", low, high)
+    cap = _settled_descent(robot, step_request, "descend_8cm_to_place", place, rotvec, gripper)
+    released = _open_and_settle(robot, request, step_request, place, rotvec, cap=cap, gripper=gripper)
     _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
     _move_to_start(robot)
     width = verified_pick(
@@ -1809,7 +1855,9 @@ def completed_trials(path: Path) -> list[dict[str, Any]]:
 # What a resumed run must share with the rows it appends to, or its trials are not the same
 # trials: where the pegs go (seed, mask, table height), which arm, how long the policy gets, and
 # which policy (`run_start.policy`, compared when both runs recorded one).
-RESUME_MUST_MATCH = ("seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo", "afterClose")
+RESUME_MUST_MATCH = (
+    "seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo", "afterClose", "funnelBottomTeacher",
+)
 
 
 def resume_point(path: Path, request: GraspLoopRequest, policy: str | None) -> int:
@@ -2366,13 +2414,26 @@ def run_grasp_loop(
                 ),
             )
             if arm == "B":
-                handover.funnel = GraspFunnel(funnel_config(request, trial, peg_xyz))
+                handover.funnel = GraspFunnel(funnel_config(request, trial, peg_xyz, staging=staging))
             log(
                 f"[INFO] grasp_loop_arm trial={trial} arm={arm}"
                 + (f" funnel_align_dz_mm={handover.funnel.config.alignDzMm:.0f}" if handover.funnel is not None else "")
                 + (
                     f" funnel_residual_mm={handover.funnel.config.residualMm:.0f}"
                     if handover.funnel is not None and request.funnelCorrective
+                    else ""
+                )
+                + (
+                    " funnel_bottom_offset_mm=%.1f,%.1f slide_dz_mm=%.1f"
+                    % (*handover.funnel.config.bottomOffsetMm, handover.funnel.config.bottomSlideDzMm)
+                    if handover.funnel is not None and handover.funnel.config.bottomOffsetMm is not None
+                    else ""
+                )
+                + (
+                    f" funnel_bottom=skipped_{staging}"
+                    if handover.funnel is not None
+                    and request.funnelBottomTeacher
+                    and handover.funnel.config.bottomOffsetMm is None
                     else ""
                 )
             )

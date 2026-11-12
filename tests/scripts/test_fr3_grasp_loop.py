@@ -2671,3 +2671,95 @@ def test_the_loop_records_lighting_latency_and_confirmations_and_never_waits_for
     assert summary["confirmations"] == {"confirmed": 1, "of": 3, "disagree": [0]}
     start = json.loads(out.read_text().splitlines()[0])
     assert start["kind"] == "run_start" and start["lighting"] == "lab"
+
+
+# ---------------------------------------------------------------- bottom teacher (11-11) ---
+
+
+def test_the_bottom_teacher_draws_mostly_plus_x_offsets_and_low_slides_on_fixture_pegs_only():
+    request = _request(arms="B", seed=4, funnelBottomTeacher=True, insertServo=_insert_servo())
+    grasp_loop.validate_grasp_loop_request(request)
+    peg = (0.40, -0.15, 0.058)
+    configs = [grasp_loop.funnel_config(request, t, peg) for t in range(400)]
+    xs = [c.bottomOffsetMm[0] for c in configs]
+    ys = [c.bottomOffsetMm[1] for c in configs]
+    assert all(3.0 <= abs(x) <= 12.0 for x in xs) and all(abs(y) <= 3.0 for y in ys)
+    assert 0.68 < sum(x > 0 for x in xs) / len(xs) < 0.82
+    assert all(-6.0 <= c.bottomSlideDzMm <= 2.0 for c in configs)
+    # The takeover height is the plain draw, and nothing of the corrective funnel comes along.
+    assert all(c.alignDzMm == grasp_loop.funnel_align_dz_mm(request, t) for t, c in enumerate(configs))
+    assert all(c.residualMm == 0.0 and c.liftDzMm is None for c in configs)
+    # Drawn per trial, so a resumed run agrees.
+    assert configs == [grasp_loop.funnel_config(request, t, peg) for t in range(400)]
+    # A regrip or repick records the peg ~5 mm off: no offset to slide back from there.
+    for staging in ("regrip", "repick"):
+        assert grasp_loop.funnel_config(request, 3, peg, staging=staging).bottomOffsetMm is None
+    assert grasp_loop.funnel_config(_request(arms="B", seed=4), 3, peg).bottomOffsetMm is None
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        ({"arms": "A", "insertServo": "servo"}, "arm A alone"),
+        ({"arms": "B", "insertServo": "servo", "funnelCorrective": True}, "record them apart"),
+        ({"arms": "B"}, "insertServo"),
+    ],
+)
+def test_the_bottom_teacher_needs_arm_b_the_fixture_and_no_corrective_funnel(fields, match):
+    if fields.get("insertServo") == "servo":
+        fields = {**fields, "insertServo": _insert_servo()}
+    with pytest.raises(scene_reset.SceneResetError, match=match):
+        grasp_loop.validate_grasp_loop_request(_request(funnelBottomTeacher=True, **fields))
+    grasp_loop.validate_grasp_loop_request(_request(arms="AB", funnelBottomTeacher=True, insertServo=_insert_servo()))
+
+
+def _teacher_policy(robot):
+    """A policy that comes down 6 mm +x of the peg, routed through arm B's funnel."""
+
+    def run(trial, handover):
+        px, py, pz = robot.peg_xyz
+        aim = (px + 0.006, py, pz + 0.020)
+        for step in range(900):
+            xyz = robot.xyz
+            policy_xyz = tuple(xyz[k] + max(-0.004, min(0.004, aim[k] - xyz[k])) for k in range(3))
+            command = {
+                "ee.x": policy_xyz[0], "ee.y": policy_xyz[1], "ee.z": policy_xyz[2],
+                "ee.wx": robot.rotvec[0], "ee.wy": robot.rotvec[1], "ee.wz": robot.rotvec[2],
+                "gripper.pos": 1.0,
+            }
+            if handover.funnel is not None:
+                command = handover.funnel.step(step, xyz, robot.rotvec, command)
+            robot.send_action(command)
+            if handover.observe(step, robot.xyz, command["gripper.pos"]):
+                return "grasp_handover"
+            if handover.timed_out(step):
+                return "grasp_timeout"
+        return "grasp_timeout"
+
+    return run
+
+
+def test_a_bottom_teacher_run_slides_every_fixture_staged_peg_and_rows_carry_the_draw(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "teacher.jsonl"
+    asked = []
+    run_grasp_loop(
+        robot,
+        _request(trials=3, arms="B", funnelBottomTeacher=True, insertServo=_insert_servo()),
+        run_policy_trial=_teacher_policy(robot),
+        out_path=out,
+        ask_grade=_grades(robot, ["in", "in", "in"], asked),
+    )
+    rows = _trials(out)
+    assert [r["verdict"] for r in rows] == ["held"] * 3
+    assert [r["staging"] for r in rows] == ["fixture"] * 3
+    for t, row in enumerate(rows):
+        offset, slide_dz = grasp_loop.bottom_teacher_draw(_request(funnelBottomTeacher=True), t)
+        assert row["bottomOffsetMm"] == [round(v, 1) for v in offset]
+        assert row["bottomSlideDzMm"] == round(slide_dz, 1)
+        assert row["bottomAbandoned"] == "" and row["slideEndStep"] is not None
+        assert row["xyErrorAtCloseMm"] <= 2.0
+        records = [json.loads(line) for line in open(row["funnelSteps"], encoding="utf-8")]
+        assert any(r["funnel_state"] == "SLIDE" for r in records)
+    first = json.loads(out.read_text().splitlines()[0])
+    assert first["request"]["funnelBottomTeacher"] is True

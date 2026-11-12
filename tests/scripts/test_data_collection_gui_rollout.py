@@ -4546,6 +4546,24 @@ def test_the_funnel_corrective_switch_reaches_the_launcher_only_with_arm_b():
     assert "grasp_loop_args+=(--grasp-loop-funnel-corrective)" in launcher
 
 
+def test_the_bottom_teacher_switch_reaches_the_launcher_only_with_arm_b_an_insert_pose_and_no_corrective_funnel():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    raw = {"graspLoopArms": "B", "graspLoopInsertPose": "0.3597,-0.1328,0.058", "graspLoopFunnelBottomTeacher": True}
+    got = sanitize(raw)
+    assert got["FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER"] == "1"
+    assert "FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER" not in sanitize({**raw, "graspLoopFunnelBottomTeacher": False})
+    for bad, match in (
+        ({**raw, "graspLoopArms": "A"}, "choose arm B or AB"),
+        ({**raw, "graspLoopInsertPose": ""}, "graspLoopInsertPose"),
+        ({**raw, "graspLoopFunnelCorrective": True}, "record them apart"),
+    ):
+        with pytest.raises(rollout_backend.RolloutError, match=match):
+            sanitize(bad)
+    assert "FR3_GRASP_LOOP_FUNNEL_BOTTOM_TEACHER" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert "grasp_loop_args+=(--grasp-loop-funnel-bottom-teacher)" in launcher
+
+
 def test_the_late_takeover_settings_reach_the_launcher_only_with_the_corrective_funnel():
     """11-03 mass collection: how many trials the funnel takes late, how low, and keeping the
     policy's low steps (whole trials only) for the offline relabel."""

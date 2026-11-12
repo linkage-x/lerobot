@@ -1758,6 +1758,8 @@ export type RolloutRuntimeOptions = {
   graspLoopFunnelLateDzMm?: string;
   /** With graspLoopFunnelCorrective + whole trials: keep the policy's low steps before a late takeover, for the offline relabel. */
   graspLoopFunnelKeepLowPolicy?: boolean;
+  /** Arm B: the bottom teacher (11-11) -- down 3-12 mm beside the peg, across to it at the bottom, close. Not with graspLoopFunnelCorrective. */
+  graspLoopFunnelBottomTeacher?: boolean;
   /** Past the close: the scripted insertion, the recorded insertion teacher, or the policy. Not script: needs graspLoopInsertPose. */
   graspLoopAfterClose?: "script" | "teacher" | "policy";
 };

@@ -605,6 +605,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-funnel-bottom-teacher',
+        action='store_true',
+        help=(
+            'Arm B: the bottom teacher (11-11). The funnel descends 3-12 mm beside the peg (mostly +x), '
+            'slides across to it at the bottom without lifting, then closes: the low lateral '
+            'correction the training labels lack (grasp_loop GRASP_LOOP_BOTTOM_*). Fixture-staged '
+            'trials only (needs --grasp-loop-insert-pose); regrip/repick trials run the plain funnel. Not with --grasp-loop-funnel-corrective.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-dataset-root',
         type=Path,
         default=None,
@@ -5942,6 +5952,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 funnelLateFraction=float(args.grasp_loop_funnel_late_fraction),
                 funnelLateDzMm=parse_funnel_takeover_dz_mm(args.grasp_loop_funnel_late_dz_mm),
                 funnelKeepLowPolicy=bool(args.grasp_loop_funnel_keep_low_policy),
+                funnelBottomTeacher=bool(args.grasp_loop_funnel_bottom_teacher),
                 afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
@@ -5983,6 +5994,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 if grasp_loop_request.funnelCorrective
                 else ''
             )
+            + f'funnel_bottom_teacher={int(grasp_loop_request.funnelBottomTeacher)} '
             + f'after_close={grasp_loop_request.afterClose} '
             + f'out={grasp_loop_out} dataset={args.grasp_loop_dataset_root or "off"}'
         )
