@@ -58,7 +58,7 @@ git-ignored `run/targets.local.json`. Only `ssh` and `gateway_url` can be overri
 ```sshconfig
 # ~/.ssh/config: everything (ssh, rsync, the deploy scripts) goes through the jump host
 Host thor2-lab
-  HostName 192.168.1.152
+  HostName 192.168.111.123
   User nvidia
   ProxyJump gateway.example-lab
   LocalForward 18765 127.0.0.1:8765   # the GUI reaches the gateway through this tunnel

@@ -1,7 +1,7 @@
 {
   "station": "station2",
   "user": "nvidia",
-  "address": "192.168.1.152",
+  "address": "192.168.111.123",
   "hostname": "upai-thor2",
   "repo_dir": "/home/nvidia/lerobot",
   "profile": "thor",
