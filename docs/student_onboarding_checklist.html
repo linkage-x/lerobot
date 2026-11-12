@@ -105,13 +105,13 @@ cd -</pre>
     <li><input type="checkbox"><span>浏览器打开 GUI，顶部有黄条 <b>沙箱 &lt;名字&gt;</b> 和你的 commit。没有黄条就说明连的不是你的沙箱，立刻停下来问。</span></li>
     <li><input type="checkbox"><span>复制一个<b>小</b>数据集进来（Thor 的磁盘也存着所有录制）：</span></li>
   </ul>
-<pre>bash run/sandbox.sh datasets              # 生产里可复制的数据集和大小，可加过滤词
-bash run/sandbox.sh copy-dataset &lt;名字&gt; &lt;数据集&gt;
-bash run/sandbox.sh status &lt;名字&gt;         # 端口、版本、数据集、占用空间</pre>
+<pre>bash run/sandbox.sh thor datasets              # 生产里可复制的数据集和大小，可加过滤词
+bash run/sandbox.sh thor copy-dataset &lt;名字&gt; &lt;数据集&gt;
+bash run/sandbox.sh thor status &lt;名字&gt;         # 端口、版本、数据集、占用空间</pre>
   <ul class="check">
-    <li><input type="checkbox"><span>在 GUI 里对这个数据集走一遍离线流程：轨迹生成 → IK QC → MuJoCo 预演 → 回放查看。卡住时看日志：<code>bash run/sandbox.sh logs &lt;名字&gt;</code>。</span></li>
+    <li><input type="checkbox"><span>在 GUI 里对这个数据集走一遍离线流程：轨迹生成 → IK QC → MuJoCo 预演 → 回放查看。卡住时看日志：<code>bash run/sandbox.sh thor logs &lt;名字&gt;</code>。</span></li>
     <li><input type="checkbox"><span>亲眼确认硬件被拒：点一个需要相机 / BOX / 机械臂的按钮（如相机预览、BOX 连接），GUI 报错，内容是 <code>sandbox '&lt;名字&gt;' does not touch hardware: …</code>（HTTP 409）。这是预期行为，不要改它。</span></li>
-    <li><input type="checkbox"><span>本地前端用 Ctrl-C 关掉即可；沙箱网关在 Thor 上继续跑，不用时 <code>bash run/sandbox.sh stop &lt;名字&gt;</code>。</span></li>
+    <li><input type="checkbox"><span>本地前端用 Ctrl-C 关掉即可；沙箱网关在 Thor 上继续跑，不用时 <code>bash run/sandbox.sh thor stop &lt;名字&gt;</code>。</span></li>
   </ul>
 </section>
 
@@ -126,7 +126,7 @@ bash run/sandbox.sh status &lt;名字&gt;         # 端口、版本、数据集�
 <pre>git push -u origin &lt;名字&gt;/onboarding
 gh pr create --draft --base box --title "练习：&lt;名字&gt; 上手" --body "上手练习，不合并"</pre></li>
     <li>等 CI 两项（<i>Gateway / Thor / FR3 tests</i>、<i>GUI frontend</i>）变绿。PR 页面会显示需要维护者审核：<code>run/</code>、<code>tools/fr3/</code>、world/标定、<code>gateway.py</code> 等路径归 CODEOWNERS，改到这些地方一定会落到维护者手里。</li>
-    <li>把下面三样发给维护者，维护者看过后关闭 PR：PR 链接；<code>bash run/sandbox.sh status &lt;名字&gt;</code> 的输出；MuJoCo 预演通过的截图。</li>
+    <li>把下面三样发给维护者，维护者看过后关闭 PR：PR 链接；<code>bash run/sandbox.sh thor status &lt;名字&gt;</code> 的输出；MuJoCo 预演通过的截图。</li>
   </ol>
   <div class="ok" style="margin-top:10px">做完这一节就算上手完成。之后的真实任务照同样的流程：<code>git switch -c &lt;名字&gt;/&lt;主题&gt; origin/box</code> → 本地测试 → 沙箱试跑 → PR 到 box → 维护者审核、合并、发版。一个 PR 只做一件事。</div>
 </section>
@@ -140,8 +140,8 @@ gh pr create --draft --base box --title "练习：&lt;名字&gt; 上手" --body 
       <tr><td><code>git push</code> 报 403</td><td>主仓库只有 read</td><td>找维护者改成 write；不要改成从 fork 提 PR（CI 会因子模块失败）</td></tr>
       <tr><td>部署拒绝：树不干净 / 不在 <code>origin/box</code></td><td>你在部署生产（漏了 <code>--sandbox</code>）</td><td>加上 <code>--sandbox &lt;名字&gt;</code>。不要提交、不要传 <code>--maintainer</code> 来"让它过"</td></tr>
       <tr><td>沙箱名报错</td><td>名字不合规或是保留名</td><td>用小写的自己的名字</td></tr>
-      <tr><td><code>no free sandbox port in 8770-8799</code></td><td>30 个端口用完</td><td><code>bash run/sandbox.sh list</code> 看谁的沙箱不用了，在群里说；只删自己的</td></tr>
-      <tr><td>GUI 一直报莫名其妙的错 / 接口 404</td><td>前端和网关版本不一致</td><td>重新 <code>deploy.sh --sandbox</code>，让两边是同一个 commit；看 <code>/api/snapshot</code> 里的 <code>deployment.release</code></td></tr>
+      <tr><td><code>no free sandbox port in 8770-8799</code></td><td>30 个端口用完</td><td><code>bash run/sandbox.sh thor list</code> 看谁的沙箱不用了，在群里说；只删自己的</td></tr>
+      <tr><td>GUI 一直报莫名其妙的错 / 接口 404</td><td>前端和网关版本不一致</td><td>重新 <code>deploy.sh thor --sandbox &lt;名字&gt;</code>，让两边是同一个 commit；看 <code>/api/snapshot</code> 里的 <code>deployment.release</code></td></tr>
       <tr><td>某个按钮返回 409 <code>does not touch hardware</code></td><td>沙箱没有硬件，预期行为</td><td>离线部分在沙箱做完，需要硬件的部分找维护者试</td></tr>
       <tr><td>CI 里你没碰过的测试挂了</td><td>可能是 <code>box</code> 本身或环境问题</td><td>不要删测试、不要跳过，贴链接问维护者</td></tr>
       <tr><td>复制数据集提示空间不足</td><td>Thor 至少留 30 GB 给录制</td><td>删掉自己不用的副本，挑小一点的数据集</td></tr>
@@ -155,7 +155,7 @@ gh pr create --draft --base box --title "练习：&lt;名字&gt; 上手" --body 
     <li>每次开新任务都从最新的 <code>origin/box</code> 开分支；长期分支定期 <code>git rebase origin/box</code>（只 rebase 自己的分支）。</li>
     <li>测试只跑你改到的文件对应的测试（<code>AGENTS.md</code> 第 5 节），lint 用 <code>uvx ruff@0.14.1 check &lt;文件&gt;</code>；不要整文件格式化。</li>
     <li>mock 里的 pid 一定用真实整数，不要用裸 <code>MagicMock</code>：<code>os.killpg(MagicMock())</code> 会变成 <code>kill(-1)</code>，整个桌面会被注销。</li>
-    <li>沙箱里的数据集用完就删，长时间不用的沙箱 <code>bash run/sandbox.sh remove &lt;名字&gt; --yes</code>。</li>
+    <li>沙箱里的数据集用完就删，长时间不用的沙箱 <code>bash run/sandbox.sh thor remove &lt;名字&gt; --yes</code>。</li>
     <li>拿不准是否安全时先问。问一句很便宜，机械臂走错一步、丢一个数据集都很贵。</li>
   </ul>
 </section>

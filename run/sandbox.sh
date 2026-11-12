@@ -140,7 +140,7 @@ case "$cmd" in
     dir="$(sandbox_dir "$name")"
     for dataset in "$@"; do
       if [[ ! "$dataset" =~ ^[A-Za-z0-9._-]+$ || "$dataset" == .* ]]; then
-        echo "ERROR: '$dataset' is not a dataset name (see: bash run/sandbox.sh datasets)" >&2
+        echo "ERROR: '$dataset' is not a dataset name (see: bash run/sandbox.sh ${TARGET_NAME} datasets)" >&2
         exit 2
       fi
     done
@@ -152,7 +152,7 @@ case "$cmd" in
       mkdir -p "$dst_root"
       for dataset in '"$*"'; do
         src="$src_root/$dataset"; dst="$dst_root/$dataset"
-        [[ -d "$src" ]] || { echo "ERROR: production has no dataset $dataset (see: bash run/sandbox.sh datasets)" >&2; exit 1; }
+        [[ -d "$src" ]] || { echo "ERROR: production has no dataset $dataset (see: bash run/sandbox.sh '"$TARGET_NAME"' datasets)" >&2; exit 1; }
         if [[ -e "$dst" ]]; then echo "skip $dataset: already in the sandbox (delete $dst first to copy it again)"; continue; fi
         need_kb="$(du -sk "$src" | cut -f1)"
         free_kb="$(df -k --output=avail / | tail -1 | tr -d " ")"
