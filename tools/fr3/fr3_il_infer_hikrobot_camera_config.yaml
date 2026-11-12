@@ -40,5 +40,5 @@ robot:
       warmup_s: 1
       fourcc: MJPG
       
-# 机器人使用的是192.168.11.102  pika gripper /dev/ttyUSB0
+# pika gripper on /dev/ttyUSB0
 # 0.407628,0.044434,0.356195,0.710233,-0.703370,0.003492,-0.028750
