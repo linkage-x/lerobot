@@ -7233,6 +7233,187 @@ def _serve_rollout_camera_still(
     _write_jpeg_response(handler, frame)
 
 
+# ------------------------------------------------------------- side camera tape check ---
+# "Has the side camera been bumped?", answered from where the yellow tape square round the gear
+# fixture sits in its still (tools/fr3/side_cam_check.py). Everything a policy reads from the
+# side image assumes the camera stands where it stood for the training data, so the reference
+# defaults to a still from inside that era rather than to whatever the camera sees today: a
+# grasp-loop staging snapshot of 10-27 (R4's robot A/B, arm away, all four tape sides visible).
+# History 10-16..11-11 against it: every snapshot within 2 px / 0.8 degrees.
+_SIDE_CAM_CHECK_SUBDIR = Path("outputs") / "metrology" / "side_cam_tape"
+_SIDE_CAM_DEFAULT_REFERENCE = (
+    Path("outputs") / "analysis" / "grasp_loop" / "grasp_20261027_104526_peg" / "trial_000_staged_side.png"
+)
+_SIDE_CAM_DEFAULT_REFERENCE_CAMERA = "side"
+_SIDE_CAM_HISTORY_LIMIT = 20
+
+
+def _side_cam_dir(state: GatewayState, camera_key: str) -> Path:
+    return state.repo_root / _SIDE_CAM_CHECK_SUBDIR / camera_key
+
+
+def _side_cam_reference(state: GatewayState, camera_key: str) -> tuple[Path | None, dict[str, Any]]:
+    """The reference still and where it came from; (None, {}) if there is none."""
+
+    folder = _side_cam_dir(state, camera_key)
+    saved = folder / "reference.jpg"
+    if saved.is_file():
+        try:
+            meta = json.loads((folder / "reference.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        return saved, {"kind": "saved", **meta}
+    default = state.repo_root / _SIDE_CAM_DEFAULT_REFERENCE
+    if camera_key == _SIDE_CAM_DEFAULT_REFERENCE_CAMERA and default.is_file():
+        return default, {
+            "kind": "default",
+            "source": str(_SIDE_CAM_DEFAULT_REFERENCE),
+            "note": "默认基准：10-27 R4 上机时的侧相机快照（训练数据时期）",
+        }
+    return None, {}
+
+
+def _side_cam_check_status(state: GatewayState, camera_key: str) -> dict[str, Any]:
+    folder = _side_cam_dir(state, camera_key)
+    reference, meta = _side_cam_reference(state, camera_key)
+    last: dict[str, Any] | None = None
+    try:
+        last = json.loads((folder / "last_check.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        last = None
+    history: list[dict[str, Any]] = []
+    try:
+        lines = (folder / "checks.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines[-_SIDE_CAM_HISTORY_LIMIT:]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        history.append(
+            {
+                key: row.get(key)
+                for key in ("checkedAt", "verdict", "verdictText", "reason", "pose", "reference")
+            }
+        )
+    return {
+        "ok": True,
+        "camera": camera_key,
+        "reference": None if reference is None else {**meta, "path": str(reference)},
+        "last": last,
+        "history": history,
+    }
+
+
+def _run_side_cam_check(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Grab the current still, fit the tape against the reference, keep the result."""
+
+    camera_key = _table_camera_key(payload.get("camera"))
+    reference_path, meta = _side_cam_reference(state, camera_key)
+    if reference_path is None:
+        raise ValueError(f"{camera_key} 还没有基准画面：先在画面干净时点“用当前画面作为基准”。")
+    frame, _status, error = _camera_still_bytes(state, camera_key)
+    if frame is None:
+        raise ValueError(f"拿不到 {camera_key} 相机画面：{error}")
+    try:
+        import cv2  # noqa: PLC0415  (the gateway runs without cv2 on non-FR3 profiles)
+
+        from tools.fr3 import side_cam_check  # noqa: PLC0415
+    except ImportError as exc:
+        raise ValueError(f"这个 gateway 的 Python 没有 cv2/numpy，无法做相机自检：{exc}") from exc
+    reference = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
+    if reference is None:
+        raise ValueError(f"读不了基准画面 {reference_path}")
+    current = side_cam_check.decode(frame)
+    result, picture = side_cam_check.check_images(reference, current)
+    folder = _side_cam_dir(state, camera_key)
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).astimezone()
+    result = {
+        **result,
+        "camera": camera_key,
+        "checkedAt": stamp.isoformat(timespec="seconds"),
+        "reference": {key: meta.get(key) for key in ("kind", "source", "capturedAt")},
+        "imageSize": [int(current.shape[1]), int(current.shape[0])],
+    }
+    ok, encoded = cv2.imencode(".jpg", picture, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if ok:
+        (folder / "last_overlay.jpg").write_bytes(encoded.tobytes())
+    (folder / "last_still.jpg").write_bytes(frame)
+    (folder / "last_check.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+    with (folder / "checks.jsonl").open("a", encoding="utf-8") as log:
+        log.write(json.dumps(result, ensure_ascii=False) + "\n")
+    state.log(
+        "warn" if result["verdict"] in {"shifted", "moved"} else "info",
+        f"Side camera tape check camera={camera_key} verdict={result['verdict']} pose={result.get('pose')}",
+    )
+    return {**_side_cam_check_status(state, camera_key), "result": result}
+
+
+def _set_side_cam_reference(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Make the current still the reference. The one it replaces is kept beside it."""
+
+    camera_key = _table_camera_key(payload.get("camera"))
+    frame, _status, error = _camera_still_bytes(state, camera_key)
+    if frame is None:
+        raise ValueError(f"拿不到 {camera_key} 相机画面：{error}")
+    try:
+        from tools.fr3 import side_cam_check  # noqa: PLC0415
+    except ImportError as exc:
+        raise ValueError(f"这个 gateway 的 Python 没有 cv2/numpy，无法做相机自检：{exc}") from exc
+    tape_pixels = int((side_cam_check.tape_mask(side_cam_check.decode(frame)) > 0).sum())
+    if tape_pixels < side_cam_check.MIN_TAPE_PIXELS * 3:
+        raise ValueError(
+            f"当前画面里只认出 {tape_pixels} 个胶带像素，不适合做基准：让机械臂离开、别挡住胶带后再试。"
+        )
+    folder = _side_cam_dir(state, camera_key)
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).astimezone()
+    old = folder / "reference.jpg"
+    if old.is_file():
+        archived = folder / f"reference_until_{stamp.strftime('%Y%m%d_%H%M%S')}"
+        old.rename(archived.with_suffix(".jpg"))
+        old_meta = folder / "reference.json"
+        if old_meta.is_file():
+            old_meta.rename(archived.with_suffix(".json"))
+    old.write_bytes(frame)
+    (folder / "reference.json").write_text(
+        json.dumps(
+            {"source": "captured", "capturedAt": stamp.isoformat(timespec="seconds"), "tapePixels": tape_pixels},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    state.log("warn", f"Side camera tape reference replaced camera={camera_key} tape_pixels={tape_pixels}")
+    return _side_cam_check_status(state, camera_key)
+
+
+def _serve_side_cam_file(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, camera_key: str, which: str
+) -> None:
+    if which == "reference":
+        path, _meta = _side_cam_reference(state, camera_key)
+    else:
+        path = _side_cam_dir(state, camera_key) / f"last_{which}.jpg"
+    if path is None or not path.is_file():
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"no {which} image for {camera_key}"})
+        return
+    data = path.read_bytes()
+    if path.suffix.lower() == ".png":
+        try:
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/png")
+            handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+    _write_jpeg_response(handler, data)
+
+
 # ------------------------------------------------------------------ table plane alignment ---
 # The maps on the Rollout page are drawn in base x/y. A camera still is not: it is a projection
 # of the table, and stretching it to fill a plot box lines nothing up with anything. These
@@ -14256,6 +14437,25 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/rollout/table-view.jpg":
             _serve_table_view(self, state=self.server.state, query=query)
             return
+        if path == "/api/rollout/side-cam-check":
+            try:
+                camera_key = _table_camera_key(query.get("camera", [""])[0])
+            except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.OK, _side_cam_check_status(self.server.state, camera_key))
+            return
+        if path == "/api/rollout/side-cam-check/image.jpg":
+            which = query.get("which", ["overlay"])[0]
+            try:
+                camera_key = _table_camera_key(query.get("camera", [""])[0])
+                if which not in {"overlay", "still", "reference"}:
+                    raise ValueError("which must be overlay, still or reference")
+            except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            _serve_side_cam_file(self, state=self.server.state, camera_key=camera_key, which=which)
+            return
         if path == "/api/rollout/table-probe-frame.jpg":
             state = self.server.state
             try:
@@ -14983,6 +15183,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/rollout/scene-reset":
                     with state.lock:
                         _json_response(self, HTTPStatus.OK, _request_rollout_scene_reset(state, body))
+                    return
+                if path == "/api/rollout/side-cam-check":
+                    # Outside the lock: a still plus a ~1 s fit, and nothing it reads is
+                    # mutated under the lock in a way a torn read could mislead.
+                    _json_response(self, HTTPStatus.OK, _run_side_cam_check(state, body))
+                    return
+                if path == "/api/rollout/side-cam-check/reference":
+                    _json_response(self, HTTPStatus.OK, _set_side_cam_reference(state, body))
                     return
                 if path == "/api/rollout/table-probe":
                     with state.lock:

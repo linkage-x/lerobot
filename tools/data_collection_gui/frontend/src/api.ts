@@ -55,6 +55,8 @@ import type {
   GpuServiceOp,
   RolloutLandmarks,
   TableAlignment,
+  SideCamCheckStatus,
+  SideCamCheckResult,
   TableWindow,
   SceneResetRequest,
   SceneResetResult,
@@ -1297,6 +1299,37 @@ export class DataCollectionGuiApi {
 
   async clearTableAlignment(cameraKey: string) {
     return this.trainingPost<TableAlignment>("/api/rollout/table-clear", { camera: cameraKey });
+  }
+
+  async fetchSideCamCheck(cameraKey: string): Promise<SideCamCheckStatus | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/rollout/side-cam-check?camera=${encodeURIComponent(cameraKey)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return null;
+      return (await response.json()) as SideCamCheckStatus;
+    } catch {
+      return null;
+    }
+  }
+
+  async runSideCamCheck(cameraKey: string) {
+    return this.trainingPost<SideCamCheckStatus & { result?: SideCamCheckResult }>(
+      "/api/rollout/side-cam-check",
+      { camera: cameraKey }
+    );
+  }
+
+  async setSideCamReference(cameraKey: string) {
+    return this.trainingPost<SideCamCheckStatus>("/api/rollout/side-cam-check/reference", {
+      camera: cameraKey
+    });
+  }
+
+  sideCamImageUrl(cameraKey: string, which: "overlay" | "still" | "reference", nonce: number): string {
+    const params = new URLSearchParams({ camera: cameraKey, which, t: String(nonce) });
+    return `${this.apiBase}/api/rollout/side-cam-check/image.jpg?${params.toString()}`;
   }
 
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {

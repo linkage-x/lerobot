@@ -1556,6 +1556,40 @@ export type TablePlanePoint = { u: number; v: number; x: number; y: number };
  *  distance between where the robot was and where the fit says the click was, in the units the
  *  error budget is written in.
  */
+/** Where the yellow tape square sits in a camera still relative to the reference still
+ *  (tools/fr3/side_cam_check.py): the side camera's "has it been bumped?" check. */
+export type SideCamTapePose = {
+  dxPx: number;
+  dyPx: number;
+  rotDeg: number;
+  shiftPx: number;
+  scorePx: number;
+  coverage: number;
+  tapePixels: number;
+  referenceTapePixels: number;
+  atSearchEdge: boolean;
+};
+
+export type SideCamVerdict = "ok" | "shifted" | "moved" | "unknown";
+
+export type SideCamCheckResult = {
+  verdict: SideCamVerdict;
+  verdictText: string;
+  reason: string;
+  pose: SideCamTapePose | null;
+  checkedAt?: string;
+  camera?: string;
+  reference?: { kind?: string; source?: string; capturedAt?: string };
+  thresholds?: { okShiftPx: number; okRotDeg: number; shiftedShiftPx: number; shiftedRotDeg: number };
+};
+
+export type SideCamCheckStatus = {
+  camera: string;
+  reference: { kind: string; source?: string; capturedAt?: string; note?: string; path: string } | null;
+  last: SideCamCheckResult | null;
+  history: SideCamCheckResult[];
+};
+
 export type TableAlignment = {
   ok?: boolean;
   cameraKey: string;

@@ -33,6 +33,7 @@ import type {
 import { RolloutLandingMap } from "./RolloutLandingMap";
 import { RolloutLiveViewer } from "./RolloutLiveViewer";
 import { SceneResetPanel } from "./SceneResetPanel";
+import { SideCamCheckPanel } from "./SideCamCheckPanel";
 import { TableAlignmentPanel } from "./TableAlignmentPanel";
 
 // Hidden 10-28: the side-camera table alignment is only a backdrop for the two maps, and the
@@ -1471,6 +1472,11 @@ export function RolloutPage() {
         onReset={onSceneReset}
         onRunnableChange={onSceneResetRunnableChange}
       />
+
+      {/* Beside the reset because it is about the same scene, and because a bumped side camera
+          is found cheapest between rollouts, before a batch is spent on a view the policy was
+          never trained on. */}
+      <SideCamCheckPanel cameraKey={sceneResetCameraKey} />
 
       {/* ---------------------------------------------------- landing map --- */}
       <section className="card">
