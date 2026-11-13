@@ -60,6 +60,13 @@ SHIFTED_ROT_DEG = 2.0
 MIN_TAPE_PIXELS = 300
 MIN_COVERAGE = 0.4
 MAX_SCORE_PX = 1.5
+# A still whose colour channels are this far from the reference's is not the same exposure: the
+# camera was just opened and its auto exposure / white balance had not settled (11-13: B34 G54 R4
+# against ~110 each), and the tape's yellow is not where the mask looks for it. Saying "tape
+# covered" for that sent the operator looking for an obstruction that was not there. Settled
+# stills across 10-16..11-13 sit within ~10% of the reference per channel.
+EXPOSURE_MIN_RATIO = 0.5
+EXPOSURE_MAX_RATIO = 1.6
 
 VERDICT_TEXT = {
     "ok": "未移动",
@@ -254,6 +261,25 @@ def check_images(reference_bgr: np.ndarray, current_bgr: np.ndarray) -> tuple[di
                 "verdictText": VERDICT_TEXT["unknown"],
                 "reason": f"分辨率与基准不同（基准 {w}x{h}，当前 {current_bgr.shape[1]}x{current_bgr.shape[0]}）",
                 "pose": None,
+            },
+            current_bgr,
+        )
+    reference_means = reference_bgr.reshape(-1, 3).mean(axis=0)
+    current_means = current_bgr.reshape(-1, 3).mean(axis=0)
+    ratios = current_means / np.maximum(reference_means, 1.0)
+    if ratios.min() < EXPOSURE_MIN_RATIO or ratios.max() > EXPOSURE_MAX_RATIO:
+        b, g, r = (int(round(v)) for v in current_means)
+        rb, rg, rr = (int(round(v)) for v in reference_means)
+        return (
+            {
+                "verdict": "unknown",
+                "verdictText": VERDICT_TEXT["unknown"],
+                "reason": (
+                    f"画面曝光/白平衡和基准差太多（通道均值 B{b} G{g} R{r}，基准 B{rb} G{rg} R{rr}）："
+                    "相机可能刚打开还没稳定，或者光照变了。过几秒再检查一次。"
+                ),
+                "pose": None,
+                "exposureRatios": [round(float(v), 2) for v in ratios],
             },
             current_bgr,
         )

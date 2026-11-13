@@ -82,6 +82,62 @@ def test_a_preview_at_another_size_is_compared_in_reference_pixels():
     assert result["pose"]["dyPx"] == pytest.approx(-5, abs=1.5)
 
 
+def test_an_unsettled_exposure_is_unknown_and_says_so_not_tape_covered():
+    # 11-13: the first frame of a freshly opened side camera, B34 G54 R4 against ~110 settled.
+    dark = (scene().astype(np.float64) * np.array([0.3, 0.42, 0.04])).astype(np.uint8)
+    result, _ = side_cam_check.check_images(scene(), dark)
+    assert result["verdict"] == "unknown"
+    assert "曝光" in result["reason"] and "遮挡" not in result["reason"]
+    assert min(result["exposureRatios"]) < side_cam_check.EXPOSURE_MIN_RATIO
+
+
+def test_a_settled_exposure_a_little_off_the_reference_is_still_checked():
+    brighter = np.clip(scene().astype(np.float64) * 1.12, 0, 255).astype(np.uint8)
+    result, _ = side_cam_check.check_images(scene(), brighter)
+    assert result["verdict"] == "ok", result
+
+
+def _preview_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pyrealsense2", SimpleNamespace())
+    import importlib  # noqa: PLC0415
+
+    from tools.fr3 import fr3_realsense_preview  # noqa: PLC0415
+
+    return importlib.reload(fr3_realsense_preview)
+
+
+def test_the_preview_holds_frames_back_until_the_exposure_stops_changing(monkeypatch):
+    preview = _preview_module(monkeypatch)
+    settle = preview.ExposureSettle(min_s=0.5, max_s=3.0)
+    frame = np.full((48, 64, 3), 110, np.uint8)
+    t = 0.0
+    for level in (5, 20, 45, 70, 90, 100, 106, 109):  # auto exposure ramping up, 30 fps
+        assert not settle.update(np.full_like(frame, level), t)
+        t += 1 / 30
+    while t < 0.5:  # stable, but not yet min_s
+        assert not settle.update(frame, t)
+        t += 1 / 30
+    released = None
+    for i in range(preview.SETTLE_WINDOW + 1):
+        if settle.update(frame, t):
+            released = i
+            break
+        t += 1 / 30
+    assert released is not None
+    assert settle.update(np.full_like(frame, 3), t + 0.1)  # once settled, stays settled
+
+
+def test_the_preview_gives_up_waiting_at_max_s(monkeypatch):
+    preview = _preview_module(monkeypatch)
+    settle = preview.ExposureSettle(min_s=0.5, max_s=3.0)
+    t, level = 0.0, 10
+    while t < 3.0:
+        assert not settle.update(np.full((48, 64, 3), level, np.uint8), t)
+        t += 1 / 30
+        level = 10 + (level + 7) % 200  # never stable
+    assert settle.update(np.full((48, 64, 3), level, np.uint8), 3.0)
+
+
 def _jpeg(image) -> bytes:
     ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
     assert ok
