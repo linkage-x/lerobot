@@ -3,12 +3,12 @@
 # start the local frontend against that gateway.
 #
 # Usage:
-#   bash run/deploy.sh                         # defaults to Thor
-#   bash run/deploy.sh thor
-#   bash run/deploy.sh workstation
+#   bash run/deploy.sh thor1                   # a target is required; `thor` is an alias of thor1
+#   bash run/deploy.sh thor2
 #   bash run/deploy.sh workstation --sync-only
-#   bash run/deploy.sh thor --no-frontend
-#   bash run/deploy.sh thor --sandbox NAME     # your own sandbox: own directory + port, no hardware
+#   bash run/deploy.sh thor1 --no-frontend
+#   bash run/deploy.sh thor1 --sandbox NAME    # your own sandbox: own directory + port, no hardware
+#   python3 run/targets.py list                # the targets (run/targets/*.json) and how to reach them
 #
 # Production only accepts a clean checkout whose HEAD is on origin/box (see run/sync_to_target.sh);
 # a maintainer adds --maintainer to deploy a clean commit that is not merged yet. Students deploy
@@ -18,13 +18,13 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
-target="thor"
+target=""
 target_explicit=false
 sync_only=false
 no_frontend=false
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # shellcheck source=run/sandbox_common.sh
@@ -43,24 +43,25 @@ for arg in "$@"; do
     --sandbox) expect_sandbox_name=true ;;
     --sandbox=*) sandbox="${arg#--sandbox=}" ;;
     --maintainer) maintainer=true ;;
-    thor|workstation)
-      if $target_explicit; then
-        echo "ERROR: specify exactly one deployment target" >&2
-        exit 2
-      fi
-      target="$arg"
-      target_explicit=true
-      ;;
     --sync-only) sync_only=true ;;
     --no-frontend) no_frontend=true ;;
     -h|--help)
       usage
       exit 0
       ;;
-    *)
+    -*)
       echo "ERROR: unknown argument '$arg'" >&2
       usage >&2
       exit 2
+      ;;
+    *)
+      # Any other word is a target name or alias; resolve_target below rejects unknown ones.
+      if $target_explicit; then
+        echo "ERROR: specify exactly one deployment target" >&2
+        exit 2
+      fi
+      target="$arg"
+      target_explicit=true
       ;;
   esac
 done
@@ -69,28 +70,20 @@ if $expect_sandbox_name; then
   exit 2
 fi
 
-case "$target" in
-  thor)
-    remote="nvidia@192.168.111.122"
-    remote_dir="/home/nvidia/lerobot"
-    profile="thor"
-    config_path="tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
-    gateway_target="http://192.168.111.122:8765"
-    ;;
-  workstation)
-    remote="hph@192.168.100.155"
-    remote_dir="/home/hph/Code/lerobot"
-    profile="workstation"
-    config_path="tools/fr3/fr3_record_config.yaml"
-    gateway_target="http://192.168.100.155:8765"
-    ;;
-esac
+require_target_name "$target"
+resolve_target "$target"
+target="$TARGET_NAME"
+remote="$TARGET_SSH"
+remote_dir="$TARGET_DIR"
+production_dir="$TARGET_DIR"
+profile="$TARGET_PROFILE"
+config_path="$TARGET_CONFIG"
+gateway_target="$TARGET_GATEWAY_URL"
 
 sync_flags=()
-gateway_port=8765
 if [[ -n "$sandbox" ]]; then
-  if [[ "$target" != "thor" ]]; then
-    echo "ERROR: sandboxes exist only on Thor" >&2
+  if [[ "$TARGET_SANDBOXES" != true ]]; then
+    echo "ERROR: ${target} has no sandboxes (run/targets/${target}.json); they exist only on Thor targets" >&2
     exit 2
   fi
   if $maintainer; then
@@ -108,8 +101,9 @@ fi
 bash "$script_dir/sync_to_target.sh" "$target" ${sync_flags[@]+"${sync_flags[@]}"}
 
 # A sandbox starts from production's calibration (copied by the remote script below), never from
-# this checkout's outputs/.
-if [[ "$target" == "thor" && -z "$sandbox" ]]; then
+# this checkout's outputs/. These inputs were solved on the cameras of the target whose file says
+# calibration_in_tree; another Thor must not receive them.
+if [[ "$profile" == "thor" && -z "$sandbox" && "$TARGET_CALIBRATION_IN_TREE" == true ]]; then
   calibration_paths=(
     "outputs/calibration/thor_gmsl2_intrinisics_dict_0720"
     "outputs/calibration/thor_gmsl2_extrinisics_robot_base_0720"
@@ -167,7 +161,7 @@ restart_log="$(mktemp)"
 trap 'rm -f "$restart_log"' EXIT
 restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o -E 75 '$deploy_lock' bash -s -- '$remote_dir' '$profile' '$config_path' '$sandbox' '$THOR_PRODUCTION_DIR' '$SANDBOX_PORT_MIN' '$SANDBOX_PORT_MAX' '$THOR_SANDBOX_BASE'" \
+  "flock -n -o -E 75 '$deploy_lock' bash -s -- '$remote_dir' '$profile' '$config_path' '$sandbox' '$production_dir' '$SANDBOX_PORT_MIN' '$SANDBOX_PORT_MAX' '$THOR_SANDBOX_BASE' '$TARGET_PORT' '$TARGET_BOX_NET_ADDR'" \
   <<'REMOTE' 2>&1 | tee "$restart_log" || restart_rc=${PIPESTATUS[0]}
 set -euo pipefail
 
@@ -179,8 +173,9 @@ production_dir="$5"
 port_min="$6"
 port_max="$7"
 sandbox_base="$8"
+port="$9"
+box_net_addr="${10}"
 gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
-port=8765
 
 if [[ -n "$sandbox" ]]; then
   # One port per sandbox, kept across deploys in .sandbox_port (excluded from the sync).
@@ -343,8 +338,10 @@ fi
 
 cd "$repo_dir"
 if [[ "$profile" == "thor" ]]; then
-  if [[ -z "$sandbox" ]]; then
-    bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
+  # The static address the legacy BOX firmware pushes to, per target (box_net_addr): two Thors on one
+  # LAN must never both claim it, so a target without one gets none.
+  if [[ -z "$sandbox" && -n "$box_net_addr" ]]; then
+    BOX_NET_ADDR="$box_net_addr" bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
   fi
   . tools/thor/box_sdk/setup_env.sh
 fi
@@ -444,9 +441,13 @@ fi
 REMOTE
 
 gateway_port="$(sed -n 's/^GATEWAY_PORT=\([0-9]*\)$/\1/p' "$restart_log" | tail -1)"
-gateway_port="${gateway_port:-8765}"
+gateway_port="${gateway_port:-$TARGET_PORT}"
 if [[ -n "$sandbox" ]]; then
-  gateway_target="http://${THOR_HOST}:${gateway_port}"
+  if [[ "$TARGET_OVERRIDDEN" == *gateway_url* ]]; then
+    echo "WARNING: run/targets.local.json routes ${target}'s gateway through ${TARGET_GATEWAY_URL};" >&2
+    echo "         the sandbox listens on port ${gateway_port}, which that route does not cover." >&2
+  fi
+  gateway_target="http://${TARGET_ADDRESS}:${gateway_port}"
 fi
 
 if [[ $restart_rc -eq 75 ]]; then

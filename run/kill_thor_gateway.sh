@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Stop the data-collection GUI gateway on Thor without starting a replacement.
+# Stop the data-collection GUI gateway on a Thor without starting a replacement.
 #
 # Usage:
-#   bash run/kill_thor_gateway.sh          # send TERM, report any survivors
-#   bash run/kill_thor_gateway.sh --force  # send TERM, then KILL survivors
+#   bash run/kill_thor_gateway.sh TARGET          # send TERM, report any survivors
+#   bash run/kill_thor_gateway.sh TARGET --force  # send TERM, then KILL survivors
 set -euo pipefail
 
-THOR="nvidia@192.168.111.122"
+# shellcheck source=run/targets_common.sh
+. "$(cd "$(dirname "$0")" && pwd)/targets_common.sh"
+
+target=""
 force=false
 for arg in "$@"; do
   case "$arg" in
@@ -16,19 +19,28 @@ for arg in "$@"; do
 Stop the data-collection GUI gateway on Thor without starting a replacement.
 
 Usage:
-  bash run/kill_thor_gateway.sh          # send TERM, report any survivors
-  bash run/kill_thor_gateway.sh --force  # send TERM, then KILL survivors
+  bash run/kill_thor_gateway.sh TARGET          # send TERM, report any survivors
+  bash run/kill_thor_gateway.sh TARGET --force  # send TERM, then KILL survivors
 EOF
       exit 0
       ;;
-    *)
+    -*)
       echo "ERROR: unknown argument: $arg" >&2
       exit 2
       ;;
+    *) target="$arg" ;;
   esac
 done
 
-ssh -o ConnectTimeout=5 "$THOR" "FORCE=$force bash -s" <<'REMOTE'
+require_target_name "$target"
+resolve_target "$target"
+if [[ "$TARGET_PROFILE" != thor ]]; then
+  echo "ERROR: ${TARGET_NAME} is not a Thor (profile ${TARGET_PROFILE})" >&2
+  exit 2
+fi
+require_target_identity
+
+target_ssh "FORCE=$force bash -s" <<'REMOTE'
 set -euo pipefail
 
 _gateway_pids() {

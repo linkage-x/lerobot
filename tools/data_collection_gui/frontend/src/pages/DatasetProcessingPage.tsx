@@ -363,11 +363,10 @@ export function DatasetProcessingPage({
             snapshot.gateway.state !== "online" ? (
               <div className="empty-dataset-list">
                 <p>Gateway not connected (state: {snapshot.gateway.state}).</p>
-                <p>Ensure the gateway is running on Thor:</p>
-                <code>ssh nvidia@192.168.111.122</code>
-                <code>bash ~/lerobot/run/restart_gateway.sh</code>
-                <p>Then set the Vite proxy target:</p>
-                <code>GUI_API_TARGET=http://192.168.111.122:8765 npm run dev</code>
+                <p>Deploy (or restart) the gateway on the target machine; this also starts the GUI against it:</p>
+                <code>bash run/deploy.sh &lt;target&gt;</code>
+                <p>Targets and their gateway URLs:</p>
+                <code>python3 run/targets.py list</code>
               </div>
             ) : (
               <div className="empty-dataset-list">
