@@ -42,7 +42,6 @@ class SOFollowerConfig:
     use_degrees: bool = True
 
 
-@RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")
 @dataclass
 class SOFollowerRobotConfig(RobotConfig, SOFollowerConfig):
@@ -50,4 +49,9 @@ class SOFollowerRobotConfig(RobotConfig, SOFollowerConfig):
 
 
 SO100FollowerConfig = SOFollowerRobotConfig
-SO101FollowerConfig = SOFollowerRobotConfig
+
+
+@RobotConfig.register_subclass("so101_follower")
+@dataclass
+class SO101FollowerConfig(SOFollowerRobotConfig):
+    """Keep the model identity distinct when a config is decoded from YAML."""

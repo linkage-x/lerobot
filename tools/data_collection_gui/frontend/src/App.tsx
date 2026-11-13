@@ -103,7 +103,11 @@ const workstationPageIds = new Set<PageId>([
   "unattended"
 ]);
 
-function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
+function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation", capabilities?: string[]): boolean {
+  if (profile === "workstation" && capabilities) {
+    if (!capabilities.includes("training_view") && ["dataset-export", "training"].includes(page)) return false;
+    if (!capabilities.includes("rollout") && ["rollout", "unattended"].includes(page)) return false;
+  }
   return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation";
 }
 const navPageLabels: Partial<Record<PageId, string>> = {
@@ -151,12 +155,12 @@ function App() {
   useEffect(() => {
     if (!snapshot) return;
     const profile = snapshot.deployment?.profile ?? "thor";
-    if (!pageAllowedForProfile(activePage, profile)) {
+    if (!pageAllowedForProfile(activePage, profile, snapshot.hardware?.capabilities)) {
       const fallback = (snapshot.deployment?.defaultRoute as PageId) ?? "live-record";
       window.location.hash = fallback;
       setActivePage(fallback);
     }
-  }, [activePage, snapshot?.deployment?.profile, snapshot?.deployment?.defaultRoute]);
+  }, [activePage, snapshot?.deployment?.profile, snapshot?.deployment?.defaultRoute, snapshot?.hardware?.capabilities.join(",")]);
 
   useEffect(() => {
     let cancelled = false;
@@ -428,10 +432,10 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>{deployment.label}</h1>
+          <h1>{snapshot.hardware?.activeId ? snapshot.hardware.label : deployment.label}</h1>
           <p>
             {workstationProfile
-              ? `FR3 + Pika · SpaceMouse · ${snapshot.devices.filter((d) => d.kind === "camera").length} RealSense cameras`
+              ? `${snapshot.devices.filter((d) => ["robot", "gripper", "teleoperator"].includes(d.kind)).map((d) => d.label).join(" · ")} · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras`
               : `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`}
           </p>
         </div>
@@ -518,7 +522,7 @@ function SidebarNav({
   const caliBadge = calibrationNavBadge();
   const profile = snapshot.deployment?.profile ?? "thor";
   const visibleNavGroups = navGroups
-    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile)) }))
+    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile, snapshot.hardware?.capabilities)) }))
     .filter((group) => group.ids.length > 0);
 
   const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;
@@ -585,7 +589,7 @@ function SidebarNav({
             <div className="nav-footer-row nav-footer-muted">BOX ID: {boxIdLabel}</div>
           </>
         ) : (
-          <div className="nav-footer-row nav-footer-muted">FR3 workstation · standalone</div>
+          <div className="nav-footer-row nav-footer-muted">{snapshot.hardware?.label ?? "Robot workstation"}</div>
         )}
       </div>
     </nav>

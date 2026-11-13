@@ -1,4 +1,5 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
+import type { HardwareDocument, HardwarePayload, HardwareResult, HardwareSavedSetup, HardwareSetupEntry } from "./hardwareTypes";
 import type {
   CollectionTask,
   EpisodeAnnotation,
@@ -135,6 +136,7 @@ const FR3_SIM_TELEOP_GAINS: TeleopGainValues = {
 };
 
 export type GuiSnapshot = {
+  hardware?: { activeId: string | null; label: string; capabilities: string[] };
   deployment: DeploymentProfile;
   gateway: GatewayStatus;
   configSummary: ConfigSummary;
@@ -867,6 +869,30 @@ export class DataCollectionGuiApi {
         error: error instanceof Error ? error.message : String(error)
       };
     }
+  }
+
+  async fetchHardware(): Promise<HardwarePayload | null> {
+    return this.trainingGet<HardwarePayload>("/api/hardware");
+  }
+
+  async fetchHardwareSetup(id: string): Promise<HardwareSavedSetup | null> {
+    return this.trainingGet<HardwareSavedSetup>("/api/hardware/setup", { id });
+  }
+
+  async validateHardware(document: HardwareDocument): Promise<HardwareResult<{ warnings: string[]; runtimeYaml: string }>> {
+    return this.trainingPost("/api/hardware/validate", { document });
+  }
+
+  async saveHardware(document: HardwareDocument, revision: string | null): Promise<HardwareResult<HardwareSavedSetup & { setups: HardwareSetupEntry[] }>> {
+    return this.trainingPost("/api/hardware/save", { document, revision });
+  }
+
+  async applyHardware(id: string, revision: string): Promise<HardwareResult<HardwarePayload>> {
+    return this.trainingPost("/api/hardware/activate", { id, revision });
+  }
+
+  async resetHardware(): Promise<HardwareResult<HardwarePayload>> {
+    return this.trainingPost("/api/hardware/reset", {});
   }
 
   async fetchTrainingHosts(): Promise<TrainingHost[]> {

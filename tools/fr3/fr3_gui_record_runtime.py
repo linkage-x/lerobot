@@ -41,14 +41,14 @@ and a sim episode can be replayed against hardware tooling without conversion.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import logging
-from pathlib import Path
 import queue
 import re
 import sys
 import threading
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,28 +58,25 @@ for _path in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import lerobot.robots.franka_research3  # noqa: E402,F401  # registers both FR3 robot choices
+import lerobot.teleoperators.spacemouse  # noqa: E402,F401
 from lerobot.configs import parser  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
-from lerobot.datasets.utils import DEFAULT_TASKS_PATH, LEGACY_TASKS_PATH  # noqa: E402
-from lerobot.datasets.video_utils import VideoEncodingManager  # noqa: E402
-import lerobot.robots.franka_research3  # noqa: E402,F401  # registers both FR3 robot choices
-from lerobot.robots.utils import make_robot_from_config  # noqa: E402
-from lerobot.robots.franka_research3 import FrankaResearch3MujocoConfig  # noqa: E402
-from lerobot.scripts.lerobot_record import RecordConfig, record_loop  # noqa: E402
-import lerobot.teleoperators.spacemouse  # noqa: E402,F401
-from lerobot.teleoperators import make_teleoperator_from_config  # noqa: E402
-from tools.fr3.scene_reset import (  # noqa: E402
-    SceneResetError,
-    execute_scene_reset,
-    scene_reset_request_from_payload,
+from lerobot.datasets.utils import (  # noqa: E402
+    DEFAULT_TASKS_PATH,
+    LEGACY_TASKS_PATH,
 )
+from lerobot.datasets.video_utils import VideoEncodingManager  # noqa: E402
+from lerobot.robots.franka_research3 import FrankaResearch3MujocoConfig  # noqa: E402
+from lerobot.robots.utils import make_robot_from_config  # noqa: E402
+from lerobot.scripts.lerobot_record import RecordConfig, record_loop  # noqa: E402
+from lerobot.teleoperators import make_teleoperator_from_config  # noqa: E402
 from lerobot.utils.control_utils import (  # noqa: E402
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
-
 from tools.fr3.fr3_record_runtime import (  # noqa: E402
     build_fr3_ee2ee_dataset_features,
     make_fr3_action_processors,
@@ -93,6 +90,11 @@ from tools.fr3.fr3_sync_audit import (  # noqa: E402
     residual_tolerance_for_camera_fps,
     summarize_episode_capture_timestamps,
     write_fr3_sync_report,
+)
+from tools.fr3.scene_reset import (  # noqa: E402
+    SceneResetError,
+    execute_scene_reset,
+    scene_reset_request_from_payload,
 )
 
 _RUNTIME_ARGS: argparse.Namespace | None = None
@@ -485,8 +487,9 @@ def parse_runtime_args(argv: list[str] | None = None) -> tuple[argparse.Namespac
 def _resolve_workspace_path(value: str) -> str:
     """Map a container-style ``/lerobot/...`` config path onto this checkout."""
     path = Path(value)
-    if str(path).startswith("/lerobot/"):
-        return str(_REPO_ROOT / path.relative_to("/lerobot"))
+    for prefix in ("/lerobot", "/workspace"):
+        if str(path).startswith(prefix + "/"):
+            return str(_REPO_ROOT / path.relative_to(prefix))
     return value
 
 
@@ -574,11 +577,14 @@ def build_sim_robot_config(
 
 def _build_robot(cfg: RecordConfig, runtime_args: argparse.Namespace):
     if runtime_args.backend == "sim":
+        if cfg.robot.type != "franka_research3" or getattr(cfg.robot, "gripper_backend", "pika") != "pika":
+            raise ValueError("Simulation is currently available for the FR3 + Pika assembly only.")
         sim_cfg = build_sim_robot_config(
             cfg, camera_map_override=_parse_sim_camera_map(runtime_args.sim_camera_map)
         )
         return make_robot_from_config(sim_cfg), sim_cfg
-    cfg.robot.urdf_path = _resolve_workspace_path(cfg.robot.urdf_path)
+    if hasattr(cfg.robot, "urdf_path"):
+        cfg.robot.urdf_path = _resolve_workspace_path(cfg.robot.urdf_path)
     return make_robot_from_config(cfg.robot), cfg.robot
 
 
@@ -801,17 +807,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # (Rebinding in place rather than dataclasses.replace: RecordConfig.__post_init__ re-reads
     # draccus CLI state, which is not valid to do a second time outside the parser context.)
     cfg.robot = robot_cfg
-    teleop_action_processor, robot_action_processor, robot_observation_processor = (
-        make_fr3_action_processors(cfg)
-    )
-
-    dataset_features = build_fr3_ee2ee_dataset_features(
-        robot=robot,
-        teleop=teleop,
-        teleop_action_processor=teleop_action_processor,
-        robot_observation_processor=robot_observation_processor,
-        use_videos=cfg.dataset.video,
-    )
+    is_fr3 = cfg.robot.type in {"franka_research3", "franka_research3_mujoco"}
+    if is_fr3:
+        teleop_action_processor, robot_action_processor, robot_observation_processor = make_fr3_action_processors(cfg)
+        dataset_features = build_fr3_ee2ee_dataset_features(
+            robot=robot, teleop=teleop, teleop_action_processor=teleop_action_processor,
+            robot_observation_processor=robot_observation_processor, use_videos=cfg.dataset.video,
+        )
+    else:
+        from lerobot.hardware.recording import native_recording_features, native_recording_processors
+        processors = native_recording_processors(cfg, robot, teleop)
+        teleop_action_processor, robot_action_processor, robot_observation_processor = processors
+        dataset_features = native_recording_features(robot, teleop, processors, use_videos=cfg.dataset.video)
 
     dataset_root = _session_dataset_root(cfg, backend)
     repo_id = f"{cfg.dataset.repo_id}_sim" if backend == "sim" else cfg.dataset.repo_id
@@ -898,11 +905,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         teleop.connect()
         emit(f"Connected teleoperator {cfg.teleop.type}")
         sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
-        if callable(sync_gripper):
+        if is_fr3 and callable(sync_gripper):
             observation = robot.get_observation(include_cameras=False)
             sync_gripper(float(observation["gripper.pos"]))
-        _reset_gripper_to_open(robot, teleop)
-        emit("Gripper opened")
+        if is_fr3:
+            _reset_gripper_to_open(robot, teleop)
+            emit("Gripper opened")
 
         commands.start()
         emit(f"Backend: {backend}")
@@ -917,8 +925,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             # camera keys). Sim stays silent here so the gateway can leave those rows idle
             # rather than flagging absent hardware as failed.
             emit(f"Cameras: {', '.join(getattr(robot, 'cameras', {}) or ())}")
-            emit("Robots: fr3")
-            emit("Grippers: pika")
+            emit(f"Robots: {'fr3' if is_fr3 else robot.name}")
+            if is_fr3:
+                emit(f"Grippers: {getattr(cfg.robot, 'gripper_backend', 'pika')}")
 
         with VideoEncodingManager(dataset), _StartPoseCaptureWatcher(robot, events):
             while not events["stop_recording"] and saved_episodes < cfg.dataset.num_episodes:
@@ -926,8 +935,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     move_to_start = getattr(robot, "move_to_start", None)
                     if callable(move_to_start):
                         move_to_start()
-                    _reset_gripper_to_open(robot, teleop)
-                    emit("Gripper opened")
+                    if is_fr3:
+                        _reset_gripper_to_open(robot, teleop)
+                        emit("Gripper opened")
 
                 emit(f"Episode {dataset.num_episodes} ready")
                 command = commands.wait_for_command()
@@ -1024,7 +1034,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             finalized = True
         except Exception as exc:  # noqa: BLE001 - report, but still release the hardware below
             emit(f"ERROR: dataset finalize failed: {exc}")
-        if finalized and dataset.num_episodes:
+        if finalized and dataset.num_episodes and capture_timestamp_names:
             _write_dataset_sync_report(
                 Path(dataset.root), runtime_args, residual_tolerance_ms=residual_tolerance_ms
             )

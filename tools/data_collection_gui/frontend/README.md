@@ -2,6 +2,8 @@
 
 Browser UI for local data collection, recorded dataset review, episode annotation, MuJoCo validation, and guarded FR3 replay.
 
+**Hardware selection and instance configuration:** open **Device Manager → Hardware configuration** to select robots, end effectors, teleoperators and cameras, edit IP / port / serial bindings, and save or apply portable setups. See [the hardware configuration guide](../../../docs/hardware_configuration.md) for supported workflows, persistence and plugin interfaces.
+
 The default rig is **Thor + 11 x GMSL2 (SG2-AR0234C-G2F) + BOX 采集板** — see
 `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` and
 `tools/thor/box_sdk/README.md`. It replaces the previous Hikrobot 8-camera +

@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
 import contextlib
-from functools import cached_property
 import logging
 import threading
 import time
+from collections.abc import Iterator, Sequence
+from functools import cached_property
 from typing import Any
 
 import numpy as np
@@ -29,13 +29,13 @@ import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
-from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.rotation import Rotation
 
 from ..robot import Robot
 from .backends import (
-    DasGripperHardwareDriver,
     CoreneticGripperHardwareDriver,
+    DasGripperHardwareDriver,
     FrankaHandGripperHardwareDriver,
     HirolGaussianNewtonKinematicsDriver,
     HirolLMKinematicsDriver,
@@ -389,6 +389,19 @@ class FrankaResearch3(Robot):
         return float(timestamp_s - self._capture_timestamp_origin_s)
 
     def _make_gripper_driver(self):
+        if self.config.gripper_backend not in {"mock", "pika", "das", "franka_hand", "corenetic"}:
+            import draccus
+
+            from lerobot.hardware import EndEffectorDriver, get_model
+            model = get_model("end_effector", self.config.gripper_backend)
+            if model.end_effector_factory is None:
+                raise ValueError(f"No end-effector driver registered for {model.type}")
+            config_type = model.config_type()
+            config = draccus.decode(config_type, self.config.gripper_config) if config_type else self.config.gripper_config
+            driver = model.end_effector_factory(config)
+            if not isinstance(driver, EndEffectorDriver):
+                raise TypeError("End-effector factory must implement EndEffectorDriver")
+            return driver
         if self.config.gripper_backend == "mock":
             return self.mock_gripper_driver_cls(initial_position=1.0)
         if self.config.gripper_backend == "das":

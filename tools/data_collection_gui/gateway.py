@@ -6,6 +6,7 @@ import argparse
 import bisect
 import copy
 import csv
+import dataclasses
 import ipaddress
 import json
 import math
@@ -14,16 +15,15 @@ import queue
 import re
 import select
 import shlex
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
-import dataclasses
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,23 +33,26 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
-from tools.data_collection_gui import checkpoints as checkpoint_backend
-from tools.data_collection_gui import gpu_hosts
-from tools.data_collection_gui import policy_servers
-from tools.data_collection_gui import remote_deployments
-from tools.data_collection_gui import rollout as rollout_backend
-from tools.data_collection_gui import table_plane
-from tools.data_collection_gui import task_ladders
-from tools.data_collection_gui import training as training_backend
-from tools.data_collection_gui import unattended as unattended_backend
+from tools.data_collection_gui import (
+    checkpoints as checkpoint_backend,
+    gpu_hosts,
+    hardware_config,
+    policy_servers,
+    remote_deployments,
+    rollout as rollout_backend,
+    table_plane,
+    task_ladders,
+    training as training_backend,
+    unattended as unattended_backend,
+)
 from tools.fr3 import fr3_align_checkpoint_use_amp as use_amp_alignment
 from tools.fr3.scene_reset import (
     SceneResetError,
     parse_mask_strokes,
     pose_probe_command,
     sanitize_pose_probe_request,
-    scene_reset_command,
     sanitize_scene_reset_request,
+    scene_reset_command,
 )
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -335,6 +338,8 @@ class GatewayState:
     recording: RecordingStatus
     replay: ReplayStatus
     profile: str = "thor"
+    hardware_source_config_path: Path | None = None
+    hardware_active: dict[str, Any] | None = None
     datasets_root: Path | None = None
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
@@ -487,6 +492,104 @@ class GatewayState:
             ),
         )
         del self.events[24:]
+
+
+def _hardware_store(state: GatewayState) -> Path:
+    return hardware_config.store_root(state.repo_root, state.hardware_source_config_path or state.config_path)
+
+
+def _hardware_busy_reason(state: GatewayState) -> str:
+    for name, process in (
+        ("recording", state.process), ("teleoperation", state.teleop_process),
+        ("replay", state.replay_process), ("rollout", state.rollout_process),
+        ("export", state.export_process), ("training", state.training_process),
+    ):
+        if process is not None and process.poll() is None:
+            return f"Stop {name} before applying a hardware configuration."
+    if state.recording.state in {"connecting", "armed", "recording", "review", "saving", "discarding"}:
+        return "Disconnect the recorder before applying a hardware configuration."
+    if state.calibration.state == "running" or state.calibration_session.active or state.marker_tcp_session.active:
+        return "Finish calibration before applying a hardware configuration."
+    running = unattended_backend.active_run(state.repo_root)
+    if running:
+        return "Stop unattended runs before applying a hardware configuration."
+    return ""
+
+
+def _hardware_capabilities(state: GatewayState) -> list[str]:
+    robot = state.config.get("robot") or {}
+    if not robot:
+        return ["record"]
+    capabilities = ["record", "teleoperate"]
+    if robot.get("type", "franka_research3") == "franka_research3":
+        capabilities.append("training_view")
+        if robot.get("gripper_backend", "pika") == "pika":
+            capabilities.extend(["simulation", "replay", "rollout"])
+    return capabilities
+
+
+def _hardware_payload(state: GatewayState) -> dict[str, Any]:
+    active = state.hardware_active
+    return {
+        "ok": True,
+        "document": copy.deepcopy(active["document"] if active else hardware_config.from_runtime(state.config)),
+        "revision": active["revision"] if active else None,
+        "activeId": active["document"]["id"] if active else None,
+        "setups": hardware_config.list_setups(_hardware_store(state)),
+        "sourcePath": str(state.hardware_source_config_path or state.config_path),
+        "runtimePath": str(state.config_path),
+        "busyReason": _hardware_busy_reason(state),
+        "warnings": active.get("warnings", []) if active else [],
+        "capabilities": _hardware_capabilities(state),
+    }
+
+
+def _apply_hardware_config(state: GatewayState, saved: dict[str, Any] | None) -> None:
+    reason = _hardware_busy_reason(state)
+    if reason:
+        raise hardware_config.HardwareConfigError(reason)
+    source = state.hardware_source_config_path or state.config_path
+    if saved:
+        # Revalidate on application: models or resources may have changed since Save.
+        config, warnings = hardware_config.compile_setup(saved["document"], saved["runtime"], state.repo_root)
+        saved = {**saved, "runtime": config, "warnings": warnings}
+    else:
+        config = _load_yaml(source)
+    _stop_all_camera_previews(state)
+    _stop_realsense_preview(state)
+    with state.camera_preview_lock:
+        state.camera_preview_frames.clear()
+        state.camera_preview_last_access.clear()
+    if saved:
+        config_path = hardware_config.activate_setup(_hardware_store(state), saved)
+    else:
+        (_hardware_store(state) / "active.json").unlink(missing_ok=True)
+        config_path = source
+    state.hardware_source_config_path = source
+    state.hardware_active = saved
+    state.config = config
+    state.config_path = config_path
+    state.profile = "workstation" if config.get("robot") else "thor"
+    state.runtime_recording_config = None
+    state.runtime_recording_config_path = None
+    state.runtime_teleop_gains = {}
+    state.box_devices_roster = []
+    state.device_preview = {}
+    state.devices = _device_statuses(config, state.repo_root)
+    state.recording = _recording_status_from_config(config)
+    state.replay = _replay_status_from_config(config)
+    state.replay.mujocoValidation = _new_mujoco_validation(state)
+    robot_config = config.get("robot") or {}
+    state.teleop = TeleopStatus(
+        backend="real",
+        robotModel=str(robot_config.get("type") or ""),
+        inputDevice=str((config.get("teleop") or {}).get("type") or ""),
+        urdfPath=str(robot_config.get("urdf_path") or ""),
+        targetFrameName=str(robot_config.get("target_frame_name") or ""),
+        message="Hardware configuration applied; ready for a new session",
+    )
+    state.dataset_cache_ready = False
+    state.log("info", f"Applied hardware configuration: {saved['document']['label'] if saved else 'source YAML'}")
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -818,7 +921,8 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
     is_gmsl = "gmsl" in recorder_script or "defaults" in cameras
 
     vcodec = str(dataset.get("vcodec") or cam_defaults.get("codec") or "")
-    is_fr3 = "fr3_gui_record_runtime" in recorder_script or "tools/fr3/" in recorder_script or "tools\\fr3\\" in recorder_script
+    robot_type = str((config.get("robot") or {}).get("type") or "")
+    is_fr3 = robot_type == "franka_research3" or "fr3_gui_record_runtime" in recorder_script or "tools/fr3/" in recorder_script or "tools\\fr3\\" in recorder_script
     return {
         "configPath": str(config_path),
         "repoId": str(dataset.get("repo_id") or ""),
@@ -836,7 +940,7 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
             "savePath": str(config.get("rerun_save_path") or ""),
         },
         "recorderScript": recorder_script,
-        "rigType": "fr3" if is_fr3 else "gmsl2" if is_gmsl else "handheld",
+        "rigType": "fr3" if is_fr3 else "robot" if robot_type else "gmsl2" if is_gmsl else "handheld",
         "hardwareSync": {
             "enabled": bool(hw_sync.get("enabled", False)),
             "fps": int(hw_sync.get("fps") or 0),
@@ -984,30 +1088,33 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
         devices.append(_make_mapping_device(str(device_id), device, "camera"))
 
     if robot:
+        robot_type = str(robot.get("type") or "franka_research3")
+        is_fr3 = robot_type == "franka_research3"
         devices.append(
             {
-                "id": "fr3",
+                "id": "fr3" if is_fr3 else robot_type,
                 "kind": "robot",
-                "label": "Franka Research 3",
+                "label": "Franka Research 3" if is_fr3 else robot_type,
                 "state": "idle",
                 "fps": int(config.get("control_fps") or 0),
                 "latencyMs": 0,
-                "detail": f"robot {robot.get('robot_ip', '?')}",
+                "detail": str(robot.get("robot_ip") or robot.get("port") or ""),
                 "config": robot,
             }
         )
         gripper_port = robot.get("gripper_port")
-        if gripper_port:
+        gripper_backend = str(robot.get("gripper_backend") or ("pika" if is_fr3 else ""))
+        if gripper_backend:
             devices.append(
                 {
-                    "id": "pika",
+                    "id": gripper_backend,
                     "kind": "gripper",
-                    "label": "Pika gripper",
+                    "label": {"pika": "Pika gripper", "franka_hand": "Franka Hand", "das": "DAS gripper", "corenetic": "Corenetic gripper"}.get(gripper_backend, gripper_backend),
                     "state": "idle",
                     "fps": int(config.get("control_fps") or 0),
                     "latencyMs": 0,
-                    "detail": str(gripper_port),
-                    "config": {"port": gripper_port, "backend": robot.get("gripper_backend", "pika")},
+                    "detail": str(robot.get("robot_ip") if gripper_backend == "franka_hand" else gripper_port or robot.get("corenetic_remote_ip") or ""),
+                    "config": {"port": gripper_port, "backend": gripper_backend},
                 }
             )
     teleop = config.get("teleop") if isinstance(config.get("teleop"), dict) else {}
@@ -1070,7 +1177,7 @@ def _usb_physical_device_count(vendor_id: str, product_id: str) -> int:
 
 def _probe_workstation_devices(state: GatewayState) -> None:
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
-    robot_ip = str(robot.get("robot_ip") or "")
+    robot_ip = str(robot.get("robot_ip") or "") if robot.get("type", "franka_research3") == "franka_research3" else ""
     if robot_ip:
         try:
             result = subprocess.run(
@@ -1114,13 +1221,13 @@ def _probe_workstation_devices(state: GatewayState) -> None:
         )
 
     gripper_port = str(robot.get("gripper_port") or "")
-    if gripper_port:
+    if gripper_port and robot.get("gripper_backend", "pika") in {"pika", "das"}:
         port = Path(gripper_port)
         exists = port.exists()
         accessible = exists and os.access(port, os.R_OK | os.W_OK)
         _set_workstation_device_probe(
             state.devices,
-            "pika",
+            str(robot.get("gripper_backend", "pika")),
             detected=accessible,
             warning=exists and not accessible,
             detail=(
@@ -6152,7 +6259,7 @@ def _rig_contract(state: GatewayState) -> checkpoint_backend.RigContract:
         robot_ip = ""
     import yaml  # local, matching how the rest of this module pulls it in
 
-    camera_config_rel = "tools/fr3/fr3_il_infer_realsense_camera_config.yaml"
+    camera_config_rel = str(state.config_path) if state.hardware_active else "tools/fr3/fr3_il_infer_realsense_camera_config.yaml"
     camera_keys: list[str] = []
     camera_path = state.repo_root / camera_config_rel
     if camera_path.is_file():
@@ -6676,6 +6783,15 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         base_env=_tool_env(state.repo_root),
         policy_server=policy_server,
     )
+    if state.hardware_active:
+        robot_config = state.config.get("robot") or {}
+        env.update({
+            "FR3_RECORD_CONFIG": str(state.config_path),
+            "FR3_GRIPPER_BACKEND": str(robot_config.get("gripper_backend") or ""),
+            "FR3_GRIPPER_PORT": str(robot_config.get("gripper_port") or ""),
+            "FR3_GRIPPER_MAX_WIDTH_MM": str(robot_config.get("gripper_max_width_mm", 90)),
+            "FR3_ROBOT_URDF_PATH": str(robot_config.get("urdf_path") or ""),
+        })
     if remote is not None:
         command, env = remote_deployments.rollout_command(
             command, env, repo_root=state.repo_root, deployment=remote, mode=mode.id
@@ -11660,6 +11776,11 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
 
     return {
         "deployment": {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]},
+        "hardware": {
+            "activeId": state.hardware_active["document"]["id"] if state.hardware_active else None,
+            "label": state.hardware_active["document"]["label"] if state.hardware_active else "Source configuration",
+            "capabilities": _hardware_capabilities(state),
+        },
         "gateway": {
             "configPath": str(state.config_path),
             "pid": state.recording.pid,
@@ -11791,6 +11912,8 @@ def _fr3_target_frame_name(state: GatewayState) -> str:
     frame from the one the recorder is using -- the same silent offset, arrived at from the inside.
     """
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    if robot.get("type", "franka_research3") != "franka_research3":
+        return str(robot.get("target_frame_name") or "")
     return str(robot.get("target_frame_name") or "").strip() or FR3_DEFAULT_TARGET_FRAME_NAME
 
 
@@ -11898,6 +12021,8 @@ def _start_teleop_output_reader(state: GatewayState, process: subprocess.Popen[s
 
 
 def _start_fr3_sim_teleop(state: GatewayState) -> None:
+    if "simulation" not in _hardware_capabilities(state):
+        raise ValueError("Simulation is unavailable for the selected robot/end-effector assembly.")
     process = state.teleop_process
     if process is not None and process.poll() is None:
         state.teleop.message = "FR3 MuJoCo teleop is already running"
@@ -11943,9 +12068,10 @@ def _start_fr3_real_teleop(state: GatewayState) -> None:
     if process is not None and process.poll() is None:
         state.teleop.message = "An FR3 teleop session is already active"
         return
-    urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
-    if not urdf_path.is_file():
-        raise RuntimeError(f"Missing FR3 Pika URDF: {urdf_path}")
+    robot_config = state.config.get("robot") or {}
+    if not robot_config:
+        raise ValueError("Select a robot in Device Manager first.")
+    urdf_path = str(robot_config.get("urdf_path") or "")
     if not state.config_path.is_file():
         raise RuntimeError(f"Missing workstation FR3 config: {state.config_path}")
 
@@ -11964,13 +12090,13 @@ def _start_fr3_real_teleop(state: GatewayState) -> None:
     state.teleop = TeleopStatus(
         state="starting",
         backend="real",
-        inputDevice="spacemouse",
-        robotModel="fr3_pika_gripper",
+        inputDevice=str((state.config.get("teleop") or {}).get("type") or ""),
+        robotModel=str(robot_config.get("type") or ""),
         urdfPath=str(urdf_path),
-        simXmlPath=str(sim_xml_path),
+        simXmlPath="",
         targetFrameName=_fr3_target_frame_name(state),
         pid=process.pid,
-        message="Connecting to FR3 192.168.1.206, Pika gripper, and SpaceMouse",
+        message=f"Connecting to {robot_config.get('type')} at {robot_config.get('robot_ip') or robot_config.get('port')}",
         command=command,
         realRobotReady=False,
     )
@@ -12108,6 +12234,8 @@ def _recorder_script(state: GatewayState) -> tuple[Path, str]:
     if state.profile == "workstation":
         # The FR3 workstation config is a lerobot RecordConfig, which draccus parses strictly;
         # it cannot carry a `recorder:` block to point here, so the profile selects the script.
+        if (state.config.get("robot") or {}).get("type", "franka_research3") != "franka_research3":
+            return state.repo_root / "tools/data_collection_gui/robot_record.py", "--config_path"
         return state.repo_root / WORKSTATION_RECORDER_SCRIPT, "--config_path"
     return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
 
@@ -12300,6 +12428,8 @@ def _connect_recorder(
             raise ValueError(f"Recording backend must be one of {RECORD_BACKENDS}, got {backend!r}")
         if not is_workstation and backend != DEFAULT_RECORD_BACKEND:
             raise ValueError("Only the workstation profile can choose a recording backend")
+        if backend == "sim" and "simulation" not in _hardware_capabilities(state):
+            raise ValueError("Simulation is unavailable for the selected robot/end-effector assembly.")
         state.recording.backend = backend
 
     config_path = _resolve_recorder_config_path(
@@ -14350,6 +14480,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path in {"/api/hardware", "/api/hardware/catalog", "/api/hardware/setup"}:
+            try:
+                # Import installed plugin registrations once, outside the gateway state lock.
+                from lerobot.hardware import catalog
+                models = catalog()
+                with self.server.state.lock:
+                    if path == "/api/hardware/catalog":
+                        report = {"ok": True, "models": models}
+                    elif path == "/api/hardware/setup":
+                        saved = hardware_config.read_setup(_hardware_store(self.server.state), query.get("id", [""])[0])
+                        report = {"ok": True, **saved}
+                    else:
+                        report = {**_hardware_payload(self.server.state), "models": models}
+                _json_response(self, HTTPStatus.OK, report)
+            except (ValueError, OSError) as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
         if path == "/api/teleop/camera.jpg":
             if self.server.state.profile != "workstation":
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "teleoperation is unavailable"})
@@ -14961,6 +15108,52 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        if path.startswith("/api/hardware/"):
+            try:
+                body = _read_json_body(self)
+                with self.server.state.lock:
+                    state = self.server.state
+                    if path in {"/api/hardware/validate", "/api/hardware/save"}:
+                        document = body.get("document")
+                        runtime, warnings = hardware_config.compile_setup(document, state.config, state.repo_root)
+                        if path.endswith("/save"):
+                            saved = hardware_config.save_setup(
+                                _hardware_store(state), document, runtime, warnings, body.get("revision")
+                            )
+                            report = {"ok": True, **saved, "setups": hardware_config.list_setups(_hardware_store(state))}
+                        else:
+                            import yaml
+                            report = {"ok": True, "warnings": warnings,
+                                      "runtimeYaml": yaml.safe_dump(runtime, sort_keys=False, allow_unicode=True)}
+                    elif path == "/api/hardware/activate":
+                        saved = hardware_config.read_setup(_hardware_store(state), body.get("id"))
+                        if body.get("revision") != saved["revision"]:
+                            raise hardware_config.HardwareConfigError("Configuration changed; reload it before applying.")
+                        _apply_hardware_config(state, saved)
+                        report = _hardware_payload(state)
+                    elif path == "/api/hardware/reset":
+                        _apply_hardware_config(state, None)
+                        report = _hardware_payload(state)
+                    else:
+                        raise hardware_config.HardwareConfigError(f"Unknown hardware operation: {path}")
+                _json_response(self, HTTPStatus.OK, report)
+            except Exception as exc:
+                # Driver dataclasses can raise different configuration-specific exceptions.
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+        required_capability = {
+            "/api/teleop/start-sim": "simulation",
+            "/api/replay/start-mujoco": "simulation",
+            "/api/replay/start-real": "replay",
+            "/api/training/start": "training_view",
+            "/api/datasets/export": "training_view",
+        }.get(path)
+        robot_type = (self.server.state.config.get("robot") or {}).get("type")
+        if robot_type and (path.startswith("/api/rollout/") or path.startswith("/api/unattended/")):
+            required_capability = "rollout"
+        if robot_type and required_capability and required_capability not in _hardware_capabilities(self.server.state):
+            _json_response(self, HTTPStatus.CONFLICT, {"ok": False, "error": f"{required_capability} is unavailable for the selected hardware assembly."})
+            return
         # Recording is available in both profiles now: Thor drives the handheld/GMSL2 rig,
         # the workstation drives the FR3 SpaceMouse recorder. Only the BOX-sensor calibration
         # endpoints remain Thor-specific, since no BOX exists on the workstation.
@@ -15670,7 +15863,17 @@ def make_state(
         raise ValueError(f"Unknown deployment profile: {profile}")
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
-    config = _load_yaml(resolved_config)
+    source_config = resolved_config
+    saved_hardware = hardware_config.active_setup(hardware_config.store_root(resolved_root, source_config))
+    if saved_hardware:
+        from lerobot.hardware import catalog
+        catalog()
+        config, warnings = hardware_config.compile_setup(saved_hardware["document"], saved_hardware["runtime"], resolved_root)
+        saved_hardware = {**saved_hardware, "runtime": config, "warnings": warnings}
+        resolved_config = hardware_config.activate_setup(hardware_config.store_root(resolved_root, source_config), saved_hardware)
+        profile = "workstation" if config.get("robot") else "thor"
+    else:
+        config = _load_yaml(resolved_config)
     resolved_datasets_root: Path | None = None
     if datasets_root is not None:
         resolved_datasets_root = datasets_root if datasets_root.is_absolute() else resolved_root / datasets_root
@@ -15684,6 +15887,8 @@ def make_state(
         config_path=resolved_config,
         config=config,
         profile=profile,
+        hardware_source_config_path=source_config,
+        hardware_active=saved_hardware,
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
@@ -15695,11 +15900,17 @@ def make_state(
     state.replay.mujocoValidation = _new_mujoco_validation(state)
     _load_active_calibration_runs(state)
     _restore_training_run(state)
-    if profile == "workstation":
+    if profile == "workstation" and not saved_hardware:
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
         state.teleop.urdfPath = str(urdf_path)
         state.teleop.simXmlPath = str(sim_xml_path)
         state.teleop.message = "FR3 Pika MuJoCo teleop is ready on the workstation"
+    elif saved_hardware:
+        robot_config = config.get("robot") or {}
+        state.teleop.robotModel = str(robot_config.get("type") or "")
+        state.teleop.inputDevice = str((config.get("teleop") or {}).get("type") or "")
+        state.teleop.urdfPath = str(robot_config.get("urdf_path") or "")
+        state.teleop.message = "Saved hardware configuration restored; ready for a new session"
     state.log("info", f"Loaded {profile} config {resolved_config}")
     if resolved_datasets_root is not None:
         state.log("info", f"Scanning datasets under {resolved_datasets_root}")

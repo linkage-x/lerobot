@@ -320,7 +320,10 @@ export function LiveRecordPage({
   // Only the FR3 workstation has two robots behind one recorder; Thor's rig is singular and
   // must keep sending Connect with no backend at all.
   const workstationProfile = snapshot.deployment?.profile === "workstation";
+  const fr3Profile = workstationProfile && snapshot.devices.some((device) => device.kind === "robot" && device.id === "fr3");
+  const supportsSceneReset = fr3Profile && (!snapshot.hardware || snapshot.hardware.capabilities.includes("rollout"));
   const supportsBackendChoice = workstationProfile;
+  const supportsSimulation = !snapshot.hardware || snapshot.hardware.capabilities.includes("simulation");
   const supportsTrajectoryGeneration = !workstationProfile;
   const [sceneResetLandmarks, setSceneResetLandmarks] = useState<RolloutLandmarks>({});
   const [sceneResetTrainingViews, setSceneResetTrainingViews] = useState<TrainingView[]>([]);
@@ -332,6 +335,7 @@ export function LiveRecordPage({
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
+  useEffect(() => { if (!supportsSimulation) setSelectedBackend("real"); }, [supportsSimulation]);
   const [episodeTimeInput, setEpisodeTimeInput] = useState(() => String(snapshot.configSummary.episodeTimeS));
   const [fpsInput, setFpsInput] = useState(() => String(snapshot.configSummary.fps));
   // `numEpisodes` is `number | "unlimited"`: the handheld rigs run until the operator stops, the
@@ -432,7 +436,7 @@ export function LiveRecordPage({
   }, [recorderConnected, snapshot.recording.backend]);
 
   useEffect(() => {
-    if (!workstationProfile) return;
+    if (!supportsSceneReset) return;
     let cancelled = false;
     void (async () => {
       const payload = await api.fetchRolloutLandmarks(snapshot.recording.datasetRoot);
@@ -441,10 +445,10 @@ export function LiveRecordPage({
     return () => {
       cancelled = true;
     };
-  }, [workstationProfile, snapshot.recording.datasetRoot]);
+  }, [supportsSceneReset, snapshot.recording.datasetRoot]);
 
   useEffect(() => {
-    if (!workstationProfile) return;
+    if (!supportsSceneReset) return;
     let cancelled = false;
     void (async () => {
       const views = await api.fetchTrainingViews();
@@ -453,10 +457,10 @@ export function LiveRecordPage({
     return () => {
       cancelled = true;
     };
-  }, [workstationProfile]);
+  }, [supportsSceneReset]);
 
   useEffect(() => {
-    if (!workstationProfile) return;
+    if (!supportsSceneReset) return;
     if (sceneResetReferenceSource === "none") {
       setSceneResetReferenceLandmarks({});
       return;
@@ -470,7 +474,7 @@ export function LiveRecordPage({
     return () => {
       cancelled = true;
     };
-  }, [workstationProfile, sceneResetReferenceSource]);
+  }, [supportsSceneReset, sceneResetReferenceSource]);
 
   useEffect(() => {
     if (!recorderConnected) {
@@ -538,11 +542,11 @@ export function LiveRecordPage({
         onClick={() => setSelectedBackend("real")}
         type="button"
       >
-        Real FR3
+        Real robot
       </button>
       <button
         className={selectedBackend === "sim" ? "active" : ""}
-        disabled={busy || recorderConnected}
+        disabled={busy || recorderConnected || !supportsSimulation}
         onClick={() => setSelectedBackend("sim")}
         type="button"
       >
@@ -593,12 +597,12 @@ export function LiveRecordPage({
       <PageHeader
         title="Live Record"
         subtitle={supportsBackendChoice
-          ? `FR3 SpaceMouse capture on the ${selectedBackend === "sim" ? "MuJoCo twin" : "real arm"}; both write the same dataset schema`
+          ? `${snapshot.hardware?.label ?? "Robot"} · ${selectedBackend === "sim" ? "MuJoCo simulation" : "hardware recording"}`
           : snapshot.configSummary.rigType === "gmsl2"
             ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
             : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
       />
-      {workstationProfile ? (
+      {supportsSceneReset ? (
         <section className="panel capture-readiness-banner" aria-label="FR3 capture readiness">
           <div>
             <strong>Before collecting: lock camera exposure and white balance</strong>
@@ -644,11 +648,11 @@ export function LiveRecordPage({
           backendPicker={backendPicker}
           episodeDurationControl={episodeDurationControl}
           episodeDurationValid={canUseEpisodeTimeInput && canUseFpsInput && canUseNumEpisodesInput}
-          showStartPoseControl={workstationProfile}
+          showStartPoseControl={fr3Profile}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
-      {workstationProfile ? (
+      {supportsSceneReset ? (
         <SceneResetPanel
           title="Record scene reset"
           landmarks={sceneResetPanelLandmarks}

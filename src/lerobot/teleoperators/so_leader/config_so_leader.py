@@ -30,7 +30,6 @@ class SOLeaderConfig:
     use_degrees: bool = True
 
 
-@TeleoperatorConfig.register_subclass("so101_leader")
 @TeleoperatorConfig.register_subclass("so100_leader")
 @dataclass
 class SOLeaderTeleopConfig(TeleoperatorConfig, SOLeaderConfig):
@@ -38,4 +37,9 @@ class SOLeaderTeleopConfig(TeleoperatorConfig, SOLeaderConfig):
 
 
 SO100LeaderConfig = SOLeaderTeleopConfig
-SO101LeaderConfig = SOLeaderTeleopConfig
+
+
+@TeleoperatorConfig.register_subclass("so101_leader")
+@dataclass
+class SO101LeaderConfig(SOLeaderTeleopConfig):
+    """Keep the model identity distinct when a config is decoded from YAML."""

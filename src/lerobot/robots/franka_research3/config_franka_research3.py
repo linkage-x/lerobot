@@ -27,6 +27,8 @@ class FrankaResearch3Config(RobotConfig):
     robot_ip: str = "127.0.0.1"
     gripper_port: str = "/dev/ttyUSB0"
     gripper_backend: str = "pika"
+    # Adapter-specific parameters for registered third-party end effectors.
+    gripper_config: dict = field(default_factory=dict)
     allow_mock_gripper: bool = True
     urdf_path: str = ""
     target_frame_name: str = "pika_gripper_ee"
@@ -129,7 +131,10 @@ class FrankaResearch3Config(RobotConfig):
         if self.realtime_config not in ("auto", "enforce", "ignore"):
             raise ValueError("realtime_config must be one of 'auto', 'enforce', or 'ignore'.")
         if self.gripper_backend not in {"pika", "das", "franka_hand", "corenetic", "mock"}:
-            raise ValueError("gripper_backend must be one of 'pika', 'das', 'franka_hand', 'corenetic', or 'mock'.")
+            from lerobot.hardware import get_model
+            model = get_model("end_effector", self.gripper_backend)
+            if "franka_research3" not in model.compatible_robots or model.end_effector_factory is None:
+                raise ValueError("End effector must register an FR3-compatible driver factory.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
         if self.start_joint_positions is not None and len(self.start_joint_positions) != len(self.joint_names):

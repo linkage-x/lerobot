@@ -26,6 +26,8 @@
 
 ## Data Collection GUI
 
+To select robot, end-effector and camera models and configure their IPs, ports and serial numbers in the browser, open **Device Manager → Hardware configuration**. See [Hardware configuration and adapter interfaces](./docs/hardware_configuration.md) for portable setups, saved configurations and adding new hardware.
+
 For the thor workflow(with sensing's gmsl2 cams), use [Thor Data Collection GUI guide](./tools/thor/README.md)
 
 For the local FR3 data-collection workflow(with hikrobot cams), use the [Data Collection GUI guide](./tools/data_collection_gui/frontend/README.md). It documents the browser entry points for Live Record, Dataset Processing, Episode Replay, annotation, MuJoCo validation, guarded real-robot replay, and the command-line fallbacks for functionality that is not fully wired into the GUI yet.

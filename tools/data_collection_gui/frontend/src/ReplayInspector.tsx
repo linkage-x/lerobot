@@ -284,6 +284,7 @@ export function ReplayInspector({
   onMujocoModeChange,
   onRunMujoco,
   onApproveMujoco,
+  simulationAvailable = true,
   replayStatus,
   busy,
   mujocoRefreshKey = "",
@@ -301,6 +302,7 @@ export function ReplayInspector({
   onMujocoModeChange: (mode: MujocoCubeMode) => void;
   onRunMujoco: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
+  simulationAvailable?: boolean;
   replayStatus: ReplayStatus;
   busy: boolean;
   mujocoRefreshKey?: string;
@@ -840,7 +842,7 @@ export function ReplayInspector({
           ) : null}
           <button
             className="mujoco-run-button"
-            disabled={busy || replayActive || !canRunMujoco}
+            disabled={busy || replayActive || !canRunMujoco || !simulationAvailable}
             onClick={() => onRunMujoco(mujocoMode)}
             type="button"
           >
@@ -854,7 +856,7 @@ export function ReplayInspector({
           {cubeSelection ? (
             <button
               className="mujoco-pass-button"
-              disabled={busy || replayActive || !mujocoPreview}
+              disabled={busy || replayActive || !mujocoPreview || !simulationAvailable}
               onClick={() => onApproveMujoco(mujocoMode)}
               type="button"
             >

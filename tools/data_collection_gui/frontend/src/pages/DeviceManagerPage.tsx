@@ -3,6 +3,7 @@ import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { api } from "../apiClient";
+import { HardwareConfiguration } from "./HardwareConfiguration";
 import { TouchHeatmapGrid, numberArray, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples } from "../touchVisualization";
 
 export function numberValue(value: unknown): number | null {
@@ -505,7 +506,8 @@ export function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
 
   return (
     <div className="page-stack">
-      <PageHeader title="Device Manager" subtitle="view connected hardware devices, configuration details, and connection status" />
+      <PageHeader title="Device Manager" subtitle="select hardware models, configure device instances, and inspect connection status" />
+      <HardwareConfiguration snapshot={snapshot} />
       <section className="panel">
         <div className="panel-heading">
           <h2>Summary</h2>

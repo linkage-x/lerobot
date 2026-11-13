@@ -8,15 +8,14 @@ import logging
 import signal
 from pathlib import Path
 
-from lerobot.configs import parser
 import lerobot.robots.franka_research3  # noqa: F401  # registers the `franka_research3` robot choice
+import lerobot.teleoperators.spacemouse  # noqa: F401
+from lerobot.configs import parser
 from lerobot.robots import make_robot_from_config
 from lerobot.scripts.lerobot_record import RecordConfig, record_loop
-import lerobot.teleoperators.spacemouse  # noqa: F401
 from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
-
 from tools.fr3.fr3_record_runtime import make_fr3_action_processors
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,16 +35,21 @@ def teleoperate(cfg: RecordConfig) -> None:
         raise ValueError("FR3 real teleop requires a teleoperator configuration.")
 
     init_logging()
-    cfg.robot.urdf_path = _resolve_workspace_path(cfg.robot.urdf_path)
+    if hasattr(cfg.robot, "urdf_path"):
+        cfg.robot.urdf_path = _resolve_workspace_path(cfg.robot.urdf_path)
     # Camera ownership stays with the gateway preview processes. This keeps
     # both RealSense streams available even when the FR3 FCI connection fails.
     cfg.robot.cameras = {}
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = (
-        make_fr3_action_processors(cfg)
-    )
+    is_fr3 = cfg.robot.type == "franka_research3"
+    if is_fr3:
+        processors = make_fr3_action_processors(cfg)
+    else:
+        from lerobot.hardware.recording import native_recording_processors
+        processors = native_recording_processors(cfg, robot, teleop)
+    teleop_action_processor, robot_action_processor, robot_observation_processor = processors
     events = {
         "exit_early": False,
         "rerecord_episode": False,
@@ -62,7 +66,7 @@ def teleoperate(cfg: RecordConfig) -> None:
     try:
         teleop.connect()
         robot.connect()
-        observation = robot.get_observation(include_cameras=False)
+        observation = robot.get_observation(include_cameras=False) if is_fr3 else robot.get_observation()
         sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
         if callable(sync_gripper):
             sync_gripper(float(observation["gripper.pos"]))

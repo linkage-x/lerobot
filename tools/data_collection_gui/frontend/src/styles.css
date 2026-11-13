@@ -5284,3 +5284,15 @@ button.danger {
 .gpu-host-failed {
   color: #b42318;
 }
+.hardware-editor { border: 0; padding: 0; margin: 0; min-width: 0; }
+.hardware-toolbar, .hardware-camera-heading { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.hardware-toolbar .annotation-field { flex: 1; min-width: 220px; }
+.hardware-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 12px 0; }
+.hardware-instance { padding: 14px 0; border-bottom: 1px solid var(--border, #d8dee9); }
+.hardware-model-select { max-width: 460px; }
+.hardware-advanced { margin: 12px 0; }
+.hardware-advanced summary { cursor: pointer; padding: 8px 0; font-weight: 600; }
+.hardware-camera { margin: 12px 0; padding: 16px; border: 1px solid var(--border, #d8dee9); border-radius: 8px; }
+.hardware-field-error { color: #d34c4c; }
+.hardware-runtime { max-height: 400px; overflow: auto; white-space: pre-wrap; padding: 12px; }
+.hardware-active-label { overflow-wrap: anywhere; }

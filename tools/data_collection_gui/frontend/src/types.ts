@@ -7,7 +7,7 @@ export type DeploymentProfile = {
   defaultRoute: string;
 };
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator";
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "gripper" | "teleoperator";
 
 export type DeviceStatus = {
   id: string;
@@ -88,7 +88,7 @@ export type ConfigSummary = {
     savePath: string;
   };
   recorderScript?: string;
-  rigType?: "gmsl2" | "handheld" | "fr3";
+  rigType?: "gmsl2" | "handheld" | "fr3" | "robot";
   hardwareSync?: HardwareSyncStatus;
   cameraDefaults?: CameraDefaults;
 };

@@ -279,6 +279,9 @@ export function TeleoperationPage({
   cameraUrl: (view: TeleopCameraView, backend: TeleopBackend) => string;
 }) {
   const teleop = snapshot.teleop;
+  const supportsSimulation = !snapshot.hardware || snapshot.hardware.capabilities.includes("simulation");
+  const robotDevice = snapshot.devices.find((device) => device.kind === "robot");
+  const gripperDevice = snapshot.devices.find((device) => device.kind === "gripper");
   const sessionActive = teleop.state === "running" || teleop.state === "starting";
   const [selectedBackend, setSelectedBackend] = useState<TeleopBackend>(teleop.backend);
   const statusState = sessionActive ? "running" : teleop.state === "error" ? "error" : "idle";
@@ -293,11 +296,12 @@ export function TeleoperationPage({
 
   useEffect(() => {
     if (sessionActive) setSelectedBackend(teleop.backend);
-  }, [sessionActive, teleop.backend]);
+    else if (!supportsSimulation) setSelectedBackend("real");
+  }, [sessionActive, teleop.backend, supportsSimulation]);
 
   return (
     <div className="page-stack">
-      <PageHeader title="FR3 Pika Teleoperation" subtitle="workstation control and observation" />
+      <PageHeader title="Robot Teleoperation" subtitle={snapshot.hardware?.label ?? "workstation control and observation"} />
       <section className="panel teleop-panel">
         <div className="panel-heading">
           <h2>Control Session</h2>
@@ -306,7 +310,7 @@ export function TeleoperationPage({
         <div className="mujoco-mode-picker teleop-backend-picker" role="group" aria-label="Teleoperation backend">
           <button
             className={selectedBackend === "mujoco" ? "active" : ""}
-            disabled={busy || sessionActive}
+            disabled={busy || sessionActive || !supportsSimulation}
             onClick={() => setSelectedBackend("mujoco")}
             type="button"
           >
@@ -322,14 +326,14 @@ export function TeleoperationPage({
           </button>
         </div>
         <div className="summary-grid">
-          <Metric label="Backend" value={selectedBackend === "real" ? "FR3 hardware" : "MuJoCo"} />
+          <Metric label="Backend" value={selectedBackend === "real" ? "Robot hardware" : "MuJoCo"} />
           <Metric label="Input" value={teleop.inputDevice} />
           <Metric label="Robot" value={teleop.robotModel} />
           <Metric label="Target" value={teleop.targetFrameName} />
         </div>
         <div className="teleop-config-grid">
-          <div><span>FR3</span><strong>192.168.1.206</strong></div>
-          <div><span>Pika gripper</span><strong>/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0</strong></div>
+          <div><span>{robotDevice?.label ?? "Robot"}</span><strong>{robotDevice?.detail ?? "Select in Device Manager"}</strong></div>
+          <div><span>{gripperDevice?.label ?? "End effector"}</span><strong>{gripperDevice?.detail ?? "Integrated"}</strong></div>
           <div><span>URDF</span><strong>{teleop.urdfPath}</strong></div>
           <div>
             <span>{selectedBackend === "mujoco" ? "MJCF" : "FCI connection"}</span>
@@ -344,7 +348,7 @@ export function TeleoperationPage({
             </strong>
           </div>
           <div><span>PID</span><strong>{sessionActive ? teleop.pid ?? "-" : "-"}</strong></div>
-          <div><span>Cameras</span><strong>D435I external · D405 wrist</strong></div>
+          <div><span>Cameras</span><strong>{snapshot.devices.filter((device) => device.kind === "camera").map((device) => device.id).join(" · ") || "None"}</strong></div>
         </div>
         <div className="control-row">
           <button
@@ -361,12 +365,12 @@ export function TeleoperationPage({
         <div className="teleop-message">{teleop.message}</div>
       </section>
 
-      <TeleopGainsPanel
+      {snapshot.devices.some((device) => device.kind === "teleoperator" && device.id === "spacemouse") && <TeleopGainsPanel
         snapshot={snapshot}
         busy={busy}
         sessionActive={sessionActive}
         onSetTeleopGains={onSetTeleopGains}
-      />
+      />}
 
       <section className="panel teleop-observation-panel">
         <div className="panel-heading">

@@ -984,6 +984,8 @@ export function EpisodeReplayPage({
   // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
   // pick between, and the gateway ignores the cube mode on that profile entirely.
   const workstationProfile = (snapshot.deployment?.profile ?? "thor") === "workstation";
+  const supportsSimulation = !workstationProfile || !snapshot.hardware || snapshot.hardware.capabilities.includes("simulation");
+  const supportsRealReplay = !workstationProfile || !snapshot.hardware || snapshot.hardware.capabilities.includes("replay");
   const cubeSelection = !workstationProfile;
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
@@ -1026,12 +1028,14 @@ export function EpisodeReplayPage({
         onMujocoModeChange={setMujocoMode}
         onRunMujoco={onMujocoReplay}
         onApproveMujoco={onApproveMujoco}
+        simulationAvailable={supportsSimulation}
         replayStatus={snapshot.replay}
         busy={busy}
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}
         cubeSelection={cubeSelection}
       />
-      <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} />
+      {supportsRealReplay ? <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} /> :
+        <p className="panel-note">Real-robot replay is unavailable for the selected hardware assembly. Recorded data can still be inspected and annotated.</p>}
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
