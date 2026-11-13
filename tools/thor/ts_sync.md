@@ -587,6 +587,14 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 > `export_v3` 会跳过并说明；`box_realign` 只处理 44 维）。
 > 原则：state 只留可训练的传感器读数, 不放单调计数/常量/同一量的第二种编码, 避免归一化被带歪与时间泄漏。
 
+> **扳机锁定（2026-11-13 查 SDK v4.1）**：固件规则是扳机捏到底保持约 2 s 就锁定，松手后夹爪仍闭合、
+> `depth_percent` 停在 100，只有 `raw_depth_percent` 跟着手指；再捏到底一次解锁（11-03 现场实测）。
+> **这个锁定关不掉**：导出的 C API（`box_*`）、wheel 的 `ctypes_backend.py`、`box_sdk.conf`、厂商 Python API 文档
+> 都没有锁定相关的 setter 或配置，SDK 只读回 `locked` 标志；`set_mode` 0/1（采集/控制）会不会影响锁定，文档没写。
+> 要关只能请厂商（源络）在固件里加开关。state 里的 `box_trigger.travel_pct` 是锁定后的有效值，和夹爪实际开合一致；
+> `box_client` 解码出的 `raw_travel_pct` 和 `locked` **没有写进数据集**，所以事后从数据里分不出哪段是误锁。
+> 录制时的操作规矩见使用指南第 5 节。
+
 #### 9.1.1 IMU 姿态去冗余（31 → 28 维，`rpy` 删除 + quat 改 xyzw）✅ 2026-07-29
 
 **结论（已实施）**：删掉 `box_imu.{roll,pitch,yaw}_deg` 三维，只保留四元数，并把顺序从原来的

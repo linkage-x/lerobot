@@ -293,6 +293,7 @@
       <ul>
         <li>右手 rig 的 4 块贴片尽量让至少 2 台已标定相机同时看到；手、袖子、物体别长时间挡住贴片。</li>
         <li>动作别太快（1 m/s 量级会丢检测）；在右臂可达、并且尽量靠近上面那块标定覆盖区的范围里做。</li>
+        <li>扳机别捏到底停住：捏到底保持约 2 秒，BOX 会把夹爪锁在闭合状态，松手也不张开。锁住了就再捏到底一次解锁，这一段丢弃重录。这个锁定目前关不掉（BOX 固件行为，SDK 没有开关）。</li>
         <li>结束时同样静止 1–2 秒。</li>
       </ul></li>
     <li><b>保存或丢弃。</b><span class="ui">Save</span>（<kbd>S</kbd>）保存，<span class="ui">Discard</span>（<kbd>D</kbd>）丢弃，<span class="ui">Exit</span>（<kbd>Esc</kbd>）退出会话。保存后页面出现 <span class="ui">Raw dataset saved</span>，可以直接 <span class="ui">Open in Replay</span>、<span class="ui">Queue Traj Gen</span> 或 <span class="ui">Go to Processing</span>。</li>
@@ -396,6 +397,7 @@
       <tr><td><span class="ui">2 · Execute trajectory</span> 是灰的</td><td>还没到 at start，或勾了激光但跟踪仪没 ready。</td><td>等 Phase 变 at start；激光模式下把 SMR 装到臂上并锁定光束。</td></tr>
       <tr><td>某几路相机没画面</td><td>Argus 没起来。</td><td>在 Thor 跑 <code>recover_argus.sh</code>；不行就整机断电重启。</td></tr>
       <tr><td><code>connect: HTTP 500：gateway 没有应答…</code>（旧版只显示 <code>HTTP 500</code>）</td><td>不是录制出错，是 gateway 没在运行或正在重启（有人在部署；11-13 之前的 <code>recover_argus.sh</code> 会把它停掉）。</td><td>等一分钟再点；一直这样找维护者重新部署。</td></tr>
+      <tr><td>松开扳机后手持夹爪还闭着、不张开</td><td>扳机捏到底停了约 2 秒，BOX 固件锁定了夹爪（不是故障，目前也关不掉）。</td><td>再把扳机捏到底一次解锁；这一段丢弃重录。</td></tr>
       <tr><td>保存时 0 samples</td><td>BOX 数据没进来。</td><td>丢弃这段；检查 BOX 上电和网络，找维护者。</td></tr>
       <tr><td>回放时夹爪不动</td><td>夹爪 BOX 没上电或掉电重启过。</td><td>检查 BOX 3100715645 供电，重新预检。</td></tr>
       <tr><td>功能「刚修好」但界面没变化</td><td>前端改动要部署后才生效，网关改动要重新部署并重启。</td><td>问维护者 Thor 上是不是最新版本。</td></tr>
