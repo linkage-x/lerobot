@@ -5112,3 +5112,20 @@ def test_the_lighting_option_is_a_checked_label():
     assert sanitize({"graspLoopLighting": ""}) == {}
     with pytest.raises(rollout_backend.RolloutError):
         sanitize({"graspLoopLighting": "a;b"})
+
+
+def test_a_free_space_speedup_reaches_the_launcher_with_its_height(tmp_path: Path):
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {"freeSpaceSpeedup": 1.5, "freeSpaceAboveZ": 0.12}
+    )
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+    assert env["FR3_FREE_SPACE_SPEEDUP"] == "1.5" and env["FR3_FREE_SPACE_ABOVE_Z"] == "0.12"
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert 'common_args+=(--free-space-speedup "${free_space_speedup}")' in launcher
+    assert 'common_args+=(--free-space-above-z "${free_space_above_z}")' in launcher
+    with pytest.raises(rollout_backend.RolloutError, match="freeSpaceAboveZ"):
+        rollout_backend.sanitize_rollout_runtime_options({"freeSpaceSpeedup": 2})
+    with pytest.raises(rollout_backend.RolloutError, match="<= 3"):
+        rollout_backend.sanitize_rollout_runtime_options({"freeSpaceSpeedup": 4, "freeSpaceAboveZ": 0.12})
+    # 1 is the runtime as before: nothing reaches the launcher.
+    assert "FR3_FREE_SPACE_SPEEDUP" not in rollout_backend.sanitize_rollout_runtime_options({"freeSpaceSpeedup": 1})

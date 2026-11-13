@@ -154,6 +154,8 @@ phase_align_action_samples="${FR3_PHASE_ALIGN_ACTION_SAMPLES-}"
 phase_hysteresis_mm="${FR3_PHASE_HYSTERESIS_MM-}"
 # 1 = below the align height, chunks are asked for without the RTC prefix.
 phase_align_unguided="${FR3_PHASE_ALIGN_UNGUIDED-0}"
+free_space_speedup="${FR3_FREE_SPACE_SPEEDUP-}"
+free_space_above_z="${FR3_FREE_SPACE_ABOVE_Z-}"
 terminal_servo_handoff_z="${FR3_TERMINAL_SERVO_HANDOFF_Z-}"
 terminal_servo_search_ring="${FR3_TERMINAL_SERVO_SEARCH_RING-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
@@ -337,6 +339,12 @@ fi
 if [[ "${phase_align_unguided}" == "1" ]]; then
   common_args+=(--phase-align-unguided)
 fi
+if [[ -n "${free_space_speedup}" ]]; then
+  common_args+=(--free-space-speedup "${free_space_speedup}")
+fi
+if [[ -n "${free_space_above_z}" ]]; then
+  common_args+=(--free-space-above-z "${free_space_above_z}")
+fi
 if [[ -n "${terminal_servo_pose}" ]]; then
   common_args+=(--terminal-servo-pose "${terminal_servo_pose}")
 fi
@@ -391,6 +399,8 @@ case "$mode" in
     echo "FR3_PHASE_ALIGN_ACTION_SAMPLES=${phase_align_action_samples:-<runtime default>}"
     echo "FR3_PHASE_HYSTERESIS_MM=${phase_hysteresis_mm:-<runtime default>}"
     echo "FR3_PHASE_ALIGN_UNGUIDED=${phase_align_unguided}"
+    echo "FR3_FREE_SPACE_SPEEDUP=${free_space_speedup:-1}"
+    echo "FR3_FREE_SPACE_ABOVE_Z=${free_space_above_z:-<unset>}"
     echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
     echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
     echo "FR3_TERMINAL_SERVO_SEARCH_RING=${terminal_servo_search_ring:-<off>}"

@@ -2308,6 +2308,7 @@ def run_grasp_loop(
     lighting: Callable[[], str] | None = None,
     inference_latency_s: Callable[[], list[float]] | None = None,
     take_confirmations: Callable[[], list[dict[str, Any]]] | None = None,
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run `request.trials` graded grasps, appending one JSONL row per trial to `out_path`.
 
@@ -2418,6 +2419,9 @@ def run_grasp_loop(
         "kind": "run_start", "at": time.time(), "request": _request_record(request), "resumedAfter": len(done),
         "startTrial": start, "policy": policy,
         "lighting": None if lighting is None else lighting(),
+        # Runtime settings the request does not carry but that change how the policy runs (the
+        # free-space speedup, 11-13). Only written when set, so earlier rows read the same.
+        **({"runtime": dict(runtime)} if runtime else {}),
     })
     log(
         f"[INFO] grasp_loop=start trials={request.trials} resumed_after={len(done)} start_trial={start} "

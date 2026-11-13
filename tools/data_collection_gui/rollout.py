@@ -83,6 +83,8 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_PHASE_ALIGN_ACTION_SAMPLES",
     "FR3_PHASE_HYSTERESIS_MM",
     "FR3_PHASE_ALIGN_UNGUIDED",
+    "FR3_FREE_SPACE_SPEEDUP",
+    "FR3_FREE_SPACE_ABOVE_Z",
     "FR3_TERMINAL_SERVO_POSE",
     "FR3_TERMINAL_SERVO_HANDOFF_Z",
     "FR3_TERMINAL_SERVO_SEARCH_RING",
@@ -447,6 +449,17 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         if "FR3_PHASE_ALIGN_BELOW_Z" not in options:
             raise RolloutError("phaseAlignUnguided acts below the align height: set phaseAlignBelowZ too.")
         options["FR3_PHASE_ALIGN_UNGUIDED"] = "1"
+    # Free-space speedup (11-13): above a height the queue runs this many actions a control step.
+    # 1 is the runtime as before and is not passed on; the height is required with anything else.
+    speedup = _set_optional_float_env(options, raw, "freeSpaceSpeedup", "FR3_FREE_SPACE_SPEEDUP", minimum=1.0)
+    if speedup is not None:
+        if speedup > 3.0:
+            raise RolloutError("freeSpaceSpeedup must be <= 3.")
+        if speedup == 1.0:
+            options.pop("FR3_FREE_SPACE_SPEEDUP")
+    _set_optional_float_env(options, raw, "freeSpaceAboveZ", "FR3_FREE_SPACE_ABOVE_Z", minimum=0.0)
+    if "FR3_FREE_SPACE_SPEEDUP" in options and "FR3_FREE_SPACE_ABOVE_Z" not in options:
+        raise RolloutError("freeSpaceSpeedup applies above a height: set freeSpaceAboveZ too.")
 
     # E5. Refused here as well as at startup, because the page is where a mistyped pose is
     # cheapest to catch -- the alternative is a launcher that comes up, homes the arm and then

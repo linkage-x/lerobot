@@ -151,6 +151,8 @@ export function RolloutPage() {
   const [phaseAlignActionSamples, setPhaseAlignActionSamples] = useState("1");
   const [phaseAlignUnguided, setPhaseAlignUnguided] = useState(false);
   const [phaseHysteresisMm, setPhaseHysteresisMm] = useState("");
+  const [freeSpaceSpeedup, setFreeSpaceSpeedup] = useState("");
+  const [freeSpaceAboveZ, setFreeSpaceAboveZ] = useState("");
   const [terminalServoPose, setTerminalServoPose] = useState("");
   const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
   const [terminalServoSearchRing, setTerminalServoSearchRing] = useState("");
@@ -326,6 +328,9 @@ export function RolloutPage() {
       // Sent only with a height: the gateway refuses it without one.
       phaseAlignUnguided: phaseAlignBelowZ.trim() ? phaseAlignUnguided : undefined,
       phaseHysteresisMm: optionalNumberOrNull(phaseHysteresisMm) ?? undefined,
+      // Sent only with a height: the gateway refuses a speedup without one.
+      freeSpaceSpeedup: freeSpaceAboveZ.trim() ? optionalNumberOrNull(freeSpaceSpeedup) ?? undefined : undefined,
+      freeSpaceAboveZ: freeSpaceSpeedup.trim() ? optionalNumberOrNull(freeSpaceAboveZ) ?? undefined : undefined,
       // The grasp loop ends every trial at the grasp, so a servo pose there is refused by the
       // runtime; not sending it keeps a leftover field from blocking the start.
       terminalServoPose: modeId === "grasp_loop" ? undefined : terminalServoPose.trim() || undefined,
@@ -412,6 +417,8 @@ export function RolloutPage() {
       phaseAlignActionSamples,
       phaseAlignUnguided,
       phaseHysteresisMm,
+      freeSpaceSpeedup,
+      freeSpaceAboveZ,
       terminalServoPose,
       terminalServoHandoffZ,
       terminalServoSearchRing,
@@ -581,6 +588,8 @@ export function RolloutPage() {
         setPhaseAlignActionSamples(String(options.phaseAlignActionSamples));
       setPhaseAlignUnguided(Boolean(options.phaseAlignUnguided));
       setPhaseHysteresisMm(options.phaseHysteresisMm == null ? "" : String(options.phaseHysteresisMm));
+      setFreeSpaceSpeedup(options.freeSpaceSpeedup == null ? "" : String(options.freeSpaceSpeedup));
+      setFreeSpaceAboveZ(options.freeSpaceAboveZ == null ? "" : String(options.freeSpaceAboveZ));
       // Deliberately not carried over. Every other knob here tunes how the policy runs; this
       // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
       // an E5 trial that nobody asked for.
@@ -2112,6 +2121,34 @@ export function RolloutPage() {
                 The floor is the inference latency, ~7 steps for one draw: shorter than that, the
                 queue replans as each chunk lands. Keep align draws at 1 &mdash; eight take ~15
                 steps.
+              </p>
+              <div className="row-actions">
+                <label className="field inline">
+                  <span>Free-space speedup</span>
+                  <input
+                    value={freeSpaceSpeedup}
+                    onChange={(event) => setFreeSpaceSpeedup(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="1 (off)"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Above z (m)</span>
+                  <input
+                    value={freeSpaceAboveZ}
+                    onChange={(event) => setFreeSpaceAboveZ(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="0.12"
+                    disabled={isLive}
+                  />
+                </label>
+              </div>
+              <p className="hint">
+                Above this height each control step runs that many of the policy&apos;s queued
+                actions (1.5 alternates 1 and 2), so the free-space approach plays back faster than
+                it was recorded; below it the policy runs at the recorded speed. Needs both fields;
+                1 or empty is off.
               </p>
               <div className="row-actions">
                 <label className="field inline">

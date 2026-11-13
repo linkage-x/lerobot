@@ -69,6 +69,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     PREV_CMD_QUAT_KEYS,
     PREV_CMD_ROTVEC_KEYS,
     _continuous_quaternion,
+    delta_ee_position_keys,
     delta_ee_rotvec_keys,
     delta_reference_from_action_names,
 )
@@ -796,6 +797,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             'The align phase asks for its chunks without RTC guidance: no previous-chunk prefix, '
             'inference delay 0. The queue still skips the steps run during inference.'
+        ),
+    )
+    parser.add_argument(
+        '--free-space-speedup',
+        type=float,
+        default=1.0,
+        help=(
+            'Above --free-space-above-z, run the policy this many times faster than its data: each '
+            'control step pops that many queued actions (on average: 1.5 alternates 1 and 2) and '
+            'sends their composed delta. 1 (default) is the runtime as before. Needs RTC and a '
+            'delta-action checkpoint; the low phase always runs at the recorded speed.'
+        ),
+    )
+    parser.add_argument(
+        '--free-space-above-z',
+        type=float,
+        default=None,
+        help=(
+            'Base-frame tool height (m) above which --free-space-speedup applies. Left below it, '
+            'entered again only above it plus --phase-hysteresis-mm.'
         ),
     )
     parser.add_argument(
@@ -5119,6 +5140,104 @@ def merge_completed_rtc_plan(
     }
 
 
+class FreeSpaceSpeedup:
+    """How many queued actions each control step runs: `factor` above `above_z`, 1 below.
+
+    The policy moves at its data's speed (11-13: rollout p95 57 mm/s = training data p95 57.5
+    mm/s), so running faster means running its actions faster. Popping n actions in one 33 ms
+    step and sending their composed delta is the data played back n times faster: the same path,
+    in fewer steps. Only above a height, so the last stretch to the peg -- where the precision
+    work of every line since R4 lives -- runs exactly as recorded. A fractional factor is spread
+    over steps by a running credit (1.5 runs 1, 2, 1, 2, ...). Left below `above_z`, entered again
+    only above `above_z + hysteresis_m`, as `RolloutPhaseSchedule` does.
+    """
+
+    def __init__(self, factor: float = 1.0, above_z: float | None = None, hysteresis_m: float = 0.0) -> None:
+        if not 1.0 <= float(factor) <= 3.0:
+            raise ValueError(f'free-space speedup must be within [1, 3], got {factor}')
+        if float(factor) > 1.0 and above_z is None:
+            raise ValueError('a free-space speedup needs the height above which it applies')
+        if hysteresis_m < 0.0:
+            raise ValueError('hysteresis_m must not be negative.')
+        self.factor = float(factor)
+        self.above_z = None if above_z is None else float(above_z)
+        self.hysteresis_m = float(hysteresis_m)
+        self.active = False
+        self.credit = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.factor > 1.0
+
+    def reset(self) -> None:
+        self.active = False
+        self.credit = 0.0
+
+    def update(self, observed_z: float) -> bool:
+        """Switch on or off for `observed_z`. True when that changed the state."""
+        if not self.enabled or self.above_z is None:
+            return False
+        if self.active and observed_z < self.above_z:
+            self.active = False
+        elif not self.active and observed_z >= self.above_z + self.hysteresis_m:
+            self.active = True
+        else:
+            return False
+        self.credit = 0.0
+        return True
+
+    @property
+    def rate(self) -> float:
+        """Actions run per control step right now (the average, for a fractional factor)."""
+        return self.factor if self.active else 1.0
+
+    def pops(self) -> int:
+        """Actions to run this control step."""
+        if not self.active:
+            return 1
+        self.credit += self.factor
+        n = int(self.credit)
+        self.credit -= n
+        return max(n, 1)
+
+
+def compose_delta_actions(
+    actions: list[torch.Tensor],
+    *,
+    action_names: list[str],
+    reference: str,
+) -> torch.Tensor:
+    """The one delta action that does what `actions` do run back to back.
+
+    `DeltaEEToAbsoluteEEAction` adds the position delta to the previous command and right-
+    multiplies its rotation, so n steps compose to: positions summed, rotations multiplied in
+    order. Every other column (the gripper) is the last action's. A rotation axis the contract
+    drops stays as the last action's zero; with one kept axis (R4's) the composition is exact.
+    """
+    if len(actions) == 1:
+        return actions[0]
+    last = actions[-1]
+    stacked = torch.stack([a.reshape(-1) for a in actions]).detach().to(torch.float64).cpu().numpy()
+    out = stacked[-1].copy()
+    pos_idx = [action_names.index(k) for k in delta_ee_position_keys(reference) if k in action_names]
+    if len(pos_idx) != 3:
+        raise ValueError(f'composing delta actions needs the three position columns of {reference!r}')
+    out[pos_idx] = stacked[:, pos_idx].sum(0)
+    rot_keys = delta_ee_rotvec_keys(reference)
+    rot_idx = {axis: action_names.index(k) for axis, k in enumerate(rot_keys) if k in action_names}
+    if rot_idx:
+        total = Rotation.from_rotvec(np.zeros(3))
+        for row in stacked:
+            rv = np.zeros(3)
+            for axis, i in rot_idx.items():
+                rv[axis] = row[i]
+            total = total * Rotation.from_rotvec(rv)
+        composed = total.as_rotvec()
+        for axis, i in rot_idx.items():
+            out[i] = composed[axis]
+    return torch.as_tensor(out, dtype=last.dtype, device=last.device).reshape(last.shape)
+
+
 @dataclass(frozen=True)
 class RolloutPhase:
     """How the RTC queue is driven while the arm is in one phase of a rollout."""
@@ -5314,6 +5433,59 @@ def _record_rtc_chunk(
             'processed': processed_actions.detach().float().cpu().numpy(),
         }
     )
+
+
+def build_free_space_speedup(
+    args: argparse.Namespace,
+    *,
+    rtc_enabled: bool,
+    delta_reconstructor: DeltaEEToAbsoluteEEAction | None,
+    action_names: list[str],
+) -> FreeSpaceSpeedup:
+    """The run's free-space speedup, refused at startup when it could not run as asked."""
+    factor = float(args.free_space_speedup)
+    if factor == 1.0:
+        return FreeSpaceSpeedup()
+    if args.free_space_above_z is None:
+        raise SystemExit('--free-space-speedup needs --free-space-above-z: the height above which it applies.')
+    if not rtc_enabled:
+        raise SystemExit('--free-space-speedup pops the RTC action queue, and RTC is disabled for this run.')
+    if delta_reconstructor is None:
+        raise SystemExit('--free-space-speedup composes delta actions, and this checkpoint emits absolute ones.')
+    missing = [k for k in delta_ee_position_keys(delta_reconstructor.reference) if k not in action_names]
+    if missing:
+        raise SystemExit(f'--free-space-speedup needs the delta position columns; the action has no {missing}.')
+    try:
+        return FreeSpaceSpeedup(
+            factor, float(args.free_space_above_z), hysteresis_m=float(args.phase_hysteresis_mm) / 1000.0
+        )
+    except ValueError as exc:
+        raise SystemExit(f'--free-space-speedup: {exc}') from exc
+
+
+def pop_free_space_actions(
+    first: torch.Tensor,
+    action_queue: ActionQueue,
+    *,
+    pops: int,
+    action_names: list[str],
+    reference: str,
+    gripper_close_below: float | None,
+) -> tuple[torch.Tensor, int]:
+    """`first` composed with up to `pops - 1` more queued actions, and how many ran.
+
+    Stops early on an empty queue (the next replan has not landed) and after a closing gripper
+    action, so a close is never folded into the steps that follow it.
+    """
+    taken = [first]
+    def closing(a: torch.Tensor) -> bool:
+        return gripper_close_below is not None and extract_action_gripper_raw(a, action_names) < float(gripper_close_below)
+    while len(taken) < pops and not closing(taken[-1]) and action_queue.qsize() > 0:
+        nxt = action_queue.get()
+        if nxt is None:
+            break
+        taken.append(nxt)
+    return compose_delta_actions(taken, action_names=action_names, reference=reference), len(taken)
 
 
 def advance_rtc_queue(
@@ -5895,6 +6067,14 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             f'action_samples={phase.action_samples} selection_horizon={phase.action_sample_horizon} '
             f'guided={phase.guided}'
         )
+    free_space_speedup = build_free_space_speedup(
+        args, rtc_enabled=rtc_enabled, delta_reconstructor=delta_reconstructor, action_names=action_names
+    )
+    if free_space_speedup.enabled:
+        print(
+            f'[INFO] free_space_speedup factor={free_space_speedup.factor:g} '
+            f'above_z={free_space_speedup.above_z:.4f} hysteresis_mm={free_space_speedup.hysteresis_m * 1000:.1f}'
+        )
     # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
     # is a startup error, not something discovered with a peg in the gripper 12 cm above the
     # fixture. The reach check is not run yet -- it needs the arm -- so this is the deterministic
@@ -6405,6 +6585,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
         rtc_state['chunk_seq'] = 0
         rtc_state['chunk_offset'] = 0
         rollout_phases.reset()
+        free_space_speedup.reset()
 
     def run_policy_rollout(
         interactive_keyboard: InteractiveRolloutKeyboard | None = None,
@@ -6701,17 +6882,39 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                         f'execution_horizon={rollout_phases.current.execution_horizon} '
                         f'action_samples={rollout_phases.current.action_samples}'
                     )
+                if free_space_speedup.update(float(robot_observation['ee.z'])):
+                    print(
+                        f'[INFO] free_space_speedup={"on" if free_space_speedup.active else "off"} '
+                        f'step={step_idx} z={float(robot_observation["ee.z"]):.4f} rate={free_space_speedup.rate:g}'
+                    )
                 action_tensor = advance_rtc_queue(
                     rtc_state,
                     rtc_planner,
                     policy_observation,
                     phase=rollout_phases.current,
                     step_idx=step_idx,
-                    time_per_step_s=rtc_time_per_step,
+                    # Sped up, the queue runs `rate` actions a control step, so a latency covers
+                    # that many more of them: the guidance delay is counted in actions.
+                    time_per_step_s=rtc_time_per_step / free_space_speedup.rate,
                     inference_delay_steps=args.rtc_inference_delay_steps,
                     predict_kwargs=rtc_predict_kwargs,
                 )
                 action_queue = rtc_state['queue']
+                if free_space_speedup.active:
+                    assert delta_reconstructor is not None  # build_free_space_speedup refused otherwise
+                    action_tensor, ran = pop_free_space_actions(
+                        action_tensor,
+                        action_queue,
+                        pops=free_space_speedup.pops(),
+                        action_names=action_names,
+                        reference=delta_reconstructor.reference,
+                        # Without a run threshold, the grasp loop's own: a command below 0.5 is a close.
+                        gripper_close_below=0.5 if args.gripper_close_below is None else args.gripper_close_below,
+                    )
+                    rtc_state['last_debug']['chunk_pos'] = (
+                        int(rtc_state.get('chunk_offset', 0)) + action_queue.get_action_index() - 1
+                    )
+                    rtc_state['last_debug']['speedup_actions'] = ran
                 temporal_offset_used = 0
             else:
                 predict_start_t = time.perf_counter()
@@ -7444,6 +7647,10 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 lighting=control.lighting,
                 inference_latency_s=INFERENCE_LATENCY.take,
                 take_confirmations=control.take_confirmations,
+                runtime=(
+                    {'freeSpaceSpeedup': free_space_speedup.factor, 'freeSpaceAboveZ': free_space_speedup.above_z}
+                    if free_space_speedup.enabled else None
+                ),
             )
             finish_grasp_write()
         else:

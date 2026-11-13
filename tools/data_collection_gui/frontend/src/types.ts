@@ -1744,6 +1744,9 @@ export type RolloutRuntimeOptions = {
   phaseHysteresisMm?: number;
   /** Below the align height, chunks are asked for without the RTC prefix (guidance delay 0). */
   phaseAlignUnguided?: boolean;
+  /** Above `freeSpaceAboveZ` (m), run this many queued actions a control step (1..3; 1 = off). */
+  freeSpaceSpeedup?: number;
+  freeSpaceAboveZ?: number;
   /** E5. `x,y,z` in metres: below the handoff height, with the peg held, the arm comes off the
    *  policy and is driven here, then lets go. Empty or undefined leaves the policy in charge. */
   terminalServoPose?: string;

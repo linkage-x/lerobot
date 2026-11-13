@@ -3085,3 +3085,109 @@ def test_every_executed_step_is_stamped_with_the_chunk_and_position_it_came_from
     # Bootstrap runs positions 0..15, then each async chunk from position 1.
     assert [pos for _, chunk, pos in executed if chunk == 0] == list(range(17))
     assert [pos for _, chunk, pos in executed if chunk == 1][:3] == [1, 2, 3]
+
+
+# --- free-space speedup (11-13) ---------------------------------------------------------------
+
+_SPEED_NAMES = [
+    'delta_ee_from_prev_cmd.dx', 'delta_ee_from_prev_cmd.dy', 'delta_ee_from_prev_cmd.dz',
+    'delta_ee_from_prev_cmd.drz', 'gripper',
+]
+
+
+def _speed_rebuild(obs: dict, action: np.ndarray, names: list[str]) -> dict:
+    rt = fr3_act_infer_real_runtime
+    step = rt.DeltaEEToAbsoluteEEAction(reference='prev_cmd')
+    amap = {n: float(v) for n, v in zip(names, action)}
+    for k in rt.delta_ee_rotvec_keys('prev_cmd'):
+        amap.setdefault(k, 0.0)
+    return step({rt.TransitionKey.ACTION: amap, rt.TransitionKey.OBSERVATION: dict(obs)})[rt.TransitionKey.ACTION]
+
+
+def _speed_obs(pos, quat) -> dict:
+    return {
+        **dict(zip(fr3_act_infer_real_runtime.PREV_CMD_POSITION_KEYS, map(float, pos))),
+        **dict(zip(fr3_act_infer_real_runtime.PREV_CMD_QUAT_KEYS, map(float, quat))),
+    }
+
+
+@pytest.mark.parametrize('names', [_SPEED_NAMES, _SPEED_NAMES[:3] + [
+    'delta_ee_from_prev_cmd.drx', 'delta_ee_from_prev_cmd.dry', 'delta_ee_from_prev_cmd.drz', 'gripper']])
+def test_composed_delta_action_lands_where_the_actions_run_back_to_back_land(names):
+    rt = fr3_act_infer_real_runtime
+    rng = np.random.default_rng(0)
+    actions = []
+    for _ in range(3):
+        a = np.zeros(len(names))
+        a[:3] = rng.normal(0, 0.002, 3)
+        a[3:-1] = rng.normal(0, 0.02, len(names) - 4)
+        a[-1] = rng.uniform(0.6, 1.0)
+        actions.append(a)
+    quat = rt.Rotation.from_rotvec(np.array([3.1, 0.05, -0.2])).as_quat()
+    obs = _speed_obs([0.4, -0.1, 0.3], quat)
+    for a in actions:  # one action per control step, each against the command the last one sent
+        out = _speed_rebuild(obs, a, names)
+        obs = _speed_obs([out['ee.x'], out['ee.y'], out['ee.z']], [out[k] for k in rt.EE_QUAT_KEYS])
+    composed = rt.compose_delta_actions(
+        [torch.tensor(a, dtype=torch.float32).unsqueeze(0) for a in actions], action_names=names, reference='prev_cmd'
+    )
+    assert composed.shape == (1, len(names))
+    once = _speed_rebuild(_speed_obs([0.4, -0.1, 0.3], quat), composed.squeeze(0).double().numpy(), names)
+    np.testing.assert_allclose([once[k] for k in ('ee.x', 'ee.y', 'ee.z')], [out[k] for k in ('ee.x', 'ee.y', 'ee.z')], atol=1e-6)
+    r_once = rt.Rotation.from_quat(np.array([once[k] for k in rt.EE_QUAT_KEYS]))
+    r_seq = rt.Rotation.from_quat(np.array([out[k] for k in rt.EE_QUAT_KEYS]))
+    assert np.linalg.norm((r_once.inv() * r_seq).as_rotvec()) < 1e-5
+    assert once['gripper'] == pytest.approx(actions[-1][-1], abs=1e-6)
+
+
+def test_free_space_speedup_runs_its_factor_above_the_height_and_one_below():
+    s = fr3_act_infer_real_runtime.FreeSpaceSpeedup(1.5, 0.12, hysteresis_m=0.01)
+    assert s.update(0.125) is False and s.pops() == 1  # within the hysteresis band: not yet
+    assert s.update(0.30) is True and s.active
+    assert [s.pops() for _ in range(4)] == [1, 2, 1, 2]
+    assert s.rate == 1.5
+    assert s.update(0.125) is False and s.active  # stays on until below the line
+    assert s.update(0.119) is True and not s.active and s.pops() == 1 and s.rate == 1.0
+    s.update(0.30); s.reset()
+    assert not s.active
+    off = fr3_act_infer_real_runtime.FreeSpaceSpeedup()
+    assert not off.enabled and off.update(1.0) is False and off.pops() == 1
+    with pytest.raises(ValueError):
+        fr3_act_infer_real_runtime.FreeSpaceSpeedup(2.0)
+    with pytest.raises(ValueError):
+        fr3_act_infer_real_runtime.FreeSpaceSpeedup(4.0, 0.12)
+
+
+def test_free_space_pop_stops_at_a_close_and_at_an_empty_queue():
+    rt = fr3_act_infer_real_runtime
+    q = rt.ActionQueue(rt.RTCConfig(enabled=True))
+    chunk = torch.zeros(5, len(_SPEED_NAMES))
+    chunk[:, 0] = torch.arange(1, 6, dtype=torch.float32) * 0.001
+    chunk[:, -1] = torch.tensor([1.0, 1.0, 0.1, 1.0, 1.0])  # the third action closes
+    q.merge(chunk, chunk.clone(), real_delay=0, action_index_before_inference=0)
+    first = q.get()
+    a, ran = rt.pop_free_space_actions(first, q, pops=3, action_names=_SPEED_NAMES, reference='prev_cmd', gripper_close_below=0.5)
+    assert ran == 3 and a.reshape(-1)[0].item() == pytest.approx(0.006) and a.reshape(-1)[-1].item() == pytest.approx(0.1)
+    a, ran = rt.pop_free_space_actions(q.get(), q, pops=2, action_names=_SPEED_NAMES, reference='prev_cmd', gripper_close_below=0.5)
+    assert ran == 2 and q.qsize() == 0
+    # a closing first action runs alone
+    q.merge(chunk[2:], chunk[2:].clone(), real_delay=0, action_index_before_inference=0)
+    a, ran = rt.pop_free_space_actions(q.get(), q, pops=3, action_names=_SPEED_NAMES, reference='prev_cmd', gripper_close_below=0.5)
+    assert ran == 1 and q.qsize() == 2
+
+
+def test_free_space_speedup_is_refused_where_it_could_not_run():
+    rt = fr3_act_infer_real_runtime
+    recon = rt.DeltaEEToAbsoluteEEAction(reference='prev_cmd')
+    args = lambda **kw: SimpleNamespace(**{'free_space_speedup': 2.0, 'free_space_above_z': 0.12, 'phase_hysteresis_mm': 10.0, **kw})
+    assert not rt.build_free_space_speedup(args(free_space_speedup=1.0), rtc_enabled=False, delta_reconstructor=None, action_names=[]).enabled
+    s = rt.build_free_space_speedup(args(), rtc_enabled=True, delta_reconstructor=recon, action_names=_SPEED_NAMES)
+    assert s.enabled and s.factor == 2.0 and s.hysteresis_m == pytest.approx(0.01)
+    for kw, ctx in [
+        (dict(a=args(free_space_above_z=None), rtc_enabled=True, delta_reconstructor=recon), 'free-space-above-z'),
+        (dict(a=args(), rtc_enabled=False, delta_reconstructor=recon), 'RTC'),
+        (dict(a=args(), rtc_enabled=True, delta_reconstructor=None), 'absolute'),
+        (dict(a=args(free_space_speedup=5.0), rtc_enabled=True, delta_reconstructor=recon), 'within'),
+    ]:
+        with pytest.raises(SystemExit, match=ctx):
+            rt.build_free_space_speedup(kw.pop('a'), action_names=_SPEED_NAMES, **kw)
