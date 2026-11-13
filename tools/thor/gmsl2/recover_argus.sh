@@ -2,7 +2,8 @@
 # Recover Thor SG16A/AR0234 Argus capture without rebooting the Jetson.
 #
 # This is intentionally a stronger reset than just restarting nvargus-daemon:
-# it stops stale recorder/GStreamer processes, stops Argus, reloads the camera
+# it stops stale recorder/GStreamer processes (never the GUI gateway, so open
+# GUIs keep working and only need Connect again), stops Argus, reloads the camera
 # kernel modules via setup_sync.sh, restarts Argus, then probes each requested
 # sensor-id with nvarguscamerasrc.
 #
@@ -119,20 +120,41 @@ print_step() {
   echo "==> $*"
 }
 
+# The processes that own Argus sessions. The gateway spawns the recorder as
+# `<python> /abs/path/tools/thor/gmsl2/thor_record.py ...`, so match the path
+# form as well as the `-m tools.thor.gmsl2.thor_record` form; the old dots-only
+# pattern never matched the real recorder.
+RECORDER_PATTERN='python.*tools[./]thor[./]gmsl2[./]thor_record'
+# Native recorder children can outlive their Python parent. Match argv[0]
+# because Linux truncates their comm names (so pkill -x cannot match them).
+NATIVE_RECORDER_PATTERN='^([^[:space:]]*/)?lerobot_argus_(online_sync|metadata)_video_recorder([[:space:]]|$)'
+
 if [[ ${SKIP_KILL} -eq 0 ]]; then
   print_step "Stopping stale recorder/GStreamer processes"
   # These processes own Argus sessions and can keep nvargus-daemon wedged after
   # a failed connect. Ignore misses so the script is idempotent.
-  pkill -TERM -f 'python.*tools\.thor\.gmsl2\.thor_record' 2>/dev/null || true
-  pkill -TERM -f 'python.*tools\.data_collection_gui\.gateway' 2>/dev/null || true
-  # Native recorder children can outlive their Python parent. Match argv[0]
-  # because Linux truncates their comm names (so pkill -x cannot match them).
-  pkill -TERM -f '^([^[:space:]]*/)?lerobot_argus_(online_sync|metadata)_video_recorder([[:space:]]|$)' 2>/dev/null || true
+  #
+  # The GUI gateway is deliberately left alone: it holds no Argus session (Device
+  # Manager previews come from the recorder), it notices its recorder exiting, and
+  # the next Connect starts a fresh one. Killing it (as this script did until
+  # 2026-11-13) left every open GUI on "connect: HTTP 500" -- the dev-server proxy's
+  # answer when nothing listens on the gateway port -- until someone redeployed, and
+  # it took the sandbox gateways down with it.
+  pkill -TERM -f "${RECORDER_PATTERN}" 2>/dev/null || true
+  pkill -TERM -f "${NATIVE_RECORDER_PATTERN}" 2>/dev/null || true
   pkill -TERM -x gst-launch-1.0 2>/dev/null || true
-  sleep 1
-  pkill -KILL -f 'python.*tools\.thor\.gmsl2\.thor_record' 2>/dev/null || true
-  pkill -KILL -f '^([^[:space:]]*/)?lerobot_argus_(online_sync|metadata)_video_recorder([[:space:]]|$)' 2>/dev/null || true
+  # TERM sets the recorder's stop event (a clean shutdown); give it 10 s before KILL.
+  for _ in $(seq 10); do
+    if ! pgrep -f "${RECORDER_PATTERN}" >/dev/null 2>&1 \
+        && ! pgrep -f "${NATIVE_RECORDER_PATTERN}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  pkill -KILL -f "${RECORDER_PATTERN}" 2>/dev/null || true
+  pkill -KILL -f "${NATIVE_RECORDER_PATTERN}" 2>/dev/null || true
   pkill -KILL -x gst-launch-1.0 2>/dev/null || true
+  echo "GUI gateway left running; press Connect in the GUI once this script reports success."
 else
   print_step "Skipping stale process cleanup"
 fi

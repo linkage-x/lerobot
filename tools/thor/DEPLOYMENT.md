@@ -959,6 +959,17 @@ StartEpisode 时 recorder 没有进入录制，前端看起来像卡死。
      默认 kill stale process 行为。
    - 回归测试：`tests/scripts/test_thor_record_auto_recover.py` 覆盖 recover 命令
      必须包含 `--skip-kill`。
+   - **2026-11-13 补充：人工 recover 也不再杀 gateway。** 学生反映「录制退出后
+     connect: HTTP 500，要重新部署」：11-09～11-12 五次都是有人在 Thor 终端跑
+     `recover_argus.sh`（gateway 日志最后一行 1 s 后就是 `sudo service nvargus-daemon stop`），
+     gateway 被 `pkill` 掉，所有打开的 GUI 经 Vite 代理拿到 ECONNREFUSED → 无 JSON 的
+     500，直到重新部署。gateway 本身不持有 Argus（预览来自录制器），录制器退出它会自己
+     复位，所以脚本只停录制器/原生录制子进程/gst-launch。另外旧的录制器匹配式
+     `python.*tools\.thor\.gmsl2\.thor_record` 从来匹配不上 gateway 实际启动的
+     `…/tools/thor/gmsl2/thor_record.py`（录制器过去是因 gateway 死后 stdin EOF 才退出的），
+     现改为 `tools[./]thor[./]gmsl2[./]thor_record`，先 TERM（录制器干净退出）最多等 10 s
+     再 KILL。前端把无 JSON 的 5xx 显示为「gateway 没有应答」。
+     回归测试：`tests/scripts/test_recover_argus_script.py`。
 
 本轮保留/新增的稳定性策略：
 

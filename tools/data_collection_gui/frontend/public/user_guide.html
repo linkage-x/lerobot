@@ -268,7 +268,7 @@
   <ol class="steps">
     <li><b>Thor 和相机。</b>Thor 开机或重启后，相机流可能起不来。在 Thor 上执行：
       <pre><code>cd ~/lerobot &amp;&amp; ./tools/thor/gmsl2/recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1</code></pre>
-      还不行：Thor 和转接板（12 V/3 A）全部断电至少 3 秒再上电。Thor 关机可能卡约 9 分钟后由看门狗重启，别急着拔电。</li>
+      它会停掉正在运行的录制器，但不动 GUI 的 gateway：跑完回到 GUI 重新点 <span class="ui">Connect</span> 即可，不用重新部署。还不行：Thor 和转接板（12 V/3 A）全部断电至少 3 秒再上电。Thor 关机可能卡约 9 分钟后由看门狗重启，别急着拔电。</li>
     <li><b>打开 GUI。</b>用维护者给的地址。前端跑在维护者的开发机上，形如 <code>http://&lt;开发机 IP&gt;:&lt;端口&gt;/</code>，端口以维护者通知为准（不一定是 5173）。在开发机本机上打开时，IP 写 <code>localhost</code>。顶部应显示 <span class="ui">Gateway online</span>，并且<b>没有红色警告条</b>。</li>
     <li><b>Calibration → 概览。</b>看相机自检有没有报漂移、有没有要重做的项。有就停下找维护者，不要带着漂移的相机录数据。</li>
     <li><b>Device Manager。</b>相机都在线；手持 BOX（3906437858）和右臂夹爪 BOX（3100715645）在线。</li>
@@ -395,6 +395,7 @@
       <tr><td><span class="ui">1 · Move to trajectory start</span> 是灰的</td><td>MuJoCo 没通过 / 不是当前选择的结果 / 没选臂 / 回放已经在进行 / 这是导出后的数据集。</td><td>按第 7 节顺序重做。</td></tr>
       <tr><td><span class="ui">2 · Execute trajectory</span> 是灰的</td><td>还没到 at start，或勾了激光但跟踪仪没 ready。</td><td>等 Phase 变 at start；激光模式下把 SMR 装到臂上并锁定光束。</td></tr>
       <tr><td>某几路相机没画面</td><td>Argus 没起来。</td><td>在 Thor 跑 <code>recover_argus.sh</code>；不行就整机断电重启。</td></tr>
+      <tr><td><code>connect: HTTP 500：gateway 没有应答…</code>（旧版只显示 <code>HTTP 500</code>）</td><td>不是录制出错，是 gateway 没在运行或正在重启（有人在部署；11-13 之前的 <code>recover_argus.sh</code> 会把它停掉）。</td><td>等一分钟再点；一直这样找维护者重新部署。</td></tr>
       <tr><td>保存时 0 samples</td><td>BOX 数据没进来。</td><td>丢弃这段；检查 BOX 上电和网络，找维护者。</td></tr>
       <tr><td>回放时夹爪不动</td><td>夹爪 BOX 没上电或掉电重启过。</td><td>检查 BOX 3100715645 供电，重新预检。</td></tr>
       <tr><td>功能「刚修好」但界面没变化</td><td>前端改动要部署后才生效，网关改动要重新部署并重启。</td><td>问维护者 Thor 上是不是最新版本。</td></tr>
