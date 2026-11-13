@@ -57,6 +57,7 @@ import type {
   TrackerValidateResponse,
 } from "./types";
 import type { PayloadCalibrationResponse } from "./calibration/payloadCalibration";
+import { gatewayErrorMessage } from "./shared/httpError";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
@@ -2039,15 +2040,13 @@ export class DataCollectionGuiApi {
   }
 
   private async remoteErrorMessage(response: Response): Promise<string> {
+    let payload: unknown = null;
     try {
-      const payload = await response.json();
-      if (payload && typeof payload.error === "string") {
-        return payload.error;
-      }
+      payload = await response.json();
     } catch {
-      // Fall back to HTTP status text below.
+      // Not JSON: not the gateway's answer (see gatewayErrorMessage).
     }
-    return `HTTP ${response.status}`;
+    return gatewayErrorMessage(response.status, payload);
   }
 
   /**
