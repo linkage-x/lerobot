@@ -1297,6 +1297,9 @@ export type GraspLoopTrial = {
   trialS: number | null;
   /** End-to-end runs: in the hole (operator's answer), not, or null for an ungraded insertion. */
   inserted?: boolean | null;
+  /** After the teacher's or policy's miss: the scripted search put the peg in (true) or not. The
+   * trial stays a miss either way; this only shows that the operator's "in" was recorded. */
+  rescued?: boolean | null;
   /** The lighting label the trial ran under ("lab" by default). */
   lighting?: string | null;
   /** Inference wall time over the policy's segment, nearest-rank percentiles in ms. */
@@ -1774,6 +1777,12 @@ export type RolloutRuntimeOptions = {
   graspLoopArms?: "A" | "B" | "AB";
   /** v14 step 4: "x,y,z" of the hole each held grasp is carried into. Blank: grasp only. */
   graspLoopInsertPose?: string;
+  /** Insertion search: landing indices tried first, "8,14,6,7,5,0". Blank: the runtime's order. Needs graspLoopInsertPose. */
+  graspLoopInsertSearchOrder?: string;
+  /** Insertion search: landings before it gives up, 1-17. Blank: all 17. Needs graspLoopInsertPose. */
+  graspLoopInsertMaxLandings?: string;
+  /** Order each insertion search by where a fixture-staged peg sits in the hand (11-13). Needs graspLoopInsertPose. */
+  graspLoopInsertOrderByHand?: boolean;
   /** Record arm B's funnel steps (held grasps only) into the checkpoint's funnel_ dataset. */
   graspLoopRecord?: boolean;
   /** With graspLoopRecord: whole held trials, the policy's steps too, into the checkpoint's trial_ dataset. */

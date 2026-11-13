@@ -23,7 +23,9 @@ from typing import Any
 
 from tools.fr3.grasp_loop import summarize_grasp_loop
 
-MOMENTS = (("staged", "摆放后"), ("before", "插入前"), ("after", "插入后"))
+MOMENTS = (
+    ("staged", "摆放后"), ("before", "插入前"), ("grade", "判定时"), ("after", "插入后"), ("released", "松手后"),
+)
 
 
 def load_run(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

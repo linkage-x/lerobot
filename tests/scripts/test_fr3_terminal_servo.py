@@ -9,6 +9,7 @@ different numbers rather than as the same timeout.
 
 from collections import deque
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -676,6 +677,39 @@ def test_a_reordered_search_seats_on_its_first_landing_and_names_it_by_ring_inde
         math.hypot(float(a["ee.x"]) - (SEATED[0] + dx), float(a["ee.y"]) - (SEATED[1] + dy)) < 1e-4
         for a in low
     )
+
+
+def test_a_capped_search_tries_only_the_first_landings_of_its_order():
+    request = _searching(searchInnerRingM=0.0035, searchOrder=(8, 14, 6, 7, 5, 0), searchMaxLandings=6)
+    assert [index for index, _ in terminal_servo_search_sequence(request)] == [8, 14, 6, 7, 5, 0]
+    # A cap past the order's end takes the rest in index order, and one past every landing is all 17.
+    assert [i for i, _ in terminal_servo_search_sequence(replace(request, searchMaxLandings=8))] == [8, 14, 6, 7, 5, 0, 1, 2]
+    assert len(terminal_servo_search_sequence(replace(request, searchMaxLandings=40))) == 17
+    assert len(terminal_servo_search_sequence(replace(request, searchMaxLandings=0))) == 17
+    with pytest.raises(TerminalServoError, match="searchMaxLandings"):
+        validate_terminal_servo_trajectory(replace(request, searchMaxLandings=-1))
+
+
+def test_a_capped_search_gives_up_as_exhausted_after_its_last_landing():
+    request = _searching(searchInnerRingM=0.0035, searchOrder=(8, 14, 6), searchMaxLandings=3)
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + 0.030, SEATED[1]))
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+    result = execute_terminal_servo(robot, request)
+    assert result["searchStoppedOn"] == "exhausted"
+    assert [attempt["index"] for attempt in result["searchAttempts"]] == [8, 14, 6]
+    assert result["searchTried"] == result["searchLandings"] == 3
+
+
+def test_a_capped_search_still_seats_on_a_landing_inside_the_cap():
+    request = _searching(searchInnerRingM=0.0035, searchOrder=(8, 14, 6), searchMaxLandings=3)
+    dx, dy = terminal_servo_search_offsets(request)[14]
+    robot = FakeHoleRobot(hole_xy=(SEATED[0] + dx, SEATED[1] + dy), capture_m=0.0015)
+    robot.xyz = (SEATED[0] - 0.01, SEATED[1] + 0.008, 0.12)
+    robot.gripper = 0.25
+    result = execute_terminal_servo(robot, request)
+    assert result["searchStoppedOn"] == "seated"
+    assert (result["searchIndex"], result["searchTried"]) == (14, 2)
 
 
 def test_a_search_order_that_adds_or_repeats_a_landing_is_refused():

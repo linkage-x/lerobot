@@ -260,6 +260,11 @@ class TerminalServoRequest:
     # Empty keeps the generated order. It exists because a peg's seat is not spread evenly
     # round the nominal pose -- see GRASP_LOOP_INSERT_SEARCH_ORDER for the evidence.
     searchOrder: tuple[int, ...] = ()
+    # How many landings of that order are tried before the search gives up ("exhausted"). Zero,
+    # the default, tries them all. It exists because a miss costs the whole ring: 151 policy-grasp
+    # misses (10-16..11-12) averaged 13.8 landings, ~2.4 s each, while 136 of 143 graded seats
+    # fell in the first six landings of GRASP_LOOP_INSERT_SEARCH_ORDER_RANKED.
+    searchMaxLandings: int = 0
     searchLiftM: float = TERMINAL_SERVO_SEARCH_LIFT_M
     searchSeatedM: float = TERMINAL_SERVO_SEARCH_SEATED_M
     searchSlipM: float = TERMINAL_SERVO_SEARCH_SLIP_M
@@ -431,7 +436,8 @@ def terminal_servo_search_sequence(
 ) -> tuple[tuple[int, tuple[float, float]], ...]:
     """The landings in the order they are tried: (index into the offsets, offset).
 
-    `searchOrder` first, then every landing it leaves out in the generated order. The index is
+    `searchOrder` first, then every landing it leaves out in the generated order, cut to the first
+    `searchMaxLandings` when that is set. The index is
     kept rather than the position so that `searchIndex` still names a place on the rings, which
     is what every run before the reorder recorded and what an analysis compares.
     """
@@ -439,7 +445,10 @@ def terminal_servo_search_sequence(
     offsets = terminal_servo_search_offsets(request)
     first = tuple(int(index) for index in request.searchOrder if 0 <= int(index) < len(offsets))
     rest = tuple(index for index in range(len(offsets)) if index not in first)
-    return tuple((index, offsets[index]) for index in first + rest)
+    order = first + rest
+    if request.searchMaxLandings > 0:
+        order = order[: int(request.searchMaxLandings)]
+    return tuple((index, offsets[index]) for index in order)
 
 
 def terminal_servo_search_path(
@@ -517,6 +526,8 @@ def validate_terminal_servo_trajectory(
                 f"searchOrder {list(request.searchOrder)} must name distinct landings in "
                 f"0..{landings - 1}: it reorders the search, it cannot add to it."
             )
+    if request.searchMaxLandings < 0:
+        raise TerminalServoError("searchMaxLandings must be non-negative; zero tries every landing.")
     if request.searchRingM > 0.0:
         if request.searchPoints < 3:
             raise TerminalServoError(

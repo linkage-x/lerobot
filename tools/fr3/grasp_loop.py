@@ -338,6 +338,28 @@ GRASP_LOOP_INSERT_PRESS_CAP_N = 6.0
 # and scored on the other, <= 5.4 and <= 4.7. Assumes a landing's outcome does not depend on the
 # presses before it; first landings off the hole seated too (152430 x4, 163333 x3).
 GRASP_LOOP_INSERT_SEARCH_ORDER: tuple[int, ...] = (8, 7, 6, 0, 1, 9, 5, 14)
+# The order for a capped search (`searchMaxLandings`), ranked by where policy grasps seated (11-13):
+# 143 graded-in arm-A seats 10-16..11-12 fell at idx 8 67, 14 23, 6 20, 7 13, 5 7, 0 6 -- 136 of 143
+# (95%) in these six. Fitted on the runs before 10-28 and scored on the rest, the first six caught
+# 99%; the other way round 83%. The default order put idx 14 (-x,-y on the 7 mm ring) eighth, so 23
+# R4 seats each came after seven presses; the 11-12 JEPA test order (8,14,5,4,6,13,7,3) keeps 83%
+# in six. Policy-grasp misses averaged 13.8 landings (~2.4 s each): a cap of six spends ~8 fewer.
+GRASP_LOOP_INSERT_SEARCH_ORDER_RANKED: tuple[int, ...] = (8, 14, 6, 7, 5, 0)
+# The same six landings in two orders, chosen per trial by where the peg sits in the hand
+# (`insertOrderByHand`, 11-13): the tool's x at the close minus the staged peg's x. A tool that
+# closed more than 3 mm -x of the peg holds it +x of the fingers, so the tool has to land -x of
+# the aim: of 41 such fixture-staged seats 10-16..11-12, idx 14/6/5 (-x side) took 35, against 3
+# of 84 with the peg centred, whose seats were idx 8/7 69 times. Ordered by each group's seats;
+# fitted on the runs before 10-28 and scored on the rest (and the other way round), the first
+# landing went in 0.78 / 0.49 of the time against 0.07 / 0.25 for one order fitted the same way,
+# with the six together still holding 0.98 / 0.94. Only a fixture-staged peg's record is good
+# enough to read the offset from (regrip-staged records are ~5 mm off in x); the rest keep
+# `insertServo.searchOrder`. Torque/force direction at a face landing was tried on the same runs
+# and does not point at the seat: within one landing the lateral force is the same whichever way
+# the hole was (a fixed bias, cos 0.86 for a constant vs 0.20 for the reading).
+GRASP_LOOP_INSERT_HAND_SPLIT_MM = -3.0
+GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X: tuple[int, ...] = (14, 6, 5, 7, 8, 0)
+GRASP_LOOP_INSERT_ORDER_PEG_CENTRED: tuple[int, ...] = (8, 7, 6, 0, 14, 5)
 # The last landing whose "seated" is believed. Of 58 seated verdicts graded 10-16..10-23, all 53 on
 # landings 1-8 were in and all 5 on landings 11-16 out (105703 t2/t8, 091639 t6, 085523 t8,
 # 093213 t6); depth separated nothing -- closes from +12 to -29 mm on both sides. A dozen face
@@ -361,6 +383,11 @@ GRASP_LOOP_LET_GO_XY_M = 0.004
 # The hole estimate for the teacher: the median over this many of the latest insertions that went
 # in. One is the noise of a 3.5 mm search grid; the hole creeps over days, not trials.
 GRASP_LOOP_HOLE_WINDOW = 5
+# Where the configured hole is in the frame the teacher servos in (the measured tool), m. The
+# configured pose is a commanded one, and the arm stands ~2 mm -x of what it is sent (11-13). Fitted
+# 11-13 on the 19 teacher descents of 144947 + 151143 by their measured tool xy at the hub's height
+# less the in-hand offset: every seat lay within ~2.2 mm of configured + this, every block outside.
+GRASP_LOOP_TEACHER_HOLE_SHIFT_M = (-0.0024, -0.0002)
 
 # Trial conditions and evidence (11-10). Lighting is a label on every trial row: the policy's low
 # close leans on the gripper's shadow (11-05 S1 probe), so a lamp moved or off is a condition a
@@ -440,6 +467,9 @@ class GraspLoopRequest:
     # GRASP_LOOP_AFTER_CLOSE. Anything but "script" needs `insertServo`, for the hole.
     afterClose: str = "script"
     insertMaxSteps: int = GRASP_LOOP_INSERT_MAX_STEPS
+    # Order each insertion search by where a fixture-staged peg sits in the hand
+    # (GRASP_LOOP_INSERT_ORDER_PEG_*); off keeps `insertServo.searchOrder` for every trial.
+    insertOrderByHand: bool = False
 
     @property
     def regripZ(self) -> float:
@@ -576,6 +606,13 @@ def validate_grasp_loop_request(
     if request.afterClose not in GRASP_LOOP_AFTER_CLOSE:
         raise SceneResetError(
             f"afterClose must be one of {', '.join(GRASP_LOOP_AFTER_CLOSE)}, not {request.afterClose!r}."
+        )
+    if request.insertOrderByHand and (
+        request.insertServo is None or request.insertServo.searchRingM <= 0.0 or request.insertServo.searchInnerRingM <= 0.0
+    ):
+        raise SceneResetError(
+            "insertOrderByHand orders the two-ring search's landings (idx 1-8 the inner ring, 9-16 the outer): "
+            "it needs insertServo with searchRingM and searchInnerRingM."
         )
     if request.afterClose != "script" and request.insertServo is None:
         raise SceneResetError(f"afterClose {request.afterClose!r} carries the peg to the hole: it needs insertServo.")
@@ -960,17 +997,32 @@ def hole_sample_xy(row: dict[str, Any]) -> tuple[float, float] | None:
 
 
 def teacher_hole_xy(request: GraspLoopRequest, rows: Iterable[dict[str, Any]]) -> tuple[float, float]:
-    """The hole the teacher aims at: the median of the latest GRASP_LOOP_HOLE_WINDOW samples
-    within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of the configured pose, or that pose until one."""
+    """The hole the teacher aims at, in the measured tool's frame (the one its servo closes on).
+
+    The configured pose moved by GRASP_LOOP_TEACHER_HOLE_SHIFT_M, then the median of the latest
+    GRASP_LOOP_HOLE_WINDOW teacher seats: each the measured tool at the entry height less its
+    in-hand offset, within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of that start. Not `hole_sample_xy`:
+    a scripted landing is a commanded point and a seated tool is pulled toward its command inside
+    the clearance, so mixing them walked the aim +2..3 mm x and 7 of 9 descents met the face (151143).
+    """
 
     assert request.insertServo is not None
-    configured = (float(request.insertServo.xyz[0]), float(request.insertServo.xyz[1]))
-    samples = [
-        xy for xy in (hole_sample_xy(row) for row in rows)
-        if xy is not None and math.dist(xy, configured) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M
-    ][-GRASP_LOOP_HOLE_WINDOW:]
+    start = (
+        float(request.insertServo.xyz[0]) + GRASP_LOOP_TEACHER_HOLE_SHIFT_M[0],
+        float(request.insertServo.xyz[1]) + GRASP_LOOP_TEACHER_HOLE_SHIFT_M[1],
+    )
+    samples = []
+    for row in rows:
+        segment = row.get("insertSegment") or {}
+        entry, offset = segment.get("entryXyz"), segment.get("offsetXyMm")
+        if row.get("inserted") is not True or segment.get("outcome") != "seated" or not entry or offset is None:
+            continue
+        xy = (float(entry[0]) - float(offset[0]) / 1000.0, float(entry[1]) - float(offset[1]) / 1000.0)
+        if math.dist(xy, start) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M:
+            samples.append(xy)
+    samples = samples[-GRASP_LOOP_HOLE_WINDOW:]
     if not samples:
-        return configured
+        return start
     return (statistics.median(x for x, _ in samples), statistics.median(y for _, y in samples))
 
 
@@ -1189,6 +1241,23 @@ def set_down_and_regrip(
     return width, released
 
 
+def insert_search_order(request: GraspLoopRequest, row: dict[str, Any]) -> tuple[tuple[int, ...], float | None]:
+    """The insertion search's order for this trial, and the hand offset it was read from (mm).
+
+    With `insertOrderByHand` and a fixture-staged peg: GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X when the
+    tool closed more than 3 mm -x of the peg, else GRASP_LOOP_INSERT_ORDER_PEG_CENTRED. Otherwise
+    `insertServo.searchOrder`. The offset is reported whenever the row has both poses."""
+
+    assert request.insertServo is not None
+    close, peg = row.get("closeXyz"), row.get("pegXyz")
+    offset_mm = None if not (close and peg) else 1000.0 * (float(close[0]) - float(peg[0]))
+    if not request.insertOrderByHand or offset_mm is None or row.get("staging") != "fixture":
+        return tuple(request.insertServo.searchOrder), offset_mm
+    if offset_mm < GRASP_LOOP_INSERT_HAND_SPLIT_MM:
+        return GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X, offset_mm
+    return GRASP_LOOP_INSERT_ORDER_PEG_CENTRED, offset_mm
+
+
 def insert_held_peg(
     robot: Any,
     request: GraspLoopRequest,
@@ -1201,12 +1270,19 @@ def insert_held_peg(
     snapshot_dir: Path | None = None,
     level_rotvec: tuple[float, float, float] | None = None,
     out_early: Callable[[], bool] | None = None,
+    search_order: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Carry the peg a held grasp has to the hole and put it in with step 3's servo.
+
+    `search_order` replaces `insertServo.searchOrder` for this trial (`insert_search_order`).
 
     With `snapshot_dir`, every camera's frame is saved there with the peg hanging over the hole
     before the descent, and again after it if the peg is still held: how the peg sits in the
     fingers is what decides where the tool has to be, and nothing else on the rig sees it.
+    Also at the grade (`_grade`: the descent stopped, fingers still closed, before anyone is
+    asked) and after a release (`_released`: fingers open, tool retreated straight up). Those two
+    are the labelled pictures an automatic in/out judge would learn from and be checked on
+    (11-13): until then only misses had pictures, and none at the moment the grade is made.
 
     `aim_xy` replaces the configured xy: where the last peg went in (see
     GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M). None aims at `insertServo.xyz`.
@@ -1264,6 +1340,7 @@ def insert_held_peg(
         releaseOnlyWhenSeated=False,
         stepToleranceM=request.insertServo.stepToleranceM or GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
         requestId=f"{request_id}#insert",
+        **({} if search_order is None else {"searchOrder": tuple(search_order)}),
     )
     # Across at the handoff height first, at the reset's speed: the servo's own lateral leg keeps
     # the height it starts from, and from home that would make its slow descent 20 cm long.
@@ -1273,6 +1350,9 @@ def insert_held_peg(
 
     def release_gate(descent: dict[str, Any]) -> bool | str:
         log_search("end")
+        if snapshot_dir is not None:
+            # The arm holds still at the stop while this is taken; a person takes seconds anyway.
+            grade["snapshots"] = save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_grade")
         above_mm = float(descent["seatedDepthErrorMm"])
         grade["auto"] = classify_stop(
             above_mm,
@@ -1324,8 +1404,10 @@ def insert_held_peg(
     if not result.get("ok"):
         raise SceneResetError(f"insertion failed: {result.get('error')}")
     released = bool(result.get("released"))
-    if snapshot_dir is not None and not released:
-        snapshots += save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_after")
+    grade_snapshots = list(grade.get("snapshots") or [])
+    if snapshot_dir is not None:
+        stem = f"trial_{trial:03d}_{'released' if released else 'after'}"
+        snapshots += save_camera_frames(robot, snapshot_dir, stem)
     inserted: bool | None
     if ask_grade is None:
         inserted = released
@@ -1352,9 +1434,12 @@ def insert_held_peg(
         "searchIndex": int(result.get("searchIndex") or 0),
         "searchTried": int(result.get("searchTried") or int(result.get("searchIndex") or 0) + 1),
         "searchStoppedOn": result.get("searchStoppedOn"),
+        "searchOrder": list(servo.searchOrder),
+        "searchMaxLandings": int(servo.searchMaxLandings),
         "dfzPeakN": None if not peaks else round(min(peaks), 1),
         "pressCapped": bool(result.get("pressCapped", False)),
         "snapshots": snapshots,
+        "gradeSnapshots": grade_snapshots,
         "rotvec": rotvec,
     }
     print(
@@ -1620,14 +1705,19 @@ def recover_from_fault(
     return True
 
 
-def release_and_clear(robot: Any, request: GraspLoopRequest, *, request_id: str) -> None:
-    """After an empty or abandoned grasp: open, straight up, home. Nothing is known to be held."""
+def release_and_clear(robot: Any, request: GraspLoopRequest, *, request_id: str, home: bool = True) -> None:
+    """After an empty or abandoned grasp: open, straight up, home. Nothing is known to be held.
+
+    `home=False` stops above: for a peg a let-go put in the hole, whose next staging picks it from
+    right there, as a scripted insertion's "in" goes on without homing (11-13: the trip home and
+    back cost ~4 s a trial)."""
 
     step_request = request.step_request(request_id)
     xyz, rotvec, _ = _observation_xyz_rotvec_gripper(robot)
     _run_step(robot, step_request, "open_gripper", xyz, rotvec, request.openGripper)
     _clear_upward(robot, request, step_request, request.openGripper, "retreat_8cm")
-    _move_to_start(robot)
+    if home:
+        _move_to_start(robot)
 
 
 def turned_about_tool_z(rotvec: tuple[float, float, float], angle_rad: float) -> tuple[float, float, float]:
@@ -1888,6 +1978,7 @@ def completed_trials(path: Path) -> list[dict[str, Any]]:
 # which policy (`run_start.policy`, compared when both runs recorded one).
 RESUME_MUST_MATCH = (
     "seed", "strokes", "targetZ", "arms", "maxPolicySteps", "insertServo", "afterClose", "funnelBottomTeacher",
+    "insertOrderByHand",
 )
 
 
@@ -1917,6 +2008,14 @@ def resume_point(path: Path, request: GraspLoopRequest, policy: str | None) -> i
         # Through JSON, as the file's copy was: a tuple (insertServo's xyz) reads back as a list,
         # and a list never equals a tuple -- every insertServo run refused its own resume.
         first, now = starts[0], json.loads(json.dumps(_request_record(request)))
+        # A servo field added since the file was started compares equal at its default, so an old
+        # run still resumes on new code (searchMaxLandings, 11-13); set to anything else it differs.
+        then_servo, now_servo = first.get("request", {}).get("insertServo"), now.get("insertServo")
+        if isinstance(then_servo, dict) and isinstance(now_servo, dict):
+            defaults = json.loads(json.dumps(TerminalServoRequest(xyz=(0.0, 0.0, 0.0)).payload()))
+            now["insertServo"] = {
+                k: v for k, v in now_servo.items() if k in then_servo or k not in defaults or v != defaults[k]
+            }
         differs = [k for k in RESUME_MUST_MATCH if k in first.get("request", {}) and first["request"][k] != now[k]]
         if first.get("policy") and policy and first["policy"] != policy:
             differs.append(f"policy ({first['policy']} vs {policy})")
@@ -2556,6 +2655,9 @@ def run_grasp_loop(
                 regrip = held
                 let_go = past_close and held and handover.afterCloseEnd in ("seated", "released")
                 if let_go:
+                    if snapshot_dir is not None:
+                        # The fingers are already open here: the grade's picture, as insert_held_peg's.
+                        row["gradeSnapshots"] = save_camera_frames(robot, snapshot_dir, f"trial_{trial:03d}_grade")
                     row["inserted"] = grade_let_go(handover, row["insertSegment"], trial=trial, ask_grade=ask_grade)
                     log(
                         f"[INFO] grasp_loop_let_go trial={trial} mode={handover.afterClose} "
@@ -2563,16 +2665,24 @@ def run_grasp_loop(
                     )
                     # In the fixture if it went in; otherwise wherever it fell, which is a person's.
                     peg, regrip = ("at_pick" if row["inserted"] else "lost"), False
-                    release_and_clear(robot, request, request_id=request_id)
+                    release_and_clear(robot, request, request_id=request_id, home=not row["inserted"])
                 elif held and request.insertServo is not None:
                     assert handover.closeXyz is not None
                     clear_out_early()
+                    order, hand_x_mm = insert_search_order(request, {**row, "closeXyz": list(handover.closeXyz)})
+                    if request.insertOrderByHand:
+                        log(
+                            f"[INFO] grasp_loop_insert_order trial={trial} staging={row.get('staging')} "
+                            f"hand_x_mm={'na' if hand_x_mm is None else f'{hand_x_mm:+.1f}'} order={','.join(map(str, order)) or 'index'}"
+                        )
                     insert = insert_held_peg(
                         robot, request, trial=trial, close_z=handover.closeXyz[2],
                         request_id=request_id, ask_grade=ask_grade, aim_xy=insert_aim,
                         snapshot_dir=snapshot_dir, level_rotvec=level_rotvec,
-                        out_early=out_early_requested,
+                        out_early=out_early_requested, search_order=order,
                     )
+                    if hand_x_mm is not None:
+                        insert["handOffsetXMm"] = round(hand_x_mm, 1)
                     insert_rotvec = insert.pop("rotvec")
                     if past_close:
                         # The teacher stood on the face or the policy ran out of steps: the
@@ -2656,6 +2766,9 @@ def run_grasp_loop(
                 f"width_lifted={row.get('widthLifted')} close_above_target_mm={row.get('closeAboveTargetMm')} "
                 f"lateral_mm={row.get('lateralMm')} trial_s={row['trialS']}"
                 + (f" inserted={_flag(row['inserted'])}" if "inserted" in row else "")
+                # The scripted search that put back a peg the teacher or policy left on the face: a
+                # person's "in" there is kept, but the trial stays the segment's miss.
+                + (f" rescued={_flag(row['rescue'].get('inserted'))}" if isinstance(row.get("rescue"), dict) else "")
                 + (f" lighting={row['lighting']}" if row.get("lighting") else "")
                 + (
                     f" infer_p50_ms={row['inferenceMs']['p50']} infer_p95_ms={row['inferenceMs']['p95']}"

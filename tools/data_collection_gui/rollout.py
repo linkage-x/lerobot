@@ -101,6 +101,9 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_ATTENDED",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
+    "FR3_GRASP_LOOP_INSERT_SEARCH_ORDER",
+    "FR3_GRASP_LOOP_INSERT_MAX_LANDINGS",
+    "FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND",
     "FR3_GRASP_LOOP_DATASET_ROOT",
     "FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL",
     "FR3_GRASP_LOOP_KEEP_MISSES",
@@ -506,6 +509,27 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         except TerminalServoError as exc:
             raise RolloutError(f"graspLoopInsertPose is not usable: {exc}") from exc
         options["FR3_GRASP_LOOP_INSERT_POSE"] = insert_pose
+    # The insertion search: landing indices tried first (0 the aim, 1-8 the inner ring, 9-16 the
+    # outer) and how many landings before it gives up. Blank keeps the runtime's order / all 17.
+    search_order = _optional_text(raw.get("graspLoopInsertSearchOrder"))
+    max_landings = _optional_text(raw.get("graspLoopInsertMaxLandings"))
+    if (search_order or max_landings) and not insert_pose:
+        raise RolloutError("graspLoopInsertSearchOrder / graspLoopInsertMaxLandings shape the insertion search: set graspLoopInsertPose.")
+    if search_order:
+        parts = [part.strip() for part in search_order.split(",") if part.strip()]
+        if not parts or not all(part.isdigit() and int(part) <= 16 for part in parts) or len(set(parts)) != len(parts):
+            raise RolloutError("graspLoopInsertSearchOrder must be distinct landing indices 0-16, comma-separated.")
+        options["FR3_GRASP_LOOP_INSERT_SEARCH_ORDER"] = ",".join(str(int(part)) for part in parts)
+    if max_landings:
+        if not max_landings.isdigit() or not 1 <= int(max_landings) <= 17:
+            raise RolloutError("graspLoopInsertMaxLandings must be a whole number of landings, 1-17.")
+        if int(max_landings) < 17:
+            options["FR3_GRASP_LOOP_INSERT_MAX_LANDINGS"] = str(int(max_landings))
+    # Each search ordered by where a fixture-staged peg sits in the hand (11-13).
+    if _parse_bool_field(raw.get("graspLoopInsertOrderByHand", False), "graspLoopInsertOrderByHand"):
+        if not insert_pose:
+            raise RolloutError("graspLoopInsertOrderByHand orders the insertion search: set graspLoopInsertPose.")
+        options["FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND"] = "1"
     # Arm B's takeover height above the peg, "h" or "low,high" mm; the runtime checks the range.
     takeover = _optional_text(raw.get("graspLoopFunnelTakeoverDzMm"))
     if takeover:
@@ -1457,6 +1481,7 @@ def grasp_loop_resume_params(
     options["graspLoopFunnelKeepLowPolicy"] = bool(request.get("funnelKeepLowPolicy", False))
     options["graspLoopFunnelBottomTeacher"] = bool(request.get("funnelBottomTeacher", False))
     options["graspLoopReseatAfterMiss"] = bool(request.get("reseatAfterMiss", False))
+    options["graspLoopInsertOrderByHand"] = bool(request.get("insertOrderByHand", False))
     dz = request.get("funnelAlignDzMm")
     if isinstance(dz, list) and len(dz) == 2:
         low, high = dz
@@ -1464,6 +1489,11 @@ def grasp_loop_resume_params(
     servo = request.get("insertServo")
     if isinstance(servo, dict) and isinstance(servo.get("xyz"), list):
         options["graspLoopInsertPose"] = ",".join(_mm(value) for value in servo["xyz"])
+        # The search as the run started it: a resume must match it (RESUME_MUST_MATCH insertServo).
+        if isinstance(servo.get("searchOrder"), list):
+            options["graspLoopInsertSearchOrder"] = ",".join(str(int(i)) for i in servo["searchOrder"])
+        if int(servo.get("searchMaxLandings") or 0) > 0:
+            options["graspLoopInsertMaxLandings"] = str(int(servo["searchMaxLandings"]))
         if source == "rebuilt":
             options["terminalServoHandoffZ"] = servo.get("handoffZ")
             options["terminalServoSearchRing"] = servo.get("searchRingM")
@@ -1568,6 +1598,8 @@ def parse_grasp_loop_line(line: str) -> dict[str, Any]:
             "trialS": _grasp_number(fields.get("trial_s")),
             # End-to-end runs only: 1 in the hole, 0 not, "-" a held grasp nobody graded.
             "inserted": {"1": True, "0": False}.get(fields.get("inserted", "")),
+            # After a segment's miss: whether the scripted search put the peg in (a person's answer).
+            "rescued": {"1": True, "0": False}.get(fields.get("rescued", "")),
             "lighting": fields.get("lighting") or None,
             "inferP50Ms": _grasp_number(fields.get("infer_p50_ms")),
             "inferP95Ms": _grasp_number(fields.get("infer_p95_ms")),

@@ -4227,7 +4227,8 @@ def test_an_end_to_end_run_counts_insertions_over_every_graded_grasp():
     for line in (
         "[INFO] grasp_loop=configured trials=4 strokes=38 held_width=0.025 max_policy_steps=450 attended=True arms=B insert=0.3597,-0.1328,0.0580 insert_ring_m=0.0070 out=g.jsonl",
         "[INFO] grasp_loop_trial trial=0 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=1",
-        "[INFO] grasp_loop_trial trial=1 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=0",
+        # The teacher stood on the face; the operator's "in" for the scripted search that followed.
+        "[INFO] grasp_loop_trial trial=1 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=0 rescued=1",
         "[INFO] grasp_loop_trial trial=2 arm=B verdict=empty width_lifted=0.006 close_above_target_mm=-6.0 lateral_mm=9.0 trial_s=40.0 inserted=0",
         # A held grasp whose insertion nobody graded (a stop mid-question) is not a trial of the task.
         "[INFO] grasp_loop_trial trial=3 arm=B verdict=held width_lifted=0.310 close_above_target_mm=-6.0 lateral_mm=1.5 trial_s=60.0 inserted=-",
@@ -4235,6 +4236,8 @@ def test_an_end_to_end_run_counts_insertions_over_every_graded_grasp():
         progress = rollout_backend.apply_grasp_loop_event(progress, rollout_backend.parse_grasp_loop_line(line))
     assert progress["insert"] is True
     assert [t["inserted"] for t in progress["trials"]] == [True, False, False, None]
+    # The rescue is shown, but the trial stays the segment's miss.
+    assert [t["rescued"] for t in progress["trials"]] == [None, True, None, None]
     assert (progress["e2eGraded"], progress["inserted"]) == (3, 1)
     assert progress["held"] == 3
     # A grasp-only run says so, and carries no end-to-end count.
@@ -4574,6 +4577,35 @@ def test_the_reseat_switch_reaches_the_launcher_only_with_an_insert_pose():
     assert "FR3_GRASP_LOOP_RESEAT_AFTER_MISS" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
     launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
     assert "grasp_loop_args+=(--grasp-loop-reseat-after-miss)" in launcher
+
+
+def test_a_capped_search_reaches_the_launcher_only_with_an_insert_pose():
+    sanitize = rollout_backend.sanitize_rollout_runtime_options
+    raw = {"graspLoopArms": "A", "graspLoopInsertPose": "0.3597,-0.1328,0.058",
+           "graspLoopInsertSearchOrder": "8, 14,6,7,5,0", "graspLoopInsertMaxLandings": "6"}
+    got = sanitize(raw)
+    assert got["FR3_GRASP_LOOP_INSERT_SEARCH_ORDER"] == "8,14,6,7,5,0"
+    assert got["FR3_GRASP_LOOP_INSERT_MAX_LANDINGS"] == "6"
+    # 17 is every landing: the search as before, nothing reaches the launcher.
+    assert "FR3_GRASP_LOOP_INSERT_MAX_LANDINGS" not in sanitize({**raw, "graspLoopInsertMaxLandings": "17"})
+    for key, bad in (("graspLoopInsertSearchOrder", "8,8"), ("graspLoopInsertSearchOrder", "17"),
+                     ("graspLoopInsertMaxLandings", "0"), ("graspLoopInsertMaxLandings", "2.5")):
+        with pytest.raises(rollout_backend.RolloutError, match=key):
+            sanitize({**raw, key: bad})
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopInsertPose"):
+        sanitize({**raw, "graspLoopInsertPose": ""})
+    for key in ("FR3_GRASP_LOOP_INSERT_SEARCH_ORDER", "FR3_GRASP_LOOP_INSERT_MAX_LANDINGS"):
+        assert key in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    launcher = (REPO_ROOT / "tools/fr3/run_pick_place_infer_workstation.sh").read_text()
+    assert 'grasp_loop_args+=(--grasp-loop-insert-search-order "${FR3_GRASP_LOOP_INSERT_SEARCH_ORDER}")' in launcher
+    assert 'grasp_loop_args+=(--grasp-loop-insert-max-landings "${FR3_GRASP_LOOP_INSERT_MAX_LANDINGS}")' in launcher
+    # Ordering each search by the hand: a switch, with an insert pose only.
+    assert sanitize({**raw, "graspLoopInsertOrderByHand": True})["FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND"] == "1"
+    assert "FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND" not in sanitize(raw)
+    with pytest.raises(rollout_backend.RolloutError, match="graspLoopInsertPose"):
+        sanitize({"graspLoopArms": "A", "graspLoopInsertOrderByHand": True})
+    assert "FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND" in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS
+    assert "grasp_loop_args+=(--grasp-loop-insert-order-by-hand)" in launcher
 
 
 def test_the_late_takeover_settings_reach_the_launcher_only_with_the_corrective_funnel():

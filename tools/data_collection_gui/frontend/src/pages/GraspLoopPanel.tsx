@@ -418,6 +418,11 @@ export function GraspLoopPanel({
                 {progress.insert && (
                   <td style={{ color: trial.inserted ? "#38a169" : trial.inserted === false ? "#e53e3e" : undefined }}>
                     {trial.inserted ? "进了" : trial.inserted === false ? (trial.verdict === "held" ? "没进" : "—") : "未判"}
+                    {trial.inserted === false && trial.rescued != null ? (
+                      <span style={{ color: "#718096" }} title="老师/策略自己没插进；之后脚本搜索的结果（你点的进/没进记在这里）">
+                        {trial.rescued ? " · 搜索救回进了" : " · 搜索也没进"}
+                      </span>
+                    ) : null}
                   </td>
                 )}
                 <td>{fmt(trial.widthLifted, 3)}</td>

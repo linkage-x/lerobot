@@ -10,6 +10,7 @@ reach of the peg take it, and it moves with them until they open.
 """
 
 import json
+from dataclasses import replace
 import math
 import time
 
@@ -1316,6 +1317,49 @@ def test_a_held_grasp_is_carried_into_the_hole_and_let_go_only_on_the_operators_
     assert not robot.held
 
 
+def test_the_search_order_follows_where_a_fixture_staged_peg_sits_in_the_hand():
+    request = _request(insertServo=_insert_servo(searchInnerRingM=0.0035, searchOrder=(8, 7)), insertOrderByHand=True)
+    peg = [0.40, -0.10, TARGET_Z]
+    row = lambda dx_mm, staging="fixture": {"staging": staging, "pegXyz": peg, "closeXyz": [0.40 + dx_mm / 1000.0, -0.1, TARGET_Z]}
+    # The tool closed 5 mm -x of the peg: the peg is +x in the fingers, so the tool lands -x first.
+    order, hx = grasp_loop.insert_search_order(request, row(-5.0))
+    assert order == grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X and hx == pytest.approx(-5.0)
+    assert grasp_loop.insert_search_order(request, row(-1.0))[0] == grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_CENTRED
+    # Same six landings, two orders.
+    assert sorted(grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X) == sorted(grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_CENTRED)
+    # A regrip-staged peg's record is ~5 mm off: it keeps the configured order, offset still reported.
+    order, hx = grasp_loop.insert_search_order(request, row(-5.0, "regrip"))
+    assert order == (8, 7) and hx == pytest.approx(-5.0)
+    # Off, every trial keeps the configured order.
+    assert grasp_loop.insert_search_order(replace(request, insertOrderByHand=False), row(-5.0))[0] == (8, 7)
+
+
+def test_ordering_by_the_hand_needs_the_two_ring_search():
+    with pytest.raises(SceneResetError, match="insertOrderByHand"):
+        validate_grasp_loop_request(_request(insertServo=_insert_servo(), insertOrderByHand=True))
+    with pytest.raises(SceneResetError, match="insertOrderByHand"):
+        validate_grasp_loop_request(_request(insertOrderByHand=True))
+    validate_grasp_loop_request(_request(insertServo=_insert_servo(searchInnerRingM=0.0035), insertOrderByHand=True))
+
+
+def test_an_insertion_ordered_by_the_hand_records_the_order_and_offset_it_used(tmp_path, _fast_servo):
+    robot = _insert_rig()
+    out = tmp_path / "e2e.jsonl"
+    run_grasp_loop(
+        robot,
+        _request(trials=1, insertServo=_insert_servo(searchInnerRingM=0.0035, searchMaxLandings=6), insertOrderByHand=True),
+        run_policy_trial=_policy(robot, [("grasp", 0.0)]),
+        out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    insert = _trials(out)[0]["insert"]
+    expected = (grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_PLUS_X if insert["handOffsetXMm"] < -3.0
+                else grasp_loop.GRASP_LOOP_INSERT_ORDER_PEG_CENTRED)
+    assert insert["searchOrder"] == list(expected)
+    assert insert["searchMaxLandings"] == 6
+    assert insert["searchTried"] <= 6
+
+
 def test_out_keeps_hold_takes_the_peg_back_to_its_table_spot_and_regrips_it_there(tmp_path, _fast_servo):
     robot = _insert_rig()
     out = tmp_path / "e2e.jsonl"
@@ -1773,7 +1817,7 @@ class CameraRig(InsertRig):
         return observation
 
 
-def test_the_peg_is_photographed_over_the_hole_and_again_if_it_is_still_held(tmp_path, _fast_servo):
+def test_the_peg_is_photographed_over_the_hole_at_the_grade_and_after_the_descent(tmp_path, _fast_servo):
     robot = CameraRig()
     out = tmp_path / "e2e.jsonl"
     run_grasp_loop(
@@ -1781,10 +1825,63 @@ def test_the_peg_is_photographed_over_the_hole_and_again_if_it_is_still_held(tmp
         run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
         ask_grade=_grades(robot, ["in", "out"], []),
     )
-    first, second = (r["insert"]["snapshots"] for r in _trials(out))
-    assert [p.split("/")[-1] for p in first] == ["trial_000_before_wrist.png"]
-    assert [p.split("/")[-1] for p in second] == ["trial_001_before_wrist.png", "trial_001_after_wrist.png"]
-    assert all((tmp_path / "e2e_peg" / p.split("/")[-1]).is_file() for p in first + second)
+    first, second = (r["insert"] for r in _trials(out))
+    names = lambda paths: [p.split("/")[-1] for p in paths]  # noqa: E731
+    # Let go on "in": the picture after is the open fingers over the hole, named so.
+    assert names(first["snapshots"]) == ["trial_000_before_wrist.png", "trial_000_released_wrist.png"]
+    assert names(second["snapshots"]) == ["trial_001_before_wrist.png", "trial_001_after_wrist.png"]
+    # The grade's own picture, both answers: what an automatic judge would be trained and checked on.
+    assert names(first["gradeSnapshots"]) == ["trial_000_grade_wrist.png"]
+    assert names(second["gradeSnapshots"]) == ["trial_001_grade_wrist.png"]
+    every = first["snapshots"] + second["snapshots"] + first["gradeSnapshots"] + second["gradeSnapshots"]
+    assert all((tmp_path / "e2e_peg" / p.split("/")[-1]).is_file() for p in every)
+
+
+def test_a_let_go_is_photographed_when_it_is_graded(tmp_path, _fast_servo):
+    class CameraOffsetRig(OffsetInsertRig):
+        def get_observation(self, *, include_cameras=True):
+            observation = super().get_observation()
+            if include_cameras:
+                observation["wrist"] = np.full((4, 6, 3), 200, dtype=np.uint8)
+            return observation
+
+    robot = CameraOffsetRig(hole_xy=PICK[:2], capture_m=0.0025)
+    robot.face_z = TARGET_Z + 0.006 + robot.face_above_m
+    out = tmp_path / "teacher.jsonl"
+    run_grasp_loop(
+        robot, _request(trials=1, insertServo=_insert_servo(), afterClose="teacher"),
+        run_policy_trial=_policy_past_close(robot, [0.004]), out_path=out,
+        ask_grade=_grades(robot, ["in"], []),
+    )
+    (row,) = _trials(out)
+    assert [p.split("/")[-1] for p in row["gradeSnapshots"]] == ["trial_000_grade_wrist.png"]
+
+
+def test_the_grade_moments_become_a_labelled_table_only_where_a_person_answered(tmp_path, _fast_servo):
+    from tools.fr3 import grade_moment_dataset
+
+    runs = []
+    for attended in (True, False):
+        robot = CameraRig()
+        out = tmp_path / f"run_{int(attended)}.jsonl"
+        run_grasp_loop(
+            robot, _request(trials=2, insertServo=_insert_servo(), attended=attended),
+            run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
+            ask_grade=_grades(robot, ["in", "out"], []) if attended else None,
+        )
+        runs.append(out)
+    table = tmp_path / "grades.csv"
+    assert grade_moment_dataset.main([*map(str, runs), "-o", str(table)]) == 0
+    import csv
+
+    rows = list(csv.DictReader(table.open()))
+    attended_rows = [r for r in rows if r["run"] == "run_1"]
+    assert [r["label"] for r in attended_rows] == ["in", "out"]
+    assert attended_rows[0]["gradeImages"].endswith("trial_000_grade_wrist.png")
+    assert attended_rows[0]["releasedImages"].endswith("trial_000_released_wrist.png")
+    assert attended_rows[1]["releasedImages"] == ""
+    # Nobody answered the unattended run: its pictures are there, its labels are not.
+    assert all(r["label"] == "" for r in rows if r["run"] == "run_0")
 
 
 def test_a_camera_that_fails_costs_the_picture_not_the_trial(tmp_path):
@@ -2098,6 +2195,7 @@ def test_the_audit_page_lays_each_trial_beside_its_photos(tmp_path, _fast_servo)
     assert page.count('class="card"') == 2
     assert 'src="e2e_peg/trial_000_staged_wrist.png"' in page
     assert 'src="e2e_peg/trial_001_after_wrist.png"' in page
+    assert 'src="e2e_peg/trial_000_grade_wrist.png"' in page and "判定时" in page
     assert "插入 1/2" in page
 
 
@@ -2298,6 +2396,19 @@ def test_a_resume_with_another_seed_or_checkpoint_is_refused_before_anything_mov
             run_grasp_loop(robot, request, run_policy_trial=_policy(robot, [("grasp", 0.0)] * 2), out_path=out,
                            policy=policy)
         assert robot.actions == [] and out.read_text().splitlines() == lines
+
+
+def test_a_run_started_before_a_servo_field_existed_still_resumes_at_its_default(tmp_path):
+    """searchMaxLandings (11-13) is new in insertServo: an older file lacks it. Left at 0 the
+    resume matches; set, it is a different search and is refused."""
+
+    out = tmp_path / "g.jsonl"
+    record = json.loads(json.dumps(grasp_loop._request_record(_request(trials=2, insertServo=_insert_servo()))))
+    del record["insertServo"]["searchMaxLandings"]
+    out.write_text(json.dumps({"kind": "run_start", "request": record}) + "\n" + json.dumps({"kind": "trial", "trial": 0}) + "\n")
+    assert grasp_loop.resume_point(out, _request(trials=2, insertServo=_insert_servo()), None) == 1
+    with pytest.raises(SceneResetError, match="insertServo"):
+        grasp_loop.resume_point(out, _request(trials=2, insertServo=_insert_servo(searchMaxLandings=6)), None)
 
 
 def test_an_attended_fault_before_the_policy_runs_the_same_trial_again_on_the_same_peg(tmp_path, monkeypatch):
@@ -2515,11 +2626,38 @@ def test_the_teacher_inserts_an_off_centre_grasp_by_the_offset_and_the_row_says_
     assert result["summary"]["endToEnd"]["inserted"] == 2
 
 
-def test_a_teacher_blocked_on_the_face_is_a_miss_rescued_by_the_search_and_the_next_aims_at_the_real_hole(
+def test_a_peg_the_teacher_put_in_is_picked_from_where_the_fingers_left_it_without_a_trip_home(tmp_path, _fast_servo):
+    # 11-13 teacher pilot: after an "in" the arm went home and came straight back over the hole
+    # for the next staging (~4 s a trial). A scripted insertion's "in" goes on from where it is.
+    robot = _offset_rig()
+    events = []
+    home = robot.move_to_start
+    robot.move_to_start = lambda *a, **k: (events.append("home"), home(*a, **k))[1]
+    grades = _grades(robot, ["in", "in"], [])
+
+    def ask(*a, **k):
+        events.append("grade")
+        return grades(*a, **k)
+
+    run_grasp_loop(
+        robot,
+        _request(trials=2, insertServo=_insert_servo(), afterClose="teacher"),
+        run_policy_trial=_policy_past_close(robot, [0.004, -0.003]),
+        out_path=tmp_path / "teacher.jsonl",
+        ask_grade=ask,
+    )
+    first, second = [i for i, e in enumerate(events) if e == "grade"]
+    # Between the two grades only the staging's own homing, before the policy starts.
+    assert events[first + 1 : second].count("home") == 1
+
+
+def test_a_teacher_blocked_on_the_face_is_a_miss_rescued_by_the_search_which_the_teacher_does_not_learn_from(
     tmp_path, _fast_servo
 ):
     # The fixture's hole has crept 3.5 mm from the configured pose: the teacher's first try lands
-    # on the face, the scripted search finds the hole, and the second try aims at what it found.
+    # on the face and the scripted search finds the hole. Until 11-13 the second try aimed at the
+    # search's landing; that is a commanded point, the teacher servos the measured tool, and the
+    # mix walked the aim +2..3 mm x (151143: 7 of 9 on the face). So it no longer learns from it.
     robot = _offset_rig(hole_xy=(PICK[0] + 0.0035, PICK[1]))
     out = tmp_path / "blocked.jsonl"
     asked = []
@@ -2533,14 +2671,14 @@ def test_a_teacher_blocked_on_the_face_is_a_miss_rescued_by_the_search_and_the_n
     )
     rows = _trials(out)
     first, second = rows
-    # The search's question is asked holding the peg; the teacher's, after it let go.
-    assert [held for _message, held in asked] == [True, False]
+    # Both questions are the search's, asked holding the peg.
+    assert [held for _message, held in asked] == [True, True]
     assert first["verdict"] == "held" and first["insertSegment"]["outcome"] == "blocked"
     assert first["inserted"] is False and first["rescue"]["inserted"] is True
     assert not keeps_trial_recording(first, keep_misses=True)
-    # Within the search grid's reach of the real hole (the landing that seated was 0.5 mm off it).
-    assert second["insertSegment"]["holeXyz"][0] == pytest.approx(PICK[0] + 0.0035, abs=6e-4)
-    assert second["insertSegment"]["outcome"] == "seated" and second["inserted"] is True
+    start = PICK[0] + grasp_loop.GRASP_LOOP_TEACHER_HOLE_SHIFT_M[0]
+    assert second["insertSegment"]["holeXyz"][0] == pytest.approx(start, abs=1e-6)
+    assert second["insertSegment"]["outcome"] == "blocked" and second["inserted"] is False
 
 
 def test_an_empty_grasp_past_the_close_is_graded_on_the_teachers_lift(tmp_path, _fast_servo):
@@ -2604,19 +2742,49 @@ def test_a_teachers_trial_is_kept_only_when_its_peg_went_in(row, kept):
     assert keeps_trial_recording(row, keep_misses=False) is kept
 
 
-def test_the_hole_estimate_takes_the_seat_less_the_offset_and_ignores_far_or_missing_samples():
+def test_the_teachers_hole_is_in_the_measured_frame_and_learns_only_from_its_own_entries():
     request = _request(insertServo=_insert_servo())
+    sx, sy = grasp_loop.GRASP_LOOP_TEACHER_HOLE_SHIFT_M
+    start = (PICK[0] + sx, PICK[1] + sy)
+    # No seat yet: the configured (commanded) pose moved into the measured frame.
+    assert grasp_loop.teacher_hole_xy(request, []) == pytest.approx(start)
+
+    def seated(dx_mm, offset_x_mm=0.0, outcome="seated", inserted=True):
+        entry = [start[0] + (dx_mm + offset_x_mm) / 1000.0, start[1], 0.098]
+        return {"inserted": inserted, "insertSegment": {"outcome": outcome, "offsetXyMm": [offset_x_mm, 0.0], "entryXyz": entry}}
+
     rows = [
-        {"inserted": True, "insertSegment": {"offsetXyMm": [4.0, 0.0], "stoppedXyz": [PICK[0] + 0.006, PICK[1], 0.06]}},
-        {"inserted": False, "insertSegment": {"offsetXyMm": [4.0, 0.0]}, "rescue": {"inserted": True, "landingXyz": [PICK[0] + 0.006, PICK[1], 0.06]}},
-        # Scripted, from the close and the peg: 1 mm off along x.
-        {"inserted": True, "closeXyz": [0.401, -0.15, 0.06], "pegXyz": [0.4, -0.151, 0.058], "insert": {"landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
-        # 20 mm away: some other fixture.
-        {"inserted": True, "insertSegment": {"offsetXyMm": [0.0, 0.0], "stoppedXyz": [PICK[0] + 0.02, PICK[1], 0.06]}},
-        {"inserted": False, "insertSegment": {"offsetXyMm": [0.0, 0.0], "stoppedXyz": [PICK[0] + 0.01, PICK[1], 0.06]}},
+        seated(0.4, offset_x_mm=-1.0),  # entry less the in-hand offset
+        seated(0.6),
+        seated(0.8, offset_x_mm=2.0),
+        seated(20.0),  # some other fixture
+        seated(5.0, outcome="blocked", inserted=False),  # stood on the face: says nothing of the hole
+        # A scripted rescue's landing is a commanded point: never a sample for the teacher (151143).
+        {"inserted": False, "insertSegment": {"outcome": "blocked", "offsetXyMm": [0.0, 0.0]},
+         "rescue": {"inserted": True, "landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
+        {"inserted": True, "closeXyz": [0.401, -0.15, 0.06], "pegXyz": [0.4, -0.151, 0.058],
+         "insert": {"landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
     ]
-    assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx((PICK[0] + 0.002, PICK[1]))
-    assert grasp_loop.teacher_hole_xy(request, []) == pytest.approx(PICK[:2])
+    assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx((start[0] + 0.0006, start[1]))
+
+
+def test_the_151143_descents_split_on_the_shifted_hole():
+    """Measured tool at 95 mm less the in-hand offset (mm), and seated, for 144947 + 151143."""
+
+    descents = [
+        (356.7, -131.9, True), (355.3, -131.9, False), (355.1, -131.7, False), (356.6, -133.2, True),
+        (355.9, -133.1, True), (356.3, -132.6, True), (356.0, -132.8, True), (355.9, -132.8, True),
+        (355.2, -132.6, True), (354.9, -132.7, False), (359.5, -132.8, True), (361.8, -133.5, False),
+        (360.6, -134.3, False), (362.7, -134.4, False), (361.0, -134.0, False), (360.8, -134.9, False),
+        (362.3, -135.5, False), (362.6, -134.8, False), (361.8, -135.9, False),
+    ]
+    configured = (359.7, -132.8)
+    hole = (configured[0] + grasp_loop.GRASP_LOOP_TEACHER_HOLE_SHIFT_M[0] * 1000.0,
+            configured[1] + grasp_loop.GRASP_LOOP_TEACHER_HOLE_SHIFT_M[1] * 1000.0)
+    seated = [math.dist((x, y), hole) for x, y, ok in descents if ok]
+    blocked = [math.dist((x, y), hole) for x, y, ok in descents if not ok]
+    # A thin margin (2.21 vs 2.28 mm) fitted on these same descents: pilot 3 is the real test.
+    assert max(seated) < 2.25 < min(blocked)
 
 
 # ------------------------------------------------------------- trial evidence (11-10) ---

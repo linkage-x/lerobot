@@ -17,6 +17,9 @@
 #     FR3_GRASP_LOOP_MAX_POLICY_STEPS (policy steps before a trial with no close ends; blank = 450)
 #     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
+#     FR3_GRASP_LOOP_INSERT_SEARCH_ORDER (landing indices tried first, e.g. 8,14,6,7,5,0; blank = the runtime's default)
+#     FR3_GRASP_LOOP_INSERT_MAX_LANDINGS (give the search up after this many landings; blank = all 17)
+#     FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND (1 = order each search by where a fixture-staged peg sits in the hand)
 #     FR3_GRASP_LOOP_DATASET_ROOT (dir: record arm B's funnel steps as a DAgger dataset; blank = off)
 #     FR3_GRASP_LOOP_RECORD_WHOLE_TRIAL=1 (with the root: whole held trials, policy steps included)
 #     FR3_GRASP_LOOP_KEEP_MISSES=1 (with whole trials: arm A's empty / no_close trials too, for relabelling)
@@ -505,6 +508,10 @@ case "$mode" in
     if [[ -n "${FR3_GRASP_LOOP_LIGHTING-}" ]]; then grasp_loop_args+=(--grasp-loop-lighting "${FR3_GRASP_LOOP_LIGHTING}"); fi
     # v14 step 4: carry each held grasp into the hole (blank = grasp only, as steps 1-2).
     if [[ -n "${FR3_GRASP_LOOP_INSERT_POSE-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-pose "${FR3_GRASP_LOOP_INSERT_POSE}"); fi
+    # The insertion search: which landings first, and how many before it gives up (blank = default order, all 17).
+    if [[ -n "${FR3_GRASP_LOOP_INSERT_SEARCH_ORDER-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-search-order "${FR3_GRASP_LOOP_INSERT_SEARCH_ORDER}"); fi
+    if [[ -n "${FR3_GRASP_LOOP_INSERT_MAX_LANDINGS-}" ]]; then grasp_loop_args+=(--grasp-loop-insert-max-landings "${FR3_GRASP_LOOP_INSERT_MAX_LANDINGS}"); fi
+    if [[ "${FR3_GRASP_LOOP_INSERT_ORDER_BY_HAND-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-insert-order-by-hand); fi
     # Arm B: how high above the peg the funnel takes over, "h" or "low,high" mm (blank = 60).
     if [[ -n "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM-}" ]]; then grasp_loop_args+=(--grasp-loop-funnel-takeover-dz-mm "${FR3_GRASP_LOOP_FUNNEL_TAKEOVER_DZ_MM}"); fi
     # Arm B: the funnel leaves part of the aim to the descent and sometimes recovers from low (unset = off).

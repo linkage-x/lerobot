@@ -171,6 +171,10 @@ export function RolloutPage() {
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
+  // 11-13: a capped search (blank = the runtime's order, all 17 landings, as every run before).
+  const [graspLoopInsertSearchOrder, setGraspLoopInsertSearchOrder] = useState("");
+  const [graspLoopInsertMaxLandings, setGraspLoopInsertMaxLandings] = useState("");
+  const [graspLoopInsertOrderByHand, setGraspLoopInsertOrderByHand] = useState(false);
   const [graspLoopRecord, setGraspLoopRecord] = useState(false);
   const [graspLoopRecordWholeTrial, setGraspLoopRecordWholeTrial] = useState(false);
   const [graspLoopKeepMisses, setGraspLoopKeepMisses] = useState(false);
@@ -336,6 +340,12 @@ export function RolloutPage() {
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
+      graspLoopInsertSearchOrder:
+        modeId === "grasp_loop" && graspLoopInsertPose.trim() ? graspLoopInsertSearchOrder.trim() || undefined : undefined,
+      graspLoopInsertMaxLandings:
+        modeId === "grasp_loop" && graspLoopInsertPose.trim() ? graspLoopInsertMaxLandings.trim() || undefined : undefined,
+      graspLoopInsertOrderByHand:
+        modeId === "grasp_loop" && graspLoopInsertPose.trim() && graspLoopInsertOrderByHand ? true : undefined,
       graspLoopRecord: modeId === "grasp_loop" ? graspLoopRecord : undefined,
       graspLoopDatasetRoot:
         modeId === "grasp_loop" && graspLoopRecord ? graspLoopDatasetRoot.trim() || undefined : undefined,
@@ -419,6 +429,9 @@ export function RolloutPage() {
       graspLoopAttended,
       graspLoopArms,
       graspLoopInsertPose,
+      graspLoopInsertSearchOrder,
+      graspLoopInsertMaxLandings,
+      graspLoopInsertOrderByHand,
       graspLoopRecord,
       graspLoopRecordWholeTrial,
       graspLoopKeepMisses,
@@ -621,6 +634,9 @@ export function RolloutPage() {
       if (options.graspLoopAttended !== undefined) setGraspLoopAttended(options.graspLoopAttended);
       if (options.graspLoopArms !== undefined) setGraspLoopArms(options.graspLoopArms);
       if (options.graspLoopInsertPose !== undefined) setGraspLoopInsertPose(options.graspLoopInsertPose);
+      setGraspLoopInsertSearchOrder(options.graspLoopInsertSearchOrder ?? "");
+      setGraspLoopInsertMaxLandings(options.graspLoopInsertMaxLandings ?? "");
+      setGraspLoopInsertOrderByHand(options.graspLoopInsertOrderByHand ?? false);
       if (options.graspLoopFunnelTakeoverDzMm !== undefined)
         setGraspLoopFunnelTakeoverDzMm(options.graspLoopFunnelTakeoverDzMm);
       setGraspLoopResume(options.graspLoopResume ?? "");
@@ -1639,6 +1655,45 @@ export function RolloutPage() {
               端到端（v14 第 4 步）：抓住后脚本合紧、带销回原位摆正，搬到孔上方 12 cm，用第 3 步的慢速下降 + 7 mm
               搜索插入；手指张开前问你「进了 / 没进」。进了就松手，下一条从孔里取销；没进就带回抓取点放下、脚本重夹。
               孔位须在 fixture pick 15 mm 内（孔就是 fixture）。留空则和以前一样只抓不插。
+            </p>
+            <div className="row-actions">
+              <label className="field">
+                <span>搜索顺序（落点编号）</span>
+                <input
+                  value={graspLoopInsertSearchOrder}
+                  onChange={(event) => setGraspLoopInsertSearchOrder(event.target.value)}
+                  placeholder="留空 = 默认顺序"
+                  disabled={isLive || !graspLoopInsertPose.trim()}
+                />
+              </label>
+              <label className="field">
+                <span>最多落点数</span>
+                <input
+                  value={graspLoopInsertMaxLandings}
+                  onChange={(event) => setGraspLoopInsertMaxLandings(event.target.value)}
+                  placeholder="留空 = 全部 17 个"
+                  disabled={isLive || !graspLoopInsertPose.trim()}
+                />
+              </label>
+            </div>
+            <p className="hint">
+              搜索封顶（11-13）：试完前 N 个落点还没进就判没进，不再试满 17 个。建议顺序 8,14,6,7,5,0 配 6 个落点：
+              过去 143 次策略抓取插进里 136 次落在这 6 个点上；没插进的每次少试约 8 个落点（约 19 s）。
+              0 = 瞄准点，1–8 = 3.5 mm 内圈，9–16 = 7 mm 外圈。
+            </p>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={graspLoopInsertOrderByHand}
+                onChange={(event) => setGraspLoopInsertOrderByHand(event.target.checked)}
+                disabled={isLive || !graspLoopInsertPose.trim()}
+              />
+              <span>按销在手里的偏移选搜索顺序（只对夹具摆放的 trial）</span>
+            </label>
+            <p className="hint">
+              11-13：合爪时工具 x 比销的摆放位置小 3 mm 以上（销偏在手指 +x 侧）→ 先试 −x 侧 14,6,5,7,8,0；否则 8,7,6,0,14,5。
+              离线按日期对半交叉验证：第一个落点就插进 0.78 / 0.49，单一顺序 0.07 / 0.25；前 6 个落点覆盖率不变。
+              regrip/repick 摆放的销位置记录不准，照用上面的搜索顺序。建议配最多 6 个落点。
             </p>
             <label className="field">
               <span>合爪之后谁来插（端到端）</span>

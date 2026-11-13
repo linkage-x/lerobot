@@ -549,6 +549,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-insert-max-landings',
+        type=int,
+        default=0,
+        help=(
+            'Give the insertion search up after this many landings of the order (an "exhausted" '
+            'miss). 0 (default) tries all 17. With 6, use the ranked order 8,14,6,7,5,0 '
+            '(grasp_loop GRASP_LOOP_INSERT_SEARCH_ORDER_RANKED): 95%% of past policy-grasp seats.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-insert-via-home',
         action='store_true',
         help='Home with the held peg before the insertion (every step-4 run to 09-30), instead of '
@@ -602,6 +612,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "With --grasp-loop-funnel-corrective and whole-trial recording: keep the policy's own steps "
             'below the lift height before a late takeover in the dataset (left out otherwise), for '
             'funnel_relabel to label. Never train on such a recording without the relabel.'
+        ),
+    )
+    parser.add_argument(
+        '--grasp-loop-insert-order-by-hand',
+        action='store_true',
+        help=(
+            'Order each insertion search by where a fixture-staged peg sits in the hand: tool x at '
+            'the close more than 3 mm -x of the peg lands 14,6,5,7,8,0, otherwise 8,7,6,0,14,5 '
+            '(grasp_loop GRASP_LOOP_INSERT_ORDER_PEG_*). Regrip/repick-staged pegs keep '
+            '--grasp-loop-insert-search-order. Pair with --grasp-loop-insert-max-landings 6.'
         ),
     )
     parser.add_argument(
@@ -5946,6 +5966,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                         searchOrder=tuple(
                             int(part) for part in str(args.grasp_loop_insert_search_order).split(',') if part.strip()
                         ),
+                        searchMaxLandings=int(args.grasp_loop_insert_max_landings),
                         stepToleranceM=GRASP_LOOP_INSERT_STEP_TOLERANCE_M,
                         pressCapN=GRASP_LOOP_INSERT_PRESS_CAP_N,
                         controlPeriodS=1.0 / policy_fps,
@@ -5963,6 +5984,7 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 funnelKeepLowPolicy=bool(args.grasp_loop_funnel_keep_low_policy),
                 funnelBottomTeacher=bool(args.grasp_loop_funnel_bottom_teacher),
                 reseatAfterMiss=bool(args.grasp_loop_reseat_after_miss),
+                insertOrderByHand=bool(args.grasp_loop_insert_order_by_hand),
                 afterClose=str(args.grasp_loop_after_close),
             )
             validate_grasp_loop_request(grasp_loop_request)
@@ -5980,12 +6002,14 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
             f'lighting={args.grasp_loop_lighting} '
             + (
                 'insert=%.4f,%.4f,%.4f insert_ring_m=%.4f insert_inner_ring_m=%.4f insert_search_order=%s '
-                'insert_follow_seat=%d insert_via_home=%d '
+                'insert_max_landings=%s insert_order_by_hand=%d insert_follow_seat=%d insert_via_home=%d '
                 % (
                     *grasp_loop_request.insertServo.xyz,
                     grasp_loop_request.insertServo.searchRingM,
                     grasp_loop_request.insertServo.searchInnerRingM,
                     ','.join(str(index) for index in grasp_loop_request.insertServo.searchOrder) or 'index',
+                    grasp_loop_request.insertServo.searchMaxLandings or 'all',
+                    int(grasp_loop_request.insertOrderByHand),
                     int(grasp_loop_request.insertFollowSeat),
                     int(grasp_loop_request.insertViaHome),
                 )

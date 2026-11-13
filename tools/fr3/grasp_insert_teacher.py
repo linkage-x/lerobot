@@ -86,6 +86,17 @@ INSERT_TEACHER_WIDTH_SAMPLES = 10
 # dead-time rule would trim to 17 frames anyway.
 INSERT_TEACHER_OPEN_STEPS = 15
 INSERT_TEACHER_RETREAT_M = 0.05
+# Lateral servo on the measured tool (11-13 pilot 144947): the arm stands 1.5-2.2 mm -x of a
+# resting setpoint and trails a descending one by ~3 mm in x, so a setpoint on the seat put the
+# peg 3-5.5 mm off it. Above the hub the teacher adds a bias that integrates the measured miss
+# (gain per step, capped), and does not go below `entryDzM` over the seat -- the hub's top face
+# stops a peg at +32..35 mm -- until the tool stands within `alignTolM` of the seat or
+# `alignTimeoutSteps` pass. Below the entry nothing is integrated: there the hole's wall pushes.
+INSERT_TEACHER_ALIGN_GAIN = 0.15
+INSERT_TEACHER_ALIGN_MAX_M = 0.006
+INSERT_TEACHER_ALIGN_TOL_M = 0.0006
+INSERT_TEACHER_ENTRY_DZ_M = 0.040
+INSERT_TEACHER_ALIGN_TIMEOUT_STEPS = 90
 
 
 def in_hand_offset_xy(
@@ -166,6 +177,11 @@ class InsertTeacherConfig:
     widthSamples: int = INSERT_TEACHER_WIDTH_SAMPLES
     openSteps: int = INSERT_TEACHER_OPEN_STEPS
     retreatM: float = INSERT_TEACHER_RETREAT_M
+    alignGain: float = INSERT_TEACHER_ALIGN_GAIN
+    alignMaxM: float = INSERT_TEACHER_ALIGN_MAX_M
+    alignTolM: float = INSERT_TEACHER_ALIGN_TOL_M
+    entryDzM: float = INSERT_TEACHER_ENTRY_DZ_M
+    alignTimeoutSteps: int = INSERT_TEACHER_ALIGN_TIMEOUT_STEPS
 
     @property
     def offsetXy(self) -> tuple[float, float]:
@@ -209,6 +225,13 @@ class InsertTeacher:
     carryStartRotvec: tuple[float, float, float] | None = None
     stoppedXyz: tuple[float, float, float] | None = None
     releaseStepCount: int = 0
+    # Added to the setpoint's xy on output: the integrated lateral miss above the hub.
+    lateralBias: tuple[float, float] = (0.0, 0.0)
+    alignWaitSteps: int = 0
+    # The tool's measured miss of the seat (mm) when the descent passed the entry height.
+    alignErrorAtEntryMm: float | None = None
+    # The measured tool when the descent passed the entry height: where this grasp's aim stood.
+    entryXyz: tuple[float, float, float] | None = None
     stateSteps: dict[str, int] = field(default_factory=dict)
     transitions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -232,6 +255,20 @@ class InsertTeacher:
         speed = math.inf if self.previousXyz is None else math.dist(xyz, self.previousXyz) * 1000.0 / cfg.controlPeriodS
         self.quietSteps = self.quietSteps + 1 if speed < cfg.settleSpeedMmS else 0
         return self.quietSteps >= cfg.settleSteps
+
+    def _align(self, ee_xyz: tuple[float, float, float]) -> float:
+        """Integrate the measured miss of the seat into the bias, above the entry only. The miss (m)."""
+
+        cfg = self.config
+        seat = cfg.seatXyz
+        ex, ey = seat[0] - ee_xyz[0], seat[1] - ee_xyz[1]
+        if ee_xyz[2] > seat[2] + cfg.entryDzM - 1e-9:
+            bx, by = self.lateralBias[0] + cfg.alignGain * ex, self.lateralBias[1] + cfg.alignGain * ey
+            norm = math.hypot(bx, by)
+            if norm > cfg.alignMaxM:
+                bx, by = bx * cfg.alignMaxM / norm, by * cfg.alignMaxM / norm
+            self.lateralBias = (bx, by)
+        return math.hypot(ex, ey)
 
     def step(
         self,
@@ -282,7 +319,11 @@ class InsertTeacher:
                 total = math.dist(self.carryStartXyz[:2], goal[:2])
                 fraction = 1.0 if total < 1e-6 else 1.0 - math.dist(self.setpoint[:2], goal[:2]) / total
                 self.rotvec = _slerp_rotvec(self.carryStartRotvec, cfg.levelRotvec, fraction)
-            if arrived and self._settled(ee_xyz):
+            settled = self._settled(ee_xyz)
+            if arrived and settled:
+                # Only once the arm stands: a tool still catching up is not a standing miss.
+                self._align(ee_xyz)
+            if arrived and settled:
                 self._enter(DESCEND, step_idx, ee_xyz, "over_seat")
         elif self.state == DESCEND:
             bottom = max(cfg.minZ, seat[2] - cfg.pressM)
@@ -290,6 +331,16 @@ class InsertTeacher:
             fast = self.setpoint[2] > slow_from + 1e-9
             speed = cfg.descendSpeedMS if fast else cfg.seatSpeedMS
             walked_z = max(slow_from if fast else bottom, self.setpoint[2] - speed * cfg.controlPeriodS)
+            miss = self._align(ee_xyz)
+            entry_z = seat[2] + cfg.entryDzM
+            if walked_z < entry_z - 1e-9 and self.alignErrorAtEntryMm is None:
+                # The gate: hold over the hub until the tool stands on the seat's line.
+                if miss > cfg.alignTolM and self.alignWaitSteps < cfg.alignTimeoutSteps:
+                    self.alignWaitSteps += 1
+                    walked_z = max(walked_z, min(self.setpoint[2], entry_z))
+                else:
+                    self.alignErrorAtEntryMm = round(miss * 1000.0, 2)
+                    self.entryXyz = ee_xyz
             # Never further below the tool than the contact lag: whatever it stands on is pressed
             # with the controller's stiffness times this, not with a setpoint running away below.
             next_z = max(walked_z, ee_xyz[2] - cfg.contactLagM)
@@ -303,8 +354,8 @@ class InsertTeacher:
                     self._enter(RELEASE, step_idx, ee_xyz, "seated")
                 else:
                     self.outcome = "blocked"
-                    # Hold where it stands rather than keep pressing.
-                    self.setpoint = ee_xyz
+                    # Hold where it stands rather than keep pressing (the output adds the bias).
+                    self.setpoint = (ee_xyz[0] - self.lateralBias[0], ee_xyz[1] - self.lateralBias[1], ee_xyz[2])
                     self._enter(DONE, step_idx, ee_xyz, "stood_above_seat")
         elif self.state == RELEASE:
             self.releaseStepCount += 1
@@ -320,8 +371,8 @@ class InsertTeacher:
 
         self.previousXyz = ee_xyz
         return {
-            "ee.x": float(self.setpoint[0]),
-            "ee.y": float(self.setpoint[1]),
+            "ee.x": float(self.setpoint[0] + self.lateralBias[0]),
+            "ee.y": float(self.setpoint[1] + self.lateralBias[1]),
             "ee.z": float(self.setpoint[2]),
             "ee.wx": float(self.rotvec[0]),
             "ee.wy": float(self.rotvec[1]),
@@ -343,6 +394,10 @@ class InsertTeacher:
             "raisedMm": round(cfg.raisedM * 1000.0, 1),
             "stoppedXyz": None if self.stoppedXyz is None else [round(v, 5) for v in self.stoppedXyz],
             "aboveSeatMm": None if self.stoppedXyz is None else round((self.stoppedXyz[2] - seat[2]) * 1000.0, 1),
+            "alignBiasMm": [round(v * 1000.0, 2) for v in self.lateralBias],
+            "alignErrorAtEntryMm": self.alignErrorAtEntryMm,
+            "alignWaitSteps": self.alignWaitSteps,
+            "entryXyz": None if self.entryXyz is None else [round(v, 5) for v in self.entryXyz],
             "stateSteps": dict(self.stateSteps),
             "transitions": list(self.transitions),
         }

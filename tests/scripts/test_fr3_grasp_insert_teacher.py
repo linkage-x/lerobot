@@ -50,8 +50,9 @@ def _config(close_offset_x=0.0, close_dz=0.0, **overrides):
     return InsertTeacherConfig(**fields)
 
 
-def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000):
-    """Drive the teacher on an arm that tracks exactly; the peg is off the tool by the offset."""
+def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000, lag_xy=(0.0, 0.0)):
+    """Drive the teacher on an arm that tracks exactly -- or stands `lag_xy` off every setpoint,
+    as the FR3 does sideways -- and the peg is off the tool by the offset."""
 
     teacher = InsertTeacher(config, heldTest=_held_test)
     offset = config.offsetXy
@@ -64,12 +65,13 @@ def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000):
             break
         command = teacher.step(step, xyz, rotvec, width)
         commands.append(command)
-        peg_xy = (command["ee.x"] - offset[0], command["ee.y"] - offset[1])
+        tool_xy = (command["ee.x"] + lag_xy[0], command["ee.y"] + lag_xy[1])
+        peg_xy = (tool_xy[0] - offset[0], tool_xy[1] - offset[1])
         over_hole = math.dist(peg_xy, hole_xy) <= CAPTURE_M
         floor = seat_z - 0.010 if over_hole else seat_z + FACE_ABOVE_M
         # Only a peg arriving from above meets the face.
         z = command["ee.z"] if xyz[2] < floor - 1e-9 and not over_hole else max(command["ee.z"], floor)
-        xyz = (command["ee.x"], command["ee.y"], z)
+        xyz = (tool_xy[0], tool_xy[1], z)
         rotvec = (command["ee.wx"], command["ee.wy"], command["ee.wz"])
     return teacher, commands
 
@@ -168,3 +170,26 @@ def test_the_wrist_is_turned_level_on_the_carry_and_not_before():
     # Turned gradually: no step turns more than a fraction of the whole.
     steps = [abs(b[2] - a[2]) for a, b in zip(rotvecs, rotvecs[1:])]
     assert max(steps) < 0.01
+
+
+@pytest.mark.parametrize("lag_xy", [(-0.003, 0.001), (0.002, -0.002), (-0.0045, 0.0)])
+def test_an_arm_that_stands_off_its_setpoint_is_steered_onto_the_seat_before_the_peg_reaches_the_hub(lag_xy):
+    # 11-13 pilot: the FR3 stood ~2-3 mm -x of the teacher's setpoint, and 3 of 10 pegs landed on
+    # the hub's face. The teacher now servos on where the tool stands, above the hub only.
+    config = _config(close_offset_x=-0.001)
+    teacher, commands = _run(config, lag_xy=lag_xy)
+    assert teacher.outcome == "seated"
+    seat = config.seatXyz
+    assert math.dist(teacher.stoppedXyz[:2], seat[:2]) < 0.0007
+    record = teacher.record()
+    assert record["alignErrorAtEntryMm"] <= 0.6
+    # Where it entered, measured: the next trial's hole estimate learns from this, not the seat.
+    assert math.dist(record["entryXyz"][:2], seat[:2]) <= 0.0006 + 1e-6
+    assert record["entryXyz"][2] <= seat[2] + config.entryDzM + 0.002
+    assert record["alignBiasMm"] == pytest.approx([-v * 1000.0 for v in lag_xy], abs=0.7)
+
+
+def test_without_the_servo_the_same_lag_puts_the_peg_on_the_face():
+    config = _config(close_offset_x=-0.001, alignGain=0.0, alignTimeoutSteps=0)
+    teacher, _commands = _run(config, lag_xy=(-0.003, 0.001))
+    assert teacher.outcome == "blocked"
