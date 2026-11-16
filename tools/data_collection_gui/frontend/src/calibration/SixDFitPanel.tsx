@@ -7,9 +7,10 @@
 //
 // Two ways to turn the sensor through its six faces: by hand (a capture here, any BOX), or held by
 // the FR3 (the payload panel's "负载 + 6D" run, for the arm's gripper BOX). Both land in the list
-// below with their fit. A hand-held BOX's fit is registered here by whoever captured it, if the
-// self-service gate passes (box_six_d_store): into this station's own log, in force at once for the
-// export and the live wrench, no deploy. An arm BOX's K goes to the repo through a maintainer.
+// below with their fit, and whoever captured it registers it here if the self-service gate passes
+// (box_six_d_store), into this station's own log, no deploy. A hand-held BOX's K is in force at once;
+// an arm BOX's waits for the next arm-held 6D zero to re-check it. A load that comes and goes (the
+// SMR) is switched back to its earlier, already checked K with the 当前负载 picker: no new capture.
 import { useCallback, useEffect, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import { PayloadJobView } from "./PayloadJobView";
@@ -24,6 +25,8 @@ import {
   SIX_D_SELF_SERVICE_DEFAULT,
   sixDFitNotes,
   sixDGateChecks,
+  sixDRecordState,
+  sixDRegisterKind,
   sixDVerdict,
   toLocalInput,
   TOOL_CONFIG_SHORT,
@@ -42,14 +45,8 @@ type Source = {
   endEffector: string;
   fit: SixDFitSummary | null;
   registered: boolean;
-  /** an FR3 lift run: an arm BOX, registered by a maintainer, not here */
+  /** an FR3 lift run: an arm BOX, its end effector from the run, pending until the arm zero */
   armRun: boolean;
-};
-
-const TOOL_CONFIG_EE: Record<string, string> = {
-  gripper: "gripper only (no camera, no SMR nest), on the FR3",
-  gripper_cam: "gripper + camera/SMR adaptor, SMR out, on the FR3",
-  gripper_cam_smr: "gripper + camera/SMR adaptor + SMR, on the FR3",
 };
 
 export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: boolean }) {
@@ -64,6 +61,8 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
   const [regEE, setRegEE] = useState("");
   const [regFrom, setRegFrom] = useState("");
   const [regStatus, setRegStatus] = useState("");
+  const [loadPick, setLoadPick] = useState<Record<string, string>>({});
+  const [loadFrom, setLoadFrom] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async () => {
     const next = await api.fetchPayloadCalibration();
@@ -104,7 +103,8 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
   const disabled = busy || running !== "" || active;
   const rules = payload?.selfService ?? SIX_D_SELF_SERVICE_DEFAULT;
   const roleOf = (deviceId: string) => boxes.find((b) => b.deviceId === deviceId);
-  const selfService = (s: Source) => !s.armRun && (roleOf(s.deviceId)?.selfService ?? roleOf(s.deviceId)?.role === "handheld");
+  const registerKind = (s: Source) => sixDRegisterKind(roleOf(s.deviceId)?.role, s.armRun, rules);
+  const selfService = (s: Source) => registerKind(s).kind !== "";
   const gatePasses = (s: Source) => sixDGateChecks(s.fit, rules).every((c) => c.ok);
   const captureJob = job.kind === "six_d_capture";
   const live = captureJob ? job.capture ?? null : null;
@@ -128,10 +128,12 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
         title: r.name,
         how: `FR3 托举 · ${r.arm} · ${TOOL_CONFIG_SHORT[r.toolConfig] ?? r.toolConfig}`,
         deviceId: String(r.sixD?.deviceId ?? ""),
-        startedUnix: null,
-        endEffector: TOOL_CONFIG_EE[r.toolConfig] ?? "",
+        startedUnix: r.sixD?.startedUnix ?? null,
+        endEffector: r.sixD?.endEffector ?? "",
         fit: r.sixD?.fit ?? null,
-        registered: false,
+        registered: (roleOf(String(r.sixD?.deviceId ?? ""))?.records ?? []).some((rec) =>
+          (rec.status ?? "").includes(`FR3 lift run ${r.name}`),
+        ),
         armRun: true,
       })),
   ];
@@ -152,6 +154,16 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
     });
     if (result?.ok) setRegistering(null);
   };
+  const applyLoad = async (deviceId: string, key: string) => {
+    const choice = roleOf(deviceId)?.loads?.find((c) => c.key === key);
+    if (!choice) return;
+    await act("switch-back", "six-d/switch-back", {
+      deviceId,
+      sourceValidFromUnix: choice.validFromUnix,
+      sourceRegisteredUnix: choice.registeredUnix,
+      validFromUnix: fromLocalInput(loadFrom[deviceId] ?? "") ?? Math.round(Date.now() / 1000),
+    });
+  };
 
   return (
     <section className="panel">
@@ -167,8 +179,10 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
         6D 传感器上挂的东西（夹爪、rig、支架）在每个姿态都会给它一个重力读数。拟合把 IMU 读数映射成这个读数（K，6×3），
         之后每个样本都能扣掉它，只剩外力（导出的 <code>box_six_d_external.*</code> 和 BOX 页的实时外力都用它）。
         <b>K 跟着末端配置走，不跟着 BOX 走</b>：负载侧装/拆任何东西都要重新拟合，并从改动那一刻起登记。
-        <b>手持 BOX 自己采、自己登记</b>：拟合过了下面的自动门槛就能登记，写进本站的{" "}
-        <code>{payload?.localRegistryPath ?? "outputs/calibration/box_six_d/registry.jsonl"}</code>，导出和实时外力立刻生效，不用找维护者、不用 deploy。
+        <b>自己采、自己登记</b>：拟合过了下面的自动门槛就能登记，写进本站的{" "}
+        <code>{payload?.localRegistryPath ?? "outputs/calibration/box_six_d/registry.jsonl"}</code>，不用找维护者、不用 deploy。
+        手持 BOX 登记后立刻生效；臂上 BOX 登记后<b>待复核</b>，BOX 预热后做一次臂上校零、两次复核都过了才生效。
+        装上又拆下的东西（例如臂上的 SMR）不用每次重采：在下面「已登记」里把<b>当前负载</b>切回它以前验证过的那套 K。
         手册顺序：上电预热 30 分钟 → 工装上 origin → 重新上电 → 工装上动态校准 → 再拟合。
       </p>
 
@@ -253,7 +267,9 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
           <div className="cali-step-title">FR3 托举（机械臂上的夹爪 BOX）</div>
           <p className="cali-muted">
             在「FR3 机械臂」页的负载辨识里选「负载 + 6D」或「仅 6D」：机械臂把夹爪依次摆成同样六个姿态（指尖朝上/朝下、四个侧放）、每个姿态静止数秒，比手持稳，也不会碰到负载。
-            采完自动拟合，结果出现在下面。
+            机械臂会动：要有人在急停旁边，由人来点开始。BOX 要先上电预热 30 分钟。采完自动拟合，结果出现在下面，过了门槛就能登记。
+            末端配置按采集时选的「装了什么」自动写，不用填。登记后先算<b>待复核</b>：等 BOX 预热后在「6D 零点（臂上）」做一次校零，
+            两个复核姿态都在 ±0.5 N 内这条 K 才生效；复核没过它就作废（重新采集登记，或把当前负载换回以前的 K）。
           </p>
         </li>
 
@@ -290,6 +306,9 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                             {n.text}
                           </div>
                         ))}
+                        {!selfService(s) && s.fit && !s.fit.error && (
+                          <div className="cali-muted">{registerKind(s).why}</div>
+                        )}
                         {selfService(s) && s.fit && !s.fit.error && !gatePasses(s) && (
                           <div className="cali-warn">
                             不能自助登记：
@@ -322,8 +341,8 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                               {s.registered ? "已登记" : "登记"}
                             </button>
                           ) : (
-                            <span className="cali-muted" title="臂上 BOX 的 K 由维护者审过后提交到仓库">
-                              维护者登记
+                            <span className="cali-muted" title={registerKind(s).why}>
+                              不能在此登记
                             </span>
                           )}
                         </div>
@@ -336,8 +355,9 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
           )}
           <p className="cali-muted">
             「刚体读数」只是把 K 当成刚体时的质量/质心，用来发现装错，不是称重。
-            自助登记的门槛（手持 BOX）：留一面 ≤ {rules.heldoutN} N、六个姿态齐、BOX 预热 ≥ {Math.round(rules.warmupS / 60)} 分钟、
+            自助登记的门槛：留一面 ≤ {rules.heldoutN} N、六个姿态齐、BOX 预热 ≥ {Math.round(rules.warmupS / 60)} 分钟、
             回到同一朝向测过漂移且 ≤ {rules.driftN} N、装上时间不早于这只 BOX 现有最新的登记。
+            臂上 BOX 另外要：一次跑完的 FR3 托举采集，采集里的 BOX 就是 fr3_arms.json 里这条臂的夹爪 BOX；登记后由臂上校零复核。
             登记只追加不改写：K 错了就重新采、按同一个装上时间再登记一次，新的那条接管之后所有导出（旧导出的标签链会和新的不同，不会被混在一起）。
             撤销一条登记只有维护者能做。
           </p>
@@ -349,7 +369,12 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
               </div>
               <label className="cali-field payload-note">
                 末端配置（6D 传感器带的是什么）
-                <input value={regEE} onChange={(e) => setRegEE(e.target.value)} />
+                <input
+                  value={regEE}
+                  readOnly={registering.armRun}
+                  title={registering.armRun ? "按采集时选的末端配置自动写" : ""}
+                  onChange={(e) => setRegEE(e.target.value)}
+                />
               </label>
               <label className="cali-field">
                 这个配置的装上时间（记录从这一刻起生效，不是拟合时间）
@@ -367,12 +392,14 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                 ))}
               </ul>
               <p className="cali-muted">
-                写进本站登记，从装上时间起生效：之后导出、重新导出这段时间的数据都用这个 K。装上时间之后录的数据要重新导出才会换成新 K。
+                {registering.armRun
+                  ? "写进本站登记，先算待复核：BOX 预热后做一次臂上校零，两次复核都过了才从装上时间起生效；在那之前这个装上时间之后的导出会拒绝，不会悄悄用旧配置的 K。"
+                  : "写进本站登记，从装上时间起生效：之后导出、重新导出这段时间的数据都用这个 K。装上时间之后录的数据要重新导出才会换成新 K。"}
               </p>
               <div className="cali-op-actions">
                 <button onClick={() => setRegistering(null)}>取消</button>
                 <button className="cali-btn-primary" disabled={running !== "" || !regEE || !regFrom} onClick={() => void submitRegister()}>
-                  登记（立即生效）
+                  {registering.armRun ? "登记（待臂上校零复核）" : "登记（立即生效）"}
                 </button>
               </div>
             </div>
@@ -381,6 +408,63 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
 
         <li className="cali-step">
           <div className="cali-step-title">已登记</div>
+          {boxes
+            .filter((b) => b.selfService && (b.loads?.length ?? 0) > 0)
+            .map((b) => {
+              const loads = b.loads ?? [];
+              const current = loads.find((c) => c.inForce);
+              const pick = loadPick[b.deviceId] ?? current?.key ?? "";
+              const chosen = loads.find((c) => c.key === pick);
+              return (
+                <div key={`load-${b.deviceId}`} className="payload-row">
+                  <label className="cali-field payload-note">
+                    BOX {b.deviceId}（{b.role === "fr3_gripper" ? "臂上" : `手持${b.hand ? ` ${b.hand}` : ""}`}）当前负载
+                    <select
+                      value={pick}
+                      disabled={disabled}
+                      onChange={(e) => setLoadPick({ ...loadPick, [b.deviceId]: e.target.value })}
+                    >
+                      {!current && <option value="">（现在没有生效的 K）</option>}
+                      {loads.map((c) => (
+                        <option key={c.key} value={c.key}>
+                          {c.endEffector} · K 拟合自 {c.fittedFrom ?? "—"}
+                          {c.inForce ? "（现在生效）" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="cali-field">
+                    从什么时候起（装上/取下的时间，空 = 现在）
+                    <input
+                      type="datetime-local"
+                      value={loadFrom[b.deviceId] ?? ""}
+                      disabled={disabled}
+                      onChange={(e) => setLoadFrom({ ...loadFrom, [b.deviceId]: e.target.value })}
+                    />
+                  </label>
+                  <button
+                    className="cali-btn-primary"
+                    disabled={disabled || !chosen || chosen.inForce}
+                    title={chosen?.inForce ? "这就是现在生效的负载" : ""}
+                    onClick={() => void applyLoad(b.deviceId, pick)}
+                  >
+                    应用这套 K
+                  </button>
+                </div>
+              );
+            })}
+          <p className="cali-muted">
+            「当前负载」只列这只 BOX 已经验证过的 K（每种末端配置最新的一条：维护者登记、手持自助登记、或臂上校零复核过的）。
+            应用后从填的时间起生效，立即用于导出和实时外力，不用重新采集。系统看不出负载什么时候换过：
+            装上/取下 SMR 或 rig 之后要记得在这里切换，不切就一直用旧的 K，外力会偏。没有出现在列表里的配置要先采集登记。
+          </p>
+          {boxes
+            .filter((b) => b.notInForce && b.records.length > 0)
+            .map((b) => (
+              <p key={`nif-${b.deviceId}`} className="cali-warn">
+                BOX {b.deviceId} 现在没有生效的 K：{b.notInForce}
+              </p>
+            ))}
           <table className="metric-table">
             <thead>
               <tr>
@@ -413,12 +497,8 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                         <td className="cali-muted">
                           {r.store === "local" ? `本站 · ${r.registered ?? ""}` : "仓库（维护者）"}
                         </td>
-                        <td className={r.retired || !r.fitted ? "payload-verdict-warn" : r.inForce ? "payload-verdict-ok" : ""}>
-                          {r.retired
-                            ? `已撤销：${r.retired.reason ?? ""}`
-                            : r.fitted
-                              ? `${r.inForce ? "现在生效 · " : ""}留一面 ${r.heldoutWorstForceN ?? "—"} N`
-                              : "待拟合"}
+                        <td className={sixDRecordState(r).tone ? `payload-verdict-${sixDRecordState(r).tone}` : ""}>
+                          {sixDRecordState(r).text}
                         </td>
                       </tr>
                     )),

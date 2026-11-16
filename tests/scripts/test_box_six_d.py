@@ -524,7 +524,7 @@ def test_the_live_wrench_uses_the_boxs_model_and_its_last_software_zero():
     }
     origin = {"7": {**zero["7"], "kind": "origin"}}
     assert "origin" in bsd.live_external(snap, _registry(), origin, START_S)["box_six_d_force"]["external_note"]
-    assert "没有载荷模型" in bsd.live_external(snap, _registry(device="8"), zero, START_S)["box_six_d_force"]["external_note"]
+    assert "没有生效的载荷模型" in bsd.live_external(snap, _registry(device="8"), zero, START_S)["box_six_d_force"]["external_note"]
 
     two = {
         "sensors": {

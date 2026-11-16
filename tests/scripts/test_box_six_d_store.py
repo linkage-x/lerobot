@@ -81,10 +81,15 @@ def test_the_gate_names_each_thing_it_refuses(over, words):
     assert any(words in r for r in found), found
 
 
-def test_the_gate_keeps_arm_boxes_unknown_boxes_and_history_for_a_maintainer():
+def test_the_gate_keeps_unknown_boxes_and_history_for_a_maintainer():
     kw = {"capture_started_unix": 1.791e9, "now_unix": 1.8e9}
+    # an arm BOX is not refused outright any more (11-16): it needs an FR3 lift run, not a hand-held capture
     (arm,) = store.self_service_refusals(_good_fit(), device_id=8, registry=_repo(), valid_from_unix=1.79e9, **kw)
-    assert "维护者" in arm
+    assert "FR3 托举采集" in arm
+    other = _repo()
+    other["devices"]["9"] = {"role": "fixture", "six_d_payload": []}
+    (role,) = store.self_service_refusals(_good_fit(), device_id=9, registry=other, valid_from_unix=1.79e9, **kw)
+    assert "维护者" in role
     (unknown,) = store.self_service_refusals(_good_fit(), device_id=9, registry=_repo(), valid_from_unix=1.79e9, **kw)
     assert "box_devices.json" in unknown
     newer = _repo()
@@ -215,3 +220,120 @@ def test_the_capture_says_when_a_face_was_held_again_for_the_drift_check():
 def test_the_k_from_a_station_record_matches_the_numpy_model():
     reg = store.merge(_repo(), [_register(_good_fit(), 1.79e9, now=1.7901e9)])
     np.testing.assert_allclose(bsd.payload_model(reg, 7, 1.8e9).K, np.asarray(K_NEW))
+
+
+# --- an arm BOX (11-16): from an FR3 lift run, pending until the arm zero re-checks it --------------
+
+
+def _arm_run(**over):
+    run = {"source": "fr3", "complete": True, "device_id": 8, "arm": "right", "arm_device_id": 8}
+    run.update(over)
+    return run
+
+
+def _arm_register(fit, valid_from, now, k=None):
+    record = store.payload_record(
+        fit if k is None else {**fit, "K": k}, end_effector="gripper + camera/SMR adaptor, SMR out, on the FR3 (right)",
+        valid_from_unix=valid_from, status="self-service", source="run",
+    )
+    return store.register_event("8", record, pending=store.VERIFIED_ROLES["fr3_gripper"], now_unix=now)
+
+
+def _verify(event, passed, at=1.795e9):
+    return store.verify_event(event["record"], "8", passed=passed, report="outputs/fr3_six_d_zero/r.json",
+                              detail="ok" if passed else "复核外力超出", now_unix=at)
+
+
+def test_an_arm_box_passes_the_gate_only_with_a_complete_run_of_the_box_its_arm_carries():
+    kw = {"device_id": 8, "registry": _repo(), "valid_from_unix": 1.79e9, "capture_started_unix": 1.791e9,
+          "now_unix": 1.8e9}
+    assert store.self_service_refusals(_good_fit(), arm_run=_arm_run(), **kw) == []
+    for over, words in (
+        ({"complete": False}, "没有跑完"),
+        ({"source": "mujoco"}, "不是真机"),
+        ({"device_id": 7}, "不是 8"),
+        ({"arm_device_id": 3100715645}, "fr3_arms.json"),
+        ({"arm_device_id": None}, "（没有）"),
+    ):
+        found = store.self_service_refusals(_good_fit(), arm_run=_arm_run(**over), **kw)
+        assert any(words in r for r in found), (over, found)
+    # the fit gate still applies: a cold BOX on the arm is refused like a cold hand-held one
+    cold = store.self_service_refusals(_good_fit(box_uptime_s={"start_s": 575.3}), arm_run=_arm_run(), **kw)
+    assert any("预热" in r for r in cold)
+    # and a hand-held BOX is not registered from an arm run
+    (hand,) = store.self_service_refusals(_good_fit(), **{**kw, "device_id": 7}, arm_run=_arm_run(device_id=7))
+    assert "手持" in hand
+
+
+def test_a_pending_arm_k_is_out_of_force_until_the_arm_zero_passes_it():
+    old = _arm_register(_good_fit(), 1.79e9, now=1.7901e9, k=K_OLD)
+    old_ok = _verify(old, True, at=1.7902e9)
+    refit = _arm_register(_good_fit(), 1.79e9, now=1.7903e9)  # a re-fit of the same mount
+    new_mount = _arm_register(_good_fit(), 1.793e9, now=1.7931e9)
+
+    reg = store.merge(_repo(), [old])
+    record, why = store.in_force(reg, 8, 1.795e9)
+    assert record is None and "waits for its check" in why
+    assert bsd.payload_model_or_reason(reg, 8, 1.795e9)[0] is None  # the export refuses meanwhile
+    assert store.candidate(reg, 8, 1.795e9)[0]["registered_unix"] == 1790100000  # the zero re-checks it
+
+    reg = store.merge(_repo(), [old, old_ok, refit])
+    # the verified fit stays in force while its re-fit waits; the zero re-checks the re-fit
+    assert store.in_force(reg, 8, 1.795e9)[0]["registered_unix"] == 1790100000
+    assert z.payload_k(reg, 8, 1.795e9)[1]["registered_unix"] == 1790300000
+    passed = store.merge(_repo(), [old, old_ok, refit, _verify(refit, True)])
+    assert store.in_force(passed, 8, 1.795e9)[0]["registered_unix"] == 1790300000
+    failed = store.merge(_repo(), [old, old_ok, refit, _verify(refit, False)])
+    assert store.in_force(failed, 8, 1.795e9)[0]["registered_unix"] == 1790100000
+    assert store.candidate(failed, 8, 1.795e9)[0]["registered_unix"] == 1790100000  # never re-checked again
+
+    # a new mount whose only K failed: nothing in force, no fall-back to the older mount
+    reg = store.merge(_repo(), [old, old_ok, new_mount, _verify(new_mount, False)])
+    record, why = store.in_force(reg, 8, 1.795e9)
+    assert record is None and "re-check failed" in why
+    # a decided record is not decided again
+    with pytest.raises(ValueError, match="not waiting"):
+        store.merge(_repo(), [old, old_ok, _verify(old, True)])
+    # a hand-held registration needs no check
+    assert "verification" not in _register(_good_fit(), 1.79e9, now=1.7901e9)["record"]
+
+
+def test_switching_back_copies_a_trusted_record_from_a_new_mount_time():
+    smr_out = _arm_register(_good_fit(), 1.79e9, now=1.7901e9, k=K_OLD)
+    smr_in = {**_arm_register(_good_fit(), 1.792e9, now=1.7921e9)}
+    smr_in["record"] = {**smr_in["record"], "end_effector": "gripper + camera/SMR adaptor + SMR, on the FR3 (right)"}
+    events = [smr_out, _verify(smr_out, True, at=1.7902e9), smr_in, _verify(smr_in, True, at=1.7922e9)]
+    reg = store.merge(_repo(), events)
+    assert [r["registered_unix"] for r in store.reusable(reg["devices"]["8"])] == [1790100000, 1792100000]
+
+    source, refusals = store.reuse_refusals(
+        reg, device_id=8, source_valid_from_unix=1790000000, source_registered_unix=1790100000,
+        valid_from_unix=1.794e9, now_unix=1.795e9,
+    )
+    assert refusals == [] and source["K"] == K_OLD
+    back = store.register_event(8, store.reuse_record(source, valid_from_unix=1.794e9, note="SMR off"), now_unix=1.795e9)
+    reg2 = store.merge(_repo(), [*events, back])
+    record = store.in_force(reg2, 8, 1.7955e9)[0]
+    assert record["K"] == K_OLD and record["reuses"]["registered_unix"] == 1790100000
+    assert "verification" not in record and "SMR off" in record["status"]
+    assert record["end_effector"] == smr_out["record"]["end_effector"]
+    # the records of 1.792e9 are untouched: data recorded with the SMR on keeps its K
+    assert store.in_force(reg2, 8, 1.793e9)[0]["registered_unix"] == 1792100000
+
+    def refused(**kw):
+        args = {"device_id": 8, "source_valid_from_unix": 1790000000, "source_registered_unix": 1790100000,
+                "valid_from_unix": 1.794e9, "now_unix": 1.795e9, **kw}
+        return store.reuse_refusals(reg, **args)[1]
+
+    assert any("早于" in r for r in refused(valid_from_unix=1.791e9))  # before the newest record
+    assert any("未来" in r for r in refused(valid_from_unix=1.9e9))
+    assert any("不能复用" in r for r in refused(source_registered_unix=123))
+    pending = store.merge(_repo(), [smr_out])  # never re-checked: not trusted
+    assert store.reusable(pending["devices"]["8"]) == []
+    assert any("维护者" in r for r in store.reuse_refusals(
+        {**_repo(), "devices": {**_repo()["devices"], "9": {"role": "fixture", "six_d_payload": []}}},
+        device_id=9, source_valid_from_unix=1, source_registered_unix=None, valid_from_unix=1.794e9, now_unix=1.795e9,
+    )[1])
+    # a repo record (a maintainer's) can be switched back to as well
+    assert store.reuse_refusals(_repo(), device_id=7, source_valid_from_unix=100, source_registered_unix=None,
+                                valid_from_unix=1.794e9, now_unix=1.795e9)[1] == []

@@ -10597,3 +10597,51 @@ def test_a_moved_cart_is_red_in_the_snapshot_and_its_edge_stops_routing(tmp_path
     assert base["blocking"] and base["currentEdge"] and "小车被推动过" in base["note"]
     assert base["episode"] == "ds_a/episodes/episode_000000"
     assert gateway.wp.live_edges(gateway.wp.read_world_graph(state.repo_root)) == []
+
+
+def test_switching_a_box_back_to_an_earlier_k_over_http(tmp_path):
+    """POST /api/calibration/six-d/switch-back: answered (no lock re-entry) and written to the station's log."""
+    import threading
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    from tools.thor.gmsl2 import box_six_d_store as store
+
+    state = _calibration_gateway_state(tmp_path)
+    reg = tmp_path / "tools" / "thor" / "box_devices.json"
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    k = [[0.0, 0.0, 0.0]] * 6
+    reg.write_text(json.dumps({"schema": store.SCHEMA, "devices": {"7": {"role": "handheld", "six_d_payload": [
+        {"valid_from_unix": 1.79e9, "valid_from": "a", "model": store.MODEL, "K": k, "end_effector": "gripper + rig"},
+        {"valid_from_unix": 1.791e9, "valid_from": "b", "model": store.MODEL, "K": k, "end_effector": "gripper"},
+    ]}}}))
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(body: dict) -> dict:
+        request = urllib.request.Request(
+            f"{base}/api/calibration/six-d/switch-back", data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return json.loads(exc.read())
+
+    try:
+        assert "选" in post({"deviceId": "7"})["error"]
+        out = post({"deviceId": "7", "sourceValidFromUnix": 1790000000, "validFromUnix": _time.time() - 5})
+        assert out["ok"], out.get("error")
+        box = next(b for b in out["boxes"] if b["deviceId"] == "7")
+        assert next(c for c in box["loads"] if c["inForce"])["endEffector"] == "gripper + rig"
+    finally:
+        server.shutdown()
+        server.server_close()
+    (event,) = store.read_events(tmp_path / store.LOCAL_SUBPATH)
+    assert event["record"]["reuses"]["valid_from_unix"] == 1790000000
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()

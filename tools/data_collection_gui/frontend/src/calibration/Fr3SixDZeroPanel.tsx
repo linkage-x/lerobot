@@ -153,6 +153,8 @@ export function Fr3SixDZeroPanel({
         转到指尖朝上（j7 不转，线缆走向不变）→ 静止后用 IMU 核对姿态 → 校零 → 回 start → 侧放两个朝向用已登记的 6D 拟合复核外力
         ≤0.5 N → 回 start。动态校零每 30 分钟一次；每天第一次选 origin（之后要给 BOX 重新上电，机械臂会停着等）。
         录制器要先 Connect：校零经录制器做，Disconnect 后要重做。
+        如果 6D 拟合页刚登记了这只 BOX 的新 K（待复核），这次的两个复核就用新 K：BOX 已预热、校零各项都过时，复核通过它就生效，复核没过它就作废；
+        BOX 没预热或校零没过时不做判定，新 K 继续待复核。
       </p>
 
       <ol className="cali-steps">

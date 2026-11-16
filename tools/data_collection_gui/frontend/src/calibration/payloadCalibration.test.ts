@@ -12,6 +12,8 @@ import {
   sixDDriftText,
   sixDFitNotes,
   sixDGateChecks,
+  sixDRecordState,
+  sixDRegisterKind,
   sixDVerdict,
   toLocalInput,
   zeroBlocker,
@@ -218,5 +220,33 @@ describe("the self-service gate preview", () => {
     expect(failed).toHaveLength(3);
     expect(sixDGateChecks({ ...good, uptimeStartS: null }).find((c) => c.label.startsWith("预热"))!.ok).toBe(false);
     expect(sixDGateChecks({ error: "attitudes" })[0].ok).toBe(false);
+  });
+});
+
+describe("an arm BOX's page registration and the load picker's records", () => {
+  it("registers a hand-held BOX from a capture and an arm BOX from its lift run, nothing else", () => {
+    expect(sixDRegisterKind("handheld", false).kind).toBe("handheld");
+    expect(sixDRegisterKind("fr3_gripper", true).kind).toBe("arm");
+    expect(sixDRegisterKind("fr3_gripper", false)).toEqual({ kind: "", why: "臂上 BOX 用 FR3 托举采集登记，不用手持采集" });
+    expect(sixDRegisterKind("handheld", true).kind).toBe("");
+    expect(sixDRegisterKind("fixture", false).why).toContain("维护者");
+    expect(sixDRegisterKind(undefined, false).why).toContain("box_devices.json");
+    // an older gateway that only lets hand-held BOXes through: the page does not offer the arm
+    expect(sixDRegisterKind("fr3_gripper", true, { roles: ["handheld"], heldoutN: 0.3, driftN: 0.3, warmupS: 1800 }).kind).toBe("");
+  });
+
+  it("says a pending K is not in force and a failed one is gone", () => {
+    const base = { validFromUnix: 1, validFrom: "x", endEffector: "e", fitted: true, status: "", heldoutWorstForceN: 0.09 };
+    expect(sixDRecordState({ ...base, check: "pending" })).toEqual({
+      text: "待复核（BOX 预热后做一次臂上校零）· 留一面 0.09 N",
+      tone: "warn",
+    });
+    expect(sixDRecordState({ ...base, check: "fail", checkDetail: "复核外力超出 ±0.5 N" }).text).toContain("已作废");
+    expect(sixDRecordState({ ...base, check: "pass", inForce: true })).toEqual({
+      text: "现在生效 · 臂上校零已复核 · 留一面 0.09 N",
+      tone: "ok",
+    });
+    expect(sixDRecordState({ ...base, reuses: 1, inForce: true }).text).toContain("换回的 K");
+    expect(sixDRecordState({ ...base, retired: { reason: "loose" } }).text).toBe("已撤销：loose");
   });
 });

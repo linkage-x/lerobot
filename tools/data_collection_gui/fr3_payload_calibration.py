@@ -58,6 +58,12 @@ TOOL_CONFIGS = (
     {"id": "gripper_cam_smr", "label": "夹爪 + 相机/SMR 支架 + SMR"},
 )
 TOOL_CONFIG_IDS = tuple(c["id"] for c in TOOL_CONFIGS)
+#: what an arm BOX's record says it carried (from the run's tool_config, never typed in)
+ARM_END_EFFECTORS = {
+    "gripper": "gripper only (no camera, no SMR mount)",
+    "gripper_cam": "gripper + camera/SMR adaptor, SMR out",
+    "gripper_cam_smr": "gripper + camera/SMR adaptor + SMR",
+}
 POSE_SETS = (
     {"id": "payload+six_d", "label": "负载 + 6D（45 个姿态，约 12 分钟）", "poses": 45},
     {"id": "payload", "label": "仅负载（32 个姿态，约 8 分钟）", "poses": 32},
@@ -191,6 +197,9 @@ def run_summary(path: Path) -> dict[str, Any] | None:
             {
                 "deviceId": six_d.get("device_id"),
                 "log": six_d.get("log"),
+                "endEffector": f"{ARM_END_EFFECTORS[config]}, on the FR3 ({run.get('arm') or run.get('robot_ip')})"
+                if config in ARM_END_EFFECTORS else "",
+                "startedUnix": _stamp_unix(path.name),
                 "fit": six_d_fit_summary(_read_json(fit_path)) if fit_path.is_file() else None,
             }
             if six_d
@@ -245,6 +254,43 @@ def capture_summary(directory: Path) -> dict[str, Any] | None:
     }
 
 
+def _record_key(r: dict[str, Any]) -> str:
+    reg = r.get("registered_unix")
+    return f"{int(r['valid_from_unix'])}" + ("" if reg is None else f"r{int(reg)}")
+
+
+def load_choices(reusable: list[dict[str, Any]], current: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The page's 当前负载 choices: per end-effector text, its newest trusted record (box_six_d_store.reusable).
+
+    The one in force now is marked; picking another registers a copy of it from the time given.
+    """
+    newest: dict[str, dict[str, Any]] = {}
+    for r in reusable:  # oldest first, so the newest of each end effector wins
+        newest[" ".join(str(r.get("end_effector") or "").split())] = r
+    out = []
+    for ee, r in newest.items():
+        source = r
+        if r.get("reuses"):  # a switch-back copy: offer it, but say where its K came from
+            source = next(
+                (q for q in reusable if int(q["valid_from_unix"]) == int(r["reuses"]["valid_from_unix"])), r
+            )
+        out.append(
+            {
+                "endEffector": ee,
+                "validFromUnix": r.get("valid_from_unix"),
+                "registeredUnix": r.get("registered_unix"),
+                "key": _record_key(r),
+                "fittedFrom": source.get("valid_from"),
+                "heldoutWorstForceN": (r.get("fit") or {}).get("heldout_worst_force_N"),
+                "store": r.get("store") or "repo",
+                "inForce": current is not None and (
+                    r is current or " ".join(str(current.get("end_effector") or "").split()) == ee
+                ),
+            }
+        )
+    return out
+
+
 def registry_summary(root: Path, now_unix: float | None = None) -> tuple[list[dict[str, Any]], str]:
     """Every BOX's payload records (repo + this station's log) and which is in force now; and an error."""
     now = time.time() if now_unix is None else now_unix
@@ -256,6 +302,7 @@ def registry_summary(root: Path, now_unix: float | None = None) -> tuple[list[di
     out = []
     for did, entry in (reg.get("devices") or {}).items():
         current, why = six_d_store.select(entry, now)
+        reusable = six_d_store.reusable(entry) if entry.get("role") in six_d_store.SELF_SERVICE_ROLES else []
         records = []
         for r in entry.get("six_d_payload") or []:
             fit = r.get("fit") or {}
@@ -273,6 +320,10 @@ def registry_summary(root: Path, now_unix: float | None = None) -> tuple[list[di
                     "registered": r.get("registered"),
                     "retired": {"reason": retired.get("reason"), "by": retired.get("by")} if retired else None,
                     "inForce": r is current,
+                    "check": six_d_store.check_state(r),
+                    "checkDetail": (r.get("verification") or {}).get("detail"),
+                    "reusable": any(r is q for q in reusable),
+                    "reuses": (r.get("reuses") or {}).get("valid_from_unix"),
                 }
             )
         out.append(
@@ -283,6 +334,8 @@ def registry_summary(root: Path, now_unix: float | None = None) -> tuple[list[di
                 "records": records,
                 "selfService": entry.get("role") in six_d_store.SELF_SERVICE_ROLES,
                 "notInForce": "" if current else why,
+                "current": _record_key(current) if current else None,
+                "loads": load_choices(reusable, current),
             }
         )
     return out, error
@@ -949,6 +1002,15 @@ class PayloadCalibration:
                     "mode": f"held by the FR3 ({run.get('arm') or run.get('robot_ip')}), {run.get('poses_set')} poses",
                     "tool_config": run.get("tool_config"),
                 }
+                config = str(run.get("tool_config") or "")
+                meta["end_effector"] = (
+                    f"{ARM_END_EFFECTORS[config]}, on the FR3 ({run.get('arm') or run.get('robot_ip')})"
+                    if config in ARM_END_EFFECTORS else ""
+                )
+                meta["arm_run"] = {
+                    "source": run.get("source"), "complete": run.get("complete"),
+                    "device_id": run["six_d"].get("device_id"), "arm": run.get("arm"),
+                }
                 return path.with_name(base + ".six_d.log"), path.with_name(base + ".six_d.fit.json"), meta
         return None
 
@@ -962,18 +1024,14 @@ class PayloadCalibration:
         return self.payload()
 
     def register(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Register a hand-held capture's fit in the station's log, if the self-service gate passes.
+        """Register a fit in the station's log, if the self-service gate passes.
 
         No maintainer signs it off: box_six_d_store.self_service_refusals does (fit quality, all six
-        faces, a warm BOX, a measured drift, a hand-held BOX, a mount time after the newest record).
-        It is in force at once for the export and the live wrench. An arm BOX's K (an FR3 lift run)
-        goes to the repo through a maintainer instead.
+        faces, a warm BOX, a measured drift, a mount time after the newest record; for an arm BOX a
+        complete FR3 lift run of the BOX fr3_arms.json puts on that arm). A hand-held capture's record
+        is in force at once; an arm BOX's waits for the next arm-held 6D zero to re-check it.
         """
         source = str(body.get("source") or "")
-        if source.startswith("run:"):
-            return self.refusal(
-                "FR3 托举的拟合是臂上 BOX 的 K：由维护者审过后提交到仓库（tools/thor/box_devices.json），页面不登记"
-            )
         src = self._six_d_source(source)
         if src is None or not src[1].is_file():
             return self.refusal("这份 6D 记录还没有拟合结果")
@@ -983,9 +1041,20 @@ class PayloadCalibration:
             return self.refusal("拟合结果读不了，重新拟合")
         if fit.get("error"):
             return self.refusal(f"拟合被拒：{fit['error']}")
-        end_effector = " ".join(str(body.get("endEffector") or meta.get("end_effector") or "").split())[:160]
-        if not end_effector:
-            return self.refusal("写明 6D 传感器这次带的是什么（末端配置）")
+        arm_run = meta.get("arm_run")
+        if arm_run is not None:  # from the run's tool_config: what was on the arm, not what someone types
+            end_effector = str(meta.get("end_effector") or "")
+            if not end_effector:
+                return self.refusal("这次托举采集没有记录末端配置（tool_config），不能登记")
+            try:
+                arm_run = {**arm_run, "arm_device_id": self.host.resolve_arm(str(arm_run.get("arm") or "")).get(
+                    "corenetic_device_id")}
+            except ValueError:
+                arm_run = {**arm_run, "arm_device_id": None}
+        else:
+            end_effector = " ".join(str(body.get("endEffector") or meta.get("end_effector") or "").split())[:160]
+            if not end_effector:
+                return self.refusal("写明 6D 传感器这次带的是什么（末端配置）")
         try:
             valid_from = float(body.get("validFromUnix"))
         except (TypeError, ValueError):
@@ -1004,33 +1073,102 @@ class PayloadCalibration:
         started = meta.get("started_unix")
         refusals = six_d_store.self_service_refusals(
             fit, device_id=device_id, registry=registry, valid_from_unix=valid_from,
-            capture_started_unix=None if started is None else float(started), now_unix=now,
+            capture_started_unix=None if started is None else float(started), now_unix=now, arm_run=arm_run,
         )
         if refusals:
             return {**self.refusal("不能登记：" + "；".join(refusals)), "refusals": refusals}
         note = " ".join(str(body.get("status") or "").split())[:300]
-        status = f"self-service from the calibration page (hand-held capture {fit_path.parent.name})" + (
-            f": {note}" if note else ""
+        what = (
+            f"FR3 lift run {source.partition(':')[2]}" if arm_run is not None
+            else f"hand-held capture {fit_path.parent.name}"
         )
+        status = f"self-service from the calibration page ({what})" + (f": {note}" if note else "")
         record = six_d_store.payload_record(
             fit, end_effector=end_effector, valid_from_unix=valid_from, status=status,
             source=f"{log.relative_to(self.root)} ({meta.get('mode')})",
         )
         record["fit"]["box_uptime_start_s"] = (fit.get("box_uptime_s") or {}).get("start_s")
         record["fit"]["drift_worst_force_N"] = (fit.get("drift_same_attitude") or {}).get("worst_force_N")
-        event = six_d_store.register_event(device_id, record, now_unix=now)
+        role = str(((registry.get("devices") or {}).get(str(device_id)) or {}).get("role") or "")
+        event = six_d_store.register_event(device_id, record, pending=six_d_store.VERIFIED_ROLES.get(role), now_unix=now)
         try:
             six_d_store.merge(registry, [event])  # the event must merge before it is written
             six_d_store.append_event(self.root / LOCAL_REGISTRY, event)
         except (OSError, ValueError) as exc:
             return self.refusal(f"写不进 6D 登记：{exc}")
-        cap = fit_path.parent / "capture.json"
-        data = _read_json(cap) or {}
-        data["registered"] = {"at_unix": round(now, 3), "valid_from_unix": int(valid_from)}
-        cap.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        if arm_run is None:
+            cap = fit_path.parent / "capture.json"
+            data = _read_json(cap) or {}
+            data["registered"] = {"at_unix": round(now, 3), "valid_from_unix": int(valid_from)}
+            cap.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        pending = "verification" in event["record"]
         self.host.log(
             "warn",
             f"BOX {device_id}: 6D payload registered from the calibration page (valid from {record['valid_from']}, "
-            f"held-out {fit.get('heldout_worst_force_N')} N) -> {LOCAL_REGISTRY}",
+            f"held-out {fit.get('heldout_worst_force_N')} N{', pending the arm-zero re-check' if pending else ''})"
+            f" -> {LOCAL_REGISTRY}",
+        )
+        return {**self.payload(), "registered": str(device_id)}
+
+    def _six_d_verified(self, record: dict[str, Any], device_id: int, verdict: dict[str, Any], report: Path) -> None:
+        """The arm zero (its own thread, no lock held) decided a pending K: append the verify event."""
+        event = six_d_store.verify_event(
+            record, device_id, passed=bool(verdict.get("pass")), report=str(report.relative_to(self.root)),
+            detail=str(verdict.get("detail") or ""),
+        )
+        try:
+            six_d_store.merge(six_d_store.load_merged(self.root), [event])
+            six_d_store.append_event(self.root / LOCAL_REGISTRY, event)
+        except (OSError, ValueError) as exc:
+            self.host.log("warn", f"BOX {device_id}: the arm zero's verdict on the new K was not written: {exc}")
+            return
+        self.host.log(
+            "warn" if not event["pass"] else "info",
+            f"BOX {device_id}: 6D payload of {record.get('valid_from')} "
+            f"{'verified by the arm zero, in force now' if event['pass'] else 'REJECTED by the arm zero'} -> {LOCAL_REGISTRY}",
+        )
+
+    def switch_back(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Register a copy of an earlier trusted record of a BOX from a new mount time (no new capture).
+
+        For a mount that comes and goes (the SMR on the arm's gripper): box_six_d_store.reuse_refusals
+        says which records qualify. The copy is in force at once; it already passed its check.
+        """
+        try:
+            device_id = int(str(body.get("deviceId") or ""))
+            source_vf = int(body.get("sourceValidFromUnix"))
+        except (TypeError, ValueError):
+            return self.refusal("选要换回的那条登记")
+        reg = body.get("sourceRegisteredUnix")
+        try:
+            source_reg = None if reg in (None, "") else int(reg)
+            valid_from = float(body.get("validFromUnix"))
+        except (TypeError, ValueError):
+            return self.refusal("填换回的时间（这次装上/取下的时间）")
+        if self.running():
+            return self.refusal("有任务在进行，等它结束")
+        try:
+            registry = six_d_store.load_merged(self.root)
+        except (OSError, ValueError) as exc:
+            return self.refusal(f"读不了 6D 登记：{exc}")
+        now = time.time()
+        source, refusals = six_d_store.reuse_refusals(
+            registry, device_id=device_id, source_valid_from_unix=source_vf, source_registered_unix=source_reg,
+            valid_from_unix=valid_from, now_unix=now,
+        )
+        if refusals or source is None:
+            return {**self.refusal("不能换回：" + "；".join(refusals)), "refusals": refusals}
+        note = " ".join(str(body.get("status") or "").split())[:300]
+        record = six_d_store.reuse_record(source, valid_from_unix=valid_from, note=note)
+        event = six_d_store.register_event(device_id, record, now_unix=now)
+        try:
+            six_d_store.merge(registry, [event])
+            six_d_store.append_event(self.root / LOCAL_REGISTRY, event)
+        except (OSError, ValueError) as exc:
+            return self.refusal(f"写不进 6D 登记：{exc}")
+        self.host.log(
+            "warn",
+            f"BOX {device_id}: 6D payload switched back to the record of {source.get('valid_from')} "
+            f"from {record['valid_from']} -> {LOCAL_REGISTRY}",
         )
         return {**self.payload(), "registered": str(device_id)}
