@@ -6,7 +6,24 @@ from pathlib import Path
 
 import pytest
 
-from tools.thor.gmsl2 import export_v3
+from tools.thor.gmsl2 import export_v3, qc_verdict
+
+
+@pytest.fixture(autouse=True)
+def _sessions_without_qc_meta_count_as_passed(monkeypatch):
+    """A session these tests built without meta/processing.json counts as QC-passed.
+
+    Most tests here are about something other than the QC gate. The ones about it write a real
+    processing.json (see ``_stamp_qc``), and those go through the real verdict.
+    """
+    real = qc_verdict.read_verdict
+
+    def read_verdict(session_dir):
+        if not (Path(session_dir) / qc_verdict.PROCESSING_META).is_file():
+            return qc_verdict.Verdict(Path(session_dir).name, qc_verdict.PASS, "QC pass (test fixture)")
+        return real(session_dir)
+
+    monkeypatch.setattr(export_v3.qcv, "read_verdict", read_verdict)
 
 
 # ------------------------------------------------------- discovery / order ---
@@ -263,6 +280,127 @@ def test_export_task_to_v3_can_write_to_distinct_output_name(tmp_path, monkeypat
     assert sources["base_name"] == "thor_gmsl2_11ch_v1_20260713_075106"
     assert sources["output_name"] == "thor_gmsl2_2ch_v1_20260713_075106"
     assert sources["repo_id"] == "local/thor_gmsl2_2ch_v1_20260713_075106"
+
+
+def _fake_video_export(monkeypatch) -> None:
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 1)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+
+
+def _stamp_qc(session: Path, status: str | None, *, excluded: dict[int, list[str]] | None = None, fingerprint=None):
+    """Write the processing.json the gateway's QC leaves (``status`` None: a trajectory, no QC yet)."""
+    qc = None
+    if status is not None:
+        qc = {
+            "status": status,
+            "summary": f"test {status}",
+            "excluded_episodes": [{"episode": ep, "checks": checks} for ep, checks in (excluded or {}).items()],
+            "data_fingerprint": qc_verdict.data_fingerprint(session) if fingerprint is None else fingerprint,
+        }
+    meta = session / "meta" / "processing.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps({"active_version": "v1", "versions": {"v1": {"qc": qc}}}), encoding="utf-8")
+
+
+def _export_task(datasets: Path, exports: Path, **kwargs):
+    return export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="t",
+        **kwargs,
+    )
+
+
+def test_export_leaves_out_the_episodes_qc_failed_and_records_why(tmp_path, monkeypatch):
+    datasets, exports = tmp_path / "datasets", tmp_path / "exports"
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0, 1, 2])
+    _stamp_qc(session, "partial", excluded={1: ["frame_continuity"]})
+    _fake_video_export(monkeypatch)
+
+    out = _export_task(datasets, exports)
+
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert [row["source_episode"] for row in sources["episodes"]] == ["episode_000000", "episode_000002"]
+    assert sources["excluded_episodes"] == [
+        {"session": session.name, "source_episode": "episode_000001", "reason": "QC: frame_continuity"}
+    ]
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["qc_gate"]["enforced"] is True
+    assert info["qc_gate"]["sessions"][session.name]["state"] == "partial"
+
+
+def test_a_task_export_takes_nothing_from_sessions_that_failed_or_never_ran_qc(tmp_path, monkeypatch):
+    datasets, exports = tmp_path / "datasets", tmp_path / "exports"
+    passed = _make_session(datasets, "pick_and_place_20260601_101046", [0])
+    failed = _make_session(datasets, "pick_and_place_20260601_101320", [0, 1])
+    unchecked = _make_session(datasets, "pick_and_place_20260601_101500", [0])
+    _stamp_qc(passed, "warn")  # warnings are not failures
+    _stamp_qc(failed, "fail")
+    _stamp_qc(unchecked, None)
+    _fake_video_export(monkeypatch)
+
+    out = _export_task(datasets, exports)
+
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert [row["session"] for row in sources["episodes"]] == [passed.name]
+    left_out = {(row["session"], row["source_episode"]): row["reason"] for row in sources["excluded_episodes"]}
+    assert set(left_out) == {
+        (failed.name, "episode_000000"),
+        (failed.name, "episode_000001"),
+        (unchecked.name, "episode_000000"),
+    }
+    assert left_out[(failed.name, "episode_000000")].startswith("QC fail")
+    assert "has not run" in left_out[(unchecked.name, "episode_000000")]
+
+
+def test_a_session_changed_after_its_qc_is_not_exported(tmp_path, monkeypatch):
+    datasets, exports = tmp_path / "datasets", tmp_path / "exports"
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0, 1, 2])
+    _stamp_qc(session, "partial", excluded={1: ["quat_norm"]})
+    # Episode Replay deleted episode 0: the others move down, so "1" now names another episode.
+    import shutil
+
+    shutil.rmtree(session / "episodes" / "episode_000000")
+    for old, new in ((1, 0), (2, 1)):
+        (session / "episodes" / f"episode_{old:06d}").rename(session / "episodes" / f"episode_{new:06d}")
+    _fake_video_export(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="No episode of 'pick_and_place' passed QC"):
+        _export_task(datasets, exports)
+    assert qc_verdict.read_verdict(session).state == qc_verdict.STALE
+
+
+def test_ignore_qc_exports_everything_and_the_dataset_says_so(tmp_path, monkeypatch):
+    datasets, exports = tmp_path / "datasets", tmp_path / "exports"
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0, 1])
+    _stamp_qc(session, "fail")
+    _fake_video_export(monkeypatch)
+
+    out = _export_task(datasets, exports, ignore_qc=True)
+
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert len(sources["episodes"]) == 2
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["qc_gate"]["enforced"] is False
+    assert info["qc_gate"]["sessions"][session.name]["state"] == "fail"
+
+
+def test_export_cli_takes_ignore_qc(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(export_v3, "export_task_to_v3", lambda **kwargs: seen.update(kwargs) or tmp_path)
+    args = ["--datasets-root", str(tmp_path), "--exports-root", str(tmp_path), "--base-name", "b",
+            "--repo-id", "local/b", "--task", "t"]
+    assert export_v3.main(args) == 0
+    assert seen["ignore_qc"] is False
+    assert export_v3.main([*args, "--ignore-qc"]) == 0
+    assert seen["ignore_qc"] is True
 
 
 def test_export_refuses_existing_output_without_overwrite(tmp_path):

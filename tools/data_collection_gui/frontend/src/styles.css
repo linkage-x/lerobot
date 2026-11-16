@@ -2033,6 +2033,16 @@ button.danger {
 
 .qc-diagnostic-row.qc-pass { border-left-color: #0f766e; }
 .qc-diagnostic-row.qc-warn { border-left-color: #d97706; }
+.qc-export-verdict {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid #d97706;
+  background: rgba(217, 119, 6, 0.06);
+}
+.qc-export-verdict.qc-export-pass { border-left-color: #0f766e; background: rgba(15, 118, 110, 0.06); }
+.qc-export-verdict.qc-export-fail { border-left-color: #b91c1c; background: rgba(185, 28, 28, 0.06); }
+.qc-export-verdict p { margin: 0; }
+.qc-export-verdict ul { margin: 6px 0 0; padding-left: 18px; }
 .qc-diagnostic-row.qc-fail { border-left-color: #b42318; }
 .qc-diagnostic-row span { font-size: 12px; text-transform: uppercase; }
 .qc-diagnostic-row p { grid-column: 1 / -1; margin: 0; }

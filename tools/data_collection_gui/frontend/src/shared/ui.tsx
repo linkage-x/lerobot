@@ -55,12 +55,24 @@ export function processingItemsForTask(task: CollectionTask, processing: Process
   return processing.filter((item) => datasetNamePrefixes(item.name).has(baseName));
 }
 
-export function taskNeedsQcExportConfirmation(task: CollectionTask, processing: ProcessingItem[]) {
+// Statuses whose episodes a training export takes: all of a "qc_pass" dataset, all but the
+// listed episodes of a "qc_partial" one. Anything else -- QC failed, not run, or run on data
+// that has changed since -- contributes nothing; the export decides this itself (export_v3).
+export const EXPORTABLE_PROCESSING_STATUSES: ProcessingStatus[] = ["qc_pass", "qc_partial"];
+
+export function isExportable(item: ProcessingItem): boolean {
+  return EXPORTABLE_PROCESSING_STATUSES.includes(item.status);
+}
+
+export function taskExportPlan(task: CollectionTask, processing: ProcessingItem[]) {
   const taskItems = processingItemsForTask(task, processing);
-  const notQcPassed = taskItems.filter((item) => item.status !== "qc_pass");
+  const included = taskItems.filter(isExportable);
+  const leftOut = taskItems.filter((item) => !isExportable(item));
+  const leftOutEpisodes = included.reduce((total, item) => total + (item.qcExcludedEpisodes?.length ?? 0), 0);
+  const includedEpisodes = included.reduce((total, item) => total + item.totalEpisodes, 0) - leftOutEpisodes;
   const processingEpisodes = taskItems.reduce((total, item) => total + item.totalEpisodes, 0);
   const missingEpisodeCount = Math.max(task.completedEpisodes - processingEpisodes, 0);
-  return { taskItems, notQcPassed, missingEpisodeCount };
+  return { taskItems, included, leftOut, includedEpisodes, leftOutEpisodes, missingEpisodeCount };
 }
 
 export function StatusDot({ state }: { state: string }) {
@@ -148,6 +160,8 @@ export const processingStatusLabel: Record<ProcessingStatus, string> = {
   running: "Running",
   pose_ready: "Pose ready",
   qc_pass: "QC pass",
+  qc_partial: "QC partial",
+  qc_stale: "QC out of date",
   qc_failed: "QC failed",
   error: "Error"
 };

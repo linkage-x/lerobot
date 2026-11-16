@@ -680,6 +680,8 @@ export type ProcessingStatus =
   | "running"
   | "pose_ready"
   | "qc_pass"
+  | "qc_partial"
+  | "qc_stale"
   | "qc_failed"
   | "error";
 
@@ -1040,7 +1042,12 @@ export type ProcessingItem = {
     status: "pass" | "warn" | "fail";
     message: string;
     details?: Record<string, unknown>;
+    episodes?: number[];
   }>;
+  // qc_partial: the episodes the export leaves out and the checks each failed.
+  qcExcludedEpisodes?: Array<{ episode: number; checks: string[] }>;
+  // What the export takes from this dataset (tools/thor/gmsl2/qc_verdict.py), and why.
+  qcVerdict?: { state: "pass" | "partial" | "fail" | "not_run" | "stale"; reason: string } | null;
   ikEvaluation?: {
     status: "pass" | "warn" | "fail" | "skipped";
     cubes: Array<{

@@ -20,6 +20,7 @@ import pytest
 import yaml
 
 from tools.data_collection_gui import gateway
+from tools.thor.gmsl2 import qc_verdict
 
 
 @pytest.fixture(autouse=True)
@@ -1308,7 +1309,8 @@ def test_qc_passes_when_every_episode_directory_has_rows(tmp_path):
 
 
 @pytest.mark.parametrize("extra_video_episode", [False, True])
-def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path, extra_video_episode):
+def test_qc_leaves_out_a_parquet_episode_that_has_no_video(tmp_path, extra_video_episode):
+    # Until 11-16 this failed the whole dataset; the check names the episode, so only it stays out.
     dataset_root = tmp_path / "gmsl2_v3"
     _write_minimal_episode_dataset(dataset_root, total_episodes=2)
     _episode_dir_with_videos(dataset_root, 0)
@@ -1319,9 +1321,36 @@ def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path, extra_video_epis
 
     check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
     assert check["status"] == "fail"
+    assert check["episodes"] == [1]
     assert "[1] have parquet rows but no video" in check["message"]
     assert "cannot align frames to rows" in check["message"]
+    assert qc["status"] == "partial"
+    assert qc["excluded_episodes"] == [{"episode": 1, "checks": ["episode_video_pairing"]}]
+    assert (qc["passed_episodes"], qc["total_episodes"]) == (1, 2)
+
+
+def test_qc_fails_the_dataset_when_no_episode_is_left(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    _episode_dir_with_videos(dataset_root, 5)  # video only, under another number
+
+    qc = gateway._run_qc(dataset_root)
+
     assert qc["status"] == "fail"
+    assert qc["passed_episodes"] == 0
+
+
+def test_qc_result_carries_the_fingerprint_of_the_data_it_judged(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    for episode in (0, 1):
+        _episode_dir_with_videos(dataset_root, episode)
+
+    qc = gateway._run_qc(dataset_root)
+    gateway._write_processing_meta_qc(dataset_root, qc)
+
+    assert qc["data_fingerprint"] == qc_verdict.data_fingerprint(dataset_root)
+    assert gateway._processing_item_from_dataset(dataset_root)["qcVerdict"]["state"] == qc_verdict.PASS
 
 
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
@@ -3489,7 +3518,9 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
     assert gateway._require_mujoco_validation(state) == dataset_root.resolve()
 
 
-def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
+def test_run_qc_reports_fr3_ik_without_failing_the_dataset_on_it(monkeypatch, tmp_path):
+    # Reachability belongs to an arm and where it stands, not to the recording (11-16): it is
+    # shown, and never keeps data out of training.
     dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
     monkeypatch.setattr(
@@ -3504,10 +3535,14 @@ def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
 
     qc = gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=Path(sys.executable))
 
-    assert qc["status"] == "fail"
+    assert qc["status"] == "warn"
+    assert qc["ik_evaluation"]["status"] == "fail"
     assert qc["ik_evaluation"]["cubes"][0]["cube"] == "left"
     ik_check = next(check for check in qc["checks"] if check["name"] == "fr3_ik_reachability")
-    assert ik_check["status"] == "fail"
+    assert ik_check["status"] == "warn"
+    assert "not part of the export decision" in ik_check["message"]
+    assert "episodes" not in ik_check
+    assert qc["excluded_episodes"] == []
 
 
 def test_run_qc_preserves_virtualenv_python_symlink(monkeypatch, tmp_path):
@@ -3968,6 +4003,8 @@ def test_export_command_builds_args_from_task(tmp_path):
         "datasetRepoId": "local/pick_and_place",
     }
 
+    _write_qc_pass_gmsl2_session(datasets_root / "pick_and_place_20260601_101046")
+
     command, out_root = gateway._export_command(state, task)
 
     assert out_root == state.exports_root / "pick_and_place"
@@ -3979,12 +4016,76 @@ def test_export_command_builds_args_from_task(tmp_path):
     # The frame is not an operator choice: the FR3 base whenever an edge reaches it.
     assert command[command.index("--target-world") + 1] == "auto"
     assert command[1].endswith("tools/thor/gmsl2/export_v3.py")
+    # export_v3 applies QC itself; the GUI has no way to export past it.
+    assert "--ignore-qc" not in command
+    assert "--exclude-episodes" not in command
+
+
+def test_task_export_refuses_when_no_session_passed_qc_and_says_why(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    failed = datasets_root / "pick_and_place_20260601_101046"
+    _write_qc_pass_gmsl2_session(failed)
+    _stamp_qc(failed, "fail")
+    unchecked = datasets_root / "pick_and_place_20260601_101320"
+    _write_qc_pass_gmsl2_session(unchecked)
+    (unchecked / "meta" / "processing.json").unlink()
+    task = {"id": "task-1", "name": "P", "datasetRepoId": "local/pick_and_place"}
+
+    with pytest.raises(ValueError, match="No session of pick_and_place has passed QC") as raised:
+        gateway._export_command(state, task)
+    assert "101046: QC fail" in str(raised.value)
+    assert "101320: QC has not run" in str(raised.value)
+
+
+def test_task_export_plan_lists_what_each_session_contributes(tmp_path):
+    _, datasets_root = _task_state(tmp_path)
+    partial = datasets_root / "pick_and_place_20260601_101046"
+    _write_qc_pass_gmsl2_session(partial)
+    _stamp_qc(partial, "partial", excluded_episodes=[{"episode": 0, "checks": ["quat_norm"]}])
+    stale = datasets_root / "pick_and_place_20260601_101320"
+    _write_qc_pass_gmsl2_session(stale)
+    (stale / "episodes" / "episode_000000" / "meta.json").write_text("{}", encoding="utf-8")
+
+    plan = gateway._task_export_plan(datasets_root, "pick_and_place")
+
+    assert [(row["name"], row["state"]) for row in plan["sessions"]] == [
+        (partial.name, qc_verdict.PARTIAL),
+        (stale.name, qc_verdict.STALE),
+    ]
+    assert plan["sessions"][0]["excludedEpisodes"] == [0]
+    assert plan["exportableSessions"] == 1
+
+
+def test_processing_status_follows_the_verdict_export_applies(tmp_path):
+    dataset_root = tmp_path / "pick_and_place_20260601_101046"
+    _write_qc_pass_gmsl2_session(dataset_root)
+
+    _stamp_qc(dataset_root, "warn")
+    assert gateway._processing_item_from_dataset(dataset_root)["status"] == "qc_pass"
+
+    _stamp_qc(dataset_root, "partial", excluded_episodes=[{"episode": 0, "checks": ["quat_norm"]}])
+    item = gateway._processing_item_from_dataset(dataset_root)
+    assert item["status"] == "qc_partial"
+    assert item["qcExcludedEpisodes"] == [{"episode": 0, "checks": ["quat_norm"]}]
+
+    (dataset_root / "episodes" / "episode_000001").mkdir()  # the data changed after QC
+    item = gateway._processing_item_from_dataset(dataset_root)
+    assert item["status"] == "qc_stale"
+    assert item["qcExcludedEpisodes"] == []
+    assert "run QC again" in item["message"]
 
 
 def test_export_command_rejects_task_without_repo_id(tmp_path):
     state, _ = _task_state(tmp_path)
     with pytest.raises(ValueError, match="dataset repo id"):
         gateway._export_command(state, {"id": "t", "name": "x", "datasetRepoId": ""})
+
+
+def _stamp_qc(dataset_root: Path, status: str = "pass", **extra) -> None:
+    """The processing.json QC leaves, bound to the dataset as it is now."""
+    qc = {"status": status, "summary": status, "data_fingerprint": qc_verdict.data_fingerprint(dataset_root), **extra}
+    gateway._write_processing_meta(dataset_root, {"active_version": "v1", "versions": {"v1": {"qc": qc}}})
 
 
 def _write_qc_pass_gmsl2_session(dataset_root: Path, cams: tuple[str, ...] = ()) -> None:
@@ -4008,13 +4109,7 @@ def _write_qc_pass_gmsl2_session(dataset_root: Path, cams: tuple[str, ...] = ())
             ),
             encoding="utf-8",
         )
-    gateway._write_processing_meta(
-        dataset_root,
-        {
-            "active_version": "v1",
-            "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
-        },
-    )
+    _stamp_qc(dataset_root)
 
 
 def test_approved_dataset_export_command_uses_actual_camera_count_for_output_name(tmp_path):
@@ -4064,13 +4159,7 @@ def test_start_approved_dataset_export_copies_qc_pass_lerobot_v3_dataset(tmp_pat
     state.exports_root = tmp_path / "repo" / "outputs" / "exports"
     dataset_root = datasets_root / "approved_v3"
     _write_minimal_episode_dataset(dataset_root, total_episodes=2)
-    gateway._write_processing_meta(
-        dataset_root,
-        {
-            "active_version": "v1",
-            "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
-        },
-    )
+    _stamp_qc(dataset_root)
 
     gateway._start_approved_dataset_export(state, str(dataset_root))
 
@@ -4090,6 +4179,7 @@ def test_start_approved_dataset_export_consolidates_raw_gmsl2_even_with_parquet(
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
     _write_qc_pass_gmsl2_session(dataset_root)
     (dataset_root / "episodes" / "episode_000000" / "cam_00.mkv").write_bytes(b"0" * 2048)
+    _stamp_qc(dataset_root)
 
     launched: dict[str, object] = {}
 
@@ -4137,8 +4227,30 @@ def test_start_approved_dataset_export_rejects_non_qc_pass_dataset(tmp_path):
     (episode / "meta.json").write_text("{}", encoding="utf-8")
     (episode / "cam_0.mkv").write_bytes(b"0" * 2048)
 
-    with pytest.raises(ValueError, match="pass QC"):
+    with pytest.raises(ValueError, match="cannot be exported: QC has not run"):
         gateway._start_approved_dataset_export(state, str(session))
+
+
+def test_start_approved_dataset_export_refuses_a_dataset_changed_since_its_qc(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    session = datasets_root / "pick_and_place_20260601_101046"
+    _write_qc_pass_gmsl2_session(session, cams=("cam_00",))
+    (session / "episodes" / "episode_000000" / "cam_00.mkv").write_bytes(b"1" * 4096)
+
+    with pytest.raises(ValueError, match="the data changed after QC"):
+        gateway._start_approved_dataset_export(state, str(session))
+
+
+def test_start_approved_dataset_export_refuses_to_copy_a_v3_dataset_qc_passed_in_part(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    dataset_root = datasets_root / "approved_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    _stamp_qc(dataset_root, "partial", excluded_episodes=[{"episode": 1, "checks": ["quat_norm"]}])
+
+    with pytest.raises(ValueError, match="plain copy that cannot leave episodes out"):
+        gateway._start_approved_dataset_export(state, str(dataset_root))
+    assert not (state.exports_root / "approved_v3").exists()
 
 
 def test_apply_export_output_tracks_progress_and_terminal_state(tmp_path):
@@ -10704,3 +10816,19 @@ def test_switching_a_box_back_to_an_earlier_k_over_http(tmp_path):
     assert event["record"]["reuses"]["valid_from_unix"] == 1790000000
     assert state.lock.acquire(timeout=1)
     state.lock.release()
+
+
+def test_deleting_an_episode_in_replay_leaves_the_qc_result_stale(tmp_path):
+    # Deleting renumbers the episodes after it: a QC result naming "episode 2" would name
+    # another episode. The export must not trust it until QC runs again.
+    state, datasets_root = _task_state(tmp_path)
+    dataset_root = datasets_root / "pick_and_place_20260601_101046"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=3)
+    _stamp_qc(dataset_root, "partial", excluded_episodes=[{"episode": 2, "checks": ["quat_norm"]}])
+    assert gateway._processing_item_from_dataset(dataset_root)["status"] == "qc_partial"
+    state.selected_replay_root = dataset_root
+
+    gateway._delete_replay_episode(state, "0")
+
+    assert qc_verdict.read_verdict(dataset_root).state == qc_verdict.STALE
+    assert gateway._processing_item_from_dataset(dataset_root)["status"] == "qc_stale"

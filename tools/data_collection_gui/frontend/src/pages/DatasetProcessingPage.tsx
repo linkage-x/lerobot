@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackingTarget } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskExportPlan } from "../shared/ui";
 
 export const processingStatusDot: Record<ProcessingStatus, string> = {
   pose_missing: "warning",
@@ -9,9 +9,46 @@ export const processingStatusDot: Record<ProcessingStatus, string> = {
   running: "running",
   pose_ready: "armed",
   qc_pass: "running",
+  qc_partial: "running",
+  qc_stale: "warning",
   qc_failed: "error",
   error: "error"
 };
+
+// What a training export takes from this dataset. Only episodes QC passed on the data as it is
+// now go in; the way out differs: bad data is re-recorded or deleted, a check that could not run
+// or ran on older data is run again.
+function QcExportVerdict({ item }: { item: ProcessingItem }) {
+  const verdict = item.qcVerdict;
+  if (!verdict) {
+    return null;
+  }
+  const excluded = item.qcExcludedEpisodes ?? [];
+  const text =
+    verdict.state === "pass"
+      ? "Export: every episode goes in."
+      : verdict.state === "partial"
+        ? `Export: ${Math.max(item.totalEpisodes - excluded.length, 0)} of ${item.totalEpisodes} episodes go in; the ones below stay out. Delete them in Episode Replay or re-record; nothing else is needed.`
+        : verdict.state === "stale"
+          ? `Export: nothing goes in until QC runs again. ${verdict.reason}.`
+          : verdict.state === "fail"
+            ? "Export: nothing goes in. QC failed a check that applies to the whole dataset; see the checks below."
+            : "Export: nothing goes in until QC has run.";
+  return (
+    <div className={`qc-export-verdict qc-export-${verdict.state}`}>
+      <p>{text}</p>
+      {verdict.state === "partial" && excluded.length ? (
+        <ul>
+          {excluded.map((row) => (
+            <li key={row.episode}>
+              episode {row.episode}: {row.checks.join(", ")}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
 
 export function ProcessingRow({
   item,
@@ -35,12 +72,12 @@ export function ProcessingRow({
       <button disabled={busy} onClick={onGenerate}>Generate EE Trajectory</button>
     ) : item.status === "queued" || item.status === "running" ? (
       <button disabled={busy} onClick={onSelect}>View Log</button>
-    ) : item.status === "qc_pass" ? (
+    ) : item.status === "qc_pass" || item.status === "qc_partial" ? (
       <button disabled={busy} onClick={onOpenReplay}>Open Replay</button>
     ) : item.status === "error" && !item.trajectoryVersion ? (
       // trajectory generation failed: no trajectory to QC, offer to regenerate instead
       <button disabled={busy} onClick={onGenerate}>Regenerate Trajectory</button>
-    ) : item.status === "qc_failed" || item.status === "error" ? (
+    ) : item.status === "qc_failed" || item.status === "qc_stale" || item.status === "error" ? (
       <button disabled={busy} onClick={onRunQc}>Re-run QC</button>
     ) : (
       <button disabled={busy} onClick={onRunQc}>Run QC</button>
@@ -209,7 +246,7 @@ export function DatasetProcessingPage({
   );
   const runningCount = items.filter((item) => item.status === "running" || item.status === "queued").length;
   const failedCount = items.filter((item) => item.status === "qc_failed" || item.status === "error").length;
-  const readyCount = items.filter((item) => item.status === "qc_pass").length;
+  const readyCount = items.filter((item) => item.status === "qc_pass" || item.status === "qc_partial").length;
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
   const latestMarkerTcpPath = snapshot.markerTcp?.solvePath ?? "";
@@ -433,18 +470,19 @@ export function DatasetProcessingPage({
               <button
                 disabled={
                   busy ||
-                  !["pose_ready", "qc_pass", "qc_failed", "error"].includes(selected.status) ||
+                  !["pose_ready", "qc_pass", "qc_partial", "qc_stale", "qc_failed", "error"].includes(selected.status) ||
                   // trajectory generation failed: nothing to QC until a trajectory exists
                   (selected.status === "error" && !selected.trajectoryVersion)
                 }
                 onClick={() => onRunQc(selected.path)}
               >
-                {selected.status === "qc_failed" || (selected.status === "error" && selected.trajectoryVersion)
+                {["qc_pass", "qc_partial", "qc_stale", "qc_failed"].includes(selected.status) ||
+                (selected.status === "error" && selected.trajectoryVersion)
                   ? "Re-run QC"
                   : "Run QC"}
               </button>
               <button
-                disabled={busy || !["pose_ready", "qc_pass"].includes(selected.status)}
+                disabled={busy || !["pose_ready", "qc_pass", "qc_partial", "qc_stale"].includes(selected.status)}
                 onClick={() => onOpenReplay(selected.path)}
               >
                 Open Replay
@@ -454,6 +492,7 @@ export function DatasetProcessingPage({
             <div className="qc-block">
               <h3>QC summary</h3>
               <p>{selected.qcSummary}</p>
+              <QcExportVerdict item={selected} />
               {selected.qcChecks?.length ? (
                 <div className="qc-diagnostic-list">
                   {selected.qcChecks.map((check, index) => (

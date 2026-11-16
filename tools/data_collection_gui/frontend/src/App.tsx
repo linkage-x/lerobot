@@ -4,7 +4,7 @@ import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
-import { StatusDot, Metric, stateLabel, processingStatusLabel, taskNeedsQcExportConfirmation, userGuideUrl } from "./shared/ui";
+import { StatusDot, Metric, stateLabel, processingStatusLabel, taskExportPlan, userGuideUrl } from "./shared/ui";
 import { CalibrationPage } from "./calibration/CalibrationPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { historyRepo, deviceBoxId } from "./calibration/adapters";
@@ -213,23 +213,31 @@ function App() {
       run(() => api.exportTask(taskId));
       return;
     }
-    const { notQcPassed, missingEpisodeCount } = taskNeedsQcExportConfirmation(task, snapshot.processing);
-    if (missingEpisodeCount > 0 || notQcPassed.length > 0) {
-      const statusLines = notQcPassed
-        .slice(0, 4)
-        .map((item) => `${item.name}: ${processingStatusLabel[item.status]}`);
-      const moreCount = Math.max(notQcPassed.length - 4, 0);
-      const confirmLines = [
-        `Task "${task.name}" has dataset sessions that are not QC-passed.`,
+    // Only what QC passed on the current data goes in; nothing here can add the rest. The
+    // operator sees what the export will take and leave before it starts.
+    const plan = taskExportPlan(task, snapshot.processing);
+    if (plan.leftOut.length > 0 || plan.leftOutEpisodes > 0 || plan.missingEpisodeCount > 0) {
+      const leftOutLines = plan.leftOut
+        .slice(0, 6)
+        .map((item) => `  ${item.name}: ${processingStatusLabel[item.status]}`);
+      const moreCount = Math.max(plan.leftOut.length - 6, 0);
+      const lines = [
+        `Export "${task.name}": ${plan.includedEpisodes} episode(s) from ${plan.included.length} session(s).`,
+        plan.leftOutEpisodes > 0 ? `${plan.leftOutEpisodes} episode(s) QC failed in those sessions stay out.` : "",
+        plan.leftOut.length > 0 ? `Not exported (QC failed, not run, or out of date):` : "",
+        ...leftOutLines,
+        moreCount > 0 ? `  ...and ${moreCount} more` : "",
+        plan.missingEpisodeCount > 0 ? `${plan.missingEpisodeCount} recorded episode(s) have no dataset here.` : "",
         "",
-        missingEpisodeCount > 0 ? `${missingEpisodeCount} recorded episode(s) have no QC record.` : "",
-        ...statusLines,
-        moreCount > 0 ? `...and ${moreCount} more` : "",
-        "",
-        "Continue exporting LeRobot v3?"
+        plan.included.length > 0
+          ? "To include a left-out session, run QC on it in Dataset Processing first. Export the rest now?"
+          : "No session has passed QC on its current data; run QC in Dataset Processing first."
       ].filter((line) => line !== "");
-      const ok = window.confirm(confirmLines.join("\n"));
-      if (!ok) {
+      if (plan.included.length === 0) {
+        window.alert(lines.join("\n"));
+        return;
+      }
+      if (!window.confirm(lines.join("\n"))) {
         return;
       }
     }
