@@ -24,8 +24,15 @@ from tools.data_collection_gui import gateway
 
 @pytest.fixture(autouse=True)
 def _repo_arm_registry(monkeypatch):
-    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2)."""
-    registry = gateway.fr3_arms.load()
+    """Tests run on a tmp repo; the arms are the repo's own tools/fr3/fr3_arms.json (roadmap B2).
+
+    A station release ships without that file (no arms); tests that need arms then fail on
+    their own instead of every test erroring in this fixture.
+    """
+    try:
+        registry = gateway.fr3_arms.load()
+    except FileNotFoundError:
+        registry = {"schema": "fr3_arms/v1", "arms": {}}
     monkeypatch.setattr(gateway.fr3_arms, "load", lambda path=None, repo_root=None: registry)
 
 
@@ -10492,6 +10499,16 @@ def test_snapshot_reports_what_deploy_wrote(tmp_path):
     release = gateway._snapshot(state)["deployment"]["release"]
     assert release["commit"] == "abc123" and release["onBox"] is True
     assert gateway._snapshot(state)["deployment"]["sandbox"] is None
+    # Older deploys wrote no target; the GUI then shows none rather than guessing a machine.
+    assert release["target"] is None and release["station"] is None
+
+
+def test_snapshot_reports_which_machine_deploy_targeted(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    state.devices = []
+    (tmp_path / "DEPLOYED.json").write_text(json.dumps({"commit": "abc123", "target": "thor2", "station": "station2"}))
+    release = gateway._snapshot(state)["deployment"]["release"]
+    assert release["target"] == "thor2" and release["station"] == "station2"
 
 
 def _cart_repo(tmp_path: Path) -> gateway.GatewayState:

@@ -1,0 +1,15 @@
+{
+  "station": "station2",
+  "user": "nvidia",
+  "address": "192.168.111.123",
+  "hostname": "upai-thor2",
+  "repo_dir": "/home/nvidia/lerobot",
+  "profile": "thor",
+  "config": "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml",
+  "gateway_port": 8765,
+  "sandboxes": true,
+  "calibration_in_tree": false,
+  "box_net_addr": null,
+  "aliases": [],
+  "note": "Second Thor, an independent station (own cameras and BOXes). Shipped as a clone of thor1's image (hostname upai-pro03, renamed 2026-11-11). Not calibrated: the world/camera-identity files in this tree describe thor1's cameras. config is thor1's until thor2 has its own camera config."
+}

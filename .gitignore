@@ -191,3 +191,6 @@ tools/thor/gmsl2/records
 tools/thor/gmsl2/captures
 dataset_test/
 *.zip
+
+# Personal deploy-target overrides (how you reach a machine; see run/targets/README.md)
+run/targets.local.json

@@ -12,8 +12,7 @@ cd ~/lerobot && ./tools/thor/gmsl2/recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G
 然后在开发主机（通常是 x86 架构 host）的 lerobot 仓库根目录执行：
 
 ```bash
-bash run/deploy.sh       # 默认 target=thor
-bash run/deploy.sh thor  # 显式写法
+bash run/deploy.sh thor1  # 必须写明目标（thor = thor1）；python3 run/targets.py list 列出全部机器
 ```
 
 脚本先通过 rsync 增量替换 Thor 上的代码，成功后再重启 gateway，最后在 host

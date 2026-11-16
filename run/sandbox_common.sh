@@ -2,11 +2,13 @@
 #
 # Personal sandboxes: one directory per person on Thor, each with its own gateway port, so a
 # branch can be tried on the real machine and the real data without touching production
-# (/home/nvidia/lerobot, port 8765, which the students' GUI and every recording use).
+# (the target's repo_dir, port 8765, which the students' GUI and every recording use).
+# Every Thor target (run/targets/*.json with "sandboxes": true) has its own sandboxes; production
+# there is the target's repo_dir.
 
-THOR_REMOTE="nvidia@192.168.111.122"
-THOR_HOST="192.168.111.122"
-THOR_PRODUCTION_DIR="/home/nvidia/lerobot"
+# shellcheck source=run/targets_common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/targets_common.sh"
+
 THOR_SANDBOX_BASE="/home/nvidia/sandboxes"
 SANDBOX_PORT_MIN=8770
 SANDBOX_PORT_MAX=8799
@@ -40,9 +42,9 @@ deployed_release_json() {
   branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then dirty=true; else dirty=false; fi
   who="$(git -C "$repo" config user.name 2>/dev/null || true) ($(id -un)@$(hostname))"
-  python3 - "$commit" "$branch" "$dirty" "$who" "$sandbox" "$on_box" "$maintainer" <<'PY'
+  python3 - "$commit" "$branch" "$dirty" "$who" "$sandbox" "$on_box" "$maintainer" "${TARGET_NAME:-}" "${TARGET_STATION:-}" <<'PY'
 import json, sys, datetime
-commit, branch, dirty, who, sandbox, on_box, maintainer = sys.argv[1:]
+commit, branch, dirty, who, sandbox, on_box, maintainer, target, station = sys.argv[1:]
 flag = {"true": True, "false": False}
 print(json.dumps({
     "commit": commit,
@@ -51,6 +53,8 @@ print(json.dumps({
     "onBox": flag.get(on_box),
     "maintainerOverride": flag[maintainer],
     "sandbox": sandbox or None,
+    "target": target or None,
+    "station": station or None,
     "by": who.strip(),
     "deployedUtc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }, ensure_ascii=False, indent=2))

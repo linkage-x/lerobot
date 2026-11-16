@@ -20555,7 +20555,9 @@ def _deployed_release(repo_root: Path) -> dict[str, Any] | None:
             raw = None
         release = None
         if isinstance(raw, dict):
-            release = {k: raw.get(k) for k in ("commit", "branch", "deployedUtc", "by", "onBox", "sandbox")}
+            release = {
+                k: raw.get(k) for k in ("commit", "branch", "deployedUtc", "by", "onBox", "sandbox", "target", "station")
+            }
         cached = (key, release)
         _DEPLOYED_RELEASE_CACHE[str(path)] = cached
     return cached[1]
