@@ -71,10 +71,15 @@ bash run/sandbox.sh thor list                           # everyone's sandboxes a
 - Never weaken or bypass a gate: MuJoCo / IK QC approval before real replay, the world-graph guard
   (`outputs/world_graph_guard.json`, the red banner), the cart check (`outputs/cart_check.json`: an edge whose
   cart moved is not routed), label provenance (`--allow-mixed-labels`), the production deploy guard, the sandbox
-  hardware guard. If a gate blocks you, report why; do not "fix" the gate.
+  hardware guard, the 6D self-service gate (`box_six_d_store.self_service_refusals`: what a hand-held BOX's K must
+  pass to be registered without a maintainer). If a gate blocks you, report why; do not "fix" the gate.
 - Do not change calibration or registration data without a maintainer: `tools/thor/gmsl2/world/*.json`
   (`world_graph.json`, `world_reference.json`, `table_datum.json`, `cart_reference.json`), calibration runs under `outputs/calibration`,
-  `tools/thor/gmsl2/box_time_delays.json`, marker→TCP bundles, URDF/MJCF tool frames, `fr3_arms.json`.
+  `tools/thor/gmsl2/box_time_delays.json`, marker→TCP bundles, URDF/MJCF tool frames, `fr3_arms.json`, BOX payload models
+  (`tools/thor/box_devices.json`, `outputs/calibration/box_six_d/registry.jsonl`).
+  One exception, for people, not agents: an operator registers a **hand-held** BOX's 6D payload model (K) from the
+  calibration page, and the page's automatic gate (`box_six_d_store.self_service_refusals`) stands in for the maintainer.
+  Agents never write that log or the registry file themselves, never retire a record, and never register a fit for anyone.
 - Never delete or rewrite datasets in production. In your sandbox, only your copies.
 
 ## 5. Code rules that already cost us days

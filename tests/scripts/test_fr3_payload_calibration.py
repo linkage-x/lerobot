@@ -96,47 +96,120 @@ def test_unknown_configs_and_pose_sets_are_refused(tmp_path):
     assert "范围" in cal.check({"arm": "right", "poses": "six_d", "tableEdgeM": 3})["error"]
 
 
-def _faces_log(path: Path, faces=("x+", "x-", "y+", "y-", "z+", "z-")) -> None:
+def _faces_log(path: Path, faces=("x+", "x-", "y+", "y-", "z+", "z-"), *, timed=False, uptime_s=3600.0) -> None:
+    """A free-air capture. ``timed``: host and BOX clocks, each face held still, and the first face
+    held again a minute later (what the drift check of the self-service gate needs)."""
     rng = np.random.default_rng(0)
     k = np.vstack([-0.8 * 9.80665 * np.eye(3), 0.05 * rng.standard_normal((3, 3))])
     rows = []
-    for face in faces:
+    t = 1.8e9
+    order = list(faces) + ([faces[0]] if timed else [])
+    tilts: dict[str, np.ndarray] = {}
+    for i, face in enumerate(order):
         axis, sign = "xyz".index(face[0]), 1.0 if face[1] == "+" else -1.0
+        tilt = tilts.setdefault(face, rng.normal(0, 0.08, 3))  # the revisit holds the same attitude
+        if timed and i == len(order) - 1:
+            t += 60.0
         for _ in range(40):
-            v = rng.normal(0, 0.08, 3)
+            v = (tilt if timed else rng.normal(0, 0.08, 3)) + (rng.normal(0, 0.002, 3) if timed else 0.0)
+            v = np.array(v, dtype=float)
             v[axis] = sign
             v /= np.linalg.norm(v)
-            rows.append({"t": 0, "k": "box_six_d_force", "f": list(k @ v), "acc": list(v), "gyr": [0, 0, 0]})
+            row = {"t": 0, "k": "box_six_d_force", "f": list(k @ v), "acc": list(v), "gyr": [0, 0, 0]}
+            if timed:
+                t += 0.05
+                row.update(t=round(t, 3), ts=int((uptime_s + t - 1.8e9) * 1e6))
+            rows.append(row)
+        t += 5.0
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
 
-def test_a_capture_is_fitted_and_registered_with_its_mount_time(tmp_path):
+def _capture(tmp_path: Path, name="20261109_100000_box3906437858", device=3906437858, role="handheld", **log):
+    reg = tmp_path / pc.REGISTRY
+    if not reg.is_file():
+        reg.parent.mkdir(parents=True, exist_ok=True)
+        reg.write_text(json.dumps({"schema": "box_devices/v1", "devices": {
+            "3906437858": {"role": "handheld", "hand": "right", "six_d_payload": []},
+            "3100715645": {"role": "fr3_gripper", "six_d_payload": []},
+        }}))
+    d = tmp_path / pc.CAPTURE_SUBDIR / name
+    d.mkdir(parents=True)
+    (d / "capture.json").write_text(json.dumps({"device_id": device, "end_effector": "", "started_unix": 1.8e9}))
+    _faces_log(d / "free_air.log", **log)
+    return f"capture:{name}"
+
+
+def _calibration(tmp_path: Path) -> pc.PayloadCalibration:
     cal = pc.PayloadCalibration(_host(tmp_path))
     cal._tool = lambda script, *args: [sys.executable, str(REPO / script), *args]  # type: ignore[method-assign]
-    reg = tmp_path / pc.REGISTRY
-    reg.parent.mkdir(parents=True)
-    reg.write_text(json.dumps({"schema": "box_devices/v1", "devices": {"3906437858": {"role": "handheld", "hand": "right", "six_d_payload": []}}}))
-    d = tmp_path / pc.CAPTURE_SUBDIR / "20261109_100000_box3906437858"
-    d.mkdir(parents=True)
-    (d / "capture.json").write_text(json.dumps({"device_id": 3906437858, "end_effector": "", "started_unix": 1.8e9}))
-    _faces_log(d / "free_air.log")
-    payload = cal.refit({"source": "capture:20261109_100000_box3906437858"})
-    cap = payload["captures"][0]
-    assert cap["fit"]["meetsTarget"] and cap["fit"]["missingAttitudes"] == []
+    return cal
 
-    src = "capture:20261109_100000_box3906437858"
+
+def test_a_hand_held_capture_that_passes_the_gate_is_registered_at_the_station(tmp_path):
+    cal = _calibration(tmp_path)
+    src = _capture(tmp_path, timed=True)
+    cap = cal.refit({"source": src})["captures"][0]
+    assert cap["fit"]["meetsTarget"] and cap["fit"]["missingAttitudes"] == [] and cap["fit"]["drift"]["pairs"] >= 1
+
     assert "末端配置" in cal.register({"source": src, "validFromUnix": 1.79e9})["error"]
     assert "装上时间" in cal.register({"source": src, "endEffector": "gripper + rig v9b"})["error"]
+    repo_before = (tmp_path / pc.REGISTRY).read_text()
     out = cal.register({"source": src, "endEffector": "gripper + rig v9b", "validFromUnix": 1.7935e9})
-    assert out["ok"], out.get("output")
+    assert out["ok"], out["error"]
+    # the station's log, not the repo file (a deploy would overwrite that)
+    assert (tmp_path / pc.REGISTRY).read_text() == repo_before
+    events = [json.loads(line) for line in (tmp_path / pc.LOCAL_REGISTRY).read_text().splitlines()]
+    assert [e["event"] for e in events] == ["register"] and events[0]["record"]["registered_unix"]
     box = next(b for b in out["boxes"] if b["deviceId"] == "3906437858")
-    assert box["records"][0]["endEffector"] == "gripper + rig v9b" and box["records"][0]["fitted"]
+    rec = box["records"][0]
+    assert rec["endEffector"] == "gripper + rig v9b" and rec["store"] == "local" and rec["inForce"]
     assert out["captures"][0]["registered"]["valid_from_unix"] == 1793500000
 
 
+def test_the_gate_refuses_a_capture_without_warm_up_or_drift_check(tmp_path):
+    cal = _calibration(tmp_path)
+    src = _capture(tmp_path)  # untimed: no BOX clock, each face once
+    cap = cal.refit({"source": src})["captures"][0]
+    assert cap["fit"]["meetsTarget"]  # a good fit by itself ...
+    out = cal.register({"source": src, "endEffector": "gripper + rig v9b", "validFromUnix": 1.7935e9})
+    # ... but the gate cannot tell the BOX was warm or did not drift
+    assert not out["ok"] and any("上电时长" in r for r in out["refusals"]) and any("漂移" in r for r in out["refusals"])
+    assert not (tmp_path / pc.LOCAL_REGISTRY).exists()
+
+    cold = _capture(tmp_path, name="20261109_110000_box3906437858", timed=True, uptime_s=600.0)
+    cal.refit({"source": cold})
+    out = cal.register({"source": cold, "endEffector": "x", "validFromUnix": 1.7935e9})
+    assert not out["ok"] and any("预热" in r for r in out["refusals"])
+
+
+def test_an_arm_box_is_not_registered_from_the_page(tmp_path):
+    cal = _calibration(tmp_path)
+    src = _capture(tmp_path, name="20261109_100000_box3100715645", device=3100715645, timed=True)
+    cal.refit({"source": src})
+    out = cal.register({"source": src, "endEffector": "gripper on the FR3", "validFromUnix": 1.7935e9})
+    assert not out["ok"] and "维护者" in out["error"]
+    assert "维护者" in cal.register({"source": "run:20261109_100000_fr3_right.json"})["error"]
+
+
+def test_a_re_fit_of_the_same_mount_replaces_the_old_one_but_history_stays_with_the_maintainer(tmp_path):
+    cal = _calibration(tmp_path)
+    first = _capture(tmp_path, timed=True)
+    cal.refit({"source": first})
+    assert cal.register({"source": first, "endEffector": "a", "validFromUnix": 1.7935e9})["ok"]
+    again = _capture(tmp_path, name="20261109_120000_box3906437858", timed=True)
+    cal.refit({"source": again})
+    # before the newest record: rewriting history is a maintainer's job
+    early = cal.register({"source": again, "endEffector": "a", "validFromUnix": 1.7930e9})
+    assert not early["ok"] and any("最新的登记" in r for r in early["refusals"])
+    time.sleep(1.01)  # registered_unix is in whole seconds
+    out = cal.register({"source": again, "endEffector": "a", "validFromUnix": 1.7935e9})
+    assert out["ok"], out["error"]
+    records = next(b for b in out["boxes"] if b["deviceId"] == "3906437858")["records"]
+    assert len(records) == 2 and [r["inForce"] for r in records] == [False, True]
+
+
 def test_a_fit_with_missing_faces_is_shown_as_refused(tmp_path):
-    cal = pc.PayloadCalibration(_host(tmp_path))
-    cal._tool = lambda script, *args: [sys.executable, str(REPO / script), *args]  # type: ignore[method-assign]
+    cal = _calibration(tmp_path)
     d = tmp_path / pc.CAPTURE_SUBDIR / "20261109_100000_box7"
     d.mkdir(parents=True)
     (d / "capture.json").write_text(json.dumps({"device_id": 7}))

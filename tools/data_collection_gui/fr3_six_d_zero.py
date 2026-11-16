@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from tools.thor.gmsl2 import box_six_d_store as store
+
 if TYPE_CHECKING:
     from tools.data_collection_gui.fr3_payload_calibration import PayloadCalibration
 
@@ -133,16 +135,11 @@ def dynamic_check(f: list[float]) -> bool:
 
 
 def payload_k(registry: dict[str, Any], device_id: int, at_unix: float) -> tuple[list[list[float]] | None, dict]:
-    """box_six_d.payload_model's choice: the latest record not after ``at_unix``, if it has a K."""
-    entry = (registry.get("devices") or {}).get(str(int(device_id))) or {}
-    eligible = [p for p in entry.get("six_d_payload") or [] if float(p.get("valid_from_unix") or 0) <= at_unix]
-    if not eligible:
+    """box_six_d.payload_model's choice (box_six_d_store.select): the record in force at ``at_unix``, if it has a K."""
+    record, _why = store.in_force(registry, device_id, at_unix)
+    if record is None:
         return None, {}
-    p = max(eligible, key=lambda p: float(p["valid_from_unix"]))
-    k = p.get("K")
-    if p.get("model") != "affine_acc/v1" or not k or len(k) != 6 or any(len(row) != 3 for row in k):
-        return None, p
-    return [[float(v) for v in row] for row in k], p
+    return [[float(v) for v in row] for row in record["K"]], record
 
 
 def external(f, acc, f0, acc0, k) -> list[float]:

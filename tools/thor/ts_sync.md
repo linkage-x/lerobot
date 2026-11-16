@@ -676,8 +676,8 @@ checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要�
     external = f − K·acc − b
 
 - `f` = `box_six_d_force.*`，`acc` = `box_imu.acc_*_g`，都已在录制时插值到同一帧网格（§6）。
-- `K`（6×3）= 这台 BOX 在 episode 开始时生效的载荷模型，来自 `tools/thor/box_devices.json`（`box_six_d fit/register`，
-  空中六面转一遍拟合）。**没有 K 的 BOX，整个导出拒绝**。
+- `K`（6×3）= 这台 BOX 在 episode 开始时生效的载荷模型（空中六面转一遍拟合），来自仓库的 `tools/thor/box_devices.json`
+  加上本站自己的登记 `outputs/calibration/box_six_d/registry.jsonl`（见下面「谁登记 K」）。**没有 K 的 BOX，整个导出拒绝**。
 - `b` = 这一段**开头和结尾各 2 s** 里、静止（|gyr|<15°/s、|acc|≈1 g）且扳机松开（<5 %）的帧上 `f − K·acc` 的中位数，
   至少 30 帧。凑不够时退回本次 Connect 的软件零点（`b = f0 − K·acc0`，meta `box_six_d_zero`）；两个都没有，
   这一段**跳过并警告**（其他段照常导出）。两者都有时记下差值，超过 2 N 报警（多半是静止时碰到了东西）。
@@ -691,8 +691,17 @@ checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要�
 这就同时验了 K 和零点。不再显示 SDK 的 no_gravity。
 
 **记在哪**：`meta/export_sources.json` 每段的 `six_d`（BOX、K 的 `valid_from`、偏置来源和数值、静止帧数、与零点的差）；
-`info.json` 的 `label_provenance.key.six_d_payload`（每台 BOX 用的是哪条 K，`box<id>@<valid_from>`）。不同 K 的会话
+`info.json` 的 `label_provenance.key.six_d_payload`（每台 BOX 用的是哪条 K，`box<id>@<valid_from>`，本站记录再加 `r<registered_unix>`）。不同 K 的会话
 **不能同批导出**（标签链防混用，`--allow-mixed-labels` 才放行并记录），换了 K 的导出也不能和旧导出合起来训练。
+
+**谁登记 K（11-16 起）**：手持 BOX 的 K 由操作员在标定页自己登记，不经维护者，靠自动门槛
+（`box_six_d_store.self_service_refusals`）：留一面 ≤ 0.3 N、六面齐、采集开始时 BOX 上电 ≥ 30 min、同一朝向隔 30 s 以上复查过且漂移
+≤ 0.3 N（**测不出漂移算不通过**：每面只停一次的采集 `drift.pairs = 0`，那是"不知道"不是"没漂"）、BOX 角色是 handheld、装上时间不早于
+它现有最新的一条。记录追加到本站日志 `outputs/calibration/box_six_d/registry.jsonl`（`outputs/` 不随 deploy 同步，所以不会被冲掉；每台
+Thor 各有各的），导出和实时外力立刻读到。选哪条：装上时间 ≤ episode 开始的最新一组里，最后登记且未撤销的那条；同一装上时间重新登记
+就是重拟合，接管之后所有导出。撤销（`python -m tools.thor.gmsl2.box_six_d_store retire …`）只有维护者做；一组全撤销后**拒绝导出**，
+不会退回更早配置的 K。臂上 BOX 的 K（FR3 托举）仍由维护者审过后提交到仓库。本站记录的标签是 `box<id>@<valid_from>r<registered_unix>`，
+两次重拟合是两个标签，标签链不会把它们混进一个数据集；`export_sources.json` 每段记下所用 K 本身（`payload_K`）和来源（`payload_store`）。
 
 **K 的现状**：右手 `3906437858` 用 11-09 14:24 手持拟合（provisional：之后补装了相机和 SMR 座，周末数据验证残差每轴 0.1–0.5 N）；
 左手 `3969377039` 11-06；右臂夹爪 `3100715645` 11-09。换夹爪/加减负载侧零件就要新加一条记录并重拟合。

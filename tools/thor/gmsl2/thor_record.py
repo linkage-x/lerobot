@@ -405,14 +405,21 @@ def _emit_box_live(box: bc.BoxPool, *, last_emit_s: float, min_interval_s: float
     return now
 
 
-# The payload registry for the live external wrench, re-read when the file changes (a fit registered
-# from the calibration page shows up without a re-Connect).
+# The payload registry for the live external wrench, re-read when it changes: the repo file or the
+# station's own log (a fit registered from the calibration page shows up without a re-Connect).
 _LIVE_REGISTRY: dict[str, Any] = {"mtime": None, "registry": None}
+
+
+def _mtime_or_none(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return None
 
 
 def _live_registry() -> dict[str, Any] | None:
     try:
-        mtime = box_six_d.REGISTRY_PATH.stat().st_mtime
+        mtime = (box_six_d.REGISTRY_PATH.stat().st_mtime, _mtime_or_none(Path(box_six_d.LOCAL_REGISTRY_PATH)))
         if _LIVE_REGISTRY["mtime"] != mtime:
             _LIVE_REGISTRY.update(mtime=mtime, registry=box_six_d.load_registry())
     except (OSError, ValueError) as exc:
