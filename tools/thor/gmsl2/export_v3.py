@@ -1384,6 +1384,8 @@ def _describe_labels(labels: dict[str, Any]) -> str:
     state = labels.get("camera_state") or "?"
     if isinstance(px, (int, float)):
         state = f"{state} {px:.2f} px"
+    if labels.get("excluded_cameras"):
+        state += f" without {', '.join(labels['excluded_cameras'])} (moved, left out)"
     return (
         f"extrinsics {labels.get('extrinsics') or '?'}, cameras {state}, "
         f"TCP {Path(labels.get('marker_to_tcp') or '?').name}, BOX {pairing}"
@@ -1719,6 +1721,13 @@ def export_task_to_v3(
             labels["six_d_payload"] = sorted(six_d_labels[session])
     for session, labels in session_labels.items():
         _emit(f"Labels: {session}: {_describe_labels(labels)}")
+        if labels.get("excluded_cameras"):
+            # The labels are fine; the rig is not. Without this line a moved camera is left out
+            # quietly forever, since the camera state of the rest reads ok.
+            _emit(
+                f"WARNING: {session}: tracked without {', '.join(labels['excluded_cameras'])}, which moved "
+                "since the extrinsics (derived/camera_motion.json); recalibrate the rig"
+            )
     for session_dir in sorted({src.session_dir for src in episodes}):
         labels = session_labels[session_dir.name]
         tracked_run = str(labels.get("extrinsics") or "") if labels.get("tracked") else ""

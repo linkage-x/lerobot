@@ -1166,6 +1166,30 @@ def test_export_check_writes_nothing(tmp_path, monkeypatch, capsys):
     assert "Check passed" in printed.strip().splitlines()[-1]
 
 
+def test_export_warns_when_a_session_was_tracked_without_its_moved_cameras(tmp_path, monkeypatch, capsys):
+    """Leaving moved cameras out keeps the camera state ok -- so the export has to say the rig needs work."""
+    pytest.importorskip("pyarrow")
+    datasets, exports, _ = _labelled_sessions(
+        tmp_path, monkeypatch, {"pick_and_place_20261113_183417": ("calib_1102", "ok")}
+    )
+    info_path = datasets / "pick_and_place_20261113_183417" / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["derived"]["april_cube_tracking_in_robot_base"]["camera_state"]["excluded_cameras"] = [
+        "cam_03", "cam_13", "cam_14",
+    ]  # fmt: skip
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    _export(datasets, exports, check_only=True)
+
+    printed = capsys.readouterr().out
+    assert "cameras ok 0.50 px without cam_03, cam_13, cam_14 (moved, left out)" in printed
+    assert (
+        "WARNING: pick_and_place_20261113_183417: tracked without cam_03, cam_13, cam_14, which moved "
+        "since the extrinsics" in printed
+    )
+    assert "recalibrate the rig" in printed and "Check passed" in printed.strip().splitlines()[-1]
+
+
 def test_untracked_sessions_do_not_count_as_a_different_chain(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     datasets, exports, _ = _labelled_sessions(

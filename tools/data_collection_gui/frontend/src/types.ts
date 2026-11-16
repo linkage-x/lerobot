@@ -992,6 +992,8 @@ export type TrackingDetectionSummary = {
     worstCube: string;
     thresholdPx: number;
     extrinsics: string;
+    /** Cameras the tracking left out because they had moved since the extrinsics; the verdict is about the rest. */
+    excludedCameras?: string[];
     message: string;
   } | null;
 };

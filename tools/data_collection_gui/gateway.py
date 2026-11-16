@@ -10271,6 +10271,9 @@ def _camera_state_view(summary: dict[str, Any]) -> dict[str, Any] | None:
         "worstCube": cs.get("worst_cube") or "",
         "thresholdPx": cs.get("threshold_px"),
         "extrinsics": cs.get("extrinsics_run_name") or "",
+        # Cameras the tracking left out because they had moved (tools/thor/gmsl2/camera_motion.py);
+        # the verdict is about the others.
+        "excludedCameras": [str(c) for c in cs.get("excluded_cameras") or []],
         "message": _CAMERA_STATE_MODULE.describe(cs),
     }
 
@@ -12997,6 +13000,7 @@ def _ee_trajectory_command(
     marker_to_tcp_calibration_path: Path | None = None,
     tracking_target: str = DEFAULT_TRACKING_TARGET,
     supersede_other_targets: bool = False,
+    auto_exclude_moved_cameras: bool = True,
 ) -> list[str]:
     runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
@@ -13026,6 +13030,11 @@ def _ee_trajectory_command(
     ]
     if supersede_other_targets:
         command.append("--supersede-other-targets")
+    if auto_exclude_moved_cameras:
+        # tools/thor/gmsl2/camera_motion.py: a camera whose background moved against the latest
+        # earlier recording the extrinsics fitted is left out of the tracking (2026-11-13: cam_03/13/14
+        # moved overnight, the other five did not). Nothing moved -> every camera, as before.
+        command.append("--auto-exclude-moved-cameras")
     return command
 
 
@@ -13206,6 +13215,7 @@ def _queue_traj_gen(
     tracking_target: str = DEFAULT_TRACKING_TARGET,
     allow_stale_calibration: bool = False,
     supersede_other_targets: bool = False,
+    auto_exclude_moved_cameras: bool = True,
 ) -> None:
     tracking_target, target_spec = _tracking_target_spec(tracking_target)
     # Checked here rather than only in the HTTP handler so that every path into
@@ -13239,6 +13249,7 @@ def _queue_traj_gen(
             marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
             tracking_target=tracking_target,
             supersede_other_targets=supersede_other_targets,
+            auto_exclude_moved_cameras=auto_exclude_moved_cameras,
         )
         marker_path_text = "" if marker_to_tcp_calibration_path is None else str(marker_to_tcp_calibration_path)
         launched_config_path = Path(command[command.index("--config") + 1])
@@ -21091,6 +21102,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 supersede = (
                     query.get("supersede_other_targets", query.get("supersedeOtherTargets", [""]))[0] or ""
                 ).strip() in {"1", "true", "yes"}
+                # On unless asked off: it changes nothing while every camera is where its extrinsics say.
+                auto_exclude = (
+                    query.get("auto_exclude_moved_cameras", query.get("autoExcludeMovedCameras", [""]))[0] or ""
+                ).strip() not in {"0", "false", "no"}
                 _queue_traj_gen(
                     state,
                     dataset_root,
@@ -21098,6 +21113,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     allow_stale_calibration=allow_stale,
                     tracking_target=tracking_target,
                     supersede_other_targets=supersede,
+                    auto_exclude_moved_cameras=auto_exclude,
                 )
                 with state.lock:
                     response = _snapshot(state)

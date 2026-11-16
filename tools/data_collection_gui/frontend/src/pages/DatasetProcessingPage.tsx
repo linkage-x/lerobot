@@ -151,6 +151,12 @@ export function TrackingDetectionBlock({
         ) : null}
       </div>
       {summary.cameraState?.verdict === "stale" ? <p className="panel-note error">{summary.cameraState.message}</p> : null}
+      {summary.cameraState?.excludedCameras?.length ? (
+        <p className="panel-note error">
+          {summary.cameraState.excludedCameras.join("、")} 已经移动（和上一段外参仍吻合的录制相比），本次轨迹没有用它们，
+          标签仍然可用（明细见数据集 derived/camera_motion.json）。这只是临时办法：请找维护者重新标定，标定后重新生成轨迹，就会用回全部相机。
+        </p>
+      ) : null}
       <div className="tracking-camera-table">
         <div className="tracking-camera-row tracking-camera-header">
           <span>Camera</span>

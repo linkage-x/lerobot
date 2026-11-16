@@ -9,7 +9,10 @@ millimetres change *without* changing it:
   calib_20261014 are both ``world_20260928_063531``;
 * the **camera state**: whether the cameras were still where those extrinsics put them
   (``metrology.camera_state``, corner-BA median > 1 px = stale).  10-09 -> 10-13 seven cameras had
-  tipped 0.2-0.6 deg and the labels carried ~4 mm with it, same world id, same extrinsics id;
+  tipped 0.2-0.6 deg and the labels carried ~4 mm with it, same world id, same extrinsics id.  A
+  session tracked without the cameras that had moved (``tools/thor/gmsl2/camera_motion.py``) is
+  judged on the ones it used, and ``excluded_cameras`` names the others -- beside the key, not in it:
+  labels from five valid cameras and from eight are the same labels, a little noisier;
 * the **world -> fr3_base edge**, replaced in place in ``world_graph.json`` (10-09 hand-eye,
   10-14 ball check, 10-15 ball check refit).  Every export through any of them says
   ``fr3_base``;
@@ -232,6 +235,7 @@ def session_labels(
         "camera_state": str((state or {}).get("verdict") or "unrecorded"),
         "camera_state_px": (state or {}).get("worst_median_reproj_px"),
         "camera_state_extrinsics": str((state or {}).get("extrinsics_run_name") or ""),
+        "excluded_cameras": [str(c) for c in (state or {}).get("excluded_cameras") or []],
         "marker_to_tcp": str(ee.get("marker_to_tcp_calibration_path") or ""),
         "tcp_link": str(ee.get("target_child_link") or ee.get("target_parent_link") or ""),
         "sidecar_chain": _canonical({k: derived.get(k) for k in SIDECAR_CHAIN_KEYS}),
