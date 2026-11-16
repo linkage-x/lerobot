@@ -15,6 +15,7 @@ import { EpisodeReplayPage } from "./pages/EpisodeReplayPage";
 import { DatasetProcessingPage } from "./pages/DatasetProcessingPage";
 import { QcReportPage } from "./pages/QcReportPage";
 import { DatasetExportPage } from "./pages/DatasetExportPage";
+import { TrainingPage } from "./pages/TrainingPage";
 import { TaskLibraryPage } from "./pages/TaskLibraryPage";
 import { DeviceManagerPage } from "./pages/DeviceManagerPage";
 import { TeleoperationPage } from "./pages/TeleoperationPage";
@@ -26,6 +27,7 @@ export type PageId =
   | "dataset-processing"
   | "episode-replay"
   | "dataset-export"
+  | "training"
   | "dashboard"
   | "qc-report"
   | "model-evaluation"
@@ -43,6 +45,7 @@ const mvpPages: PageMeta[] = [
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
+  { id: "training", label: "Training", kind: "mvp" },
   { id: "task-library", label: "Task Library", kind: "mvp" },
   { id: "calibration", label: "Calibration", kind: "mvp" },
   { id: "device-manager", label: "Device Manager", kind: "mvp" }
@@ -64,7 +67,8 @@ const navGroups: NavGroup[] = [
   { label: "Capture", ids: ["live-record", "teleoperation", "task-library"] },
   { label: "Calibration", ids: ["calibration"] },
   { label: "Devices", ids: ["device-manager"] },
-  { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] }
+  { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] },
+  { label: "Policy", ids: ["training"] }
 ];
 
 const workstationPageIds = new Set<PageId>([
@@ -73,7 +77,8 @@ const workstationPageIds = new Set<PageId>([
   "device-manager",
   "dataset-processing",
   "episode-replay",
-  "dataset-export"
+  "dataset-export",
+  "training"
 ]);
 
 function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
@@ -314,7 +319,10 @@ function App() {
         onExportApprovedDataset={(path, actionMode) => run(() => api.exportApprovedDataset(path, actionMode))}
         onOpenProcessing={() => navigate("dataset-processing")}
         onOpenReplay={(path) => selectAndOpenReplay(path)}
+        onOpenTraining={() => navigate("training")}
       />
+    ) : activePage === "training" ? (
+      <TrainingPage />
     ) : activePage === "task-library" ? (
       <TaskLibraryPage
         snapshot={snapshot}

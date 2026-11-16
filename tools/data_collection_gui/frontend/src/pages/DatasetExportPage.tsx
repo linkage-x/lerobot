@@ -190,7 +190,8 @@ export function DatasetExportPage({
   onExportTask,
   onExportApprovedDataset,
   onOpenProcessing,
-  onOpenReplay
+  onOpenReplay,
+  onOpenTraining
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
@@ -198,6 +199,7 @@ export function DatasetExportPage({
   onExportApprovedDataset: (path: string, actionMode?: string) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
+  onOpenTraining?: () => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   // The same rule export_v3 applies: QC passed (in whole or in part) on the current data.
@@ -271,6 +273,11 @@ export function DatasetExportPage({
         {exportStatus.outputPath ? (
           <div className="control-row">
             <button disabled={busy || exporting} onClick={() => onOpenReplay(exportStatus.outputPath)}>Open Replay</button>
+            {onOpenTraining ? (
+              <button disabled={busy || exporting} onClick={onOpenTraining}>
+                Train on exports →
+              </button>
+            ) : null}
           </div>
         ) : null}
       </section>

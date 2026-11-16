@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.data_collection_gui import fr3_payload_calibration as payload_cal
+from tools.data_collection_gui import training_runs
 from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import cart_state
 from tools.thor.gmsl2 import intrinsics_by_serial
@@ -593,6 +594,8 @@ class GatewayState:
     replay_tracker: Any = None
     log_dir: Path | None = None
     gateway_log_path: Path | None = None
+    # Training page backend (training_runs.TrainingManager), made on first use; it never takes state.lock.
+    training: Any = None
     recorder_log_path: Path | None = None
     box_button_last_action_s: float = float("-inf")
     device_preview: dict[str, Any] = field(default_factory=dict)
@@ -20730,6 +20733,91 @@ def _deployed_release(repo_root: Path) -> dict[str, Any] | None:
     return cached[1]
 
 
+def _training(state: GatewayState) -> training_runs.TrainingManager:
+    if state.training is None:
+        state.training = training_runs.TrainingManager(
+            state.repo_root,
+            exports_root=_task_exports_root(state),
+            datasets_root=state.datasets_root or state.repo_root / "outputs" / "datasets",
+            profile=state.profile,
+            sandbox=state.sandbox,
+            recorder_busy=lambda: state.process is not None and state.process.poll() is None,
+        )
+    return state.training
+
+
+def _training_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str, query: dict[str, list[str]]) -> bool:
+    """GET /api/training/*; True when handled. Outside state.lock (training_runs has its own)."""
+    if not path.startswith("/api/training/"):
+        return False
+    arg = lambda name, default="": (query.get(name, [default])[0] or default)  # noqa: E731
+    manager = _training(state)
+    try:
+        if path == "/api/training/status":
+            _json_response(handler, HTTPStatus.OK, manager.status())
+        elif path == "/api/training/exports":
+            _json_response(handler, HTTPStatus.OK, {"exports": manager.exports()})
+        elif path == "/api/training/log":
+            _json_response(handler, HTTPStatus.OK, {"lines": manager.log_tail(arg("job"))})
+        elif path == "/api/training/checkpoints":
+            _json_response(handler, HTTPStatus.OK, {"checkpoints": manager.checkpoints(arg("job"))})
+        elif path == "/api/training/crop":
+            _json_response(handler, HTTPStatus.OK, manager.crop_suggestion(arg("export"), arg("camera"), arg("hand", "right")))
+        elif path == "/api/training/frame.jpg":
+            crop = [int(v) for v in arg("crop").split(",")] if arg("crop") else None
+            data = manager.camera_frame(arg("export"), arg("camera"), crop, float(arg("at", "0.5")))
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/jpeg")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(data)
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+    except (training_runs.TrainingError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
+def _training_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """POST /api/training/*; True when handled. Outside state.lock (training_runs has its own)."""
+    if not path.startswith("/api/training/"):
+        return False
+    manager = _training(state)
+    try:
+        body = _read_json_body(handler)
+        if path == "/api/training/check":
+            payload = {"check": manager.check([str(n) for n in body.get("exports") or []], str(body.get("hand") or ""))}
+        elif path == "/api/training/hosts/add":
+            payload = {"host": vars(manager.add_host(str(body.get("label") or ""), str(body.get("sshTarget") or ""),
+                                                     str(body.get("repoDir") or ""), str(body.get("python") or "")))}
+        elif path == "/api/training/hosts/remove":
+            manager.remove_host(str(body.get("hostId") or ""))
+            payload = {}
+        elif path == "/api/training/probe":
+            payload = manager.probe(str(body.get("hostId") or "local"))
+        elif path == "/api/training/start":
+            payload = {"run": vars(manager.start(body))}
+            state.log("info", f"Training run {payload['run']['job']} started on {payload['run']['hostLabel']}")
+        elif path == "/api/training/stop":
+            payload = {"message": manager.stop(str(body.get("job") or ""))}
+        elif path == "/api/training/resume":
+            steps = body.get("steps")
+            payload = {"run": vars(manager.resume(str(body.get("job") or ""), int(steps) if steps else None))}
+        elif path == "/api/training/fetch":
+            payload = {"run": vars(manager.fetch(str(body.get("job") or "")))}
+        elif path == "/api/training/delete":
+            manager.delete_record(str(body.get("job") or ""))
+            payload = {}
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+            return True
+        _json_response(handler, HTTPStatus.OK, {"ok": True, **payload})
+    except (training_runs.TrainingError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
 class DataCollectionGuiHandler(BaseHTTPRequestHandler):
     server: "DataCollectionGuiServer"
 
@@ -20743,6 +20831,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         refusal = _sandbox_hardware_refusal(self.server.state, "GET", path)
         if refusal is not None:
             _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
+        if _training_get(self, self.server.state, path, query):
             return
         if path == "/api/teleop/camera.jpg":
             if self.server.state.profile != "workstation":
@@ -21158,7 +21248,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 {"error": f"{path} is unavailable in the workstation profile"},
             )
             return
+        if _training_post(self, self.server.state, path):
+            return
         if path == "/api/handheld/record/connect":
+            if self.server.state.profile == "thor" and _training(self.server.state).local_run_active():
+                # On a Thor the GPU that trains also serves the cameras (training_runs).
+                _json_response(self, HTTPStatus.CONFLICT, {
+                    "error": "a training run is using this Thor's GPU; stop it on the Training page (or wait "
+                    "for it) before connecting the recorder"
+                })
+                return
             # Free the cameras before the recorder opens them: live Device
             # Manager previews hold Argus sessions on the same sensor-ids, and
             # leaving them up makes the recorder's nvarguscamerasrc open hang.
