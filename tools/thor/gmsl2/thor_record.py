@@ -401,8 +401,45 @@ def _emit_box_live(box: bc.BoxPool, *, last_emit_s: float, min_interval_s: float
     except Exception as exc:  # noqa: BLE001 - preview must never break recording
         logger.debug("box live read failed: %s", exc)
         return now
-    _emit("BOX_LIVE " + json.dumps(snap, separators=(",", ":")))
+    _emit("BOX_LIVE " + json.dumps(_with_live_external(snap), separators=(",", ":")))
     return now
+
+
+# The payload registry for the live external wrench, re-read when the file changes (a fit registered
+# from the calibration page shows up without a re-Connect).
+_LIVE_REGISTRY: dict[str, Any] = {"mtime": None, "registry": None}
+
+
+def _live_registry() -> dict[str, Any] | None:
+    try:
+        mtime = box_six_d.REGISTRY_PATH.stat().st_mtime
+        if _LIVE_REGISTRY["mtime"] != mtime:
+            _LIVE_REGISTRY.update(mtime=mtime, registry=box_six_d.load_registry())
+    except (OSError, ValueError) as exc:
+        logger.debug("BOX registry unreadable for the live wrench: %s", exc)
+        _LIVE_REGISTRY.update(mtime=None, registry=None)
+    return _LIVE_REGISTRY["registry"]
+
+
+def _with_live_external(snap: dict[str, Any]) -> dict[str, Any]:
+    """``snap`` with each 6D sensor's external wrench (or why not) added, for the calibration page.
+
+    A copy: the snapshot's sensor dicts may be the client's own, and what is recorded must not change.
+    """
+    registry = _live_registry()
+    if registry is None or not isinstance(snap.get("sensors"), dict):
+        return snap
+    try:
+        extra = box_six_d.live_external(snap, registry, _six_d_zeros_snapshot(), time.time())
+    except Exception as exc:  # noqa: BLE001 - preview must never break recording
+        logger.debug("live external wrench failed: %s", exc)
+        return snap
+    if not extra:
+        return snap
+    sensors = dict(snap["sensors"])
+    for sid, fields in extra.items():
+        sensors[sid] = {**sensors[sid], **fields}
+    return {**snap, "sensors": sensors}
 
 
 _FORCE_CHANNEL_LABELS = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")

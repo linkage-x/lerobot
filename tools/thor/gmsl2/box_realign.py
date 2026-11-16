@@ -100,7 +100,15 @@ def load_episode(ep_dir: Path) -> dict[str, Any]:
 
 
 def build_rows(
-    ep: dict[str, Any], n_frames: int, fps: int, box_ids, *, delays_s=None, legacy=False, prior=None
+    ep: dict[str, Any],
+    n_frames: int,
+    fps: int,
+    box_ids,
+    *,
+    delays_s=None,
+    legacy=False,
+    prior=None,
+    sdk_no_gravity=False,
 ):
     """Rows for one episode: ``legacy`` as the parquet holds it now -- as an earlier realign chose
     (``prior``, its ``boxes`` entry for this episode) or else as the recorder built it (from its
@@ -113,6 +121,7 @@ def build_rows(
         "sensor_samples": ep["samples"],
         "t0_wall_s": ep["t0_wall_s"],
         "box_ids": box_ids,
+        "sdk_no_gravity": sdk_no_gravity,
     }
     if legacy and prior is not None:
         delays_s = {
@@ -261,7 +270,9 @@ def realign(
         rows_idx = np.nonzero(episode_col == ep_index)[0]
         ep = load_episode(ep_dir)
         box_ids = lr3.box_ids_from_inputs([], ep["samples"])
-        if len(lr3.box_state_names(box_ids)) != width:
+        # Sessions recorded until 2026-11-16 carry the SDK's no_gravity: rebuilt in their own layout.
+        sdk_no_gravity = len(lr3.box_state_names(box_ids, sdk_no_gravity=True)) == width
+        if not sdk_no_gravity and len(lr3.box_state_names(box_ids)) != width:
             if len(lr3.box_state_names(box_ids, one_pad=True)) == width:
                 raise ValueError(
                     f"{ep_dir.name}: recorded with one touch pad per finger in observation.state (before "
@@ -271,7 +282,9 @@ def realign(
                 f"{ep_dir.name}: {len(box_ids)} BOX(es) in the raw data, the parquet has {width} state channels"
             )
         prior = ((info.get("box_alignment") or {}).get("episodes") or {}).get(str(ep_index), {}).get("boxes")
-        legacy = build_rows(ep, len(rows_idx), fps, box_ids, legacy=True, prior=prior)
+        legacy = build_rows(
+            ep, len(rows_idx), fps, box_ids, legacy=True, prior=prior, sdk_no_gravity=sdk_no_gravity
+        )
         same, worst = _reproduces(
             legacy, state[rows_idx], stored_ts[rows_idx], lr3.box_timestamp_names(box_ids)
         )
@@ -301,7 +314,7 @@ def realign(
                     "source": "unmeasured",
                     **({"episode_estimate": own} if own else {}),
                 }
-        rows = build_rows(ep, len(rows_idx), fps, box_ids, delays_s=delays_s)
+        rows = build_rows(ep, len(rows_idx), fps, box_ids, delays_s=delays_s, sdk_no_gravity=sdk_no_gravity)
         new_state[rows_idx] = np.asarray([r["observation.state"] for r in rows], dtype=np.float64)
         new_ts[rows_idx] = np.asarray([r["box.timestamps"] for r in rows], dtype=np.float64)
         moved = np.abs(np.asarray(new_state[rows_idx], dtype=np.float32) - state[rows_idx])

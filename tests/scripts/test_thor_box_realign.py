@@ -299,3 +299,35 @@ def test_the_estimator_s_one_box_episode_is_kept(tmp_path, monkeypatch):
 
     monkeypatch.setattr(est, "main", fake_main)
     assert br.estimate_delays(tmp_path, tmp_path / "x.csv") == {0: {"": {"d_box_ms": 9.98, "r": 0.99}}}
+
+
+def test_a_session_recorded_with_the_sdk_no_gravity_is_realigned_in_its_own_layout(tmp_path):
+    # Sessions recorded until 2026-11-16 carry 6 SDK no_gravity channels per BOX after the 6D reading.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = _make_dataset(tmp_path)
+    parquet = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(parquet)
+    new, old = lr3.BOX_STATE_NAMES, lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY
+    rows = []
+    for state in table["observation.state"].to_pylist():
+        out = []
+        for slot in range(len(state) // len(new)):
+            values = dict(zip(new, state[slot * len(new) : (slot + 1) * len(new)], strict=True))
+            out.extend(values.get(name, 0.0) for name in old)
+        rows.append(out)
+    width = len(rows[0])
+    columns = {name: table[name] for name in table.column_names}
+    columns["observation.state"] = pa.array(rows, type=pa.list_(pa.float32(), width))
+    if "action" in columns:
+        columns["action"] = pa.array(rows, type=pa.list_(pa.float32(), width))
+    pq.write_table(pa.table(columns), parquet)
+
+    report = br.realign(root, estimate=False, write=True, table={"boxA": DELAY_S["boxA"]})
+
+    assert report["episodes"]["0"]["reproduced_same_pick"] == 1.0
+    after = np.asarray(pq.read_table(parquet)["observation.state"].to_pylist())
+    assert after.shape[1] == width == 2 * len(old)
+    mid = np.array([_sof(f) - EXPOSURE_S / 2 for f in range(FRAMES)])
+    assert np.abs(after[:, 0] - mid).max() < 1e-5

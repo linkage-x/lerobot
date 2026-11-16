@@ -54,10 +54,12 @@ export const DYNAMIC_FORCE_LIMITS: ForceAxisLimits = {
   momentMaxNm: 0.01,
 };
 
-// --- 6D force: gravity-compensated static residual ---------------------------
-// Diagnostic only: this checks whether fxyz_mxyz_no_gravity is plausibly close
-// to zero while the tool is static/free-air. It does not redefine the legacy
-// box_six_d_force.* observation channels, which still carry fxyz_mxyz.
+// --- 6D force: external wrench, static -----------------------------------------
+// Checks that the external wrench (the recorder's fxyz_mxyz_external: the BOX's own
+// payload model K and this Connect's last dynamic zero) stays near zero while the
+// tool is held still in free air, at any attitude: K and the zero both good. The
+// SDK's fxyz_mxyz_no_gravity is not used: the vendor's one default payload fits none
+// of our BOXes (tools/thor/ts_sync.md 9.1.2).
 export const STATIC_COMPENSATED_FORCE_LIMITS: ForceAxisLimits = {
   fxMaxN: 1.0,
   fyMaxN: 1.0,

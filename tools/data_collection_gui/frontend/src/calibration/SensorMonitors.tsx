@@ -82,54 +82,58 @@ export function ForceStaticValidationCard({
 }) {
   const view = useBoxPreview(api, device.id);
   const online = device.state === "running" || view.fresh;
-  const evalResult = view.forceNoGravity
-    ? evaluateForce(view.forceNoGravity, STATIC_COMPENSATED_FORCE_LIMITS)
+  const evalResult = view.forceExternal
+    ? evaluateForce(view.forceExternal, STATIC_COMPENSATED_FORCE_LIMITS)
     : null;
   const ready = Boolean(view.fresh && evalResult?.pass);
-  const forceNorm = vecNorm(view.forceNoGravity, ["fx", "fy", "fz"]);
-  const momentNorm = vecNorm(view.forceNoGravity, ["mx", "my", "mz"]);
+  const forceNorm = vecNorm(view.forceExternal, ["fx", "fy", "fz"]);
+  const momentNorm = vecNorm(view.forceExternal, ["mx", "my", "mz"]);
   const rawForceNorm = vecNorm(view.force, ["fx", "fy", "fz"]);
-  const chipText = !view.forceNoGravity
-    ? "等待补偿数据"
+  const chipText = !view.forceExternal
+    ? view.externalNote
+      ? "外力不可用"
+      : "等待外力数据"
     : !view.fresh
       ? "数据陈旧"
       : evalResult?.pass
         ? "静态通过"
-        : "残差偏大";
+        : "外力偏大";
 
   return (
     <div className="cali-monitor cali-monitor-dark">
       <div className="cali-monitor-head">
         <span className="cali-monitor-title">
           <span className={`status-dot status-${ready ? "running" : online ? "warning" : "idle"}`} />
-          重力补偿静态验证
+          外力静态验证
         </span>
         <span className={`cali-chip ${ready ? "cali-chip-ok" : "cali-chip-warn"}`}>
           {chipText}
         </span>
       </div>
       <div className="cali-monitor-body">
-        {view.forceNoGravity ? (
+        {view.forceExternal ? (
           <ForceAxisGrid
-            vec={view.forceNoGravity}
+            vec={view.forceExternal}
             limits={STATIC_COMPENSATED_FORCE_LIMITS}
             variant="monitor"
           />
         ) : (
-          <div className="cali-axis-empty">无补偿后力数据（{online ? "等待采样" : "离线"}）</div>
+          <div className="cali-axis-empty">
+            {view.externalNote ?? `无外力数据（${online ? "等待采样" : "离线"}）`}
+          </div>
         )}
       </div>
       <div className="cali-touch-metrics cali-force-static-metrics">
         <div className="cali-touch-metric">
-          <span>补偿后 |F|</span>
+          <span>外力 |F|</span>
           <strong>{fmtN(forceNorm)}</strong>
         </div>
         <div className="cali-touch-metric">
-          <span>补偿后 |M|</span>
+          <span>外力 |M|</span>
           <strong>{fmtNm(momentNorm)}</strong>
         </div>
         <div className="cali-touch-metric">
-          <span>原力 |F|</span>
+          <span>原读数 |F|</span>
           <strong>{fmtN(rawForceNorm)}</strong>
         </div>
         <div className="cali-touch-metric">
@@ -139,7 +143,7 @@ export function ForceStaticValidationCard({
       </div>
       <div className="cali-monitor-foot">
         <span>{device.label || device.id}</span>
-        <span>空载静止时应接近 0</span>
+        <span>本机载荷模型 + 最近一次动态校准；空中静止、任何姿态都应接近 0</span>
       </div>
     </div>
   );

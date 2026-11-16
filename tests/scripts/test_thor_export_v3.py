@@ -1430,3 +1430,19 @@ def test_an_episode_not_held_still_at_its_ends_is_left_out_and_said(tmp_path, mo
     assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == 1
     said = capsys.readouterr().out
     assert "leaving out pick_20261113_111046/episode_000000" in said and "开始和结束各静止" in said
+
+
+def test_sessions_recorded_before_and_after_the_sdk_no_gravity_left_share_an_export(tmp_path, monkeypatch):
+    _needs_transcoder()
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    _six_d_session(datasets, "pick_20261115_101046", names=list(lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY), zero=False, push_n=3.0, seed=1)
+    _six_d_session(datasets, "pick_20261117_101046", names=list(lr3.BOX_STATE_NAMES), zero=False, push_n=3.0, seed=2)
+
+    out = _six_d_export(datasets, tmp_path, six_d_registry=_registry_file(tmp_path))
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 2
+    assert len(info["features"]["observation.state"]["names"]) == len(lr3.BOX_STATE_NAMES)

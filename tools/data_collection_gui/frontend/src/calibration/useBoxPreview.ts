@@ -35,8 +35,10 @@ export type BoxPreviewView = {
   fresh: boolean;
   /** Parsed legacy 6D force vector, from fxyz_mxyz (force sensors only). */
   force: ForceVec | null;
-  /** Parsed gravity-compensated 6D force vector, when supplied by SDK v4.0+. */
-  forceNoGravity: ForceVec | null;
+  /** External wrench: the BOX's own payload model and this Connect's last software zero (recorder). */
+  forceExternal: ForceVec | null;
+  /** Why there is no external wrench (no payload model, no dynamic zero yet, ...). */
+  externalNote: string | undefined;
   /** Touch pad taxel arrays in 0.1 N units (touch sensors only). */
   touchFx0p1N: number[];
   touchFy0p1N: number[];
@@ -54,7 +56,8 @@ const EMPTY_VIEW: BoxPreviewView = {
   staleS: null,
   fresh: false,
   force: null,
-  forceNoGravity: null,
+  forceExternal: null,
+  externalNote: undefined,
   touchFx0p1N: [],
   touchFy0p1N: [],
   touchFz0p1N: [],
@@ -64,7 +67,7 @@ const EMPTY_VIEW: BoxPreviewView = {
   touchMaxResidual: null,
 };
 
-function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
+export function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
   if (!payload) return EMPTY_VIEW;
   const sensor = payload.sensor ?? null;
   const staleS = payload.staleS ?? null;
@@ -78,9 +81,10 @@ function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
     staleS,
     fresh,
     force: forceVecFromSensor(sensor),
-    forceNoGravity:
-      forceVecFromSensor(sensor, "fxyz_mxyz_no_gravity") ??
-      forceVecFromSensor(sensor, "fxyz_mxyz_gravity_compensated"),
+    // Not the SDK's fxyz_mxyz_no_gravity: that is the vendor's one default payload, wrong for every
+    // BOX we have (ts_sync.md 9.1.2).
+    forceExternal: forceVecFromSensor(sensor, "fxyz_mxyz_external"),
+    externalNote: typeof sensor?.["external_note"] === "string" ? (sensor["external_note"] as string) : undefined,
     touchFx0p1N,
     touchFy0p1N,
     touchFz0p1N,
