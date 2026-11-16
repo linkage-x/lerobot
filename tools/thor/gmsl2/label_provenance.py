@@ -55,7 +55,12 @@ SESSION_FIELDS = (
     "tcp_link",
     "sidecar_chain",
     "box_pairing",
+    "six_d_payload",
 )
+#: Fields compared over every session, tracked or not (the rest only over tracked sessions): they are
+#: about the BOX, which an untracked session has too. ``six_d_payload`` (which payload model turned each
+#: BOX's 6D channel into the external wrench, export_v3) is compared only where the export set it.
+ALL_SESSION_FIELDS = ("box_pairing", "six_d_payload")
 #: What a dataset's ``key`` holds: the session fields plus the world and edge it was exported in.
 KEY_FIELDS = ("world_frame_id", "edge", *SESSION_FIELDS)
 #: Keys of ``derived.<sidecar>`` that identify the tracker's chain (as ``aggregate.DERIVED_CHAIN_KEYS``).
@@ -251,7 +256,9 @@ def mixed_session_fields(sessions: Mapping[str, Mapping[str, Any]]) -> dict[str,
     for field in SESSION_FIELDS:
         by_value: dict[str, list[str]] = {}
         for name, labels in sessions.items():
-            if field != "box_pairing" and not labels.get("tracked"):
+            if field not in ALL_SESSION_FIELDS and not labels.get("tracked"):
+                continue
+            if field == "six_d_payload" and field not in labels:
                 continue
             for value in _field_values(labels, field):
                 by_value.setdefault(value, []).append(name)
@@ -325,7 +332,9 @@ def dataset_key(
     }
     tracked = {name: labels for name, labels in sessions.items() if labels.get("tracked")}
     for field in SESSION_FIELDS:
-        pool = sessions if field == "box_pairing" else tracked
+        pool = sessions if field in ALL_SESSION_FIELDS else tracked
+        if field == "six_d_payload":
+            pool = {name: labels for name, labels in pool.items() if field in labels}
         key[field] = sorted({v for labels in pool.values() for v in _field_values(labels, field)})
     return key
 

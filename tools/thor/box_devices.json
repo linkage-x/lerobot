@@ -85,7 +85,42 @@
       "hand": "right",
       "ip_seen": "192.168.1.150",
       "identified": "2026-11-03 on the rig, by elimination against 3969377039; 1819152274 before the v4.1 firmware",
-      "six_d_payload": []
+      "six_d_payload": [
+        {
+          "valid_from_unix": 1794205484,
+          "valid_from": "2026-11-09 14:24:44 +08:00",
+          "end_effector": "gripper (44 mm two-pad fingertips) + marker rig v9b right (100/101/110/111); the camera and SMR seat added later on 11-09 are not in the fit",
+          "model": "affine_acc/v1",
+          "K": [
+            [-0.00518, 8.81914, -0.03823],
+            [0.58128, -0.0581, -8.76732],
+            [8.76437, -0.11815, 0.41446],
+            [0.23833, 0.00248, 0.45685],
+            [-0.00283, 0.45431, -0.00224],
+            [-0.00015, -0.27086, 0.00184]
+          ],
+          "status": "provisional: one hand-held pass 22 min after power-up (vendor asks 30). Checked against the 11-13/11-15 recordings, which carry the camera and SMR seat: 15392 still, trigger-released frames over 136 episodes, one constant per episode, force residual rms 0.1-0.5 N per axis, p95 |F| <= 0.8 N. Re-fit with what is mounted now when there is time",
+          "fit": {
+            "log": "Thor outputs/calibration/box_six_d/20261109_142444_box3906437858 (free_air.log, 4943 still samples, all six faces)",
+            "n_static": 4943,
+            "attitudes": {
+              "x+": 705,
+              "x-": 945,
+              "y+": 679,
+              "y-": 892,
+              "z+": 1195,
+              "z-": 527
+            },
+            "heldout_worst_force_N": 0.2596,
+            "heldout_worst_moment_Nm": 0.0163,
+            "rigid_reading": {
+              "mass_kg": 0.8967,
+              "axis_gain_kg": [0.9074, 0.897, 0.8855],
+              "com_in_ft_m": [0.0001, 0.0306, 0.0511]
+            }
+          }
+        }
+      ]
     },
     "3100715645": {
       "role": "fr3_gripper",

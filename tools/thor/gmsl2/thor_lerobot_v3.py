@@ -213,6 +213,14 @@ def box_state_names(
     return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in names)
 
 
+def box_state_layouts(box_ids: tuple[str, ...] | list[str] | None = None) -> tuple[tuple[str, ...], ...]:
+    """Every observation.state layout the recorder has written that can still be named, newest first.
+
+    A session's own info.json names its columns; these are for sessions without it, told apart by width.
+    """
+    return (box_state_names(box_ids), box_state_names(box_ids, one_pad=True))
+
+
 def box_timestamp_names(
     box_ids: tuple[str, ...] | list[str] | None = None, *, one_pad: bool = False
 ) -> tuple[str, ...]:

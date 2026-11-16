@@ -163,7 +163,7 @@
       <tr><td class="k">双臂协同回放</td><td><span class="badge b-bad">不可用</span></td><td>需要两台臂都有注册边，以及两臂之间的相对位置。依赖左臂标定。</td></tr>
       <tr><td class="k">带头部相机录制</td><td><span class="badge b-warn">暂不使用</span></td><td>当前不带 head 录制，界面里只显示 left / right 两只手。</td></tr>
       <tr><td class="k">导出 LeRobot 数据集</td><td><span class="badge b-warn">能跑，未验证</span></td><td>导出的标签一律保留在录制时的相机世界系，日志会列出这份数据目前能部署到哪台臂。部署时由推理端按臂名查注册边，这条链路还没在真机上跑过。见 <a href="#export">第 8 节</a>。</td></tr>
-      <tr><td class="k">策略训练 / 推理</td><td><span class="badge b-warn">未验证</span></td><td>本版本没有在这套数据上跑通过训练和部署，不要拿结果下结论。推理目前只有命令行，GUI 入口还在做。</td></tr>
+      <tr><td class="k">策略训练 / 推理</td><td><span class="badge b-warn">未验证</span></td><td>本版本没有在这套数据上跑通过训练和部署，不要拿结果下结论。<b>仓库里现有的推理代码已经过时，不要直接拿来跑</b>：它早于现在的数据格式（例如导出的六维力已改成外力），推理会重新做。见 <a href="#export">第 8 节</a>。</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -288,13 +288,13 @@
   <ol class="steps">
     <li><b>（可选）绑定任务。</b>在 Task Library 激活一个任务，录到的数据会归到该任务的数据集；不绑定就是普通 session。Live Record 页顶部会显示 <span class="ui">Recording for task: …</span>，可以 <span class="ui">Unbind</span>。</li>
     <li><b>连接录制器。</b><span class="ui">Connect</span>（快捷键 <kbd>C</kbd>，顶栏也有）。连接后录制器、标定和设备预览共用这一个会话。勾了激光跟踪仪的话，要等它 Home 成功才能开录。</li>
-    <li><b>开始一段。</b>手持夹爪放到起始位置、静止 1–2 秒，点 <span class="ui">StartEpisode</span>（<kbd>E</kbd>）。</li>
+    <li><b>开始一段。</b>手持夹爪放到起始位置，点 <span class="ui">StartEpisode</span>（<kbd>E</kbd>），然后<b>在空中拿稳、扳机松开，静止 1–2 秒</b>再开始动作。不要把夹爪搁在桌上或靠着东西：导出时用这一段（和结尾那段）定六维力的零点，碰着东西零点就错了，两头都没停住的这一段导出时会被跳过。</li>
     <li><b>做示教动作。</b>注意：
       <ul>
         <li>右手 rig 的 4 块贴片尽量让至少 2 台已标定相机同时看到；手、袖子、物体别长时间挡住贴片。</li>
         <li>动作别太快（1 m/s 量级会丢检测）；在右臂可达、并且尽量靠近上面那块标定覆盖区的范围里做。</li>
         <li>扳机别捏到底停住：捏到底保持约 2 秒，BOX 会把夹爪锁在闭合状态，松手也不张开。锁住了就再捏到底一次解锁，这一段丢弃重录。这个锁定目前关不掉（BOX 固件行为，SDK 没有开关）。</li>
-        <li>结束时同样静止 1–2 秒。</li>
+        <li>结束时同样在空中拿稳、扳机松开，静止 1–2 秒，再按 <span class="ui">Save</span>。</li>
       </ul></li>
     <li><b>保存或丢弃。</b><span class="ui">Save</span>（<kbd>S</kbd>）保存，<span class="ui">Discard</span>（<kbd>D</kbd>）丢弃，<span class="ui">Exit</span>（<kbd>Esc</kbd>）退出会话。保存后页面出现 <span class="ui">Raw dataset saved</span>，可以直接 <span class="ui">Open in Replay</span>、<span class="ui">Queue Traj Gen</span> 或 <span class="ui">Go to Processing</span>。</li>
     <li><b>收工。</b>顶栏 <span class="ui">Disconnect</span>。正在写盘时不能断开。</li>
@@ -352,7 +352,15 @@
   <h2><span class="num">8</span>导出与训推（当前未验证）</h2>
   <div class="callout warn">
     <p>本版本<b>没有验证</b>「右臂数据 → 导出 → 训练 → 在右臂上推理」这条链路。</p>
+    <p><b>推理代码已经过时，不要直接用。</b>仓库里的推理脚本（<code>tools/fr3/fr3_act_infer_real*</code>、<code>run_pick_place_infer*.sh</code> 等）早于现在的数据格式和标定链，例如它不会在臂上算六维外力，喂给模型的就不是训练时的量。推理会重新做，做好之前不要拿这些脚本跑模型。下面「坐标系约定」里关于推理的几条是旧代码的设计，留作重做时的参考。</p>
   </div>
+  <h3>六维力（11-16 起）</h3>
+  <ul>
+    <li><b>导出的六维力是外力。</b>数据集里只有 <code>box_six_d_external.{fx,fy,fz,mx,my,mz}</code>：手对物体、物体对夹爪的力，已经扣掉夹爪自重和校准偏置。录制里的 <code>box_six_d_force</code>（带偏置的原读数）和 <code>box_six_d_force_no_gravity</code>（SDK 按厂家默认参数扣重力，对我们的 BOX 都不对，会差 7.8 N 甚至更多）<b>都不导出</b>，也不要拿录制目录里的这两列直接训练。</li>
+    <li><b>零点取自每段开头和结尾的静止。</b>每段开头、结尾各 2 秒里，夹爪静止、扳机松开的帧用来定这一段的零点（所以第 5 节要求在空中拿稳）。两头都没停住时，用这次连接后做过的动态校准；两个都没有，这一段跳过，日志里写 <code>leaving out …</code>。</li>
+    <li><b>每台 BOX 要有自己的载荷模型。</b>没有的话导出会直接报错（<code>no fitted payload model</code>），找维护者在标定页做「6D 拟合」并登记。换夹爪、加减夹爪上的零件后都要重做。用不同载荷模型的会话不能一起导出。</li>
+    <li>细节和实测依据见 <code>tools/thor/ts_sync.md</code> §9.1.2。</li>
+  </ul>
   <h3>坐标系约定（11-10 起）</h3>
   <ul>
     <li><b>导出不换坐标系。</b>Dataset Export 页把 QC 通过的数据导出成 LeRobot v3，位姿留在录制时的相机世界系（<code>world_…</code>），不再写进任何一台臂的基座系。这样同一份数据左臂、右臂、双臂都能用；以后某台臂重新标定，已经训练好的策略也不用重新导出。</li>
@@ -371,7 +379,7 @@
   <h3>现在能做到哪一步</h3>
   <ul>
     <li>训练：GUI 只能准备训练视图，训练本身还要另外手动跑。</li>
-    <li>推理：只有命令行 <code>tools/fr3/fr3_act_infer_real_runtime.py</code>。<code>tools/fr3/run_pick_place_infer*.sh</code> 是旧设备（pika 夹爪、海康相机）用的，<b>不要用</b>。</li>
+    <li>推理：<b>还没有能用的推理</b>。<code>tools/fr3/fr3_act_infer_real_runtime.py</code> 和 <code>tools/fr3/run_pick_place_infer*.sh</code> 都已过时（后者还是旧设备 pika 夹爪、海康相机用的），<b>不要用</b>。重做时要让臂上的 BOX 用它自己的载荷模型实时算出同样的六维外力。</li>
     <li>GUI 里的分级放行流程还在做：离线对比 → MuJoCo → 真机只看不动 → 真机限幅执行。做好之前，推理只能到「真机只看不动」（<code>--preview</code>）这一级，必须有维护者在场，且有人守着急停。结果里要注明「未验证链路」。</li>
   </ul>
 </section>
@@ -399,6 +407,8 @@
       <tr><td><code>connect: HTTP 500：gateway 没有应答…</code>（旧版只显示 <code>HTTP 500</code>）</td><td>不是录制出错，是 gateway 没在运行或正在重启（有人在部署；11-13 之前的 <code>recover_argus.sh</code> 会把它停掉）。</td><td>等一分钟再点；一直这样找维护者重新部署。</td></tr>
       <tr><td>松开扳机后手持夹爪还闭着、不张开</td><td>扳机捏到底停了约 2 秒，BOX 固件锁定了夹爪（不是故障，目前也关不掉）。</td><td>再把扳机捏到底一次解锁；这一段丢弃重录。</td></tr>
       <tr><td>保存时 0 samples</td><td>BOX 数据没进来。</td><td>丢弃这段；检查 BOX 上电和网络，找维护者。</td></tr>
+      <tr><td>导出日志 <code>leaving out … only N still frames with the trigger released at its ends</code></td><td>这一段开头和结尾都没在空中停住，又没做过动态校准，定不了六维力零点。</td><td>这一段不进数据集，其他段照常导出。以后按第 5 节在两头各停 1–2 秒。</td></tr>
+      <tr><td>导出报 <code>no fitted payload model</code></td><td>这台 BOX 还没有载荷模型，或者换了夹爪/零件后还没重新拟合。</td><td>找维护者在标定页做 6D 拟合并登记，再导出。</td></tr>
       <tr><td>回放时夹爪不动</td><td>夹爪 BOX 没上电或掉电重启过。</td><td>检查 BOX 3100715645 供电，重新预检。</td></tr>
       <tr><td>功能「刚修好」但界面没变化</td><td>前端改动要部署后才生效，网关改动要重新部署并重启。</td><td>问维护者 Thor 上是不是最新版本。</td></tr>
     </tbody>
