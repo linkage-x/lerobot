@@ -71,6 +71,7 @@ from tools.fr3 import fr3_arms  # noqa: E402
 from tools.thor.gmsl2 import (  # noqa: E402
     box_six_d as bsd,
     label_provenance as lp,
+    pose_columns,
     qc_verdict as qcv,
     thor_lerobot_v3 as lr3,
     world_provenance as wp,
@@ -883,19 +884,14 @@ def _discover_tracking_pose_columns(sessions: list[Path]) -> list[_PoseColumn]:
             cube = state_action_csv.name.removeprefix("state_action.").removesuffix(".csv")
             if not cube:
                 continue
-            columns.setdefault(
-                f"observation.ee_pose.{cube}.base",
-                _PoseColumn(f"observation.ee_pose.{cube}.base", "ee_state", cube),
-            )
-            columns.setdefault(
-                f"action.ee_pose.{cube}.base",
-                _PoseColumn(f"action.ee_pose.{cube}.base", "ee_action", cube),
-            )
+            # ``.world``: in the dataset's world frame (info.json ``world_frame``); see pose_columns.
+            ee_state = pose_columns.world_key(pose_columns.EE_STATE, cube)
+            ee_action = pose_columns.world_key(pose_columns.EE_ACTION, cube)
+            columns.setdefault(ee_state, _PoseColumn(ee_state, "ee_state", cube))
+            columns.setdefault(ee_action, _PoseColumn(ee_action, "ee_action", cube))
             if _fused_cube_csv(session_dir, cube) is not None or _cube_pose_csvs(session_dir, cube):
-                columns.setdefault(
-                    f"observation.cube_pose.{cube}.base",
-                    _PoseColumn(f"observation.cube_pose.{cube}.base", "cube_base", cube),
-                )
+                cube_world = pose_columns.world_key(pose_columns.CUBE, cube)
+                columns.setdefault(cube_world, _PoseColumn(cube_world, "cube_base", cube))
         for cube_pose_csv in sorted(sidecar.glob("cube_pose.*.*.csv")):
             stem = cube_pose_csv.name.removeprefix("cube_pose.").removesuffix(".csv")
             cube, sep, camera = stem.partition(".")
@@ -1293,9 +1289,11 @@ class _V3Writer:
 def _dataset_tcp_frame(episodes: list[EpisodeSource]) -> dict[str, Any]:
     """info.json's ``tcp_frame``: the link the ee poses are expressed on.
 
-    Deployment in fr3_base commands these poses absolutely, so the arm's IK target
-    must be the same link; a dataset whose sessions disagree records ``link: ""``
-    and is refused there rather than averaged here.
+    Training turns these poses into motions relative to the TCP itself, and deployment
+    applies them to this arm's FK of the same point (user guide, "infer-relative"): a
+    different point would turn every rotation into a wrong translation. So a dataset
+    whose sessions disagree records ``link: ""`` and is refused by training rather than
+    averaged here.
     """
     per_session = {src.session_dir.name: _tcp_frame_of_session(src.session_dir) for src in episodes}
     links = {frame["link"] for frame in per_session.values()}
@@ -1771,6 +1769,11 @@ def export_task_to_v3(
             for hop in edges_used
         )])
         _emit(f"Re-expressing world-frame poses in {target_world} via {route}")
+        _emit(
+            f"WARNING: this export is in {target_world}, not the recorded camera world: it is tied to that "
+            "edge and that arm. Exports normally keep the camera world (--target-world auto); training "
+            "does not need this"
+        )
 
     # Same rule for the rest of the label chain: extrinsics, camera state, edge,
     # marker->TCP bundle, BOX pairing can each move the labels by millimetres
@@ -2043,10 +2046,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--target-world",
         default=None,
-        help="re-express world-frame poses in this world (e.g. fr3_base) through a "
-        "registration edge of tools/thor/gmsl2/world/world_graph.json; 'auto' (the GUI) keeps "
-        "the recorded world and lists the arms deployment can reach from it; default keeps the "
-        "world the episodes were recorded in",
+        help="'auto' (the GUI) and the default keep the camera world the episodes were recorded "
+        "in, and 'auto' lists the arms deployment can reach from it. Naming a frame (e.g. fr3_base) "
+        "re-expresses world-frame poses in it through a registration edge of "
+        "tools/thor/gmsl2/world/world_graph.json: for a maintainer only, never the GUI. Training "
+        "does not need it (it uses poses relative to the TCP, which no world changes), and the "
+        "result is tied to that edge and that arm",
     )
     ap.add_argument(
         "--allow-mixed-labels",

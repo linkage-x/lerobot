@@ -37,6 +37,7 @@ from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import cart_state
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
+from tools.thor.gmsl2 import pose_columns as pose_cols
 from tools.thor.gmsl2 import qc_verdict as qcv
 from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
@@ -13747,9 +13748,10 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 parquet = pq.ParquetFile(data_file)
                 column_names = parquet.schema_arrow.names
                 pose_columns = [
-                    f"{prefix}.ee_pose.{cube_name}.base"
-                    for prefix in ("observation", "action")
+                    f"{kind}.{cube_name}.{suffix}"
+                    for kind in (pose_cols.EE_STATE, pose_cols.EE_ACTION)
                     for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES
+                    for suffix in pose_cols.SUFFIXES
                 ]
                 wanted_columns = [
                     column
@@ -13939,9 +13941,8 @@ def _preferred_exported_ee_pose_cube(info: dict[str, Any]) -> str | None:
     if not isinstance(features, dict):
         return None
     for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
-        if (
-            f"observation.ee_pose.{cube_name}.base" in features
-            or f"action.ee_pose.{cube_name}.base" in features
+        if pose_cols.pose_key(features, pose_cols.EE_STATE, cube_name) or pose_cols.pose_key(
+            features, pose_cols.EE_ACTION, cube_name
         ):
             return cube_name
     return None
@@ -13970,9 +13971,11 @@ def _ee_pose_from_row(
     # left/right/head mixes different tracked objects into one impossible path.
     pose = None
     if exported_pose_cube is not None:
-        pose = _fixed_pose7_from_row(row, f"observation.ee_pose.{exported_pose_cube}.base")
-        if pose is None:
-            pose = _fixed_pose7_from_row(row, f"action.ee_pose.{exported_pose_cube}.base")
+        for kind in (pose_cols.EE_STATE, pose_cols.EE_ACTION):
+            key = pose_cols.pose_key(row, kind, exported_pose_cube)
+            pose = _fixed_pose7_from_row(row, key) if key else None
+            if pose is not None:
+                break
 
     # Legacy v3 datasets embed EE pose dimensions inside observation.state/action.
     if pose is None:
@@ -19776,11 +19779,7 @@ def _export_source_episode(state: GatewayState, dataset_root: Path, episode: int
         ),
         None,
     )
-    hands = sorted(
-        key.removeprefix("observation.ee_pose.").removesuffix(".base")
-        for key in (_load_dataset_info(dataset_root).get("features") or {})
-        if key.startswith("observation.ee_pose.") and key.endswith(".base")
-    )
+    hands = pose_cols.tracked_hands(_load_dataset_info(dataset_root).get("features") or {})
     problem = ""
     if source_root is None:
         problem = f"its recording {session} is not on this machine any more, so nothing vouches for its poses"
