@@ -105,9 +105,20 @@ records the source world block and the edge in `info.json`'s `world_frame`.
 Without an edge connecting the two worlds the export is refused, never treated
 as an identity.
 
-The GUI's exports pass `--target-world auto`: `fr3_base` when an edge reaches
-it, otherwise the recorded world, and the "Export complete" line names which.
-It is not offered as a choice, because the consumer (the FR3) fixes it.
+The GUI's exports pass `--target-world auto`. Until 11-10 that meant
+`fr3_base` when an edge reached it; since 11-10 it always keeps the recorded
+camera world and only lists, per arm, whether an edge reaches its base today.
+The `.base` suffix of the pose columns is historical: in an `auto` export they
+hold camera-world poses (`info.json` `world_frame` says which world).
+
+Since 11-16 the planned inference does not use absolute poses at all (user
+guide section 8, `#infer-relative`): the policy sees and outputs TCP poses
+relative to the TCP itself, converted from these camera-world columns when
+training reads them. On the arm the pose comes from FK alone (the arm's gripper
+carries no rig) and a target is `FK(q_t) * dT`, so the world->base edge is not
+in the control loop and its constant error cancels; the edge is used only to
+place the arm and bound its workspace. The `--dataset-alignment` modes below
+belong to the old runtime, which is not to be used.
 `info.json` also gets `tcp_frame` (the URDF link the ee poses carry, from each
 session's tracking-run summary), since deployment has to drive that same link.
 
