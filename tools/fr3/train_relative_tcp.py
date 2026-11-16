@@ -134,7 +134,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log-freq", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--image-aug", action="store_true", help="LeRobot's colour/affine image augmentation")
-    ap.add_argument("--video-backend", default=None, help="pyav or torchcodec (default: what LeRobot picks)")
     ap.add_argument("--device", default=None, help="cuda / cpu (default: cuda when available)")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--policy-arg", action="append", default=[],
@@ -216,8 +215,6 @@ def lerobot_argv(args: argparse.Namespace, run_dir: Path, contract: rt.PolicyCon
         argv.append(f"--policy.device={args.device}")
     if args.image_aug:
         argv.append("--dataset.image_transforms.enable=true")
-    if args.video_backend:
-        argv.append(f"--dataset.video_backend={args.video_backend}")
     argv += list(args.policy_arg)
     return argv
 
@@ -240,9 +237,7 @@ class _Hooks:
         from lerobot.datasets.transforms import ImageTransforms
 
         transforms = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-        self.dataset = rd.RelativeTcpDataset(
-            self.views, self.contract, self.stats, video_backend=cfg.dataset.video_backend, image_transforms=transforms
-        )
+        self.dataset = rd.RelativeTcpDataset(self.views, self.contract, self.stats, image_transforms=transforms)
         progress(event="dataset", frames=self.dataset.num_frames, episodes=self.dataset.num_episodes)
         return self.dataset
 

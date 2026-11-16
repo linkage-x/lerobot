@@ -87,3 +87,41 @@ def test_samples_pad_untracked_targets_and_skip_untracked_observations():
     assert pad_end.tolist() == [False, True, True]
     first, _, _ = rd.sample_vectors(contract, arrays, 0)  # history before the start: not moving
     np.testing.assert_allclose(first[:3], 0.0, atol=1e-9)
+
+
+def test_view_videos_return_each_frame_in_order(tmp_path):
+    """A view is decoded with PyAV directly (Thor has neither torchcodec nor torchvision's VideoReader)."""
+    import json
+    import shutil
+    import subprocess
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    cam = rt.CameraInput("cam_10", 64, 48, [0, 0, 64, 48], 64, 48)
+    video = tmp_path / "videos" / cam.key / "chunk-000" / "file-000.mp4"
+    video.parent.mkdir(parents=True)
+    # 20 frames whose brightness rises 10 per frame; episode 1 starts at frame 8 of the file.
+    frames = np.stack([np.full((48, 64, 3), 10 * i + 5, np.uint8) for i in range(20)])
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "64x48", "-r", "60", "-i", "-",
+         "-c:v", "libx264", "-qp", "0", "-g", "1", "-pix_fmt", "yuv444p", str(video)],
+        input=frames.tobytes(), capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    (tmp_path / "meta" / "episodes").mkdir(parents=True)
+    (tmp_path / "meta" / "info.json").write_text(json.dumps({"fps": 60}), encoding="utf-8")
+    pq.write_table(
+        pa.table({
+            "episode_index": [0, 1],
+            f"videos/{cam.key}/chunk_index": [0, 0],
+            f"videos/{cam.key}/file_index": [0, 0],
+            f"videos/{cam.key}/from_timestamp": [0.0, 8 / 60],
+        }),
+        tmp_path / "meta" / "episodes" / "file-000.parquet",
+    )
+    videos = rd.ViewVideos(tmp_path, [cam])
+    levels = [int(videos.frame(1, t, "cam_10").mean()) for t in (0, 3, 1, 11)]
+    assert levels == pytest.approx([85, 115, 95, 195], abs=3)

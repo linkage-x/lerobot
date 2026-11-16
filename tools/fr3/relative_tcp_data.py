@@ -347,6 +347,7 @@ class EpisodeArrays:
     poses: np.ndarray  # (n, 7) TCP pose per frame, NaN where tracking failed
     widths: np.ndarray  # (n,)
     wrench: np.ndarray | None  # (n, 6)
+    episode: int = 0  # the dataset's episode_index
 
 
 def _state_indices(info: dict[str, Any], box: str, with_wrench: bool) -> tuple[int, list[int]]:
@@ -394,6 +395,7 @@ def load_episode_arrays(root: Path, contract: rt.PolicyContract) -> list[Episode
                 poses=poses[idx],
                 widths=state[idx, cols["width"]],
                 wrench=state[idx][:, cols["wrench"]] if cols["wrench"] else None,
+                episode=int(e),
             )
         )
     return out
@@ -482,11 +484,60 @@ def compute_stats(view_roots: Sequence[Path], contract: rt.PolicyContract) -> tu
     return stats, summary
 
 
+class ViewVideos:
+    """Frames of a training view's cameras, decoded with PyAV directly.
+
+    Not through LeRobot's video backends: on Thor torchcodec is not installed and torchvision 0.27 dropped
+    the VideoReader LeRobot's "pyav" backend goes through (11-16), so the same view would decode on one
+    machine and not on another. A view's videos are all-intra (build_view), so a seek lands on the frame.
+    Containers are opened lazily per process: DataLoader workers each get their own.
+    """
+
+    def __init__(self, root: Path, cameras: Sequence[rt.CameraInput]):
+        import pyarrow.parquet as pq
+
+        self.root = Path(root)
+        info = _read_info(self.root)
+        self.fps = float(info["fps"])
+        self.template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
+        table = pq.read_table(self.root / "meta" / "episodes").to_pydict()
+        self.where: dict[tuple[int, str], tuple[Path, float]] = {}
+        for row, episode in enumerate(table["episode_index"]):
+            for cam in cameras:
+                prefix = f"videos/{cam.key}/"
+                path = self.root / self.template.format(
+                    video_key=cam.key,
+                    chunk_index=int(table[prefix + "chunk_index"][row]),
+                    file_index=int(table[prefix + "file_index"][row]),
+                )
+                self.where[(int(episode), cam.name)] = (path, float(table[prefix + "from_timestamp"][row]))
+        self._open: dict[tuple[int, Path], Any] = {}
+
+    def frame(self, episode: int, t: int, camera: str) -> np.ndarray:
+        """HxWx3 uint8 RGB of frame ``t`` of ``episode``."""
+        import av
+
+        path, start = self.where[(episode, camera)]
+        key = (os.getpid(), path)
+        container = self._open.get(key)
+        if container is None:
+            container = self._open[key] = av.open(str(path))
+        stream = container.streams.video[0]
+        target = start + t / self.fps
+        half = 0.5 / self.fps
+        container.seek(max(0, int((target - half) / stream.time_base)), stream=stream, backward=True, any_frame=False)
+        for frame in container.decode(stream):
+            if frame.time is not None and frame.time >= target - half:
+                return frame.to_ndarray(format="rgb24")
+        raise TrainingDataError(f"{path}: no frame at {target:.3f} s (episode {episode}, frame {t})")
+
+
 class RelativeTcpDataset:
     """Training views -> LeRobot-style samples in the relative-TCP contract (a torch Dataset).
 
     ``meta`` stands in for LeRobotDatasetMetadata where lerobot_train reads it: ``features`` and
-    ``stats`` describe the converted samples, not the stored columns.
+    ``stats`` describe the converted samples, not the stored columns. Poses and widths are read once,
+    here, and converted per sample by sample_vectors; images are one decoded frame per camera.
     """
 
     def __init__(
@@ -495,35 +546,28 @@ class RelativeTcpDataset:
         contract: rt.PolicyContract,
         stats: dict[str, Any],
         *,
-        video_backend: str | None = None,
         image_transforms=None,
     ):
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
         self.contract = contract
+        self.image_transforms = image_transforms
         self.view_roots = [Path(r) for r in view_roots]
-        self.datasets = []
+        self.videos: list[ViewVideos] = []
         self.arrays: list[list[EpisodeArrays]] = []
-        self.index: list[tuple[int, int, int, int]] = []  # (dataset, global row, episode, frame)
+        self.index: list[tuple[int, int, int]] = []  # (view, episode position, frame)
         from_index, to_index = [], []
         for d, root in enumerate(self.view_roots):
             info = _read_info(root)
             if int(info["fps"]) != contract.fps:
                 raise TrainingDataError(f"{root.name} is {info['fps']} fps, the contract says {contract.fps}")
-            # Only the camera frames come from LeRobot: one decoded frame per camera per sample. The
-            # poses and widths are read once, here, and converted per sample by sample_vectors.
-            ds = LeRobotDataset(
-                f"local/{root.name}", root=root, video_backend=video_backend, image_transforms=image_transforms
-            )
-            self.datasets.append(ds)
+            self.videos.append(ViewVideos(root, contract.cameras))
             episodes = load_episode_arrays(root, contract)
             self.arrays.append(episodes)
-            starts = np.asarray(ds.meta.episodes["dataset_from_index"])
             for e, arrays in enumerate(episodes):
                 begin = len(self.index)
                 for t in range(len(arrays.poses)):
-                    if sample_vectors(contract, arrays, t) is not None:
-                        self.index.append((d, int(starts[e]) + t, e, t))
+                    sample = sample_vectors(contract, arrays, t)
+                    if sample is not None and not sample[2].all():
+                        self.index.append((d, e, t))
                 if len(self.index) > begin:
                     from_index.append(begin)
                     to_index.append(len(self.index))
@@ -538,23 +582,31 @@ class RelativeTcpDataset:
     def __len__(self) -> int:
         return len(self.index)
 
+    def image(self, i: int, camera: rt.CameraInput) -> np.ndarray:
+        d, e, t = self.index[int(i)]
+        return self.videos[d].frame(self.arrays[d][e].episode, t, camera.name)
+
     def __getitem__(self, i: int) -> dict[str, Any]:
         import torch
 
-        d, row, e, t = self.index[int(i)]
-        state, actions, pad = sample_vectors(self.contract, self.arrays[d][e], t)
-        item = self.datasets[d][row]
+        d, e, t = self.index[int(i)]
+        arrays = self.arrays[d][e]
+        state, actions, pad = sample_vectors(self.contract, arrays, t)
         out = {
             "observation.state": torch.from_numpy(state),
             "action": torch.from_numpy(actions),
             "action_is_pad": torch.from_numpy(pad),
             "index": torch.tensor(i),
-            "episode_index": torch.tensor(e),
+            "episode_index": torch.tensor(arrays.episode),
             "frame_index": torch.tensor(t),
-            "task": item.get("task", ""),
+            "task": "",
         }
         for cam in self.contract.cameras:
-            out[cam.key] = item[cam.key]
+            frame = self.videos[d].frame(arrays.episode, t, cam.name)
+            if frame.shape != (cam.height, cam.width, 3):
+                raise TrainingDataError(f"{cam.name}: view frame {frame.shape}, contract {(cam.height, cam.width, 3)}")
+            image = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            out[cam.key] = self.image_transforms(image) if self.image_transforms is not None else image
         return out
 
 

@@ -47,6 +47,8 @@ HOST_MARKER = ".lerobot_training_host"
 SYNC_EXCLUDES = (
     "/outputs/", "/.git/", ".venv*/", "node_modules/", "__pycache__/", "/third_party/",
     "/tools/data_collection_gui/frontend/", "/run/logs/", "*.mkv", "*.mp4",
+    # Excluded so --delete keeps it: it is what says the directory belongs to this page.
+    f"/{HOST_MARKER}",
 )
 LOCAL_PYTHON_CANDIDATES = (".venv-fr3/bin/python", ".venv/bin/python")
 ACTIVE_STATES = ("syncing", "starting", "running")
@@ -498,8 +500,6 @@ class TrainingManager:
             if not re.match(r"^[A-Za-z0-9_./-]*$", box):
                 raise TrainingError("BOX prefix")
             args += ["--box", box]
-        if params.get("videoBackend") in ("pyav", "torchcodec"):
-            args += ["--video-backend", params["videoBackend"]]
         return args
 
     def _spawn_local(self, rec: RunRecord, host: TrainingHost, args: list[str]) -> None:
@@ -535,7 +535,7 @@ class TrainingManager:
         check = self._ssh(
             host,
             f"mkdir -p {q(host.repoDir)} && cd {q(host.repoDir)} && "
-            f"if [ -e {HOST_MARKER} ] || [ -z \"$(ls -A)\" ]; then touch {HOST_MARKER}; echo ok; else echo foreign; fi",
+            f"if [ -e {HOST_MARKER} ] || [ -z \"$(ls -A)\" ]; then touch {HOST_MARKER} && mkdir -p outputs/exports && echo ok; else echo foreign; fi",
         )
         if (check.stdout or "").strip() != "ok":
             raise TrainingError(
