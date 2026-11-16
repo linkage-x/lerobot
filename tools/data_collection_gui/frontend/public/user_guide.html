@@ -163,7 +163,8 @@
       <tr><td class="k">双臂协同回放</td><td><span class="badge b-bad">不可用</span></td><td>需要两台臂都有注册边，以及两臂之间的相对位置。依赖左臂标定。</td></tr>
       <tr><td class="k">带头部相机录制</td><td><span class="badge b-warn">暂不使用</span></td><td>当前不带 head 录制，界面里只显示 left / right 两只手。</td></tr>
       <tr><td class="k">导出 LeRobot 数据集</td><td><span class="badge b-warn">能跑，未验证</span></td><td>导出的标签一律保留在录制时的相机世界系，日志会列出这份数据目前能部署到哪台臂。部署时由推理端按臂名查注册边，这条链路还没在真机上跑过。见 <a href="#export">第 8 节</a>。</td></tr>
-      <tr><td class="k">策略训练 / 推理</td><td><span class="badge b-warn">未验证</span></td><td>本版本没有在这套数据上跑通过训练和部署，不要拿结果下结论。<b>仓库里现有的推理代码已经过时，不要直接拿来跑</b>：它早于现在的数据格式（例如导出的六维力已改成外力），推理会重新做。见 <a href="#export">第 8 节</a>。</td></tr>
+      <tr><td class="k">策略训练（Training 页）</td><td><span class="badge b-warn">能跑，未在真机验证</span></td><td>11-16 起：在网页上对 QC 后的导出训练 ACT（本机或 ssh 远程机器），可停止、续训，checkpoint 带输入规格和来源，能重新加载。见 <a href="#train">第 8 节</a>。</td></tr>
+      <tr><td class="k">Rollout（离线预测 / 在线预览）</td><td><span class="badge b-warn">能跑，臂不动</span></td><td>离线预测、在线预览（实时相机 + BOX）和执行前检查都能用；<b>上真机执行还没做</b>。旧推理代码已过时，不要用。见 <a href="#rollout">第 8 节</a>。</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -257,6 +258,8 @@
       <tr><td class="k">Dataset Processing</td><td>轨迹生成队列、QC、日志。</td></tr>
       <tr><td class="k">Episode Replay</td><td>回看视频和轨迹、MuJoCo 预演、真机回放、标注。</td></tr>
       <tr><td class="k">Dataset Export</td><td>导出 LeRobot v3 数据集（见第 8 节的限制）。</td></tr>
+      <tr><td class="k">Training</td><td>在 QC 后的导出上训练策略（相对位姿），停止、续训、拉回 checkpoint、看日志。</td></tr>
+      <tr><td class="k">Rollout</td><td>离线预测、在线预览、执行前检查；臂不动。</td></tr>
     </tbody>
   </table></div>
   <p class="muted small">Teleoperation 页只在工作站（RealSense + Pika）版本里出现，和本指南无关。</p>
@@ -361,10 +364,10 @@
 
 <!-- ================================================================ -->
 <section class="card" id="export">
-  <h2><span class="num">8</span>导出与训推（当前未验证）</h2>
+  <h2><span class="num">8</span>导出、训练与 Rollout</h2>
   <div class="callout warn">
-    <p>本版本<b>没有验证</b>「右臂数据 → 导出 → 训练 → 在右臂上推理」这条链路。</p>
-    <p><b>推理代码已经过时，不要直接用。</b>仓库里的推理脚本（<code>tools/fr3/fr3_act_infer_real*</code>、<code>run_pick_place_infer*.sh</code> 等）早于现在的数据格式和标定链，例如它不会在臂上算六维外力，喂给模型的就不是训练时的量。推理会重新做，做好之前不要拿这些脚本跑模型。下面「坐标系约定」里关于推理的几条是旧代码的设计，留作重做时的参考；重做要按本节最后的 <a href="#infer-inputs">新推理的输入规格</a>。</p>
+    <p>「QC → 导出 → 网页训练 → 离线预测 / 在线预览」这条链已经能走（11-16 起，见 <a href="#train">训练</a> 和 <a href="#rollout">Rollout</a>）；<b>策略上真机执行还没有做</b>，Rollout 页不会让臂动。</p>
+    <p><b>旧推理代码已经过时，不要用。</b>仓库里的推理脚本（<code>tools/fr3/fr3_act_infer_real*</code>、<code>run_pick_place_infer*.sh</code> 等）早于现在的数据格式和标定链，例如它不会在臂上算六维外力，喂给模型的就不是训练时的量。推理会重新做，做好之前不要拿这些脚本跑模型。下面「坐标系约定」里关于推理的几条是旧代码的设计，留作重做时的参考；重做要按本节最后的 <a href="#infer-inputs">新推理的输入规格</a>。</p>
   </div>
   <h3>六维力（11-16 起）</h3>
   <ul>
@@ -407,13 +410,30 @@
     <li>标签链有防混用检查：外参、相机状态、注册边、TCP 定义、BOX 配帧不一致的数据不能混在一个导出里。看到相关报错不要强行加 <code>--allow-mixed-labels</code>。</li>
     <li><b>相机被碰动后，生成轨迹会自动不用它（11-16 起）。</b>每次生成 EE 轨迹前，系统先把每台相机的背景和「上一段外参还吻合、而且用全部相机生成的录制」对比。背景移动 0.6 px 以上的相机这次不参与计算，处理页会写出用了哪些、不用哪些（明细在数据集的 <code>derived/camera_motion.json</code>）。没有相机动过时，和以前完全一样。这只是应急：处理页会用红字列出被排除的相机，导出日志也会有一行 <code>WARNING: … tracked without cam_…</code>。看到这两处任何一处，就请维护者重新标定；标定后重新生成轨迹，就会用回全部相机。可信相机少于 4 台时不会排除，相机状态会显示 stale。</li>
   </ul>
-  <h3>现在能做到哪一步</h3>
+  <h3 id="train">训练（Training 页，11-16 起）</h3>
+  <ol>
+    <li><b>先 QC，再导出。</b>只有在 QC 门槛上线（11-16）之后导出的数据集能训练：训练页会把旧导出标成不可用，理由写在行尾（「exported before the QC gate」）。旧数据重跑一次 QC、再导出就行。</li>
+    <li>打开 <span class="ui">Training</span>（或在 Dataset Export 页点 <span class="ui">Train on exports →</span>），勾选导出、选手（right / left）。训练页自己检查：QC 门槛开着、TCP 是同一个点、几份导出的标签链一致。不一致的会直接列出来，不用硬训。</li>
+    <li><b>相机：</b><code>cam_10</code> 必选（整幅），再加固定相机，每台设一个裁剪框。点 <span class="ui">Suggest crop</span> 会按这份导出里夹爪 rig 出现过的位置给一个 4:3 的框，下面的预览图上画着这个框，拖滑块看不同时刻，确认夹爪、物体都在框里再开始。裁剪框写进 checkpoint，推理时对实时画面用同一个框、同一段代码。</li>
+    <li><b>右手任务第一次训练建议的外部相机是 <code>cam_06</code>，框 x 140–1180、y 220–1000</b>（11-16 按 7 个右手会话约 190 段的统计选的）：它 99% 的帧都看得到夹爪（最差的 episode 也有 98%），离工作区最近（物体最大），7 个会话里从没被判移动；框外的 rig 角点只有 0.17%。代价：夹爪正后方几乎总是人的上身，推理时那里是机械臂和小车，这是人和机器人画面差得最多的地方，训练默认开图像增强。<code>cam_08</code> 视角类似、远 0.26 m，可作备选；<code>cam_03/13</code> 俯视但夹爪常出画面（只有 55–62% 的帧看得到）；<code>cam_09/07/12/14</code> 工作区太偏或看到夹爪的帧太少。换任务、换桌面布置后用 Suggest crop 重新看一次框。</li>
+    <li><b>策略：</b>目前只有 ACT。默认每 2 帧一步（30 Hz）、一段 32 步（约 1.1 s）、每次执行 16 步、状态里带最近 2 帧的相对位姿和夹爪开度。这些是起点，不是调好的值。外力作为输入要勾选，勾了以后推理时臂上 BOX 的 K 必须已经生效。</li>
+    <li><b>在哪训练：</b>本机，或者通过 ssh 用远程机器（<span class="ui">Add a remote machine</span>：<code>user@host</code>、一个专门用来训练的空目录、那台机器上的 python）。<b>在 Thor 上本机训练时，录制器必须断开</b>：GPU 同时给相机用；训练中 Connect 会被拒绝。沙箱不能用 Thor 的 GPU 训练。远程训练前，网页会把当前代码和选中的导出拷过去（那个目录里不属于代码的文件会被删除，所以只能用空目录或网页建的目录）。</li>
+    <li><b>停止 / 继续：</b><span class="ui">Stop</span> 后点 <span class="ui">Resume</span> 从最后一个 checkpoint 接着训；训完了想多训，填更大的总步数点 <span class="ui">Train further</span>。远程训练的 checkpoint 在那台机器上，点 <span class="ui">Fetch checkpoints here</span> 拷回来（不带优化器状态），Rollout 才能用。</li>
+    <li><b>每个 checkpoint 都说明自己从哪来：</b>旁边的 <code>fr3_policy_contract.json</code> 写着输入输出、相机和裁剪、步长；<code>fr3_provenance.json</code> 写着用了哪几份导出（带指纹）、训练视图、代码版本、机器、续训记录和训练集的工作空间。最后一个 checkpoint 会从磁盘重新加载，预测必须和训练时内存里的模型完全一致；页面上显示「identical」才算能用。</li>
+  </ol>
+  <h3 id="rollout">Rollout 页（11-16 起，臂不动）</h3>
+  <p>页面顶上写着现在支持到哪一级：<b>离线预测、在线预览、执行前检查已经能用；上真机执行还没有做</b>。</p>
+  <ol>
+    <li><b>离线预测：</b>选 checkpoint 和一份导出，每隔几帧走一遍<b>和在线完全相同的代码路径</b>（整幅画面 → 同一个裁剪 → 策略），和手实际的运动比。结果里有每一步的位置、角度、开度误差，一个「不动」策略作对照，还有「训练用的图像」和「在线算出来的图像」各自预测出的差别。用训练过的导出测，看到的是拟合程度，不是泛化，页面会标出来。</li>
+    <li><b>在线预览：</b>录制器 Connect 之后才能开始。策略读录制器的实时画面（帧总线，全分辨率，不自己打开相机）和<b>臂上夹爪 BOX</b> 的开度、外力，臂保持不动，什么都不发给臂。每一步的输入输出都会存下来；之后点 <span class="ui">Replay check</span>，把存下的输入重新走离线那条路，预测必须完全一致，以此确认在线和离线是同一套处理。外力用的是这次 Connect 后最近一次 BOX 零点，导出用的是每段首尾的静止，这个差别写在每份预览记录里。</li>
+    <li><b>执行前检查</b>（勾选「读一次关节」才有：连一次臂只读当前角度，不动）：每次预测都算一遍目标 = 观测时刻的 FK × ΔT（基座系），检查 IK 能不能到、会不会出训练集的工作空间（经当天的注册边换到基座系；守卫红条在时直接拒绝）、离小车、桌子、相机够不够远。结果只显示「会通过 / 会停」和原因，不执行。</li>
+    <li><b>臂上的 TCP 点</b>：训练标签的点是插件 nov4 的球窝中心（轴向和 <code>corenetic_gripper_ee</code> 相同），在臂的 URDF 里是 <code>corenetic_socket_ee</code>，比 <code>corenetic_gripper_ee</code> 的原点远 33.5 mm。执行层的 FK 一律算到 <code>corenetic_socket_ee</code>，代码里有检查。</li>
+  </ol>
+  <h3>旧推理脚本</h3>
   <ul>
-    <li>训练：GUI 只能准备训练视图，训练本身还要另外手动跑。</li>
-    <li>推理：<b>还没有能用的推理</b>。<code>tools/fr3/fr3_act_infer_real_runtime.py</code> 和 <code>tools/fr3/run_pick_place_infer*.sh</code> 都已过时（后者还是旧设备 pika 夹爪、海康相机用的），<b>不要用</b>。比如它直接用 v4l2 抓相机、帧率 30 fps、末端相机叫 <code>gmsl2_wrist</code>，和现在的录制管线、帧率、键名（<code>cam_10</code>）都对不上。重做按下面的输入规格。</li>
-    <li>GUI 里的分级放行流程还在做：离线对比 → MuJoCo → 真机只看不动 → 真机限幅执行。做好之前，推理只能到「真机只看不动」（<code>--preview</code>）这一级，必须有维护者在场，且有人守着急停。结果里要注明「未验证链路」。</li>
+    <li><code>tools/fr3/fr3_act_infer_real_runtime.py</code> 和 <code>tools/fr3/run_pick_place_infer*.sh</code> 都已过时（后者还是旧设备 pika 夹爪、海康相机用的），<b>不要用</b>。比如它直接用 v4l2 抓相机、帧率 30 fps、末端相机叫 <code>gmsl2_wrist</code>，和现在的录制管线、帧率、键名（<code>cam_10</code>）都对不上。</li>
   </ul>
-  <h3 id="infer-inputs">新推理的输入规格（11-16 定，还没实现）</h3>
+  <h3 id="infer-inputs">新推理的输入规格（11-16 定；Training / Rollout 按它实现，执行层只实现到检查）</h3>
   <p>手持采集器和臂上的末端是<b>同构</b>的：同款夹爪、同款 BOX、同一位置的末端相机 <code>cam_10</code>。所以录下来的数据可以直接训练，人和机器人不一样的只有末端后面的部分（人的手臂和身体，或者机械臂和小车）。规格按这个原则定：<b>策略的输入和输出只用末端上能测、能执行的量；和具体哪台臂、臂放在哪有关的事，全部交给执行层。</b></p>
   <h4 id="infer-relative">位姿用相对量，不用任何坐标系里的绝对位姿</h4>
   <p>策略看到的位姿和输出的动作都是<b>相对 TCP 自己</b>的量（做法同 UMI）：</p>
