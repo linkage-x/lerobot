@@ -692,13 +692,16 @@ def test_one_pad_sessions_keep_their_names_but_never_share_an_export_with_two_pa
     new = _make_video_session(datasets, "pick_20261103_101320", {0: 4}, cams=cams, w=64, h=64, fps=30, with_box=False, world_frame_id=world)
     _write_box_parquet(new, {0: 4}, state_width=len(lr3.BOX_STATE_NAMES))
 
+    # The layouts are the point here, not 6D (exported without it: these sessions have no payload model).
     out = export_v3.export_task_to_v3(
         datasets_root=datasets, exports_root=tmp_path / "exports",
-        base_name="local/pick", repo_id="local/pick", task="pick",
+        base_name="local/pick", repo_id="local/pick", task="pick", six_d="none",
     )
 
     info = json.loads((out / "meta" / "info.json").read_text())
-    assert info["features"]["observation.state"]["names"] == list(lr3.BOX_STATE_NAMES_ONE_PAD)
+    from tools.thor.gmsl2 import box_six_d as bsd
+
+    assert info["features"]["observation.state"]["names"] == bsd.drop_six_d_names(lr3.BOX_STATE_NAMES_ONE_PAD)
     assert info["total_episodes"] == 1
     said = capsys.readouterr().out
     assert "one touch pad per finger" in said
@@ -1258,3 +1261,172 @@ def test_the_table_check_runs_in_the_tracker_venv_and_reads_back_what_it_wrote(t
     )
     (session / export_v3._TABLE_CHECK_FILE).unlink()
     assert export_v3._table_check(session) == {"verdict": "unchecked", "why": "KeyError: 'x'"}
+
+
+# ------------------------------------------------------------ 6D: external wrench ---
+
+
+def _six_d_session(datasets: Path, name: str, *, names: list[str], zero: bool, push_n: float, seed: int):
+    """A one-BOX session whose recorder parquet carries ``names``, with a 6D channel the test controls."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from test_box_six_d import _episode, _meta
+
+    n = 150  # 5 s at 30 fps: 2 s still at each end, the push in between
+    session = _make_video_session(
+        datasets, name, {0: n}, cams=("cam_00",), w=64, h=64, fps=30, with_box=False,
+        world_frame_id="world_20260819_031843",
+    )
+    ep_dir = session / "episodes" / "episode_000000"
+    meta = json.loads((ep_dir / "meta.json").read_text())
+    meta.update(_meta(zero=zero))
+    (ep_dir / "meta.json").write_text(json.dumps(meta))
+    push = [[0.0] * 6 for _ in range(n)]
+    for row in push[70:80]:
+        row[2] = push_n
+    import numpy as np
+
+    rows, _acc, _ = _episode(names, n=n, push=np.asarray(push), seed=seed)
+    data = session / "data" / "chunk-000"
+    data.mkdir(parents=True)
+    table = pa.table(
+        {
+            "observation.state": rows.tolist(),
+            "frame_index": list(range(n)),
+            "episode_index": [0] * n,
+        },
+        schema=pa.schema([
+            ("observation.state", pa.list_(pa.float32(), len(names))),
+            ("frame_index", pa.int64()),
+            ("episode_index", pa.int64()),
+        ]),
+    )
+    pq.write_table(table, data / "file-000.parquet")
+    (session / "meta").mkdir(exist_ok=True)
+    (session / "meta" / "info.json").write_text(
+        json.dumps({"features": {"observation.state": {"dtype": "float32", "shape": [len(names)], "names": names}}})
+    )
+    return session
+
+
+def _registry_file(tmp_path: Path, valid_from: float = 100.0) -> Path:
+    from test_box_six_d import _registry
+
+    path = tmp_path / "box_devices.json"
+    path.write_text(json.dumps(_registry(valid_from=valid_from)))
+    return path
+
+
+def _six_d_export(datasets: Path, tmp_path: Path, **kwargs):
+    return export_v3.export_task_to_v3(
+        datasets_root=datasets, exports_root=tmp_path / "exports",
+        base_name="local/pick", repo_id="local/pick", task="pick", **kwargs,
+    )
+
+
+def _needs_transcoder():
+    import shutil as _sh
+
+    pytest.importorskip("pyarrow")
+    if _sh.which("ffmpeg") is None and _sh.which("gst-launch-1.0") is None:
+        pytest.skip("no transcoder (ffmpeg / gst-launch-1.0) available")
+
+
+def test_the_export_writes_the_external_wrench_and_never_the_recorded_6d(tmp_path, monkeypatch):
+    _needs_transcoder()
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    import pyarrow.parquet as pq
+
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    names = list(lr3.BOX_STATE_NAMES)
+    _six_d_session(datasets, "pick_20261113_101046", names=names, zero=True, push_n=3.0, seed=1)
+    _six_d_session(datasets, "pick_20261113_111046", names=names, zero=False, push_n=0.0, seed=2)
+
+    out = _six_d_export(datasets, tmp_path, six_d_registry=_registry_file(tmp_path))
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    exported = info["features"]["observation.state"]["names"]
+    assert not [n for n in exported if n.startswith("box_six_d_force")]
+    assert info["features"]["action"]["names"] == exported
+    fz = exported.index("box_six_d_external.fz")
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet").to_pydict()
+    states = [row for row, ep in zip(table["observation.state"], table["episode_index"], strict=True) if ep == 0]
+    assert max(abs(s[fz]) for s in states[:70] + states[80:]) < 0.1  # free air: no external force
+    assert all(abs(s[fz] - 3.0) < 0.1 for s in states[70:80])  # the 3 N push, gravity and bias gone
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())["episodes"]
+    assert [e["six_d"][0]["bias_source"] for e in sources] == ["still_frames", "still_frames"]
+    assert "still_vs_zero_force_N" in sources[0]["six_d"][0] and "zero_unused" in sources[1]["six_d"][0]
+    assert info["label_provenance"]["key"]["six_d_payload"] == ["box7@100"]
+
+
+def test_an_episode_without_a_payload_model_stops_the_export_before_anything_is_written(tmp_path, monkeypatch):
+    _needs_transcoder()
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    _six_d_session(datasets, "pick_20261113_101046", names=list(lr3.BOX_STATE_NAMES), zero=True, push_n=0.0, seed=1)
+    with pytest.raises(RuntimeError, match="no fitted payload model"):
+        _six_d_export(datasets, tmp_path, six_d_registry=_registry_file(tmp_path, valid_from=5_000.0))
+    assert not (tmp_path / "exports" / "pick").exists()
+
+    out = _six_d_export(datasets, tmp_path, six_d="none", six_d_registry=_registry_file(tmp_path, valid_from=5_000.0))
+    exported = json.loads((out / "meta" / "info.json").read_text())["features"]["observation.state"]["names"]
+    assert not [n for n in exported if "six_d" in n]
+
+
+def test_sessions_fitted_with_two_payload_models_do_not_share_an_export(tmp_path, monkeypatch):
+    _needs_transcoder()
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from test_box_six_d import K_TRUE, _registry
+
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    names = list(lr3.BOX_STATE_NAMES)
+    _six_d_session(datasets, "pick_20261113_101046", names=names, zero=True, push_n=0.0, seed=1)
+    _six_d_session(datasets, "pick_20261113_111046", names=names, zero=True, push_n=0.0, seed=2)
+    reg = _registry()
+    # the second session starts after a re-fit of the same BOX: its external wrench went through another K
+    meta_path = datasets / "pick_20261113_111046" / "episodes" / "episode_000000" / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["sync_reference"]["t0_wall_s"] = 3_000.0
+    meta["box_six_d_zero"]["7"]["wall_s"] = 2_900.0
+    meta_path.write_text(json.dumps(meta))
+    reg["devices"]["7"]["six_d_payload"].append({"valid_from_unix": 2_000.0, "model": "affine_acc/v1", "K": K_TRUE.tolist()})
+    path = tmp_path / "two.json"
+    path.write_text(json.dumps(reg))
+
+    with pytest.raises(Exception, match="six_d_payload"):
+        _six_d_export(datasets, tmp_path, six_d_registry=path)
+    out = _six_d_export(datasets, tmp_path, six_d_registry=path, allow_mixed_labels=True)
+    assert json.loads((out / "meta" / "info.json").read_text())["label_provenance"]["mixed_fields"] == ["six_d_payload"]
+
+
+def test_an_episode_not_held_still_at_its_ends_is_left_out_and_said(tmp_path, monkeypatch, capsys):
+    _needs_transcoder()
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+
+    datasets = tmp_path / "datasets"
+    names = list(lr3.BOX_STATE_NAMES)
+    _six_d_session(datasets, "pick_20261113_101046", names=names, zero=False, push_n=0.0, seed=1)
+    restless = _six_d_session(datasets, "pick_20261113_111046", names=names, zero=False, push_n=0.0, seed=2)
+    import pyarrow.parquet as pq
+
+    parquet = restless / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(parquet).to_pydict()
+    gyr = names.index("box_imu.gyr_x_deg_s")
+    for row in table["observation.state"]:
+        row[gyr] = 40.0  # turning the whole time
+    import pyarrow as pa
+
+    pq.write_table(pa.table(table, schema=pq.read_schema(parquet)), parquet)
+
+    out = _six_d_export(datasets, tmp_path, six_d_registry=_registry_file(tmp_path))
+
+    assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == 1
+    said = capsys.readouterr().out
+    assert "leaving out pick_20261113_111046/episode_000000" in said and "开始和结束各静止" in said

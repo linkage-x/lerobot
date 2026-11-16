@@ -69,6 +69,7 @@ if str(_REPO_ROOT) not in sys.path:
 # pyarrow-only helpers shared with the recorder's box v3 writer.
 from tools.fr3 import fr3_arms  # noqa: E402
 from tools.thor.gmsl2 import (  # noqa: E402
+    box_six_d as bsd,
     label_provenance as lp,
     thor_lerobot_v3 as lr3,
     world_provenance as wp,
@@ -452,6 +453,55 @@ def _align_touch_rows(
 
 # ----------------------------------------------------- box ↔ camera sync ---
 
+
+
+#: What becomes of each BOX's recorded 6D channel in the export (``--six-d``): ``external`` replaces it
+#: with the external wrench (box_six_d.plan_episode: each BOX's own payload model and bias), ``none``
+#: leaves 6D out. The recorded reading and the SDK's no_gravity are never exported: neither is the
+#: same quantity on a hand-held BOX and on the arm's (tools/thor/ts_sync.md §9.1).
+SIX_D_MODES = ("external", "none")
+
+
+def _recorded_state_names(
+    session_dir: Path, width: int, box_ids: tuple[str, ...]
+) -> list[str] | None:
+    """The names of a session's recorded ``observation.state``: its own info.json, else the layout of that width.
+
+    The recorder writes the names into the session's info.json; sessions without them get the
+    current layout or an earlier one whose width matches, and None (nameless) when none does.
+    """
+    try:
+        info = json.loads((session_dir / "meta" / "info.json").read_text(encoding="utf-8"))
+        names = ((info.get("features") or {}).get("observation.state") or {}).get("names")
+    except (OSError, ValueError):
+        names = None
+    if isinstance(names, list) and len(names) == width and all(isinstance(n, str) for n in names):
+        return list(names)
+    for layout in lr3.box_state_layouts(box_ids):
+        if len(layout) == width:
+            return list(layout)
+    return None
+
+
+def _export_state_names(recorded: list[str] | None, six_d: str) -> list[str] | None:
+    if recorded is None:
+        return None
+    if six_d == "external":
+        return bsd.external_state_names(recorded)
+    return bsd.drop_six_d_names(recorded)
+
+
+def _export_state_rows(
+    names: list[str], rows: list[list[float]], six_d: str, plans: list[bsd.SixDPlan] | None
+) -> list[list[float]]:
+    """A recorded episode's state rows in the export layout (:func:`_export_state_names`)."""
+    if six_d == "external":
+        if plans is None:
+            raise RuntimeError("an episode with a 6D channel reached the writer without a 6D plan")
+        return bsd.apply_external(names, rows, plans)
+    kept = set(bsd.drop_six_d_names(names))
+    keep = [i for i, name in enumerate(names) if name in kept]
+    return [[row[i] for i in keep] for row in rows]
 
 
 def _next_state_actions(state_rows: list[list[float]]) -> list[list[float]]:
@@ -1326,6 +1376,8 @@ def _describe_table_check(check: dict[str, Any]) -> str:
 
 def _describe_labels(labels: dict[str, Any]) -> str:
     pairing = "/".join(labels.get("box_pairing") or []) or "?"
+    if "six_d_payload" in labels:
+        pairing += f", 6D {'/'.join(labels['six_d_payload']) or '?'}"
     if not labels.get("tracked"):
         return f"untracked, BOX {pairing}"
     px = labels.get("camera_state_px")
@@ -1384,6 +1436,8 @@ def export_task_to_v3(
     target_world: str | None = None,
     allow_mixed_labels: bool = False,
     check_only: bool = False,
+    six_d: str = "external",
+    six_d_registry: Path | None = None,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
@@ -1455,26 +1509,42 @@ def export_task_to_v3(
 
     has_box = state_width > 0
 
-    # Sessions recorded before the fingertip pads joined observation.state
-    # (2026-11-03) have the same channels minus the trailing box_touch_*_1 ones,
-    # so they keep their names -- but they are a different layout, and the
-    # per-episode loop below refuses to put the two into one dataset.
-    if has_box and len(box_state_names) != state_width:
-        one_pad = lr3.box_state_names(first_snapshot_box_ids, one_pad=True)
-        if len(one_pad) == state_width:
-            box_state_names = list(one_pad)
+    # Each session's recorded layout is named by its own info.json (else by width,
+    # lr3.box_state_layouts); what the export writes is that layout with the 6D
+    # channel turned into the external wrench (or dropped, --six-d none). Sessions
+    # recorded in different layouts share an export when they export to the same
+    # names: the recorder dropping the SDK's no_gravity changed the recording, not
+    # the export. Sessions recorded before the fingertip pads joined
+    # observation.state (2026-11-03) lack the trailing box_touch_*_1 channels, so
+    # they export to other names, and the per-episode loop below refuses to put the
+    # two into one dataset.
+    if six_d not in SIX_D_MODES:
+        raise RuntimeError(f"--six-d must be one of {', '.join(SIX_D_MODES)}, not {six_d!r}")
+    recorded_names_by_session: dict[Path, list[str] | None] = {}
+
+    def recorded_names_of(session_dir: Path, width: int) -> list[str] | None:
+        if session_dir not in recorded_names_by_session:
+            recorded_names_by_session[session_dir] = _recorded_state_names(
+                session_dir, width, first_snapshot_box_ids
+            )
+        return recorded_names_by_session[session_dir]
+
+    recorded_state_names = recorded_names_of(first.session_dir, state_width) if has_box else None
+    if recorded_state_names is not None:
+        box_state_names = recorded_state_names
+        if recorded_state_names == list(lr3.box_state_names(first_snapshot_box_ids, one_pad=True)):
             box_ts_names = list(lr3.box_timestamp_names(first_snapshot_box_ids, one_pad=True))
             _emit(
                 f"NOTE: one touch pad per finger in observation.state ({state_width} channels, "
                 "recorded before 2026-11-03); the fingertip pads are not in it"
             )
 
-    # The recorded parquet width wins, but a width that disagrees with the
-    # current BOX_STATE_NAMES means the session predates a schema change (e.g.
-    # the 31-dim rpy+quat_wxyz layout vs today's 28-dim quat_xyzw one). The
-    # writer then has no trustworthy names for those columns and drops them, so
-    # say it out loud instead of emitting a nameless observation.state.
-    if has_box and len(box_state_names) != state_width:
+    # A width no known layout has and no names in the session's info.json means the
+    # session predates a schema change (e.g. the 31-dim rpy+quat_wxyz layout vs the
+    # 28-dim quat_xyzw one). The writer then has no trustworthy names for those
+    # columns and drops them, so say it out loud instead of emitting a nameless
+    # observation.state.
+    if has_box and recorded_state_names is None:
         _emit(
             f"WARNING: session state width {state_width} != current schema "
             f"{len(box_state_names)} ({', '.join(box_state_names[:3])}, ...); "
@@ -1491,11 +1561,75 @@ def export_task_to_v3(
     touch_width = _detect_touch_width([src.ep_dir for src in episodes])
     touch_columns = _touch_array_columns(_detect_touch_sensors([src.ep_dir for src in episodes]))
     touch_model = lr3.touch_model_for_point_count(touch_width)
+    export_state_names = _export_state_names(recorded_state_names, six_d)
+    export_state_width = len(export_state_names) if export_state_names is not None else state_width
     _emit(
         f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, "
-        f"state_width={state_width}, touch={touch_width} taxels "
+        f"state_width={export_state_width} (recorded {state_width}), touch={touch_width} taxels "
         f"({touch_model or 'unrecognised pad'})"
     )
+
+    # The 6D channel, per episode and BOX, before a byte is written: which payload
+    # model and which bias turn it into the external wrench. A BOX with no payload
+    # model stops the export (setup: fit and register it); an episode that gives no
+    # bias (not held still at its ends, no software zero) is left out and said.
+    # Never silent zeros, never the raw reading under the external name.
+    box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
+    six_d_plans: dict[tuple[Path, int], list[bsd.SixDPlan]] = {}
+    six_d_labels: dict[str, set[str]] = {}
+    six_d_dropped: dict[tuple[Path, int], str] = {}
+    if has_box and recorded_state_names is not None and bsd.six_d_prefixes(recorded_state_names):
+        registry = bsd.load_registry(six_d_registry or bsd.REGISTRY_PATH)
+        refused: list[str] = []
+        for src in episodes:
+            if src.session_dir not in box_cache:
+                box_cache[src.session_dir] = _load_box_rows(src.session_dir)
+            rows = box_cache[src.session_dir].get(src.local_index) or []
+            if not rows:
+                continue  # skipped by the loop below, which says why
+            names = recorded_names_of(src.session_dir, len(rows[0]["observation.state"]))
+            if _export_state_names(names, six_d) != export_state_names:
+                continue  # another layout: skipped by the loop below
+            labels = six_d_labels.setdefault(src.session_dir.name, set())
+            if six_d == "none":
+                labels.add("none")
+                continue
+            where = f"{src.session_dir.name}/{src.ep_dir.name}"
+            try:
+                plans = bsd.plan_episode(
+                    names, [r["observation.state"] for r in rows], _load_meta(src.ep_dir), registry
+                )
+            except bsd.SixDNoBiasError as exc:
+                six_d_dropped[(src.session_dir, src.local_index)] = str(exc)
+                _emit(f"WARNING: leaving out {where}: {exc}")
+                continue
+            except bsd.SixDExportError as exc:
+                refused.append(f"  {where}: {exc}")
+                continue
+            six_d_plans[(src.session_dir, src.local_index)] = plans
+            for plan in plans:
+                labels.add(plan.label())
+                r = plan.record
+                _emit(
+                    f"6D: {where}: BOX {plan.device_id} payload@{r['payload_valid_from_unix']} "
+                    f"({r['payload_status']}), bias from {plan.source.replace('_', ' ')}"
+                    + (f" ({r['still_frames']} still frames)" if plan.source == "still_frames" else "")
+                )
+                for warning in plan.warnings:
+                    _emit(f"WARNING: {where}: {warning}")
+        if refused:
+            raise RuntimeError(
+                f"cannot turn the 6D channel into the external wrench for {len(refused)} episode(s):\n"
+                + "\n".join(refused)
+                + "\nFit and register the BOX's payload (box_six_d fit/register), leave these "
+                "episodes out, or export without 6D (--six-d none)."
+            )
+        if six_d_dropped:
+            _emit(
+                f"WARNING: {len(six_d_dropped)} episode(s) left out: the 6D bias comes from the "
+                f"first and last {bsd.STILL_WINDOW_S:g} s held still with the trigger released "
+                "(使用指南: 开始和结束各静止 1-2 秒)"
+            )
 
     # One dataset, one world. Absolute poses from two coordinate systems
     # concatenated into one training set are wrong in a way no downstream check
@@ -1571,6 +1705,11 @@ def export_task_to_v3(
     # marker->TCP bundle, BOX pairing can each move the labels by millimetres
     # without changing the world id, so the sessions must agree on every one.
     session_labels = _session_labels(episodes)
+    # Which payload model each session's 6D went through is a link of the chain too:
+    # a re-fitted K moves the external wrench without changing anything else.
+    for session, labels in session_labels.items():
+        if session in six_d_labels:
+            labels["six_d_payload"] = sorted(six_d_labels[session])
     for session, labels in session_labels.items():
         _emit(f"Labels: {session}: {_describe_labels(labels)}")
     for session_dir in sorted({src.session_dir for src in episodes}):
@@ -1614,8 +1753,8 @@ def export_task_to_v3(
         height=height,
         width=width,
         video_keys=video_keys,
-        state_width=state_width,
-        state_names=box_state_names if state_width else None,
+        state_width=export_state_width,
+        state_names=export_state_names if state_width else None,
         ts_width=ts_width,
         ts_names=box_ts_names if ts_width else None,
         pose_columns=pose_columns,
@@ -1626,7 +1765,6 @@ def export_task_to_v3(
         label_provenance=label_provenance,
     )
 
-    box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
     sources: list[dict[str, Any]] = []
     global_index = 0
     for src in episodes:
@@ -1636,6 +1774,8 @@ def export_task_to_v3(
             _emit(f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: camera set mismatch")
             continue
         src_codec = str((meta.get("video") or {}).get("codec") or "h265").lower()
+        if (src.session_dir, src.local_index) in six_d_dropped:
+            continue  # said above, before anything was written
 
         if src.session_dir not in box_cache:
             box_cache[src.session_dir] = _load_box_rows(src.session_dir)
@@ -1663,12 +1803,22 @@ def export_task_to_v3(
         if has_box:
             box_rows = box_cache[src.session_dir].get(src.local_index, [])
             parquet_width = len(box_rows[0].get("observation.state", [])) if box_rows else 0
-            if box_rows and parquet_width == state_width:
+            names = recorded_names_of(src.session_dir, parquet_width) if box_rows else None
+            if export_state_names is not None:
+                compatible = _export_state_names(names, six_d) == export_state_names
+            else:
+                compatible = parquet_width == state_width
+            if box_rows and compatible:
                 # Default: align the recorder's pre-synced box parquet to the
                 # camera grid by frame_index (ts_sync.md §6), not list position.
                 state_rows, action_rows, ts_rows, missing = _align_box_rows_by_frame_index(
-                    box_rows, n_frames, state_width, ts_width
+                    box_rows, n_frames, parquet_width, ts_width
                 )
+                if names is not None and names != export_state_names:
+                    state_rows = _export_state_rows(
+                        names, state_rows, six_d, six_d_plans.get((src.session_dir, src.local_index))
+                    )
+                    action_rows = _next_state_actions(state_rows)
                 box_grid_len = max(int(r["frame_index"]) for r in box_rows) + 1
                 if missing:
                     _emit(
@@ -1760,6 +1910,11 @@ def export_task_to_v3(
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
                 "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
+                "six_d": (
+                    [plan.record for plan in six_d_plans.get((src.session_dir, src.local_index), [])]
+                    if six_d == "external"
+                    else six_d
+                ),
             }
         )
         _emit(f"Episode {global_index} written ({n_frames} frames) from {src.session_dir.name}/{src.ep_dir.name}")
@@ -1820,6 +1975,14 @@ def main(argv: list[str] | None = None) -> int:
         "combine the result with another dataset",
     )
     ap.add_argument(
+        "--six-d",
+        choices=SIX_D_MODES,
+        default="external",
+        help="external (default): each BOX's 6D channel becomes the external wrench "
+        "(box_six_d_external.*: its payload model from tools/thor/box_devices.json and the bias of "
+        "its zero or of the episode's still frames); none: leave 6D out of observation.state",
+    )
+    ap.add_argument(
         "--check",
         action="store_true",
         help="run the world and label checks and print each session's label chain; write nothing",
@@ -1840,6 +2003,7 @@ def main(argv: list[str] | None = None) -> int:
             target_world=args.target_world,
             allow_mixed_labels=args.allow_mixed_labels,
             check_only=args.check,
+            six_d=args.six_d,
         )
     except Exception as exc:  # noqa: BLE001
         _emit(f"ERROR: {exc}")

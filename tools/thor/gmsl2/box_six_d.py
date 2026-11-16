@@ -534,6 +534,260 @@ def compensate_episode(ep_dir: Path, registry: dict[str, Any] | None = None) -> 
     return out
 
 
+# --- export: the external wrench in place of the recorded 6D channels ---------------------------
+#
+# The recorder's observation.state carries the 6D channel as read (``box_six_d_force.*``: after
+# whatever zero this Connect had, so a per-session constant rides in it) and, until the recorder
+# dropped it, the SDK's ``box_six_d_force_no_gravity.*`` (the vendor's one payload and extrinsic,
+# wrong for every BOX we have: 7.8 N off right after an origin, up to ~15 N at other attitudes).
+# Neither is the same quantity on a hand-held BOX and on the arm's BOX, which carry different
+# payloads. Training needs what both share: the external wrench, each BOX with its own K. The export
+# replaces both recorded groups with ``box_six_d_external.*``; the recording keeps the raw reading so
+# a better K later only needs a re-export.
+
+EXTERNAL_GROUP = "box_six_d_external"
+RECORDED_GROUPS = ("box_six_d_force", "box_six_d_force_no_gravity")
+SIX_D_AXES = ("fx", "fy", "fz", "mx", "my", "mz")
+_SIX_D_NAME_RE = re.compile(
+    r"^(?P<prefix>(?:[^.]+\.)?)(?P<group>box_six_d_force(?:_no_gravity)?)\.(?P<axis>fx|fy|fz|mx|my|mz)$"
+)
+_BOX_PREFIX_RE = re.compile(r"^box(\d+)\.$")
+#: An episode's bias comes from its own still frames with the trigger let go, in its first and last
+#: STILL_WINDOW_S (the guide asks for 1-2 s still at both ends; elsewhere a slow push with the gripper
+#: open looks still too): at least STILL_MIN_FRAMES of them, 0.5 s at 60 fps. 131 of the 139 weekend
+#: episodes have them in the first 2 s, and the first and last 2 s agree within 0.63 N. Measured on the 11-13/11-15
+#: recordings (139 episodes): within a session these biases move smoothly (183417: Fz 8.68 -> 7.03 N
+#: over 30 episodes, the warm-up drift), each episode's still frames scatter < 0.15 N, while a
+#: software zero's bias sat 0.5-0.9 N off from the first episode on (a K fitted at other attitudes)
+#: and 1.7 N off half an hour after a cold start (170638). So the still frames come first; the zero
+#: is the fallback, and the check on them.
+STILL_MIN_FRAMES = 30
+STILL_WINDOW_S = 2.0
+TRIGGER_RELEASED_PCT = 5.0
+#: Still frames this far (force norm) from the zero's bias are more than drift: the BOX probably
+#: touched something while it was still, and the warning says so.
+BIAS_DISAGREE_WARN_N = 2.0
+
+
+class SixDExportError(ValueError):
+    """An episode's 6D channel cannot be turned into an external wrench (a missing model or id: setup)."""
+
+
+class SixDNoBiasError(SixDExportError):
+    """The episode itself gives no bias: not still at its ends, and no software zero (the operator's)."""
+
+
+def six_d_prefixes(names: list[str] | tuple[str, ...]) -> list[str]:
+    """The BOX prefixes (``""`` or ``"box<id>."``) whose recorded 6D channel is in ``names``."""
+    out: list[str] = []
+    for name in names:
+        m = _SIX_D_NAME_RE.match(name)
+        if m and m["group"] == "box_six_d_force" and m["axis"] == "fx" and m["prefix"] not in out:
+            out.append(m["prefix"])
+    return out
+
+
+def external_state_names(names: list[str] | tuple[str, ...]) -> list[str]:
+    """``names`` with each BOX's recorded 6D groups replaced by ``box_six_d_external.*`` in their place."""
+    out: list[str] = []
+    for name in names:
+        m = _SIX_D_NAME_RE.match(name)
+        if not m:
+            out.append(name)
+        elif m["group"] == "box_six_d_force" and m["axis"] == "fx":
+            out.extend(f"{m['prefix']}{EXTERNAL_GROUP}.{axis}" for axis in SIX_D_AXES)
+    return out
+
+
+def drop_six_d_names(names: list[str] | tuple[str, ...]) -> list[str]:
+    """``names`` without any BOX's recorded 6D groups (an export with ``--six-d none``)."""
+    return [name for name in names if not _SIX_D_NAME_RE.match(name)]
+
+
+def episode_device_id(prefix: str, meta: dict[str, Any]) -> str | None:
+    """The device id of the BOX behind ``prefix`` in an episode.
+
+    Several BOXes name their channels ``box<id>.``; a one-BOX recording names them bare, and its id
+    is what the recorder's snapshots report (``status.device_id``), else the only zeroed or
+    registered BOX of the episode.
+    """
+    if prefix:
+        m = _BOX_PREFIX_RE.match(prefix)
+        return m.group(1) if m else None
+    for snapshot in (meta.get("box_collection") or {}).get("snapshots") or []:
+        device = ((snapshot or {}).get("status") or {}).get("device_id")
+        if device:
+            return str(int(device))
+    for key in ("box_six_d_zero", "box_devices"):
+        ids = [k for k in (meta.get(key) or {}) if str(k).isdigit()]
+        if len(ids) == 1:
+            return str(int(ids[0]))
+    return None
+
+
+def episode_start_unix(meta: dict[str, Any]) -> float | None:
+    t0 = (meta.get("sync_reference") or {}).get("t0_wall_s")
+    if t0:
+        return float(t0)
+    stamp = meta.get("wallclock_start_utc")
+    if stamp:
+        try:
+            return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class SixDPlan:
+    """How one BOX's 6D channel of one episode becomes the external wrench."""
+
+    prefix: str
+    device_id: str
+    model: PayloadModel
+    bias: np.ndarray  # (6,)
+    source: str  # "software_zero" | "still_frames"
+    record: dict[str, Any]  # what export_sources.json keeps
+    warnings: tuple[str, ...]
+
+    def label(self) -> str:
+        """What the label chain compares: which K, by BOX and the record's start."""
+        return f"box{self.device_id}@{int(self.model.valid_from_unix)}"
+
+
+def _columns(names: list[str], rows: np.ndarray, prefix: str, wanted: list[str]) -> np.ndarray:
+    index = {n: i for i, n in enumerate(names)}
+    missing = [prefix + w for w in wanted if prefix + w not in index]
+    if missing:
+        raise SixDExportError(f"observation.state has no {', '.join(missing)}")
+    return rows[:, [index[prefix + w] for w in wanted]]
+
+
+def _six_d_inputs(names: list[str], rows: np.ndarray, prefix: str):
+    f = _columns(names, rows, prefix, [f"box_six_d_force.{a}" for a in SIX_D_AXES])
+    acc = _columns(names, rows, prefix, [f"box_imu.acc_{a}_g" for a in "xyz"])
+    gyr = _columns(names, rows, prefix, [f"box_imu.gyr_{a}_deg_s" for a in "xyz"])
+    trig = _columns(names, rows, prefix, ["box_trigger.travel_pct"])[:, 0]
+    return f, acc, gyr, trig
+
+
+def plan_episode(
+    names: list[str] | tuple[str, ...],
+    rows: list[list[float]] | np.ndarray,
+    meta: dict[str, Any],
+    registry: dict[str, Any],
+) -> list[SixDPlan]:
+    """One :class:`SixDPlan` per BOX with a recorded 6D channel; raises :class:`SixDExportError`.
+
+    The bias is the median of ``f - K @ acc`` over the still frames with the trigger released in the
+    episode's first and last :data:`STILL_WINDOW_S` (see :data:`STILL_MIN_FRAMES` for why it comes first); with too few of them, the software zero's
+    (``f0 - K @ acc0`` from ``meta.box_six_d_zero``), when the episode has one taken before it started
+    with the payload in force. When both exist they are compared and a gap over
+    :data:`BIAS_DISAGREE_WARN_N` is a warning.
+    """
+    names = list(names)
+    data = np.asarray(rows, dtype=float)
+    if data.ndim != 2 or data.shape[1] != len(names):
+        raise SixDExportError(f"observation.state rows are not {len(names)} wide")
+    start = episode_start_unix(meta)
+    if start is None:
+        raise SixDExportError("meta.json has no start time (sync_reference.t0_wall_s / wallclock_start_utc)")
+    plans: list[SixDPlan] = []
+    for prefix in six_d_prefixes(names):
+        did = episode_device_id(prefix, meta)
+        box = f"BOX {did}" if did else f"BOX {prefix.rstrip('.') or '(one-BOX recording)'}"
+        if did is None:
+            raise SixDExportError(f"{box}: no device id in meta.json, so no payload model can be chosen")
+        model = payload_model(registry, did, start)
+        if model is None:
+            raise SixDExportError(
+                f"{box}: no fitted payload model in force at the episode's start "
+                "(tools/thor/box_devices.json six_d_payload; fit one with box_six_d fit/register)"
+            )
+        f, acc, gyr, trig = _six_d_inputs(names, data, prefix)
+        residual = f - model.wrench(acc)
+        fps = float((meta.get("video") or {}).get("fps") or 60.0)
+        window = max(1, round(STILL_WINDOW_S * fps))
+        at_ends = np.zeros(len(data), dtype=bool)
+        at_ends[:window] = True
+        at_ends[-window:] = True
+        still = at_ends & static_mask(acc, gyr) & (trig < TRIGGER_RELEASED_PCT)
+        n_still = int(still.sum())
+        still_bias = np.median(residual[still], axis=0) if n_still >= STILL_MIN_FRAMES else None
+
+        zero_bias_v, zero_note = None, ""
+        zero = (meta.get("box_six_d_zero") or {}).get(did)
+        if not zero:
+            zero_note = "no 6D zero in this Connect"
+        elif zero.get("kind") != "software":
+            zero_note = f"last zero was {zero.get('kind')!r}, not a software zero"
+        elif zero.get("wall_s") is not None and float(zero["wall_s"]) > start:
+            zero_note = "the zero was taken after the episode started"
+        else:
+            try:
+                zero_bias_v = zero_bias(model, zero)
+            except (ValueError, KeyError) as exc:
+                zero_note = str(exc)
+
+        warnings: list[str] = []
+        record: dict[str, Any] = {
+            "device_id": did,
+            "payload_valid_from_unix": int(model.valid_from_unix),
+            "payload_status": model.status.split(":", 1)[0],
+            "still_frames": n_still,
+        }
+        if still_bias is not None:
+            bias, source = still_bias, "still_frames"
+            spread = np.median(np.abs(residual[still, :3] - still_bias[:3]), axis=0)
+            record["still_mad_N"] = [round(float(v), 3) for v in spread]
+            if zero_bias_v is None:
+                record["zero_unused"] = zero_note
+            else:
+                gap = float(np.linalg.norm(zero_bias_v[:3] - still_bias[:3]))
+                record["still_vs_zero_force_N"] = round(gap, 3)
+                if gap > BIAS_DISAGREE_WARN_N:
+                    warnings.append(
+                        f"{box}: the episode's still frames sit {gap:.2f} N from the zero's bias, more "
+                        "than drift: did the BOX touch something while it was still?"
+                    )
+        elif zero_bias_v is not None:
+            bias, source = zero_bias_v, "software_zero"
+            record["zero_wall_s"] = float(zero.get("wall_s") or 0.0)
+        else:
+            raise SixDNoBiasError(
+                f"{box}: only {n_still} still frames with the trigger released at its ends (need "
+                f"{STILL_MIN_FRAMES}) to take the bias from, and {zero_note}"
+            )
+        record["bias_source"] = source
+        record["bias"] = [round(float(v), 4) for v in bias]
+        plans.append(SixDPlan(prefix, did, model, bias, source, record, tuple(warnings)))
+    return plans
+
+
+def apply_external(
+    names: list[str] | tuple[str, ...], rows: list[list[float]], plans: list[SixDPlan]
+) -> list[list[float]]:
+    """``rows`` laid out as :func:`external_state_names` (``names``) says, the external wrench filled in."""
+    names = list(names)
+    data = np.asarray(rows, dtype=float).reshape(len(rows), len(names))
+    external = {}
+    for plan in plans:
+        f, acc, _gyr, _trig = _six_d_inputs(names, data, plan.prefix)
+        external[plan.prefix] = external_wrench(f, acc, plan.model, plan.bias)
+    columns: list[np.ndarray] = []
+    for i, name in enumerate(names):
+        m = _SIX_D_NAME_RE.match(name)
+        if not m:
+            columns.append(data[:, i : i + 1])
+        elif m["group"] == "box_six_d_force" and m["axis"] == "fx":
+            if m["prefix"] not in external:
+                raise SixDExportError(f"no plan for the 6D channel of {m['prefix'] or 'the BOX'}")
+            columns.append(external[m["prefix"]])
+    if not columns:
+        return [[] for _ in rows]
+    return np.hstack(columns).tolist()
+
+
 # --- registry writes ---------------------------------------------------------------------------
 
 

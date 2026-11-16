@@ -8,7 +8,7 @@ import json
 import numpy as np
 import pytest
 
-from tools.thor.gmsl2 import box_six_d as bsd
+from tools.thor.gmsl2 import box_six_d as bsd, thor_lerobot_v3 as lr3
 
 G = bsd.G
 # A rigid 0.5 kg payload, CoM 6 cm out along FT z, FT turned 180 deg about z from the IMU-ish frame.
@@ -358,3 +358,144 @@ def test_fit_cli_reads_the_times_from_the_log(tmp_path):
     fit = json.loads((tmp_path / "fit.json").read_text())
     assert fit["drift_same_attitude"]["axis"] == "Fx" and fit["box_uptime_s"]["start_s"] == 49.0
     assert len(fit["warnings"]) == 2
+
+
+# --- export: the external wrench in place of the recorded 6D channels ---------------------------
+
+START_S = 1_000.0
+ZERO_ACC = np.array([-1.0, 0.0, 0.0])
+BIAS = np.array([0.4, -1.2, 5.7, 0.2, -0.03, 0.02])
+
+
+def _registry(device="7", valid_from=100.0, K=K_TRUE):
+    return {
+        "schema": bsd.SCHEMA,
+        "devices": {device: {"role": "handheld", "six_d_payload": [{"valid_from_unix": valid_from, "model": bsd.MODEL, "K": K.tolist()}]}},
+    }
+
+
+def _episode(names, n=300, push=None, still_frames=None, trigger=0.0, seed=1):
+    """State rows of a hand-held episode: the BOX turns between attitudes, ``push`` (n, 6) is the external wrench."""
+    rng = np.random.default_rng(seed)
+    acc = np.repeat(_faces(n_per=1, seed=seed), -(-n // 6), axis=0)[:n]
+    gyr = np.zeros((n, 3))
+    if still_frames is not None:
+        gyr[still_frames:] = 40.0  # moving after the first `still_frames`
+    push = np.zeros((n, 6)) if push is None else push
+    f = acc @ K_TRUE.T + BIAS + push + rng.normal(0, 0.01, (n, 6))
+    rows = np.zeros((n, len(names)))
+    col = {name: i for i, name in enumerate(names)}
+    prefixes = bsd.six_d_prefixes(names)
+    for p in prefixes:
+        for k, a in enumerate(bsd.SIX_D_AXES):
+            rows[:, col[f"{p}box_six_d_force.{a}"]] = f[:, k]
+            if f"{p}box_six_d_force_no_gravity.{a}" in col:
+                rows[:, col[f"{p}box_six_d_force_no_gravity.{a}"]] = -99.0  # the SDK's: must never be exported
+        for k, a in enumerate("xyz"):
+            rows[:, col[f"{p}box_imu.acc_{a}_g"]] = acc[:, k]
+            rows[:, col[f"{p}box_imu.gyr_{a}_deg_s"]] = gyr[:, k]
+        rows[:, col[f"{p}box_trigger.travel_pct"]] = trigger
+        rows[:, col[f"{p}box_gripper.distance_m"]] = 0.05
+    return rows, acc, push
+
+
+def _meta(device="7", zero=True, zero_at=START_S - 60.0, snapshot_id=True):
+    meta = {"sync_reference": {"t0_wall_s": START_S}}
+    if snapshot_id:
+        meta["box_collection"] = {"snapshots": [{"status": {"device_id": int(device)}, "sensors": {}}]}
+    if zero:
+        meta["box_six_d_zero"] = {
+            device: {"kind": "software", "fxyz_mxyz": (ZERO_ACC @ K_TRUE.T + BIAS).tolist(), "acc_g": ZERO_ACC.tolist(), "wall_s": zero_at}
+        }
+    return meta
+
+
+def test_the_export_layout_swaps_both_recorded_6d_groups_for_the_external_wrench_in_place():
+    names = list(lr3.BOX_STATE_NAMES)
+    out = bsd.external_state_names(names)
+    assert not [n for n in out if "box_six_d_force" in n]
+    start = names.index("box_six_d_force.fx")
+    assert out[start : start + 6] == [f"box_six_d_external.{a}" for a in bsd.SIX_D_AXES]
+    assert out[:start] == names[:start] and out[start + 6 :] == names[start + 12 :]
+    two = list(lr3.box_state_names(("box7", "box8")))
+    assert bsd.six_d_prefixes(two) == ["box7.", "box8."]
+    assert "box8.box_six_d_external.mz" in bsd.external_state_names(two)
+    assert not [n for n in bsd.drop_six_d_names(two) if "six_d" in n]
+
+
+def _external(names, rows, plans):
+    out = np.asarray(bsd.apply_external(names, rows.tolist(), plans))
+    assert out.shape[1] == len(names) - 6
+    return out[:, [bsd.external_state_names(names).index(f"box_six_d_external.{a}") for a in bsd.SIX_D_AXES]]
+
+
+def test_the_bias_comes_from_the_episodes_still_released_frames_and_leaves_the_push_alone():
+    names = list(lr3.BOX_STATE_NAMES)
+    push = np.zeros((600, 6))
+    # pressing 3 N along FT z for the 6 s between the still ends, slowly, the gripper open: most of
+    # the episode, so only taking the still frames from its ends keeps the push out of the bias
+    push[120:480, 2] = 3.0
+    rows, _acc, push = _episode(names, n=600, push=push)
+    for meta in (_meta(), _meta(zero=False), _meta(zero_at=START_S + 5.0)):  # zero, none, mid-episode
+        plans = bsd.plan_episode(names, rows, meta, _registry())
+        assert [p.source for p in plans] == ["still_frames"] and plans[0].label() == "box7@100"
+        np.testing.assert_allclose(_external(names, rows, plans), push, atol=0.05)
+    origin = _meta()
+    origin["box_six_d_zero"]["7"]["kind"] = "origin"
+    (plan,) = bsd.plan_episode(names, rows, origin, _registry())
+    assert plan.source == "still_frames" and "origin" in plan.record["zero_unused"]
+
+
+def test_with_too_few_still_frames_the_software_zero_gives_the_bias():
+    names = list(lr3.BOX_STATE_NAMES)
+    push = np.zeros((300, 6))
+    push[150:, 2] = 3.0
+    rows, _acc, push = _episode(names, push=push, still_frames=10)
+    plans = bsd.plan_episode(names, rows, _meta(), _registry())
+    assert [p.source for p in plans] == ["software_zero"]
+    np.testing.assert_allclose(_external(names, rows, plans), push, atol=0.05)
+
+
+def test_an_episode_that_cannot_be_compensated_is_refused_and_says_why():
+    names = list(lr3.BOX_STATE_NAMES)
+    moving, _a, _p = _episode(names, still_frames=10)
+    with pytest.raises(bsd.SixDExportError, match="only 10 still frames"):
+        bsd.plan_episode(names, moving, _meta(zero=False), _registry())
+    squeezed, _a, _p = _episode(names, trigger=60.0)
+    with pytest.raises(bsd.SixDExportError, match="only 0 still frames"):
+        bsd.plan_episode(names, squeezed, _meta(zero=False), _registry())
+    rows, _a, _p = _episode(names)
+    with pytest.raises(bsd.SixDExportError, match="no fitted payload model"):
+        bsd.plan_episode(names, rows, _meta(), _registry(valid_from=START_S + 1))
+    with pytest.raises(bsd.SixDExportError, match="no device id"):
+        bsd.plan_episode(names, rows, _meta(zero=False, snapshot_id=False), _registry())
+
+
+def test_still_frames_far_from_the_zero_are_said():
+    names = list(lr3.BOX_STATE_NAMES)
+    rows, _a, _p = _episode(names)
+    meta = _meta()
+    meta["box_six_d_zero"]["7"]["fxyz_mxyz"][0] += 1.5  # drift since the zero: recorded, not warned
+    (plan,) = bsd.plan_episode(names, rows, meta, _registry())
+    assert plan.source == "still_frames" and not plan.warnings
+    assert plan.record["still_vs_zero_force_N"] == pytest.approx(1.5, abs=0.05)
+    meta["box_six_d_zero"]["7"]["fxyz_mxyz"][0] += 1.5  # 3 N: more than drift
+    (plan,) = bsd.plan_episode(names, rows, meta, _registry())
+    assert plan.warnings and "3.00 N" in plan.warnings[0]
+
+
+def test_each_box_of_a_two_box_episode_gets_its_own_model():
+    names = list(lr3.box_state_names(("box7", "box8")))
+    rows, _a, _p = _episode(names)
+    reg = _registry()
+    reg["devices"]["8"] = _registry(device="8", valid_from=200.0)["devices"]["8"]
+    meta = _meta(zero=False, snapshot_id=False)
+    plans = bsd.plan_episode(names, rows, meta, reg)
+    assert [p.label() for p in plans] == ["box7@100", "box8@200"]
+
+
+def test_the_checked_in_registry_has_the_right_hand_payload_for_the_11_13_recordings():
+    model = bsd.payload_model(bsd.load_registry(), 3906437858, 1794560000)  # 2026-11-13 afternoon
+    assert model is not None and model.status.startswith("provisional")
+    # gripper up on the fixture (IMU x down): ~0.9 kg on FT -z
+    assert model.wrench(np.array([-1.0, 0.0, 0.0]))[2] == pytest.approx(-8.76, abs=0.05)
