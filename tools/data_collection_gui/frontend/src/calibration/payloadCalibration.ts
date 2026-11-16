@@ -127,8 +127,22 @@ export type BoxRegistryEntry = {
     fitted: boolean;
     status: string;
     heldoutWorstForceN: number | null;
+    /** "repo": tools/thor/box_devices.json (maintainer); "local": this station's log (the page) */
+    store?: "repo" | "local";
+    registeredUnix?: number | null;
+    registered?: string | null;
+    retired?: { reason?: string | null; by?: string | null } | null;
+    /** the record the export and the live wrench use now */
+    inForce?: boolean;
   }[];
+  /** whether the page may register this BOX's fit itself (hand-held) */
+  selfService?: boolean;
+  /** why nothing is in force now ("" when something is) */
+  notInForce?: string;
 };
+
+/** The page's self-service gate (box_six_d_store): the numbers it checks a fit against. */
+export type SixDSelfServiceRules = { roles: string[]; heldoutN: number; driftN: number; warmupS: number };
 
 export type PoseCheck = {
   arm: string;
@@ -186,6 +200,10 @@ export type PayloadJob = {
     need?: number;
     picked_up?: boolean;
     done?: boolean;
+    /** all six faces have enough samples (``done`` also needs a face held again, for the drift check) */
+    faces_done?: boolean;
+    /** the face held again 30 s+ after its first hold, or null */
+    revisited?: string | null;
     opening_mm?: number | null;
     error?: string;
   } | null;
@@ -209,6 +227,12 @@ export type PayloadCalibrationResponse = {
   captures: SixDCapture[];
   boxes: BoxRegistryEntry[];
   registryPath: string;
+  /** this station's own 6D records (append-only; a deploy does not touch it) */
+  localRegistryPath?: string;
+  registryError?: string;
+  selfService?: SixDSelfServiceRules;
+  /** a refused registration: each thing the gate found */
+  refusals?: string[];
   runsRoot: string;
   captureRoot: string;
   captureDurationRangeS: [number, number];
@@ -377,6 +401,48 @@ export function sixDFitNotes(fit: SixDFitSummary | null | undefined): { tone: "w
   const line = sixDDriftText(fit);
   if (line && !warned) notes.push({ tone: "muted", text: line });
   return notes;
+}
+
+export const SIX_D_SELF_SERVICE_DEFAULT: SixDSelfServiceRules = {
+  roles: ["handheld"],
+  heldoutN: 0.3,
+  driftN: 0.3,
+  warmupS: 1800,
+};
+
+export type SixDGateCheck = { label: string; ok: boolean; detail: string };
+
+/**
+ * What the self-service gate will check of a fit, item by item, so the page can show it before the
+ * click. The gateway decides (it also checks the BOX's role and the mount time); this only previews.
+ */
+export function sixDGateChecks(
+  fit: SixDFitSummary | null | undefined,
+  rules: SixDSelfServiceRules = SIX_D_SELF_SERVICE_DEFAULT,
+): SixDGateCheck[] {
+  if (!fit || fit.error) return [{ label: "拟合", ok: false, detail: fit?.error ? `被拒：${fit.error}` : "还没有拟合" }];
+  const worst = fit.heldoutWorstForceN;
+  const missing = fit.missingAttitudes ?? [];
+  const up = fit.uptimeStartS;
+  const d = fit.drift;
+  return [
+    {
+      label: `留一面 ≤ ${rules.heldoutN} N`,
+      ok: worst != null && worst <= rules.heldoutN,
+      detail: worst == null ? "—" : `${worst} N`,
+    },
+    { label: "六个姿态齐", ok: missing.length === 0, detail: missing.length ? `缺 ${missing.map(faceLabel).join("、")}` : "齐" },
+    {
+      label: `预热 ≥ ${Math.round(rules.warmupS / 60)} 分钟`,
+      ok: up != null && up >= rules.warmupS,
+      detail: up == null ? "日志里没有 BOX 上电时长" : `采集开始时已上电 ${Math.round(up / 60)} 分钟`,
+    },
+    {
+      label: `漂移已测且 ≤ ${rules.driftN} N`,
+      ok: !!d && d.pairs > 0 && (d.worstForceN ?? Infinity) <= rules.driftN,
+      detail: !d || !d.pairs ? "没有回到同一朝向，估计不了（采完六面回到第一个姿态再停 3 秒）" : `${d.worstForceN ?? "—"} N`,
+    },
+  ];
 }
 
 /** ``YYYY-MM-DDTHH:MM`` (local) for a datetime-local input. */

@@ -3,11 +3,13 @@
 // What the 6D sensor carries (gripper, rig, brackets) pulls on it with gravity at every attitude;
 // K (6x3) maps the IMU's specific force to that wrench, so it can be taken out of every sample.
 // K belongs to what is mounted, not to the BOX: every change on the payload side needs a new fit,
-// registered in tools/thor/box_devices.json from the time of the change.
+// registered from the time of the change.
 //
 // Two ways to turn the sensor through its six faces: by hand (a capture here, any BOX), or held by
 // the FR3 (the payload panel's "负载 + 6D" run, for the arm's gripper BOX). Both land in the list
-// below with their fit, and either can be registered.
+// below with their fit. A hand-held BOX's fit is registered here by whoever captured it, if the
+// self-service gate passes (box_six_d_store): into this station's own log, in force at once for the
+// export and the live wrench, no deploy. An arm BOX's K goes to the repo through a maintainer.
 import { useCallback, useEffect, useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
 import { PayloadJobView } from "./PayloadJobView";
@@ -19,7 +21,9 @@ import {
   fmtMm,
   fromLocalInput,
   isJobActive,
+  SIX_D_SELF_SERVICE_DEFAULT,
   sixDFitNotes,
+  sixDGateChecks,
   sixDVerdict,
   toLocalInput,
   TOOL_CONFIG_SHORT,
@@ -38,6 +42,8 @@ type Source = {
   endEffector: string;
   fit: SixDFitSummary | null;
   registered: boolean;
+  /** an FR3 lift run: an arm BOX, registered by a maintainer, not here */
+  armRun: boolean;
 };
 
 const TOOL_CONFIG_EE: Record<string, string> = {
@@ -96,6 +102,10 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
     (payload?.arms ?? []).map((a) => a.gripperBox),
   );
   const disabled = busy || running !== "" || active;
+  const rules = payload?.selfService ?? SIX_D_SELF_SERVICE_DEFAULT;
+  const roleOf = (deviceId: string) => boxes.find((b) => b.deviceId === deviceId);
+  const selfService = (s: Source) => !s.armRun && (roleOf(s.deviceId)?.selfService ?? roleOf(s.deviceId)?.role === "handheld");
+  const gatePasses = (s: Source) => sixDGateChecks(s.fit, rules).every((c) => c.ok);
   const captureJob = job.kind === "six_d_capture";
   const live = captureJob ? job.capture ?? null : null;
 
@@ -109,6 +119,7 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
       endEffector: c.endEffector,
       fit: c.fit,
       registered: !!c.registered,
+      armRun: false,
     })),
     ...(payload?.runs ?? [])
       .filter((r) => r.sixD)
@@ -121,6 +132,7 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
         endEffector: TOOL_CONFIG_EE[r.toolConfig] ?? "",
         fit: r.sixD?.fit ?? null,
         registered: false,
+        armRun: true,
       })),
   ];
 
@@ -134,7 +146,6 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
     if (!registering) return;
     const result = await act("register", "six-d/register", {
       source: registering.key,
-      deviceId: registering.deviceId,
       endEffector: regEE,
       validFromUnix: fromLocalInput(regFrom),
       status: regStatus,
@@ -154,8 +165,10 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
       </div>
       <p className="cali-muted">
         6D 传感器上挂的东西（夹爪、rig、支架）在每个姿态都会给它一个重力读数。拟合把 IMU 读数映射成这个读数（K，6×3），
-        之后每个样本都能扣掉它，只剩外力。<b>K 跟着末端配置走，不跟着 BOX 走</b>：负载侧装/拆任何东西都要重新拟合，
-        并从改动那一刻起登记到 <code>{payload?.registryPath ?? "tools/thor/box_devices.json"}</code>。
+        之后每个样本都能扣掉它，只剩外力（导出的 <code>box_six_d_external.*</code> 和 BOX 页的实时外力都用它）。
+        <b>K 跟着末端配置走，不跟着 BOX 走</b>：负载侧装/拆任何东西都要重新拟合，并从改动那一刻起登记。
+        <b>手持 BOX 自己采、自己登记</b>：拟合过了下面的自动门槛就能登记，写进本站的{" "}
+        <code>{payload?.localRegistryPath ?? "outputs/calibration/box_six_d/registry.jsonl"}</code>，导出和实时外力立刻生效，不用找维护者、不用 deploy。
         手册顺序：上电预热 30 分钟 → 工装上 origin → 重新上电 → 工装上动态校准 → 再拟合。
       </p>
 
@@ -165,8 +178,9 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
           <p className="cali-muted">
             握住 BOX 本体或手柄，夹爪悬空、不夹东西、开度不动。依次摆出六个姿态，每个<b>静止 2–3 秒</b>，姿态之间最好多停几个中间角度：
             <b>指尖朝上</b>、<b>指尖朝下</b>；夹爪侧放、<b>两指一上一下</b>，再翻 180° 换另一指在上；夹爪侧放、<b>两指并排</b>（一样高），再翻面。
-            偏 30° 以内都算，哪个格子没满就补哪个。
-            录制器要先 Disconnect（采集独占 BOX 端口）。从拿起那一刻开始计数。
+            偏 30° 以内都算，哪个格子没满就补哪个。<b>六面都满之后，回到第一个姿态再静止 3 秒</b>（和第一次隔 30 秒以上）：
+            用来测这段时间里读数漂了多少，测不出漂移的拟合不能自助登记。
+            BOX 要上电 30 分钟以上再采。录制器要先 Disconnect（采集独占 BOX 端口）。从拿起那一刻开始计数。
             装在机械臂上的夹爪 BOX 不在这个列表里：它装着时没法用手翻面，用下一步的 FR3 托举。
           </p>
           <div className="payload-row">
@@ -218,7 +232,11 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
               <p className="cali-muted">
                 {live?.picked_up ? "已拿起，正在计数" : "等待拿起（转动超过 30°/s 开始计数）"} · {live?.rows ?? 0} 个样本
                 {live?.opening_mm != null ? ` · 开度 ${live.opening_mm} mm` : ""}
-                {live?.done ? " · 六个姿态都够了，可以停止" : ""}
+                {live?.done
+                  ? ` · 六个姿态都够了，${live.revisited ? `${faceLabel(live.revisited)}也复查过，` : ""}可以停止`
+                  : live?.faces_done
+                    ? " · 六个姿态都够了：回到第一个姿态再静止 3 秒（测漂移），然后停止"
+                    : ""}
               </p>
               {active && (
                 <button className="cali-btn-primary" disabled={running === "stop"} onClick={() => void act("stop", "six-d/stop")}>
@@ -272,6 +290,15 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                             {n.text}
                           </div>
                         ))}
+                        {selfService(s) && s.fit && !s.fit.error && !gatePasses(s) && (
+                          <div className="cali-warn">
+                            不能自助登记：
+                            {sixDGateChecks(s.fit, rules)
+                              .filter((c) => !c.ok)
+                              .map((c) => `${c.label}（${c.detail}）`)
+                              .join("；")}
+                          </div>
+                        )}
                       </td>
                       <td className="cali-muted">
                         {s.fit && !s.fit.error ? `${fmtG(s.fit.massKg)} · ${fmtMm(s.fit.comInFtM)}` : "—"}
@@ -285,14 +312,20 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                           >
                             重新拟合
                           </button>
-                          <button
-                            className="cali-mini-btn"
-                            disabled={disabled || !s.fit || !!s.fit.error || !s.fit.meetsTarget}
-                            title={s.fit?.meetsTarget ? "" : "未达标的拟合不登记"}
-                            onClick={() => openRegister(s)}
-                          >
-                            {s.registered ? "已登记" : "登记"}
-                          </button>
+                          {selfService(s) ? (
+                            <button
+                              className="cali-mini-btn"
+                              disabled={disabled || !gatePasses(s)}
+                              title={gatePasses(s) ? "" : "没过自助登记门槛（点开看哪一项）"}
+                              onClick={() => openRegister(s)}
+                            >
+                              {s.registered ? "已登记" : "登记"}
+                            </button>
+                          ) : (
+                            <span className="cali-muted" title="臂上 BOX 的 K 由维护者审过后提交到仓库">
+                              维护者登记
+                            </span>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -302,8 +335,11 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
             </table>
           )}
           <p className="cali-muted">
-            「刚体读数」只是把 K 当成刚体时的质量/质心，用来发现装错，不是称重。登记写的是 Thor 上的文件（旧文件留 .bak）；
-            下次 deploy 会用工作站的版本覆盖它，<b>登记后要把 box_devices.json 拷回仓库提交</b>。
+            「刚体读数」只是把 K 当成刚体时的质量/质心，用来发现装错，不是称重。
+            自助登记的门槛（手持 BOX）：留一面 ≤ {rules.heldoutN} N、六个姿态齐、BOX 预热 ≥ {Math.round(rules.warmupS / 60)} 分钟、
+            回到同一朝向测过漂移且 ≤ {rules.driftN} N、装上时间不早于这只 BOX 现有最新的登记。
+            登记只追加不改写：K 错了就重新采、按同一个装上时间再登记一次，新的那条接管之后所有导出（旧导出的标签链会和新的不同，不会被混在一起）。
+            撤销一条登记只有维护者能做。
           </p>
           {registering && (
             <div className="cali-result-box">
@@ -323,10 +359,20 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                 备注（可空）
                 <input value={regStatus} onChange={(e) => setRegStatus(e.target.value)} />
               </label>
+              <ul className="cali-muted">
+                {sixDGateChecks(registering.fit, rules).map((c) => (
+                  <li key={c.label} className={c.ok ? "" : "cali-warn"}>
+                    {c.ok ? "✓" : "✗"} {c.label}：{c.detail}
+                  </li>
+                ))}
+              </ul>
+              <p className="cali-muted">
+                写进本站登记，从装上时间起生效：之后导出、重新导出这段时间的数据都用这个 K。装上时间之后录的数据要重新导出才会换成新 K。
+              </p>
               <div className="cali-op-actions">
                 <button onClick={() => setRegistering(null)}>取消</button>
                 <button className="cali-btn-primary" disabled={running !== "" || !regEE || !regFrom} onClick={() => void submitRegister()}>
-                  写入 box_devices.json
+                  登记（立即生效）
                 </button>
               </div>
             </div>
@@ -342,6 +388,7 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                 <th>角色</th>
                 <th>生效时间</th>
                 <th>末端配置</th>
+                <th>来源</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -352,19 +399,26 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
                       <tr key={b.deviceId}>
                         <td>{b.deviceId}</td>
                         <td>{b.role}{b.hand ? ` ${b.hand}` : ""}</td>
-                        <td colSpan={3} className="payload-verdict-warn">
+                        <td colSpan={4} className="payload-verdict-warn">
                           没有拟合（这只 BOX 的 6D 不能补偿）
                         </td>
                       </tr>,
                     ]
                   : b.records.map((r, i) => (
-                      <tr key={`${b.deviceId}-${r.validFromUnix}`}>
+                      <tr key={`${b.deviceId}-${r.validFromUnix}-${r.registeredUnix ?? "repo"}`}>
                         <td>{i === 0 ? b.deviceId : ""}</td>
                         <td>{i === 0 ? `${b.role}${b.hand ? ` ${b.hand}` : ""}` : ""}</td>
                         <td>{r.validFrom}</td>
                         <td>{r.endEffector}</td>
-                        <td className={r.fitted ? "" : "payload-verdict-warn"}>
-                          {r.fitted ? `留一面 ${r.heldoutWorstForceN ?? "—"} N` : "待拟合"}
+                        <td className="cali-muted">
+                          {r.store === "local" ? `本站 · ${r.registered ?? ""}` : "仓库（维护者）"}
+                        </td>
+                        <td className={r.retired || !r.fitted ? "payload-verdict-warn" : r.inForce ? "payload-verdict-ok" : ""}>
+                          {r.retired
+                            ? `已撤销：${r.retired.reason ?? ""}`
+                            : r.fitted
+                              ? `${r.inForce ? "现在生效 · " : ""}留一面 ${r.heldoutWorstForceN ?? "—"} N`
+                              : "待拟合"}
                         </td>
                       </tr>
                     )),
@@ -374,6 +428,7 @@ export function SixDFitPanel({ api, busy }: { api: DataCollectionGuiApi; busy: b
         </li>
       </ol>
 
+      {payload?.registryError && <p className="cali-warn">6D 登记读不了：{payload.registryError}</p>}
       {error && <p className="cali-warn">{error}</p>}
       {output && (
         <details>

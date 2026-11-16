@@ -1579,7 +1579,13 @@ def export_task_to_v3(
     six_d_labels: dict[str, set[str]] = {}
     six_d_dropped: dict[tuple[Path, int], str] = {}
     if has_box and recorded_state_names is not None and bsd.six_d_prefixes(recorded_state_names):
-        registry = bsd.load_registry(six_d_registry or bsd.REGISTRY_PATH)
+        try:
+            registry = bsd.load_registry(six_d_registry or bsd.REGISTRY_PATH)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read the 6D payload records: {exc}") from exc
+        local = registry.get("local_store") or {}
+        if local:
+            _emit(f"6D: payload records from tools/thor/box_devices.json + {local.get('path')} ({local.get('events')} station event(s))")
         refused: list[str] = []
         for src in episodes:
             if src.session_dir not in box_cache:
@@ -1611,8 +1617,8 @@ def export_task_to_v3(
                 labels.add(plan.label())
                 r = plan.record
                 _emit(
-                    f"6D: {where}: BOX {plan.device_id} payload@{r['payload_valid_from_unix']} "
-                    f"({r['payload_status']}), bias from {plan.source.replace('_', ' ')}"
+                    f"6D: {where}: BOX {plan.device_id} payload {plan.label()} "
+                    f"({r['payload_store']}: {r['payload_status']}), bias from {plan.source.replace('_', ' ')}"
                     + (f" ({r['still_frames']} still frames)" if plan.source == "still_frames" else "")
                 )
                 for warning in plan.warnings:
@@ -1621,8 +1627,9 @@ def export_task_to_v3(
             raise RuntimeError(
                 f"cannot turn the 6D channel into the external wrench for {len(refused)} episode(s):\n"
                 + "\n".join(refused)
-                + "\nFit and register the BOX's payload (box_six_d fit/register), leave these "
-                "episodes out, or export without 6D (--six-d none)."
+                + "\nFit and register the BOX's payload (calibration page, 6D 拟合: a hand-held BOX "
+                "registers there itself; an arm BOX through a maintainer), leave these episodes out, "
+                "or export without 6D (--six-d none)."
             )
         if six_d_dropped:
             _emit(
@@ -1979,7 +1986,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=SIX_D_MODES,
         default="external",
         help="external (default): each BOX's 6D channel becomes the external wrench "
-        "(box_six_d_external.*: its payload model from tools/thor/box_devices.json and the bias of "
+        "(box_six_d_external.*: its payload model from tools/thor/box_devices.json plus this station's "
+        "outputs/calibration/box_six_d/registry.jsonl, and the bias of "
         "its zero or of the episode's still frames); none: leave 6D out of observation.state",
     )
     ap.add_argument(

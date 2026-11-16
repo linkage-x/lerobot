@@ -25,7 +25,9 @@ right after the zero) in every later sample. The recorder keeps ``f0``/``acc0`` 
     external(t) = f(t) - K @ acc(t) - b
 
 Parameters live in ``tools/thor/box_devices.json``, per BOX id and per end-effector configuration
-(``valid_from``): the payload belongs to what is mounted, not to the BOX, and both change.
+(``valid_from``): the payload belongs to what is mounted, not to the BOX, and both change. A station
+adds its own records (registered from the calibration page) in an append-only log under
+``outputs/``; :func:`load_registry` merges the two (see box_six_d_store).
 """
 
 from __future__ import annotations
@@ -37,15 +39,21 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-REGISTRY_PATH = Path(__file__).resolve().parents[1] / "box_devices.json"
-SCHEMA = "box_devices/v1"
-MODEL = "affine_acc/v1"
+try:
+    from tools.thor.gmsl2 import box_six_d_store as store
+except ModuleNotFoundError:  # run as a script from tools/thor/gmsl2
+    import box_six_d_store as store  # type: ignore[no-redef]
+
+REGISTRY_PATH = store.REGISTRY_PATH
+LOCAL_REGISTRY_PATH = store.LOCAL_REGISTRY_PATH
+SCHEMA = store.SCHEMA
+MODEL = store.MODEL
 G = 9.80665
 
 #: A free-air sample is quasi-static when the BOX turns slower than this and |acc| is 1 g within
@@ -73,6 +81,8 @@ class PayloadModel:
     end_effector: str
     K: np.ndarray  # (6, 3)
     status: str
+    registered_unix: int | None = None  # a station record (calibration page); None for a repo record
+    store: str = "repo"
 
     def wrench(self, acc_g: np.ndarray) -> np.ndarray:
         """Payload wrench (N, N*m) for specific force(s) ``acc_g`` (..., 3) in g."""
@@ -82,42 +92,60 @@ class PayloadModel:
 # --- registry ----------------------------------------------------------------------------------
 
 
-def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
-    reg = json.loads(Path(path).read_text(encoding="utf-8"))
-    if reg.get("schema") != SCHEMA:
-        raise ValueError(f"{path}: schema {reg.get('schema')!r}, expected {SCHEMA!r}")
-    return reg
+_DEFAULT_LOCAL = object()
+
+
+def load_registry(path: Path = REGISTRY_PATH, local: Any = _DEFAULT_LOCAL) -> dict[str, Any]:
+    """The repo registry at ``path`` with the station's records (``local``, a box_six_d_store log) over it.
+
+    ``local`` defaults to this checkout's log when ``path`` is this checkout's registry, else to none
+    (a registry given explicitly, as tests do, is taken as it is); pass None to read the repo file alone.
+    """
+    reg = store.load_repo(path)
+    if local is _DEFAULT_LOCAL:
+        local = LOCAL_REGISTRY_PATH if Path(path).resolve() == Path(REGISTRY_PATH).resolve() else None
+    if local is None:
+        return reg
+    return store.merge(reg, store.read_events(Path(local)))
 
 
 def device_entry(registry: dict[str, Any], device_id: int | str) -> dict[str, Any] | None:
     return (registry.get("devices") or {}).get(str(int(device_id)))
 
 
-def payload_model(registry: dict[str, Any], device_id: int | str, at_unix: float) -> PayloadModel | None:
-    """The payload model in force for ``device_id`` at ``at_unix``: the latest ``valid_from`` not after it.
+def payload_model_or_reason(
+    registry: dict[str, Any], device_id: int | str, at_unix: float
+) -> tuple[PayloadModel | None, str]:
+    """The payload model in force for ``device_id`` at ``at_unix``, or None and why (box_six_d_store.select).
 
-    None when the BOX is unknown, nothing was fitted yet, or the latest configuration before
-    ``at_unix`` has no fit (``K`` null: the end effector changed and nobody re-fitted).
+    The latest ``valid_from`` not after ``at_unix``; of re-fits of that configuration the last one
+    registered and not retired. None when the BOX is unknown, nothing was fitted yet, the latest
+    configuration has no fit (``K`` null: the end effector changed and nobody re-fitted), or its
+    records were all retired.
     """
-    entry = device_entry(registry, device_id)
-    if not entry:
-        return None
-    eligible = [p for p in entry.get("six_d_payload") or [] if float(p["valid_from_unix"]) <= at_unix]
-    if not eligible:
-        return None
-    p = max(eligible, key=lambda p: float(p["valid_from_unix"]))
-    if p.get("model") != MODEL or p.get("K") is None:
-        return None
+    p, why = store.in_force(registry, device_id, at_unix)
+    if p is None:
+        return None, why
     K = np.asarray(p["K"], dtype=float)
     if K.shape != (6, 3):
         raise ValueError(f"BOX {device_id}: K has shape {K.shape}, expected (6, 3)")
-    return PayloadModel(
-        int(device_id),
-        float(p["valid_from_unix"]),
-        str(p.get("end_effector", "")),
-        K,
-        str(p.get("status", "")),
+    registered = p.get("registered_unix")
+    return (
+        PayloadModel(
+            int(device_id),
+            float(p["valid_from_unix"]),
+            str(p.get("end_effector", "")),
+            K,
+            str(p.get("status", "")),
+            None if registered is None else int(registered),
+            str(p.get("store") or "repo"),
+        ),
+        "",
     )
+
+
+def payload_model(registry: dict[str, Any], device_id: int | str, at_unix: float) -> PayloadModel | None:
+    return payload_model_or_reason(registry, device_id, at_unix)[0]
 
 
 def box_roles(registry: dict[str, Any], device_ids: list[int | str]) -> dict[str, dict[str, Any]]:
@@ -651,8 +679,10 @@ class SixDPlan:
     warnings: tuple[str, ...]
 
     def label(self) -> str:
-        """What the label chain compares: which K, by BOX and the record's start."""
-        return f"box{self.device_id}@{int(self.model.valid_from_unix)}"
+        """What the label chain compares: which K, by BOX and the record's start (and, for a station
+        record, when it was registered: two re-fits of one mount are two different labels)."""
+        base = f"box{self.device_id}@{int(self.model.valid_from_unix)}"
+        return base if self.model.registered_unix is None else f"{base}r{self.model.registered_unix}"
 
 
 def _columns(names: list[str], rows: np.ndarray, prefix: str, wanted: list[str]) -> np.ndarray:
@@ -698,11 +728,11 @@ def plan_episode(
         box = f"BOX {did}" if did else f"BOX {prefix.rstrip('.') or '(one-BOX recording)'}"
         if did is None:
             raise SixDExportError(f"{box}: no device id in meta.json, so no payload model can be chosen")
-        model = payload_model(registry, did, start)
+        model, why = payload_model_or_reason(registry, did, start)
         if model is None:
             raise SixDExportError(
-                f"{box}: no fitted payload model in force at the episode's start "
-                "(tools/thor/box_devices.json six_d_payload; fit one with box_six_d fit/register)"
+                f"{box}: no fitted payload model in force at the episode's start ({why}); fit one on the "
+                "calibration page (6D 拟合) and register it, then export again"
             )
         f, acc, gyr, trig = _six_d_inputs(names, data, prefix)
         residual = f - model.wrench(acc)
@@ -734,8 +764,12 @@ def plan_episode(
             "device_id": did,
             "payload_valid_from_unix": int(model.valid_from_unix),
             "payload_status": model.status.split(":", 1)[0],
+            "payload_store": model.store,
+            "payload_K": model.K.round(5).tolist(),
             "still_frames": n_still,
         }
+        if model.registered_unix is not None:
+            record["payload_registered_unix"] = model.registered_unix
         if still_bias is not None:
             bias, source = still_bias, "still_frames"
             spread = np.median(np.abs(residual[still, :3] - still_bias[:3]), axis=0)
@@ -825,7 +859,7 @@ def live_external(
             continue
         model = payload_model(registry, did, now_s)
         if model is None:
-            out[sid] = {"external_note": f"BOX {did} 没有载荷模型（先做 6D 拟合并登记）"}
+            out[sid] = {"external_note": f"BOX {did} 没有载荷模型（在标定页 6D 拟合里采集、拟合并登记）"}
             continue
         zero = zeros.get(did)
         if not zero:
@@ -864,25 +898,7 @@ def payload_record(
     """A ``six_d_payload`` entry from a :func:`fit_payload` result."""
     if fit.get("K") is None or np.asarray(fit["K"]).shape != (6, 3):
         raise ValueError("the fit has no 6x3 K")
-    stamp = datetime.fromtimestamp(valid_from_unix, tz=timezone(timedelta(hours=8)))
-    return {
-        "valid_from_unix": int(valid_from_unix),
-        "valid_from": stamp.strftime("%Y-%m-%d %H:%M:%S +08:00"),
-        "end_effector": end_effector,
-        "model": MODEL,
-        "K": fit["K"],
-        "status": status,
-        "fit": {
-            "log": source,
-            "n_static": fit.get("n_static"),
-            "attitudes": fit.get("attitudes"),
-            "heldout_worst_force_N": fit.get("heldout_worst_force_N"),
-            "heldout_worst_moment_Nm": fit.get("heldout_worst_moment_Nm"),
-            "rigid_reading": {
-                k: v for k, v in (fit.get("rigid_reading") or {}).items() if k in ("mass_kg", "axis_gain_kg", "com_in_ft_m")
-            },
-        },
-    }
+    return store.payload_record(fit, end_effector=end_effector, valid_from_unix=valid_from_unix, status=status, source=source)
 
 
 def add_payload_record(registry: dict[str, Any], device_id: int | str, record: dict[str, Any]) -> dict[str, Any]:
@@ -977,7 +993,8 @@ def _cmd_register(args: argparse.Namespace) -> int:
         status=args.status,
         source=args.source or str(args.fit),
     )
-    registry = add_payload_record(load_registry(args.registry), args.device_id, record)
+    # the repo file alone: the station's records stay in its own log
+    registry = add_payload_record(load_registry(args.registry, local=None), args.device_id, record)
     backup = write_registry(registry, args.registry)
     print(json.dumps({"registered": record, "registry": str(args.registry), "backup": str(backup) if backup else None}, ensure_ascii=False))
     return 0

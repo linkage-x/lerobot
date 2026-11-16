@@ -11,6 +11,7 @@ import {
   jobPercent,
   sixDDriftText,
   sixDFitNotes,
+  sixDGateChecks,
   sixDVerdict,
   toLocalInput,
   zeroBlocker,
@@ -185,5 +186,37 @@ describe("the arm-held 6D zero", () => {
     expect(isZeroJob({ kind: "check", poses: "six_d_zero" })).toBe(true);
     expect(isZeroJob({ kind: "check", poses: "payload+six_d" })).toBe(false);
     expect(isZeroJob({ kind: "collect" })).toBe(false);
+  });
+});
+
+describe("the self-service gate preview", () => {
+  const good = {
+    meetsTarget: true,
+    heldoutWorstForceN: 0.12,
+    missingAttitudes: [],
+    uptimeStartS: 3600,
+    drift: { pairs: 1, worstForceN: 0.08 },
+  };
+
+  it("passes a warm, complete, drift-checked fit", () => {
+    expect(sixDGateChecks(good).every((c) => c.ok)).toBe(true);
+  });
+
+  it("does not count an unmeasured drift as no drift", () => {
+    // each face held once: box_six_d reports pairs 0, which is "unknown", not "steady"
+    const checks = sixDGateChecks({ ...good, drift: { pairs: 0 } });
+    const drift = checks.find((c) => c.label.startsWith("漂移"))!;
+    expect(drift.ok).toBe(false);
+    expect(drift.detail).toContain("回到第一个姿态");
+    expect(sixDGateChecks({ ...good, drift: null }).find((c) => c.label.startsWith("漂移"))!.ok).toBe(false);
+  });
+
+  it("names a cold BOX, a missing face and a poor held-out face", () => {
+    const failed = sixDGateChecks({ ...good, uptimeStartS: 600, missingAttitudes: ["z-"], heldoutWorstForceN: 0.5 })
+      .filter((c) => !c.ok)
+      .map((c) => c.label);
+    expect(failed).toHaveLength(3);
+    expect(sixDGateChecks({ ...good, uptimeStartS: null }).find((c) => c.label.startsWith("预热"))!.ok).toBe(false);
+    expect(sixDGateChecks({ error: "attitudes" })[0].ok).toBe(false);
   });
 });

@@ -47,13 +47,26 @@ def face_of(acc: list[float], gyr: list[float]) -> str | None:
 
 
 class Counter:
+    """Samples per face, and whether a face was held again later (what the drift check needs).
+
+    The fit's drift check (box_six_d.same_attitude_drift) compares two holds of the same attitude at
+    least DRIFT_MIN_APART_S apart; a capture that visits each face once leaves it unmeasured, and the
+    calibration page will not register such a fit. ``revisited`` is the capture's own rough version
+    of that (same face, after another face, that long after it was first held), to tell the operator
+    when to stop; the fit decides.
+    """
+
     def __init__(self, need: int = DEFAULT_NEED) -> None:
         self.need = need
         self.faces = dict.fromkeys(FACES, 0)
         self.picked_up = False
         self.rows = 0
+        self.first_t: dict[str, float] = {}
+        self.left: set[str] = set()
+        self.last_face: str | None = None
+        self.revisited: str | None = None
 
-    def add(self, acc: list[float], gyr: list[float]) -> None:
+    def add(self, acc: list[float], gyr: list[float], t: float | None = None) -> None:
         self.rows += 1
         if not self.picked_up and math.sqrt(sum(g * g for g in gyr)) > PICKUP_GYR_DEG_S:
             self.picked_up = True
@@ -61,10 +74,25 @@ class Counter:
             face = face_of(acc, gyr)
             if face:
                 self.faces[face] += 1
+                if t is not None:
+                    self._track(face, t)
+
+    def _track(self, face: str, t: float) -> None:
+        if face != self.last_face:
+            if self.last_face is not None:
+                self.left.add(self.last_face)
+            self.last_face = face
+        self.first_t.setdefault(face, t)
+        if self.revisited is None and face in self.left and t - self.first_t[face] >= box_six_d.DRIFT_MIN_APART_S:
+            self.revisited = face
+
+    @property
+    def faces_done(self) -> bool:
+        return all(n >= self.need for n in self.faces.values())
 
     @property
     def done(self) -> bool:
-        return all(n >= self.need for n in self.faces.values())
+        return self.faces_done and self.revisited is not None
 
 
 def _open(device_id: int):
@@ -98,6 +126,7 @@ def run(args: argparse.Namespace) -> int:
         status.update(kw)
         status.update(
             {"faces": counter.faces, "rows": counter.rows, "picked_up": counter.picked_up, "done": counter.done,
+             "faces_done": counter.faces_done, "revisited": counter.revisited,
              "updated_unix": round(time.time(), 3)}
         )
         tmp = out / "status.json.tmp"
@@ -130,7 +159,7 @@ def run(args: argparse.Namespace) -> int:
                         )
                         + "\n"
                     )
-                    counter.add(acc, gyr)
+                    counter.add(acc, gyr, time.time())
                     status["opening_mm"] = None if grip.get("distance_m") is None else round(grip["distance_m"] * 1000, 1)
                 if time.monotonic() - last_status > 0.5:
                     last_status = time.monotonic()
