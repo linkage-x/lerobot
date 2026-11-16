@@ -290,8 +290,9 @@ def test_the_fingertip_pads_are_in_state_after_every_older_channel():
     # 2026-11-03, rig: each finger has two pads, touch_device_id 0 by the finger root
     # (box_touch_left/right) and 1 at the fingertip (box_touch_*_1). Both are state.
     one_pad = lr3.BOX_STATE_NAMES_ONE_PAD
-    assert lr3.BOX_STATE_NAMES[: len(one_pad)] == one_pad  # older channels keep their index
-    assert lr3.BOX_STATE_NAMES[len(one_pad):] == tuple(
+    two_pad = lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY  # the layout of 11-03..11-16, which one_pad leads
+    assert two_pad[: len(one_pad)] == one_pad  # older channels keep their index
+    assert two_pad[len(one_pad):] == lr3.BOX_STATE_NAMES[-len(two_pad) + len(one_pad):] == tuple(
         f"box_touch_{side}_1.{name}" for side in ("left", "right") for name in lr3._TOUCH_SUMMARY_NAMES
     )
     assert lr3.BOX_TIMESTAMP_NAMES[-2:] == ("box_touch_left_1.timestamp", "box_touch_right_1.timestamp")
@@ -397,7 +398,9 @@ def test_imu_attitude_is_quaternion_only_in_xyzw_order():
     assert 111.0 not in state and 222.0 not in state and 333.0 not in state
 
 
-def test_force_state_keeps_legacy_force_and_appends_no_gravity_channels():
+def test_the_sdk_no_gravity_left_the_state_and_its_old_layout_can_still_be_built():
+    # 2026-11-16: the SDK's no_gravity is the vendor's one default payload, wrong for every BOX we
+    # have (ts_sync.md 9.1.2); the export writes the external wrench from fxyz_mxyz instead.
     snapshot = {
         "sensors": {
             "box_six_d_force": {
@@ -407,37 +410,23 @@ def test_force_state_keeps_legacy_force_and_appends_no_gravity_channels():
             }
         }
     }
+    force = [f"box_six_d_force.{a}" for a in ("fx", "fy", "fz", "mx", "my", "mz")]
+    sdk = [f"box_six_d_force_no_gravity.{a}" for a in ("fx", "fy", "fz", "mx", "my", "mz")]
 
     state = lr3.box_snapshot_to_state(snapshot)
-    assert len(state) == len(lr3.BOX_STATE_NAMES)
+    assert len(state) == len(lr3.BOX_STATE_NAMES) == 38
+    assert not [n for n in lr3.BOX_STATE_NAMES if "no_gravity" in n]
+    assert [state[lr3.BOX_STATE_NAMES.index(n)] for n in force] == pytest.approx([1, 2, 3, 4, 5, 6])
 
-    legacy_names = [
-        "box_six_d_force.fx",
-        "box_six_d_force.fy",
-        "box_six_d_force.fz",
-        "box_six_d_force.mx",
-        "box_six_d_force.my",
-        "box_six_d_force.mz",
-    ]
-    compensated_names = [
-        "box_six_d_force_no_gravity.fx",
-        "box_six_d_force_no_gravity.fy",
-        "box_six_d_force_no_gravity.fz",
-        "box_six_d_force_no_gravity.mx",
-        "box_six_d_force_no_gravity.my",
-        "box_six_d_force_no_gravity.mz",
-    ]
-    legacy = [state[lr3.BOX_STATE_NAMES.index(name)] for name in legacy_names]
-    compensated = [state[lr3.BOX_STATE_NAMES.index(name)] for name in compensated_names]
-    assert legacy == pytest.approx([1, 2, 3, 4, 5, 6])
-    assert compensated == pytest.approx([10, 20, 30, 40, 50, 60])
-    first_compensated = lr3.BOX_STATE_NAMES.index(compensated_names[0])
-    last_legacy = lr3.BOX_STATE_NAMES.index(legacy_names[-1])
-    assert first_compensated > last_legacy
-
-    old_snapshot = {"sensors": {"box_six_d_force": {"fxyz_mxyz": [1, 2, 3, 4, 5, 6]}}}
-    old_state = lr3.box_snapshot_to_state(old_snapshot)
-    assert [old_state[lr3.BOX_STATE_NAMES.index(name)] for name in compensated_names] == [0.0] * 6
+    # sessions recorded until 11-16 (box_realign rebuilds them in their own 44-wide layout)
+    old = lr3.box_snapshot_to_state(snapshot, sdk_no_gravity=True)
+    names = lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY
+    assert len(old) == len(names) == 44
+    assert [old[names.index(n)] for n in sdk] == pytest.approx([10, 20, 30, 40, 50, 60])
+    assert [v for n, v in zip(names, old, strict=True) if n not in sdk] == state
+    assert lr3.box_state_layouts(("",)) == (
+        lr3.BOX_STATE_NAMES, lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY, lr3.BOX_STATE_NAMES_ONE_PAD
+    )
 
 
 def test_multi_box_namespaced_snapshots_expand_state_and_timestamps(tmp_path):

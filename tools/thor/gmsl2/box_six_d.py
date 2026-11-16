@@ -788,6 +788,60 @@ def apply_external(
     return np.hstack(columns).tolist()
 
 
+def live_external(
+    snapshot: dict[str, Any],
+    registry: dict[str, Any],
+    zeros: dict[str, dict[str, Any]],
+    now_s: float,
+) -> dict[str, dict[str, Any]]:
+    """The external wrench of each BOX in a live snapshot, for the calibration page, or why there is none.
+
+    Returns ``{six_d sensor id: {"fxyz_mxyz_external": [6]} | {"external_note": str}}``. The bias is the
+    last software zero of this Connect (``zeros``, the recorder's records), so after a dynamic zero
+    the reading should stay near 0 in free air at every attitude: what the page checks K and the zero
+    with. (An export takes the bias from each episode's still ends instead; see plan_episode.)
+    """
+    sensors = snapshot.get("sensors") if isinstance(snapshot.get("sensors"), dict) else {}
+    out: dict[str, dict[str, Any]] = {}
+    for sid, data in sensors.items():
+        if not str(sid).endswith("box_six_d_force") or not isinstance(data, dict):
+            continue
+        prefix = str(sid)[: -len("box_six_d_force")]
+        if prefix:
+            m = re.match(r"^box(\d+)/$", prefix)
+            did = m.group(1) if m else None
+        else:
+            device = ((snapshot.get("status") or {}) if isinstance(snapshot.get("status"), dict) else {}).get(
+                "device_id"
+            )
+            did = str(int(device)) if device else None
+        f = data.get("fxyz_mxyz")
+        acc = (sensors.get(prefix + "box_imu") or {}).get("acc_g")
+        if did is None:
+            out[sid] = {"external_note": "不知道这台 BOX 的 id"}
+            continue
+        if not f or len(f) < 6 or not acc or len(acc) < 3:
+            out[sid] = {"external_note": "还没有力或 IMU 读数"}
+            continue
+        model = payload_model(registry, did, now_s)
+        if model is None:
+            out[sid] = {"external_note": f"BOX {did} 没有载荷模型（先做 6D 拟合并登记）"}
+            continue
+        zero = zeros.get(did)
+        if not zero:
+            out[sid] = {"external_note": "这次连接后还没做动态校准"}
+            continue
+        try:
+            bias = zero_bias(model, zero)
+        except (ValueError, KeyError) as exc:
+            note = "origin 之后还没做动态校准" if zero.get("kind") == "origin" else str(exc)
+            out[sid] = {"external_note": note}
+            continue
+        ext = external_wrench(np.asarray(f[:6], dtype=float), np.asarray(acc[:3], dtype=float), model, bias)
+        out[sid] = {"fxyz_mxyz_external": [round(float(v), 4) for v in ext]}
+    return out
+
+
 # --- registry writes ---------------------------------------------------------------------------
 
 

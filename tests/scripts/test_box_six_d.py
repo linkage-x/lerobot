@@ -411,12 +411,14 @@ def _meta(device="7", zero=True, zero_at=START_S - 60.0, snapshot_id=True):
 
 
 def test_the_export_layout_swaps_both_recorded_6d_groups_for_the_external_wrench_in_place():
-    names = list(lr3.BOX_STATE_NAMES)
+    names = list(lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY)  # recorded until 11-16
     out = bsd.external_state_names(names)
     assert not [n for n in out if "box_six_d_force" in n]
     start = names.index("box_six_d_force.fx")
     assert out[start : start + 6] == [f"box_six_d_external.{a}" for a in bsd.SIX_D_AXES]
     assert out[:start] == names[:start] and out[start + 6 :] == names[start + 12 :]
+    # the recorder's layout since then exports to the same names
+    assert bsd.external_state_names(lr3.BOX_STATE_NAMES) == out
     two = list(lr3.box_state_names(("box7", "box8")))
     assert bsd.six_d_prefixes(two) == ["box7.", "box8."]
     assert "box8.box_six_d_external.mz" in bsd.external_state_names(two)
@@ -425,12 +427,17 @@ def test_the_export_layout_swaps_both_recorded_6d_groups_for_the_external_wrench
 
 def _external(names, rows, plans):
     out = np.asarray(bsd.apply_external(names, rows.tolist(), plans))
-    assert out.shape[1] == len(names) - 6
+    assert out.shape[1] == len(bsd.external_state_names(names)) == len(lr3.BOX_STATE_NAMES)
     return out[:, [bsd.external_state_names(names).index(f"box_six_d_external.{a}") for a in bsd.SIX_D_AXES]]
 
 
-def test_the_bias_comes_from_the_episodes_still_released_frames_and_leaves_the_push_alone():
-    names = list(lr3.BOX_STATE_NAMES)
+LAYOUTS = pytest.mark.parametrize(
+    "names", [list(lr3.BOX_STATE_NAMES), list(lr3.BOX_STATE_NAMES_SDK_NO_GRAVITY)], ids=["38", "44"]
+)
+
+
+@LAYOUTS
+def test_the_bias_comes_from_the_episodes_still_released_frames_and_leaves_the_push_alone(names):
     push = np.zeros((600, 6))
     # pressing 3 N along FT z for the 6 s between the still ends, slowly, the gripper open: most of
     # the episode, so only taking the still frames from its ends keeps the push out of the bias
@@ -446,8 +453,8 @@ def test_the_bias_comes_from_the_episodes_still_released_frames_and_leaves_the_p
     assert plan.source == "still_frames" and "origin" in plan.record["zero_unused"]
 
 
-def test_with_too_few_still_frames_the_software_zero_gives_the_bias():
-    names = list(lr3.BOX_STATE_NAMES)
+@LAYOUTS
+def test_with_too_few_still_frames_the_software_zero_gives_the_bias(names):
     push = np.zeros((300, 6))
     push[150:, 2] = 3.0
     rows, _acc, push = _episode(names, push=push, still_frames=10)
@@ -499,3 +506,33 @@ def test_the_checked_in_registry_has_the_right_hand_payload_for_the_11_13_record
     assert model is not None and model.status.startswith("provisional")
     # gripper up on the fixture (IMU x down): ~0.9 kg on FT -z
     assert model.wrench(np.array([-1.0, 0.0, 0.0]))[2] == pytest.approx(-8.76, abs=0.05)
+
+
+def test_the_live_wrench_uses_the_boxs_model_and_its_last_software_zero():
+    acc = np.array([0.0, 1.0, 0.0])
+    f = acc @ K_TRUE.T + BIAS + np.array([0, 0, 2.0, 0, 0, 0])  # a 2 N push
+    zero = _meta()["box_six_d_zero"]
+    snap = {
+        "status": {"device_id": 7},
+        "sensors": {"box_six_d_force": {"fxyz_mxyz": f.tolist()}, "box_imu": {"acc_g": acc.tolist()}},
+    }
+    out = bsd.live_external(snap, _registry(), zero, START_S)
+    np.testing.assert_allclose(out["box_six_d_force"]["fxyz_mxyz_external"], [0, 0, 2.0, 0, 0, 0], atol=1e-3)
+
+    assert bsd.live_external(snap, _registry(), {}, START_S)["box_six_d_force"] == {
+        "external_note": "这次连接后还没做动态校准"
+    }
+    origin = {"7": {**zero["7"], "kind": "origin"}}
+    assert "origin" in bsd.live_external(snap, _registry(), origin, START_S)["box_six_d_force"]["external_note"]
+    assert "没有载荷模型" in bsd.live_external(snap, _registry(device="8"), zero, START_S)["box_six_d_force"]["external_note"]
+
+    two = {
+        "sensors": {
+            "box7/box_six_d_force": {"fxyz_mxyz": f.tolist()},
+            "box7/box_imu": {"acc_g": acc.tolist()},
+            "box8/box_six_d_force": {"fxyz_mxyz": f.tolist()},
+        }
+    }
+    out = bsd.live_external(two, _registry(), zero, START_S)
+    assert "fxyz_mxyz_external" in out["box7/box_six_d_force"]
+    assert out["box8/box_six_d_force"] == {"external_note": "还没有力或 IMU 读数"}

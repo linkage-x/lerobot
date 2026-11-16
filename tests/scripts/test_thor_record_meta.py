@@ -721,3 +721,30 @@ def test_an_origin_outlasts_the_recorder_and_the_zero_after_the_re_power_recheck
     )
     saved = json.loads(path.read_text())["3969377039"]
     assert saved["kind"] == "origin" and saved["recheck"]["pass"] is True
+
+
+def test_the_live_box_feed_carries_the_external_wrench_without_touching_the_snapshot(tmp_path, monkeypatch) -> None:
+    # The calibration page reads the external wrench from BOX_LIVE; the snapshot the recorder
+    # records from must not change (its sensor dicts may be the BOX client's own).
+    thor_record = _load_thor_record_module()
+    registry = tmp_path / "box_devices.json"
+    zero_k = [[0.0, 0.0, 0.0]] * 6
+    registry.write_text(
+        json.dumps(
+            {"schema": "box_devices/v1", "devices": {"7": {"six_d_payload": [{"valid_from_unix": 0, "model": "affine_acc/v1", "K": zero_k}]}}}
+        )
+    )
+    monkeypatch.setattr(thor_record.box_six_d, "REGISTRY_PATH", registry)
+    monkeypatch.setattr(thor_record.box_six_d, "load_registry", lambda path=registry: json.loads(registry.read_text()))
+    monkeypatch.setitem(
+        thor_record._SIX_D_ZEROS,
+        "7",
+        {"kind": "software", "fxyz_mxyz": [1.0, 0, 0, 0, 0, 0], "acc_g": [0, 0, 1.0], "wall_s": 1.0},
+    )
+    force = {"fxyz_mxyz": [3.0, 0, 0, 0, 0, 0]}
+    snap = {"status": {"device_id": 7}, "sensors": {"box_six_d_force": force, "box_imu": {"acc_g": [0, 0, 1.0]}}}
+
+    out = thor_record._with_live_external(snap)
+
+    assert out["sensors"]["box_six_d_force"]["fxyz_mxyz_external"] == [2.0, 0, 0, 0, 0, 0]
+    assert "fxyz_mxyz_external" not in force and snap["sensors"]["box_six_d_force"] is force

@@ -60,7 +60,12 @@ except Exception:  # noqa: BLE001
 _SIX_D_FORCE_AXIS_NAMES = ("fx", "fy", "fz", "mx", "my", "mz")
 
 
-BOX_STATE_NAMES: tuple[str, ...] = (
+#: The layout recorded until 2026-11-16: the SDK's ``fxyz_mxyz_no_gravity`` right after the reading.
+#: It is the vendor's one default payload and extrinsic, wrong for every BOX we have (+7.78 N on FT z
+#: right after an origin, ~15 N at other attitudes on the right hand-held BOX), so it left the state;
+#: the export writes the external wrench instead (box_six_d.py, ts_sync.md §9.1.2) and the raw
+#: box_sensors.jsonl keeps the SDK field. Kept to name, rebuild and export the sessions recorded with it.
+BOX_STATE_NAMES_SDK_NO_GRAVITY: tuple[str, ...] = (
     "box_gripper.distance_m",
     "box_trigger.travel_pct",
     "box_imu.acc_x_g",
@@ -89,10 +94,17 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     *tuple(f"box_touch_right_1.{name}" for name in _TOUCH_SUMMARY_NAMES),
 )
 
+_SDK_NO_GRAVITY_PREFIX = "box_six_d_force_no_gravity."
+#: What the recorder writes: :data:`BOX_STATE_NAMES_SDK_NO_GRAVITY` without the SDK's no_gravity
+#: (38 per BOX). Every channel after the 6D reading moved 6 down.
+BOX_STATE_NAMES: tuple[str, ...] = tuple(
+    name for name in BOX_STATE_NAMES_SDK_NO_GRAVITY if not name.startswith(_SDK_NO_GRAVITY_PREFIX)
+)
+
 #: The layout before the second pads joined (sessions recorded up to 2026-11-03):
-#: exactly the leading part of :data:`BOX_STATE_NAMES`, so its columns can still be
-#: named. It is not a layout to train against next to the current one.
-BOX_STATE_NAMES_ONE_PAD: tuple[str, ...] = BOX_STATE_NAMES[: -2 * len(_TOUCH_SUMMARY_NAMES)]
+#: exactly the leading part of :data:`BOX_STATE_NAMES_SDK_NO_GRAVITY` (it had no_gravity),
+#: so its columns can still be named. It is not a layout to train against next to the current one.
+BOX_STATE_NAMES_ONE_PAD: tuple[str, ...] = BOX_STATE_NAMES_SDK_NO_GRAVITY[: -2 * len(_TOUCH_SUMMARY_NAMES)]
 
 # Per-frame timestamp metadata, emitted as a SEPARATE non-observation parquet
 # column ``box.timestamps`` (float64 to preserve the µs-resolution MCU counters
@@ -203,10 +215,17 @@ def _prefix_box_name(box_id: str, name: str) -> str:
 
 
 def box_state_names(
-    box_ids: tuple[str, ...] | list[str] | None = None, *, one_pad: bool = False
+    box_ids: tuple[str, ...] | list[str] | None = None,
+    *,
+    one_pad: bool = False,
+    sdk_no_gravity: bool = False,
 ) -> tuple[str, ...]:
-    """State channel names; ``one_pad`` names the pre-2026-11-03 layout (one pad per finger)."""
-    names = BOX_STATE_NAMES_ONE_PAD if one_pad else BOX_STATE_NAMES
+    """State channel names; ``one_pad`` names the pre-2026-11-03 layout (one pad per finger, with
+    the SDK's no_gravity), ``sdk_no_gravity`` the two-pad layout recorded until 2026-11-16."""
+    if one_pad:
+        names = BOX_STATE_NAMES_ONE_PAD
+    else:
+        names = BOX_STATE_NAMES_SDK_NO_GRAVITY if sdk_no_gravity else BOX_STATE_NAMES
     ids = tuple(box_ids or ("",))
     if ids == ("",):
         return names
@@ -218,7 +237,11 @@ def box_state_layouts(box_ids: tuple[str, ...] | list[str] | None = None) -> tup
 
     A session's own info.json names its columns; these are for sessions without it, told apart by width.
     """
-    return (box_state_names(box_ids), box_state_names(box_ids, one_pad=True))
+    return (
+        box_state_names(box_ids),
+        box_state_names(box_ids, sdk_no_gravity=True),
+        box_state_names(box_ids, one_pad=True),
+    )
 
 
 def box_timestamp_names(
@@ -322,7 +345,7 @@ def _touch_summary(sensor: dict[str, Any]) -> list[float]:
     ]
 
 
-def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
+def box_snapshot_to_state(snapshot: dict[str, Any], *, sdk_no_gravity: bool = False) -> list[float]:
     """Flatten one BOX snapshot into the named LeRobot state vector.
 
     Per-sensor MCU timestamps are intentionally excluded -- they are diagnostic
@@ -357,9 +380,14 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         *_touch_summary(touch_left_1),
         *_touch_summary(touch_right_1),
     ]
-    if len(state) != len(BOX_STATE_NAMES):
-        raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES)}")
+    if len(state) != len(BOX_STATE_NAMES_SDK_NO_GRAVITY):
+        raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES_SDK_NO_GRAVITY)}")
+    if not sdk_no_gravity:
+        state = [v for v, keep in zip(state, _KEEP_IN_CURRENT_STATE, strict=True) if keep]
     return [float(v) for v in state]
+
+
+_KEEP_IN_CURRENT_STATE = tuple(not n.startswith(_SDK_NO_GRAVITY_PREFIX) for n in BOX_STATE_NAMES_SDK_NO_GRAVITY)
 
 
 def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
@@ -399,13 +427,17 @@ def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
 def box_snapshot_to_state_for_boxes(
     snapshot: dict[str, Any],
     box_ids: tuple[str, ...] | list[str] | None = None,
+    *,
+    sdk_no_gravity: bool = False,
 ) -> list[float]:
     ids = tuple(box_ids or box_ids_from_snapshot(snapshot))
     if ids == ("",):
-        return box_snapshot_to_state(snapshot)
+        return box_snapshot_to_state(snapshot, sdk_no_gravity=sdk_no_gravity)
     state: list[float] = []
     for box_id in ids:
-        state.extend(box_snapshot_to_state(_snapshot_for_box(snapshot, str(box_id))))
+        state.extend(
+            box_snapshot_to_state(_snapshot_for_box(snapshot, str(box_id)), sdk_no_gravity=sdk_no_gravity)
+        )
     return state
 
 
@@ -1323,8 +1355,12 @@ def _build_episode_rows(
     sof_frame_times_s: list[float | None] | None = None,
     box_delays_s: dict[str, float] | None = None,
     interpolate: bool = False,
+    sdk_no_gravity: bool = False,
 ) -> list[dict[str, Any]]:
     """One row per camera frame, each BOX sensor read at that frame's target time.
+
+    ``sdk_no_gravity`` builds the state in the layout recorded until 2026-11-16 (box_realign
+    rebuilding such a session); the recorder leaves it off.
 
     ``frame_times_s`` is the camera timeline (``camera_frame_times_rel``).  Given
     ``sof_frame_times_s`` as well (the same sidecar at ``exposure_fraction=0``),
@@ -1395,7 +1431,7 @@ def _build_episode_rows(
                 if data:
                     sensors[sid] = data
             snap = {"valid": bool(sensors), "sensors": sensors}
-            state = box_snapshot_to_state_for_boxes(snap, resolved_box_ids)
+            state = box_snapshot_to_state_for_boxes(snap, resolved_box_ids, sdk_no_gravity=sdk_no_gravity)
             rows.append({
                 "observation.state": state,
                 "box.timestamps": box_snapshot_to_timestamps_for_boxes(snap, resolved_box_ids),
@@ -1434,7 +1470,7 @@ def _build_episode_rows(
         for local_frame in range(frame_count):
             timestamp_s = local_frame / max(int(fps), 1)
             snapshot = snapshot_for_timestamp(timestamp_s)
-            state = box_snapshot_to_state_for_boxes(snapshot, resolved_box_ids)
+            state = box_snapshot_to_state_for_boxes(snapshot, resolved_box_ids, sdk_no_gravity=sdk_no_gravity)
             rows.append({
                 "observation.state": state,
                 "box.timestamps": box_snapshot_to_timestamps_for_boxes(snapshot, resolved_box_ids),

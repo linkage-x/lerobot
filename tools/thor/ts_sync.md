@@ -567,7 +567,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 
 `export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（taxel 维数按贴片型号，见 §9.3）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
 
-### 9.1 `observation.state` / `action`（float32，每台 BOX **44** 维）
+### 9.1 `observation.state` / `action`（float32，每台 BOX **38** 维）
 
 只放可训练的传感器读数，**不含任何时间戳、不含状态位**。通道分组（`BOX_STATE_NAMES`）：
 
@@ -576,7 +576,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 | gripper | `box_gripper.distance_m` | 1 |
 | trigger | `box_trigger.travel_pct` | 1 |
 | IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `quat_{x,y,z,w}` | 10（姿态只留四元数，**xyzw 标量在后**，见 §9.1.1） |
-| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` / `box_six_d_force_no_gravity.*` | 6+6 |
+| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}`（当前零点下的读数；导出时换成外力 `box_six_d_external.*`，见 §9.1.2） | 6 |
 | 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（**按贴片实际触点数**聚合，见 §9.3）；先指根那片 `box_touch_left/right`，再指尖那片 `box_touch_left_1/right_1`（排在最后） | 5+5+5+5 |
 
 > 演进：42 维（含重复 `gripper.pos`、7 个 `*.timestamp`、恒定死通道 `box_status.{valid,liwp_index}`）
@@ -584,7 +584,10 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 > 和 `liwp_index`(HF 路径恒 0)）→ 28 维（删 IMU 的 `roll/pitch/yaw_deg`，与 `quat` 冗余，见 §9.1.1）
 > → 34 维（加 `box_six_d_force_no_gravity.*`）→ **44 维**（2026-11-03：每指第二片、靠指尖的贴片也进 state，
 > 追加在末尾，前 34 维下标不变；旧 34 维 session 导出时仍带列名(`BOX_STATE_NAMES_ONE_PAD`)，但不能和 44 维的同批导出，
-> `export_v3` 会跳过并说明；`box_realign` 只处理 44 维）。
+> `export_v3` 会跳过并说明）→ **38 维**（2026-11-16：删掉 SDK 的 `box_six_d_force_no_gravity.*`，它用的是厂家默认载荷，
+> 对我们每台 BOX 都不对，见 §9.1.2；其后各通道下标前移 6。raw `box_sensors.jsonl` 仍保留 SDK 原字段。
+> 旧 44 维 session 按自己 `info.json` 的列名导出，和 38 维的导出结果同名同宽，可以同批导出；
+> `box_realign` 按 session 自己的宽度（38 / 44，`BOX_STATE_NAMES_SDK_NO_GRAVITY`）重建，一指一片的 34 维仍不处理）。
 > 原则：state 只留可训练的传感器读数, 不放单调计数/常量/同一量的第二种编码, 避免归一化被带歪与时间泄漏。
 
 > **扳机锁定（2026-11-13 查 SDK v4.1）**：固件规则是扳机捏到底保持约 2 s 就锁定，松手后夹爪仍闭合、
@@ -656,8 +659,8 @@ checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要�
 #### 9.1.2 六维力：录制存原读数，导出写外力（2026-11-16）
 
 **导出的训练数据里，六维力只有 `box_six_d_external.{fx,fy,fz,mx,my,mz}`**：作用在 BOX 负载上的外力（N、N·m，力传感器坐标系），
-位置就在原来 `box_six_d_force.*` 那一组。录制的 `box_six_d_force.*` 和 SDK 的 `box_six_d_force_no_gravity.*` **都不导出**
-（`export_v3 --six-d external`，默认；`--six-d none` 整个不导六维力）。录制目录本身不改。
+位置就在原来 `box_six_d_force.*` 那一组。录制的 `box_six_d_force.*` 和 SDK 的 `box_six_d_force_no_gravity.*`（11-16 前录的 44 维 session 才有）
+**都不导出**（`export_v3 --six-d external`，默认；`--six-d none` 整个不导六维力）。录制目录本身不改。
 
 **为什么两列录制值都不能直接训练**（11-13 165001 和周末 139 个 episode 实测）：
 
@@ -682,6 +685,10 @@ checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要�
   每段离散 < 0.15 N；软件零点的偏置一开始就差 0.5–0.9 N（K 不是在工作姿态拟合的），冷机半小时后差到 1.7 N。
   只取两端是因为中间张着夹爪慢慢推东西也像"静止"。周末 139 段：133 段用静止帧、4 段用零点、2 段跳过（145924，两端没停住），
   空中外力每段中位数的中位数 0.39 N。
+
+**标定页实时看**：录制器在 BOX_LIVE 里附上 `fxyz_mxyz_external`（`box_six_d.live_external`：本机 K + 本次 Connect 最近一次软件零点，
+没有时给 `external_note` 说明原因），标定页「外力静态验证」卡读它：做完动态校准后拿在空中转各个姿态，应一直在 1 N 以内，
+这就同时验了 K 和零点。不再显示 SDK 的 no_gravity。
 
 **记在哪**：`meta/export_sources.json` 每段的 `six_d`（BOX、K 的 `valid_from`、偏置来源和数值、静止帧数、与零点的差）；
 `info.json` 的 `label_provenance.key.six_d_payload`（每台 BOX 用的是哪条 K，`box<id>@<valid_from>`）。不同 K 的会话
