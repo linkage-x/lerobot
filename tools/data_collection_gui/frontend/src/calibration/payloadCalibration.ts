@@ -42,7 +42,14 @@ export type PayloadRun = {
   twoWay: boolean;
   note: string;
   deskAtStart: number | null;
-  sixD: { deviceId: number | null; log: string; fit: SixDFitSummary | null } | null;
+  sixD: {
+    deviceId: number | null;
+    log: string;
+    fit: SixDFitSummary | null;
+    /** what was on the arm (from the run's tool_config); an arm BOX's record says this */
+    endEffector?: string;
+    startedUnix?: number | null;
+  } | null;
 };
 
 export type DeskConfigEntry = {
@@ -134,12 +141,61 @@ export type BoxRegistryEntry = {
     retired?: { reason?: string | null; by?: string | null } | null;
     /** the record the export and the live wrench use now */
     inForce?: boolean;
+    /** an arm BOX's page registration: "pending" until the arm zero re-checks it, then "pass" / "fail" */
+    check?: "" | "pending" | "pass" | "fail";
+    checkDetail?: string | null;
+    /** the page may switch this BOX back to this record */
+    reusable?: boolean;
+    /** a switch-back copy: the valid_from of the record it copies */
+    reuses?: number | null;
   }[];
-  /** whether the page may register this BOX's fit itself (hand-held) */
+  /** whether the page may register this BOX's fit itself (hand-held, or an arm BOX from its lift run) */
   selfService?: boolean;
   /** why nothing is in force now ("" when something is) */
   notInForce?: string;
+  /** the page's 当前负载 choices: per end effector, its newest trusted record */
+  loads?: SixDLoadChoice[];
 };
+
+export type SixDLoadChoice = {
+  endEffector: string;
+  validFromUnix: number;
+  registeredUnix: number | null;
+  key: string;
+  /** when the K it carries was fitted for (a switch-back copy names its source) */
+  fittedFrom: string | null;
+  heldoutWorstForceN: number | null;
+  store: "repo" | "local";
+  inForce: boolean;
+};
+
+/** How the 已登记 table shows a record: retired, waiting for / failed / passed the arm zero, in force. */
+export function sixDRecordState(r: BoxRegistryEntry["records"][number]): { text: string; tone: "ok" | "warn" | "" } {
+  if (r.retired) return { text: `已撤销：${r.retired.reason ?? ""}`, tone: "warn" };
+  if (!r.fitted) return { text: "待拟合", tone: "warn" };
+  const heldout = `留一面 ${r.heldoutWorstForceN ?? "—"} N`;
+  if (r.check === "pending") return { text: `待复核（BOX 预热后做一次臂上校零）· ${heldout}`, tone: "warn" };
+  if (r.check === "fail") return { text: `复核没过，已作废：${r.checkDetail ?? ""}`, tone: "warn" };
+  const checked = r.check === "pass" ? "臂上校零已复核 · " : "";
+  const reused = r.reuses ? "换回的 K · " : "";
+  return { text: `${r.inForce ? "现在生效 · " : ""}${reused}${checked}${heldout}`, tone: r.inForce ? "ok" : "" };
+}
+
+/**
+ * Whether the page registers this source's fit, and how: a hand-held capture of a hand-held BOX, or
+ * an FR3 lift run of an arm BOX (pending until the arm zero). Anything else: "" (and why).
+ */
+export function sixDRegisterKind(
+  role: string | undefined,
+  armRun: boolean,
+  rules: SixDSelfServiceRules = SIX_D_SELF_SERVICE_DEFAULT,
+): { kind: "" | "handheld" | "arm"; why: string } {
+  if (!role) return { kind: "", why: "这只 BOX 不在 box_devices.json 里（新 BOX 先由维护者登记角色）" };
+  if (!rules.roles.includes(role)) return { kind: "", why: `角色 ${role} 的 K 由维护者登记` };
+  if (role === "fr3_gripper")
+    return armRun ? { kind: "arm", why: "" } : { kind: "", why: "臂上 BOX 用 FR3 托举采集登记，不用手持采集" };
+  return armRun ? { kind: "", why: "手持 BOX 用手持采集登记" } : { kind: "handheld", why: "" };
+}
 
 /** The page's self-service gate (box_six_d_store): the numbers it checks a fit against. */
 export type SixDSelfServiceRules = { roles: string[]; heldoutN: number; driftN: number; warmupS: number };
@@ -404,7 +460,7 @@ export function sixDFitNotes(fit: SixDFitSummary | null | undefined): { tone: "w
 }
 
 export const SIX_D_SELF_SERVICE_DEFAULT: SixDSelfServiceRules = {
-  roles: ["handheld"],
+  roles: ["handheld", "fr3_gripper"],
   heldoutN: 0.3,
   driftN: 0.3,
   warmupS: 1800,

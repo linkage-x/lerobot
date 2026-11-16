@@ -857,9 +857,13 @@ def live_external(
         if not f or len(f) < 6 or not acc or len(acc) < 3:
             out[sid] = {"external_note": "还没有力或 IMU 读数"}
             continue
-        model = payload_model(registry, did, now_s)
+        model, why = payload_model_or_reason(registry, did, now_s)
         if model is None:
-            out[sid] = {"external_note": f"BOX {did} 没有载荷模型（在标定页 6D 拟合里采集、拟合并登记）"}
+            out[sid] = {
+                "external_note": f"BOX {did} 的新 K 还没复核（BOX 预热后做一次臂上 6D 零点）"
+                if "waits for its check" in why
+                else f"BOX {did} 没有生效的载荷模型（在标定页 6D 拟合里采集、拟合并登记，或切回以前的负载）"
+            }
             continue
         zero = zeros.get(did)
         if not zero:

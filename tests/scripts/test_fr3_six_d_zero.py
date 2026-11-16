@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from tools.data_collection_gui import fr3_payload_calibration as pc, fr3_six_d_zero as z
-from tools.thor.gmsl2 import box_six_d
+from tools.thor.gmsl2 import box_six_d, box_six_d_store as store
 
 REPO = Path(__file__).resolve().parents[2]
 DEVICE = 3100715645
@@ -339,3 +339,70 @@ def test_the_box_tab_still_finds_this_mornings_origin_after_many_dynamic_zeros(t
         ("right", DEVICE, "dynamic"): "2026-11-10T16:00:00",  # nor the failed 17:00 one
         ("left", 1234, "dynamic"): "2026-11-10T09:15:00",
     }
+
+
+# --- a K registered from the page for an arm BOX waits for this zero's re-checks (11-16) ------------
+
+
+def _pending(tmp_path, k, valid_from=1.75e9):
+    record = store.payload_record(
+        {"K": [list(map(float, row)) for row in np.asarray(k)]}, end_effector="gripper + camera, on the FR3 (right)",
+        valid_from_unix=valid_from, status="self-service", source="run",
+    )
+    event = store.register_event(DEVICE, record, pending="arm_zero_recheck", now_unix=valid_from + 100)
+    store.append_event(tmp_path / store.LOCAL_SUBPATH, event)
+    return event
+
+
+def _events(tmp_path):
+    return store.read_events(tmp_path / store.LOCAL_SUBPATH)
+
+
+def test_the_zero_re_checks_a_pending_k_and_puts_it_in_force(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    rig = FakeRig()
+    cal = _cal(tmp_path, rig)
+    _pending(tmp_path, K)
+    assert store.in_force(store.load_merged(tmp_path), DEVICE, time.time())[0] is None
+    assert cal.zero_start({"arm": "right", "mode": "dynamic", "confirmed": True})["ok"]
+    job = _wait(cal)
+    assert job["state"] == "done" and job["pass"], (job["error"], job["log"][-8:])
+    report = json.loads((tmp_path / z.REPORT_SUBDIR / job["report"]).read_text())
+    assert report["k_record"]["check"] == "pending" and report["k_record"]["store"] == "local"
+    assert report["k_verification"] == {"decided": True, "pass": True, "detail": report["k_verification"]["detail"]}
+    verify = _events(tmp_path)[-1]
+    assert verify["event"] == "verify" and verify["pass"] and verify["report"].endswith(job["report"])
+    record = store.in_force(store.load_merged(tmp_path), DEVICE, time.time())[0]
+    assert record["store"] == "local" and store.check_state(record) == "pass"
+
+
+def test_a_pending_k_that_fails_the_re_check_is_rejected(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    rig = FakeRig()
+    cal = _cal(tmp_path, rig)
+    wrong = np.asarray(K) * 1.0
+    wrong[2, 1] += 1.2
+    _pending(tmp_path, wrong)
+    assert cal.zero_start({"arm": "right", "mode": "dynamic", "confirmed": True})["ok"]
+    job = _wait(cal)
+    assert not job["pass"] and any("已作废" in w for w in job["warnings"])
+    verify = _events(tmp_path)[-1]
+    assert verify["event"] == "verify" and verify["pass"] is False
+    reg = store.load_merged(tmp_path)
+    record, why = store.in_force(reg, DEVICE, time.time())
+    assert record is None and "re-check failed" in why  # no fall-back to the repo K of the older mount
+    # the next zero re-checks nothing new: there is no candidate left for that mount
+    assert z.payload_k(reg, DEVICE, time.time())[0] is None
+
+
+def test_a_cold_box_decides_nothing_about_a_pending_k(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    rig = FakeRig()
+    rig.boot = time.time() - 600.0
+    cal = _cal(tmp_path, rig)
+    _pending(tmp_path, K)
+    assert cal.zero_start({"arm": "right", "mode": "dynamic", "confirmed": True})["ok"]
+    job = _wait(cal)
+    assert job["pass"] and any("没有判定" in w for w in job["warnings"])
+    assert [e["event"] for e in _events(tmp_path)] == ["register"]
+    assert store.check_state(z.payload_k(store.load_merged(tmp_path), DEVICE, time.time())[1]) == "pending"

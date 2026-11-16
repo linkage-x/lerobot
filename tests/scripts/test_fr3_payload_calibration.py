@@ -182,13 +182,92 @@ def test_the_gate_refuses_a_capture_without_warm_up_or_drift_check(tmp_path):
     assert not out["ok"] and any("预热" in r for r in out["refusals"])
 
 
-def test_an_arm_box_is_not_registered_from_the_page(tmp_path):
+def _arm_run(tmp_path: Path, name="20261109_100000_fr3_smr_out", device=3100715645, **run_over) -> str:
+    """An FR3 lift run with its BOX 6D log (warm, every face, a revisit), as the page's collect leaves it."""
+    if not (tmp_path / pc.REGISTRY).is_file():
+        _capture(tmp_path, name="20261109_090000_box3906437858")  # writes the repo registry
+    d = tmp_path / pc.RUNS_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    run = {"source": "fr3", "arm": "right", "robot_ip": "192.168.1.210", "tool_config": "gripper_cam",
+           "poses_set": "six_d", "complete": True, "poses": [], "six_d": {"device_id": device, "log": f"{name}.six_d.log"}}
+    run.update(run_over)
+    (d / f"{name}.json").write_text(json.dumps(run))
+    _faces_log(d / f"{name}.six_d.log", timed=True)
+    return f"run:{name}.json"
+
+
+# 2026-11-09 10:00 +08:00, the runs' name stamp: a mount time must not be after the run started
+MOUNT = 1794189600
+
+
+def test_an_arm_box_is_registered_from_its_lift_run_and_waits_for_the_arm_zero(tmp_path):
     cal = _calibration(tmp_path)
-    src = _capture(tmp_path, name="20261109_100000_box3100715645", device=3100715645, timed=True)
+    src = _arm_run(tmp_path)
+    run = cal.refit({"source": src})["runs"][0]
+    assert run["sixD"]["endEffector"] == "gripper + camera/SMR adaptor, SMR out, on the FR3 (right)"
+    # what was on the arm comes from the run, not from the form
+    out = cal.register({"source": src, "endEffector": "typed by someone", "validFromUnix": MOUNT})
+    assert out["ok"], out["error"]
+    (event,) = [json.loads(line) for line in (tmp_path / pc.LOCAL_REGISTRY).read_text().splitlines()]
+    assert event["record"]["end_effector"] == run["sixD"]["endEffector"]
+    assert event["record"]["verification"] == {"by": "arm_zero_recheck", "result": None}
+    assert "FR3 lift run" in event["record"]["status"]
+    box = next(b for b in out["boxes"] if b["deviceId"] == "3100715645")
+    assert box["records"][0]["check"] == "pending" and not box["records"][0]["inForce"]
+    assert "waits for its check" in box["notInForce"]
+
+
+def test_an_arm_box_is_refused_from_a_hand_held_capture_or_another_arm_s_box(tmp_path):
+    cal = _calibration(tmp_path)
+    hand = _capture(tmp_path, name="20261109_100000_box3100715645", device=3100715645, timed=True)
+    cal.refit({"source": hand})
+    out = cal.register({"source": hand, "endEffector": "gripper on the FR3", "validFromUnix": 1.7935e9})
+    assert not out["ok"] and "FR3 托举采集" in out["error"]
+
+    src = _arm_run(tmp_path, complete=False)
     cal.refit({"source": src})
-    out = cal.register({"source": src, "endEffector": "gripper on the FR3", "validFromUnix": 1.7935e9})
-    assert not out["ok"] and "维护者" in out["error"]
-    assert "维护者" in cal.register({"source": "run:20261109_100000_fr3_right.json"})["error"]
+    out = cal.register({"source": src, "validFromUnix": MOUNT})
+    assert not out["ok"] and any("没有跑完" in r for r in out["refusals"])
+
+    other = pc.PayloadCalibration(_host(tmp_path, resolve_arm=lambda arm: {
+        "arm": "right", "robot_ip": "192.168.1.210", "corenetic_device_id": 596523097}))
+    other._tool = cal._tool  # type: ignore[method-assign]
+    src = _arm_run(tmp_path, name="20261109_110000_fr3_smr_out")
+    other.refit({"source": src})
+    out = other.register({"source": src, "validFromUnix": MOUNT})
+    assert not out["ok"] and any("fr3_arms.json" in r for r in out["refusals"])
+    assert not (tmp_path / pc.LOCAL_REGISTRY).exists()
+
+
+def test_the_page_switches_a_box_back_to_a_load_it_had_before(tmp_path):
+    cal = _calibration(tmp_path)
+    first = _capture(tmp_path, timed=True)
+    cal.refit({"source": first})
+    assert cal.register({"source": first, "endEffector": "gripper + rig v9b", "validFromUnix": 1.7935e9})["ok"]
+    second = _capture(tmp_path, name="20261109_120000_box3906437858", timed=True)
+    cal.refit({"source": second})
+    time.sleep(1.01)
+    out = cal.register({"source": second, "endEffector": "gripper + rig v9b + camera", "validFromUnix": 1.7936e9})
+    assert out["ok"], out["error"]
+    box = next(b for b in out["boxes"] if b["deviceId"] == "3906437858")
+    loads = {c["endEffector"]: c for c in box["loads"]}
+    assert set(loads) == {"gripper + rig v9b", "gripper + rig v9b + camera"}
+    assert loads["gripper + rig v9b + camera"]["inForce"] and not loads["gripper + rig v9b"]["inForce"]
+
+    pick = loads["gripper + rig v9b"]
+    body = {"deviceId": "3906437858", "sourceValidFromUnix": pick["validFromUnix"],
+            "sourceRegisteredUnix": pick["registeredUnix"], "status": "camera off"}
+    early = cal.switch_back({**body, "validFromUnix": 1.7935e9})
+    assert not early["ok"] and any("早于" in r for r in early["refusals"])
+    time.sleep(1.01)
+    out = cal.switch_back({**body, "validFromUnix": time.time() - 5})
+    assert out["ok"], out["error"]
+    box = next(b for b in out["boxes"] if b["deviceId"] == "3906437858")
+    loads = {c["endEffector"]: c for c in box["loads"]}
+    assert loads["gripper + rig v9b"]["inForce"] and not loads["gripper + rig v9b + camera"]["inForce"]
+    current = next(r for r in box["records"] if r["inForce"])
+    assert current["reuses"] == pick["validFromUnix"] and current["endEffector"] == "gripper + rig v9b"
+    assert "选" in cal.switch_back({"deviceId": "3906437858"})["error"]
 
 
 def test_a_re_fit_of_the_same_mount_replaces_the_old_one_but_history_stays_with_the_maintainer(tmp_path):

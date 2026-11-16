@@ -10,7 +10,11 @@ fingertips up, never held by hand. On the arm the robot holds that attitude inst
   4. dynamic zero (``cali_6d_force_sensor``) and its acceptance (Fz −7.784 ±0.5 N, Mx −0.168 ±0.01 N·m),
      then reads f0 / acc0 at the zero pose
   5. back to start, then the two re-check poses: external = (f − f0) − K·(acc − acc0) with the BOX's
-     registered 6D fit, every force axis within 0.5 N
+     registered 6D fit, every force axis within 0.5 N. A K registered from the page and still waiting
+     for its check (box_six_d_store.candidate) is the one re-checked: if every check passed with the
+     BOX warm, the job appends a ``verify`` pass to the station's 6D log and the K is in force from
+     then on; a failed re-check appends a fail and the K is rejected (a cold BOX or a failed zero
+     check decides nothing)
   6. back to start, report in outputs/fr3_six_d_zero/
 
 The zeros go through the recorder (it owns the BOX port, and the software zero lives in its SDK
@@ -135,8 +139,9 @@ def dynamic_check(f: list[float]) -> bool:
 
 
 def payload_k(registry: dict[str, Any], device_id: int, at_unix: float) -> tuple[list[list[float]] | None, dict]:
-    """box_six_d.payload_model's choice (box_six_d_store.select): the record in force at ``at_unix``, if it has a K."""
-    record, _why = store.in_force(registry, device_id, at_unix)
+    """The K to re-check with: the record in force at ``at_unix``, or a newer registration of the same
+    mount still waiting for this check (box_six_d_store.candidate)."""
+    record, _why = store.candidate(registry, device_id, at_unix)
     if record is None:
         return None, {}
     return [[float(v) for v in row] for row in record["K"]], record
@@ -203,7 +208,11 @@ class ZeroJob:
             "device_id": ctx["device_id"],
             "box_id": ctx["box_id"],
             "mode": ctx["mode"],
-            "k_record": {k: ctx["k_record"].get(k) for k in ("valid_from", "valid_from_unix", "end_effector")}
+            "k_record": {
+                **{k: ctx["k_record"].get(k) for k in ("valid_from", "valid_from_unix", "registered_unix", "end_effector")},
+                "store": ctx["k_record"].get("store") or "repo",
+                "check": store.check_state(ctx["k_record"]),
+            }
             if ctx.get("k_record")
             else None,
             "checks": [],
@@ -340,7 +349,12 @@ class ZeroJob:
         self.report.update({"state": state, "error": error, "pass": passed})
         with self.cal.lock:
             self.report["log"] = list(self.cal.job.get("log") or [])
+        verdict = self.verification(state, passed)
+        if verdict is not None:
+            self.report["k_verification"] = verdict
         path = self.write_report()
+        if verdict is not None and verdict["decided"]:
+            self.cal._six_d_verified(self.ctx["k_record"], self.ctx["device_id"], verdict, path)
         with self.cal.lock:
             self.cal.job["report"] = path.name
             self.cal.job["pass"] = passed
@@ -349,6 +363,33 @@ class ZeroJob:
             state, error = "error", "零点流程走完了，但有检查没通过（见红项）"
         self.cal._finish(state, error)
         self.cal.host.log("info" if passed else "warn", f"FR3 6D zero ({self.ctx['arm']}): {state}, pass={passed}")
+
+    def verification(self, state: str, passed: bool) -> dict[str, Any] | None:
+        """What this run says about a K waiting for its check (None: the K needed none)."""
+        record = self.ctx.get("k_record") or {}
+        if store.check_state(record) != "pending":
+            return None
+        checks = {c["id"]: c["pass"] for c in self.report["checks"]}
+        rechecks = [checks.get(n) for n in ("check_xplus", "check_yminus")]
+        others = [ok for cid, ok in checks.items() if cid not in ("check_xplus", "check_yminus")]
+        uptime = self.report.get("uptime_at_start_s")
+        why = ""
+        if state != "done" or None in rechecks:
+            why = "零点流程没走完，两次复核没有都做"
+        elif not all(others):
+            why = "零点本身有检查没过，复核说明不了 K"
+        elif uptime is None or float(uptime) < WARMUP_S:
+            why = f"BOX 没预热 {WARMUP_S // 60} 分钟，复核说明不了 K"
+        if why:
+            text = f"新登记的 K（{record.get('valid_from')}）这次没有判定：{why}；它仍未生效，预热后再校零一次"
+            self.warn(text)
+            return {"decided": False, "detail": why}
+        ok = all(rechecks)
+        detail = f"两次复核都在 ±{RECHECK_FORCE_N:.1f} N 内" if ok else f"复核外力超出 ±{RECHECK_FORCE_N:.1f} N"
+        self.log(f"{'PASS' if ok else 'FAIL'} 新登记的 K（{record.get('valid_from')}）：{detail}")
+        if not ok:
+            self.warn(f"新登记的 K（{record.get('valid_from')}）复核没过，已作废：重新托举采集并登记，或换回旧的 K")
+        return {"decided": True, "pass": ok, "detail": detail}
 
     def write_report(self) -> Path:
         out = self.cal.root / REPORT_SUBDIR

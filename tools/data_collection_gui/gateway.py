@@ -5811,6 +5811,7 @@ _PAYLOAD_CALIBRATION_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], 
     "/api/calibration/six-d/stop": lambda state, body: _payload_calibration(state).stop(),
     "/api/calibration/six-d/fit": lambda state, body: _payload_calibration(state).refit(body),
     "/api/calibration/six-d/register": lambda state, body: _payload_calibration(state).register(body),
+    "/api/calibration/six-d/switch-back": lambda state, body: _payload_calibration(state).switch_back(body),
 }
 
 
