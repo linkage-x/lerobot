@@ -997,33 +997,23 @@ def hole_sample_xy(row: dict[str, Any]) -> tuple[float, float] | None:
 
 
 def teacher_hole_xy(request: GraspLoopRequest, rows: Iterable[dict[str, Any]]) -> tuple[float, float]:
-    """The hole the teacher aims at, in the measured tool's frame (the one its servo closes on).
+    """The hole the teacher aims at, in the measured tool's frame (the one its servo closes on):
+    the configured pose moved by GRASP_LOOP_TEACHER_HOLE_SHIFT_M. Fixed for the run.
 
-    The configured pose moved by GRASP_LOOP_TEACHER_HOLE_SHIFT_M, then the median of the latest
-    GRASP_LOOP_HOLE_WINDOW teacher seats: each the measured tool at the entry height less its
-    in-hand offset, within GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M of that start. Not `hole_sample_xy`:
-    a scripted landing is a commanded point and a seated tool is pulled toward its command inside
-    the clearance, so mixing them walked the aim +2..3 mm x and 7 of 9 descents met the face (151143).
+    It learned from earlier insertions twice, and walked off both times. From scripted landings and
+    seated stops (151143): commanded points and a tool pulled toward its command, +1..2 mm x, 7 of 9
+    descents on the face. From its own entries (160003): the gate lets a descent through at the
+    edge of its 0.6 mm tolerance, always on the side the arm lags from, so each seat moved the
+    median ~0.3 mm -x; 4/4 seated while the aim was within 1.4 mm of the start, 4/6 after. A hole
+    that creeps shows up as blocks, not as a silently walking aim. `rows` is kept for the call site.
     """
 
+    del rows
     assert request.insertServo is not None
-    start = (
+    return (
         float(request.insertServo.xyz[0]) + GRASP_LOOP_TEACHER_HOLE_SHIFT_M[0],
         float(request.insertServo.xyz[1]) + GRASP_LOOP_TEACHER_HOLE_SHIFT_M[1],
     )
-    samples = []
-    for row in rows:
-        segment = row.get("insertSegment") or {}
-        entry, offset = segment.get("entryXyz"), segment.get("offsetXyMm")
-        if row.get("inserted") is not True or segment.get("outcome") != "seated" or not entry or offset is None:
-            continue
-        xy = (float(entry[0]) - float(offset[0]) / 1000.0, float(entry[1]) - float(offset[1]) / 1000.0)
-        if math.dist(xy, start) <= GRASP_LOOP_INSERT_MAX_AIM_SHIFT_M:
-            samples.append(xy)
-    samples = samples[-GRASP_LOOP_HOLE_WINDOW:]
-    if not samples:
-        return start
-    return (statistics.median(x for x, _ in samples), statistics.median(y for _, y in samples))
 
 
 def read_width(robot: Any, samples: int = GRASP_LOOP_WIDTH_SAMPLES, period_s: float = 1.0 / 30.0) -> float:

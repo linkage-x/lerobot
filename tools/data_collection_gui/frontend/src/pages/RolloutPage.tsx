@@ -170,6 +170,7 @@ export function RolloutPage() {
   const [graspLoopResume, setGraspLoopResume] = useState("");
   const graspLoopResumeRef = useRef<HTMLInputElement | null>(null);
   const [graspLoopAttended, setGraspLoopAttended] = useState(true);
+  const [graspLoopWaitForPerson, setGraspLoopWaitForPerson] = useState(true);
   const [graspLoopArms, setGraspLoopArms] = useState<"A" | "B" | "AB">("AB");
   // v14 step 4 (09-29): end to end by default, into the hole step 3 passed its gate on.
   const [graspLoopInsertPose, setGraspLoopInsertPose] = useState("0.3597,-0.1328,0.058");
@@ -343,6 +344,7 @@ export function RolloutPage() {
       graspLoopLighting: modeId === "grasp_loop" ? graspLoopLighting.trim() || undefined : undefined,
       graspLoopResume: modeId === "grasp_loop" ? graspLoopResume.trim() || undefined : undefined,
       graspLoopAttended: modeId === "grasp_loop" ? graspLoopAttended : undefined,
+      graspLoopWaitForPerson: modeId === "grasp_loop" && !graspLoopAttended ? graspLoopWaitForPerson : undefined,
       graspLoopArms: modeId === "grasp_loop" ? graspLoopArms : undefined,
       graspLoopInsertPose: modeId === "grasp_loop" ? graspLoopInsertPose.trim() || undefined : undefined,
       graspLoopInsertSearchOrder:
@@ -434,6 +436,7 @@ export function RolloutPage() {
       graspLoopLighting,
       graspLoopResume,
       graspLoopAttended,
+      graspLoopWaitForPerson,
       graspLoopArms,
       graspLoopInsertPose,
       graspLoopInsertSearchOrder,
@@ -641,6 +644,7 @@ export function RolloutPage() {
       if (options.graspLoopSeed !== undefined) setGraspLoopSeed(String(options.graspLoopSeed));
       if (options.graspLoopLighting !== undefined) setGraspLoopLighting(options.graspLoopLighting || "lab");
       if (options.graspLoopAttended !== undefined) setGraspLoopAttended(options.graspLoopAttended);
+      if (options.graspLoopWaitForPerson !== undefined) setGraspLoopWaitForPerson(options.graspLoopWaitForPerson);
       if (options.graspLoopArms !== undefined) setGraspLoopArms(options.graspLoopArms);
       if (options.graspLoopInsertPose !== undefined) setGraspLoopInsertPose(options.graspLoopInsertPose);
       setGraspLoopInsertSearchOrder(options.graspLoopInsertSearchOrder ?? "");
@@ -1651,6 +1655,17 @@ export function RolloutPage() {
               />
               <span>有人在场：销被碰倒时暂停等我放回（不勾则直接停机）；端到端时每次插完由我判进没进</span>
             </label>
+            {!graspLoopAttended && (
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={graspLoopWaitForPerson}
+                  onChange={(event) => setGraspLoopWaitForPerson(event.target.checked)}
+                  disabled={isLive}
+                />
+                <span>需要人时暂停等待，不结束这一轮：销丢了/反射/故障时停在原位，放回后点「继续」接着跑（不用续跑）；进没进仍由程序自己判</span>
+              </label>
+            )}
             <label className="field">
               <span>插入孔位 x,y,z（端到端）</span>
               <input

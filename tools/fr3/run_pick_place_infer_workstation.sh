@@ -13,7 +13,8 @@
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_debug             # + MuJoCo target viewer
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_once              # one bounded rollout
 #   bash tools/fr3/run_pick_place_infer_workstation.sh grasp_loop             # graded grasp-only trials
-#     FR3_GRASP_LOOP_TRIALS (40), FR3_GRASP_LOOP_MASK, FR3_GRASP_LOOP_OUT, FR3_GRASP_LOOP_ATTENDED=1
+#     FR3_GRASP_LOOP_TRIALS (40), FR3_GRASP_LOOP_MASK, FR3_GRASP_LOOP_OUT, FR3_GRASP_LOOP_ATTENDED=1,
+#     FR3_GRASP_LOOP_WAIT_FOR_PERSON=1
 #     FR3_GRASP_LOOP_MAX_POLICY_STEPS (policy steps before a trial with no close ends; blank = 450)
 #     FR3_GRASP_LOOP_ARMS (A | B | AB: pure policy, GT grasp funnel, or both interleaved)
 #     FR3_GRASP_LOOP_INSERT_POSE (x,y,z: carry each held grasp into the hole there; blank = grasp only)
@@ -510,6 +511,8 @@ case "$mode" in
       --rollout-trace-dir "outputs/rollout_traces/grasp_loop_${grasp_loop_stamp}"
     )
     if [[ "${FR3_GRASP_LOOP_ATTENDED-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-attended); fi
+    # Unattended, but a lost peg (or a reflex/fault) waits for a person instead of ending the run.
+    if [[ "${FR3_GRASP_LOOP_WAIT_FOR_PERSON-0}" == "1" ]]; then grasp_loop_args+=(--grasp-loop-wait-for-person); fi
     # Policy steps before a trial that never closes ends (blank = the runtime's 450).
     if [[ -n "${FR3_GRASP_LOOP_MAX_POLICY_STEPS-}" ]]; then grasp_loop_args+=(--grasp-loop-max-policy-steps "${FR3_GRASP_LOOP_MAX_POLICY_STEPS}"); fi
     # Where the pegs go and arm B's draws: a paired A/B shares one, recordings each need a new one (blank = 0).

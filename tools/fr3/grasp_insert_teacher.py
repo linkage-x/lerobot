@@ -36,10 +36,19 @@ Phases: LIFT straight up from the close, grading the grasp on the way as `check_
 squeezing to the script's close; CARRY across at carry height, turning to the level wrist;
 DESCEND fast to `approachDzM` over the seat, then slowly, the setpoint never more than
 `contactLagM` below the tool, until the tool stands still; RELEASE if it stands within `seatedM`
-of the seat, else stop holding (`blocked`); RETREAT straight up with the fingers open.
+of the seat; else RETRY: up `retryLiftM`, the aim moved `retryStepM` the way the hub pushed the
+tool, and down again, at most `retries` times, before it stops holding (`blocked`); RETREAT
+straight up with the fingers open.
 
-No lift-and-retry at the bottom: the funnel's lift labels taught the policy a bimodal bottom
-(10-30 unguided A/B), and a blocked insertion is handed back to the loop's scripted search.
+Why a retry (11-16, run 092701 3/8 seated): what the teacher can see -- the measured tool less
+the in-hand offset -- did not tell a seat from a block (25 descents of 163608 + 092701 overlap
+fully); the ~1 mm it cannot see (the offset's own error) is the hole's whole clearance. But the
+hub tells it which way: 21 of 25 descents were pushed +x on touching (the peg -x of the hole),
+the 4 pushed -x all stood +x of the rest. A block handed to the scripted search ends with the peg
+leaned in the fingers and a re-grip that closes on nothing -- a person has to put it back, so no
+unattended recording. The retries happen over the hole with the peg still held; their frames
+are in the episode and its `transitions` say where, so a view can still mask them (the funnel's
+lift labels taught the policy a bimodal bottom, 10-30) if training on them shows the same.
 
 Pure: no robot, no clock. The runtime feeds the measured pose and width and sends what comes back.
 """
@@ -60,6 +69,7 @@ CARRY = "CARRY"
 DESCEND = "DESCEND"
 RELEASE = "RELEASE"
 RETREAT = "RETREAT"
+RETRY = "RETRY"
 DONE = "DONE"
 
 # The funnel's align speed for the lift, and a carry a little faster: the arm trails a 0.05 m/s
@@ -97,6 +107,16 @@ INSERT_TEACHER_ALIGN_MAX_M = 0.006
 INSERT_TEACHER_ALIGN_TOL_M = 0.0006
 INSERT_TEACHER_ENTRY_DZ_M = 0.040
 INSERT_TEACHER_ALIGN_TIMEOUT_STEPS = 90
+# After a block (see the module docstring): lift clear of the face, move the aim this far along
+# the measured push, descend again. 1 mm is the clearance; three of them reach the 3 mm the
+# misses spread over. A push under 1 mm says nothing about the side (the descent's own wobble).
+# OFF since 11-16 (101911): 0 of 6 retries seated. A peg standing on the hub's face is pushed
+# +7.3 mm x / -1.3 mm y whatever the aim (a skid, not the hole's edge), and each press stood the
+# tool ~1.4 mm lower on the same face -- the peg driven up into the fingers. Kept as an option.
+INSERT_TEACHER_RETRIES = 0
+INSERT_TEACHER_RETRY_LIFT_M = 0.005
+INSERT_TEACHER_RETRY_STEP_M = 0.001
+INSERT_TEACHER_RETRY_MIN_PUSH_M = 0.001
 
 
 def in_hand_offset_xy(
@@ -182,6 +202,10 @@ class InsertTeacherConfig:
     alignTolM: float = INSERT_TEACHER_ALIGN_TOL_M
     entryDzM: float = INSERT_TEACHER_ENTRY_DZ_M
     alignTimeoutSteps: int = INSERT_TEACHER_ALIGN_TIMEOUT_STEPS
+    retries: int = INSERT_TEACHER_RETRIES
+    retryLiftM: float = INSERT_TEACHER_RETRY_LIFT_M
+    retryStepM: float = INSERT_TEACHER_RETRY_STEP_M
+    retryMinPushM: float = INSERT_TEACHER_RETRY_MIN_PUSH_M
 
     @property
     def offsetXy(self) -> tuple[float, float]:
@@ -232,6 +256,11 @@ class InsertTeacher:
     alignErrorAtEntryMm: float | None = None
     # The measured tool when the descent passed the entry height: where this grasp's aim stood.
     entryXyz: tuple[float, float, float] | None = None
+    # Added to the seat's xy for the descent: the retries' moves along the pushes.
+    aimNudge: tuple[float, float] = (0.0, 0.0)
+    retryLog: list[dict[str, Any]] = field(default_factory=list)
+    # RETRY's leg: "lift" (straight up off the face), then "shift" (the aim, at that height).
+    retryLeg: str = ""
     stateSteps: dict[str, int] = field(default_factory=dict)
     transitions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -257,11 +286,16 @@ class InsertTeacher:
         return self.quietSteps >= cfg.settleSteps
 
     def _align(self, ee_xyz: tuple[float, float, float]) -> float:
-        """Integrate the measured miss of the seat into the bias, above the entry only. The miss (m)."""
+        """Integrate the measured miss of the aim into the bias, above the entry only. The miss (m).
+
+        The aim is the seat plus the retries' moves: a retry lifts back to about the entry's
+        height (the hub's face is ~35 mm over the seat), and a bias pulled back onto the seat
+        there would undo the move it was lifted to make.
+        """
 
         cfg = self.config
         seat = cfg.seatXyz
-        ex, ey = seat[0] - ee_xyz[0], seat[1] - ee_xyz[1]
+        ex, ey = seat[0] + self.aimNudge[0] - ee_xyz[0], seat[1] + self.aimNudge[1] - ee_xyz[1]
         if ee_xyz[2] > seat[2] + cfg.entryDzM - 1e-9:
             bx, by = self.lateralBias[0] + cfg.alignGain * ex, self.lateralBias[1] + cfg.alignGain * ey
             norm = math.hypot(bx, by)
@@ -344,19 +378,51 @@ class InsertTeacher:
             # Never further below the tool than the contact lag: whatever it stands on is pressed
             # with the controller's stiffness times this, not with a setpoint running away below.
             next_z = max(walked_z, ee_xyz[2] - cfg.contactLagM)
-            self.setpoint = (seat[0], seat[1], next_z)
+            aim = (seat[0] + self.aimNudge[0], seat[1] + self.aimNudge[1])
+            self.setpoint = (aim[0], aim[1], next_z)
             settled = self._settled(ee_xyz)
             if settled and (next_z <= bottom + 1e-9 or next_z > walked_z + 1e-9):
                 # At the bottom of its travel, or held back by the lag, and the tool has stopped.
                 self.stoppedXyz = ee_xyz
+                # Hold where it stands rather than keep pressing (the output adds the bias).
+                hold = (ee_xyz[0] - self.lateralBias[0], ee_xyz[1] - self.lateralBias[1], ee_xyz[2])
+                push = (ee_xyz[0] - aim[0], ee_xyz[1] - aim[1])
+                push_m = math.hypot(*push)
                 if ee_xyz[2] - seat[2] <= cfg.seatedM:
                     self.gripper = cfg.openGripper
                     self._enter(RELEASE, step_idx, ee_xyz, "seated")
+                elif len(self.retryLog) < cfg.retries and push_m >= cfg.retryMinPushM:
+                    self.aimNudge = (
+                        self.aimNudge[0] + cfg.retryStepM * push[0] / push_m,
+                        self.aimNudge[1] + cfg.retryStepM * push[1] / push_m,
+                    )
+                    self.retryLog.append({
+                        "step": step_idx, "stoppedXyz": [round(v, 5) for v in ee_xyz],
+                        "aboveSeatMm": round((ee_xyz[2] - seat[2]) * 1000.0, 1),
+                        "pushMm": [round(v * 1000.0, 2) for v in push],
+                        "aimNudgeMm": [round(v * 1000.0, 2) for v in self.aimNudge],
+                    })
+                    self.setpoint = hold
+                    self.retryLeg = "lift"
+                    self._enter(RETRY, step_idx, ee_xyz, "stood_above_seat_retry")
                 else:
                     self.outcome = "blocked"
-                    # Hold where it stands rather than keep pressing (the output adds the bias).
-                    self.setpoint = (ee_xyz[0] - self.lateralBias[0], ee_xyz[1] - self.lateralBias[1], ee_xyz[2])
+                    self.setpoint = hold
                     self._enter(DONE, step_idx, ee_xyz, "stood_above_seat")
+        elif self.state == RETRY:
+            assert self.stoppedXyz is not None
+            if self.retryLeg == "lift":
+                goal = (self.setpoint[0], self.setpoint[1], self.stoppedXyz[2] + cfg.retryLiftM)
+                self.setpoint, arrived = _walk(self.setpoint, goal, cfg.liftSpeedMS * cfg.controlPeriodS)
+                if self._settled(ee_xyz) and arrived:
+                    self.retryLeg = "shift"
+                    self.quietSteps = 0
+            else:
+                goal = (seat[0] + self.aimNudge[0], seat[1] + self.aimNudge[1], self.setpoint[2])
+                self.setpoint, arrived = _walk(self.setpoint, goal, cfg.seatSpeedMS * cfg.controlPeriodS)
+                if self._settled(ee_xyz) and arrived:
+                    self.retryLeg = ""
+                    self._enter(DESCEND, step_idx, ee_xyz, "retry")
         elif self.state == RELEASE:
             self.releaseStepCount += 1
             if self.releaseStepCount >= cfg.openSteps:
@@ -398,6 +464,9 @@ class InsertTeacher:
             "alignErrorAtEntryMm": self.alignErrorAtEntryMm,
             "alignWaitSteps": self.alignWaitSteps,
             "entryXyz": None if self.entryXyz is None else [round(v, 5) for v in self.entryXyz],
+            "retries": len(self.retryLog),
+            "retryLog": list(self.retryLog),
+            "aimNudgeMm": [round(v * 1000.0, 2) for v in self.aimNudge],
             "stateSteps": dict(self.stateSteps),
             "transitions": list(self.transitions),
         }

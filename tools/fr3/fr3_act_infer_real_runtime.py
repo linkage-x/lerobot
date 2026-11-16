@@ -528,6 +528,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        '--grasp-loop-wait-for-person',
+        action='store_true',
+        help=(
+            'Unattended (the loop grades its own inserts), but what needs a person -- a lost peg, '
+            'a reflex, a fault -- waits for "continue" from the page instead of ending the run. '
+            'Implied by --grasp-loop-attended.'
+        ),
+    )
+    parser.add_argument(
         '--grasp-loop-insert-pose',
         default='',
         help=(
@@ -6730,6 +6739,11 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                             if grasp_handover.afterClose != 'script'
                             else ''
                         )
+                        + (
+                            f' retries={len(grasp_handover.teacher.retryLog)}'
+                            if getattr(grasp_handover, 'teacher', None) is not None
+                            else ''
+                        )
                     )
                     return finish_rollout('grasp_handover')
                 if grasp_handover.timed_out(step_idx):
@@ -7635,7 +7649,10 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 run_policy_trial=run_grasp_trial,
                 out_path=grasp_loop_out,
                 stop_requested=lambda: stop_file.requested() or control.stop_requested(),
-                wait_for_operator=control.wait_for_operator if args.grasp_loop_attended else None,
+                wait_for_operator=(
+                    control.wait_for_operator
+                    if args.grasp_loop_attended or args.grasp_loop_wait_for_person else None
+                ),
                 ask_grade=control.ask_grade if args.grasp_loop_attended else None,
                 void_requested=control.void_requested,
                 clear_void=control.clear_void,
@@ -7648,8 +7665,14 @@ def _run_inference(args: argparse.Namespace, policy_cleanup: ExitStack) -> int:
                 inference_latency_s=INFERENCE_LATENCY.take,
                 take_confirmations=control.take_confirmations,
                 runtime=(
-                    {'freeSpaceSpeedup': free_space_speedup.factor, 'freeSpaceAboveZ': free_space_speedup.above_z}
-                    if free_space_speedup.enabled else None
+                    {
+                        **(
+                            {'freeSpaceSpeedup': free_space_speedup.factor, 'freeSpaceAboveZ': free_space_speedup.above_z}
+                            if free_space_speedup.enabled else {}
+                        ),
+                        **({'waitForPerson': True} if args.grasp_loop_wait_for_person and not args.grasp_loop_attended else {}),
+                    }
+                    or None
                 ),
             )
             finish_grasp_write()

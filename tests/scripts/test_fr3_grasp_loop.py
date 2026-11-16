@@ -2742,30 +2742,20 @@ def test_a_teachers_trial_is_kept_only_when_its_peg_went_in(row, kept):
     assert keeps_trial_recording(row, keep_misses=False) is kept
 
 
-def test_the_teachers_hole_is_in_the_measured_frame_and_learns_only_from_its_own_entries():
+def test_the_teachers_hole_is_the_configured_pose_in_the_measured_frame_and_does_not_walk():
     request = _request(insertServo=_insert_servo())
     sx, sy = grasp_loop.GRASP_LOOP_TEACHER_HOLE_SHIFT_M
     start = (PICK[0] + sx, PICK[1] + sy)
-    # No seat yet: the configured (commanded) pose moved into the measured frame.
     assert grasp_loop.teacher_hole_xy(request, []) == pytest.approx(start)
-
-    def seated(dx_mm, offset_x_mm=0.0, outcome="seated", inserted=True):
-        entry = [start[0] + (dx_mm + offset_x_mm) / 1000.0, start[1], 0.098]
-        return {"inserted": inserted, "insertSegment": {"outcome": outcome, "offsetXyMm": [offset_x_mm, 0.0], "entryXyz": entry}}
-
+    # 160003: seats whose entries sat 0.5 mm -x of the aim (the gate's tolerance, on the lag side)
+    # walked a learned aim 1.5 mm in 9 trials. Neither they nor a scripted rescue move it now.
     rows = [
-        seated(0.4, offset_x_mm=-1.0),  # entry less the in-hand offset
-        seated(0.6),
-        seated(0.8, offset_x_mm=2.0),
-        seated(20.0),  # some other fixture
-        seated(5.0, outcome="blocked", inserted=False),  # stood on the face: says nothing of the hole
-        # A scripted rescue's landing is a commanded point: never a sample for the teacher (151143).
-        {"inserted": False, "insertSegment": {"outcome": "blocked", "offsetXyMm": [0.0, 0.0]},
-         "rescue": {"inserted": True, "landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
-        {"inserted": True, "closeXyz": [0.401, -0.15, 0.06], "pegXyz": [0.4, -0.151, 0.058],
-         "insert": {"landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}},
-    ]
-    assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx((start[0] + 0.0006, start[1]))
+        {"inserted": True, "insertSegment": {"outcome": "seated", "offsetXyMm": [-0.8, 0.0],
+                                             "entryXyz": [start[0] - 0.0005 * (i + 1), start[1], 0.098]}}
+        for i in range(6)
+    ] + [{"inserted": False, "insertSegment": {"outcome": "blocked", "offsetXyMm": [0.0, 0.0]},
+          "rescue": {"inserted": True, "landingXyz": [PICK[0] + 0.003, PICK[1], 0.06]}}]
+    assert grasp_loop.teacher_hole_xy(request, rows) == pytest.approx(start)
 
 
 def test_the_151143_descents_split_on_the_shifted_hole():

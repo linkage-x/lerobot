@@ -101,6 +101,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_GRASP_LOOP_SEED",
     "FR3_GRASP_LOOP_LIGHTING",
     "FR3_GRASP_LOOP_ATTENDED",
+    "FR3_GRASP_LOOP_WAIT_FOR_PERSON",
     "FR3_GRASP_LOOP_ARMS",
     "FR3_GRASP_LOOP_INSERT_POSE",
     "FR3_GRASP_LOOP_INSERT_SEARCH_ORDER",
@@ -508,6 +509,10 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
         options["FR3_GRASP_LOOP_OUT"] = str(GRASP_LOOP_DIR / f"{resume}.jsonl")
     if _parse_bool_field(raw.get("graspLoopAttended", False), "graspLoopAttended"):
         options["FR3_GRASP_LOOP_ATTENDED"] = "1"
+    # Unattended (the loop grades itself), but whatever needs a person -- a lost peg above all --
+    # waits on the page's "continue" instead of ending the run, so no resume is needed (user 11-16).
+    if _parse_bool_field(raw.get("graspLoopWaitForPerson", False), "graspLoopWaitForPerson"):
+        options["FR3_GRASP_LOOP_WAIT_FOR_PERSON"] = "1"
     grasp_arms = _optional_text(raw.get("graspLoopArms"))
     if grasp_arms:
         if grasp_arms not in ("A", "B", "AB"):

@@ -16,6 +16,7 @@ from tools.fr3.grasp_insert_teacher import (
     LIFT,
     RELEASE,
     RETREAT,
+    RETRY,
     InsertTeacher,
     InsertTeacherConfig,
     in_hand_offset_xy,
@@ -50,9 +51,11 @@ def _config(close_offset_x=0.0, close_dz=0.0, **overrides):
     return InsertTeacherConfig(**fields)
 
 
-def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000, lag_xy=(0.0, 0.0)):
+def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000, lag_xy=(0.0, 0.0), edge_push_m=0.0):
     """Drive the teacher on an arm that tracks exactly -- or stands `lag_xy` off every setpoint,
-    as the FR3 does sideways -- and the peg is off the tool by the offset."""
+    as the FR3 does sideways -- and the peg is off the tool by the offset. With `edge_push_m`, a
+    peg standing on the face within 5 mm of the hole has the tool pushed that far toward the hole
+    and stays on the face (092701: blocked pegs skated 6-7 mm along the hub's top)."""
 
     teacher = InsertTeacher(config, heldTest=_held_test)
     offset = config.offsetXy
@@ -71,6 +74,10 @@ def _run(config, *, width=HELD_WIDTH, peg_hole_xy=None, max_steps=3000, lag_xy=(
         floor = seat_z - 0.010 if over_hole else seat_z + FACE_ABOVE_M
         # Only a peg arriving from above meets the face.
         z = command["ee.z"] if xyz[2] < floor - 1e-9 and not over_hole else max(command["ee.z"], floor)
+        miss = (hole_xy[0] - peg_xy[0], hole_xy[1] - peg_xy[1])
+        if edge_push_m and not over_hole and z <= floor + 1e-9 and math.hypot(*miss) < 0.005:
+            norm = math.hypot(*miss)
+            tool_xy = (tool_xy[0] + edge_push_m * miss[0] / norm, tool_xy[1] + edge_push_m * miss[1] / norm)
         xyz = (tool_xy[0], tool_xy[1], z)
         rotvec = (command["ee.wx"], command["ee.wy"], command["ee.wz"])
     return teacher, commands
@@ -131,8 +138,10 @@ def test_an_empty_grasp_is_graded_on_the_lift_and_never_squeezed_or_carried():
 
 
 def test_a_peg_that_lands_on_the_face_is_held_where_it_stands_and_never_let_go():
-    # The hole is 3 mm from where the teacher believes: the peg lands on the face.
+    # The hole is 3 mm from where the teacher believes and nothing pushes: the peg lands on the
+    # face, and with no push to go by there is no retry either.
     teacher, commands = _run(_config(close_offset_x=0.004), peg_hole_xy=(HOLE[0] + 0.003, HOLE[1]))
+    assert teacher.record()["retries"] == 0
     assert teacher.outcome == "blocked"
     assert all(c["gripper.pos"] < 0.5 for c in commands)
     face = _config(close_offset_x=0.004).seatXyz[2] + FACE_ABOVE_M
@@ -193,3 +202,54 @@ def test_without_the_servo_the_same_lag_puts_the_peg_on_the_face():
     config = _config(close_offset_x=-0.001, alignGain=0.0, alignTimeoutSteps=0)
     teacher, _commands = _run(config, lag_xy=(-0.003, 0.001))
     assert teacher.outcome == "blocked"
+
+
+@pytest.mark.parametrize("miss_mm,retries", [(1.6, 1), (2.6, 2), (-1.6, 1)])
+def test_a_peg_pushed_aside_by_the_hub_is_lifted_and_tried_again_a_millimetre_that_way(miss_mm, retries):
+    # 092701: the hole stood ~1 mm from where the teacher believed, and the hub pushed the tool
+    # toward it on touching. Each retry moves the aim 1 mm along the push.
+    config = _config(close_offset_x=0.003, retries=3)
+    teacher, commands = _run(config, peg_hole_xy=(HOLE[0] + miss_mm / 1000.0, HOLE[1]), edge_push_m=0.006)
+    assert teacher.outcome == "seated"
+    record = teacher.record()
+    assert record["retries"] == retries
+    assert [t["to"] for t in teacher.transitions] == (
+        [CARRY, DESCEND] + [RETRY, DESCEND] * retries + [RELEASE, RETREAT, DONE]
+    )
+    assert record["aimNudgeMm"] == pytest.approx([math.copysign(retries, miss_mm), 0.0], abs=0.01)
+    assert all(c["gripper.pos"] < 0.5 for c in commands[: next(i for i, c in enumerate(commands) if c["gripper.pos"] > 0.5)])
+    # Lifted straight off the face before any sideways move, and never higher than the lift.
+    for entry in record["retryLog"]:
+        assert entry["aboveSeatMm"] == pytest.approx(FACE_ABOVE_M * 1000.0, abs=0.1)
+    face = config.seatXyz[2] + FACE_ABOVE_M
+    lowest_after_first_block = min(
+        c["ee.z"] for c in commands[record["retryLog"][0]["step"]:] if c["ee.z"] > face - 0.0045
+    )
+    assert lowest_after_first_block >= face - 0.004 - 1e-9
+
+
+@pytest.mark.parametrize("lag_xy", [(0.0, 0.0), (-0.0025, 0.001)])
+def test_a_retry_lifted_to_the_entry_height_keeps_its_move_and_seats(lag_xy):
+    # 3.9 mm off: three 1 mm moves leave 0.9 mm, inside this model's 1.2 mm capture. The lift
+    # puts the tool back at the servo's height, which must steer onto the moved aim, not the seat.
+    config = _config(close_offset_x=0.003, retries=3)
+    teacher, _commands = _run(config, peg_hole_xy=(HOLE[0] + 0.0039, HOLE[1]), edge_push_m=0.006, lag_xy=lag_xy)
+    assert teacher.outcome == "seated"
+    assert teacher.record()["retries"] == 3
+    assert teacher.stoppedXyz[0] == pytest.approx(config.seatXyz[0] + 0.003, abs=0.0007)
+
+
+def test_retries_stop_at_three_and_hand_the_block_on():
+    config = _config(close_offset_x=0.003, retries=3)
+    teacher, _commands = _run(config, peg_hole_xy=(HOLE[0] + 0.0045, HOLE[1]), edge_push_m=0.006)
+    record = teacher.record()
+    assert record["retries"] == 3
+    assert teacher.outcome == "blocked"
+    assert teacher.transitions[-1]["reason"] == "stood_above_seat"
+
+
+def test_retries_are_off_by_default_and_a_pushed_block_is_handed_on_at_once():
+    # 11-16 101911: 0 of 6 retries seated, and each press drove the peg up the fingers.
+    config = _config(close_offset_x=0.003)
+    teacher, _commands = _run(config, peg_hole_xy=(HOLE[0] + 0.0016, HOLE[1]), edge_push_m=0.006)
+    assert teacher.outcome == "blocked" and teacher.record()["retries"] == 0

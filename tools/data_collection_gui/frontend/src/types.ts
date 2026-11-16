@@ -1776,6 +1776,7 @@ export type RolloutRuntimeOptions = {
    *  the trial after its last finished one. The runtime refuses another seed, arm or checkpoint. */
   graspLoopResume?: string;
   graspLoopAttended?: boolean;
+  graspLoopWaitForPerson?: boolean;
   /** A pure policy, B GT grasp funnel, AB both interleaved in randomised pairs. */
   graspLoopArms?: "A" | "B" | "AB";
   /** v14 step 4: "x,y,z" of the hole each held grasp is carried into. Blank: grasp only. */

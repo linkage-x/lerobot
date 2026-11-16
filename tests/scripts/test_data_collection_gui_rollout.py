@@ -4136,6 +4136,12 @@ def test_the_grasp_loop_is_a_mode_that_moves_the_arm_and_takes_its_options():
     assert options == {"FR3_GRASP_LOOP_TRIALS": "91", "FR3_GRASP_LOOP_ATTENDED": "1"}
     # Absent means unattended, so no other mode is handed the variable.
     assert "FR3_GRASP_LOOP_ATTENDED" not in rollout_backend.sanitize_rollout_runtime_options({"rtcMode": "auto"})
+    # Unattended but waiting for a person on a lost peg instead of ending the run (11-16).
+    options = rollout_backend.sanitize_rollout_runtime_options({"graspLoopTrials": 100, "graspLoopWaitForPerson": True})
+    assert options == {"FR3_GRASP_LOOP_TRIALS": "100", "FR3_GRASP_LOOP_WAIT_FOR_PERSON": "1"}
+    assert "FR3_GRASP_LOOP_WAIT_FOR_PERSON" not in rollout_backend.sanitize_rollout_runtime_options(
+        {"graspLoopWaitForPerson": False}
+    )
 
 
 def test_the_grasp_loop_arm_is_passed_through_and_nothing_else_is_accepted():
