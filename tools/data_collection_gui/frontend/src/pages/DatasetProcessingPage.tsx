@@ -151,6 +151,12 @@ export function TrackingDetectionBlock({
         ) : null}
       </div>
       {summary.cameraState?.verdict === "stale" ? <p className="panel-note error">{summary.cameraState.message}</p> : null}
+      {summary.cameraState?.excludedCameras?.length ? (
+        <p className="panel-note">
+          {summary.cameraState.excludedCameras.join("、")} 相对上一次外参仍吻合的录制移动了，本次轨迹没有用它们（详见数据集
+          derived/camera_motion.json）。重新标定后再生成即可恢复全部相机。
+        </p>
+      ) : null}
       <div className="tracking-camera-table">
         <div className="tracking-camera-row tracking-camera-header">
           <span>Camera</span>

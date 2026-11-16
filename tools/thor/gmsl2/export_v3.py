@@ -1384,6 +1384,8 @@ def _describe_labels(labels: dict[str, Any]) -> str:
     state = labels.get("camera_state") or "?"
     if isinstance(px, (int, float)):
         state = f"{state} {px:.2f} px"
+    if labels.get("excluded_cameras"):
+        state += f" without {', '.join(labels['excluded_cameras'])} (moved, left out)"
     return (
         f"extrinsics {labels.get('extrinsics') or '?'}, cameras {state}, "
         f"TCP {Path(labels.get('marker_to_tcp') or '?').name}, BOX {pairing}"

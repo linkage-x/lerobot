@@ -197,3 +197,24 @@ def test_the_export_carries_each_hand_s_status_outside_the_key(tmp_path):
     (warning,) = lp.hand_warnings(block)
     assert warning.startswith("left hand labels are unvalidated (marker->TCP never checked by the laser")
     assert lp.hand_warnings(lp.provenance_block(None, {"r": other}, [])) == []
+
+
+def test_a_session_tracked_without_its_moved_cameras_names_them_outside_the_key(tmp_path):
+    import json
+
+    full, run_full = _tracked_session(tmp_path / "full", _BUNDLE_0929)
+    reduced, run_reduced = _tracked_session(tmp_path / "reduced", _BUNDLE_0929)
+    info_path = reduced / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["derived"][lp.SIDECAR]["camera_state"] = {
+        "verdict": "ok",
+        "excluded_cameras": ["cam_03", "cam_13", "cam_14"],
+    }
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    labels_full = lp.session_labels(full, run_full, {0: {}}, lp._REPO_ROOT)
+    labels_reduced = lp.session_labels(reduced, run_reduced, {0: {}}, lp._REPO_ROOT)
+    assert labels_full["excluded_cameras"] == []
+    assert labels_reduced["excluded_cameras"] == ["cam_03", "cam_13", "cam_14"]
+    # five valid cameras and eight label the same thing: the sessions share one chain
+    assert lp.mixed_session_fields({"full": labels_full, "reduced": labels_reduced}) == {}
+    assert "excluded_cameras" not in lp.provenance_block(None, {"r": labels_reduced}, [])["key"]

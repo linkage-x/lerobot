@@ -2891,8 +2891,52 @@ def test_traj_gen_refuses_to_put_a_second_target_next_to_the_first(tmp_path, mon
 
     # Asked for explicitly, the tracker gets the flag; the gateway itself moves nothing.
     gateway._queue_traj_gen(state, dataset_root, tracking_target="gripper_rig_v9b", supersede_other_targets=True)
-    assert launched[-1][-1] == "--supersede-other-targets"
+    assert "--supersede-other-targets" in launched[-1]
     assert (sidecar / "state_action.left.csv").is_file()
+
+
+def test_traj_gen_leaves_out_moved_cameras_unless_asked_not_to(tmp_path, monkeypatch):
+    """The runner checks camera motion before tracking by default; ``auto_exclude_moved_cameras=0``
+    over HTTP turns it off, and the handler does not deadlock on the gateway lock either way."""
+    import threading
+    import urllib.parse
+    import urllib.request
+
+    state, dataset_root, _sidecar = _rig_over_cube_repo(tmp_path)
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 4321
+        stdout = []
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway, "_resolve_known_dataset", lambda _state, _requested: dataset_root)
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **_k: launched.append(command) or FakeProcess())
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+    monkeypatch.setattr(gateway, "_stale_calibration_gate", lambda _state: {})
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        for extra in ({}, {"auto_exclude_moved_cameras": "0"}):
+            state.processing_processes.clear()
+            query = urllib.parse.urlencode(
+                {"path": str(dataset_root), "tracking_target": "gripper_rig_v9b", "supersede_other_targets": "1", **extra}
+            )
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/api/processing/traj-gen?{query}", method="POST"
+            )
+            with urllib.request.urlopen(request, timeout=5) as answered:
+                assert answered.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert "--auto-exclude-moved-cameras" in launched[0]
+    assert "--auto-exclude-moved-cameras" not in launched[1]
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
 
 
 def test_traj_gen_conflict_reaches_the_gui_as_409_with_the_targets(tmp_path, monkeypatch):
@@ -7102,6 +7146,21 @@ def test_tracking_detection_summary_reports_per_camera_evidence(tmp_path):
     camera = gateway._tracking_detection_summary(state, dataset_root, "hybrid_carrier_v1")["cameraState"]
     assert camera["verdict"] == "stale" and camera["worstMedianPx"] == 1.57 and camera["worstCube"] == "right"
     assert camera["extrinsics"] == "calib_20261014_180431_extrinsics" and "recalibrate" in camera["message"]
+    assert camera["excludedCameras"] == []
+
+    # tracked without the cameras that had moved: the verdict is about the others, and says so
+    summary["camera_state"] = {
+        "verdict": "ok",
+        "worst_median_reproj_px": 0.88,
+        "worst_cube": "right",
+        "threshold_px": 1.0,
+        "extrinsics_run_name": "calib_20261102_195715_extrinsics",
+        "excluded_cameras": ["cam_03", "cam_13", "cam_14"],
+    }
+    (tracking_run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    camera = gateway._tracking_detection_summary(state, dataset_root, "hybrid_carrier_v1")["cameraState"]
+    assert camera["verdict"] == "ok" and camera["excludedCameras"] == ["cam_03", "cam_13", "cam_14"]
+    assert "without cam_03, cam_13, cam_14" in camera["message"]
 
 
 def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(tmp_path):
