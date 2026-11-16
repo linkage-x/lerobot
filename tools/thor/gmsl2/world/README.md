@@ -98,9 +98,10 @@ The P0 run's own solution frees the cameras, which makes the FR3 base a new
 world. Pointing production at it without also changing this reference would
 stamp FR3-base poses with the island's id (linkage-x/lerobot#51).
 
-To use it, run `export_v3.py --target-world fr3_base`. This re-expresses
-`observation.ee_pose.*.base`, `action.ee_pose.*.base` and
-`observation.cube_pose.*.base` (camera-frame columns are untouched), and
+A maintainer can still run `export_v3.py --target-world fr3_base` (the GUI never
+does; training does not need it). This re-expresses
+`observation.ee_pose.*.world`, `action.ee_pose.*.world` and
+`observation.cube_pose.*.world` (camera-frame columns are untouched), and
 records the source world block and the edge in `info.json`'s `world_frame`.
 Without an edge connecting the two worlds the export is refused, never treated
 as an identity.
@@ -108,8 +109,11 @@ as an identity.
 The GUI's exports pass `--target-world auto`. Until 11-10 that meant
 `fr3_base` when an edge reached it; since 11-10 it always keeps the recorded
 camera world and only lists, per arm, whether an edge reaches its base today.
-The `.base` suffix of the pose columns is historical: in an `auto` export they
-hold camera-world poses (`info.json` `world_frame` says which world).
+The pose columns end in `.world`: they hold poses in the world `info.json`
+`world_frame` names, the recorded camera world for every GUI export. Exports
+written before 11-16 call the same columns `.base`, a name left over from the
+re-expressing days; they are not renamed, and readers take both
+(`tools/thor/gmsl2/pose_columns.py`).
 
 Since 11-16 the planned inference does not use absolute poses at all (user
 guide section 8, `#infer-relative`): the policy sees and outputs TCP poses

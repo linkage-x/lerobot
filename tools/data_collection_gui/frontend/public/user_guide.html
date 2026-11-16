@@ -393,7 +393,7 @@
   </ul>
   <h3>坐标系约定（11-10 起）</h3>
   <ul>
-    <li><b>导出不换坐标系。</b>Dataset Export 页把 QC 通过的数据导出成 LeRobot v3，位姿留在录制时的相机世界系（<code>world_…</code>），不再写进任何一台臂的基座系。这样同一份数据左臂、右臂、双臂都能用；以后某台臂重新标定，已经训练好的策略也不用重新导出。列名里的 <code>.base</code>（如 <code>observation.ee_pose.right.base</code>）是历史遗留，存的就是相机世界系。训练时再换成相对量，见 <a href="#infer-relative">位姿用相对量</a>。</li>
+    <li><b>导出不换坐标系。</b>Dataset Export 页把 QC 通过的数据导出成 LeRobot v3，位姿留在录制时的相机世界系（<code>world_…</code>），不再写进任何一台臂的基座系。这样同一份数据左臂、右臂、双臂都能用；以后某台臂重新标定，已经训练好的策略也不用重新导出。位姿列名以 <code>.world</code> 结尾（如 <code>observation.ee_pose.right.world</code>），存的就是相机世界系；11-16 以前的导出叫 <code>.base</code>，是历史遗留的名字，内容一样，读的时候两种都认，旧导出不用重做。训练时再换成相对量，见 <a href="#infer-relative">位姿用相对量</a>。</li>
     <li><b>导出日志会告诉你能部署到哪台臂。</b>看日志里的这几行：
       <ul>
         <li><code>Deployable on the right arm (fr3_base_right) via …</code>：可以部署到右臂。</li>

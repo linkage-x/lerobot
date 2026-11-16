@@ -59,7 +59,7 @@
   <h2>2 · 分期</h2>
   <h3>T1 · Thor 数据契约 + 训练视图（中）</h3>
   <ul>
-    <li>每台臂对应一只手。<b>11-16 改定为相对表示</b>（原因和完整输入规格见使用指南第 8 节 <code>#infer-relative</code> / <code>#infer-inputs</code>）：<b>state</b> = 该手最近几帧 TCP 位姿相对当前帧的变化 + 夹爪开度，不含任何绝对位姿；<b>action</b> = 一段 TCP 目标位姿，相对观测时刻的 TCP、表达在其坐标系里（T<sub>t</sub><sup>−1</sup>T<sub>t+k</sub>）+ 夹爪开度；<b>图像</b> = <code>cam_10</code> + 选定的固定相机。相对量从导出的 <code>observation.ee_pose.&lt;hand&gt;.base</code>（名字是历史遗留，存的是相机世界系，TCP = 球窝）在训练读数据时换算，训练和推理共用一份换算代码。推理时位姿只来自 FK（臂上没有 rig），目标 = FK(q<sub>t</sub>)·ΔT，不经过注册边；边只用于选臂摆位和限工作空间。原先的「绝对位姿或按帧差分（沿用现有 action_mode）」作废。</li>
+    <li>每台臂对应一只手。<b>11-16 改定为相对表示</b>（原因和完整输入规格见使用指南第 8 节 <code>#infer-relative</code> / <code>#infer-inputs</code>）：<b>state</b> = 该手最近几帧 TCP 位姿相对当前帧的变化 + 夹爪开度，不含任何绝对位姿；<b>action</b> = 一段 TCP 目标位姿，相对观测时刻的 TCP、表达在其坐标系里（T<sub>t</sub><sup>−1</sup>T<sub>t+k</sub>）+ 夹爪开度；<b>图像</b> = <code>cam_10</code> + 选定的固定相机。相对量从导出的 <code>observation.ee_pose.&lt;hand&gt;.world</code>（11-16 以前的导出叫 <code>.base</code>，内容一样；存的是相机世界系，TCP = 球窝）在训练读数据时换算，训练和推理共用一份换算代码。推理时位姿只来自 FK（臂上没有 rig），目标 = FK(q<sub>t</sub>)·ΔT，不经过注册边；边只用于选臂摆位和限工作空间。原先的「绝对位姿或按帧差分（沿用现有 action_mode）」作废。</li>
     <li>视图 meta 记录：手、世界 id、tcp link、标签链指纹。推理端校验与 <code>--arm</code> 和 IK 目标是否一致，不一致就拒绝。</li>
     <li>GUI 在 Thor 导出旁加「建训练视图」，只列出能部署的臂。</li>
   </ul>
