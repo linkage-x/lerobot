@@ -36,7 +36,10 @@ import numpy as np
 from tools.fr3 import relative_tcp as rt
 from tools.thor.gmsl2 import label_provenance as lp, pose_columns as pc
 
-VIEW_SCHEMA = "fr3_training_view/1"
+#: /2 (11-16): frames cropped and resized by relative_tcp.crop_resize itself and stored losslessly in RGB.
+#: /1 scaled with ffmpeg in YUV 4:2:0 and re-encoded: up to 22 grey levels off what inference computes from
+#: the same frame, which moved ACT's predicted targets by up to 29 mm.
+VIEW_SCHEMA = "fr3_training_view/2"
 VIEW_FILE = "training_view.json"
 WIDTH_SUFFIX = "box_gripper.distance_m"
 WRENCH_PREFIX = "box_six_d_external."
@@ -253,7 +256,7 @@ def _export_fingerprint(root: Path) -> str:
 
 def view_name(export_root: Path, cameras: Sequence[rt.CameraInput]) -> str:
     spec = json.dumps([vars(c) for c in cameras], sort_keys=True)
-    tag = hashlib.sha256(f"{_export_fingerprint(export_root)}|{spec}".encode()).hexdigest()[:10]
+    tag = hashlib.sha256(f"{VIEW_SCHEMA}|{_export_fingerprint(export_root)}|{spec}".encode()).hexdigest()[:10]
     return f"{Path(export_root).name}__view_{tag}"
 
 
@@ -267,17 +270,34 @@ def _count_frames(path: Path) -> int:
 
 
 def transcode(src: Path, dst: Path, camera: rt.CameraInput, fps: int) -> None:
-    """Crop and scale one video file, frame for frame. All-intra so random access costs one frame."""
-    x0, y0, x1, y1 = camera.crop
+    """Crop and resize one video file frame for frame, with the function inference uses.
+
+    Each frame is decoded to RGB, passed through relative_tcp.crop_resize and stored losslessly (x264 RGB,
+    qp 0, all-intra), so training reads exactly what inference computes from the same frame; the codec of
+    the recording itself is the only thing left between them. All-intra: random access costs one frame.
+    """
+    import av
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-    vf = f"crop={x1 - x0}:{y1 - y0}:{x0}:{y0},scale={camera.width}:{camera.height}:flags=area,format=yuv420p"
     cmd = [
-        "ffmpeg", "-v", "error", "-y", "-i", str(src), "-vf", vf, "-fps_mode", "passthrough",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "15", "-g", "1", "-bf", "0",
-        "-video_track_timescale", str(int(fps) * 1000), str(dst),
+        "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{camera.width}x{camera.height}", "-r", str(int(fps)), "-i", "-",
+        "-c:v", "libx264rgb", "-qp", "0", "-preset", "veryfast", "-g", "1", "-bf", "0", str(dst),
     ]
-    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True)
-    n_src, n_dst = _count_frames(src), _count_frames(dst)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    n_src = 0
+    try:
+        with av.open(str(src)) as container:
+            for frame in container.decode(container.streams.video[0]):
+                proc.stdin.write(np.ascontiguousarray(rt.crop_resize(frame.to_ndarray(format="rgb24"), camera)).tobytes())
+                n_src += 1
+    finally:
+        proc.stdin.close()
+        err = proc.stderr.read().decode(errors="replace")
+        proc.wait()
+    if proc.returncode != 0:
+        raise TrainingDataError(f"encoding {dst} failed: {err[-300:]}")
+    n_dst = _count_frames(dst)
     if n_src != n_dst:
         raise TrainingDataError(f"transcoding {src} gave {n_dst} frames, the source has {n_src}")
 
@@ -312,7 +332,7 @@ def build_view(export_root: Path, cameras: Sequence[rt.CameraInput], views_root:
         feat = dict(features[key])
         feat["shape"] = [cam.height, cam.width, 3]
         feat["info"] = {**(feat.get("info") or {}), "video.height": cam.height, "video.width": cam.width,
-                        "video.codec": "h264", "video.pix_fmt": "yuv420p"}
+                        "video.codec": "h264", "video.pix_fmt": "gbrp"}
         features[key] = feat
         sources = sorted((export_root / "videos" / key).rglob("*.mp4"))
         if not sources:
@@ -437,6 +457,28 @@ def sample_vectors(
     widths = np.where(bad, arrays.widths[t], widths)
     actions = rt.action_chunk(T_hist[-1], rt.pose7_to_matrix(targets), widths)
     return state, actions, pad
+
+
+def training_workspace(view_roots: Sequence[Path], contract: rt.PolicyContract, world_frame_id: str) -> dict[str, Any]:
+    """Where the training TCP went, in the recording's camera world: what execution must keep the arm inside.
+
+    The policy never sees an absolute pose, so it cannot know when it leaves the region it was trained in;
+    the execution layer bounds the TCP to this box (re-expressed in the arm's base through the
+    registration edge of the day, user guide #infer-relative step 4).
+    """
+    points = [arrays.poses[:, :3] for root in view_roots for arrays in load_episode_arrays(root, contract)]
+    xyz = np.concatenate(points) if points else np.zeros((0, 3))
+    xyz = xyz[np.all(np.isfinite(xyz), axis=1)]
+    if len(xyz) == 0:
+        raise TrainingDataError("no tracked TCP position to bound the workspace with")
+    return {
+        "frame": world_frame_id,
+        "min": xyz.min(0).round(4).tolist(),
+        "max": xyz.max(0).round(4).tolist(),
+        "p005": np.quantile(xyz, 0.005, axis=0).round(4).tolist(),
+        "p995": np.quantile(xyz, 0.995, axis=0).round(4).tolist(),
+        "points": int(len(xyz)),
+    }
 
 
 def _vector_stats(values: np.ndarray) -> dict[str, list[float]]:

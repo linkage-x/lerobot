@@ -250,6 +250,7 @@ class _Hooks:
             "total_steps": total,
             "saved": _now(),
             "exports": self.run["exports"],
+            "workspace": self.run.get("workspace"),
             "views": self.run["views"],
             "policy": self.run["policy"],
             "code": self.run["code"],
@@ -383,6 +384,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
             {"root": str(v.resolve()), **json.loads((v / rd.VIEW_FILE).read_text(encoding="utf-8"))} for v in views
         ],
         "usable": usable,
+        "workspace": rd.training_workspace(views, contract, check.exports[0].world_frame_id),
         "warnings": check.warnings,
         "code": code_provenance(),
         "host": _host(),

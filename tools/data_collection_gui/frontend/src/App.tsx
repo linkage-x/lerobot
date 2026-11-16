@@ -16,6 +16,7 @@ import { DatasetProcessingPage } from "./pages/DatasetProcessingPage";
 import { QcReportPage } from "./pages/QcReportPage";
 import { DatasetExportPage } from "./pages/DatasetExportPage";
 import { TrainingPage } from "./pages/TrainingPage";
+import { RolloutPage } from "./pages/RolloutPage";
 import { TaskLibraryPage } from "./pages/TaskLibraryPage";
 import { DeviceManagerPage } from "./pages/DeviceManagerPage";
 import { TeleoperationPage } from "./pages/TeleoperationPage";
@@ -28,6 +29,7 @@ export type PageId =
   | "episode-replay"
   | "dataset-export"
   | "training"
+  | "rollout"
   | "dashboard"
   | "qc-report"
   | "model-evaluation"
@@ -46,6 +48,7 @@ const mvpPages: PageMeta[] = [
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
   { id: "training", label: "Training", kind: "mvp" },
+  { id: "rollout", label: "Rollout", kind: "mvp" },
   { id: "task-library", label: "Task Library", kind: "mvp" },
   { id: "calibration", label: "Calibration", kind: "mvp" },
   { id: "device-manager", label: "Device Manager", kind: "mvp" }
@@ -68,7 +71,7 @@ const navGroups: NavGroup[] = [
   { label: "Calibration", ids: ["calibration"] },
   { label: "Devices", ids: ["device-manager"] },
   { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] },
-  { label: "Policy", ids: ["training"] }
+  { label: "Policy", ids: ["training", "rollout"] }
 ];
 
 const workstationPageIds = new Set<PageId>([
@@ -78,7 +81,8 @@ const workstationPageIds = new Set<PageId>([
   "dataset-processing",
   "episode-replay",
   "dataset-export",
-  "training"
+  "training",
+  "rollout"
 ]);
 
 function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
@@ -323,6 +327,8 @@ function App() {
       />
     ) : activePage === "training" ? (
       <TrainingPage />
+    ) : activePage === "rollout" ? (
+      <RolloutPage />
     ) : activePage === "task-library" ? (
       <TaskLibraryPage
         snapshot={snapshot}

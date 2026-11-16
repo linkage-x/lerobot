@@ -36,10 +36,15 @@ import numpy as np
 CONTRACT_SCHEMA = "fr3_relative_tcp/1"
 CONTRACT_FILE = "fr3_policy_contract.json"
 PROVENANCE_FILE = "fr3_provenance.json"
-#: The point the TCP pose is of: the gripper's ball-socket centre. Exports label it (info.json
-#: ``tcp_frame.link``) and the arm's FK must reach the same point; a different point turns every
-#: rotation into a wrong translation, which a relative pose does not cancel.
+#: What the TCP pose of the training labels is. Exports name it in info.json ``tcp_frame.link``: the axes
+#: are this URDF link's, the origin is what the marker->TCP calibration defines -- for rig v9b the socket
+#: centre of pivot insert nov4 on the 44 mm fingertips, 168.5 mm from the rig's sensor face.
 TCP_LINK = "corenetic_gripper_ee"
+#: The same physical point on the arm: the URDF's ball centre of insert nov4, with corenetic_gripper_ee's
+#: axes (no rotation between them) and 33.5 mm further out. FK on the arm must go here, not to
+#: corenetic_gripper_ee: a different point turns every rotation into a wrong translation, which a relative
+#: pose does not cancel (rollout_relative_tcp checks the two share their axes).
+ARM_FK_FRAME = "corenetic_socket_ee"
 
 POSE_DIM = 9  # dx, dy, dz (m) + rotation 6D
 POSE_NAMES = ("dx_m", "dy_m", "dz_m", "r00", "r10", "r20", "r01", "r11", "r21")

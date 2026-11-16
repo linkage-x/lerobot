@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.data_collection_gui import fr3_payload_calibration as payload_cal
+from tools.data_collection_gui import rollout_runs
 from tools.data_collection_gui import training_runs
 from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import cart_state
@@ -596,6 +597,8 @@ class GatewayState:
     gateway_log_path: Path | None = None
     # Training page backend (training_runs.TrainingManager), made on first use; it never takes state.lock.
     training: Any = None
+    # Rollout page backend (rollout_runs.RolloutManager), made on first use; it never takes state.lock.
+    rollout: Any = None
     recorder_log_path: Path | None = None
     box_button_last_action_s: float = float("-inf")
     device_preview: dict[str, Any] = field(default_factory=dict)
@@ -20818,6 +20821,81 @@ def _training_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: s
     return True
 
 
+def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
+    if state.rollout is None:
+        state.rollout = rollout_runs.RolloutManager(
+            state.repo_root,
+            exports_root=_task_exports_root(state),
+            profile=state.profile,
+            sandbox=state.sandbox,
+            recorder_busy=lambda: state.process is not None and state.process.poll() is None,
+            gateway_url=f"http://127.0.0.1:{port}",
+        )
+    return state.rollout
+
+
+def _rollout_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str, query: dict[str, list[str]]) -> bool:
+    """GET /api/rollout/*; True when handled. Outside state.lock."""
+    if not path.startswith("/api/rollout/"):
+        return False
+    arg = lambda name, default="": (query.get(name, [default])[0] or default)  # noqa: E731
+    manager = _rollout(state, handler.server.server_address[1])
+    try:
+        if path == "/api/rollout/status":
+            _json_response(handler, HTTPStatus.OK, manager.status())
+        elif path == "/api/rollout/checkpoints":
+            _json_response(handler, HTTPStatus.OK, {"checkpoints": manager.checkpoints()})
+        elif path == "/api/rollout/results":
+            _json_response(handler, HTTPStatus.OK, {"results": manager.results()})
+        elif path == "/api/rollout/result":
+            _json_response(handler, HTTPStatus.OK, manager.result(arg("path")))
+        elif path == "/api/rollout/log":
+            _json_response(handler, HTTPStatus.OK, {"lines": manager.log_tail(arg("job"))})
+        elif path == "/api/rollout/preview-latest":
+            _json_response(handler, HTTPStatus.OK, manager.preview_latest(arg("record")))
+        elif path == "/api/rollout/preview.jpg":
+            data = manager.preview_image(arg("record"))
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/jpeg")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(data)
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+    except (rollout_runs.RolloutError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
+def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """POST /api/rollout/*; True when handled. Outside state.lock."""
+    if not path.startswith("/api/rollout/"):
+        return False
+    manager = _rollout(state, handler.server.server_address[1])
+    try:
+        body = _read_json_body(handler)
+        if path == "/api/rollout/offline":
+            job = manager.start_offline(str(body.get("checkpoint") or ""), str(body.get("export") or ""),
+                                        [int(e) for e in body.get("episodes") or []], int(body.get("stride") or 15))
+        elif path == "/api/rollout/preview":
+            job = manager.start_preview(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
+                                        float(body.get("rate") or 2.0), bool(body.get("readJoints")))
+            state.log("info", f"Rollout preview {job.id} started (arm still, no motion)")
+        elif path == "/api/rollout/replay":
+            job = manager.start_replay(str(body.get("record") or ""))
+        elif path == "/api/rollout/stop":
+            _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
+            return True
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+            return True
+        _json_response(handler, HTTPStatus.OK, {"ok": True, "job": vars(job)})
+    except (rollout_runs.RolloutError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
 class DataCollectionGuiHandler(BaseHTTPRequestHandler):
     server: "DataCollectionGuiServer"
 
@@ -20833,6 +20911,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
             return
         if _training_get(self, self.server.state, path, query):
+            return
+        if _rollout_get(self, self.server.state, path, query):
             return
         if path == "/api/teleop/camera.jpg":
             if self.server.state.profile != "workstation":
@@ -21249,6 +21329,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             )
             return
         if _training_post(self, self.server.state, path):
+            return
+        if _rollout_post(self, self.server.state, path):
             return
         if path == "/api/handheld/record/connect":
             if self.server.state.profile == "thor" and _training(self.server.state).local_run_active():

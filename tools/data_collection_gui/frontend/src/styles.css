@@ -4850,3 +4850,21 @@ button.danger {
 .train-crop-inputs input[type="number"] { width: 80px; margin-left: 4px; }
 .train-preview { max-width: 100%; width: 640px; display: block; border-radius: 4px; }
 .train-log { max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+
+/* Rollout page */
+.rollout-stages { margin: 4px 0 8px 18px; font-size: 13px; }
+.rollout-stage-on strong { color: inherit; }
+.rollout-stage-off { opacity: 0.6; }
+.rollout-figures { display: flex; gap: 16px; flex-wrap: wrap; }
+.rollout-figure { margin: 8px 0; font-size: 12px; max-width: 380px; }
+.rollout-figure input[type="range"] { width: 360px; }
+.rollout-plot-bg { fill: rgba(127, 127, 127, 0.08); stroke: rgba(127, 127, 127, 0.3); }
+.rollout-line-pred, .rollout-line-truth, .rollout-line-still { fill: none; stroke-width: 2; }
+.rollout-line-pred { stroke: #2f6fde; }
+.rollout-line-truth { stroke: #1f9d55; }
+.rollout-line-still { stroke: #c0392b; stroke-dasharray: 4 3; }
+.rollout-dot { fill: #333; }
+.rollout-key-pred { color: #2f6fde; font-weight: 600; }
+.rollout-key-truth { color: #1f9d55; font-weight: 600; }
+.rollout-key-still { color: #c0392b; font-weight: 600; }
+.rollout-live { margin-top: 8px; }
