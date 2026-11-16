@@ -37,6 +37,7 @@ from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import cart_state
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
+from tools.thor.gmsl2 import qc_verdict as qcv
 from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
 from tools.thor.gmsl2 import world_graph_guard
@@ -2398,6 +2399,7 @@ def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
     actual_frames_total = 0
     max_delta_ns: int | None = None
     failure_reasons: list[str] = []
+    failed_episodes: list[int] = []
     frame_count_mismatch = 0
     for ep_dir in ep_dirs:
         match = re.search(r"episode_(\d+)$", ep_dir.name)
@@ -2414,6 +2416,7 @@ def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
         }
         if not manifest_path.is_file():
             missing_count += 1
+            failed_episodes.append(ep_index)
             failure_reasons.append(f"episode {ep_index}: missing online_sync_manifest.json")
             episodes.append(item)
             continue
@@ -2422,12 +2425,14 @@ def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             failed_count += 1
+            failed_episodes.append(ep_index)
             item["failure"] = f"invalid online_sync_manifest.json: {exc}"
             failure_reasons.append(f"episode {ep_index}: {item['failure']}")
             episodes.append(item)
             continue
         if not isinstance(manifest, dict):
             failed_count += 1
+            failed_episodes.append(ep_index)
             item["failure"] = "invalid online_sync_manifest.json payload"
             failure_reasons.append(f"episode {ep_index}: {item['failure']}")
             episodes.append(item)
@@ -2466,6 +2471,7 @@ def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
             actual_frames_total += actual_frames
         else:
             failed_count += 1
+            failed_episodes.append(ep_index)
             failure_reasons.append(f"episode {ep_index}: {failure}")
         item.update({
             "ok": ok,
@@ -2485,6 +2491,7 @@ def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
         "maxSofDeltaMs": (max_delta_ns / 1_000_000.0) if max_delta_ns is not None else None,
         "frameCountMismatch": frame_count_mismatch,
         "failureReasons": failure_reasons[:8],
+        "failedEpisodes": sorted(failed_episodes),
         "episodes": episodes[:12],
     }
     if present == 0:
@@ -2512,11 +2519,15 @@ def _online_sync_manifest_check(dataset_root: Path) -> tuple[dict[str, Any] | No
         check_status = "warn"
     else:
         check_status = "fail"
-    return summary, {
+    check: dict[str, Any] = {
         "name": "online_sync_manifest",
         "status": check_status,
         "message": summary.get("message") or "online sync manifest unavailable",
     }
+    # Each episode has its own manifest, and export skips an episode whose manifest failed.
+    if check_status == "fail" and summary.get("failedEpisodes"):
+        check["episodes"] = list(summary["failedEpisodes"])
+    return summary, check
 
 
 def _processing_item_from_dataset(
@@ -2549,6 +2560,8 @@ def _processing_item_from_dataset(
         "onlineSync": _online_sync_manifest_summary(dataset_root),
         "qcChecks": [],
         "ikEvaluation": None,
+        "qcExcludedEpisodes": [],
+        "qcVerdict": None,
     }
 
     meta = _load_processing_meta(dataset_root)
@@ -2573,6 +2586,9 @@ def _processing_item_from_dataset(
             marker_tcp_path = str(current_job.get("marker_to_tcp_calibration_path", "") or "")
         if not marker_tcp_path and isinstance(version_info, dict):
             marker_tcp_path = str(version_info.get("marker_to_tcp_calibration_path", "") or "")
+        # The same verdict export_v3 applies (tools/thor/gmsl2/qc_verdict.py): a QC "warn"
+        # exports, a QC result older than the data does not.
+        verdict = qcv.verdict_from_qc(dataset_root, qc) if isinstance(qc, dict) else None
         if isinstance(current_job, dict) and current_job.get("status") in ("queued", "running"):
             status = str(current_job["status"])
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} {status}"
@@ -2588,15 +2604,21 @@ def _processing_item_from_dataset(
         elif isinstance(current_job, dict) and current_job.get("status") in ("failed", "error"):
             status = "error"
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} failed"
-        elif isinstance(qc, dict):
-            qc_status = str(qc.get("status") or "").lower()
-            if qc_status == "pass":
-                status = "qc_pass"
-            elif qc_status in ("fail", "failed"):
-                status = "qc_failed"
-            else:
-                status = "pose_ready"
-            message = qc.get("reason") or qc.get("message") or "QC available"
+        elif verdict is not None:
+            status = {
+                qcv.PASS: "qc_pass",
+                qcv.PARTIAL: "qc_partial",
+                qcv.FAIL: "qc_failed",
+                qcv.STALE: "qc_stale",
+            }.get(verdict.state, "pose_ready")
+            message = str((qc or {}).get("reason") or (qc or {}).get("message") or "QC available")
+            if verdict.state == qcv.PARTIAL:
+                message = (
+                    f"QC passed {(qc or {}).get('passed_episodes', '?')}/{(qc or {}).get('total_episodes', '?')} episodes; "
+                    f"export leaves out episodes {_episode_list_text(verdict.excluded)}"
+                )
+            elif verdict.state == qcv.STALE:
+                message = f"QC result no longer describes this data: {verdict.reason}"
         elif version_info is not None:
             status = "pose_ready"
             message = "EE trajectory generated; QC pending"
@@ -2617,6 +2639,12 @@ def _processing_item_from_dataset(
             "detectionSummary": detection_summary,
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
+            "qcExcludedEpisodes": (
+                list(qc.get("excluded_episodes") or []) if status == "qc_partial" and isinstance(qc, dict) else []
+            ),
+            "qcVerdict": (
+                {"state": verdict.state, "reason": verdict.reason} if verdict is not None else None
+            ),
         }
 
     if not _dataset_data_files(dataset_root):
@@ -11522,7 +11550,38 @@ def _export_command(state: GatewayState, task: dict[str, Any]) -> tuple[list[str
         # arm's base through the edge live then. export_v3 lists which arms that is.
         "--target-world", "auto",
     ]
+    # Which episodes go in is export_v3's decision, from each session's own QC verdict
+    # (tools/thor/gmsl2/qc_verdict.py), the same rule for every way an export starts. Refuse
+    # here only when nothing would be exported, so the operator sees why without a failed job.
+    plan = _task_export_plan(datasets_dir, base_name)
+    if not plan["sessions"]:
+        raise ValueError(f"No recorded sessions found for {base_name}.")
+    if not plan["exportableSessions"]:
+        raise ValueError(
+            f"No session of {base_name} has passed QC on its current data, so nothing can be exported: "
+            + "; ".join(f"{row['name']}: {row['reason']}" for row in plan["sessions"][:6])
+            + ("; …" if len(plan["sessions"]) > 6 else "")
+        )
     return command, out_root
+
+
+def _task_export_plan(datasets_dir: Path, base_name: str) -> dict[str, Any]:
+    """What a task export will take from each of its sessions (the rule export_v3 applies)."""
+    sessions: list[dict[str, Any]] = []
+    for session in sorted(datasets_dir.iterdir()) if datasets_dir.is_dir() else []:
+        if not (session.is_dir() and base_name in _dataset_name_prefixes(session.name) and _has_gmsl2_episodes(session)):
+            continue
+        verdict = qcv.read_verdict(session)
+        sessions.append({
+            "name": session.name,
+            "state": verdict.state,
+            "reason": verdict.reason,
+            "excludedEpisodes": sorted(verdict.excluded),
+        })
+    return {
+        "sessions": sessions,
+        "exportableSessions": sum(1 for row in sessions if row["state"] in qcv.EXPORTABLE),
+    }
 
 
 def _matching_task_for_dataset(state: GatewayState, dataset_root: Path) -> dict[str, Any] | None:
@@ -11536,7 +11595,10 @@ def _matching_task_for_dataset(state: GatewayState, dataset_root: Path) -> dict[
 
 
 def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) -> tuple[list[str], Path]:
-    """Build an export_v3 command scoped to one approved raw GMSL2 session."""
+    """Build an export_v3 command scoped to one approved raw GMSL2 session.
+
+    export_v3 reads the session's QC verdict itself and leaves out the episodes QC failed.
+    """
 
     if not _has_gmsl2_episodes(dataset_root):
         raise ValueError("Approved raw export requires a GMSL2 session dataset.")
@@ -11740,10 +11802,19 @@ def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
     if dataset_root is None:
         raise ValueError("Dataset not found in the approved/candidate dataset list.")
     processing_item = _processing_item_from_dataset(dataset_root)
-    if processing_item.get("status") != "qc_pass":
-        raise ValueError("Dataset must pass QC before export.")
+    verdict = qcv.read_verdict(dataset_root)
+    if not verdict.exportable:
+        raise ValueError(f"{dataset_root.name} cannot be exported: {verdict.reason}.")
+    excluded = sorted(verdict.excluded)
     if not _has_gmsl2_episodes(dataset_root):
         if _has_lerobot_v3_data(dataset_root):
+            if excluded:
+                # The v3 path copies the dataset as it is; it cannot drop episodes.
+                raise ValueError(
+                    f"QC failed episodes {excluded} of this LeRobot v3 dataset, "
+                    "and its export is a plain copy that cannot leave episodes out. Delete those "
+                    "episodes in Episode Replay and run QC again."
+                )
             _copy_approved_v3_dataset_export(state, dataset_root, processing_item)
             return
         raise ValueError("Approved dataset export supports LeRobot v3 datasets or raw GMSL2 session datasets.")
@@ -11763,9 +11834,11 @@ def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
         target="lerobot_v3",
         datasetRoot=str(dataset_root),
         outputPath=str(out_root),
-        selectedEpisodes=int(processing_item.get("totalEpisodes") or 0),
+        selectedEpisodes=max(0, int(processing_item.get("totalEpisodes") or 0) - len(excluded)),
         totalFrames=0,
-        message=f"Exporting approved dataset {dataset_root.name}…",
+        message=f"Exporting approved dataset {dataset_root.name}"
+        + (f" without the {len(excluded)} episode(s) QC failed" if excluded else "")
+        + "…",
         pid=state.export_process.pid,
     )
     state.log("info", f"Started approved dataset v3 export for {dataset_root} -> {out_root}")
@@ -12548,6 +12621,22 @@ def _run_qc(
     repo_root: Path | None = None,
     ik_python: Path | None = None,
 ) -> dict[str, Any]:
+    """QC of ``dataset_root``, stamped with the fingerprint of the data it judged.
+
+    Taken before any check reads the data: a change while QC runs leaves the result stale, never
+    a stale result that looks current (tools/thor/gmsl2/qc_verdict.py).
+    """
+    fingerprint = qcv.data_fingerprint(dataset_root)
+    result = _run_qc_checks(dataset_root, repo_root=repo_root, ik_python=ik_python)
+    return {**result, "data_fingerprint": fingerprint}
+
+
+def _run_qc_checks(
+    dataset_root: Path,
+    *,
+    repo_root: Path | None = None,
+    ik_python: Path | None = None,
+) -> dict[str, Any]:
     try:
         import pyarrow.parquet as pq
     except Exception as exc:  # noqa: BLE001
@@ -12627,8 +12716,12 @@ def _run_qc(
             "message": f"{len(data_files)} parquet file(s), {total_rows} rows",
         })
 
+    # A check that can name the episodes it failed on lists them under "episodes": those
+    # episodes are left out of the export and the rest of the dataset still counts. A check
+    # that fails without naming episodes (an unreadable parquet, a camera stream missing from
+    # the whole dataset, an IK run that never finished) fails the dataset.
+    by_episode: dict[int, list[dict[str, Any]]] = {}
     if all_rows:
-        by_episode: dict[int, list[dict[str, Any]]] = {}
         for row in all_rows:
             ep = int(row.get("episode_index") or 0)
             by_episode.setdefault(ep, []).append(row)
@@ -12637,19 +12730,23 @@ def _run_qc(
 
         gap_count = 0
         first_gap: tuple[int, int] | None = None
+        gap_episodes: set[int] = set()
         backward_count = 0
         first_backward: tuple[int, int] | None = None
+        backward_episodes: set[int] = set()
         for ep_index, episode_rows in by_episode.items():
             frame_indices = [int(row.get("frame_index") or 0) for row in episode_rows]
             for i in range(1, len(frame_indices)):
                 if frame_indices[i] - frame_indices[i - 1] != 1:
                     gap_count += 1
+                    gap_episodes.add(ep_index)
                     if first_gap is None:
                         first_gap = (ep_index, frame_indices[i])
             timestamps = [float(row.get("timestamp") or 0.0) for row in episode_rows]
             for i in range(1, len(timestamps)):
                 if timestamps[i] + 1e-6 < timestamps[i - 1]:
                     backward_count += 1
+                    backward_episodes.add(ep_index)
                     if first_backward is None:
                         first_backward = (ep_index, frame_indices[i])
 
@@ -12657,7 +12754,11 @@ def _run_qc(
             checks.append({
                 "name": "frame_continuity",
                 "status": "fail",
-                "message": f"{gap_count} frame gaps across {len(by_episode)} episodes; first ep={first_gap[0]} frame={first_gap[1]}",
+                "message": (
+                    f"{gap_count} frame gaps in episodes {_episode_list_text(gap_episodes)}; "
+                    f"first ep={first_gap[0]} frame={first_gap[1]}"
+                ),
+                "episodes": sorted(gap_episodes),
             })
             invalid_rows += gap_count
         else:
@@ -12671,7 +12772,11 @@ def _run_qc(
             checks.append({
                 "name": "timestamp_monotonic",
                 "status": "fail",
-                "message": f"{backward_count} backward timestamps; first ep={first_backward[0]} frame={first_backward[1]}",
+                "message": (
+                    f"{backward_count} backward timestamps in episodes {_episode_list_text(backward_episodes)}; "
+                    f"first ep={first_backward[0]} frame={first_backward[1]}"
+                ),
+                "episodes": sorted(backward_episodes),
             })
             invalid_rows += backward_count
         else:
@@ -12679,9 +12784,9 @@ def _run_qc(
 
         ee_axis_indices = _named_indices(state_names, ("ee.x", "ee.y", "ee.z"))
         if ee_axis_indices is not None:
-            jumps = 0
+            jumps_by_episode: dict[int, int] = {}
             max_delta = 0.0
-            for episode_rows in by_episode.values():
+            for ep_index, episode_rows in by_episode.items():
                 prev: tuple[float, float, float] | None = None
                 for row in episode_rows:
                     values = _as_float_list(row.get("observation.state"))
@@ -12692,17 +12797,25 @@ def _run_qc(
                         delta = ((current[0] - prev[0]) ** 2 + (current[1] - prev[1]) ** 2 + (current[2] - prev[2]) ** 2) ** 0.5
                         max_delta = max(max_delta, delta)
                         if delta > 0.05:
-                            jumps += 1
+                            jumps_by_episode[ep_index] = jumps_by_episode.get(ep_index, 0) + 1
                     prev = current
+            jumps = sum(jumps_by_episode.values())
             if jumps:
-                severity = "warn" if jumps <= max(1, total_rows // 100) else "fail"
-                checks.append({
+                # Up to 1% of an episode's frames (at least one) is a warning; more fails that episode.
+                jumpy = sorted(
+                    ep for ep, count in jumps_by_episode.items()
+                    if count > max(1, len(by_episode[ep]) // 100)
+                )
+                check = {
                     "name": "ee_continuity",
-                    "status": severity,
-                    "message": f"{jumps} consecutive frames moved > 5 cm (max {max_delta * 100:.1f} cm)",
-                })
-                if severity == "fail":
-                    invalid_rows += jumps
+                    "status": "fail" if jumpy else "warn",
+                    "message": f"{jumps} consecutive frames moved > 5 cm (max {max_delta * 100:.1f} cm)"
+                    + (f"; more than 1% of the frames in episodes {_episode_list_text(jumpy)}" if jumpy else ""),
+                }
+                if jumpy:
+                    check["episodes"] = jumpy
+                    invalid_rows += sum(jumps_by_episode[ep] for ep in jumpy)
+                checks.append(check)
             else:
                 checks.append({
                     "name": "ee_continuity",
@@ -12721,22 +12834,21 @@ def _run_qc(
         quat_indices = _named_indices(state_names, ("ee.qx", "ee.qy", "ee.qz", "ee.qw"))
         if quat_indices is not None:
             bad = 0
+            bad_episodes: set[int] = set()
             for row in all_rows:
                 values = _as_float_list(row.get("observation.state"))
                 if max(quat_indices) >= len(values):
                     continue
                 norm_sq = sum(values[idx] ** 2 for idx in quat_indices)
-                if norm_sq <= 0:
+                if norm_sq <= 0 or not (0.95 <= norm_sq ** 0.5 <= 1.05):
                     bad += 1
-                    continue
-                norm = norm_sq ** 0.5
-                if not (0.95 <= norm <= 1.05):
-                    bad += 1
+                    bad_episodes.add(int(row.get("episode_index") or 0))
             if bad:
                 checks.append({
                     "name": "quat_norm",
                     "status": "fail",
-                    "message": f"{bad} frames with |q| outside [0.95, 1.05]",
+                    "message": f"{bad} frames with |q| outside [0.95, 1.05] in episodes {_episode_list_text(bad_episodes)}",
+                    "episodes": sorted(bad_episodes),
                 })
                 invalid_rows += bad
             else:
@@ -12749,6 +12861,7 @@ def _run_qc(
             gripper_source = "action"
         if gripper_idx is not None:
             out_of_range = 0
+            out_of_range_episodes: set[int] = set()
             for row in all_rows:
                 values = _as_float_list(row.get(gripper_source))
                 if gripper_idx >= len(values):
@@ -12756,11 +12869,16 @@ def _run_qc(
                 value = values[gripper_idx]
                 if value != value or not (-0.05 <= value <= 1.05):
                     out_of_range += 1
+                    out_of_range_episodes.add(int(row.get("episode_index") or 0))
             if out_of_range:
                 checks.append({
                     "name": "gripper_range",
                     "status": "fail",
-                    "message": f"{out_of_range} frames outside [0, 1] in {gripper_source}",
+                    "message": (
+                        f"{out_of_range} frames outside [0, 1] in {gripper_source}, "
+                        f"episodes {_episode_list_text(out_of_range_episodes)}"
+                    ),
+                    "episodes": sorted(out_of_range_episodes),
                 })
                 invalid_rows += out_of_range
             else:
@@ -12800,11 +12918,14 @@ def _run_qc(
                         f"the {len(by_episode)} parquet episodes by episode number; "
                         "missing sensor observations are not reconstructed"
                     )
-                checks.append({
+                pairing_check: dict[str, Any] = {
                     "name": "episode_video_pairing",
                     "status": "fail" if rowless else "warn",
                     "message": "; ".join(parts) + " - " + consequence,
-                })
+                }
+                if rowless:
+                    pairing_check["episodes"] = rowless
+                checks.append(pairing_check)
             elif video_episodes:
                 checks.append({
                     "name": "episode_video_pairing",
@@ -12848,28 +12969,52 @@ def _run_qc(
         fps=int(info.get("fps") or 30),
     )
     if ik_evaluation["status"] != "skipped":
-        checks.append({
+        # Reachability belongs to a trajectory *and* an arm placed somewhere (its registered
+        # base), not to the recording: the export keeps the poses in the camera world they were
+        # recorded in, and deployment puts them in the driven arm's base through the edge live
+        # then. So it informs, and never fails a dataset or leaves an episode out of training:
+        # an arm not registered yet (the left arm since 11-03, a new station) would otherwise
+        # block every recording made there. Before an arm moves, real replay still needs its
+        # own per-episode MuJoCo validation; that gate does not read this.
+        ik_check: dict[str, Any] = {
             "name": "fr3_ik_reachability",
-            "status": ik_evaluation["status"],
-            "message": ik_evaluation["message"],
+            "status": "warn" if ik_evaluation["status"] == "fail" else ik_evaluation["status"],
+            "message": ik_evaluation["message"]
+            + (" (reference for deployment; not part of the export decision)" if ik_evaluation["status"] == "fail" else ""),
             "details": {"cubes": ik_evaluation["cubes"]},
-        })
+        }
+        checks.append(ik_check)
 
     valid_rows = max(0, total_rows - invalid_rows)
 
-    overall = "pass"
+    excluded: dict[int, list[str]] = {}
+    dataset_failed = False
     for check in checks:
-        if check.get("status") == "fail":
-            overall = "fail"
-            break
-        if check.get("status") == "warn" and overall == "pass":
-            overall = "warn"
+        if check.get("status") != "fail":
+            continue
+        if not check.get("episodes"):
+            dataset_failed = True
+            continue
+        for ep in check["episodes"]:
+            excluded.setdefault(int(ep), []).append(str(check.get("name") or "?"))
+    passed_episodes = sorted(set(by_episode) - set(excluded))
+
+    if dataset_failed or (by_episode and not passed_episodes):
+        overall = "fail"
+    elif excluded:
+        overall = "partial"
+    elif any(check.get("status") == "warn" for check in checks):
+        overall = "warn"
+    else:
+        overall = "pass"
 
     valid_pct = (valid_rows / total_rows * 100.0) if total_rows else 0.0
     summary_pass = sum(1 for check in checks if check.get("status") == "pass")
     summary_warn = sum(1 for check in checks if check.get("status") == "warn")
     summary_fail = sum(1 for check in checks if check.get("status") == "fail")
     summary = f"{summary_pass} pass · {summary_warn} warn · {summary_fail} fail · {total_rows} frames"
+    if overall == "partial":
+        summary += f" · {len(passed_episodes)}/{len(by_episode)} episodes pass, {len(excluded)} left out"
 
     return {
         "status": overall,
@@ -12878,8 +13023,19 @@ def _run_qc(
         "checks": checks,
         "online_sync": online_sync_summary,
         "ik_evaluation": ik_evaluation,
+        # Episodes the export leaves out, with the checks each failed. Only a dataset that
+        # failed nothing dataset-wide gets here; one that did is "fail" whatever this says.
+        "excluded_episodes": [{"episode": ep, "checks": names} for ep, names in sorted(excluded.items())],
+        "passed_episodes": len(passed_episodes),
+        "total_episodes": len(by_episode),
         "completed_at": _now_iso(),
     }
+
+
+def _episode_list_text(episodes: Any, limit: int = 12) -> str:
+    ordered = sorted(int(ep) for ep in episodes)
+    text = ", ".join(str(ep) for ep in ordered[:limit])
+    return f"[{text}{', …' if len(ordered) > limit else ''}]"
 
 
 def _named_indices(names: list[str], required: tuple[str, ...]) -> tuple[int, ...] | None:

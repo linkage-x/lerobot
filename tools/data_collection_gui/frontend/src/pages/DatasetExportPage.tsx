@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { RecordedDataset } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, taskStatusDot } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, stateLabel, taskStatusDot, isExportable } from "../shared/ui";
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
 
@@ -200,7 +200,8 @@ export function DatasetExportPage({
   onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
-  const eligible = snapshot.processing.filter((item) => item.status === "qc_pass");
+  // The same rule export_v3 applies: QC passed (in whole or in part) on the current data.
+  const eligible = snapshot.processing.filter(isExportable);
   const hasEligible = eligible.length > 0;
   const exportableTasks = (snapshot.tasks ?? []).filter((t) => t.datasetRepoId);
   const exporting = exportStatus.state === "exporting";
@@ -290,6 +291,13 @@ export function DatasetExportPage({
                       {item.trajectoryVersion ? <em>{item.trajectoryVersion}</em> : null}
                     </div>
                     <p>{item.qcSummary}</p>
+                    {item.status === "qc_partial" ? (
+                      <p>
+                        Exports {Math.max(item.totalEpisodes - (item.qcExcludedEpisodes?.length ?? 0), 0)} of{" "}
+                        {item.totalEpisodes} episodes; QC failed episodes{" "}
+                        {(item.qcExcludedEpisodes ?? []).map((row) => row.episode).join(", ")}.
+                      </p>
+                    ) : null}
                   </div>
                   <div className="processing-stats">
                     <span>{item.totalEpisodes} ep · {item.totalFrames} fr</span>

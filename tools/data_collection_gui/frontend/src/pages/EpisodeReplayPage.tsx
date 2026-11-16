@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus, RealSensePreviewCameraStatus, ReplayTimeline } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection, userGuideUrl } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskExportPlan, mujocoValidationMatchesSelection, userGuideUrl } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { DualFr3ExecutabilityPanel } from "../DualFr3ExecutabilityPanel";
 import { DualFr3HomePanel } from "../DualFr3HomePanel";
@@ -713,8 +713,18 @@ export function ReplayReadinessCard({
   const trajectoryReady =
     status.dataStatus === "loaded" &&
     (status.trajectoryKind === "pose" || status.trajectoryKind === "gripper_width") &&
-    (!processing || processing.status === "qc_pass" || processing.status === "pose_ready");
-  const qcLabel = !processing ? "—" : processing.status === "qc_pass" ? "Pass" : processing.status === "qc_failed" ? "Fail" : "Pending";
+    (!processing || ["qc_pass", "qc_partial", "qc_stale", "pose_ready"].includes(processing.status));
+  const qcLabel = !processing
+    ? "—"
+    : processing.status === "qc_pass"
+      ? "Pass"
+      : processing.status === "qc_partial"
+        ? `Partial (${processing.qcExcludedEpisodes?.length ?? 0} ep out)`
+        : processing.status === "qc_stale"
+          ? "Out of date"
+          : processing.status === "qc_failed"
+            ? "Fail"
+            : "Pending";
   const validFrames = processing?.validFramesPct != null ? `${processing.validFramesPct}%` : "—";
 
   if (!trajectoryReady) {

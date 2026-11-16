@@ -71,6 +71,7 @@ from tools.fr3 import fr3_arms  # noqa: E402
 from tools.thor.gmsl2 import (  # noqa: E402
     box_six_d as bsd,
     label_provenance as lp,
+    qc_verdict as qcv,
     thor_lerobot_v3 as lr3,
     world_provenance as wp,
 )
@@ -163,6 +164,47 @@ class EpisodeSource:
     session_dir: Path
     ep_dir: Path
     local_index: int  # episode_index within its session (for the box parquet join)
+
+
+def _apply_qc_gate(
+    episodes: list[EpisodeSource], *, ignore_qc: bool = False
+) -> tuple[list[EpisodeSource], list[dict[str, Any]], dict[str, Any]]:
+    """Keep the episodes each session's QC passed on its current data (tools/thor/gmsl2/qc_verdict.py).
+
+    Returns (kept, left_out, gate): ``left_out`` rows say which episode stayed out and why, ``gate``
+    is the block info.json records. A session QC failed as a whole, never ran on, or whose data changed
+    since QC contributes nothing; a session QC passed in part contributes the episodes it passed.
+    ``ignore_qc`` (``--ignore-qc``, never the GUI) keeps everything and says so in the dataset.
+    """
+    verdicts: dict[Path, qcv.Verdict] = {}
+    for src in episodes:
+        if src.session_dir not in verdicts:
+            verdicts[src.session_dir] = qcv.read_verdict(src.session_dir)
+    sessions = {
+        session.name: {"state": verdict.state, "reason": verdict.reason}
+        for session, verdict in sorted(verdicts.items(), key=lambda item: item[0].name)
+    }
+    if ignore_qc:
+        return episodes, [], {"enforced": False, "rule": "--ignore-qc: QC verdicts not applied", "sessions": sessions}
+    kept: list[EpisodeSource] = []
+    left_out: list[dict[str, Any]] = []
+    for src in episodes:
+        verdict = verdicts[src.session_dir]
+        if verdict.allows(src.local_index):
+            kept.append(src)
+            continue
+        left_out.append({
+            "session": src.session_dir.name,
+            "source_episode": src.ep_dir.name,
+            "reason": verdict.excluded.get(src.local_index) or verdict.reason,
+        })
+    gate = {
+        "enforced": True,
+        "rule": "an episode is exported only when QC passed it on the session's current data",
+        "sessions": sessions,
+        "left_out_episodes": len(left_out),
+    }
+    return kept, left_out, gate
 
 
 def gather_episodes(sessions: list[Path]) -> list[EpisodeSource]:
@@ -1010,6 +1052,7 @@ class _V3Writer:
         world_frame: dict[str, Any] | None = None,
         tcp_frame: dict[str, Any] | None = None,
         label_provenance: dict[str, Any] | None = None,
+        qc_gate: dict[str, Any] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -1033,6 +1076,7 @@ class _V3Writer:
         self.world_frame = dict(world_frame) if world_frame else None
         self.tcp_frame = dict(tcp_frame) if tcp_frame else None
         self.label_provenance = dict(label_provenance) if label_provenance else None
+        self.qc_gate = dict(qc_gate) if qc_gate else None
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -1238,6 +1282,8 @@ class _V3Writer:
             info["tcp_frame"] = self.tcp_frame
         if self.label_provenance is not None:
             info["label_provenance"] = self.label_provenance
+        if self.qc_gate is not None:
+            info["qc_gate"] = self.qc_gate
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
 
@@ -1440,6 +1486,7 @@ def export_task_to_v3(
     check_only: bool = False,
     six_d: str = "external",
     six_d_registry: Path | None = None,
+    ignore_qc: bool = False,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
@@ -1453,7 +1500,22 @@ def export_task_to_v3(
     episodes = gather_episodes(sessions)
     if not episodes:
         raise RuntimeError(f"Sessions for '{name}' contain no episodes")
-    _emit(f"Export plan: {len(episodes)} episodes from {len(sessions)} session(s) -> {repo_id}")
+    episodes, excluded, qc_gate = _apply_qc_gate(episodes, ignore_qc=ignore_qc)
+    for session_name, row in qc_gate["sessions"].items():
+        _emit(f"QC {session_name}: {row['state']} - {row['reason']}")
+    if ignore_qc:
+        _emit("WARNING: --ignore-qc: exporting every episode whatever QC said; info.json records it")
+    for row in excluded:
+        _emit(f"Leaving out {row['session']}/{row['source_episode']}: {row['reason']}")
+    if not episodes:
+        raise RuntimeError(
+            f"No episode of '{name}' passed QC on its current data; nothing to export "
+            "(run QC in Dataset Processing; a session changed since its QC needs QC again)"
+        )
+    _emit(
+        f"Export plan: {len(episodes)} episodes from {len(sessions)} session(s) -> {repo_id}"
+        + (f" ({len(excluded)} left out)" if excluded else "")
+    )
 
     out_root = exports_root / export_name
     if out_root.exists() and not overwrite and not check_only:
@@ -1779,6 +1841,7 @@ def export_task_to_v3(
         world_frame=output_world_frame,
         tcp_frame=_dataset_tcp_frame(episodes) if pose_columns else None,
         label_provenance=label_provenance,
+        qc_gate=qc_gate,
     )
 
     sources: list[dict[str, Any]] = []
@@ -1948,6 +2011,8 @@ def export_task_to_v3(
                 "base_name": name,
                 "output_name": export_name,
                 "episodes": sources,
+                "excluded_episodes": excluded,
+                "qc_gate": qc_gate,
             },
             indent=2,
             ensure_ascii=False,
@@ -2000,6 +2065,13 @@ def main(argv: list[str] | None = None) -> int:
         "its zero or of the episode's still frames); none: leave 6D out of observation.state",
     )
     ap.add_argument(
+        "--ignore-qc",
+        action="store_true",
+        help="export every episode whatever each session's QC says (by default only the episodes QC "
+        "passed on the session's current data go in); for a maintainer, never the GUI; recorded in "
+        "info.json (qc_gate.enforced = false)",
+    )
+    ap.add_argument(
         "--check",
         action="store_true",
         help="run the world and label checks and print each session's label chain; write nothing",
@@ -2021,6 +2093,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_mixed_labels=args.allow_mixed_labels,
             check_only=args.check,
             six_d=args.six_d,
+            ignore_qc=args.ignore_qc,
         )
     except Exception as exc:  # noqa: BLE001
         _emit(f"ERROR: {exc}")

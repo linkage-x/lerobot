@@ -312,11 +312,23 @@
       <ul>
         <li><b>Online Sync Manifest</b>：相机帧和 BOX 数据的时间对齐是否通过。</li>
         <li><b>Marker detection evidence</b>：每台相机的检测率，看是否大段丢检。</li>
-        <li><b>FR3 offline IK evaluation</b>：这只手的轨迹在对应臂的基座里逐帧求 IK，是否都够得着（<code>fr3_ik_reachability</code>）。</li>
+        <li><b>FR3 offline IK evaluation</b>：这只手的轨迹在对应臂的基座里逐帧求 IK，是否都够得着（<code>fr3_ik_reachability</code>）。<b>只作参考</b>（11-16 起）：够不着最多是 warn，不会让数据进不了训练集。能不能够着取决于臂放在哪、注册了没有，不是录得好不好；真机回放前的 MuJoCo 预演照样会逐段把关。</li>
       </ul>
-      全部通过后状态变成 QC pass，按钮变成 <span class="ui">Open Replay</span>。</li>
+      全部通过（或只有 warn）后状态变成 QC pass，按钮变成 <span class="ui">Open Replay</span>。</li>
   </ol>
-  <div class="callout"><p>生成失败显示 <span class="ui">Regenerate Trajectory</span>；QC 失败显示 <span class="ui">Re-run QC</span>。重跑前先看日志里的原因，不要反复点。IK 不可达通常说明动作超出了右臂工作空间，这段数据只能丢掉或者重录。</p></div>
+  <h3 id="qc-export-rule">哪些数据会进训练集（11-16 起）</h3>
+  <p>只有一条规则，从哪里导出都一样（单个数据集、按任务、命令行）：<b>一个 episode 只有在 QC 对它现在的数据判了通过，才会被导出。</b>处理页每个数据集下面的 QC summary 里会直接写出导出会拿走什么。</p>
+  <table>
+    <thead><tr><th>状态</th><th>导出时</th><th>怎么办</th></tr></thead>
+    <tbody>
+      <tr><td>QC pass</td><td>全部 episode 都进。</td><td>—</td></tr>
+      <tr><td>QC partial</td><td>没过的 episode 不进，其余照常进。页面列出是哪几个、没过哪项检查。</td><td>不用做什么。想清理就在 Episode Replay 删掉这几段（删完要重跑 QC），或者重录。</td></tr>
+      <tr><td>QC failed</td><td>整份不进。说明有一项检查没法落到具体 episode（比如 parquet 读不了、整份缺某路相机）。</td><td>看检查明细，修好或重录后重跑 QC。</td></tr>
+      <tr><td>QC out of date</td><td>整份不进。QC 之后数据变过：在 Replay 删了 episode（后面的会重新编号，旧结论会对不上号）、重新生成了轨迹、重新配了 BOX。11-16 之前跑的 QC 也算这种。</td><td>点 <span class="ui">Re-run QC</span>。</td></tr>
+      <tr><td>Pose ready（QC 没跑）</td><td>整份不进。</td><td>点 <span class="ui">Run QC</span>。</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><p>生成失败显示 <span class="ui">Regenerate Trajectory</span>；QC 失败或过期显示 <span class="ui">Re-run QC</span>。重跑前先看日志里的原因，不要反复点。按任务导出时，会先弹出一个清单，写明会导出多少段、哪些 session 不进以及原因。点确定也只导出清单里能进的部分，<b>没有“照样导出”的选项</b>。想让某个 session 进来，先去处理页让它通过 QC。</p></div>
 </section>
 
 <!-- ================================================================ -->
@@ -419,7 +431,9 @@
       <tr><td>推理报 <code>choose an arm … there is no default arm</code></td><td>推理没有默认臂。</td><td>加 <code>--arm right</code>。</td></tr>
       <tr><td>推理报 <code>no live registration edge connects world_… to fr3_base…</code></td><td>选的臂没有在用的注册边（左臂的边 11-03 已退役），或者守卫停用了到基座的边。</td><td>右臂换 <code>--arm right</code>；左臂先做第 10 节；有红条就找维护者。</td></tr>
       <tr><td>推理报 <code>…put in fr3_base through an edge that has since been retired…</code></td><td>旧数据集是用已退役的边换进左臂基座的。</td><td>在 Dataset Export 页重新导出（新导出留在相机世界系），再重新训练。</td></tr>
-      <tr><td>QC 的 <code>fr3_ik_reachability</code> 失败</td><td>轨迹有帧在右臂够不着的地方。</td><td>看 3D 视图哪里超出；在右臂可达区重录。</td></tr>
+      <tr><td>QC 的 <code>fr3_ik_reachability</code> 是 warn</td><td>轨迹有帧在这台臂当前的摆放下够不着，或者这台臂还没注册（左臂、新工位）。</td><td>不影响导出。要在这台臂上回放，就换一段 MuJoCo 能通过的 episode，或者在可达区重录。</td></tr>
+      <tr><td>导出报 <code>No episode of '…' passed QC on its current data</code>，或单个数据集报 <code>cannot be exported</code></td><td>这些 session 都没有对当前数据通过 QC：没跑、失败，或者 QC 之后数据变过。</td><td>在 Dataset Processing 对它们跑 QC（过期的点 <span class="ui">Re-run QC</span>）。</td></tr>
+      <tr><td>导出日志 <code>Leaving out …: QC …</code></td><td>QC 没过的 episode，或者 QC 没跑、已过期的 session。</td><td>正常现象，其余照常导出。见第 6 节「哪些数据会进训练集」。</td></tr>
       <tr><td><span class="ui">1 · Move to trajectory start</span> 是灰的</td><td>MuJoCo 没通过 / 不是当前选择的结果 / 没选臂 / 回放已经在进行 / 这是导出后的数据集。</td><td>按第 7 节顺序重做。</td></tr>
       <tr><td><span class="ui">2 · Execute trajectory</span> 是灰的</td><td>还没到 at start，或勾了激光但跟踪仪没 ready。</td><td>等 Phase 变 at start；激光模式下把 SMR 装到臂上并锁定光束。</td></tr>
       <tr><td>某几路相机没画面</td><td>Argus 没起来。</td><td>在 Thor 跑 <code>recover_argus.sh</code>；不行就整机断电重启。</td></tr>
