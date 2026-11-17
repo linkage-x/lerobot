@@ -550,22 +550,22 @@ def test_export_task_to_v3_merges_tracking_pose_sidecars(tmp_path, monkeypatch):
     )
 
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
-    assert "observation.ee_pose.left.base" in table.column_names
-    assert "action.ee_pose.left.base" in table.column_names
+    assert "observation.ee_pose.left.world" in table.column_names
+    assert "action.ee_pose.left.world" in table.column_names
     assert "observation.cube_pose.left.camera.cam_00" in table.column_names
-    assert "observation.cube_pose.left.base" in table.column_names
-    ee_rows = table.column("observation.ee_pose.left.base").to_pylist()
+    assert "observation.cube_pose.left.world" in table.column_names
+    ee_rows = table.column("observation.ee_pose.left.world").to_pylist()
     assert ee_rows[0] == pytest.approx([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0])
     assert ee_rows[1] == pytest.approx([0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0])
-    assert table.column("action.ee_pose.left.base").to_pylist()[1][:3] == pytest.approx([1.4, 1.5, 1.6])
+    assert table.column("action.ee_pose.left.world").to_pylist()[1][:3] == pytest.approx([1.4, 1.5, 1.6])
     assert table.column("observation.cube_pose.left.camera.cam_00").to_pylist()[0][:3] == pytest.approx([2.1, 2.2, 2.3])
-    assert table.column("observation.cube_pose.left.base").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
+    assert table.column("observation.cube_pose.left.world").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
 
     info = json.loads((out / "meta" / "info.json").read_text())
-    assert info["features"]["observation.cube_pose.left.base"]["names"] == list(export_v3._POSE7_FEATURE_NAMES)
+    assert info["features"]["observation.cube_pose.left.world"]["names"] == list(export_v3._POSE7_FEATURE_NAMES)
     stats = json.loads((out / "meta" / "stats.json").read_text())
-    assert stats["observation.ee_pose.left.base"]["count"] == [2] * 7
-    assert not math.isnan(table.column("observation.ee_pose.left.base").to_pylist()[1][0])
+    assert stats["observation.ee_pose.left.world"]["count"] == [2] * 7
+    assert not math.isnan(table.column("observation.ee_pose.left.world").to_pylist()[1][0])
 
 
 def test_export_task_to_v3_falls_back_to_sidecar_cube_base(tmp_path, monkeypatch):
@@ -614,11 +614,11 @@ def test_export_task_to_v3_falls_back_to_sidecar_cube_base(tmp_path, monkeypatch
     )
 
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
-    assert "observation.cube_pose.left.base" in table.column_names
-    assert table.column("observation.cube_pose.left.base").to_pylist()[0][:3] == pytest.approx([3.1, 3.2, 3.3])
-    assert table.column("observation.cube_pose.left.base").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
+    assert "observation.cube_pose.left.world" in table.column_names
+    assert table.column("observation.cube_pose.left.world").to_pylist()[0][:3] == pytest.approx([3.1, 3.2, 3.3])
+    assert table.column("observation.cube_pose.left.world").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
     stats = json.loads((out / "meta" / "stats.json").read_text())
-    assert stats["observation.cube_pose.left.base"]["count"] == [2] * 7
+    assert stats["observation.cube_pose.left.world"]["count"] == [2] * 7
 
 
 # ----------------------------------------------- box ↔ camera time sync ----
@@ -980,13 +980,13 @@ def test_export_reexpresses_world_poses_through_a_graph_edge(tmp_path, monkeypat
     )
 
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
-    state = table.column("observation.ee_pose.left.base").to_pylist()
+    state = table.column("observation.ee_pose.left.world").to_pylist()
     # (0.1, 0.2, 0.3) -> (1 - 0.2, 2 + 0.1, 3 + 0.3); identity orientation -> 90 deg about z.
     s = math.sqrt(0.5)
     assert state[0] == pytest.approx([0.8, 2.1, 3.3, 0.0, 0.0, s, s])
     # An untracked frame stays a gap; it must not become the edge's translation.
     assert all(math.isnan(v) for v in state[1])
-    assert table.column("action.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([1.0, 3.0, 3.0])
+    assert table.column("action.ee_pose.left.world").to_pylist()[0][:3] == pytest.approx([1.0, 3.0, 3.0])
     # Camera-frame poses do not move with the world.
     assert table.column("observation.cube_pose.left.camera.cam_00").to_pylist()[0][:3] == pytest.approx([2.1, 2.2, 2.3])
 
@@ -1039,7 +1039,7 @@ def test_export_auto_target_world_keeps_the_camera_world_even_when_an_edge_reach
     assert info["world_frame"]["world_frame_id"] == "world_a"
     assert "reexpressed_from" not in info["world_frame"]
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
-    assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
+    assert table.column("observation.ee_pose.left.world").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
     # Deployment commands these poses through the edge, so it has to know which link they are on.
     assert info["tcp_frame"]["link"] == "corenetic_gripper_ee"
     assert info["tcp_frame"]["marker_to_tcp_calibrations"] == ["config_thor/marker_to_tcp_calibration_test.json"]
@@ -1069,7 +1069,7 @@ def test_export_auto_target_world_keeps_the_recorded_world_without_an_edge(tmp_p
     # No tracking summary: the link is unknown, which deployment in fr3_base refuses.
     assert info["tcp_frame"]["link"] == ""
     table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
-    assert table.column("observation.ee_pose.left.base").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
+    assert table.column("observation.ee_pose.left.world").to_pylist()[0][:3] == pytest.approx([0.1, 0.2, 0.3])
     printed = capsys.readouterr().out
     assert "Not deployable on the right arm (fr3_base_right) until it is registered: no edge" in printed
     assert "(world frame: world_a)" in printed.strip().splitlines()[-1]

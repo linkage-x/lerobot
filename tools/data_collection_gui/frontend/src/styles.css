@@ -4831,3 +4831,40 @@ button.danger {
   top: 0;
   z-index: 1;
 }
+
+/* Training page */
+.train-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.train-table th, .train-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid rgba(127, 127, 127, 0.2); }
+.train-table tbody tr { cursor: default; }
+.train-unusable { opacity: 0.55; }
+.train-selected { background: rgba(80, 140, 255, 0.12); }
+.train-path { font-family: monospace; font-size: 11px; word-break: break-all; }
+.train-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; margin: 8px 0; }
+.train-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.train-field small { opacity: 0.7; }
+.train-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.train-inline input[type="number"] { width: 100px; }
+.train-camera { border: 1px solid rgba(127, 127, 127, 0.25); border-radius: 6px; padding: 8px; margin: 8px 0; }
+.train-camera-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.train-crop-inputs { display: flex; gap: 10px; flex-wrap: wrap; margin: 6px 0; font-size: 12px; }
+.train-crop-inputs input[type="number"] { width: 80px; margin-left: 4px; }
+.train-preview { max-width: 100%; width: 640px; display: block; border-radius: 4px; }
+.train-log { max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+
+/* Rollout page */
+.rollout-stages { margin: 4px 0 8px 18px; font-size: 13px; }
+.rollout-stage-on strong { color: inherit; }
+.rollout-stage-off { opacity: 0.6; }
+.rollout-figures { display: flex; gap: 16px; flex-wrap: wrap; }
+.rollout-figure { margin: 8px 0; font-size: 12px; max-width: 380px; }
+.rollout-figure input[type="range"] { width: 360px; }
+.rollout-plot-bg { fill: rgba(127, 127, 127, 0.08); stroke: rgba(127, 127, 127, 0.3); }
+.rollout-line-pred, .rollout-line-truth, .rollout-line-still { fill: none; stroke-width: 2; }
+.rollout-line-pred { stroke: #2f6fde; }
+.rollout-line-truth { stroke: #1f9d55; }
+.rollout-line-still { stroke: #c0392b; stroke-dasharray: 4 3; }
+.rollout-dot { fill: #333; }
+.rollout-key-pred { color: #2f6fde; font-weight: 600; }
+.rollout-key-truth { color: #1f9d55; font-weight: 600; }
+.rollout-key-still { color: #c0392b; font-weight: 600; }
+.rollout-live { margin-top: 8px; }

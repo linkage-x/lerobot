@@ -3518,9 +3518,42 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
     assert gateway._require_mujoco_validation(state) == dataset_root.resolve()
 
 
-def test_run_qc_reports_fr3_ik_without_failing_the_dataset_on_it(monkeypatch, tmp_path):
-    # Reachability belongs to an arm and where it stands, not to the recording (11-16): it is
-    # shown, and never keeps data out of training.
+def test_run_qc_leaves_out_the_episodes_the_arm_cannot_reach(monkeypatch, tmp_path):
+    # A policy learns the motions it is shown (11-17): an episode IK names unreachable stays out
+    # of the export, the rest of the dataset still goes.
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    monkeypatch.setattr(
+        gateway,
+        "_run_fr3_ik_qc",
+        lambda *args, **kwargs: {
+            "status": "fail",
+            "message": "right: 1/2 trajectories reachable; 96.00% poses reachable",
+            "cubes": [{
+                "cube": "right",
+                "status": "fail",
+                "numUnreachableTrajectories": 1,
+                "reachableRatio": 0.96,
+                "reachableEpisodeIndices": [0],
+                "unreachableEpisodeIndices": [1],
+            }],
+        },
+    )
+
+    qc = gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=Path(sys.executable))
+
+    assert qc["status"] == "partial"
+    ik_check = next(check for check in qc["checks"] if check["name"] == "fr3_ik_reachability")
+    assert ik_check["status"] == "fail"
+    assert ik_check["episodes"] == [1]
+    assert "stay out of the export" in ik_check["message"]
+    assert qc["excluded_episodes"] == [{"episode": 1, "checks": ["fr3_ik_reachability"]}]
+    verdict = qc_verdict.verdict_from_qc(dataset_root, qc)
+    assert verdict.allows(0) and not verdict.allows(1)
+
+
+def test_run_qc_does_not_wait_on_an_ik_evaluation_that_named_no_episode(monkeypatch, tmp_path):
+    # No edge to any arm base, or the verifier failed: that says nothing about the recording.
     dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
     monkeypatch.setattr(
@@ -3528,19 +3561,17 @@ def test_run_qc_reports_fr3_ik_without_failing_the_dataset_on_it(monkeypatch, tm
         "_run_fr3_ik_qc",
         lambda *args, **kwargs: {
             "status": "fail",
-            "message": "left: 0/1 trajectories reachable; 80.00% poses reachable",
-            "cubes": [{"cube": "left", "numUnreachableTrajectories": 1, "reachableRatio": 0.8}],
+            "message": "left: no registered edge reaches an arm base",
+            "cubes": [{"cube": "left", "status": "fail", "message": "no registered edge reaches an arm base"}],
         },
     )
 
     qc = gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=Path(sys.executable))
 
     assert qc["status"] == "warn"
-    assert qc["ik_evaluation"]["status"] == "fail"
-    assert qc["ik_evaluation"]["cubes"][0]["cube"] == "left"
     ik_check = next(check for check in qc["checks"] if check["name"] == "fr3_ik_reachability")
     assert ik_check["status"] == "warn"
-    assert "not part of the export decision" in ik_check["message"]
+    assert "not judged per episode" in ik_check["message"]
     assert "episodes" not in ik_check
     assert qc["excluded_episodes"] == []
 

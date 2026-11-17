@@ -34,7 +34,7 @@ Real-robot replay should be unlocked only when all of these are true:
 | --- | --- | --- |
 | Raw recording writer action semantics | Done | `tools/thor/gmsl2/thor_lerobot_v3.py` writes BOX `observation.state` only; `action` is left for export. |
 | Exported main `action` derivation | Done | `tools/thor/gmsl2/export_v3.py` derives `action[i] = observation.state[i + 1]`, holding the final state. |
-| Exported EE pose sidecar columns | Done | `export_v3.py` can include `observation.ee_pose.{cube}.base` and `action.ee_pose.{cube}.base` from `derived/april_cube_tracking_in_robot_base/state_action.*.csv`. |
+| Exported EE pose sidecar columns | Done | `export_v3.py` can include `observation.ee_pose.{cube}.world` and `action.ee_pose.{cube}.world` (camera world; exports before 11-16 call them `.base`, see `tools/thor/gmsl2/pose_columns.py`) from `derived/april_cube_tracking_in_robot_base/state_action.*.csv`. |
 | Export dataset visibility in GUI Replay | Done | Gateway scans `outputs/exports`, returns `datasetKind=exported`, and Replay lists exported datasets. |
 | Export page open-in-replay entry | Done | Dataset Export shows `Open Replay` when `datasetExport.outputPath` is available. |
 | MuJoCo validation infrastructure | Done | Gateway starts MuJoCo replay, requires structured `mujoco_replay_result`, stores metrics, persists validation, and checks current dataset/episode/fps/thresholds. |
@@ -70,7 +70,7 @@ one canonical command source:
 
 - Option A: write main `action` as the selected EE pose command stream for replay;
 - Option B: teach replay runtimes and GUI validation to select an explicit
-  `action.ee_pose.<target>.base` column;
+  `action.ee_pose.<target>.world` column;
 - Option C: create a replay-ready derived dataset variant whose main `action`
   is EE pose while BOX state remains in `observation.state` / auxiliary columns.
 
@@ -146,7 +146,7 @@ The backend must remain authoritative.
 
 ### P0: Pick the canonical command stream for Thor exported replay
 
-- Decide whether replay consumes main `action` or `action.ee_pose.<target>.base`.
+- Decide whether replay consumes main `action` or `action.ee_pose.<target>.world`.
 - If using `action.ee_pose.*`, add a GUI/config selector for target stream
   (`left`, `right`, `head`, or task-specific default).
 - If using main `action`, export a replay-ready action vector with EE pose names

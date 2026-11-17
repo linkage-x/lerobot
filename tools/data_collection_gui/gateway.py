@@ -33,10 +33,13 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.data_collection_gui import fr3_payload_calibration as payload_cal
+from tools.data_collection_gui import rollout_runs
+from tools.data_collection_gui import training_runs
 from tools.fr3 import fr3_arms
 from tools.thor.gmsl2 import cart_state
 from tools.thor.gmsl2 import intrinsics_by_serial
 from tools.thor.gmsl2 import laser_tracker_session as lts
+from tools.thor.gmsl2 import pose_columns as pose_cols
 from tools.thor.gmsl2 import qc_verdict as qcv
 from tools.thor.gmsl2 import register_fr3_base
 from tools.thor.gmsl2 import tracker_live_geometry as tracker_geometry
@@ -592,6 +595,10 @@ class GatewayState:
     replay_tracker: Any = None
     log_dir: Path | None = None
     gateway_log_path: Path | None = None
+    # Training page backend (training_runs.TrainingManager), made on first use; it never takes state.lock.
+    training: Any = None
+    # Rollout page backend (rollout_runs.RolloutManager), made on first use; it never takes state.lock.
+    rollout: Any = None
     recorder_log_path: Path | None = None
     box_button_last_action_s: float = float("-inf")
     device_preview: dict[str, Any] = field(default_factory=dict)
@@ -2613,8 +2620,10 @@ def _processing_item_from_dataset(
             }.get(verdict.state, "pose_ready")
             message = str((qc or {}).get("reason") or (qc or {}).get("message") or "QC available")
             if verdict.state == qcv.PARTIAL:
+                total = (qc or {}).get("total_episodes")
+                passed = f"{total - len(verdict.excluded)}/{total}" if isinstance(total, int) else "?"
                 message = (
-                    f"QC passed {(qc or {}).get('passed_episodes', '?')}/{(qc or {}).get('total_episodes', '?')} episodes; "
+                    f"QC passed {passed} episodes; "
                     f"export leaves out episodes {_episode_list_text(verdict.excluded)}"
                 )
             elif verdict.state == qcv.STALE:
@@ -2639,8 +2648,15 @@ def _processing_item_from_dataset(
             "detectionSummary": detection_summary,
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
+            # From the verdict, not the stored list: it also holds the unreachable episodes a QC
+            # result from before 11-17 only warned about.
             "qcExcludedEpisodes": (
-                list(qc.get("excluded_episodes") or []) if status == "qc_partial" and isinstance(qc, dict) else []
+                [
+                    {"episode": ep, "checks": reason.removeprefix("QC: ").split(", ")}
+                    for ep, reason in sorted(verdict.excluded.items())
+                ]
+                if status == "qc_partial" and verdict is not None
+                else []
             ),
             "qcVerdict": (
                 {"state": verdict.state, "reason": verdict.reason} if verdict is not None else None
@@ -12969,20 +12985,27 @@ def _run_qc_checks(
         fps=int(info.get("fps") or 30),
     )
     if ik_evaluation["status"] != "skipped":
-        # Reachability belongs to a trajectory *and* an arm placed somewhere (its registered
-        # base), not to the recording: the export keeps the poses in the camera world they were
-        # recorded in, and deployment puts them in the driven arm's base through the edge live
-        # then. So it informs, and never fails a dataset or leaves an episode out of training:
-        # an arm not registered yet (the left arm since 11-03, a new station) would otherwise
-        # block every recording made there. Before an arm moves, real replay still needs its
-        # own per-episode MuJoCo validation; that gate does not read this.
+        # An episode the arm cannot reach where it stands stays out of training (11-17): a policy
+        # learns the motions it is shown, and one taught a motion the arm cannot make rolls out
+        # into the edge of its workspace. Only episodes IK named unreachable are left out, the
+        # rest of the dataset exports. An evaluation that could not judge episodes (no edge to
+        # any arm base, the verifier missing or failing) stays a warning, as before: that says
+        # nothing about the recording. Real replay still needs its own MuJoCo validation.
+        unreachable = qcv.ik_unreachable_episodes({"cubes": ik_evaluation["cubes"]})
+        if unreachable:
+            ik_status, ik_note = "fail", " (episodes the arm cannot reach stay out of the export)"
+        elif ik_evaluation["status"] == "fail":
+            ik_status, ik_note = "warn", " (reachability not judged per episode; the export does not wait on it)"
+        else:
+            ik_status, ik_note = ik_evaluation["status"], ""
         ik_check: dict[str, Any] = {
             "name": "fr3_ik_reachability",
-            "status": "warn" if ik_evaluation["status"] == "fail" else ik_evaluation["status"],
-            "message": ik_evaluation["message"]
-            + (" (reference for deployment; not part of the export decision)" if ik_evaluation["status"] == "fail" else ""),
+            "status": ik_status,
+            "message": ik_evaluation["message"] + ik_note,
             "details": {"cubes": ik_evaluation["cubes"]},
         }
+        if unreachable:
+            ik_check["episodes"] = sorted(unreachable)
         checks.append(ik_check)
 
     valid_rows = max(0, total_rows - invalid_rows)
@@ -13747,9 +13770,10 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 parquet = pq.ParquetFile(data_file)
                 column_names = parquet.schema_arrow.names
                 pose_columns = [
-                    f"{prefix}.ee_pose.{cube_name}.base"
-                    for prefix in ("observation", "action")
+                    f"{kind}.{cube_name}.{suffix}"
+                    for kind in (pose_cols.EE_STATE, pose_cols.EE_ACTION)
                     for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES
+                    for suffix in pose_cols.SUFFIXES
                 ]
                 wanted_columns = [
                     column
@@ -13939,9 +13963,8 @@ def _preferred_exported_ee_pose_cube(info: dict[str, Any]) -> str | None:
     if not isinstance(features, dict):
         return None
     for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
-        if (
-            f"observation.ee_pose.{cube_name}.base" in features
-            or f"action.ee_pose.{cube_name}.base" in features
+        if pose_cols.pose_key(features, pose_cols.EE_STATE, cube_name) or pose_cols.pose_key(
+            features, pose_cols.EE_ACTION, cube_name
         ):
             return cube_name
     return None
@@ -13970,9 +13993,11 @@ def _ee_pose_from_row(
     # left/right/head mixes different tracked objects into one impossible path.
     pose = None
     if exported_pose_cube is not None:
-        pose = _fixed_pose7_from_row(row, f"observation.ee_pose.{exported_pose_cube}.base")
-        if pose is None:
-            pose = _fixed_pose7_from_row(row, f"action.ee_pose.{exported_pose_cube}.base")
+        for kind in (pose_cols.EE_STATE, pose_cols.EE_ACTION):
+            key = pose_cols.pose_key(row, kind, exported_pose_cube)
+            pose = _fixed_pose7_from_row(row, key) if key else None
+            if pose is not None:
+                break
 
     # Legacy v3 datasets embed EE pose dimensions inside observation.state/action.
     if pose is None:
@@ -19776,11 +19801,7 @@ def _export_source_episode(state: GatewayState, dataset_root: Path, episode: int
         ),
         None,
     )
-    hands = sorted(
-        key.removeprefix("observation.ee_pose.").removesuffix(".base")
-        for key in (_load_dataset_info(dataset_root).get("features") or {})
-        if key.startswith("observation.ee_pose.") and key.endswith(".base")
-    )
+    hands = pose_cols.tracked_hands(_load_dataset_info(dataset_root).get("features") or {})
     problem = ""
     if source_root is None:
         problem = f"its recording {session} is not on this machine any more, so nothing vouches for its poses"
@@ -20731,6 +20752,166 @@ def _deployed_release(repo_root: Path) -> dict[str, Any] | None:
     return cached[1]
 
 
+def _training(state: GatewayState) -> training_runs.TrainingManager:
+    if state.training is None:
+        state.training = training_runs.TrainingManager(
+            state.repo_root,
+            exports_root=_task_exports_root(state),
+            datasets_root=state.datasets_root or state.repo_root / "outputs" / "datasets",
+            profile=state.profile,
+            sandbox=state.sandbox,
+            recorder_busy=lambda: state.process is not None and state.process.poll() is None,
+        )
+    return state.training
+
+
+def _training_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str, query: dict[str, list[str]]) -> bool:
+    """GET /api/training/*; True when handled. Outside state.lock (training_runs has its own)."""
+    if not path.startswith("/api/training/"):
+        return False
+    arg = lambda name, default="": (query.get(name, [default])[0] or default)  # noqa: E731
+    manager = _training(state)
+    try:
+        if path == "/api/training/status":
+            _json_response(handler, HTTPStatus.OK, manager.status())
+        elif path == "/api/training/exports":
+            _json_response(handler, HTTPStatus.OK, {"exports": manager.exports()})
+        elif path == "/api/training/log":
+            _json_response(handler, HTTPStatus.OK, {"lines": manager.log_tail(arg("job"))})
+        elif path == "/api/training/checkpoints":
+            _json_response(handler, HTTPStatus.OK, {"checkpoints": manager.checkpoints(arg("job"))})
+        elif path == "/api/training/crop":
+            _json_response(handler, HTTPStatus.OK, manager.crop_suggestion(arg("export"), arg("camera"), arg("hand", "right")))
+        elif path == "/api/training/frame.jpg":
+            crop = [int(v) for v in arg("crop").split(",")] if arg("crop") else None
+            data = manager.camera_frame(arg("export"), arg("camera"), crop, float(arg("at", "0.5")))
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/jpeg")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(data)
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+    except (training_runs.TrainingError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
+def _training_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """POST /api/training/*; True when handled. Outside state.lock (training_runs has its own)."""
+    if not path.startswith("/api/training/"):
+        return False
+    manager = _training(state)
+    try:
+        body = _read_json_body(handler)
+        if path == "/api/training/check":
+            payload = {"check": manager.check([str(n) for n in body.get("exports") or []], str(body.get("hand") or ""))}
+        elif path == "/api/training/hosts/add":
+            payload = {"host": vars(manager.add_host(str(body.get("label") or ""), str(body.get("sshTarget") or ""),
+                                                     str(body.get("repoDir") or ""), str(body.get("python") or "")))}
+        elif path == "/api/training/hosts/remove":
+            manager.remove_host(str(body.get("hostId") or ""))
+            payload = {}
+        elif path == "/api/training/probe":
+            payload = manager.probe(str(body.get("hostId") or "local"))
+        elif path == "/api/training/start":
+            payload = {"run": vars(manager.start(body))}
+            state.log("info", f"Training run {payload['run']['job']} started on {payload['run']['hostLabel']}")
+        elif path == "/api/training/stop":
+            payload = {"message": manager.stop(str(body.get("job") or ""))}
+        elif path == "/api/training/resume":
+            steps = body.get("steps")
+            payload = {"run": vars(manager.resume(str(body.get("job") or ""), int(steps) if steps else None))}
+        elif path == "/api/training/fetch":
+            payload = {"run": vars(manager.fetch(str(body.get("job") or "")))}
+        elif path == "/api/training/delete":
+            manager.delete_record(str(body.get("job") or ""))
+            payload = {}
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+            return True
+        _json_response(handler, HTTPStatus.OK, {"ok": True, **payload})
+    except (training_runs.TrainingError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
+def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
+    if state.rollout is None:
+        state.rollout = rollout_runs.RolloutManager(
+            state.repo_root,
+            exports_root=_task_exports_root(state),
+            profile=state.profile,
+            sandbox=state.sandbox,
+            recorder_busy=lambda: state.process is not None and state.process.poll() is None,
+            gateway_url=f"http://127.0.0.1:{port}",
+        )
+    return state.rollout
+
+
+def _rollout_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str, query: dict[str, list[str]]) -> bool:
+    """GET /api/rollout/*; True when handled. Outside state.lock."""
+    if not path.startswith("/api/rollout/"):
+        return False
+    arg = lambda name, default="": (query.get(name, [default])[0] or default)  # noqa: E731
+    manager = _rollout(state, handler.server.server_address[1])
+    try:
+        if path == "/api/rollout/status":
+            _json_response(handler, HTTPStatus.OK, manager.status())
+        elif path == "/api/rollout/checkpoints":
+            _json_response(handler, HTTPStatus.OK, {"checkpoints": manager.checkpoints()})
+        elif path == "/api/rollout/results":
+            _json_response(handler, HTTPStatus.OK, {"results": manager.results()})
+        elif path == "/api/rollout/result":
+            _json_response(handler, HTTPStatus.OK, manager.result(arg("path")))
+        elif path == "/api/rollout/log":
+            _json_response(handler, HTTPStatus.OK, {"lines": manager.log_tail(arg("job"))})
+        elif path == "/api/rollout/preview-latest":
+            _json_response(handler, HTTPStatus.OK, manager.preview_latest(arg("record")))
+        elif path == "/api/rollout/preview.jpg":
+            data = manager.preview_image(arg("record"))
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/jpeg")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(data)
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+    except (rollout_runs.RolloutError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
+def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """POST /api/rollout/*; True when handled. Outside state.lock."""
+    if not path.startswith("/api/rollout/"):
+        return False
+    manager = _rollout(state, handler.server.server_address[1])
+    try:
+        body = _read_json_body(handler)
+        if path == "/api/rollout/offline":
+            job = manager.start_offline(str(body.get("checkpoint") or ""), str(body.get("export") or ""),
+                                        [int(e) for e in body.get("episodes") or []], int(body.get("stride") or 15))
+        elif path == "/api/rollout/preview":
+            job = manager.start_preview(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
+                                        float(body.get("rate") or 2.0), bool(body.get("readJoints")))
+            state.log("info", f"Rollout preview {job.id} started (arm still, no motion)")
+        elif path == "/api/rollout/replay":
+            job = manager.start_replay(str(body.get("record") or ""))
+        elif path == "/api/rollout/stop":
+            _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
+            return True
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown {path}"})
+            return True
+        _json_response(handler, HTTPStatus.OK, {"ok": True, "job": vars(job)})
+    except (rollout_runs.RolloutError, ValueError, OSError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+    return True
+
+
 class DataCollectionGuiHandler(BaseHTTPRequestHandler):
     server: "DataCollectionGuiServer"
 
@@ -20744,6 +20925,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         refusal = _sandbox_hardware_refusal(self.server.state, "GET", path)
         if refusal is not None:
             _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
+        if _training_get(self, self.server.state, path, query):
+            return
+        if _rollout_get(self, self.server.state, path, query):
             return
         if path == "/api/teleop/camera.jpg":
             if self.server.state.profile != "workstation":
@@ -21159,7 +21344,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 {"error": f"{path} is unavailable in the workstation profile"},
             )
             return
+        if _training_post(self, self.server.state, path):
+            return
+        if _rollout_post(self, self.server.state, path):
+            return
         if path == "/api/handheld/record/connect":
+            if self.server.state.profile == "thor" and _training(self.server.state).local_run_active():
+                # On a Thor the GPU that trains also serves the cameras (training_runs).
+                _json_response(self, HTTPStatus.CONFLICT, {
+                    "error": "a training run is using this Thor's GPU; stop it on the Training page (or wait "
+                    "for it) before connecting the recorder"
+                })
+                return
             # Free the cameras before the recorder opens them: live Device
             # Manager previews hold Argus sessions on the same sensor-ids, and
             # leaving them up makes the recorder's nvarguscamerasrc open hang.

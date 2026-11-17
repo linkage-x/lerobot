@@ -108,3 +108,80 @@ def test_read_verdict_uses_the_active_versions_qc(tmp_path):
     meta["versions"]["v2"]["qc"] = _qc(session, "pass")
     (session / "meta" / "processing.json").write_text(json.dumps(meta), encoding="utf-8")
     assert qcv.read_verdict(session).state == qcv.PASS
+
+
+def _ik_check(unreachable, *, legacy=False) -> dict:
+    episodes = [{"episodeIndex": ep, "status": "unreachable"} for ep in unreachable]
+    cube = {"cube": "right", "status": "fail" if unreachable else "pass", "episodes": episodes}
+    if not legacy:
+        cube["unreachableEpisodeIndices"] = list(unreachable)
+    return {"name": "fr3_ik_reachability", "status": "warn", "details": {"cubes": [cube]}}
+
+
+def test_a_qc_warn_from_before_11_17_still_leaves_unreachable_episodes_out(tmp_path):
+    # Until 11-17 an episode out of the arm's reach was only a warning; the verdict reads it from
+    # the IK check so no session has to re-run QC for the new rule.
+    session = _session(tmp_path, episodes=(0, 1, 2))
+    verdict = qcv.verdict_from_qc(session, _qc(session, "warn", checks=[_ik_check([2])], total_episodes=3))
+    assert verdict.state == qcv.PARTIAL
+    assert verdict.allows(0) and verdict.allows(1) and not verdict.allows(2)
+    assert verdict.excluded == {2: "QC: fr3_ik_reachability"}
+
+    # older reports name the episodes only in their per-episode rows
+    legacy = qcv.verdict_from_qc(session, _qc(session, "warn", checks=[_ik_check([1], legacy=True)]))
+    assert legacy.excluded == {1: "QC: fr3_ik_reachability"}
+
+    # every episode out of reach leaves nothing to export
+    none_left = qcv.verdict_from_qc(session, _qc(session, "warn", checks=[_ik_check([0, 1, 2])], total_episodes=3))
+    assert none_left.state == qcv.FAIL
+
+
+def test_an_ik_check_that_names_no_episode_keeps_the_session_exportable(tmp_path):
+    session = _session(tmp_path)
+    refused = {"name": "fr3_ik_reachability", "status": "warn",
+               "details": {"cubes": [{"cube": "left", "status": "fail", "message": "no edge"}]}}
+    assert qcv.verdict_from_qc(session, _qc(session, "warn", checks=[refused])).state == qcv.PASS
+    assert qcv.verdict_from_qc(session, _qc(session, "pass", checks=[_ik_check([])])).state == qcv.PASS
+
+
+def test_a_partial_qc_and_unreachable_episodes_add_up(tmp_path):
+    session = _session(tmp_path, episodes=(0, 1, 2))
+    qc = _qc(
+        session,
+        "partial",
+        excluded_episodes=[{"episode": 0, "checks": ["quat_norm"]}],
+        checks=[_ik_check([0, 2])],
+        total_episodes=3,
+    )
+    verdict = qcv.verdict_from_qc(session, qc)
+    assert verdict.state == qcv.PARTIAL
+    assert verdict.excluded == {0: "QC: quat_norm", 2: "QC: fr3_ik_reachability"}
+
+
+def test_watching_an_episode_in_replay_leaves_qc_current(tmp_path):
+    # 11-17: Replay's browser copy of each video (cam_XX.mp4 beside cam_XX.mkv) made the QC of
+    # thor_gmsl2_9ch_v1_20261115_170638 read as out of date the moment episode 2 was opened.
+    session = _session(tmp_path)
+    ep = session / "episodes" / "episode_000001"
+    (ep / "cam_00.mkv").write_bytes(b"recorded")
+    qc = _qc(session, "pass")
+
+    (ep / ".cam_00.4242.tmp.mp4").write_bytes(b"half")
+    assert qcv.verdict_from_qc(session, qc).state == qcv.PASS
+    (ep / ".cam_00.4242.tmp.mp4").rename(ep / "cam_00.mp4")
+    assert qcv.verdict_from_qc(session, qc).state == qcv.PASS
+
+    # an mp4 that is the recording itself (no mkv beside it) is still data
+    (ep / "cam_01.mp4").write_bytes(b"recorded as mp4")
+    assert qcv.verdict_from_qc(session, qc).state == qcv.STALE
+
+
+def test_a_qc_stamped_before_11_17_is_checked_the_old_way(tmp_path):
+    session = _session(tmp_path)
+    legacy = {"status": "pass", "summary": "pass", "data_fingerprint": qcv.data_fingerprint(session, "qcfp1")}
+    assert legacy["data_fingerprint"].startswith("qcfp1:")
+    assert qcv.verdict_from_qc(session, legacy).state == qcv.PASS
+
+    (session / "episodes" / "episode_000000" / "cam_00.mp4").write_bytes(b"replay copy")
+    assert qcv.verdict_from_qc(session, legacy).state == qcv.STALE  # the old stamp counted it
+    assert qcv.data_fingerprint(session).startswith("qcfp2:")
