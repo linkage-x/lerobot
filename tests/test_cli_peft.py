@@ -233,3 +233,22 @@ def test_peft_record_loads_policy(policy_type, tmp_path):
         )
 
         assert isinstance(loaded_policy, PeftModel)
+
+
+@require_package("peft")
+def test_peft_alpha_maps_to_lora_alpha():
+    """PEFT's own LoRA alpha is a fixed 8, so r=32 alone trains at a scaling of 0.25; --peft.alpha sets it."""
+    import dataclasses
+
+    from peft import PeftType
+
+    from lerobot.configs.default import PeftConfig
+    from lerobot.policies.pretrained import PreTrainedPolicy
+
+    def overrides(cfg):
+        return PreTrainedPolicy._preprocess_peft_cli_overrides(None, dataclasses.asdict(cfg), PeftType.LORA)
+
+    assert overrides(PeftConfig(r=32, alpha=32))["lora_alpha"] == 32
+    assert "lora_alpha" not in overrides(PeftConfig(r=32)) and "alpha" not in overrides(PeftConfig(r=32))
+    with pytest.raises(ValueError, match="alpha"):
+        PreTrainedPolicy._preprocess_peft_cli_overrides(None, dataclasses.asdict(PeftConfig(alpha=4)), PeftType.IA3)

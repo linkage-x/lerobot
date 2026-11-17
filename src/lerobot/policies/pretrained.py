@@ -366,6 +366,15 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Remove method_type as it's handled separately
         cli_overrides.pop("method_type", None)
 
+        # Handle alpha specially: it is the scaling numerator every rank-decomposition method has,
+        # but each spells it differently.
+        alpha = cli_overrides.pop("alpha", None)
+        if alpha is not None:
+            if peft_method_type == PeftType.LORA:
+                cli_overrides["lora_alpha"] = alpha
+            else:
+                raise ValueError(f"`alpha` is not supported for PEFT method {peft_method_type}.")
+
         # Handle init_type specially based on PEFT method
         init_type = cli_overrides.pop("init_type", None)
         if init_type is not None:

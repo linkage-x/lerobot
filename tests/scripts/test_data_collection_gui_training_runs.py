@@ -103,8 +103,9 @@ def test_a_local_run_follows_its_log_and_finishes_with_the_reload_check(tmp_path
                 break
             threading.Event().wait(0.02)
         cmd, kw = launched[0]
-        assert cmd[1] == tr.TRAIN_SCRIPT and kw["start_new_session"] and kw["stdin"] is subprocess.DEVNULL
-        assert "cam_06:140,220,1180,1000" in cmd and "--hand" in cmd
+        assert cmd[:2] == ["bash", "-c"] and kw["start_new_session"] and kw["stdin"] is subprocess.DEVNULL
+        assert tr.TRAIN_SCRIPT in cmd[2] and "cam_06:140,220,1180,1000" in cmd[2] and "--hand" in cmd[2]
+        assert "--policy act" in cmd[2] and "accelerate" not in cmd[2] and "CUDA_VISIBLE_DEVICES" not in cmd[2]
         # The trainer reports through its log; the job name is in the sleeper's cmdline only in real runs,
         # so the pid check reads "not this job" and the run is finished from the log.
         with open(rec.logPath, "a", encoding="utf-8") as log:
@@ -189,3 +190,134 @@ def test_connect_is_refused_on_a_thor_while_a_local_run_trains(tmp_path, monkeyp
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_registry_hosts_are_listed_with_their_port_and_cannot_be_removed_from_the_page(tmp_path):
+    manager = _manager(tmp_path)
+    hosts_dir = manager.repo_root / tr.HOSTS_DIR
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "a100.json").write_text(json.dumps({
+        "label": "a100", "user": "hph", "address": "10.0.0.9", "port": 2200, "hostname": "A100",
+        "repo_dir": "/data/hph/fr3_train", "python": ".venv/bin/python", "pythonpath_prefix": "/home/hph/shim",
+    }), encoding="utf-8")
+    (hosts_dir / "bad.json").write_text(json.dumps({"user": "hph", "address": "x; id", "repo_dir": "/data/x"}))
+    hosts = {h.id: h for h in manager.hosts()}
+    assert set(hosts) == {"local", "a100"}
+    assert hosts["a100"].port == 2200 and hosts["a100"].source == "registry"
+    assert manager._pythonpath(hosts["a100"]) == "/home/hph/shim:src:."
+    with pytest.raises(tr.TrainingError, match="training_hosts"):
+        manager.remove_host("a100")
+    page = manager.add_host("4060", "hph@10.0.0.3:2222", "/home/hph/fr3_train", "")
+    assert page.port == 2222 and {h.id for h in manager.hosts()} == {"local", "a100", page.id}
+
+
+def test_a_git_ignored_local_registry_file_keeps_its_plain_id(tmp_path):
+    # A machine whose address must not be published (this repository is public) lives in
+    # <id>.local.json, which .gitignore keeps out of git; runs started on it still say hostId <id>.
+    manager = _manager(tmp_path)
+    hosts_dir = manager.repo_root / tr.HOSTS_DIR
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "dc-a100.local.json").write_text(json.dumps({
+        "label": "dc", "user": "hph", "address": "10.0.0.9", "port": 2200, "repo_dir": "/data/hph/fr3_train",
+    }), encoding="utf-8")
+    hosts = {h.id: h for h in manager.hosts()}
+    assert hosts["dc-a100"].source == "registry" and hosts["dc-a100"].port == 2200
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "run/training_hosts/dc-a100.local.json"],
+        cwd=Path(__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
+    )
+    assert ignored.returncode == 0, ".gitignore must keep run/training_hosts/*.local.json out of git"
+
+
+def test_several_gpus_prepare_once_then_train_under_accelerate(tmp_path):
+    manager = _manager(tmp_path)
+    host = tr.TrainingHost("a100", "a100", "remote", "hph@10.0.0.9", "/data/fr3_train", ".venv/bin/python",
+                           pythonpathPrefix="/home/hph/shim")
+    one = manager._shell(host, [tr.TRAIN_SCRIPT, "--job-name", "j1"], "j1", [3])
+    assert "CUDA_VISIBLE_DEVICES=3" in one and "accelerate" not in one and "--prepare-only" not in one
+    assert "PYTHONPATH=/home/hph/shim:src:." in one
+    many = manager._shell(host, [tr.TRAIN_SCRIPT, "--job-name", "j1"], "j1", [0, 1, 2, 3])
+    prepare, _, launch = many.partition("&&")
+    assert "--prepare-only" in prepare and "accelerate" not in prepare
+    assert "accelerate.commands.launch --num_processes 4" in launch
+    assert "--start outputs/training/runs/j1" in launch and "CUDA_VISIBLE_DEVICES=0,1,2,3" in many
+    resume = manager._shell(host, [tr.TRAIN_SCRIPT, "--resume", "outputs/training/runs/j1"], "j1", [0, 1])
+    assert "--prepare-only" not in resume and "--num_processes 2" in resume and "--resume outputs/training/runs/j1" in resume
+
+
+def test_pi05_needs_a_task_and_passes_its_settings(tmp_path):
+    _export(tmp_path, "good")
+    manager = _manager(tmp_path)
+    host = manager.host("local")
+    base = {"exports": ["good"], "hand": "right", "cameras": [{"name": "cam_10"}], "policy": "pi05"}
+    with pytest.raises(tr.TrainingError, match="task"):
+        manager._train_args(base, ["good"], "j", host)
+    args = manager._train_args({**base, "task": "  pick   up the part ", "loraR": 16, "holdoutEpisodes": [4, 1]},
+                               ["good"], "j", host)
+    assert args[args.index("--policy") + 1] == "pi05" and args[args.index("--task") + 1] == "pick up the part"
+    assert args[args.index("--lora-r") + 1] == "16" and args[args.index("--holdout-episodes") + 1] == "1,4"
+    with pytest.raises(tr.TrainingError, match="policy"):
+        manager._train_args({**base, "policy": "diffusion"}, ["good"], "j", host)
+
+
+def test_gpu_status_lists_every_gpu_with_whose_processes_run_on_it():
+    text = (
+        "0, GPU-a, NVIDIA A100-SXM4-80GB, 1200, 81920, 35\n"
+        "1, GPU-b, NVIDIA A100-SXM4-80GB, 0, 81920, 0\n"
+        "--apps--\n"
+        "GPU-a, 4242, 1180\n"
+        "--ps--\n"
+        "  4242 hph      python tools/fr3/train_relative_tcp.py --job-name pi05_v1\n"
+        "  1 root /sbin/init\n"
+    )
+    gpus = tr.parse_gpu_status(text)
+    assert [g["index"] for g in gpus] == [0, 1] and gpus[0]["utilPct"] == 35 and gpus[1]["processes"] == []
+    proc = gpus[0]["processes"][0]
+    assert proc["pid"] == 4242 and proc["user"] == "hph" and "pi05_v1" in proc["command"] and proc["memMiB"] == 1180
+
+
+def test_remote_poll_and_stop_work_where_dev_null_is_not_writable(tmp_path, monkeypatch):
+    """On a100-19 /dev/null is a read-only file: a `2>/dev/null` made a live trainer look dead and Stop a no-op."""
+    manager = _manager(tmp_path)
+    hosts_dir = manager.repo_root / tr.HOSTS_DIR
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "a100.json").write_text(json.dumps({
+        "label": "a100", "user": "hph", "address": "10.0.0.9", "hostname": "A100", "repo_dir": "/data/fr3_train",
+        "python": ".venv/bin/python",
+    }), encoding="utf-8")
+    commands: list[str] = []
+
+    def ssh(host, command, timeout=30.0):  # the remote shell, run here
+        commands.append(command)
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+
+    monkeypatch.setattr(manager, "_ssh", ssh)
+    monkeypatch.setattr(manager, "_run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
+    trainer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "remote_job"],
+                               start_new_session=True, stdin=subprocess.DEVNULL)
+    try:
+        assert isinstance(trainer.pid, int) and trainer.pid > 1
+        log = tmp_path / "remote_job.log"
+        log.write_text("", encoding="utf-8")
+        rec = tr.RunRecord("remote_job", "a100", "a100", "remote", state="running", pid=trainer.pid, logPath=str(log))
+        manager.runs[rec.job] = rec
+        assert manager._poll_remote(rec) is False and rec.state == "running"
+        assert "stopped" in manager.stop("remote_job")
+        assert trainer.wait(timeout=10) is not None
+    finally:
+        if trainer.poll() is None:
+            trainer.kill()
+    assert commands and not any("/dev/null" in c for c in commands)
+
+
+def test_pi05_training_is_refused_on_a_gpu_too_small_for_it(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    host = manager.host("local")
+    small = {"state": "ok", "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 4060", "memUsedMiB": 0,
+                                      "memTotalMiB": 8188, "utilPct": 0, "processes": []}]}
+    monkeypatch.setattr(manager, "gpu_status", lambda host_id, wait=False: small)
+    manager._gpus[host.id] = small
+    with pytest.raises(tr.TrainingError, match=r"pi05 cannot run on .*RTX 4060.*8\.8 GiB"):
+        manager._gpus_param({"policy": "pi05", "gpus": [0]}, host)
+    assert manager._gpus_param({"policy": "act", "gpus": [0]}, host) == [0]

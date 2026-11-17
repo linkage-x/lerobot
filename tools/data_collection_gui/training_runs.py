@@ -5,17 +5,21 @@ Kept out of gateway.py. Nothing here takes ``state.lock``: the gateway calls in 
 run outlives any one request (and any one gateway: runs are detached processes, and their state is
 re-read from their log and pid on every status call).
 
-A run trains with tools/fr3/train_relative_tcp.py, either here or on a remote machine over ssh:
+A run trains with tools/fr3/train_relative_tcp.py (ACT or pi0.5), here or on a remote machine over ssh, on
+the GPUs picked for it (several: the run is prepared once, then trained under ``accelerate launch``):
 
 * **here** ("local"): the gateway's own tree and outputs/exports. On a Thor the GPU also serves the
   cameras, so a local run is refused while the recorder is connected, and the gateway refuses Connect
   while a local run trains (:meth:`TrainingManager.local_run_active`).
-* **remote**: ``user@host`` and a directory used only for training there. Before each start the code this
+* **remote**: a machine in run/training_hosts/ (or one added on the page): ``user@host[:port]`` and a
+  directory used only for training there; its hostname is checked before anything is synced. Before each start the code this
   gateway runs is copied into it (rsync --delete; the directory is marked on first use and a directory
   that is not marked is never written into) and so are the chosen exports. Checkpoints stay there until
   **Fetch** copies the run back (without optimiser state) so Rollout here can load it.
 
 Every run has a record in outputs/training/gui_runs.json and a log in outputs/training/logs/<job>.log.
+The page also shows every machine's GPUs (nvidia-smi: memory, load, whose processes), refreshed in the
+background so a status call never waits on ssh.
 """
 
 from __future__ import annotations
@@ -37,6 +41,15 @@ from pathlib import Path
 from typing import Any
 
 TRAIN_SCRIPT = "tools/fr3/train_relative_tcp.py"
+HOSTS_DIR = Path("run/training_hosts")
+POLICIES = ("act", "pi05")
+GPU_TTL_S = 15.0
+GPU_QUERY = (
+    "nvidia-smi --query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu "
+    "--format=csv,noheader,nounits && echo '--apps--' && "
+    "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits && "
+    "echo '--ps--' && ps -eo pid=,user=,args= | cut -c1-300"
+)
 PROGRESS_PREFIX = "FR3_PROGRESS "
 SSH_OPTS = ("-o", "ConnectTimeout=8", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new")
 SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")
@@ -81,6 +94,11 @@ class TrainingHost:
     sshTarget: str = ""
     repoDir: str = ""
     python: str = ""
+    port: int = 22
+    hostname: str = ""  # checked over ssh before a sync; empty: not checked (hosts added on the page)
+    pythonpathPrefix: str = ""
+    note: str = ""
+    source: str = "page"  # local | registry (run/training_hosts) | page (added on the page)
 
 
 @dataclass
@@ -123,6 +141,52 @@ def validate_remote_dir(path: str) -> str:
     if path in ("/", "/home", "/root", "/tmp"):
         raise TrainingError(f"{path} cannot be a training directory")
     return path
+
+
+def _validate_python(python: str) -> str:
+    python = (python or "").strip() or ".venv/bin/python"
+    if any(ch in python for ch in "'\"\\$`\n ;&|"):
+        raise TrainingError("python path must not contain shell characters")
+    return python
+
+
+def parse_gpu_status(text: str) -> list[dict[str, Any]]:
+    """GPU_QUERY's output -> one row per GPU with the processes on it (pid, user, memory, command)."""
+    gpu_part, _, rest = text.partition("--apps--")
+    apps_part, _, ps_part = rest.partition("--ps--")
+    ps: dict[int, tuple[str, str]] = {}
+    for line in ps_part.splitlines():
+        bits = line.split(None, 2)
+        if len(bits) >= 2 and bits[0].isdigit():
+            ps[int(bits[0])] = (bits[1], bits[2] if len(bits) > 2 else "")
+    gpus, by_uuid = [], {}
+    for line in gpu_part.splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) < 6 or not cols[0].isdigit():
+            continue
+
+        def num(v: str) -> float | None:
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
+        row = {"index": int(cols[0]), "name": cols[2], "memUsedMiB": num(cols[3]), "memTotalMiB": num(cols[4]),
+               "utilPct": num(cols[5]), "processes": []}
+        gpus.append(row)
+        by_uuid[cols[1]] = row
+    for line in apps_part.splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) < 3 or cols[0] not in by_uuid or not cols[1].isdigit():
+            continue
+        pid = int(cols[1])
+        user, command = ps.get(pid, ("?", ""))
+        try:
+            mem = float(cols[2])
+        except ValueError:
+            mem = None
+        by_uuid[cols[0]]["processes"].append({"pid": pid, "user": user, "memMiB": mem, "command": command[:160]})
+    return gpus
 
 
 def suggest_crop(corner_points: list[tuple[float, float]], size: tuple[int, int], *, margin: float = 0.2,
@@ -182,6 +246,8 @@ class TrainingManager:
         self.lock = threading.Lock()
         self.runs: dict[str, RunRecord] = {}
         self._remote_polled: dict[str, float] = {}
+        self._gpus: dict[str, dict[str, Any]] = {}
+        self._gpu_refreshing: set[str] = set()
         self._load()
 
     # ------------------------------------------------------------ storage ---
@@ -220,17 +286,44 @@ class TrainingManager:
 
     def hosts(self) -> list[TrainingHost]:
         label = "This machine" + (" (Thor: refused while the recorder is connected)" if self.profile == "thor" else "")
-        hosts = [TrainingHost("local", label, "local", python=self._local_python())]
+        hosts = [TrainingHost("local", label, "local", python=self._local_python(), source="local")]
+        hosts += self._registry_hosts()
         try:
             raw = json.loads(self._hosts_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raw = []
+        taken = {h.id for h in hosts}
         for item in raw if isinstance(raw, list) else []:
             try:
-                hosts.append(TrainingHost(**item))
+                host = TrainingHost(**item)
             except TypeError:
                 continue
+            if host.id not in taken:
+                hosts.append(host)
         return hosts
+
+    def _registry_hosts(self) -> list[TrainingHost]:
+        """run/training_hosts/<id>.json (or a git-ignored <id>.local.json): the machines this lab trains on."""
+        out = []
+        for path in sorted((self.repo_root / HOSTS_DIR).glob("*.json")):
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+                target = validate_ssh_target(f"{item['user']}@{item['address']}")
+                port = int(item.get("port") or 22)
+                repo_dir = validate_remote_dir(str(item["repo_dir"]))
+                python = _validate_python(str(item.get("python") or ".venv/bin/python"))
+                prefix = str(item.get("pythonpath_prefix") or "")
+                if prefix:
+                    prefix = validate_remote_dir(prefix)
+            except (OSError, ValueError, KeyError, TrainingError):
+                continue
+            out.append(TrainingHost(
+                id=path.stem.removesuffix(".local"), label=str(item.get("label") or path.stem)[:60], kind="remote",
+                sshTarget=target,
+                repoDir=repo_dir, python=python, port=port, hostname=str(item.get("hostname") or ""),
+                pythonpathPrefix=prefix, note=str(item.get("note") or ""), source="registry",
+            ))
+        return out
 
     def host(self, host_id: str) -> TrainingHost:
         for host in self.hosts():
@@ -239,12 +332,13 @@ class TrainingManager:
         raise TrainingError(f"no training host {host_id!r}")
 
     def add_host(self, label: str, ssh_target: str, repo_dir: str, python: str) -> TrainingHost:
-        target = validate_ssh_target(ssh_target)
+        target, _, port = (ssh_target or "").strip().partition(":")
+        target = validate_ssh_target(target)
+        port = int(port) if port.isdigit() else 22
         repo_dir = validate_remote_dir(repo_dir)
-        python = (python or "").strip() or ".venv/bin/python"
-        if any(ch in python for ch in "'\"\\$`\n ;&|"):
-            raise TrainingError("python path must not contain shell characters")
+        python = _validate_python(python)
         host = TrainingHost(
+            port=port,
             id=re.sub(r"[^A-Za-z0-9]+", "-", f"{target}-{repo_dir}").strip("-").lower(),
             label=(label or target).strip()[:60],
             kind="remote",
@@ -252,19 +346,26 @@ class TrainingManager:
             repoDir=repo_dir,
             python=python,
         )
-        remotes = [h for h in self.hosts() if h.kind == "remote" and h.id != host.id] + [host]
+        remotes = [h for h in self.hosts() if h.source == "page" and h.id != host.id] + [host]
         self.root.mkdir(parents=True, exist_ok=True)
         self._hosts_file.write_text(json.dumps([asdict(h) for h in remotes], indent=2), encoding="utf-8")
         return host
 
     def remove_host(self, host_id: str) -> None:
-        remotes = [h for h in self.hosts() if h.kind == "remote" and h.id != host_id]
+        if any(h.id == host_id and h.source == "registry" for h in self.hosts()):
+            raise TrainingError(f"{host_id} is listed in {HOSTS_DIR}/; remove it there")
+        remotes = [h for h in self.hosts() if h.source == "page" and h.id != host_id]
         self._hosts_file.write_text(json.dumps([asdict(h) for h in remotes], indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _ssh_e(host: TrainingHost) -> str:
+        """The ``rsync -e`` of a host."""
+        return "ssh " + " ".join(SSH_OPTS) + f" -p {int(host.port)}"
 
     def _ssh(self, host: TrainingHost, command: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
         try:
             return self._run(
-                ["ssh", *SSH_OPTS, host.sshTarget, command],
+                ["ssh", *SSH_OPTS, "-p", str(int(host.port)), host.sshTarget, command],
                 capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
@@ -280,7 +381,7 @@ class TrainingManager:
             result = self._ssh(
                 host,
                 f"mkdir -p {shlex.quote(host.repoDir)} && cd {shlex.quote(host.repoDir)} && "
-                f"PYTHONPATH=src:. {shlex.quote(host.python)} -c {shlex.quote(PROBE_SNIPPET)}",
+                f"PYTHONPATH={shlex.quote(self._pythonpath(host))} {shlex.quote(host.python)} -c {shlex.quote(PROBE_SNIPPET)}",
                 timeout=120,
             )
         line = next((ln for ln in (result.stdout or "").splitlines() if ln.startswith("PROBE ")), "")
@@ -290,6 +391,50 @@ class TrainingManager:
         data = json.loads(line[6:])
         ready = bool(data.get("cuda")) and data.get("lerobot") and data.get("ffmpeg") and (data.get("torchcodec") or data.get("av"))
         return {"ok": True, "host": host.id, "ready": bool(ready), **data}
+
+    @staticmethod
+    def _pythonpath(host: TrainingHost) -> str:
+        return f"{host.pythonpathPrefix}:src:." if host.pythonpathPrefix else "src:."
+
+    # --------------------------------------------------------------- GPUs ---
+    def gpu_status(self, host_id: str, *, wait: bool = False) -> dict[str, Any]:
+        """The last GPU reading of a host; a stale one is refreshed in the background (or now, ``wait``)."""
+        entry = self._gpus.get(host_id)
+        stale = entry is None or time.monotonic() - entry.get("_at", 0.0) > GPU_TTL_S
+        if stale and wait:
+            self._refresh_gpus(host_id)
+            entry = self._gpus.get(host_id)
+        elif stale and host_id not in self._gpu_refreshing:
+            self._gpu_refreshing.add(host_id)
+            threading.Thread(target=self._refresh_gpus, args=(host_id,), daemon=True).start()
+        if entry is None:
+            return {"state": "probing"}
+        return {k: v for k, v in entry.items() if not k.startswith("_")}
+
+    def _refresh_gpus(self, host_id: str) -> None:
+        try:
+            host = self.host(host_id)
+            if host.kind == "local":
+                result = self._run(["bash", "-c", GPU_QUERY], capture_output=True, text=True, timeout=20,
+                                   stdin=subprocess.DEVNULL)
+            else:
+                result = self._ssh(host, GPU_QUERY, timeout=20)
+            gpus = parse_gpu_status(result.stdout or "")
+            if result.returncode != 0 and not gpus:
+                detail = (result.stderr or result.stdout or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+                entry = {"state": "unreachable", "error": detail[0][:200]}
+            else:
+                jobs = {r.job for r in self.runs.values() if r.hostId == host_id and r.state in ACTIVE_STATES}
+                for gpu in gpus:
+                    for proc in gpu["processes"]:
+                        proc["job"] = next((j for j in jobs if j in proc["command"]), "")
+                entry = {"state": "ok", "gpus": gpus}
+        except Exception as exc:  # noqa: BLE001 -- shown on the page
+            entry = {"state": "unreachable", "error": str(exc)[:200]}
+        entry["probedAt"] = _now()
+        entry["_at"] = time.monotonic()
+        self._gpus[host_id] = entry
+        self._gpu_refreshing.discard(host_id)
 
     # ------------------------------------------------------------ exports ---
     def exports(self) -> list[dict[str, Any]]:
@@ -437,6 +582,7 @@ class TrainingManager:
         if host.kind == "local":
             self._check_local_allowed()
         args = self._train_args(params, exports if host.kind == "remote" else [str(r) for r in roots], job, host)
+        params = {**params, "gpus": self._gpus_param(params, host)}
         rec = RunRecord(job=job, hostId=host.id, hostLabel=host.label, kind=host.kind,
                         state="syncing" if host.kind == "remote" else "starting",
                         startedAt=_now(), params=params, exports=exports,
@@ -447,6 +593,56 @@ class TrainingManager:
             self._save()
         threading.Thread(target=self._launch, args=(rec, host, roots, args), daemon=True).start()
         return rec
+
+    def _gpus_param(self, params: dict[str, Any], host: TrainingHost) -> list[int]:
+        raw = params.get("gpus")
+        if raw in (None, [], ""):
+            return [] if host.kind == "local" else [0]
+        try:
+            gpus = sorted({int(g) for g in raw})
+        except (TypeError, ValueError):
+            raise TrainingError("gpus: a list of GPU indices") from None
+        known = [g["index"] for g in (self._gpus.get(host.id) or {}).get("gpus") or []]
+        bad = [g for g in gpus if g < 0 or (known and g not in known)]
+        if bad:
+            raise TrainingError(f"{host.label} has no GPU {bad} (it has {known or 'unknown'})")
+        self._check_gpus_fit(params, host, gpus)
+        return gpus
+
+    def _check_gpus_fit(self, params: dict[str, Any], host: TrainingHost, gpus: list[int]) -> None:
+        """pi0.5 on a GPU that cannot hold it (the 8 GB RTX 4060) is refused here, with the reason."""
+        from tools.fr3 import relative_tcp_policy as rtp
+
+        policy = str(params.get("policy") or "act")
+        if policy not in rtp.NOISE_POLICIES:
+            return
+        rows = self.gpu_status(host.id, wait=True).get("gpus") or []
+        for row in rows:
+            if (gpus and row["index"] not in gpus) or row.get("memTotalMiB") is None:
+                continue
+            reason = rtp.gpu_too_small(policy, f"{host.label} GPU {row['index']} ({row['name']})",
+                                       row["memTotalMiB"] / 1024)
+            if reason:
+                raise TrainingError(reason)
+
+    def _shell(self, host: TrainingHost, args: list[str], job: str, gpus: list[int]) -> str:
+        """The bash script a run is: the trainer on one GPU, or prepared once and trained under accelerate."""
+        q = shlex.quote
+        env = [f"PYTHONPATH={q(self._pythonpath(host))}", "PYTHONUNBUFFERED=1", "HF_HUB_OFFLINE=1",
+               "TOKENIZERS_PARALLELISM=false"]
+        if gpus:
+            env.append(f"CUDA_VISIBLE_DEVICES={','.join(str(g) for g in gpus)}")
+        prefix = "export " + " ".join(env) + "; "
+        py = q(host.python)
+        if len(gpus) <= 1:
+            return prefix + "exec " + py + " " + " ".join(q(a) for a in args)
+        port = 29500 + sum(job.encode()) % 2000  # two runs on one machine must not share a rendezvous port
+        launch = (f"{py} -m accelerate.commands.launch --num_processes {len(gpus)} --num_machines 1 "
+                  f"--mixed_precision no --dynamo_backend no --main_process_port {port} {q(TRAIN_SCRIPT)} ")
+        if "--resume" in args:
+            return prefix + "exec " + launch + " ".join(q(a) for a in args[1:])
+        return (prefix + py + " " + " ".join(q(a) for a in args) + " --prepare-only && exec " + launch
+                + f"--start {q(f'outputs/training/runs/{job}')}")
 
     def _train_args(self, params: dict[str, Any], exports: list[str], job: str, host: TrainingHost) -> list[str]:
         def num(key: str, default: int, lo: int, hi: int) -> int:
@@ -461,7 +657,29 @@ class TrainingManager:
         hand = str(params.get("hand") or "")
         if hand not in ("right", "left"):
             raise TrainingError("pick the hand (right / left)")
-        args = [TRAIN_SCRIPT, "--hand", hand, "--job-name", job, "--policy", "act"]
+        policy = str(params.get("policy") or "act")
+        if policy not in POLICIES:
+            raise TrainingError(f"policy is one of {', '.join(POLICIES)}")
+        args = [TRAIN_SCRIPT, "--hand", hand, "--job-name", job, "--policy", policy]
+        if policy == "pi05":
+            task = " ".join(str(params.get("task") or "").split())
+            if not task:
+                raise TrainingError("pi0.5 is prompted with a task: describe it (e.g. \"pick up the part\")")
+            if len(task) > 200:
+                raise TrainingError("task: 200 characters at most")
+            args += ["--task", task, "--lora-r", str(num("loraR", 32, 0, 256))]
+            pretrained = str(params.get("pretrained") or "").strip()
+            if pretrained:
+                if not re.match(r"^/?[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$", pretrained):
+                    raise TrainingError("base checkpoint: a Hugging Face id or an absolute directory")
+                args += ["--pretrained", pretrained]
+        holdout = params.get("holdoutEpisodes") or []
+        if holdout:
+            try:
+                episodes = sorted({int(e) for e in holdout})
+            except (TypeError, ValueError):
+                raise TrainingError("held-out episodes: whole numbers") from None
+            args += ["--holdout-episodes", ",".join(str(e) for e in episodes)]
         for name in exports:
             args += ["--export", f"outputs/exports/{name}" if host.kind == "remote" else name]
         cameras = params.get("cameras") or []
@@ -507,9 +725,9 @@ class TrainingManager:
         log = open(rec.logPath, "ab")  # noqa: SIM115 -- handed to the child
         try:
             proc = self._popen(
-                [host.python, *args],
+                ["bash", "-c", self._shell(host, args, rec.job, list(rec.params.get("gpus") or []))],
                 cwd=self.repo_root,
-                env={**os.environ, "PYTHONPATH": "src:.", "PYTHONUNBUFFERED": "1"},
+                env=dict(os.environ),
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -519,19 +737,25 @@ class TrainingManager:
         rec.runDir = str(self.root / "runs" / rec.job)
         rec.localRunDir = rec.runDir
 
-    def _remote_command(self, host: TrainingHost, args: list[str], job: str) -> str:
+    def _remote_command(self, host: TrainingHost, args: list[str], job: str, gpus: list[int]) -> str:
         q = shlex.quote
         log = f"outputs/training/logs/{job}.log"
         pidfile = f"outputs/training/pids/{job}.pid"
         return (
             f"cd {q(host.repoDir)} && mkdir -p outputs/training/logs outputs/training/pids && "
-            f"(PYTHONPATH=src:. PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 setsid {q(host.python)} "
-            + " ".join(q(a) for a in args)
-            + f" >> {q(log)} 2>&1 < /dev/null & echo $! > {q(pidfile)}; cat {q(pidfile)})"
+            f"(setsid bash -c {q(self._shell(host, args, job, gpus))}"
+            f" >> {q(log)} 2>&1 < /dev/null & echo $! > {q(pidfile)}; cat {q(pidfile)})"
         )
 
     def _sync_remote(self, host: TrainingHost, roots: list[Path], rec: RunRecord) -> None:
         q = shlex.quote
+        if host.hostname:
+            seen = self._ssh(host, "hostname")
+            if (seen.stdout or "").strip() != host.hostname:
+                raise TrainingError(
+                    f"{host.sshTarget} answers as {(seen.stdout or '').strip() or '?'!r}, not {host.hostname!r}: "
+                    "the address now reaches another machine; nothing was synced"
+                )
         check = self._ssh(
             host,
             f"mkdir -p {q(host.repoDir)} && cd {q(host.repoDir)} && "
@@ -545,7 +769,7 @@ class TrainingManager:
         excludes = [arg for pattern in SYNC_EXCLUDES for arg in ("--exclude", pattern)]
         self._append_log(rec, f"Syncing code to {host.sshTarget}:{host.repoDir}")
         result = self._run(
-            ["rsync", "-a", "--delete", *excludes, "-e", "ssh " + " ".join(SSH_OPTS),
+            ["rsync", "-a", "--delete", *excludes, "-e", self._ssh_e(host),
              f"{self.repo_root}/", f"{host.sshTarget}:{host.repoDir}/"],
             capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL,
         )
@@ -554,7 +778,7 @@ class TrainingManager:
         for root in roots:
             self._append_log(rec, f"Copying export {root.name}")
             result = self._run(
-                ["rsync", "-a", "--delete", "-e", "ssh " + " ".join(SSH_OPTS), f"{root}/",
+                ["rsync", "-a", "--delete", "-e", self._ssh_e(host), f"{root}/",
                  f"{host.sshTarget}:{host.repoDir}/outputs/exports/{root.name}/"],
                 capture_output=True, text=True, timeout=7200, stdin=subprocess.DEVNULL,
             )
@@ -572,7 +796,7 @@ class TrainingManager:
                 self._spawn_local(rec, host, args)
             else:
                 self._sync_remote(host, roots, rec)
-                result = self._ssh(host, self._remote_command(host, args, rec.job))
+                result = self._ssh(host, self._remote_command(host, args, rec.job, list(rec.params.get("gpus") or [])))
                 pid = (result.stdout or "").strip().splitlines()[-1:] or [""]
                 if result.returncode != 0 or not pid[0].isdigit():
                     raise TrainingError(f"could not start on {host.sshTarget}: {(result.stderr or '').strip()[-300:]}")
@@ -629,7 +853,7 @@ class TrainingManager:
             q = shlex.quote
             result = self._ssh(
                 host,
-                f"pid={int(rec.pid)}; if tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -qF -- {q(job)}; "
+                f"pid={int(rec.pid)}; if tr '\\0' ' ' < /proc/$pid/cmdline | grep -qF -- {q(job)}; "
                 "then kill -TERM -- -$pid && echo stopped; else echo gone; fi",
             )
             message = (result.stdout or "").strip() or (result.stderr or "").strip()
@@ -650,7 +874,7 @@ class TrainingManager:
         local = self.root / "runs" / job
         local.mkdir(parents=True, exist_ok=True)
         result = self._run(
-            ["rsync", "-a", "--exclude", "training_state/", "-e", "ssh " + " ".join(SSH_OPTS),
+            ["rsync", "-a", "--exclude", "training_state/", "-e", self._ssh_e(host),
              f"{host.sshTarget}:{rec.runDir}/", f"{local}/"],
             capture_output=True, text=True, timeout=3600, stdin=subprocess.DEVNULL,
         )
@@ -694,6 +918,9 @@ class TrainingManager:
             with self.lock:
                 self._save()
 
+    # Remote commands never write to /dev/null: on a100-19 it is a read-only regular file, the redirection
+    # fails, bash skips the command, and a live trainer looked dead (and Stop said "gone" while it ran on).
+    # stderr is captured anyway.
     def _poll_remote(self, rec: RunRecord) -> bool:
         if time.monotonic() - self._remote_polled.get(rec.job, 0.0) < 5.0:
             return False
@@ -704,13 +931,13 @@ class TrainingManager:
             return False
         q = shlex.quote
         self._run(
-            ["rsync", "-a", "-e", "ssh " + " ".join(SSH_OPTS),
+            ["rsync", "-a", "-e", self._ssh_e(host),
              f"{host.sshTarget}:{host.repoDir}/outputs/training/logs/{rec.job}.log", rec.logPath],
             capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
         )
         try:
             alive = self._ssh(
-                host, f"tr '\\0' ' ' < /proc/{int(rec.pid or 0)}/cmdline 2>/dev/null | grep -qF -- {q(rec.job)} && echo alive",
+                host, f"tr '\\0' ' ' < /proc/{int(rec.pid or 0)}/cmdline | grep -qF -- {q(rec.job)} && echo alive",
                 timeout=15,
             )
         except TrainingError:
@@ -819,8 +1046,11 @@ class TrainingManager:
             runs = [asdict(r) for r in sorted(self.runs.values(), key=lambda r: r.startedAt, reverse=True)]
         for run in runs:
             run.pop("logOffset", None)
+        hosts = self.hosts()
         return {
-            "hosts": [asdict(h) for h in self.hosts()],
+            "hosts": [asdict(h) for h in hosts],
+            "gpus": {h.id: self.gpu_status(h.id) for h in hosts},
+            "policies": list(POLICIES),
             "runs": runs,
             "profile": self.profile,
             "sandbox": self.sandbox,

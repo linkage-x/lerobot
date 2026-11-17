@@ -5,9 +5,12 @@ import {
   cropProblem,
   formProblems,
   outputSize,
+  parseEpisodes,
+  policyDefaults,
   progressFraction,
   startRequest,
-  stepHz
+  stepHz,
+  suggestHoldout
 } from "./trainingForm";
 
 const sizes: Record<string, [number, number]> = { cam_10: [1920, 1080], cam_06: [1920, 1080] };
@@ -38,7 +41,7 @@ describe("training form", () => {
     expect(formProblems({ ...DEFAULT_FORM, exports: ["a"], nActionSteps: 64 }, sizes)[0]).toMatch(/exceed/);
   });
 
-  it("sends the crop per camera and always ACT", () => {
+  it("sends the crop per camera, ACT by default", () => {
     const body = startRequest({
       ...DEFAULT_FORM,
       exports: ["a"],
@@ -54,6 +57,27 @@ describe("training form", () => {
       { name: "cam_10", crop: null },
       { name: "cam_06", crop: [140, 220, 1180, 1000] }
     ]);
+  });
+
+  it("asks pi0.5 for a task, sends its settings, the GPUs and the held-out episodes", () => {
+    const pi05 = { ...DEFAULT_FORM, ...policyDefaults("pi05"), exports: ["a"], gpus: [0, 1, 2, 3] };
+    expect(pi05.steps).toBe(6000);
+    expect(formProblems(pi05, sizes)).toContain("pi0.5 needs the task described in words.");
+    expect(formProblems({ ...pi05, task: "pick", holdout: "4,x" }, sizes)).toContain(
+      "Held-out episodes: whole numbers, comma separated."
+    );
+    expect(formProblems({ ...pi05, task: "pick", gpus: [] }, sizes)).toContain("Pick at least one GPU.");
+    const body = startRequest({ ...pi05, task: " pick up the part ", holdout: "24, 4,14" });
+    expect(body).toMatchObject({ policy: "pi05", task: "pick up the part", gpus: [0, 1, 2, 3], holdoutEpisodes: [4, 14, 24] });
+    expect(body).not.toHaveProperty("holdout");
+    expect(startRequest({ ...DEFAULT_FORM, exports: ["a"], task: "ignored" }).task).toBe("");
+  });
+
+  it("holds out about a tenth of the episodes, evenly spaced", () => {
+    expect(suggestHoldout(29)).toBe("4,14,24");
+    expect(suggestHoldout(3)).toBe("");
+    expect(parseEpisodes("")).toEqual([]);
+    expect(parseEpisodes("3,1,3")).toEqual([1, 3]);
   });
 
   it("clamps progress", () => {

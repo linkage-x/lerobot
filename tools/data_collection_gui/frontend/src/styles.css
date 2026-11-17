@@ -4850,6 +4850,19 @@ button.danger {
 .train-crop-inputs input[type="number"] { width: 80px; margin-left: 4px; }
 .train-preview { max-width: 100%; width: 640px; display: block; border-radius: 4px; }
 .train-log { max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+.train-machines { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.train-machine { border: 1px solid rgba(127, 127, 127, 0.25); border-radius: 6px; padding: 8px; }
+.train-machine.chosen { border-color: rgba(80, 140, 255, 0.7); background: rgba(80, 140, 255, 0.05); }
+.train-machine-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.train-machine-pick { display: inline-flex; gap: 6px; margin-left: auto; }
+.gpu-table { width: 100%; font-size: 12px; margin-top: 6px; }
+.gpu-table td { padding: 3px 6px; vertical-align: middle; }
+.gpu-busy { opacity: 0.75; }
+.gpu-bar { display: inline-block; width: 90px; height: 8px; border-radius: 4px; background: rgba(127, 127, 127, 0.2); vertical-align: middle; overflow: hidden; }
+.gpu-bar-fill { height: 100%; background: rgba(80, 140, 255, 0.8); }
+.gpu-mem { margin-left: 6px; font-variant-numeric: tabular-nums; }
+.gpu-procs span { display: inline-block; margin-right: 8px; }
+@media (max-width: 720px) { .gpu-bar { display: none; } .train-machine-pick { margin-left: 0; } }
 
 /* Rollout page */
 .rollout-stages { margin: 4px 0 8px 18px; font-size: 13px; }

@@ -125,3 +125,44 @@ def test_view_videos_return_each_frame_in_order(tmp_path):
     videos = rd.ViewVideos(tmp_path, [cam])
     levels = [int(videos.frame(1, t, "cam_10").mean()) for t in (0, 3, 1, 11)]
     assert levels == pytest.approx([85, 115, 95, 195], abs=3)
+
+
+def test_pi05_load_that_would_not_fit_in_ram_is_refused(tmp_path):
+    """A pi0.5 load peaks at ~3x its weights in RAM; one that needs swap froze a workstation (2026-11-17)."""
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"\0" * 1000)
+    assert rtp.weights_file(tmp_path) == weights
+    need = int(1000 * rtp.LOAD_PEAK_PER_WEIGHT_BYTE)
+    rtp.check_host_memory("pi05", weights, available=need)
+    with pytest.raises(rtp.HostMemoryError, match="2 processes"):
+        rtp.check_host_memory("pi05", weights, processes=2, available=need)
+    with pytest.raises(rtp.HostMemoryError):
+        rtp.check_host_memory("pi05", weights, available=need - 1)
+    rtp.check_host_memory("act", weights, available=0)  # ACT is small and loads as before
+    rtp.check_host_memory("pi05", None, available=0)  # ACT: nothing to measure
+
+
+def test_missing_pi05_base_weights_are_refused_not_replaced_by_random_ones(tmp_path):
+    """PI05Policy.from_pretrained silently returns a random model when its weights are missing."""
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    with pytest.raises(FileNotFoundError, match="random weights"):
+        rtp.require_weights(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        rtp.require_weights("no-such-org/no-such-model")
+    (tmp_path / "model.safetensors").write_bytes(b"\0")
+    assert rtp.require_weights(tmp_path) == tmp_path / "model.safetensors"
+    assert rtp.host_memory_available() > 0
+
+
+def test_pi05_is_refused_outright_on_an_8gb_gpu():
+    """The RTX 4060 (8 GB): pi0.5 inference peaks at 8.8 GiB, so it is refused with the reason, ACT is not."""
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    reason = rtp.gpu_too_small("pi05", "NVIDIA GeForce RTX 4060", 7.6)
+    assert reason and "8.8 GiB" in reason and "41 GB" in reason and "A100" in reason
+    assert rtp.gpu_too_small("act", "NVIDIA GeForce RTX 4060", 7.6) is None
+    assert rtp.gpu_too_small("pi05", "NVIDIA A100-SXM4-80GB", 79.3) is None
+    rtp.check_gpu_memory("pi05", "cpu")  # no GPU involved: the RAM check decides

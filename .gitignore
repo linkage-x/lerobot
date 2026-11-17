@@ -194,3 +194,5 @@ dataset_test/
 
 # Personal deploy-target overrides (how you reach a machine; see run/targets/README.md)
 run/targets.local.json
+# Training machines whose address must not be published (see run/training_hosts/README.md)
+run/training_hosts/*.local.json

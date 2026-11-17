@@ -11,15 +11,20 @@ import {
 } from "./trainingApi";
 import {
   type Crop,
+  type Policy,
   type TrainingForm,
   DEFAULT_FORM,
   chunkSeconds,
   formProblems,
   outputSize,
+  policyDefaults,
   progressFraction,
   startRequest,
-  stepHz
+  stepHz,
+  suggestHoldout
 } from "./trainingForm";
+import { TrainingMachines } from "./TrainingMachines";
+import { gpusFor } from "./trainingGpus";
 
 const ACTIVE = new Set(["syncing", "starting", "running"]);
 
@@ -272,6 +277,28 @@ export function TrainingPage() {
   const runs = status?.runs ?? [];
   const run = runs.find((r) => r.job === selectedRun) ?? runs[0];
   const set = <K extends keyof TrainingForm>(key: K, value: TrainingForm[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const hosts = status?.hosts ?? [];
+  const hostGpus = status?.gpus?.[form.hostId]?.gpus;
+
+  // The default machine (a100-19) may not be listed by this gateway: fall back to this machine.
+  useEffect(() => {
+    if (hosts.length && !hosts.some((h) => h.id === form.hostId)) setForm((f) => ({ ...f, hostId: "local", gpus: [] }));
+  }, [hosts, form.hostId]);
+
+  // Keep the picked GPUs to ones the chosen machine has (first free one when none is left).
+  useEffect(() => {
+    if (!hostGpus) return;
+    setForm((f) => {
+      const gpus = gpusFor(f.gpus, hostGpus);
+      return gpus.join(",") === f.gpus.join(",") ? f : { ...f, gpus };
+    });
+  }, [hostGpus]);
+
+  // Suggest held-out evaluation episodes when the first export is picked.
+  const chosenEpisodes = exports.filter((e) => form.exports.includes(e.name)).reduce((n, e) => Math.max(n, e.episodes), 0);
+  useEffect(() => {
+    setForm((f) => (f.holdout || !chosenEpisodes ? f : { ...f, holdout: suggestHoldout(chosenEpisodes) }));
+  }, [chosenEpisodes]);
 
   return (
     <div className="page-stack">
@@ -336,7 +363,15 @@ export function TrainingPage() {
               <option value="left">left</option>
             </select>
           </label>
+          <label className="train-inline" title="Not trained on; offline evaluation on the Rollout page uses them">
+            held-out episodes
+            <input value={form.holdout} placeholder="none" onChange={(e) => set("holdout", e.target.value)} />
+          </label>
         </div>
+        <p className="panel-note">
+          Held-out episodes are not trained on (nor in the normaliser&apos;s statistics). Offline evaluation on them says
+          how the policy does on motions it has not seen; on trained episodes it only says how well it memorised.
+        </p>
         {check?.problems.map((p) => (
           <p key={p} className="command-error">
             {p}
@@ -399,8 +434,41 @@ export function TrainingPage() {
       <section className="panel">
         <div className="panel-heading">
           <h2>3 · Policy</h2>
-          <span>ACT</span>
+          <span>{form.policy === "pi05" ? "pi0.5 (LoRA on lerobot/pi05_base)" : "ACT"}</span>
         </div>
+        <div className="control-row">
+          <label className="train-inline">
+            policy
+            <select
+              value={form.policy}
+              onChange={(e) => setForm((f) => ({ ...f, ...policyDefaults(e.target.value as Policy) }))}
+            >
+              <option value="act">ACT (small, one GPU)</option>
+              <option value="pi05">pi0.5 (3B vision-language-action, LoRA, several GPUs)</option>
+            </select>
+          </label>
+        </div>
+        {form.policy === "pi05" ? (
+          <>
+            <p className="panel-note">
+              pi0.5 is prompted with the task in words; the checkpoint keeps the text and Rollout sends the same. It
+              predicts the same relative-TCP chunk as ACT. Its chunk is sampled from noise; inference always gives it the
+              same noise, so offline, online and replay compare exactly. The base weights and the PaliGemma tokenizer
+              must be in the training machine&apos;s Hugging Face cache (training runs offline).
+            </p>
+            <div className="train-grid">
+              <label className="train-field">
+                <span>Task (prompt)</span>
+                <input value={form.task} placeholder="pick up the part and place it" onChange={(e) => set("task", e.target.value)} />
+              </label>
+              <NumberField label="LoRA rank (0 = all weights)" value={form.loraR} onChange={(v) => set("loraR", v)} />
+              <label className="train-field">
+                <span>Base checkpoint</span>
+                <input value={form.pretrained} placeholder="lerobot/pi05_base" onChange={(e) => set("pretrained", e.target.value)} />
+              </label>
+            </div>
+          </>
+        ) : null}
         <p className="panel-note">
           Action: the next {form.horizon} TCP targets relative to the TCP now, every {form.frameStride} frames
           {fps ? ` (${stepHz(fps, form.frameStride).toFixed(0)} Hz, ${chunkSeconds(fps, form.frameStride, form.horizon).toFixed(2)} s)` : ""},
@@ -409,7 +477,11 @@ export function TrainingPage() {
         </p>
         <div className="train-grid">
           <NumberField label="Steps" value={form.steps} onChange={(v) => set("steps", v)} />
-          <NumberField label="Batch size" value={form.batchSize} onChange={(v) => set("batchSize", v)} />
+          <NumberField
+            label={form.gpus.length > 1 ? `Batch per GPU (×${form.gpus.length} = ${form.batchSize * form.gpus.length})` : "Batch size"}
+            value={form.batchSize}
+            onChange={(v) => set("batchSize", v)}
+          />
           <NumberField label="Chunk length" value={form.horizon} onChange={(v) => set("horizon", v)} />
           <NumberField label="Executed per call" value={form.nActionSteps} onChange={(v) => set("nActionSteps", v)} />
           <NumberField label="Frame stride" value={form.frameStride} onChange={(v) => set("frameStride", v)} />
@@ -419,7 +491,7 @@ export function TrainingPage() {
           <NumberField label="Data workers" value={form.numWorkers} onChange={(v) => set("numWorkers", v)} />
           <label className="train-field">
             <span>Run name</span>
-            <input value={form.jobName} placeholder="act_right_<time>" onChange={(e) => set("jobName", e.target.value)} />
+            <input value={form.jobName} placeholder={`${form.policy}_${form.hand}_<time>`} onChange={(e) => set("jobName", e.target.value)} />
           </label>
         </div>
         <div className="control-row">
@@ -436,20 +508,30 @@ export function TrainingPage() {
 
       <section className="panel">
         <div className="panel-heading">
-          <h2>4 · Machine</h2>
-          <span>{status?.recorderConnected ? "recorder connected" : "recorder not connected"}</span>
+          <h2>4 · Machines and GPUs</h2>
+          <span>
+            {form.gpus.length ? `GPU ${form.gpus.join(", ")} on ` : ""}
+            {hosts.find((h) => h.id === form.hostId)?.label ?? form.hostId}
+          </span>
         </div>
+        <TrainingMachines
+          hosts={hosts}
+          gpus={status?.gpus ?? {}}
+          hostId={form.hostId}
+          selected={form.gpus}
+          onHost={(id) => {
+            setProbe(null);
+            setForm((f) => ({ ...f, hostId: id, gpus: id === "local" ? [] : [0] }));
+          }}
+          onGpus={(gpus) => set("gpus", gpus)}
+        />
+        <p className="panel-note">
+          One GPU runs the trainer directly; several run one process per GPU (accelerate) with the batch per GPU above.
+          {status?.recorderConnected ? " The recorder is connected: on a Thor this machine's GPU serves the cameras." : ""}
+        </p>
         <div className="control-row">
-          <select value={form.hostId} onChange={(e) => set("hostId", e.target.value)}>
-            {(status?.hosts ?? []).map((h) => (
-              <option key={h.id} value={h.id}>
-                {h.label}
-                {h.kind === "remote" ? ` — ${h.sshTarget}:${h.repoDir}` : ""}
-              </option>
-            ))}
-          </select>
           <button onClick={() => act(async () => setProbe(await trainingApi.probe(form.hostId)))}>Check machine</button>
-          {form.hostId !== "local" ? (
+          {hosts.find((h) => h.id === form.hostId)?.source === "page" ? (
             <button onClick={() => act(() => trainingApi.removeHost(form.hostId).then(() => set("hostId", "local")))}>
               Remove
             </button>

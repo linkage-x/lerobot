@@ -1,0 +1,10 @@
+{
+  "label": "corenetic (RTX 4060 8G)",
+  "user": "hph",
+  "address": "192.168.11.44",
+  "port": 22,
+  "hostname": "corenetic",
+  "repo_dir": "/home/hph/fr3_train",
+  "python": ".venv/bin/python",
+  "note": "8 GB: ACT only; pi0.5 does not fit."
+}
