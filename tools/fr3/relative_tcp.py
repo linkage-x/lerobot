@@ -202,6 +202,9 @@ class PolicyContract:
     wrench_names: list[str] = field(default_factory=list)  # dataset state columns, empty = not used
     tcp_link: str = TCP_LINK
     schema: str = CONTRACT_SCHEMA
+    # The language prompt of a vision-language-action policy (pi0.5): training and inference must send the
+    # same text. Empty for ACT, and then left out of the file so code from before 11-17 still reads it.
+    task: str = ""
 
     # ---- layout
     @property
@@ -255,6 +258,8 @@ class PolicyContract:
     # ---- (de)serialisation
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
+        if not out.get("task"):
+            out.pop("task", None)
         out["state_names"] = self.state_names
         out["action_names"] = self.action_names
         return out

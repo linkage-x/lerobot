@@ -4,7 +4,31 @@ import { gatewayErrorMessage } from "../shared/httpError";
 
 const base = import.meta.env.VITE_GUI_API_BASE ?? "";
 
-export type TrainingHost = { id: string; label: string; kind: "local" | "remote"; sshTarget: string; repoDir: string; python: string };
+export type TrainingHost = {
+  id: string;
+  label: string;
+  kind: "local" | "remote";
+  sshTarget: string;
+  repoDir: string;
+  python: string;
+  port: number;
+  hostname: string;
+  note: string;
+  source: "local" | "registry" | "page";
+};
+
+export type GpuProcess = { pid: number; user: string; memMiB: number | null; command: string; job?: string };
+
+export type Gpu = {
+  index: number;
+  name: string;
+  memUsedMiB: number | null;
+  memTotalMiB: number | null;
+  utilPct: number | null;
+  processes: GpuProcess[];
+};
+
+export type GpuHostStatus = { state: "ok" | "probing" | "unreachable"; gpus?: Gpu[]; error?: string; probedAt?: string };
 
 export type TrainingRun = {
   job: string;
@@ -31,6 +55,8 @@ export type TrainingRun = {
 
 export type TrainingStatus = {
   hosts: TrainingHost[];
+  gpus: Record<string, GpuHostStatus>;
+  policies: string[];
   runs: TrainingRun[];
   profile: string;
   sandbox: string | null;

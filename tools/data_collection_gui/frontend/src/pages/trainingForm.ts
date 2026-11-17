@@ -5,6 +5,8 @@ export type Crop = [number, number, number, number];
 
 export type CameraChoice = { name: string; crop: Crop | null };
 
+export type Policy = "act" | "pi05";
+
 export type TrainingForm = {
   exports: string[];
   hand: "right" | "left";
@@ -22,6 +24,17 @@ export type TrainingForm = {
   imageAug: boolean;
   jobName: string;
   hostId: string;
+  policy: Policy;
+  /** pi0.5's language prompt; the contract keeps it so Rollout sends the same text. */
+  task: string;
+  /** pi0.5 LoRA rank; 0 trains every weight. */
+  loraR: number;
+  /** pi0.5 base weights; empty = lerobot/pi05_base. */
+  pretrained: string;
+  /** GPU indices on the chosen machine; several = one process per GPU (accelerate). */
+  gpus: number[];
+  /** Episodes kept out of training for offline evaluation, e.g. "4,14,24". */
+  holdout: string;
 };
 
 // Starting values, not tuned for a task. 60 fps exports; stride 2 = 30 Hz action steps; a 32-step chunk
@@ -42,8 +55,36 @@ export const DEFAULT_FORM: TrainingForm = {
   wrench: false,
   imageAug: true,
   jobName: "",
-  hostId: "local"
+  // The 8x A100 (run/training_hosts/a100-19.json); the page falls back to this machine when it is not listed.
+  hostId: "a100-19",
+  policy: "act",
+  task: "",
+  loraR: 32,
+  pretrained: "",
+  gpus: [0],
+  holdout: ""
 };
+
+/** What changes with the policy. ACT: one GPU, batch 32. pi0.5 (3B, LoRA): batch per GPU 16, fewer steps. */
+export function policyDefaults(policy: Policy): Partial<TrainingForm> {
+  return policy === "pi05"
+    ? { policy, steps: 6000, batchSize: 16, saveFreq: 2000, numWorkers: 6 }
+    : { policy, steps: 20000, batchSize: 32, saveFreq: 2000, numWorkers: 8 };
+}
+
+/** About a tenth of the episodes, evenly spaced, as held-out evaluation episodes ("4,14,24" of 29). */
+export function suggestHoldout(episodes: number): string {
+  if (episodes < 5) return "";
+  const k = Math.max(1, Math.round(episodes * 0.1));
+  return Array.from({ length: k }, (_, i) => Math.floor(((i + 0.5) * episodes) / k)).join(",");
+}
+
+/** "4, 14,24" -> [4, 14, 24]; null when it is not a list of whole numbers. */
+export function parseEpisodes(text: string): number[] | null {
+  const parts = text.split(",").map((t) => t.trim()).filter(Boolean);
+  if (!parts.every((t) => /^\d+$/.test(t))) return null;
+  return [...new Set(parts.map(Number))].sort((a, b) => a - b);
+}
 
 export function stepHz(fps: number, stride: number): number {
   return fps > 0 && stride > 0 ? fps / stride : 0;
@@ -87,6 +128,9 @@ export function formProblems(form: TrainingForm, cameraSizes: Record<string, [nu
     }
   }
   if (form.nActionSteps > form.horizon) problems.push("Steps executed per call cannot exceed the chunk length.");
+  if (form.policy === "pi05" && !form.task.trim()) problems.push("pi0.5 needs the task described in words.");
+  if (parseEpisodes(form.holdout) === null) problems.push("Held-out episodes: whole numbers, comma separated.");
+  if (form.hostId !== "local" && form.gpus.length === 0) problems.push("Pick at least one GPU.");
   if (form.jobName && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(form.jobName)) {
     problems.push("Run name: letters, digits, . _ - only.");
   }
@@ -95,11 +139,13 @@ export function formProblems(form: TrainingForm, cameraSizes: Record<string, [nu
 
 /** The body of POST /api/training/start. */
 export function startRequest(form: TrainingForm): Record<string, unknown> {
+  const { holdout, ...rest } = form;
   return {
-    ...form,
+    ...rest,
     jobName: form.jobName.trim(),
     cameras: form.cameras.map((c) => ({ name: c.name, crop: c.crop })),
-    policy: "act"
+    task: form.policy === "pi05" ? form.task.trim() : "",
+    holdoutEpisodes: parseEpisodes(holdout) ?? []
   };
 }
 

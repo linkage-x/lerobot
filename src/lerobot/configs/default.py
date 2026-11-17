@@ -95,3 +95,9 @@ class PeftConfig:
     # the rank used for the adapter. In general a higher rank means more trainable parameters and closer to full
     # fine-tuning.
     r: int = 16
+
+    # Scaling numerator for the adapter update, whose effective strength is alpha / r. Left unset, the underlying
+    # PEFT config supplies its own fixed default (8 for LoRA), so raising `r` alone *shrinks* each update rather
+    # than strengthening it -- r=32 lands on a scaling of 0.25. Set this alongside `r` to keep the scaling fixed.
+    # Named generically because it is mapped to the method's own key (LoRA's `lora_alpha`) at build time.
+    alpha: int | None = None

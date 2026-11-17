@@ -25,7 +25,7 @@ import math
 import os
 import shutil
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -396,6 +396,14 @@ def contract_columns(contract: rt.PolicyContract, info: dict[str, Any]) -> dict[
     return {"pose_key": key, "width": width_i, "wrench": wrench_i}
 
 
+def view_episodes(root: Path) -> list[int]:
+    """Episode indices of a view or an export."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(Path(root) / "data", columns=["episode_index"])
+    return sorted(set(table.column("episode_index").to_pylist()))
+
+
 def load_episode_arrays(root: Path, contract: rt.PolicyContract) -> list[EpisodeArrays]:
     import pyarrow.parquet as pq
 
@@ -493,12 +501,20 @@ def _vector_stats(values: np.ndarray) -> dict[str, list[float]]:
     }
 
 
-def compute_stats(view_roots: Sequence[Path], contract: rt.PolicyContract) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Normaliser statistics of the relative quantities, and a summary of what was usable."""
+def compute_stats(
+    view_roots: Sequence[Path], contract: rt.PolicyContract, *, holdout: Collection[int] = ()
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normaliser statistics of the relative quantities, and a summary of what was usable.
+
+    ``holdout``: episode indices (of every view) kept out for evaluation; they do not shape the normaliser.
+    """
     states, actions = [], []
     usable = total = padded = 0
+    held = {int(e) for e in holdout}
     for root in view_roots:
         for arrays in load_episode_arrays(root, contract):
+            if arrays.episode in held:
+                continue
             for t in range(len(arrays.poses)):
                 total += 1
                 sample = sample_vectors(contract, arrays, t)
@@ -589,8 +605,11 @@ class RelativeTcpDataset:
         stats: dict[str, Any],
         *,
         image_transforms=None,
+        holdout: Collection[int] = (),
     ):
+        """``holdout``: episode indices (of every view) that are not trained on (evaluation episodes)."""
         self.contract = contract
+        self.holdout = sorted({int(e) for e in holdout})
         self.image_transforms = image_transforms
         self.view_roots = [Path(r) for r in view_roots]
         self.videos: list[ViewVideos] = []
@@ -605,6 +624,8 @@ class RelativeTcpDataset:
             episodes = load_episode_arrays(root, contract)
             self.arrays.append(episodes)
             for e, arrays in enumerate(episodes):
+                if arrays.episode in self.holdout:
+                    continue
                 begin = len(self.index)
                 for t in range(len(arrays.poses)):
                     sample = sample_vectors(contract, arrays, t)
@@ -641,7 +662,7 @@ class RelativeTcpDataset:
             "index": torch.tensor(i),
             "episode_index": torch.tensor(arrays.episode),
             "frame_index": torch.tensor(t),
-            "task": "",
+            "task": self.contract.task,
         }
         for cam in self.contract.cameras:
             frame = self.videos[d].frame(arrays.episode, t, cam.name)

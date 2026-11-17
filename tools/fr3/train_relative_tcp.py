@@ -6,7 +6,13 @@
         --camera cam_10 --camera cam_06:140,220,1180,1000 \
         --policy act --steps 20000 --job-name pick_act_v1
 
-    # resume (same run directory, from its last checkpoint):
+    # pi0.5 (LoRA on lerobot/pi05_base), three episodes held out for evaluation, on 8 GPUs:
+    PYTHONPATH=src:. python tools/fr3/train_relative_tcp.py ... --policy pi05 --task "pick up the part" \
+        --holdout-episodes 4,14,24 --job-name pick_pi05_v1 --prepare-only
+    PYTHONPATH=src:. accelerate launch --num_processes 8 tools/fr3/train_relative_tcp.py \
+        --start outputs/training/runs/pick_pi05_v1
+
+    # resume (same run directory, from its last checkpoint; under accelerate launch for several GPUs):
     PYTHONPATH=src:. python tools/fr3/train_relative_tcp.py --resume outputs/training/runs/pick_act_v1
 
 What it adds to ``lerobot_train`` (which still does the training, the checkpoints, resume and W&B):
@@ -53,15 +59,37 @@ STATS_FILE = "stats.json"
 DEFAULT_RUNS_ROOT = Path("outputs/training/runs")
 DEFAULT_VIEWS_ROOT = Path("outputs/training/views")
 PROGRESS_PREFIX = "FR3_PROGRESS "
-#: Policy types this script configures. ACT only for now: its chunk prediction is deterministic, so
-#: the reload check and inference's offline/online comparison are exact. Diffusion samples noise and
-#: keeps an observation queue; both need handling before it is offered.
-POLICY_TYPES = ("act",)
+#: Policy types this script configures. ACT predicts its chunk deterministically. pi0.5 samples it from
+#: noise; inference gives it the same noise every call (relative_tcp_policy.fixed_noise), so the reload
+#: check and the offline/online comparison stay exact. Diffusion keeps an observation queue and is not
+#: offered yet.
+POLICY_TYPES = ("act", "pi05")
+PI05_BASE = "lerobot/pi05_base"
+#: The LoRA targets of the FR3 pi0.5 baseline (lerobot_workstation, measured on the L4 task): every attention
+#: and MLP projection of the action expert plus the state/action interface. The policy's own default adapts
+#: q/v only.
+PI05_LORA_TARGETS = (
+    r"(.*\.gemma_expert\..*\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+    r"|model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))"
+)
 CODE_FILES = (
     "tools/fr3/relative_tcp.py",
     "tools/fr3/relative_tcp_data.py",
     "tools/fr3/train_relative_tcp.py",
+    "tools/fr3/relative_tcp_policy.py",
 )
+
+
+def is_main_process() -> bool:
+    """Rank 0 under ``accelerate launch`` (and the only process otherwise): the one that writes run files."""
+    return os.environ.get("RANK", "0") == "0"
+
+
+def parse_episodes(spec: str) -> list[int]:
+    try:
+        return sorted({int(v) for v in spec.split(",") if v.strip()})
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"episodes {spec!r}: expected e.g. 4,14,24") from None
 
 
 def _now() -> str:
@@ -126,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--n-action-steps", type=int, default=16, help="steps executed per policy call")
     ap.add_argument("--history", type=int, default=2, help="past relative poses in the state")
     ap.add_argument("--policy", choices=POLICY_TYPES, default="act")
+    ap.add_argument("--task", default="",
+                    help="the language prompt (pi0.5); written into the contract so inference sends the same text")
+    ap.add_argument("--pretrained", default=None,
+                    help=f"pi0.5: base weights, a Hugging Face id in the local cache or a directory (default {PI05_BASE})")
+    ap.add_argument("--lora-r", type=int, default=32, help="pi0.5: LoRA rank; 0 trains every weight")
+    ap.add_argument("--lora-targets", default=PI05_LORA_TARGETS, help="pi0.5: LoRA target modules (regex)")
+    ap.add_argument("--holdout-episodes", type=parse_episodes, default=[],
+                    help="episode indices (of every export) kept out of training, for offline evaluation")
     ap.add_argument("--steps", type=int, default=None,
                     help="total optimiser steps (default 20000); with --resume, raise it to train a finished run further")
     ap.add_argument("--batch-size", type=int, default=32)
@@ -143,6 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--views-root", type=Path, default=DEFAULT_VIEWS_ROOT)
     ap.add_argument("--resume", type=Path, help="a run directory: continue it from its last checkpoint")
     ap.add_argument("--check", action="store_true", help="check the exports, print what would train, write nothing")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="check, build views and stats, write the run directory; train with --start (several GPUs)")
+    ap.add_argument("--start", type=Path, help="a run directory written by --prepare-only: train it from step 0")
     return ap
 
 
@@ -176,7 +215,10 @@ def make_contract(args: argparse.Namespace, check: rd.ExportCheck) -> rt.PolicyC
         if missing:
             raise rd.TrainingDataError(f"no external wrench for BOX {box!r} in {', '.join(missing)}")
         wrench = [f"{box}{rd.WRENCH_PREFIX}{axis}" for axis in rt.WRENCH_AXES]
+    if args.policy == "pi05" and not args.task.strip():
+        raise rd.TrainingDataError("pi0.5 is prompted with a task: give --task (e.g. \"pick up the part\")")
     contract = rt.PolicyContract(
+        task=args.task.strip(),
         hand=args.hand,
         fps=check.exports[0].fps,
         frame_stride=args.frame_stride,
@@ -209,8 +251,16 @@ def lerobot_argv(args: argparse.Namespace, run_dir: Path, contract: rt.PolicyCon
         f"--seed={args.seed}",
         f"--wandb.enable={'true' if args.wandb else 'false'}",
     ]
-    if args.policy == "act":
-        argv += [f"--policy.chunk_size={contract.horizon}", f"--policy.n_action_steps={args.n_action_steps}"]
+    argv += [f"--policy.chunk_size={contract.horizon}", f"--policy.n_action_steps={args.n_action_steps}"]
+    if args.policy == "pi05":
+        argv += [
+            f"--policy.pretrained_path={args.pretrained or PI05_BASE}",
+            "--policy.dtype=bfloat16",
+            "--policy.gradient_checkpointing=true",
+        ]  # pi0.5 normalises state and action by quantiles (q01..q99 -> -1..1), which stats.json carries
+        if args.lora_r > 0:
+            argv += ["--peft.method_type=LORA", f"--peft.r={args.lora_r}", f"--peft.alpha={args.lora_r}",
+                     f"--peft.target_modules={args.lora_targets}"]
     if args.device:
         argv.append(f"--policy.device={args.device}")
     if args.image_aug:
@@ -237,7 +287,8 @@ class _Hooks:
         from lerobot.datasets.transforms import ImageTransforms
 
         transforms = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-        self.dataset = rd.RelativeTcpDataset(self.views, self.contract, self.stats, image_transforms=transforms)
+        self.dataset = rd.RelativeTcpDataset(self.views, self.contract, self.stats, image_transforms=transforms,
+                                             holdout=self.run.get("holdout_episodes") or [])
         progress(event="dataset", frames=self.dataset.num_frames, episodes=self.dataset.num_episodes)
         return self.dataset
 
@@ -253,6 +304,7 @@ class _Hooks:
             "workspace": self.run.get("workspace"),
             "views": self.run["views"],
             "policy": self.run["policy"],
+            "holdout_episodes": self.run.get("holdout_episodes") or [],
             "code": self.run["code"],
             "host": self.run["host"],
             "started": self.run["started"],
@@ -342,13 +394,23 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
                     "Start a new run instead."
                 )
         run.setdefault("resumes", []).append({"at": _now(), "from": str(last.parent.resolve()), "code": code_provenance()})
-        (run_dir / RUN_FILE).write_text(json.dumps(run, indent=2), encoding="utf-8")
         argv = ["lerobot_train", f"--config_path={last / 'train_config.json'}", "--resume=true"]
         if args.steps is not None:
             argv.append(f"--steps={args.steps}")
             run["policy"]["steps"] = args.steps
+        if is_main_process():  # under accelerate launch every rank gets here; one writes
             (run_dir / RUN_FILE).write_text(json.dumps(run, indent=2), encoding="utf-8")
         return run_dir, run, contract, views, stats, argv
+
+    if args.start:
+        run_dir = args.start.resolve()
+        run = json.loads((run_dir / RUN_FILE).read_text(encoding="utf-8"))
+        if (run_dir / "lerobot").exists():
+            raise rd.TrainingDataError(f"{run_dir} has already started training; --resume it")
+        contract = rt.PolicyContract.from_dict(run["contract"])
+        views = [Path(v["root"]) for v in run["views"]]
+        stats = json.loads((run_dir / STATS_FILE).read_text(encoding="utf-8"))
+        return run_dir, run, contract, views, stats, list(run["lerobot_argv"])
 
     args.steps = 20000 if args.steps is None else args.steps
     if not args.export or not args.hand:
@@ -366,7 +428,13 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
     if run_dir.exists():
         raise rd.TrainingDataError(f"{run_dir} exists; pick another --job-name, or --resume it")
     views = [rd.build_view(Path(s.root), contract.cameras, args.views_root) for s in check.exports]
-    stats, usable = rd.compute_stats(views, contract)
+    episodes = {e for v in views for e in rd.view_episodes(v)}
+    unknown = sorted(set(args.holdout_episodes) - episodes)
+    if unknown:
+        raise rd.TrainingDataError(f"--holdout-episodes {unknown}: no such episode in the exports")
+    if episodes and set(args.holdout_episodes) >= episodes:
+        raise rd.TrainingDataError("--holdout-episodes holds out every episode; nothing would be trained on")
+    stats, usable = rd.compute_stats(views, contract, holdout=args.holdout_episodes)
     run_dir.mkdir(parents=True)
     (run_dir / STATS_FILE).write_text(json.dumps(stats), encoding="utf-8")
     run = {
@@ -375,7 +443,9 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
         "started": _now(),
         "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "export"},
         "policy": {"type": args.policy, "steps": args.steps, "batch_size": args.batch_size,
-                   "n_action_steps": args.n_action_steps, "extra": list(args.policy_arg)},
+                   "n_action_steps": args.n_action_steps, "extra": list(args.policy_arg),
+                   **({"pretrained": args.pretrained or PI05_BASE, "lora_r": args.lora_r} if args.policy == "pi05" else {})},
+        "holdout_episodes": list(args.holdout_episodes),
         "contract": contract.to_dict(),
         "exports": [
             {**vars(s), "fingerprint": rd._export_fingerprint(Path(s.root))} for s in check.exports
@@ -389,8 +459,9 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
         "code": code_provenance(),
         "host": _host(),
     }
+    run["lerobot_argv"] = lerobot_argv(args, run_dir, contract, views)
     (run_dir / RUN_FILE).write_text(json.dumps(run, indent=2), encoding="utf-8")
-    return run_dir, run, contract, views, stats, lerobot_argv(args, run_dir, contract, views)
+    return run_dir, run, contract, views, stats, run["lerobot_argv"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -403,7 +474,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.check:
         return 0
-    progress(event="start", run_dir=str(run_dir), resume=bool(args.resume))
+    if args.prepare_only:
+        progress(event="prepared", run_dir=str(run_dir))
+        return 0
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    try:  # every rank builds its own copy of the model at once
+        weights = rtp.require_weights(args.pretrained or PI05_BASE) if args.policy == "pi05" else None
+        rtp.check_host_memory(args.policy, weights, processes=int(os.environ.get("WORLD_SIZE", "1")))
+        rtp.check_gpu_memory(args.policy, f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+    except (rtp.HostMemoryError, rtp.GpuMemoryError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", flush=True)
+        progress(event="refused", error=str(exc))
+        return 2
+    if is_main_process():
+        progress(event="start", run_dir=str(run_dir), resume=bool(args.resume),
+                 processes=int(os.environ.get("WORLD_SIZE", "1")))
 
     from lerobot.scripts import lerobot_train
 
@@ -420,7 +506,8 @@ def main(argv: list[str] | None = None) -> int:
     sys.argv = train_argv
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     lerobot_train.main()
-    progress(event="done", run_dir=str(run_dir))
+    if is_main_process():
+        progress(event="done", run_dir=str(run_dir))
     return 0
 
 
