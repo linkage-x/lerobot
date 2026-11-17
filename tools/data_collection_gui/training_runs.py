@@ -189,35 +189,133 @@ def parse_gpu_status(text: str) -> list[dict[str, Any]]:
     return gpus
 
 
-def suggest_crop(corner_points: list[tuple[float, float]], size: tuple[int, int], *, margin: float = 0.2,
-                 aspect: float = 4 / 3) -> list[int]:
-    """A crop around where the gripper rig was seen: 0.5-99.5 percentile box, ``margin`` on each side, then
-    widened to ``aspect`` and clipped to the image. A starting point for the operator, who checks the preview.
+#: Half-size of what the gripper handles, around the fingertip, for the crop suggestion (metres). The objects
+#: a policy needs to see are where the fingertip went: everything the hand picked up or put down was touched.
+CROP_OBJECT_RADIUS_M = 0.05
+
+
+def suggest_crop(corner_points: list[tuple[float, float]], size: tuple[int, int], *, margin: float | None = None,
+                 aspect: float = 1.0, targets: list[tuple[float, float, float]] | None = None) -> list[int]:
+    """A crop around where the gripper rig was seen and, with ``targets`` ((u, v, radius_px) of the fingertip
+    and what it holds), around what it handled.
+
+    The 0.5-99.5 percentile box of both must stay inside; ``margin`` (each side, as a share of that box;
+    default 0.05 with targets, 0.2 with the rig alone) is added, then the box is widened to ``aspect``
+    (square by default: pi0.5 pads anything else to a square with black). When that does not fit in the
+    image the margin shrinks first; only when the needed box itself is taller (or wider) than the image
+    does the crop give up the aspect, never the targets. A starting point for the operator, who checks
+    the preview.
     """
     import numpy as np
 
     w, h = size
-    if not corner_points:
+    if not corner_points and not targets:
         return [0, 0, w, h]
-    pts = np.asarray(corner_points, dtype=float)
-    x0, x1 = np.percentile(pts[:, 0], [0.5, 99.5])
-    y0, y1 = np.percentile(pts[:, 1], [0.5, 99.5])
-    bw, bh = x1 - x0, y1 - y0
-    x0, x1 = x0 - margin * bw, x1 + margin * bw
-    y0, y1 = y0 - margin * bh, y1 + margin * bh
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    bw, bh = x1 - x0, y1 - y0
-    if bw / bh < aspect:
-        bw = bh * aspect
-    else:
-        bh = bw / aspect
-    bw, bh = min(bw, w), min(bh, h)
+    if margin is None:
+        margin = 0.05 if targets else 0.2
+    lo = [np.asarray(corner_points, dtype=float).reshape(-1, 2)]
+    hi = [lo[0]]
+    if targets:
+        t = np.asarray(targets, dtype=float).reshape(-1, 3)
+        lo.append(t[:, :2] - t[:, 2:3])
+        hi.append(t[:, :2] + t[:, 2:3])
+    lo, hi = np.concatenate(lo), np.concatenate(hi)
+    nx0, ny0 = np.maximum(np.percentile(lo, 0.5, axis=0), 0.0)
+    nx1, ny1 = np.minimum(np.percentile(hi, 99.5, axis=0), [w, h])
+    nw, nh = max(nx1 - nx0, 2.0), max(ny1 - ny0, 2.0)
+    def widened(bw: float, bh: float) -> tuple[float, float]:
+        return (bh * aspect, bh) if bw / bh < aspect else (bw, bw / aspect)
+
+    mw, mh = nw * (1 + 2 * margin), nh * (1 + 2 * margin)
+    need_w, need_h = widened(nw, nh)
+    if need_w <= w and need_h <= h:  # the aspect fits: shrink the margin first if it has to
+        bw, bh = widened(mw, mh)
+        shrink = min(1.0, w / bw, h / bh)
+        bw, bh = bw * shrink, bh * shrink
+    else:  # the targets alone are too tall or too wide for that aspect: keep them, not the aspect
+        bw, bh = min(mw, w), min(mh, h)
+    cx, cy = (nx0 + nx1) / 2, (ny0 + ny1) / 2
     x0 = min(max(0.0, cx - bw / 2), w - bw)
     y0 = min(max(0.0, cy - bh / 2), h - bh)
     box = [int(round(x0)), int(round(y0)), int(round(x0 + bw)), int(round(y0 + bh))]
     box[0] -= box[0] % 2
     box[1] -= box[1] % 2
     return box
+
+
+def crop_target_coverage(crop: list[int], targets: list[tuple[float, float, float]],
+                         episodes: list[int] | None = None, size: tuple[int, int] | None = None) -> dict[str, Any]:
+    """Share of ``targets`` (u, v, radius_px) whose whole square lies inside ``crop``, overall and for the
+    worst episode. With ``size``, the part of a square outside the image does not count against the crop
+    (no crop can show it)."""
+    import numpy as np
+
+    if not targets:
+        return {"inside": None, "worstEpisode": None, "worstEpisodeInside": None}
+    t = np.asarray(targets, dtype=float).reshape(-1, 3)
+    x0, y0, x1, y1 = crop
+    lo, hi = t[:, :2] - t[:, 2:3], t[:, :2] + t[:, 2:3]
+    if size is not None:
+        lo, hi = np.maximum(lo, 0.0), np.minimum(hi, [size[0], size[1]])
+    ok = (lo[:, 0] >= x0) & (hi[:, 0] <= x1) & (lo[:, 1] >= y0) & (hi[:, 1] <= y1)
+    out: dict[str, Any] = {"inside": round(float(ok.mean()), 4), "worstEpisode": None, "worstEpisodeInside": None}
+    if episodes is not None and len(episodes) == len(t):
+        eps = np.asarray(episodes)
+        per = {int(e): float(ok[eps == e].mean()) for e in np.unique(eps)}
+        worst = min(per, key=per.get)
+        out.update(worstEpisode=worst, worstEpisodeInside=round(per[worst], 4))
+    return out
+
+
+def _quat_xyzw_to_matrix(q):
+    import numpy as np
+
+    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return np.stack([
+        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
+    ], -2)
+
+
+def _pose_matrices(poses):
+    """(N, 7) x y z qx qy qz qw -> (N, 4, 4) and which rows are valid."""
+    import numpy as np
+
+    p = np.asarray(poses, dtype=float).reshape(-1, 7)
+    ok = np.isfinite(p).all(axis=1) & (np.linalg.norm(p[:, 3:], axis=1) > 0.5)
+    out = np.repeat(np.eye(4)[None], len(p), axis=0)
+    out[ok, :3, :3] = _quat_xyzw_to_matrix(p[ok, 3:])
+    out[ok, :3, 3] = p[ok, :3]
+    return out, ok
+
+
+def project_camera_points(points_cam, camera_matrix, dist_coeffs, model: str):
+    """Camera-frame points (N, 3) -> pixels (N, 2), OpenCV's fisheye or standard (k1 k2 p1 p2 [k3]) model,
+    without cv2 (the gateway does not always have it)."""
+    import numpy as np
+
+    pts = np.asarray(points_cam, dtype=float).reshape(-1, 3)
+    kmat = np.asarray(camera_matrix, dtype=float)
+    d = np.asarray(dist_coeffs, dtype=float).reshape(-1)
+    a, b = pts[:, 0] / pts[:, 2], pts[:, 1] / pts[:, 2]
+    if "fisheye" in model:
+        r = np.hypot(a, b)
+        th = np.arctan(r)
+        k = np.zeros(4)
+        k[: min(4, len(d))] = d[:4]
+        thd = th * (1 + k[0] * th**2 + k[1] * th**4 + k[2] * th**6 + k[3] * th**8)
+        s = np.where(r > 1e-12, thd / np.maximum(r, 1e-12), 1.0)
+        xd, yd = a * s, b * s
+    else:
+        k = np.zeros(5)
+        k[: min(5, len(d))] = d[:5]
+        r2 = a * a + b * b
+        radial = 1 + k[0] * r2 + k[1] * r2**2 + k[4] * r2**3
+        xd = a * radial + 2 * k[2] * a * b + k[3] * (r2 + 2 * a * a)
+        yd = b * radial + k[2] * (r2 + 2 * b * b) + 2 * k[3] * a * b
+    return np.stack([kmat[0, 0] * xd + kmat[0, 1] * yd + kmat[0, 2], kmat[1, 1] * yd + kmat[1, 2]], axis=1)
 
 
 class TrainingManager:
@@ -546,9 +644,86 @@ class TrainingManager:
         note = f"{len(points)} rig corners from {len(wanted) - len(missing)} recording(s)"
         if missing:
             note += f"; not on this machine: {', '.join(missing)}"
-        if not points:
+        try:
+            targets, target_eps = self._fingertip_targets(root, info, camera, hand)
+            target_problem = None if targets else "no frame with both the fingertip and this camera's rig pose"
+        except TrainingError as exc:
+            targets, target_eps, target_problem = [], [], str(exc)
+        if not points and not targets:
             note += "; no rig seen by this camera, so the whole frame"
-        return {"crop": suggest_crop(points, size), "points": len(points), "size": list(size), "note": note}
+        crop = suggest_crop(points, size, targets=targets)
+        coverage = crop_target_coverage(crop, targets, target_eps, size)
+        if targets:
+            note += (f"; fingertip ±{CROP_OBJECT_RADIUS_M * 100:.0f} cm (what the gripper handles) inside in "
+                     f"{coverage['inside']:.2%} of {len(targets)} frames, worst episode {coverage['worstEpisode']} "
+                     f"{coverage['worstEpisodeInside']:.2%}")
+        else:
+            note += f"; objects not checked ({target_problem}): look at the preview for anything cut off"
+        if (crop[2] - crop[0]) != (crop[3] - crop[1]):
+            note += "; not square: keeping what the gripper handled needs more than the image's height"
+        return {"crop": crop, "points": len(points), "targets": len(targets), "coverage": coverage,
+                "size": list(size), "note": note}
+
+    def _camera_intrinsics(self, info: dict[str, Any], camera: str) -> tuple[list, list, str]:
+        """K, distortion and model of ``camera`` from the intrinsics run the export's labels were made with."""
+        runs = ((info.get("label_provenance") or {}).get("key") or {}).get("intrinsics") or []
+        if len(runs) != 1:
+            raise TrainingError(f"the export names {len(runs)} intrinsics runs, expected one")
+        run_dir = self.repo_root / "outputs" / "calibration" / str(runs[0])
+        summary = run_dir / "summary.json"
+        if not summary.is_file():
+            raise TrainingError(f"intrinsics {runs[0]} not on this machine")
+        entry = next((c for c in json.loads(summary.read_text(encoding="utf-8")).get("cameras") or []
+                      if c.get("camera_name") == camera), None)
+        if not entry:
+            raise TrainingError(f"intrinsics {runs[0]} has no {camera}")
+        path = Path(str(entry.get("intrinsics_json") or ""))
+        if not path.is_file():  # written with the absolute path of the machine that made it
+            path = run_dir / "converted" / path.parent.name / path.name
+        if not path.is_file():
+            raise TrainingError(f"intrinsics of {camera} in {runs[0]}: file missing")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data["camera_matrix"], data["dist_coeffs"], str(data.get("model") or entry.get("model") or "")
+
+    def _fingertip_targets(self, root: Path, info: dict[str, Any], camera: str,
+                           hand: str) -> tuple[list[tuple[float, float, float]], list[int]]:
+        """Where the fingertip (the exported TCP) was in ``camera``'s image, frame by frame, with the pixel
+        radius of :data:`CROP_OBJECT_RADIUS_M` at its depth: rig pose in the camera · rig->TCP from the
+        world poses of both, projected with the intrinsics the labels were made with."""
+        import numpy as np
+        import pyarrow.parquet as pq
+
+        if hand not in ("left", "right"):
+            raise TrainingError("hand is left or right")
+        cols = {"rig_cam": f"observation.cube_pose.{hand}.camera.{camera}",
+                "rig_world": f"observation.cube_pose.{hand}.world", "tcp_world": f"observation.ee_pose.{hand}.world"}
+        features = info.get("features") or {}
+        absent = [c for c in cols.values() if c not in features]
+        if absent:
+            raise TrainingError(f"the export has no {', '.join(absent)}")
+        kmat, dist, model = self._camera_intrinsics(info, camera)
+        files = sorted((root / "data").rglob("*.parquet"))
+        if not files:
+            raise TrainingError("the export has no data files")
+        parts: dict[str, list] = {k: [] for k in (*cols, "episode")}
+        for f in files:
+            table = pq.read_table(f, columns=[*cols.values(), "episode_index"])
+            for key, col in cols.items():
+                parts[key].append(np.asarray(table.column(col).to_pylist(), dtype=float).reshape(-1, 7))
+            parts["episode"].append(np.asarray(table.column("episode_index").to_pylist(), dtype=int))
+        t_c_rig, ok_c = _pose_matrices(np.concatenate(parts["rig_cam"]))
+        t_w_rig, ok_r = _pose_matrices(np.concatenate(parts["rig_world"]))
+        t_w_tcp, ok_t = _pose_matrices(np.concatenate(parts["tcp_world"]))
+        episodes = np.concatenate(parts["episode"])
+        ok = ok_c & ok_r & ok_t
+        if not ok.any():
+            return [], []
+        p_tcp = (t_c_rig[ok] @ np.linalg.inv(t_w_rig[ok]) @ t_w_tcp[ok])[:, :3, 3]
+        front = p_tcp[:, 2] > 0.05
+        p_tcp, eps = p_tcp[front], episodes[ok][front]
+        uv = project_camera_points(p_tcp, kmat, dist, model)
+        radius = float(np.asarray(kmat)[0][0]) * CROP_OBJECT_RADIUS_M / p_tcp[:, 2]
+        return [(float(u), float(v), float(r)) for (u, v), r in zip(uv, radius, strict=True)], [int(e) for e in eps]
 
     # --------------------------------------------------------------- runs ---
     def local_run_active(self) -> bool:
