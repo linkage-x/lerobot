@@ -447,7 +447,7 @@
       <tr><td class="k">TCP 位姿（相对量，见上）</td><td>相机追踪采集器上的 rig，训练读数据时换成相对量 / <b>这台臂的 FK</b>（基座系，不经过注册边）</td><td>
         <ul>
           <li>臂上的夹爪没有 rig，推理时 FK 是<b>唯一来源</b>。训练和推理的位姿来自不同的测量链：固定偏移被相对量抵消了，但噪声特性不同（追踪逐帧有毫米级抖动，FK 很平滑），训练时要考虑。</li>
-          <li>FK 算到和训练标签同一个点（夹爪球窝中心，<code>corenetic_gripper_ee</code>），不是法兰，也不是旧的 TCP 点。TCP 点不一致不会被抵消：它会让旋转带出错误的平移。</li>
+          <li>FK 算到和训练标签同一个点：夹爪球窝中心，在臂的 URDF 里是 <code>corenetic_socket_ee</code>（轴向和 <code>corenetic_gripper_ee</code> 相同，原点比它远 33.5 mm）。不是法兰，不是 <code>corenetic_gripper_ee</code> 的原点，也不是旧的 TCP 点。TCP 点不一致不会被抵消：它会让旋转带出错误的平移。</li>
           <li>相对量的换算训练和推理共用一份代码，帧时间对齐方式也一样。</li>
         </ul></td></tr>
       <tr><td class="k">BOX 开度、触觉、外力</td><td>采集器的 BOX / 臂上夹爪的 BOX</td><td>
