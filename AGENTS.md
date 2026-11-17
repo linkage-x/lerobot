@@ -34,7 +34,8 @@ replay them. Mistakes here move real robots and corrupt datasets other people de
 Production is `/home/nvidia/lerobot` on Thor (gateway port 8765). Everyone's recordings and the students' GUI
 run there. **Never deploy to it, never edit files in it, never restart its gateway.** `run/deploy.sh` refuses a
 production deploy unless the tree is clean and HEAD is already on `origin/box`; do not work around that, and
-never pass `--maintainer` (it is for maintainers deploying a reviewed commit).
+never pass `--maintainer` (it is for maintainers deploying a reviewed commit). How maintainers deploy production
+(the deploy copy on corenetic, the students' frontend on port 5180): `run/README.md`.
 
 There is more than one Thor. Machines are listed in `run/targets/` (`python3 run/targets.py list`); `thor` means
 `thor1`. Every script needs the machine named; there is no default. Every Thor has its own production tree, the

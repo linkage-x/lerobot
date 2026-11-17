@@ -261,31 +261,12 @@ bash ~/lerobot/run/run_vite.sh &
 
 ## 9. 本地开发 → Thor 部署
 
-### 一键部署
+本节原来的「一键部署」写法（本机起 vite、脚本里写死 Thor 地址）已过时。现在的做法：
 
-开发机改完代码后一条命令完成 同步 → 重启 gateway → 启动前端：
-
-```bash
-bash run/deploy.sh thor1               # 全流程：sync + restart gateway + start vite（必须写明目标，见 run/targets/）
-bash run/deploy.sh thor1 --sync-only   # 只同步代码，不重启/不启前端
-bash run/deploy.sh thor1 --no-frontend # 同步 + 重启 gateway，不启前端
-```
-
-脚本执行：
-1. `rsync` 增量同步到 `nvidia@192.168.111.122:~/lerobot`（~1s）；EE-trajectory 标定目录 best-effort 同步，缺失只告警，需硬校验时使用 `REQUIRE_EE_CALIBRATION=1 bash run/deploy.sh thor1`
-2. SSH 到 Thor：kill 旧 gateway → `ensure_box_net.sh` → `setup_env.sh` → 后台启动 gateway
-3. 本地 `npm run dev` 启动 vite，代理 → `192.168.111.122:8765`
-4. 浏览器打开 `http://localhost:5173/`
-
-### 单独操作
-
-```bash
-bash run/sync_to_thor.sh            # 只同步（增量 ~1s）
-bash run/sync_to_thor.sh --dry-run  # 预览同步内容
-```
-
-`sync_to_thor.sh` 排除 `.git/`、`node_modules/`、`outputs/`、Thor 本地的
-`run/run_gateway.sh` / `run/restart_gateway.sh` / `run/logs/` 等。
+- 学生、agent：部署到自己的沙箱，`bash run/deploy.sh thor1 --sandbox <名字>`（[AGENTS.md](../../AGENTS.md) 第 3 节）。
+- 生产（maintainer）：从 corenetic 上的部署副本部署，学生前端在 corenetic 的 5180 端口，见
+  [run/README.md](../../run/README.md)。
+- 机器地址和生产目录：[run/targets/](../../run/targets/README.md)，部署时必须写明目标。
 
 ## 10. 已知问题与已修复的坑
 
