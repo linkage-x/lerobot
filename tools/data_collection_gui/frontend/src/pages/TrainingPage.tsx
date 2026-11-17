@@ -75,7 +75,7 @@ function CameraEditor({
   const box = crop ?? full;
   const out = box ? outputSize(box, longSide) : null;
   const suggest = async () => {
-    setNote("Looking at where the gripper rig was seen…");
+    setNote("Looking at where the gripper rig and its fingertip were seen…");
     try {
       const result = await trainingApi.crop(exportName, name, hand);
       onCrop(result.crop);

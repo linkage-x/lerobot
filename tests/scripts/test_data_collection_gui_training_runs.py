@@ -51,13 +51,106 @@ def _manager(tmp_path: Path, **kw) -> tr.TrainingManager:
     return tr.TrainingManager(repo, exports_root=tmp_path / "exports", datasets_root=tmp_path / "datasets", **kw)
 
 
-def test_suggest_crop_boxes_the_rig_with_margin_at_4_by_3_inside_the_image():
+def test_suggest_crop_boxes_the_rig_with_margin_square_inside_the_image():
     pts = [(300.0, 400.0), (900.0, 400.0), (300.0, 700.0), (900.0, 700.0)] * 50
     x0, y0, x1, y1 = tr.suggest_crop(pts, (1920, 1080))
     assert x0 <= 300 and x1 >= 900 and y0 <= 400 and y1 >= 700
-    assert (x1 - x0) / (y1 - y0) == pytest.approx(4 / 3, rel=0.01)
+    assert (x1 - x0) / (y1 - y0) == pytest.approx(1.0, rel=0.01)
     assert x0 >= 0 and x1 <= 1920 and y0 >= 0 and y1 <= 1080
+    x0, y0, x1, y1 = tr.suggest_crop(pts, (1920, 1080), aspect=4 / 3)
+    assert (x1 - x0) / (y1 - y0) == pytest.approx(4 / 3, rel=0.01)
     assert tr.suggest_crop([], (1920, 1080)) == [0, 0, 1920, 1080]
+
+
+def test_suggest_crop_keeps_what_the_fingertip_handled_below_the_rig():
+    rig = [(500.0, 350.0), (900.0, 350.0), (500.0, 700.0), (900.0, 700.0)] * 50
+    # the fingertip reaches down to the table, an object of 100 px radius around it
+    targets = [(700.0, v, 100.0) for v in range(500, 960, 10)]
+    old = tr.suggest_crop(rig, (1920, 1080), margin=0.2, aspect=4 / 3)
+    assert tr.crop_target_coverage(old, targets, size=(1920, 1080))["inside"] < 0.5
+    crop = tr.suggest_crop(rig, (1920, 1080), targets=targets)
+    assert crop[2] - crop[0] == pytest.approx(crop[3] - crop[1], abs=2)
+    assert tr.crop_target_coverage(crop, targets, size=(1920, 1080))["inside"] == 1.0
+
+
+def test_suggest_crop_gives_up_the_square_never_the_targets():
+    targets = [(u, 540.0, 50.0) for u in range(200, 1700, 20)]  # 1600 px wide, the image is 1080 high
+    crop = tr.suggest_crop([], (1920, 1080), targets=targets)
+    assert crop[2] - crop[0] > 1500 and crop[3] - crop[1] <= 1080
+    cov = tr.crop_target_coverage(crop, targets, [0] * len(targets), size=(1920, 1080))
+    assert cov["inside"] >= 0.98 and cov["worstEpisode"] == 0
+
+
+def test_crop_coverage_does_not_blame_the_crop_for_what_is_outside_the_image():
+    target = [(500.0, 1050.0, 100.0)]  # half of it below the image
+    assert tr.crop_target_coverage([0, 0, 1920, 1080], target)["inside"] == 0.0
+    assert tr.crop_target_coverage([0, 0, 1920, 1080], target, size=(1920, 1080))["inside"] == 1.0
+
+
+@pytest.mark.parametrize("model", ["opencv_fisheye", "opencv"])
+def test_projection_matches_opencv(model):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    kmat = np.array([[993.0, 0.0, 966.0], [0.0, 993.2, 561.4], [0.0, 0.0, 1.0]])
+    pts = np.random.default_rng(0).uniform([-0.6, -0.4, 0.4], [0.6, 0.4, 1.6], (500, 3))
+    if model == "opencv_fisheye":
+        dist = np.array([-0.068, -0.021, 0.024, -0.011])
+        ref = cv2.fisheye.projectPoints(pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), kmat, dist.reshape(4, 1))[0]
+    else:
+        dist = np.array([-0.1, 0.02, 0.001, -0.002, 0.003])
+        ref = cv2.projectPoints(pts, np.zeros(3), np.zeros(3), kmat, dist)[0]
+    assert np.abs(tr.project_camera_points(pts, kmat, dist, model) - ref.reshape(-1, 2)).max() < 1e-6
+
+
+def test_crop_suggestion_projects_the_fingertip_with_the_labels_intrinsics(tmp_path):
+    np = pytest.importorskip("numpy")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "exports" / "e1"
+    (root / "meta").mkdir(parents=True)
+    (root / "data" / "chunk-000").mkdir(parents=True)
+    pose = {"dtype": "float32", "shape": [7]}
+    info = {
+        "fps": 60,
+        "features": {
+            "observation.images.cam_06": {"dtype": "video", "shape": [1080, 1920, 3]},
+            "observation.cube_pose.right.camera.cam_06": pose,
+            "observation.cube_pose.right.world": pose,
+            "observation.ee_pose.right.world": pose,
+        },
+        "label_provenance": {"key": {"intrinsics": ["calib_x_intrinsics"]}},
+    }
+    (root / "meta" / "info.json").write_text(json.dumps(info))
+    (root / "meta" / "export_sources.json").write_text(json.dumps({"episodes": []}))
+    run = tmp_path / "repo" / "outputs" / "calibration" / "calib_x_intrinsics"
+    (run / "converted" / "cam_06_S1").mkdir(parents=True)
+    kmat = [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]]
+    (run / "converted" / "cam_06_S1" / "intrinsics_producer.json").write_text(
+        json.dumps({"camera_matrix": kmat, "dist_coeffs": [[0.0, 0.0, 0.0, 0.0]], "model": "opencv_fisheye"}))
+    # written on another machine: the absolute path does not exist here
+    (run / "summary.json").write_text(json.dumps({"cameras": [{
+        "camera_name": "cam_06", "intrinsics_json": "/elsewhere/converted/cam_06_S1/intrinsics_producer.json"}]}))
+    n = 51
+    # world = camera; the rig 0.2 m above the fingertip, which moves along x at 1 m depth
+    tcp = [[x, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] for x in np.linspace(-0.2, 0.2, n)]
+    rig = [[x, -0.2, 1.0, 0.0, 0.0, 0.0, 1.0] for x in np.linspace(-0.2, 0.2, n)]
+    table = pa.table({
+        "episode_index": [0] * n,
+        "observation.cube_pose.right.camera.cam_06": rig,
+        "observation.cube_pose.right.world": rig,
+        "observation.ee_pose.right.world": tcp,
+    })
+    pq.write_table(table, root / "data" / "chunk-000" / "file-000.parquet")
+    m = _manager(tmp_path)
+    targets, eps = m._fingertip_targets(root, info, "cam_06", "right")
+    assert len(targets) == n and set(eps) == {0}
+    u, v, r = targets[n // 2]
+    assert (u, v) == pytest.approx((960.0, 540.0), abs=1e-6) and r == pytest.approx(50.0)
+    result = m.crop_suggestion("e1", "cam_06", "right")
+    assert result["targets"] == n and result["coverage"]["inside"] == 1.0
+    x0, y0, x1, y1 = result["crop"]
+    assert x1 - x0 == pytest.approx(y1 - y0, abs=2)
+    assert "fingertip" in result["note"]
 
 
 def test_exports_list_says_which_can_train_and_why_not(tmp_path):

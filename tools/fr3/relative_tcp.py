@@ -338,8 +338,9 @@ def targets_from_actions(T_obs_base: np.ndarray, actions: np.ndarray) -> tuple[n
 def crop_resize(image: np.ndarray, camera: CameraInput) -> np.ndarray:
     """HxWx3 uint8 source frame -> camera.height x camera.width x 3 uint8 (area interpolation).
 
-    Inference applies this to the recorder's frame; training gets the same crop from a transcoded copy of
-    the export's video (``ffmpeg crop + scale``), so the two differ only by the video codec.
+    Inference applies this to the recorder's frame; the training view (relative_tcp_data.transcode) applies
+    it to every decoded frame of the export's video and stores the result losslessly, so the two differ only
+    by the recording's video codec.
     """
     import cv2  # local: the gateway imports this module without cv2 on some machines
 
