@@ -315,7 +315,7 @@
       <ul>
         <li><b>Online Sync Manifest</b>：相机帧和 BOX 数据的时间对齐是否通过。</li>
         <li><b>Marker detection evidence</b>：每台相机的检测率，看是否大段丢检。</li>
-        <li><b>FR3 offline IK evaluation</b>：这只手的轨迹在对应臂的基座里逐帧求 IK，是否都够得着（<code>fr3_ik_reachability</code>）。<b>只作参考</b>（11-16 起）：够不着最多是 warn，不会让数据进不了训练集。能不能够着取决于臂放在哪、注册了没有，不是录得好不好；真机回放前的 MuJoCo 预演照样会逐段把关。</li>
+        <li><b>FR3 offline IK evaluation</b>：这只手的轨迹在对应臂的基座里逐帧求 IK，是否都够得着（<code>fr3_ik_reachability</code>）。<b>够不着的 episode 不进训练集</b>（11-17 起）：策略学的就是数据里的动作，教给它一段这台臂做不到的动作，rollout 时就会顶到工作空间边缘。只去掉 IK 判为不可达的那几条，其余照常导出（QC 显示 partial）。IK 没能逐条判断时（没有边能到任何臂的基座、校验程序出错）只是 warn，不挡导出。真机回放前的 MuJoCo 预演照样会逐段把关。</li>
       </ul>
       全部通过（或只有 warn）后状态变成 QC pass，按钮变成 <span class="ui">Open Replay</span>。</li>
   </ol>
@@ -484,7 +484,7 @@
     <li><b>选臂、摆位（这里用注册边）。</b>推理时轨迹是边执行边生成的，事先拿不到整条，所以按训练集轨迹覆盖的工作空间选臂和基座位置：把训练集的工作空间（相机世界系）经注册边换到这台臂的基座系，看够不够得着。导出日志里 <code>Deployable on …</code> 那几行是初步参考。边要在用：没退役，网页顶上没有 world_graph 守卫红条，车位自动检查没报 <code>moved</code>（车位检查只看已经录下的视频，推理前先按 <a href="#safety">第 2 节</a> 录一段 10 秒左右的视频）。车或臂挪过，先重新做注册（桌面 marker + 同球检验，见 <a href="#left-arm">第 10 节</a>）。这里边的几毫米误差只影响工作空间边界，不影响动作本身。</li>
     <li><b>换到基座系。</b>目标 = 观测时刻 t 的 FK(q<sub>t</sub>) · ΔT。要乘<b>观测那一刻</b>的位姿，不是执行时的当前位姿，否则推理延迟会让轨迹一路漂。</li>
     <li><b>IK，并按这台臂的速度、加速度重新做时间参数化。</b>人手的动作可能比臂允许的快。</li>
-    <li><b>每一段执行前检查可达性、碰撞和工作空间，不可达就停</b>，不能截断后照样执行。策略不知道自己在哪，所以执行层要把 TCP 限制在第 1 步算出的训练集工作空间里（基座系），出界就停。可达性在这一步查，所以 QC 里的 IK 只作参考（<a href="#trajgen">第 6 节</a>）。</li>
+    <li><b>每一段执行前检查可达性、碰撞和工作空间，不可达就停</b>，不能截断后照样执行。策略不知道自己在哪，所以执行层要把 TCP 限制在第 1 步算出的训练集工作空间里（基座系），出界就停。QC 里的 IK 已经把臂够不着的 episode 挡在训练集外（<a href="#trajgen">第 6 节</a>），但 rollout 时策略仍可能走到训练集之外，所以这一步还要查。</li>
     <li><b>阻抗执行，不做纯位置跟踪。</b>人手是柔顺的，刚性臂按同样的位姿去接触，产生的力会和示教时不同。</li>
   </ol>
   <div class="callout">
@@ -508,7 +508,8 @@
       <tr><td>推理报 <code>choose an arm … there is no default arm</code></td><td>推理没有默认臂。</td><td>加 <code>--arm right</code>。</td></tr>
       <tr><td>推理报 <code>no live registration edge connects world_… to fr3_base…</code></td><td>选的臂没有在用的注册边（左臂的边 11-03 已退役），或者守卫停用了到基座的边。</td><td>右臂换 <code>--arm right</code>；左臂先做第 10 节；有红条就找维护者。</td></tr>
       <tr><td>推理报 <code>…put in fr3_base through an edge that has since been retired…</code></td><td>旧数据集是用已退役的边换进左臂基座的。</td><td>在 Dataset Export 页重新导出（新导出留在相机世界系），再重新训练。</td></tr>
-      <tr><td>QC 的 <code>fr3_ik_reachability</code> 是 warn</td><td>轨迹有帧在这台臂当前的摆放下够不着，或者这台臂还没注册（左臂、新工位）。</td><td>不影响导出。要在这台臂上回放，就换一段 MuJoCo 能通过的 episode，或者在可达区重录。</td></tr>
+      <tr><td>QC 的 <code>fr3_ik_reachability</code> 失败，QC 显示 partial</td><td>这几条 episode 有帧在这台臂当前的摆放下够不着（错误几百毫米、上百度多半是 IK 在边界上换了解，不是真差那么多）。</td><td>这几条自动不进导出，其余照常。数据要全留，就在可达区重录，或者把臂挪到够得着的位置后请维护者重新注册边，再重跑 QC。</td></tr>
+      <tr><td>QC 的 <code>fr3_ik_reachability</code> 是 warn</td><td>IK 没能逐条判断：没有边能到任何臂的基座，或者校验程序出错。</td><td>不影响导出。看 QC 日志里的原因。</td></tr>
       <tr><td>导出报 <code>No episode of '…' passed QC on its current data</code>，或单个数据集报 <code>cannot be exported</code></td><td>这些 session 都没有对当前数据通过 QC：没跑、失败，或者 QC 之后数据变过。</td><td>在 Dataset Processing 对它们跑 QC（过期的点 <span class="ui">Re-run QC</span>）。</td></tr>
       <tr><td>导出日志 <code>Leaving out …: QC …</code></td><td>QC 没过的 episode，或者 QC 没跑、已过期的 session。</td><td>正常现象，其余照常导出。见第 6 节「哪些数据会进训练集」。</td></tr>
       <tr><td><span class="ui">1 · Move to trajectory start</span> 是灰的</td><td>MuJoCo 没通过 / 不是当前选择的结果 / 没选臂 / 回放已经在进行 / 这是导出后的数据集。</td><td>按第 7 节顺序重做。</td></tr>

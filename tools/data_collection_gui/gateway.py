@@ -2620,8 +2620,10 @@ def _processing_item_from_dataset(
             }.get(verdict.state, "pose_ready")
             message = str((qc or {}).get("reason") or (qc or {}).get("message") or "QC available")
             if verdict.state == qcv.PARTIAL:
+                total = (qc or {}).get("total_episodes")
+                passed = f"{total - len(verdict.excluded)}/{total}" if isinstance(total, int) else "?"
                 message = (
-                    f"QC passed {(qc or {}).get('passed_episodes', '?')}/{(qc or {}).get('total_episodes', '?')} episodes; "
+                    f"QC passed {passed} episodes; "
                     f"export leaves out episodes {_episode_list_text(verdict.excluded)}"
                 )
             elif verdict.state == qcv.STALE:
@@ -2646,8 +2648,15 @@ def _processing_item_from_dataset(
             "detectionSummary": detection_summary,
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
+            # From the verdict, not the stored list: it also holds the unreachable episodes a QC
+            # result from before 11-17 only warned about.
             "qcExcludedEpisodes": (
-                list(qc.get("excluded_episodes") or []) if status == "qc_partial" and isinstance(qc, dict) else []
+                [
+                    {"episode": ep, "checks": reason.removeprefix("QC: ").split(", ")}
+                    for ep, reason in sorted(verdict.excluded.items())
+                ]
+                if status == "qc_partial" and verdict is not None
+                else []
             ),
             "qcVerdict": (
                 {"state": verdict.state, "reason": verdict.reason} if verdict is not None else None
@@ -12976,20 +12985,27 @@ def _run_qc_checks(
         fps=int(info.get("fps") or 30),
     )
     if ik_evaluation["status"] != "skipped":
-        # Reachability belongs to a trajectory *and* an arm placed somewhere (its registered
-        # base), not to the recording: the export keeps the poses in the camera world they were
-        # recorded in, and deployment puts them in the driven arm's base through the edge live
-        # then. So it informs, and never fails a dataset or leaves an episode out of training:
-        # an arm not registered yet (the left arm since 11-03, a new station) would otherwise
-        # block every recording made there. Before an arm moves, real replay still needs its
-        # own per-episode MuJoCo validation; that gate does not read this.
+        # An episode the arm cannot reach where it stands stays out of training (11-17): a policy
+        # learns the motions it is shown, and one taught a motion the arm cannot make rolls out
+        # into the edge of its workspace. Only episodes IK named unreachable are left out, the
+        # rest of the dataset exports. An evaluation that could not judge episodes (no edge to
+        # any arm base, the verifier missing or failing) stays a warning, as before: that says
+        # nothing about the recording. Real replay still needs its own MuJoCo validation.
+        unreachable = qcv.ik_unreachable_episodes({"cubes": ik_evaluation["cubes"]})
+        if unreachable:
+            ik_status, ik_note = "fail", " (episodes the arm cannot reach stay out of the export)"
+        elif ik_evaluation["status"] == "fail":
+            ik_status, ik_note = "warn", " (reachability not judged per episode; the export does not wait on it)"
+        else:
+            ik_status, ik_note = ik_evaluation["status"], ""
         ik_check: dict[str, Any] = {
             "name": "fr3_ik_reachability",
-            "status": "warn" if ik_evaluation["status"] == "fail" else ik_evaluation["status"],
-            "message": ik_evaluation["message"]
-            + (" (reference for deployment; not part of the export decision)" if ik_evaluation["status"] == "fail" else ""),
+            "status": ik_status,
+            "message": ik_evaluation["message"] + ik_note,
             "details": {"cubes": ik_evaluation["cubes"]},
         }
+        if unreachable:
+            ik_check["episodes"] = sorted(unreachable)
         checks.append(ik_check)
 
     valid_rows = max(0, total_rows - invalid_rows)
