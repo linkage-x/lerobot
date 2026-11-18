@@ -235,9 +235,21 @@ if [[ -n "$sandbox" ]]; then
     # refreshed on every deploy; what it writes stays in its own copies.
     echo "    refreshing production's calibration, world state and gates into the dev tree..."
     mkdir -p "$repo_dir/outputs/calibration"
+    # Say what this refresh throws away: calibration results made on the dev gateway (camera solves, the
+    # ball check, BOX 6D captures) that production does not have, and dev-side world/gate files.
+    dev_only="$(rsync -a --delete -n --itemize-changes "$production_dir/outputs/calibration/" \
+      "$repo_dir/outputs/calibration/" | sed -n 's/^\*deleting  *//p')"
+    if [[ -n "$dev_only" ]]; then
+      echo "WARN: deleting $(wc -l <<<"$dev_only") path(s) under the dev tree's outputs/calibration that production" >&2
+      echo "      does not have (calibration done on the dev gateway; copy it out first if you need it):" >&2
+      head -20 <<<"$dev_only" | sed 's|^|        outputs/calibration/|' >&2
+    fi
     rsync -a --delete "$production_dir/outputs/calibration/" "$repo_dir/outputs/calibration/"
     for state_file in tools/thor/gmsl2/world/world_registration.json tools/thor/gmsl2/world/world_stable_source.json \
         outputs/box_six_d_origin.json outputs/world_graph_guard.json outputs/cart_check.json; do
+      if [[ -e "$repo_dir/$state_file" ]] && ! cmp -s "$production_dir/$state_file" "$repo_dir/$state_file"; then
+        echo "WARN: replacing the dev tree's ${state_file} with production's (it differed)" >&2
+      fi
       if [[ -e "$production_dir/$state_file" ]]; then
         mkdir -p "$(dirname "$repo_dir/$state_file")"
         cp -a "$production_dir/$state_file" "$repo_dir/$state_file"

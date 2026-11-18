@@ -32,6 +32,9 @@ describe("leaseBanner", () => {
     const held = leaseBanner(lease({ role: "dev", holder: "dev", mine: true }), "0123456789", "hph/x")!;
     expect(held.action).toBe("return");
     expect(held.text).toContain("01234567 (hph/x)");
+    // the dev gateway warns that a redeploy replaces calibration done on it
+    expect(held.text).toContain("outputs/calibration");
+    expect(leaseBanner(lease({ role: "dev", mine: false }))!.text).toContain("会被删掉");
   });
   it("lets only production clear an unreadable lease", () => {
     expect(leaseBanner(lease({ holder: "unknown", mine: false }))!.action).toBe("reclaim");
