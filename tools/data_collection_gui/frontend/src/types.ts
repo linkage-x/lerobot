@@ -1,4 +1,5 @@
-export type ServiceState = "offline" | "idle" | "running" | "warning" | "error";
+// not_opened: a camera the recorder did not open because it was connected for inference (Rollout page)
+export type ServiceState = "offline" | "idle" | "running" | "warning" | "error" | "not_opened";
 
 export type DeploymentProfile = {
   profile: "thor" | "workstation";

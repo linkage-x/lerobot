@@ -10961,3 +10961,37 @@ def test_connect_passes_the_inference_cameras_from_the_query(tmp_path, monkeypat
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_cameras_left_closed_for_inference_read_not_opened_not_error(tmp_path):
+    """Connected for inference, the cameras not asked for are not faults: nobody should power-cycle them."""
+    import urllib.error
+    import urllib.request
+
+    state = _thor_inference_state(tmp_path)
+    state.devices = [{"id": f"cam_{i:02d}", "kind": "camera", "state": "warning"} for i in (6, 7, 10)]
+    state.recording.inferenceCameras = ["cam_10"]
+    gateway._apply_recorder_output(state, "Cameras: cam_10")
+    assert {d["id"]: d["state"] for d in state.devices} == {
+        "cam_06": "not_opened", "cam_07": "not_opened", "cam_10": "running"}
+    gateway._apply_recorder_output(state, "Cameras: (none)")  # the one asked for failing is still an error
+    assert {d["id"]: d["state"] for d in state.devices}["cam_10"] == "error"
+    gateway._apply_recorder_output(state, "Cameras: cam_10")
+    gateway._set_active_device_states(state, "running")  # Episode ready must not light them up
+    assert [d["state"] for d in state.devices] == ["not_opened", "not_opened", "running"]
+
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/api/device-preview/camera.jpg?key=cam_06"
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(url, timeout=5)
+        assert err.value.code == 404 and "推理模式未连接" in json.loads(err.value.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # a full session: every camera the recorder names, and the rest as before
+    state.recording.inferenceCameras = []
+    gateway._apply_recorder_output(state, "Cameras: cam_06, cam_10")
+    assert [d["state"] for d in state.devices] == ["running", "error", "running"]

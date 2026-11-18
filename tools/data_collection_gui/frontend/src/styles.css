@@ -343,7 +343,8 @@ button.danger {
 
 .status-idle,
 .status-offline,
-.status-locked {
+.status-locked,
+.status-not_opened {
   background: #7b8791;
 }
 

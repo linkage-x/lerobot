@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CollectionTask, ProcessingItem, ProcessingStatus } from "../types";
-import { mujocoValidationMatchesSelection, taskExportPlan } from "./ui";
+import { mujocoValidationMatchesSelection, stateLabel, taskExportPlan } from "./ui";
 
 describe("mujocoValidationMatchesSelection", () => {
   it("holds a Thor validation to the cube it was run for", () => {
@@ -50,5 +50,12 @@ describe("taskExportPlan", () => {
     expect(plan.includedEpisodes).toBe(5);
     expect(plan.leftOutEpisodes).toBe(2);
     expect(plan.missingEpisodeCount).toBe(0);
+  });
+});
+
+describe("stateLabel", () => {
+  it("says a camera left closed by Connect for inference is not a fault", () => {
+    expect(stateLabel("not_opened")).toBe("推理模式未连接");
+    expect(stateLabel("sim_replay")).toBe("sim replay");
   });
 });

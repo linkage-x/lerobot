@@ -31,6 +31,8 @@ export function mujocoValidationMatchesSelection(
 }
 
 export function stateLabel(state: string) {
+  // a camera left closed by Connect for inference: not a fault (nobody should power-cycle it)
+  if (state === "not_opened") return "推理模式未连接";
   return state.replace("_", " ");
 }
 
