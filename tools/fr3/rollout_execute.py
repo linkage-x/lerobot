@@ -7,8 +7,9 @@ A person at the e-stop starts every run, from state A (start pose, gripper open,
     stage 2  closed loop, at most 5 s, the gripper not commanded
     stage 3  closed loop with the gripper, at most 15 s
 
-Nothing here runs without the maintainer's bounded per-arm unlock (real_execution_unlock), and the gateway
-refuses it in a sandbox, without the recorder, and while anything else holds the arm's FCI.
+It is started from the Rollout page by a person who confirms that the arm will move and a hand is on the
+e-stop; the gateway refuses it in a sandbox, without the recorder, before the checkpoint's preview passed its
+Replay check, and while anything else holds the arm's FCI.
 
 **One instant per observation.** The cameras reach the policy through the recorder's preview frame bus
 (about 5 Hz; a frame is 60-260 ms old when read), while the arm's FK is read at the loop's rate. Training
@@ -23,7 +24,8 @@ moment it is accepted (step 1 is then 33 ms away, not already late).
 
 **Every step is checked before it is commanded** (``assess``): IK inside the joint walls, the training
 workspace, the capsule model's clearance to carts/table/cameras (rollout_relative_tcp.PlanContext), at most
-STEP limits per 33 ms. A chunk is taken only when the n_action_steps it may have to carry alone are all
+STEP limits per 33 ms, and where the demonstrations went (rollout_distribution: near a training pose, no
+farther from the anchor than training's actions went by that step). A chunk is taken only when the n_action_steps it may have to carry alone are all
 executable; a failing later step only ends the chunk there. When the cursor reaches a step that is not
 executable, or a newer chunk does not come, the arm holds. It never clips or detours.
 
@@ -86,10 +88,20 @@ class Limits:
     # the first target against where the arm stands (the old runtime's default)
     first_target_mm: float = 30.0
     first_target_deg: float = 10.0
-    # one 33 ms step: training's peak hand speed was ~450 mm/s = 15 mm per step
+    # one 33 ms step. execute() replaces these with the checkpoint's own (step_limits: what one step of its
+    # training data did, p99.5 x1.5, under STEP_*_CEILING); these defaults only stand when there is none.
+    # 11-18, stack_act_wrist_v1: demonstration steps p50 5.9 / p99 22 / max 30 mm (~0.9 m/s, not tracking
+    # jumps), 12% of them above 15 mm -- the old "peak ~450 mm/s" was wrong
     step_mm: float = 15.0
     step_deg: float = 5.0
-    # one 33 ms step in any joint: 1.5 rad/s, about 60% of the FR3's slowest joint limit
+    # near the carts/table/cameras the demonstrations were slow: clearance < 100 mm, every step <= 13.4 mm
+    # (11-18, the same data through IK and the capsule model); fast only in free space (> 120 mm)
+    near_clearance_m: float = 0.10
+    near_step_mm: float = 15.0
+    # one 33 ms step in j1-j4: 1.5 rad/s, about 60% of their limit (2.62 rad/s); j5-j7 scale with their own
+    # limits (JOINT_SCALE: 2.0 / 1.6 / 2.0 x). 11-18 demonstrations through IK: j5/j7 above 0.05 rad in ~6%
+    # of steps, within their own 60% in ~2%; j1/j3 above in ~6% too, but at up to 4 rad/s -- past the
+    # hardware's 2.62 -- an IK redundancy matter, not a limit to loosen
     step_joint_rad: float = 0.05
     # a newer chunk against the command it replaces, at the moment of the switch
     switch_mm: float = 15.0
@@ -98,7 +110,7 @@ class Limits:
     tracking_mm: float = 20.0
     # |O_F_ext - its reading at the start|, force part
     force_n: float = 15.0
-    # a measured joint speed no plan here asks for (oscillation, runaway)
+    # a measured joint speed no plan here asks for (oscillation, runaway); j5-j7 x JOINT_SCALE
     joint_speed_rad_s: float = 1.6
     # a measured joint within this of panda_py's wall (IK keeps 3 deg; Monitor of fr3_pivot_auto keeps 1)
     wall_deg: float = 1.0
@@ -113,6 +125,10 @@ class Limits:
     start_speed_rad_s: float = 0.02
 
 
+FR3_VELOCITY_LIMITS = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])  # rad/s, dual_fr3_retarget
+JOINT_SCALE = FR3_VELOCITY_LIMITS / FR3_VELOCITY_LIMITS.min()  # the joint limits below are for j1-j4
+STEP_MM_CEILING = 40.0  # 1.2 m/s, whatever the data says: well under the FR3's Cartesian limit (1.7 m/s)
+STEP_DEG_CEILING = 8.0  # 240 deg/s
 LOOP_HZ = 200.0
 HOLD_S = 0.5  # the controller holds the last command this long after a stop, then lets go
 GRIPPER_CLOSE_BELOW_M = 0.050  # replay's grasp: below this the jaw is sent to 0 (squeeze, as in the demos)
@@ -266,15 +282,31 @@ class Chunk:
         return float(self.widths[k - 1])
 
 
+def step_limits(step1_m: float | None, step1_deg: float | None) -> dict[str, float]:
+    """The per-step limits for a checkpoint: what one step of its training data did (rollout_distribution:
+    p99.5 x1.5), never above the ceilings. A step limit catches what the demonstrations never did (an IK
+    branch change, a wild prediction); it does not slow the policy below its training, which would feed it
+    a history it never saw."""
+    out = {}
+    if step1_m is not None and math.isfinite(step1_m):
+        out["step_mm"] = round(min(STEP_MM_CEILING, step1_m * 1e3), 1)
+    if step1_deg is not None and math.isfinite(step1_deg):
+        out["step_deg"] = round(min(STEP_DEG_CEILING, step1_deg), 2)
+    return out
+
+
 def assess(
     T: np.ndarray,
     q: np.ndarray,
     plan_ok: np.ndarray,
     plan_why: list[str],
     limits: Limits,
+    gap: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Per step (0 = anchor): may it be commanded? A step fails on the plan check or on a STEP limit
-    against the step before it, and every step after a failed one fails with it."""
+    against the step before it, and every step after a failed one fails with it. ``gap`` (per target, m):
+    the arm's clearance to the carts/table/cameras there; closer than ``near_clearance_m`` the step limit
+    is ``near_step_mm``."""
     n = len(q)
     ok = np.ones(n, dtype=bool)
     why = [""] * n
@@ -286,14 +318,19 @@ def assess(
             reason = plan_why[k - 1] or "plan check"
         else:
             mm, deg = pose_gap(T[k - 1], T[k])
-            dq = float(np.abs(q[k] - q[k - 1]).max())
-            if mm > limits.step_mm:
+            over = np.abs(q[k] - q[k - 1]) / (limits.step_joint_rad * JOINT_SCALE)
+            near = gap is not None and k - 1 < len(gap) and gap[k - 1] < limits.near_clearance_m
+            if near and mm > limits.near_step_mm:
+                reason = (f"step {k}: {mm:.1f} mm in one step {gap[k - 1] * 1e3:.0f} mm from the carts/table/cameras "
+                          f"(limit {limits.near_step_mm:g} closer than {limits.near_clearance_m * 1e3:.0f} mm)")
+            elif mm > limits.step_mm:
                 reason = f"step {k}: {mm:.1f} mm in one step (limit {limits.step_mm:g})"
             elif deg > limits.step_deg:
                 reason = f"step {k}: {deg:.1f}° in one step (limit {limits.step_deg:g})"
-            elif dq > limits.step_joint_rad:
-                j = int(np.abs(q[k] - q[k - 1]).argmax())
-                reason = f"step {k}: j{j + 1} moves {dq:.3f} rad in one step (limit {limits.step_joint_rad:g}; an IK branch change?)"
+            elif over.max() > 1.0:
+                j = int(over.argmax())
+                reason = (f"step {k}: j{j + 1} moves {abs(q[k][j] - q[k - 1][j]):.3f} rad in one step "
+                          f"(limit {limits.step_joint_rad * JOINT_SCALE[j]:.3f}; an IK branch change?)")
         if reason:
             ok[k] = False
             why[k] = reason
@@ -362,9 +399,11 @@ def tick_problem(
 ) -> tuple[str, str]:
     """(kind, why) or ("", ""). Kinds "speed", "force", "tracking" hold where the arm is, not its command."""
     speed = np.abs(dq)
-    if speed.max() > limits.joint_speed_rad_s:
-        j = int(speed.argmax())
-        return "speed", f"j{j + 1} turns at {speed[j]:.2f} rad/s (limit {limits.joint_speed_rad_s:g}: oscillation or runaway)"
+    over = speed / (limits.joint_speed_rad_s * JOINT_SCALE)
+    if over.max() > 1.0:
+        j = int(over.argmax())
+        return "speed", (f"j{j + 1} turns at {speed[j]:.2f} rad/s (limit {limits.joint_speed_rad_s * JOINT_SCALE[j]:.2f}: "
+                         "oscillation or runaway)")
     force = float(np.linalg.norm(np.asarray(f_ext)[:3] - np.asarray(f0)[:3]))
     if force > limits.force_n:
         return "force", f"external force {force:.1f} N (limit {limits.force_n:g})"
@@ -551,7 +590,9 @@ class Predictor:
         plan = self.plan(hist[-1], actions, seed)
         T = np.concatenate([hist[-1][None], plan["T"]])
         q = np.concatenate([self.history.q_at(obs.t_img)[None], plan["q"]])
-        ok, why = assess(T, q, np.asarray(plan["ok"], dtype=bool), list(plan["why"]), L)
+        gap = plan.get("env_gap_m")
+        ok, why = assess(T, q, np.asarray(plan["ok"], dtype=bool), list(plan["why"]), L,
+                         None if gap is None else np.asarray(gap, dtype=float))
         chunk = Chunk(self.count, obs.t_img, obs.t_img, self.c.step_s, T, q, ok, why, actions[:H, rt.POSE_DIM].copy())
         self.count += 1
         return Prediction(obs, chunk, latency_s=latency, age_s=age, history=hist, actions=actions,
@@ -605,12 +646,16 @@ def run_loop(
     sleep=time.sleep,
     loop_hz: float = LOOP_HZ,
     record: Callable[[dict[str, Any]], None] | None = None,
+    start_check: Callable[[np.ndarray], str] | None = None,
 ) -> RunResult:
     """The control loop. Returns why it stopped ("" when the stage ran to its end)."""
     period = 1.0 / loop_hz
     q, dq, f0 = arm.read()
     if np.abs(dq).max() > limits.start_speed_rad_s:
         return RunResult(f"the arm is moving ({np.abs(dq).max():.3f} rad/s); it must stand still to start", False, 0, 0.0, 0, 0.0)
+    refusal = start_check(q) if start_check is not None else ""
+    if refusal:  # rollout_distribution check A: not where the demonstrations began
+        return RunResult(refusal, False, 0, 0.0, 0, 0.0)
     t_start = clock()
     # a short still history before anything is asked: the first observation's history is "standing still"
     for _ in range(max(3, int(0.15 * loop_hz))):

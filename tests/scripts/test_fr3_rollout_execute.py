@@ -112,7 +112,7 @@ def _policy(c: rt.PolicyContract, width=lambda k: 0.088):
 
 
 def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_ext=None, limits=rx.Limits(), width=lambda k: 0.088,
-         gripper=None, stop_flag=lambda: "", record=None):
+         gripper=None, stop_flag=lambda: "", record=None, start_check=None):
     c = _contract()
     clock = Clock()
     arm = FakeArm(clock, f_ext=f_ext)
@@ -131,7 +131,7 @@ def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_e
     result = rx.run_loop(arm=arm, predictor=pred, stage=stage, n_exec=16, limits=limits, fk_tcp=_fk,
                          wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
                          stop_flag=stop_flag, log=lambda **kw: seen.append(kw), gripper=gripper, clock=clock,
-                         sleep=clock.sleep, record=record)
+                         sleep=clock.sleep, record=record, start_check=start_check)
     return result, arm, seen
 
 
@@ -168,6 +168,14 @@ def test_a_chunk_whose_needed_step_is_not_executable_is_refused_and_the_arm_neve
     result, arm, _ = _run(rx.STAGES[1], fail_step=5)
     assert not result.completed and "step 5" in result.stopped and "IK" in result.stopped
     np.testing.assert_allclose(arm.q, Q0, atol=1e-6)
+
+
+def test_a_start_away_from_where_the_demonstrations_began_is_refused_before_the_arm_is_taken():
+    seen_q = []
+    result, arm, _ = _run(rx.STAGES[1], start_check=lambda q: seen_q.append(q) or "start: the TCP is 150 mm from where any training episode began")
+    assert not result.completed and result.stopped.startswith("start:") and result.chunks_accepted == 0
+    assert not arm.started and not arm.commands  # the controller was never started
+    np.testing.assert_allclose(seen_q[0], Q0)
 
 
 def test_a_failing_tail_step_ends_the_chunk_there_but_does_not_refuse_it():
@@ -215,6 +223,45 @@ def test_assess_ends_a_chunk_at_its_first_step_too_fast():
     assert "30.0 mm in one step" in why[3] and why[4] == "after step 3"
 
 
+def test_step_limits_are_the_checkpoints_own_under_the_ceilings():
+    assert rx.step_limits(0.0362, 4.49) == {"step_mm": 36.2, "step_deg": 4.49}
+    assert rx.step_limits(0.09, 20.0) == {"step_mm": rx.STEP_MM_CEILING, "step_deg": rx.STEP_DEG_CEILING}
+    assert rx.step_limits(None, None) == {}  # no distribution: the Limits defaults stand
+    lim = rx.Limits(**rx.step_limits(0.0362, 4.49))
+    assert lim.step_mm == 36.2 and lim.near_step_mm == 15.0
+
+
+def test_a_fast_step_passes_in_free_space_and_fails_near_the_carts_table_cameras():
+    lim = rx.Limits(step_mm=36.0)
+    T = np.repeat(np.eye(4)[None], 3, axis=0)
+    T[1, 0, 3], T[2, 0, 3] = 0.025, 0.050  # 25 mm per step
+    q = np.zeros((3, 7))
+    ok, _ = rx.assess(T, q, np.ones(2, bool), ["", ""], lim, np.array([0.30, 0.30]))
+    assert ok.all()
+    ok, why = rx.assess(T, q, np.ones(2, bool), ["", ""], lim, np.array([0.30, 0.06]))
+    assert ok.tolist() == [True, True, False]
+    assert "25.0 mm in one step 60 mm from the carts/table/cameras (limit 15 closer than 100 mm)" in why[2]
+    ok, why = rx.assess(T, q, np.ones(2, bool), ["", ""], rx.Limits(), None)  # the old 15 mm default
+    assert not ok[1] and "limit 15" in why[1]
+
+
+def test_joint_limits_scale_with_each_joints_own_speed_limit():
+    T = np.repeat(np.eye(4)[None], 2, axis=0)
+    q = np.zeros((2, 7))
+    q[1, 6] = 0.08  # j7: within 0.05 x 2.0
+    ok, _ = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
+    assert ok.all()
+    q[1, 0] = 0.06  # j1: over 0.05
+    ok, why = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
+    assert not ok[1] and "j1 moves 0.060 rad in one step (limit 0.050" in why[1]
+    kw = {"f_ext": np.zeros(6), "f0": np.zeros(6), "T_meas": np.eye(4), "T_cmd": np.eye(4), "loop_dt": 0.005,
+          "limits": rx.Limits(), "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
+          "q": np.array([0, 0, 0, -1.5, 0, 1.5, 0.0])}
+    assert rx.tick_problem(dq=np.array([0, 0, 0, 0, 0, 0, 3.0]), **kw) == ("", "")  # j7 under 1.6 x 2.0
+    kind, why = rx.tick_problem(dq=np.array([0, 0, 2.0, 0, 0, 0, 0]), **kw)
+    assert kind == "speed" and "j3 turns at 2.00 rad/s (limit 1.60" in why
+
+
 def test_history_is_read_at_the_observation_instant():
     h = rx.PoseHistory()
     for i in range(11):
@@ -238,15 +285,17 @@ def test_gripper_hysteresis_and_interval():
     assert g.decide(0.065, 1.0) == "open"
 
 
-def test_execute_reads_the_unlock_before_loading_anything(tmp_path: Path, monkeypatch):
-    from tools.fr3 import real_execution_unlock, relative_tcp_policy as rtp, rollout_relative_tcp as ro
+def test_execute_without_attended_loads_nothing_and_moves_nothing(tmp_path: Path, monkeypatch, capsys):
+    from tools.fr3 import relative_tcp_policy as rtp, rollout_relative_tcp as ro
 
     def nothing(*_a, **_k):
-        raise AssertionError("nothing may be loaded before the unlock is read")
+        raise AssertionError("nothing may be loaded without --attended")
 
     monkeypatch.setattr(rtp, "load_checkpoint", nothing)
-    with pytest.raises(real_execution_unlock.RealExecutionLockedError, match="executing a policy on the arm is locked"):
-        ro.execute(tmp_path / "ckpt", tmp_path / "rec", arm="right", stage=1, gateway="http://x", repo_root=tmp_path)
+    monkeypatch.setattr(ro, "execute", nothing)
+    rc = ro.main(["execute", "--checkpoint", str(tmp_path / "ckpt"), "--record", str(tmp_path / "rec"),
+                  "--arm", "right", "--stage", "1"])
+    assert rc == 1 and "a hand on the e-stop" in capsys.readouterr().err
     assert not (tmp_path / "rec").exists()
 
 
