@@ -10995,3 +10995,29 @@ def test_cameras_left_closed_for_inference_read_not_opened_not_error(tmp_path):
     state.recording.inferenceCameras = []
     gateway._apply_recorder_output(state, "Cameras: cam_06, cam_10")
     assert [d["state"] for d in state.devices] == ["running", "error", "running"]
+
+
+def test_box_rows_follow_the_live_feed_not_only_the_connect_time_roster(tmp_path):
+    """11-18: the BOX came up after Connect; it streamed and the policy read it while its rows stayed red."""
+    state = _thor_inference_state(tmp_path)
+    state.devices = [
+        {"id": "box_gripper", "kind": "box_collection", "state": "warning", "fps": 0},
+        {"id": "box_imu", "kind": "box_collection", "state": "warning", "fps": 0},
+        {"id": "3100715645/box_gripper", "kind": "box_collection", "state": "warning", "fps": 0},
+        {"id": "cam_10", "kind": "camera", "state": "running", "fps": 60},
+    ]
+    gateway._apply_recorder_output(state, "Box devices: (none)")
+    assert [d["state"] for d in state.devices][:3] == ["error", "error", "error"]
+
+    def live(fresh: dict[str, bool]) -> str:
+        sensors = {k: {"seen": True, "fresh": v, "observed_hz": 116.9 if v else 0.0} for k, v in fresh.items()}
+        return "BOX_LIVE " + json.dumps({"valid": any(fresh.values()), "sensors": {}, "status": {"sensor_status": sensors}})
+
+    gateway._apply_recorder_output(state, live({"box_gripper": True, "box_imu": True}))
+    assert [(d["state"], d["fps"]) for d in state.devices] == [
+        ("running", 117), ("running", 117), ("error", 0), ("running", 60)]  # the roster row is not guessed at
+    gateway._apply_recorder_output(state, live({"box_gripper": False, "box_imu": True}))
+    assert [d["state"] for d in state.devices][:2] == ["error", "running"]
+    gateway._apply_recorder_output(state, 'BOX_LIVE {"valid": false, "sensors": {}, "status": {}}')
+    assert [d["state"] for d in state.devices][:2] == ["error", "running"]
+    assert state.device_preview["box"]["active"] is True
