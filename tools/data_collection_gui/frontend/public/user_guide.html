@@ -164,7 +164,7 @@
       <tr><td class="k">带头部相机录制</td><td><span class="badge b-warn">暂不使用</span></td><td>当前不带 head 录制，界面里只显示 left / right 两只手。</td></tr>
       <tr><td class="k">导出 LeRobot 数据集</td><td><span class="badge b-warn">能跑，未验证</span></td><td>导出的标签一律保留在录制时的相机世界系，日志会列出这份数据目前能部署到哪台臂。部署时由推理端按臂名查注册边，这条链路还没在真机上跑过。见 <a href="#export">第 8 节</a>。</td></tr>
       <tr><td class="k">策略训练（Training 页）</td><td><span class="badge b-warn">能跑，未在真机验证</span></td><td>11-16 起：在网页上对 QC 后的导出训练 ACT（本机或 ssh 远程机器），可停止、续训，checkpoint 带输入规格和来源，能重新加载。见 <a href="#train">第 8 节</a>。</td></tr>
-      <tr><td class="k">Rollout（离线预测 / 在线预览 / 分步执行）</td><td><span class="badge b-warn">执行要维护者解锁</span></td><td>离线预测、在线预览（实时相机 + BOX）和执行前检查都能用；<b>上真机执行分三步，每次由急停旁的人启动，要维护者为这条臂写限时解锁</b>。旧推理代码已过时，不要用。见 <a href="#rollout-execute">第 8 节</a>。</td></tr>
+      <tr><td class="k">Rollout（离线预测 / 在线预览 / 分步执行）</td><td><span class="badge b-warn">执行时手放急停</span></td><td>离线预测、在线预览（实时相机 + BOX）和执行前检查都能用；<b>上真机执行分三步，每次由急停旁的人启动，弹窗确认手放急停</b>。旧推理代码已过时，不要用。见 <a href="#rollout-execute">第 8 节</a>。</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -259,7 +259,7 @@
       <tr><td class="k">Episode Replay</td><td>回看视频和轨迹、MuJoCo 预演、真机回放、标注。</td></tr>
       <tr><td class="k">Dataset Export</td><td>导出 LeRobot v3 数据集（见第 8 节的限制）。</td></tr>
       <tr><td class="k">Training</td><td>在 QC 后的导出上训练策略（相对位姿），停止、续训、拉回 checkpoint、看日志。</td></tr>
-      <tr><td class="k">Rollout</td><td>离线预测、在线预览、执行前检查（臂不动）；分步执行（臂动，要解锁）。</td></tr>
+      <tr><td class="k">Rollout</td><td>离线预测、在线预览、执行前检查（臂不动）；分步执行（臂动，弹窗确认手放急停）。</td></tr>
     </tbody>
   </table></div>
   <p class="muted small">Teleoperation 页只在工作站（RealSense + Pika）版本里出现，和本指南无关。</p>
@@ -431,7 +431,7 @@
     <li><b>臂上的 TCP 点</b>：训练标签的点是插件 nov4 的球窝中心（轴向和 <code>corenetic_gripper_ee</code> 相同），在臂的 URDF 里是 <code>corenetic_socket_ee</code>，比 <code>corenetic_gripper_ee</code> 的原点远 33.5 mm。执行层的 FK 一律算到 <code>corenetic_socket_ee</code>，代码里有检查。</li>
   </ol>
   <h3 id="rollout-execute">分步执行（11-18 起，臂会动）</h3>
-  <p><b>前提</b>（缺一条 Execute 按钮就是灰的，网关也会再查一遍）：Thor 生产网关（沙箱没有臂）、录制器已 Connect、同一个 checkpoint 的在线预览已经做过 <span class="ui">Replay check</span> 且结果一致、<b>维护者在场时为这条臂写了限时解锁</b>（<code>outputs/fr3_infer_real_unlock.json</code>，最长 12 h，写法见 <code>tools/fr3/real_execution_unlock.py</code>；agent 不写这个文件）、没有别的任务占着这条臂的 FCI（真机 replay、pivot、归位……），并勾选「我在急停旁」。从 A 状态开始：起始位、夹爪张开、方块按录制时摆。</p>
+  <p><b>前提</b>（缺一条 Execute 按钮就是灰的，网关也会再查一遍）：Thor 生产网关（沙箱没有臂）、录制器已 Connect、同一个 checkpoint 的在线预览已经做过 <span class="ui">Replay check</span> 且结果一致、没有别的任务占着这条臂的 FCI（真机 replay、pivot、归位……）。点 Execute 会弹窗提示<b>「机器人会动，手放急停」</b>，手放在急停上再点确认才开始（11-18 起不再需要维护者写解锁文件；agent 不会替你点）。从 A 状态开始：起始位、夹爪张开、方块按录制时摆。</p>
   <table>
     <thead><tr><th>步</th><th>做什么</th><th>看什么</th></tr></thead>
     <tbody>

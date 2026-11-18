@@ -27,16 +27,6 @@ export type RolloutStatus = {
   // connected for inference: the only cameras the recorder opened ([] = a full session)
   recorderCameras?: string[];
   executeStages?: Record<string, string>;
-  unlock?: Record<string, ArmUnlock>;
-};
-
-export type ArmUnlock = {
-  arm: string;
-  unlocked: boolean;
-  why?: string;
-  by?: string;
-  reason?: string;
-  expires?: string;
 };
 
 export type RolloutCheckpoint = {

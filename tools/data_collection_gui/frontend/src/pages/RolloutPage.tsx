@@ -208,7 +208,7 @@ export function RolloutPage() {
   const [rate, setRate] = useState(2);
   const [readJoints, setReadJoints] = useState(false);
   const [stage, setStage] = useState(1);
-  const [attended, setAttended] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const [selected, setSelected] = useState<ResultRow | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -251,12 +251,11 @@ export function RolloutPage() {
   const previewReplayed = Boolean(
     ckpt && results.some((r) => r.kind === "preview" && r.replayCheck?.ok && runPath(r.checkpoint) === runPath(ckpt.path))
   );
-  const blockers = executeBlockers({ status, checkpoint: ckpt, arm, attended, previewReplayed });
+  const blockers = executeBlockers({ status, checkpoint: ckpt, previewReplayed });
   const openCameras = status?.recorderCameras ?? [];
   const forInference = Boolean(status?.recorderConnected && openCameras.length);
   const wrongCameras = cameraBlocker(status, ckpt);
   const executing = running?.kind === "execute" ? running : undefined;
-  const lock = status?.unlock?.[arm];
   const episodeList = useMemo(
     () => episodes.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n >= 0),
     [episodes]
@@ -286,8 +285,8 @@ export function RolloutPage() {
           ))}
         </ol>
         <p className="panel-note">
-          Executing a policy on the arm (section 3) starts only by a person at the e-stop, on an arm a maintainer
-          has unlocked for a bounded time, after a preview of the same checkpoint passed its Replay check.
+          Executing a policy on the arm (section 3) starts only by a person with a hand on the e-stop, who confirms
+          the dialog, after a preview of the same checkpoint passed its Replay check.
         </p>
       </section>
 
@@ -427,11 +426,7 @@ export function RolloutPage() {
       <section className="panel rollout-execute">
         <div className="panel-heading">
           <h2>3 · Execute on the arm</h2>
-          <span>
-            {lock?.unlocked
-              ? `${arm} arm unlocked by ${lock.by} until ${lock.expires}`
-              : `${arm} arm locked`}
-          </span>
+          <span>{arm} arm</span>
         </div>
         <p className="panel-note">
           <strong>The arm moves.</strong> Start from the start pose with the gripper open and the cubes as recorded,
@@ -449,10 +444,6 @@ export function RolloutPage() {
             ))}
           </select>
           <span className="panel-note">arm: {arm} (chosen in section 2)</span>
-          <label className="train-inline">
-            <input type="checkbox" checked={attended} onChange={(e) => setAttended(e.target.checked)} />
-            I am at the e-stop
-          </label>
           {executing ? (
             <button className="danger rollout-stop" onClick={() => act(() => rolloutApi.stop(executing.id))}>
               STOP (hold the arm)
@@ -462,12 +453,7 @@ export function RolloutPage() {
               className="danger"
               disabled={blockers.length > 0}
               title={blockers.join("; ")}
-              onClick={() =>
-                act(async () => {
-                  await rolloutApi.execute(checkpoint, arm, stage, attended);
-                  setAttended(false);
-                })
-              }
+              onClick={() => setConfirmOpen(true)}
             >
               Execute stage {stage}
             </button>
@@ -481,6 +467,32 @@ export function RolloutPage() {
               <li key={b}>{b}</li>
             ))}
           </ul>
+        ) : null}
+        {confirmOpen ? (
+          <div className="danger-modal-backdrop" role="presentation">
+            <div aria-labelledby="rollout-execute-confirm" aria-modal="true" className="danger-modal" role="dialog">
+              <h3 id="rollout-execute-confirm">机器人会动，手放急停</h3>
+              <p>
+                The {arm} arm runs stage {stage} of <strong>{runPath(checkpoint)}</strong>. Keep a hand on the
+                e-stop until it holds.
+              </p>
+              <div className="danger-modal-actions">
+                <button autoFocus onClick={() => setConfirmOpen(false)} type="button">
+                  取消
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => {
+                    setConfirmOpen(false);
+                    act(() => rolloutApi.execute(checkpoint, arm, stage, true));
+                  }}
+                  type="button"
+                >
+                  手已放在急停上，执行
+                </button>
+              </div>
+            </div>
+          </div>
         ) : null}
       </section>
 

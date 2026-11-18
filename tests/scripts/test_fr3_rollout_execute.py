@@ -238,15 +238,17 @@ def test_gripper_hysteresis_and_interval():
     assert g.decide(0.065, 1.0) == "open"
 
 
-def test_execute_reads_the_unlock_before_loading_anything(tmp_path: Path, monkeypatch):
-    from tools.fr3 import real_execution_unlock, relative_tcp_policy as rtp, rollout_relative_tcp as ro
+def test_execute_without_attended_loads_nothing_and_moves_nothing(tmp_path: Path, monkeypatch, capsys):
+    from tools.fr3 import relative_tcp_policy as rtp, rollout_relative_tcp as ro
 
     def nothing(*_a, **_k):
-        raise AssertionError("nothing may be loaded before the unlock is read")
+        raise AssertionError("nothing may be loaded without --attended")
 
     monkeypatch.setattr(rtp, "load_checkpoint", nothing)
-    with pytest.raises(real_execution_unlock.RealExecutionLockedError, match="executing a policy on the arm is locked"):
-        ro.execute(tmp_path / "ckpt", tmp_path / "rec", arm="right", stage=1, gateway="http://x", repo_root=tmp_path)
+    monkeypatch.setattr(ro, "execute", nothing)
+    rc = ro.main(["execute", "--checkpoint", str(tmp_path / "ckpt"), "--record", str(tmp_path / "rec"),
+                  "--arm", "right", "--stage", "1"])
+    assert rc == 1 and "a hand on the e-stop" in capsys.readouterr().err
     assert not (tmp_path / "rec").exists()
 
 

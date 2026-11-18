@@ -7,8 +7,9 @@ A person at the e-stop starts every run, from state A (start pose, gripper open,
     stage 2  closed loop, at most 5 s, the gripper not commanded
     stage 3  closed loop with the gripper, at most 15 s
 
-Nothing here runs without the maintainer's bounded per-arm unlock (real_execution_unlock), and the gateway
-refuses it in a sandbox, without the recorder, and while anything else holds the arm's FCI.
+It is started from the Rollout page by a person who confirms that the arm will move and a hand is on the
+e-stop; the gateway refuses it in a sandbox, without the recorder, before the checkpoint's preview passed its
+Replay check, and while anything else holds the arm's FCI.
 
 **One instant per observation.** The cameras reach the policy through the recorder's preview frame bus
 (about 5 Hz; a frame is 60-260 ms old when read), while the arm's FK is read at the loop's rate. Training

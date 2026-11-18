@@ -5,8 +5,8 @@
     offline   predict on a QC-gated export through the online code path, against what the hand did
     preview   predict on the recorder's live cameras and BOX with the arm still; record every input
     replay    feed a preview record back through the offline path: the predictions must be identical
-    execute   drive the arm with the policy, by stages (rollout_execute): a person at the e-stop starts it,
-              and nothing moves without the maintainer's unlock for that arm (real_execution_unlock)
+    execute   drive the arm with the policy, by stages (rollout_execute): a person with a hand on the e-stop
+              starts it from the Rollout page, confirming a dialog that says the arm will move (--attended)
 
 What is the same online and offline (user guide #infer-inputs), and where it lives:
 
@@ -68,7 +68,7 @@ STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
     {"id": "plan", "label": "Execution plan check (IK, workspace, collision) on every prediction", "status": "available"},
-    {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
+    {"id": "execute", "label": "Execution on the arm (stages 1-3, a hand on the e-stop)", "status": "available"},
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
 WORKSPACE_MARGIN_M = 0.03
@@ -622,9 +622,9 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
 # ------------------------------------------------------------------ execute ---
 
 
-EXECUTE_LOCKED = (
-    "executing a policy on the arm is locked: a maintainer who is present unlocks one arm for a bounded time "
-    "(tools/fr3/real_execution_unlock.py); until then the Rollout page runs the preview only"
+NOT_ATTENDED = (
+    "execute moves the arm: it is started from the Rollout page by a person with a hand on the e-stop, who "
+    "confirms its dialog (--attended); nothing was loaded and nothing moved"
 )
 
 
@@ -639,19 +639,17 @@ def execute(
     device: str | None = None,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
-    """One staged run on the arm (rollout_execute). The unlock is read before anything is loaded."""
+    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``."""
     import cv2
 
     from tools.fr3 import (
         fr3_arms,
         fr3_kinematics as kin,
-        real_execution_unlock,
         relative_tcp_policy as rtp,
         rollout_execute as rx,
     )
     from tools.thor.gmsl2 import cart_state
 
-    unlock = real_execution_unlock.read(arm, repo_root=repo_root, locked=EXECUTE_LOCKED)
     if stage not in rx.STAGES:
         raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
     st = rx.STAGES[stage]
@@ -701,7 +699,7 @@ def execute(
         "arm": arm,
         "box_id": box_id,
         "n_action_steps": n_exec,
-        "unlock": unlock,
+        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
         "cart_check": cart or None,
         "frame_source": str(frame_bus),
         "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
@@ -724,7 +722,7 @@ def execute(
     signal.signal(signal.SIGINT, _signal)
     gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
     progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
-             cart=cart.get("verdict"), unlock_by=unlock.get("by"))
+             cart=cart.get("verdict"))
     if stop["why"]:
         raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
     panda = rx.PandaArm(str(entry["robot_ip"]))
@@ -776,13 +774,15 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--read-joints", action="store_true", help="read the arm's joints once at the start (no motion)")
     rep = sub.add_parser("replay")
     rep.add_argument("--record", type=Path, required=True)
-    exe = sub.add_parser("execute", help="moves the arm: a person at the e-stop, the maintainer's unlock")
+    exe = sub.add_parser("execute", help="moves the arm: started from the Rollout page, a hand on the e-stop")
     exe.add_argument("--checkpoint", type=Path, required=True)
     exe.add_argument("--record", type=Path, required=True)
     exe.add_argument("--arm", choices=("right", "left"), required=True)
     exe.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
     exe.add_argument("--gateway", default="http://127.0.0.1:8765")
     exe.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
+    exe.add_argument("--attended", action="store_true",
+                     help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "offline":
@@ -800,6 +800,8 @@ def main(argv: list[str] | None = None) -> int:
                            max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus)
             progress(event="done", steps=meta["steps"])
         elif args.cmd == "execute":
+            if not args.attended:
+                raise RuntimeError(NOT_ATTENDED)
             meta = execute(args.checkpoint, args.record, arm=args.arm, stage=args.stage, gateway=args.gateway,
                            frame_bus=args.frame_bus)
             r = meta["result"]

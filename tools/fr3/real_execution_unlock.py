@@ -8,7 +8,8 @@ bounded time by writing, on the machine that runs inference, ``<repo>/outputs/fr
 
 at most MAX_SPAN_H hours, and deletes it afterwards. It names the arm, so an unlock for one arm never
 drives the other. Agents never write it (AGENTS.md section 4). Read by the old absolute-pose runtime
-(fr3_act_infer_real_runtime) and by the relative-TCP execution layer (rollout_execute).
+(fr3_act_infer_real_runtime) only: since 11-18 the relative-TCP execution layer (rollout_execute) is started
+from the Rollout page by a person who confirms that the arm moves and a hand is on the e-stop.
 """
 
 from __future__ import annotations

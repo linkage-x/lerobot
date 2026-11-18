@@ -68,7 +68,10 @@ bash run/sandbox.sh thor list                           # everyone's sandboxes a
 - **Robot motion is started by a person, with a person at the e-stop.** Agents never run real replay, pivot,
   payload identification, `move-to-start`, dual-home or real inference, and never write scripts that do so
   unattended.
-- Never create `outputs/fr3_infer_real_unlock.json` (the real-inference unlock). Inference runs `--preview` only.
+- Policy execution on an arm is started only by a person on the Rollout page, who confirms its dialog (the arm
+  moves, a hand on the e-stop). Agents never call `/api/rollout/execute`, never run `rollout_relative_tcp.py
+  execute` (nor pass `--attended`), and never create `outputs/fr3_infer_real_unlock.json` (the old absolute-pose
+  runtime's unlock). Agents run inference as `--preview` only.
 - Never weaken or bypass a gate: MuJoCo / IK QC approval before real replay, the world-graph guard
   (`outputs/world_graph_guard.json`, the red banner), the cart check (`outputs/cart_check.json`: an edge whose
   cart moved is not routed), label provenance (`--allow-mixed-labels`), the production deploy guard, the sandbox
