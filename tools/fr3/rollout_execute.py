@@ -706,6 +706,8 @@ def run_loop(
                     if action:
                         gripper(action)
                         log(event="gripper", action=action, cursor=round(cursor, 2))
+                        if record:
+                            record({"event": {"kind": "gripper", "t": now, "action": action, "cursor": round(cursor, 2)}})
             arm.check()
             if record:
                 record({"tick": {"t": now, "q": q, "dq": dq, "f_ext": f_ext, "q_cmd": q_cmd.copy(), "cursor": cursor,
@@ -735,18 +737,23 @@ def run_loop(
 
 
 class Recorder:
-    """Every prediction's inputs and outputs (replayable through the offline path) and every tick."""
+    """Every prediction's inputs and outputs (replayable through the offline path), every tick, and the
+    gripper's commands. Read back by rollout_execute_report."""
 
     def __init__(self, record_dir: Path):
         self.dir = Path(record_dir)
         (self.dir / "steps").mkdir(parents=True, exist_ok=True)
         self.ticks: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
         self.n = 0
         self.lock = threading.Lock()
 
     def __call__(self, item: dict[str, Any]) -> None:
         if "tick" in item:
             self.ticks.append(item["tick"])
+            return
+        if "event" in item:
+            self.events.append(item["event"])
             return
         pred: Prediction = item["prediction"]
         row: dict[str, Any] = {"step": self.n, "t": item["t"], "accepted": item["accepted"], "why": item["why"],
@@ -775,6 +782,8 @@ class Recorder:
         self.n += 1
 
     def close(self) -> None:
+        if self.events:
+            (self.dir / "events.json").write_text(json.dumps(self.events, default=_jsonable), encoding="utf-8")
         if not self.ticks:
             return
         keys = ("t", "q", "dq", "f_ext", "q_cmd", "cursor", "chunk")

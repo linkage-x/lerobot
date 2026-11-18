@@ -217,6 +217,23 @@ def offline(
 # ---------------------------------------------------------- execution plan ---
 
 
+def arm_tcp_tool(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
+    """The policy's TCP (ARM_FK_FRAME) in the arm's flange frame, from the arm's tool model."""
+    from tools.fr3 import fr3_arms, fr3_kinematics as kin
+
+    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
+    tool = fr3_arms.tool_model(entry, repo_root=repo_root)
+    urdf = repo_root / str(tool.get("urdf_path") or kin.FR3_URDF)
+    frame = str(tool.get("target_frame_name") or "")
+    if frame != rt.ARM_FK_FRAME:
+        raise ValueError(f"the {arm} arm drives {frame!r}; the policy's TCP is {rt.ARM_FK_FRAME!r} (relative_tcp)")
+    T_tool = kin.urdf_fixed_transform(rt.ARM_FK_FRAME, urdf=urdf)
+    T_label = kin.urdf_fixed_transform(rt.TCP_LINK, urdf=urdf)
+    if not np.allclose(T_tool[:3, :3], T_label[:3, :3], atol=1e-9):
+        raise ValueError(f"{rt.ARM_FK_FRAME} and {rt.TCP_LINK} do not share their axes in {urdf}")
+    return T_tool
+
+
 class PlanContext:
     """What the execution plan check needs about one arm, read once: tool frame, edge, workspace, scene."""
 
@@ -233,17 +250,7 @@ class PlanContext:
         self.kin = kin
         self.col = col
         self.problems: list[str] = []
-        registry = fr3_arms.load(repo_root=repo_root)
-        entry = fr3_arms.resolve(registry, arm)
-        tool = fr3_arms.tool_model(entry, repo_root=repo_root)
-        urdf = repo_root / str(tool.get("urdf_path") or kin.FR3_URDF)
-        frame = str(tool.get("target_frame_name") or "")
-        if frame != rt.ARM_FK_FRAME:
-            raise ValueError(f"the {arm} arm drives {frame!r}; the policy's TCP is {rt.ARM_FK_FRAME!r} (relative_tcp)")
-        self.T_tool = kin.urdf_fixed_transform(rt.ARM_FK_FRAME, urdf=urdf)
-        T_label = kin.urdf_fixed_transform(rt.TCP_LINK, urdf=urdf)
-        if not np.allclose(self.T_tool[:3, :3], T_label[:3, :3], atol=1e-9):
-            raise ValueError(f"{rt.ARM_FK_FRAME} and {rt.TCP_LINK} do not share their axes in {urdf}")
+        self.T_tool = arm_tcp_tool(arm, repo_root=repo_root)
         self.base = fr3_arms.base_world_id(arm)
         if arm != "right":
             self.problems.append(f"the plan check models the right arm's scene; the {arm} arm is not modelled yet")
@@ -697,6 +704,7 @@ def execute(
         "unlock": unlock,
         "cart_check": cart or None,
         "frame_source": str(frame_bus),
+        "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
         **rx.stage_dict(st, limits),
     }
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
