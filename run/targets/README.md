@@ -1,7 +1,8 @@
 # Deployment targets and stations
 
 One JSON file per machine that `run/` scripts reach. Nothing under `run/` may hard-code an address
-(`tests/scripts/test_run_targets.py` checks it).
+(`tests/scripts/test_run_targets.py` checks it). The production deploy procedure (who deploys, from
+where, the students' frontend) is in [`run/README.md`](../README.md).
 
 ```bash
 python3 run/targets.py list                  # every target, how you reach it, its station
