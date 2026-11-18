@@ -18695,6 +18695,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             return
         if isinstance(payload, dict):
             state.device_preview["box"] = {**payload, "active": True, "updatedAt": time.time()}
+            _apply_box_live_freshness(state, payload)
         return
     if output.startswith("BOX_DEVICES_JSON "):
         try:
@@ -18871,6 +18872,31 @@ def _apply_box_roster(state: GatewayState, roster: list[dict[str, Any]]) -> None
         f"{e.get('box_id') or e.get('sn') or e.get('device_id')}" for e in roster
     )
     state.log("info", f"discovered {len(roster)} BOX device(s): {labels}")
+
+
+def _apply_box_live_freshness(state: GatewayState, payload: dict[str, Any]) -> None:
+    """Keep the BOX rows' state with the recorder's 10 Hz BOX_LIVE, not only the Connect-time ``Box devices:``.
+
+    A BOX that comes up after Connect (11-18: powered on a few minutes later) streams, and the policy reads
+    it, while its rows stayed red "error"; one that drops out stayed green. Each row whose id is a sensor of
+    ``status.sensor_status`` follows its ``fresh`` (and its observed rate). Rows of a multi-BOX roster are
+    named ``<box_id>/<sensor>`` and are left to the Connect-time marks: the snapshot's sensor names do
+    not say which BOX they are.
+    """
+    status = payload.get("status")
+    sensors = status.get("sensor_status") if isinstance(status, dict) else None
+    if not isinstance(sensors, dict):
+        return
+    for device in state.devices:
+        if device.get("kind") != "box_collection":
+            continue
+        sensor = sensors.get(str(device.get("id")))
+        if not isinstance(sensor, dict) or "fresh" not in sensor:
+            continue
+        device["state"] = "running" if sensor.get("fresh") else "error"
+        hz = sensor.get("observed_hz")
+        if isinstance(hz, (int, float)) and math.isfinite(hz):
+            device["fps"] = int(round(hz))
 
 
 def _apply_box_rates(state: GatewayState, rates_str: str) -> None:
