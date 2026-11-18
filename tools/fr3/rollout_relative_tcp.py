@@ -5,8 +5,8 @@
     offline   predict on a QC-gated export through the online code path, against what the hand did
     preview   predict on the recorder's live cameras and BOX with the arm still; record every input
     replay    feed a preview record back through the offline path: the predictions must be identical
-    execute   drive the arm with the policy, by stages (rollout_execute): a person at the e-stop starts it,
-              and nothing moves without the maintainer's unlock for that arm (real_execution_unlock)
+    execute   drive the arm with the policy, by stages (rollout_execute): a person with a hand on the e-stop
+              starts it from the Rollout page, confirming a dialog that says the arm will move (--attended)
 
 What is the same online and offline (user guide #infer-inputs), and where it lives:
 
@@ -68,7 +68,7 @@ STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
     {"id": "plan", "label": "Execution plan check (IK, workspace, collision) on every prediction", "status": "available"},
-    {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
+    {"id": "execute", "label": "Execution on the arm (stages 1-3, a hand on the e-stop)", "status": "available"},
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
 WORKSPACE_MARGIN_M = 0.03
@@ -237,7 +237,8 @@ def arm_tcp_tool(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
 class PlanContext:
     """What the execution plan check needs about one arm, read once: tool frame, edge, workspace, scene."""
 
-    def __init__(self, arm: str, workspace: dict[str, Any] | None, repo_root: Path = _REPO_ROOT):
+    def __init__(self, arm: str, workspace: dict[str, Any] | None, repo_root: Path = _REPO_ROOT, *,
+                 provenance: dict[str, Any] | None = None, contract: rt.PolicyContract | None = None):
         from tools.fr3 import (
             dual_fr3_collision as col,
             dual_fr3_scene as scene,
@@ -269,6 +270,19 @@ class PlanContext:
             else:
                 self.T_base_world = np.asarray(found[0], dtype=np.float64)
         self.workspace = workspace
+        # where the demonstrations went (rollout_distribution): the start, every target, every chunk
+        self.distribution = None
+        if provenance is None or contract is None:
+            self.problems.append("no training distribution to keep the arm inside (the checkpoint's provenance)")
+        else:
+            from tools.fr3 import rollout_distribution as rd
+
+            try:
+                self.distribution = rd.for_checkpoint(provenance, contract, repo_root)
+            except (rd.DistributionError, OSError, ValueError) as exc:
+                self.problems.append(f"training distribution: {exc}")
+            if self.distribution is not None and workspace and self.distribution.frame != workspace.get("frame"):
+                self.problems.append(f"training distribution in {self.distribution.frame}, workspace in {workspace.get('frame')}")
         self.model = col.load()
         self.obstacles = scene.environment_obstacles()
         cams, _ = scene.camera_obstacles(repo_root, graph)
@@ -289,12 +303,16 @@ class PlanContext:
         q_sol, ik_ok = kin.ik_retry(kin.NOMINAL, flange, np.asarray(seed, dtype=np.float64), early_exit=early_exit)
         n = len(targets)
         inside = np.ones(n, dtype=bool)
+        off_dist = [""] * n
         if self.T_base_world is not None:
             T_world_base = np.linalg.inv(self.T_base_world)
             pts = (T_world_base[:3, :3] @ targets[:, :3, 3].T).T + T_world_base[:3, 3]
             lo = np.asarray(self.workspace["p005"]) - WORKSPACE_MARGIN_M
             hi = np.asarray(self.workspace["p995"]) + WORKSPACE_MARGIN_M
             inside = np.all((pts >= lo) & (pts <= hi), axis=1)
+            if self.distribution is not None:
+                off_dist = self.distribution.target_problems(T_world_base[None] @ targets,
+                                                             np.linalg.inv(T_obs)[None] @ targets)
         A, B = self.model.place(kin.NOMINAL, q_sol)
         env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
         gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
@@ -306,6 +324,8 @@ class PlanContext:
                 why.append(f"step {k + 1}: IK not reachable inside the joint walls")
             elif not inside[k]:
                 why.append(f"step {k + 1}: leaves the training workspace (+{WORKSPACE_MARGIN_M * 100:.0f} cm)")
+            elif off_dist[k]:
+                why.append(off_dist[k])
             elif gap[k] < ENV_MARGIN_M:
                 why.append(f"step {k + 1}: {gap[k] * 1e3:.0f} mm from the carts/table/cameras (needs {ENV_MARGIN_M * 1e3:.0f})")
             else:
@@ -318,16 +338,33 @@ class PlanContext:
             "why": why,
             "ik_ok": ik_ok,
             "inside_workspace": None if self.T_base_world is None else inside,
+            "off_distribution": off_dist,
             "env_gap_m": gap,
         }
 
-    def check(self, q_obs: np.ndarray, actions: np.ndarray) -> dict[str, Any]:
-        """The preview's check: every step of the chunk, the arm standing at ``q_obs``."""
+    def start_problem(self, q: np.ndarray, width: float | None) -> str:
+        """Check A (rollout_distribution): may the arm start where it stands? "" when it may."""
+        if self.problems:
+            return "; ".join(self.problems)
+        if self.T_base_world is None or self.distribution is None:
+            return "no training distribution to compare the start with"
+        T_world = np.linalg.inv(self.T_base_world) @ self.tcp(q)
+        return self.distribution.start_problem(T_world, width)
+
+    def check(self, q_obs: np.ndarray, actions: np.ndarray, width: float | None = None) -> dict[str, Any]:
+        """The preview's check: the start (A) and every step of the chunk, the arm standing at ``q_obs``."""
         q_obs = np.asarray(q_obs, dtype=np.float64)
         T_obs = self.kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
         ev = self.evaluate(T_obs, actions, q_obs)
         ok, inside, gap = ev["ik_ok"], ev["inside_workspace"], ev["env_gap_m"]
         reasons = list(self.problems)
+        start = "" if self.problems else self.start_problem(q_obs, width)
+        if start:
+            reasons.append(start)
+        off = [w for w in ev["off_distribution"] if w]
+        if off and not self.problems:
+            reasons.append(f"distribution: {len(off)} of {len(ev['off_distribution'])} steps leave where the "
+                           f"demonstrations went (first: {off[0]})")
         if not ok.all():
             reasons.append(f"IK: {int((~ok).sum())} of {len(ok)} targets not reachable inside the joint walls")
         if inside is not None and not inside.all():
@@ -343,6 +380,8 @@ class PlanContext:
             "widths": ev["widths"].round(4).tolist(),
             "ik_ok": ok.tolist(),
             "inside_workspace": None if inside is None else inside.tolist(),
+            "start": start,
+            "off_distribution": ev["off_distribution"],
             "min_env_gap_mm": None if not math.isfinite(min_env) else round(min_env * 1e3, 1),
         }
 
@@ -518,7 +557,7 @@ def preview(
     plan = None
     plan_problem = ""
     try:
-        plan = PlanContext(arm, loaded.provenance.get("workspace"))
+        plan = PlanContext(arm, loaded.provenance.get("workspace"), provenance=loaded.provenance, contract=c)
     except Exception as exc:  # noqa: BLE001 -- reported; preview still runs
         plan_problem = f"{type(exc).__name__}: {exc}"
     live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=frame_bus)
@@ -537,6 +576,7 @@ def preview(
         "wrench_bias": "live: this Connect's last BOX zero (an export takes each episode's still ends)" if c.wrench_names else None,
         "frame_source": str(frame_bus),
         "plan_problem": plan_problem,
+        "distribution": None if plan is None or plan.distribution is None else plan.distribution.summary,
     }
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     signal.signal(signal.SIGTERM, _stop)
@@ -558,7 +598,7 @@ def preview(
         t_pred = time.monotonic()
         actions = loaded.predict(sample)
         latency_ms = (time.monotonic() - t_pred) * 1e3
-        checked = plan.check(q_arm, actions) if (plan is not None and q_arm is not None) else None
+        checked = plan.check(q_arm, actions, width) if (plan is not None and q_arm is not None) else None
         np.savez_compressed(
             record_dir / "steps" / f"{step:06d}.npz",
             width=np.float64(width),
@@ -622,9 +662,9 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
 # ------------------------------------------------------------------ execute ---
 
 
-EXECUTE_LOCKED = (
-    "executing a policy on the arm is locked: a maintainer who is present unlocks one arm for a bounded time "
-    "(tools/fr3/real_execution_unlock.py); until then the Rollout page runs the preview only"
+NOT_ATTENDED = (
+    "execute moves the arm: it is started from the Rollout page by a person with a hand on the e-stop, who "
+    "confirms its dialog (--attended); nothing was loaded and nothing moved"
 )
 
 
@@ -639,23 +679,20 @@ def execute(
     device: str | None = None,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
-    """One staged run on the arm (rollout_execute). The unlock is read before anything is loaded."""
+    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``."""
     import cv2
 
     from tools.fr3 import (
         fr3_arms,
         fr3_kinematics as kin,
-        real_execution_unlock,
         relative_tcp_policy as rtp,
         rollout_execute as rx,
     )
     from tools.thor.gmsl2 import cart_state
 
-    unlock = real_execution_unlock.read(arm, repo_root=repo_root, locked=EXECUTE_LOCKED)
     if stage not in rx.STAGES:
         raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
     st = rx.STAGES[stage]
-    limits = rx.Limits(frame_age_s=frame_age_limit_s(frame_bus))
     loaded = rtp.load_checkpoint(checkpoint, device=device)
     c = loaded.contract
     n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
@@ -665,9 +702,14 @@ def execute(
     box_id = str(entry.get("corenetic_device_id") or "")
     if not box_id:
         raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
-    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=repo_root)
+    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=repo_root, provenance=loaded.provenance,
+                       contract=c)
     if plan.problems:
         raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
+    # the per-step limits are the checkpoint's own: what one step of its demonstrations did (rx.step_limits)
+    dist = plan.distribution
+    limits = rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
+                       **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
     cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
     live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=frame_bus)
 
@@ -701,10 +743,16 @@ def execute(
         "arm": arm,
         "box_id": box_id,
         "n_action_steps": n_exec,
-        "unlock": unlock,
+        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
         "cart_check": cart or None,
         "frame_source": str(frame_bus),
         "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
+        "distribution": plan.distribution.summary if plan.distribution is not None else None,
+        "step_limits": {"from_training_mm": round(float(dist.step_m[0]) * 1e3, 1),
+                        "from_training_deg": round(float(dist.step_deg[0]), 2),
+                        "ceiling_mm": rx.STEP_MM_CEILING, "ceiling_deg": rx.STEP_DEG_CEILING,
+                        "used_mm": limits.step_mm, "used_deg": limits.step_deg,
+                        "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
         **rx.stage_dict(st, limits),
     }
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
@@ -724,7 +772,7 @@ def execute(
     signal.signal(signal.SIGINT, _signal)
     gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
     progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
-             cart=cart.get("verdict"), unlock_by=unlock.get("by"))
+             cart=cart.get("verdict"))
     if stop["why"]:
         raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
     panda = rx.PandaArm(str(entry["robot_ip"]))
@@ -736,7 +784,7 @@ def execute(
             arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
             wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
             stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=first.width,
-            record=recorder,
+            record=recorder, start_check=lambda q: plan.start_problem(q, first.width),
         )
     finally:
         resume_gc()
@@ -776,13 +824,15 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--read-joints", action="store_true", help="read the arm's joints once at the start (no motion)")
     rep = sub.add_parser("replay")
     rep.add_argument("--record", type=Path, required=True)
-    exe = sub.add_parser("execute", help="moves the arm: a person at the e-stop, the maintainer's unlock")
+    exe = sub.add_parser("execute", help="moves the arm: started from the Rollout page, a hand on the e-stop")
     exe.add_argument("--checkpoint", type=Path, required=True)
     exe.add_argument("--record", type=Path, required=True)
     exe.add_argument("--arm", choices=("right", "left"), required=True)
     exe.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
     exe.add_argument("--gateway", default="http://127.0.0.1:8765")
     exe.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
+    exe.add_argument("--attended", action="store_true",
+                     help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "offline":
@@ -800,6 +850,8 @@ def main(argv: list[str] | None = None) -> int:
                            max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus)
             progress(event="done", steps=meta["steps"])
         elif args.cmd == "execute":
+            if not args.attended:
+                raise RuntimeError(NOT_ATTENDED)
             meta = execute(args.checkpoint, args.record, arm=args.arm, stage=args.stage, gateway=args.gateway,
                            frame_bus=args.frame_bus)
             r = meta["result"]

@@ -8,9 +8,9 @@ preview shares this machine's GPU and the recorder's frame bus with the offline 
 Stages (rollout_relative_tcp.STAGES): offline prediction, online preview, the execution plan check, and
 execution on the arm by stages (tools/fr3/rollout_execute.py). The preview needs the recorder connected
 (its cameras and BOX are the inputs) and is refused in a sandbox, which has no hardware. Execution moves
-the arm: it is refused in a sandbox, off Thor, without the recorder, without the maintainer's unlock for
-that arm (tools/fr3/real_execution_unlock.py), unless the operator confirms someone is at the e-stop, and
-while anything else holds the arm's FCI; while it runs, it is the FCI holder the other arm jobs see.
+the arm: it is refused in a sandbox, off Thor, without the recorder, before a preview of the checkpoint passed
+its Replay check, unless the operator confirms in the page's dialog that the arm will move and a hand is on
+the e-stop (``attended``), and while anything else holds the arm's FCI; while it runs, it is the FCI holder the other arm jobs see.
 
 Which frame bus the jobs read follows how the recorder was connected: connected for inference (the gateway's
 Connect with ``cameras=``: only those cameras, the main bus at 30 Hz, no episodes) the main bus, provided
@@ -39,7 +39,7 @@ STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
     {"id": "plan", "label": "Execution plan check: IK, training workspace, collision (no motion)", "status": "available"},
-    {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
+    {"id": "execute", "label": "Execution on the arm (stages 1-3, a hand on the e-stop)", "status": "available"},
 )
 # The recorder's main frame bus when connected for inference (gateway _inference_overlay_config):
 # every INFERENCE_FRAME_EVERY_N-th 60 fps cluster. Same values as tools/fr3/rollout_relative_tcp.
@@ -241,21 +241,6 @@ class RolloutManager:
         return self._spawn("preview", str(model), args, str(record),
                            {"arm": arm, "rate": rate, "readJoints": read_joints, "frameBus": bus})
 
-    def unlock_status(self, arm: str) -> dict[str, Any]:
-        """Whether the maintainer's unlock lets ``arm`` be driven now (for the page; the script re-reads it)."""
-        import sys
-
-        if str(self.repo_root) not in sys.path:
-            sys.path.insert(0, str(self.repo_root))
-        from tools.fr3 import real_execution_unlock as unlock
-
-        try:
-            record = unlock.read(arm, repo_root=self.repo_root, locked="locked")
-        except unlock.RealExecutionLockedError as exc:
-            return {"arm": arm, "unlocked": False, "why": str(exc).removeprefix("locked; ")}
-        return {"arm": arm, "unlocked": True, "by": record.get("by"), "reason": record.get("reason"),
-                "expires": record.get("expires_utc")}
-
     def start_execute(self, checkpoint: str, arm: str, stage: int, attended: bool) -> RolloutJob:
         """Drive the arm with the policy, one stage (rollout_execute). Started by a person at the e-stop."""
         model = self._checkpoint(checkpoint)
@@ -268,26 +253,22 @@ class RolloutManager:
         if int(stage) not in EXECUTE_STAGES:
             raise RolloutError(f"stage: one of {sorted(EXECUTE_STAGES)}")
         if not attended:
-            raise RolloutError("the arm moves: confirm that you are at the e-stop")
+            raise RolloutError("the arm moves: confirm in the dialog that a hand is on the e-stop")
         if not self.recorder_busy():
             raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
         if not self.preview_replayed(model):
             raise RolloutError("no preview of this checkpoint has passed its Replay check yet: run the online preview "
                                "(arm still) and Replay check it first, so the live inputs are known to be the ones "
                                "the offline path reads")
-        lock = self.unlock_status(arm)
-        if not lock["unlocked"]:
-            raise RolloutError(f"execution on the {arm} arm is locked: {lock['why']} A maintainer who is present "
-                               "unlocks one arm for a bounded time (tools/fr3/real_execution_unlock.py)")
         holder = self.fci_holder()
         if holder:
             raise RolloutError(f"{holder}: it holds the arm's FCI; stop it first")
         bus_args, bus = self.frame_source(model)
         record = self.root / "records" / f"execute_{datetime.now():%Y%m%d_%H%M%S}"
         args = ["execute", "--checkpoint", str(model), "--record", str(record), "--arm", arm,
-                "--stage", str(int(stage)), "--gateway", self.gateway_url, *bus_args]
+                "--stage", str(int(stage)), "--gateway", self.gateway_url, "--attended", *bus_args]
         return self._spawn("execute", str(model), args, str(record),
-                           {"arm": arm, "stage": int(stage), "unlockBy": lock.get("by"), "frameBus": bus})
+                           {"arm": arm, "stage": int(stage), "attended": True, "frameBus": bus})
 
     def preview_replayed(self, model: Path) -> bool:
         """Has a preview record of this checkpoint been fed back through the offline path, identically?"""
@@ -409,7 +390,6 @@ class RolloutManager:
             "recorderConnected": bool(self.recorder_busy()),
             "recorderCameras": list(self.recorder_cameras()) if self.recorder_busy() else [],
             "executeStages": {str(k): v for k, v in EXECUTE_STAGES.items()},
-            "unlock": {arm: self.unlock_status(arm) for arm in ("right", "left")},
         }
 
     def log_tail(self, job_id: str, lines: int = 120) -> list[str]:

@@ -144,20 +144,6 @@ def test_rollout_endpoints_answer_outside_the_gateway_lock(tmp_path):
         server.server_close()
 
 
-def _unlock(repo: Path, arm: str = "right", hours: float = 2.0) -> None:
-    """A maintainer's unlock, in a test's own repo copy (never the real outputs/)."""
-    from datetime import UTC, datetime, timedelta
-
-    now = datetime.now(UTC).replace(microsecond=0)
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    (repo / "outputs").mkdir(parents=True, exist_ok=True)
-    (repo / "outputs" / "fr3_infer_real_unlock.json").write_text(json.dumps({
-        "arm": arm, "by": "maintainer", "reason": "test",
-        "created_utc": (now - timedelta(minutes=1)).strftime(fmt),
-        "expires_utc": (now + timedelta(hours=hours)).strftime(fmt),
-    }))
-
-
 def _replayed_preview(manager: rr.RolloutManager, ok: bool = True) -> None:
     record = manager.root / "records" / "preview_1"
     record.mkdir(parents=True)
@@ -182,13 +168,7 @@ def test_execute_is_refused_unless_every_condition_holds(tmp_path):
     with pytest.raises(rr.RolloutError, match="Replay check"):
         manager.start_execute(ckpt, "right", 1, attended=True)
     _replayed_preview(manager)
-    with pytest.raises(rr.RolloutError, match="locked: there is no"):
-        manager.start_execute(ckpt, "right", 1, attended=True)
-    _unlock(manager.repo_root, arm="left")
-    with pytest.raises(rr.RolloutError, match="for arm 'left'"):
-        manager.start_execute(ckpt, "right", 1, attended=True)
-    assert manager.status()["unlock"]["left"]["unlocked"] and not manager.status()["unlock"]["right"]["unlocked"]
-    _unlock(manager.repo_root, arm="right")
+    assert "unlock" not in manager.status()  # 11-18: no maintainer unlock file; the page's dialog confirms
     with pytest.raises(rr.RolloutError, match="stage"):
         manager.start_execute(ckpt, "right", 4, attended=True)
     holder["who"] = "真机 replay 正在运行"
@@ -197,19 +177,19 @@ def test_execute_is_refused_unless_every_condition_holds(tmp_path):
     holder["who"] = ""
     for kw in ({"sandbox": "hph"}, {"profile": "workstation"}):
         other = _manager(tmp_path / next(iter(kw)), recorder_busy=lambda: True, **kw)
-        _unlock(other.repo_root)
         _replayed_preview(other)
         with pytest.raises(rr.RolloutError, match="sandbox|not a Thor"):
             other.start_execute(other.checkpoints()[0]["path"], "right", 1, attended=True)
     no_recorder = _manager(tmp_path / "nr")
-    _unlock(no_recorder.repo_root)
     _replayed_preview(no_recorder)
     with pytest.raises(rr.RolloutError, match="connect the recorder"):
         no_recorder.start_execute(no_recorder.checkpoints()[0]["path"], "right", 1, attended=True)
 
     job = manager.start_execute(ckpt, "right", 2, attended=True)
     assert spawned[0][1:3] == [rr.SCRIPT, "execute"] and spawned[0][spawned[0].index("--stage") + 1] == "2"
-    assert job.kind == "execute" and job.params["unlockBy"] == "maintainer"
+    assert "--attended" in spawned[0]  # the script refuses without it
+    assert not (manager.repo_root / "outputs" / "fr3_infer_real_unlock.json").exists()
+    assert job.kind == "execute" and job.params["attended"] is True
 
 
 def test_a_running_execution_holds_the_fci_for_the_other_arm_jobs(tmp_path):
@@ -219,7 +199,6 @@ def test_a_running_execution_holds_the_fci_for_the_other_arm_jobs(tmp_path):
         pid = sleeper.pid
 
     manager = _manager(tmp_path, recorder_busy=lambda: True, popen=lambda *a, **k: Proc())
-    _unlock(manager.repo_root)
     _replayed_preview(manager)
     state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
     state.rollout = manager
@@ -278,7 +257,6 @@ def test_connected_for_inference_the_jobs_read_the_main_bus_if_it_has_the_checkp
     assert cmd[cmd.index("--frame-bus") + 1] == rr.INFERENCE_FRAME_BUS and job.params["frameBus"].startswith("inference bus")
     manager.jobs[job.id].state = "done"
 
-    _unlock(manager.repo_root)
     _replayed_preview(manager)
     job = manager.start_execute(ckpt, "right", 1, attended=True)
     assert spawned[-1][spawned[-1].index("--frame-bus") + 1] == rr.INFERENCE_FRAME_BUS

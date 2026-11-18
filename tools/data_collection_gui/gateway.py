@@ -21244,7 +21244,7 @@ def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: st
             job = manager.start_execute(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
                                         int(body.get("stage") or 0), body.get("attended") is True)
             state.log("warn", f"Rollout execute {job.id} started: stage {job.params.get('stage')} on the "
-                              f"{job.params.get('arm')} arm (unlocked by {job.params.get('unlockBy')}); the arm moves")
+                              f"{job.params.get('arm')} arm (operator confirmed: hand on the e-stop); the arm moves")
         elif path == "/api/rollout/stop":
             _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
             return True

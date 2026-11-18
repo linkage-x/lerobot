@@ -1,4 +1,5 @@
-// What keeps the Rollout page's Execute button disabled (the gateway re-checks every one of these).
+// What keeps the Rollout page's Execute button disabled (the gateway re-checks every one of these). With
+// none left, the button opens the dialog "机器人会动，手放急停"; only its confirm sends attended=true.
 import type { RolloutCheckpoint, RolloutStatus } from "./rolloutApi";
 
 // The gateway refuses a live job when the recorder was connected for inference without one of the
@@ -15,11 +16,9 @@ export function cameraBlocker(status: RolloutStatus | null, checkpoint: RolloutC
 export function executeBlockers(args: {
   status: RolloutStatus | null;
   checkpoint: RolloutCheckpoint | undefined;
-  arm: string;
-  attended: boolean;
   previewReplayed: boolean;
 }): string[] {
-  const { status, checkpoint, arm, attended, previewReplayed } = args;
+  const { status, checkpoint, previewReplayed } = args;
   const out: string[] = [];
   if (!status) return ["loading"];
   if (status.sandbox) out.push("a sandbox has no arm");
@@ -29,10 +28,7 @@ export function executeBlockers(args: {
   if (!status.recorderConnected) out.push("connect the recorder");
   const cameras = cameraBlocker(status, checkpoint);
   if (cameras) out.push(cameras);
-  const lock = status.unlock?.[arm];
-  if (!lock?.unlocked) out.push(`the ${arm} arm is locked${lock?.why ? `: ${lock.why}` : ""}`);
   if (status.jobs.some((j) => j.state === "running")) out.push("another rollout job is running");
   if (!previewReplayed) out.push("no identical Replay check of a preview of this checkpoint yet");
-  if (!attended) out.push("confirm that you are at the e-stop");
   return out;
 }
