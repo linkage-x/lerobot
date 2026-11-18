@@ -56,6 +56,22 @@ class RolloutError(RuntimeError):
     """Something the operator can fix; the gateway answers 4xx."""
 
 
+def job_env(python: str, base: dict[str, str]) -> dict[str, str]:
+    """The environment of a rollout job run by ``python``.
+
+    panda_py's ``_core`` links pinocchio / urdfdom from the venv's cmeel prefix, which is not on the loader path
+    (11-18: the first execute died on ``libpinocchio_parsers.so.3.4.0`` while preview and replay, which never import
+    panda_py, ran). The venv is ``python``'s parent's parent, not resolved: ``bin/python`` links to the system one.
+    """
+    env = {**base, "PYTHONPATH": "src:.", "PYTHONUNBUFFERED": "1"}
+    libs = [str(p) for p in sorted((Path(python).parent.parent / "lib").glob("python*/site-packages/cmeel.prefix/lib"))]
+    if env.get("LD_LIBRARY_PATH"):
+        libs.append(env["LD_LIBRARY_PATH"])
+    if libs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(libs))
+    return env
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -198,7 +214,7 @@ class RolloutManager:
             proc = self._popen(
                 [self.python, SCRIPT, *args],
                 cwd=self.repo_root,
-                env={**os.environ, "PYTHONPATH": "src:.", "PYTHONUNBUFFERED": "1"},
+                env=job_env(self.python, dict(os.environ)),
                 stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
             )
         job = RolloutJob(id=job_id, kind=kind, checkpoint=checkpoint, pid=int(proc.pid), startedAt=_now(),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -190,6 +191,29 @@ def test_execute_is_refused_unless_every_condition_holds(tmp_path):
     assert "--attended" in spawned[0]  # the script refuses without it
     assert not (manager.repo_root / "outputs" / "fr3_infer_real_unlock.json").exists()
     assert job.kind == "execute" and job.params["attended"] is True
+
+
+def test_jobs_find_the_venvs_cmeel_libraries_for_panda_py(tmp_path):
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    cmeel = venv / "lib" / "python3.12" / "site-packages" / "cmeel.prefix" / "lib"
+    cmeel.mkdir(parents=True)
+    env = rr.job_env(str(venv / "bin" / "python"), {"LD_LIBRARY_PATH": "/opt/x", "HOME": "/h"})
+    assert env["LD_LIBRARY_PATH"].split(os.pathsep) == [str(cmeel), "/opt/x"]
+    assert env["PYTHONPATH"] == "src:." and env["HOME"] == "/h"
+    assert "LD_LIBRARY_PATH" not in rr.job_env(str(tmp_path / "none" / "bin" / "python"), {})
+
+    seen = {}
+
+    class Proc:
+        pid = 2**22 + 9  # a real integer, never a MagicMock (os.killpg)
+
+    manager = _manager(tmp_path / "m", recorder_busy=lambda: True,
+                       popen=lambda cmd, **k: seen.update(k) or Proc())
+    manager.python = str(venv / "bin" / "python")
+    _replayed_preview(manager)
+    manager.start_execute(manager.checkpoints()[0]["path"], "right", 1, attended=True)
+    assert str(cmeel) in seen["env"]["LD_LIBRARY_PATH"] and seen["stdin"] is subprocess.DEVNULL
 
 
 def test_a_running_execution_holds_the_fci_for_the_other_arm_jobs(tmp_path):
