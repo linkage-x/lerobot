@@ -227,6 +227,9 @@ class RecordingStatus:
     # it is someone else's.
     laserTracker: bool = False
     laserTrackerState: str = "idle"
+    # Connected for inference (Rollout page): the recorder opened only these cameras and publishes them on
+    # the main frame bus at 30 Hz; no episode may be recorded. [] = a full session.
+    inferenceCameras: list[str] = field(default_factory=list)  # noqa: N815 -- a snapshot JSON key
     laserTrackerDetail: str = ""
     # What the instrument said it is (model, serial, firmware), read once at
     # Connect via the SDK's GetDeviceInformation() -- not transcribed from a
@@ -11673,10 +11676,63 @@ def _build_task_overlay_config(
     return overlay
 
 
-def _write_overlay_config(state: GatewayState, overlay: dict[str, Any]) -> Path:
+_INFERENCE_OVERLAY_NAME = "inference_cameras_overlay.yaml"
+# Where an episode of an inference session would land, were one ever started: never a dataset.
+_INFERENCE_NO_DATASET = "outputs/rollout/no_episodes"
+
+
+def _inference_camera_sids(config: dict[str, Any], names: list[str]) -> list[int]:
+    """The sensor ids of ``names`` (``cam_10`` -> 10) on this rig, or ValueError."""
+    cameras = ((config.get("sensors") or {}).get("cameras") or {}) if isinstance(config.get("sensors"), dict) else {}
+    if not isinstance(cameras, dict) or "defaults" not in cameras:
+        raise ValueError("this recorder config has no GMSL2 cameras to choose from")
+    backend = str((cameras.get("defaults") or {}).get("recorder_backend") or "argus_online_sync")
+    if backend != "argus_online_sync":
+        raise ValueError(f"connecting for inference needs the argus_online_sync recorder (this config: {backend})")
+    prefix = str(cameras.get("name_prefix") or "cam")
+    sids: list[int] = []
+    for name in names:
+        match = re.fullmatch(rf"{re.escape(prefix)}_(\d{{2}})", name)
+        if not match:
+            raise ValueError(f"not a camera of this rig: {name!r} (expected {prefix}_NN)")
+        sid = int(match.group(1))
+        if sid not in sids:
+            sids.append(sid)
+    if not sids:
+        raise ValueError("connect for inference: name at least one camera")
+    return sids
+
+
+def _inference_overlay_config(base_config: dict[str, Any], sids: list[int], repo_root: Path) -> dict[str, Any]:
+    """``base_config`` with the recorder opening only ``sids`` and publishing them on the main frame bus.
+
+    Same sensor mode, hardware trigger, exposure and BOXes as a full session (the 60 fps dtbo cannot change):
+    only fewer cameras, and every INFERENCE_FRAME_EVERY_N-th cluster copied to rollout_runs.INFERENCE_FRAME_BUS
+    (idle too). The dataset root points away from every dataset, behind the Start Episode refusal.
+    """
+    overlay = copy.deepcopy(base_config)
+    cameras = overlay["sensors"]["cameras"]
+    cameras["detect_all"] = False
+    cameras["sensor_ids"] = list(sids)
+    online = cameras.get("online_sync")
+    if not isinstance(online, dict):
+        online = {}
+        cameras["online_sync"] = online
+    online["frame_bus_dir"] = rollout_runs.INFERENCE_FRAME_BUS
+    online["frame_bus_every_n"] = rollout_runs.INFERENCE_FRAME_EVERY_N
+    dataset = overlay.get("dataset")
+    if not isinstance(dataset, dict):
+        dataset = {}
+        overlay["dataset"] = dataset
+    dataset["root"] = str(repo_root / _INFERENCE_NO_DATASET)
+    dataset["repo_id"] = "local/no_episodes"
+    return overlay
+
+
+def _write_overlay_config(state: GatewayState, overlay: dict[str, Any], name: str = "") -> Path:
     import yaml
 
-    path = state.repo_root / "outputs" / _ACTIVE_TASK_OVERLAY_NAME
+    path = state.repo_root / "outputs" / (name or _ACTIVE_TASK_OVERLAY_NAME)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as overlay_file:
         yaml.safe_dump(overlay, overlay_file, sort_keys=False, allow_unicode=True)
@@ -17322,6 +17378,7 @@ def _connect_recorder(
     *,
     backend: str | None = None,
     laser_tracker: bool | None = None,
+    inference_cameras: list[str] | None = None,
 ) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
@@ -17338,8 +17395,23 @@ def _connect_recorder(
             raise ValueError("Only the workstation profile can choose a recording backend")
         state.recording.backend = backend
 
-    config_path = _resolve_recorder_config_path(state)
     recorder_script, config_flag = _recorder_script(state)
+    if inference_cameras:
+        if is_workstation or "thor_record" not in str(recorder_script):
+            raise ValueError("connecting for inference is for the Thor GMSL2 recorder")
+        sids = _inference_camera_sids(state.config, inference_cameras)
+        laser_tracker = False  # the shared instrument has nothing to measure in a rollout
+        names = [n for i, n in enumerate(inference_cameras) if n not in inference_cameras[:i]]
+        config_path = _write_overlay_config(
+            state, _inference_overlay_config(state.config, sids, state.repo_root), _INFERENCE_OVERLAY_NAME
+        )
+        state.recording.datasetRoot = ""
+        state.log("info", f"Connecting for inference: only {', '.join(names)}, frame bus "
+                          f"{rollout_runs.INFERENCE_FRAME_BUS} at {60 // rollout_runs.INFERENCE_FRAME_EVERY_N} Hz, "
+                          "no episodes")
+    else:
+        names = []
+        config_path = _resolve_recorder_config_path(state)
     command = [
         # The FR3 stack (panda_py, placo, mujoco) lives in .venv-fr3 on the workstation.
         str(_venv_python(state.repo_root, prefer_fr3=is_workstation)),
@@ -17387,6 +17459,7 @@ def _connect_recorder(
     state.process_started_at_s = time.monotonic()
     state.recording.state = "connecting"
     state.recording.pid = state.process.pid
+    state.recording.inferenceCameras = names
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
     # A new recorder counts from zero and only says so after its first save; until then the
@@ -17508,6 +17581,13 @@ def _start_episode(
     still redirected, and Live Record passing no root is what puts it back.
     """
     process = _ensure_recorder_running(state)
+    if state.recording.inferenceCameras:
+        # Only the policy's cameras are open: an episode would have no AprilTag views for its labels, and
+        # it is not a recording anyone asked for. The overlay's dataset root is a dead end too.
+        raise RuntimeError(
+            f"录制器是为推理连接的（只开了 {', '.join(state.recording.inferenceCameras)}），不能录 episode。"
+            "要录制，先 Disconnect，再正常 Connect。"
+        )
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
 
@@ -21046,6 +21126,7 @@ def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
             sandbox=state.sandbox,
             recorder_busy=lambda: state.process is not None and state.process.poll() is None,
             fci_holder=lambda: _rollout_fci_holder(state),
+            recorder_cameras=lambda: list(state.recording.inferenceCameras),
             gateway_url=f"http://127.0.0.1:{port}",
         )
     return state.rollout
@@ -21598,6 +21679,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 else False if raw_lt in ("0", "false", "off", "no")
                 else None
             )
+            # Connect for inference (Rollout page): only these cameras, the main frame bus, no episodes.
+            requested_cameras = [
+                c.strip() for c in (query.get("cameras", [""])[0] or "").split(",") if c.strip()
+            ] or None
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
@@ -21615,6 +21700,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             state,
                             backend=requested_backend,
                             laser_tracker=requested_laser_tracker,
+                            inference_cameras=requested_cameras,
                         )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)

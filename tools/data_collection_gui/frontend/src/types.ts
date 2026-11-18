@@ -142,6 +142,8 @@ export type RecordingStatus = {
   // a property of the rig: the instrument is shared and admits one client.
   laserTracker?: boolean;
   laserTrackerState?: string;
+  // Connected for inference from the Rollout page: only these cameras, no episodes.
+  inferenceCameras?: string[];
   laserTrackerDetail?: string;
   // Model / serial / firmware as the instrument reported them.
   laserTrackerDevice?: string;

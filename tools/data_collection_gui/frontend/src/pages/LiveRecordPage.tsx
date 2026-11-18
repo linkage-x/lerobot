@@ -139,7 +139,8 @@ export function recordingControlAvailability(status: RecordingStatus) {
   return {
     isConnected,
     canConnect: !isConnected,
-    canStartEpisode: status.state === "armed",
+    // Connected for inference (Rollout page): only the policy's cameras are open; the gateway refuses too.
+    canStartEpisode: status.state === "armed" && !(status.inferenceCameras ?? []).length,
     canResolveEpisode: status.state === "recording" || status.state === "review",
     canExit: isConnected,
   };
@@ -273,6 +274,12 @@ export function RecordingPanel({
       {trackerBlocking && (
         <p className="tracker-wait-banner">
           ⏳ {trackerBlockReason}
+        </p>
+      )}
+      {isConnected && (status.inferenceCameras ?? []).length > 0 && (
+        <p className="tracker-wait-banner">
+          🔒 录制器是在 Rollout 页为推理连接的（只开了 {(status.inferenceCameras ?? []).join(", ")}），不能录
+          episode。要录制，先 Exit，再在这里 Connect。
         </p>
       )}
       {mountHeld && (

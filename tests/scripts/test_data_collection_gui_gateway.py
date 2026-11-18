@@ -10863,3 +10863,101 @@ def test_deleting_an_episode_in_replay_leaves_the_qc_result_stale(tmp_path):
 
     assert qc_verdict.read_verdict(dataset_root).state == qc_verdict.STALE
     assert gateway._processing_item_from_dataset(dataset_root)["status"] == "qc_stale"
+
+
+def _thor_inference_state(tmp_path: Path) -> gateway.GatewayState:
+    config = yaml.safe_load(gateway.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=Path.cwd() / gateway.DEFAULT_CONFIG_PATH,
+        config=config,
+        recording=gateway.RecordingStatus(repoId="local/test", state="idle"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+
+def test_the_inference_overlay_opens_only_the_policys_cameras_and_no_dataset(tmp_path):
+    import copy
+
+    from tools.data_collection_gui import rollout_runs
+
+    state = _thor_inference_state(tmp_path)
+    before = copy.deepcopy(state.config)
+    assert gateway._inference_camera_sids(state.config, ["cam_10", "cam_06", "cam_10"]) == [10, 6]
+    for bad in (["cam_1"], ["camera_10"], ["cam_10/../x"], []):
+        with pytest.raises(ValueError):
+            gateway._inference_camera_sids(state.config, bad)
+    overlay = gateway._inference_overlay_config(state.config, [10], tmp_path)
+    cams = overlay["sensors"]["cameras"]
+    assert cams["detect_all"] is False and cams["sensor_ids"] == [10]
+    assert cams["online_sync"]["frame_bus_dir"] == rollout_runs.INFERENCE_FRAME_BUS
+    assert cams["online_sync"]["frame_bus_every_n"] == 2
+    assert cams["defaults"] == before["sensors"]["cameras"]["defaults"]  # same mode, trigger, exposure
+    assert overlay["sensors"]["hardware_sync"] == before["sensors"]["hardware_sync"]
+    assert overlay["dataset"]["root"] == str(tmp_path / "outputs/rollout/no_episodes")
+    assert state.config == before
+    metadata = copy.deepcopy(state.config)
+    metadata["sensors"]["cameras"]["defaults"]["recorder_backend"] = "argus_metadata"
+    with pytest.raises(ValueError, match="argus_online_sync"):
+        gateway._inference_camera_sids(metadata, ["cam_10"])
+
+
+def test_connected_for_inference_no_episode_can_be_started(tmp_path, monkeypatch):
+    state = _thor_inference_state(tmp_path)
+    spawned = []
+
+    class StopAfterSpawnError(Exception):
+        pass
+
+    class FakeProcess:
+        pid = 4322  # a real integer, never a MagicMock
+        stdin = stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda cmd, **_k: spawned.append(cmd) or FakeProcess())
+    monkeypatch.setattr(gateway, "_set_all_device_states", lambda *_a: (_ for _ in ()).throw(StopAfterSpawnError()))
+    with pytest.raises(StopAfterSpawnError):
+        gateway._connect_recorder(state, laser_tracker=True, inference_cameras=["cam_10"])
+    cmd = spawned[0]
+    config_path = Path(next(a for a in cmd if a.startswith("--config-path=")).split("=", 1)[1])
+    assert config_path == tmp_path / "outputs" / "inference_cameras_overlay.yaml"
+    written = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert written["sensors"]["cameras"]["sensor_ids"] == [10]
+    assert "--no-laser-tracker" in cmd  # the shared tracker is not booked for a rollout
+    assert state.recording.inferenceCameras == ["cam_10"]
+    assert gateway._snapshot(state)["recording"]["inferenceCameras"] == ["cam_10"]
+    with pytest.raises(RuntimeError, match="为推理连接"):
+        gateway._start_episode(state)
+
+    # a normal Connect afterwards is a full session again
+    state.process = None
+    spawned.clear()
+    monkeypatch.setattr(gateway, "_resolve_recorder_config_path", lambda _s: tmp_path / "config.yaml")
+    with pytest.raises(StopAfterSpawnError):
+        gateway._connect_recorder(state)
+    assert state.recording.inferenceCameras == []
+
+
+def test_connect_passes_the_inference_cameras_from_the_query(tmp_path, monkeypatch):
+    import urllib.request
+
+    state = _thor_inference_state(tmp_path)
+    seen = {}
+    monkeypatch.setattr(gateway, "_stop_all_camera_previews", lambda _s: None)
+    monkeypatch.setattr(gateway, "_camera_preview_stagger_s", lambda _s: 0.0)
+    monkeypatch.setattr(gateway, "_connect_recorder", lambda _s, **kw: seen.update(kw))
+    monkeypatch.setattr(gateway, "_snapshot", lambda _s: {"ok": True})
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        for query, want in (("?cameras=cam_10,%20cam_06", ["cam_10", "cam_06"]), ("", None)):
+            request = urllib.request.Request(f"{base}/api/handheld/record/connect{query}", method="POST", data=b"{}")
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                assert answer.status == 200
+            assert seen["inference_cameras"] == want
+    finally:
+        server.shutdown()
+        server.server_close()

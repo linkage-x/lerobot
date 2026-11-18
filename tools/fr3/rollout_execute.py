@@ -102,7 +102,8 @@ class Limits:
     joint_speed_rad_s: float = 1.6
     # a measured joint within this of panda_py's wall (IK keeps 3 deg; Monitor of fr3_pivot_auto keeps 1)
     wall_deg: float = 1.0
-    # inputs: the frame bus publishes ~5 Hz (age 60-263 ms measured 11-18); BOX_LIVE staleS 6-90 ms
+    # inputs: the preview frame bus publishes ~5 Hz (age 60-263 ms measured 11-18); execute() takes 0.15 s on
+    # the inference bus (rollout_relative_tcp.frame_age_limit_s); BOX_LIVE staleS 6-90 ms
     frame_age_s: float = 0.40
     box_stale_s: float = 0.30
     predict_s: float = 0.10

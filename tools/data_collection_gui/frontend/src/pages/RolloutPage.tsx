@@ -9,7 +9,7 @@ import {
   rolloutApi
 } from "./rolloutApi";
 import { ArmGripperPanel } from "./ArmGripperPanel";
-import { executeBlockers } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers } from "./rolloutExecute";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -252,6 +252,9 @@ export function RolloutPage() {
     ckpt && results.some((r) => r.kind === "preview" && r.replayCheck?.ok && runPath(r.checkpoint) === runPath(ckpt.path))
   );
   const blockers = executeBlockers({ status, checkpoint: ckpt, arm, attended, previewReplayed });
+  const openCameras = status?.recorderCameras ?? [];
+  const forInference = Boolean(status?.recorderConnected && openCameras.length);
+  const wrongCameras = cameraBlocker(status, ckpt);
   const executing = running?.kind === "execute" ? running : undefined;
   const lock = status?.unlock?.[arm];
   const episodeList = useMemo(
@@ -352,8 +355,35 @@ export function RolloutPage() {
       <section className="panel">
         <div className="panel-heading">
           <h2>2 · Online preview</h2>
-          <span>{status?.recorderConnected ? "recorder connected" : "recorder not connected"}</span>
+          <span>
+            {!status?.recorderConnected
+              ? "recorder not connected"
+              : forInference
+                ? `connected for inference: ${openCameras.join(", ")} at 30 Hz`
+                : "recorder connected (full session, preview bus ~5 Hz)"}
+          </span>
         </div>
+        <div className="control-row">
+          {!status?.recorderConnected ? (
+            <button
+              disabled={!ckpt || !ckpt.cameras.length || status?.profile !== "thor" || Boolean(status?.sandbox)}
+              onClick={() => ckpt && act(() => rolloutApi.connectForInference(ckpt.cameras))}
+            >
+              Connect for inference ({ckpt?.cameras.join(", ") || "pick a checkpoint"})
+            </button>
+          ) : forInference ? (
+            <button disabled={Boolean(running)} onClick={() => act(() => rolloutApi.disconnect())}>
+              Disconnect
+            </button>
+          ) : null}
+          <span className="panel-note">
+            Connect for inference opens only the checkpoint's cameras (same 60 fps mode, trigger and exposure as
+            recording; the BOXes as usual) and publishes every 2nd frame, so a frame is about 55–90 ms old instead
+            of 60–260 ms on a full session's preview. No episode can be recorded until you Disconnect and Connect
+            normally (Live Record).
+          </span>
+        </div>
+        {wrongCameras ? <p className="command-error">{wrongCameras}: Disconnect and connect for this checkpoint.</p> : null}
         <p className="panel-note">
           The policy reads the recorder's live frames (it never opens a camera) and the arm gripper BOX's width
           {ckpt?.wrench ? " and external wrench" : ""}, with the arm standing still; nothing is sent to the arm. Every
@@ -381,7 +411,7 @@ export function RolloutPage() {
             </button>
           ) : (
             <button
-              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected}
+              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected || Boolean(wrongCameras)}
               onClick={() => act(() => rolloutApi.preview(checkpoint, arm, rate, readJoints))}
             >
               Start preview
