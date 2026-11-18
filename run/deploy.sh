@@ -247,7 +247,9 @@ if [[ -n "$sandbox" ]]; then
     rsync -a --delete "$production_dir/outputs/calibration/" "$repo_dir/outputs/calibration/"
     for state_file in tools/thor/gmsl2/world/world_registration.json tools/thor/gmsl2/world/world_stable_source.json \
         outputs/box_six_d_origin.json outputs/world_graph_guard.json outputs/cart_check.json; do
-      if [[ -e "$repo_dir/$state_file" ]] && ! cmp -s "$production_dir/$state_file" "$repo_dir/$state_file"; then
+      # world_registration / world_stable_source are status every continuity check rewrites, not results
+      if [[ "$state_file" != tools/thor/gmsl2/world/world_* && -e "$repo_dir/$state_file" ]] \
+          && ! cmp -s "$production_dir/$state_file" "$repo_dir/$state_file"; then
         echo "WARN: replacing the dev tree's ${state_file} with production's (it differed)" >&2
       fi
       if [[ -e "$production_dir/$state_file" ]]; then

@@ -308,8 +308,13 @@ fi
 
 # Both stamps are "%Y-%m-%dT%H:%M:%SZ", so lexicographic order is time order.
 world_excludes=()
+# A sandbox (and the dev gateway) takes these Thor-only status files from production on the remote side;
+# the copies a developer's checkout happens to hold (gitignored, stale) must not land on top of them.
+if [[ -n "$sandbox" ]]; then
+  world_excludes+=(--exclude="/$world_dir/world_registration.json" --exclude="/$world_dir/world_stable_source.json")
+fi
 if [[ -n "$remote_world_id" && "$remote_world_id" != "$local_world_id" && "$remote_world_created" > "$local_world_created" ]]; then
-  world_excludes=(--exclude="/$world_dir/world_reference.json" --exclude="/$world_dir/world_graph.json")
+  world_excludes+=(--exclude="/$world_dir/world_reference.json" --exclude="/$world_dir/world_graph.json")
   echo "WARNING: ${target} has a newer world reference than this tree, and it is being KEPT:" >&2
   echo "           ${target} has: ${remote_world_id} (${remote_world_created})" >&2
   echo "           this tree: ${local_world_id:-none} (${local_world_created:-none})" >&2
@@ -321,7 +326,7 @@ elif [[ -n "$remote_world_id" && "$remote_world_id" != "$local_world_id" ]]; the
 else
   echo "    world reference: ${local_world_id:-none}, match"
   if [[ -n "$remote_graph_newest" && "$remote_graph_newest" > "$local_graph_newest" ]]; then
-    world_excludes=(--exclude="/$world_dir/world_graph.json")
+    world_excludes+=(--exclude="/$world_dir/world_graph.json")
     echo "WARNING: ${target}'s world_graph.json is newer than this tree's, and it is being KEPT:" >&2
     echo "           ${target} newest entry: ${remote_graph_newest}; this tree: ${local_graph_newest:-none}" >&2
     echo "         It holds the world -> fr3_base edge every FR3 replay and export goes through;" >&2
