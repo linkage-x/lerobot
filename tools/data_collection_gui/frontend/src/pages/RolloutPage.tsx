@@ -9,6 +9,7 @@ import {
   rolloutApi
 } from "./rolloutApi";
 import { ArmGripperPanel } from "./ArmGripperPanel";
+import { executeBlockers } from "./rolloutExecute";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -206,6 +207,8 @@ export function RolloutPage() {
   const [arm, setArm] = useState("right");
   const [rate, setRate] = useState(2);
   const [readJoints, setReadJoints] = useState(false);
+  const [stage, setStage] = useState(1);
+  const [attended, setAttended] = useState(false);
   const [selected, setSelected] = useState<ResultRow | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -244,6 +247,13 @@ export function RolloutPage() {
   const ckpt = checkpoints.find((c) => c.path === checkpoint);
   const running = status?.jobs.find((j) => j.state === "running");
   const activePreview = status?.jobs.find((j) => j.kind === "preview");
+  const runPath = (p: string | undefined) => (p ?? "").split("/runs/")[1] ?? p ?? "";
+  const previewReplayed = Boolean(
+    ckpt && results.some((r) => r.kind === "preview" && r.replayCheck?.ok && runPath(r.checkpoint) === runPath(ckpt.path))
+  );
+  const blockers = executeBlockers({ status, checkpoint: ckpt, arm, attended, previewReplayed });
+  const executing = running?.kind === "execute" ? running : undefined;
+  const lock = status?.unlock?.[arm];
   const episodeList = useMemo(
     () => episodes.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n >= 0),
     [episodes]
@@ -253,7 +263,7 @@ export function RolloutPage() {
     <div className="page-stack">
       <PageHeader
         title="Rollout"
-        subtitle="run a trained policy on recordings and on the live cameras and BOX, with the execution layer's checks — the arm does not move"
+        subtitle="run a trained policy on recordings, on the live cameras and BOX with the arm still, and — by stages, with a person at the e-stop — on the arm"
       />
       {error ? <div className="command-error">{error}</div> : null}
       <section className="panel">
@@ -273,8 +283,8 @@ export function RolloutPage() {
           ))}
         </ol>
         <p className="panel-note">
-          Executing a policy on the arm is not part of this version. When it is, it starts only by a person, with a
-          person at the e-stop, after the offline and preview checks of the same checkpoint passed.
+          Executing a policy on the arm (section 3) starts only by a person at the e-stop, on an arm a maintainer
+          has unlocked for a bounded time, after a preview of the same checkpoint passed its Replay check.
         </p>
       </section>
 
@@ -384,6 +394,66 @@ export function RolloutPage() {
         ) : null}
       </section>
 
+      <section className="panel rollout-execute">
+        <div className="panel-heading">
+          <h2>3 · Execute on the arm</h2>
+          <span>
+            {lock?.unlocked
+              ? `${arm} arm unlocked by ${lock.by} until ${lock.expires}`
+              : `${arm} arm locked`}
+          </span>
+        </div>
+        <p className="panel-note">
+          <strong>The arm moves.</strong> Start from the start pose with the gripper open and the cubes as recorded,
+          stand at the e-stop, and go stage by stage. Every step is checked before it is sent (IK inside the joint
+          walls, training workspace + 3 cm, 10 mm from carts/table/cameras, ≤ 15 mm and 5° per 33 ms step); the arm
+          holds where it is on any stop: a step that fails, inputs too old, contact above 15 N, the TCP 20 mm off its
+          command, or Stop. Nothing is slowed down: the policy reads speed from its own history.
+        </p>
+        <div className="control-row">
+          <select value={stage} onChange={(e) => setStage(Number(e.target.value))} disabled={Boolean(executing)}>
+            {Object.entries(status?.executeStages ?? {}).map(([n, label]) => (
+              <option key={n} value={n}>
+                stage {n} · {label}
+              </option>
+            ))}
+          </select>
+          <span className="panel-note">arm: {arm} (chosen in section 2)</span>
+          <label className="train-inline">
+            <input type="checkbox" checked={attended} onChange={(e) => setAttended(e.target.checked)} />
+            I am at the e-stop
+          </label>
+          {executing ? (
+            <button className="danger rollout-stop" onClick={() => act(() => rolloutApi.stop(executing.id))}>
+              STOP (hold the arm)
+            </button>
+          ) : (
+            <button
+              className="danger"
+              disabled={blockers.length > 0}
+              title={blockers.join("; ")}
+              onClick={() =>
+                act(async () => {
+                  await rolloutApi.execute(checkpoint, arm, stage, attended);
+                  setAttended(false);
+                })
+              }
+            >
+              Execute stage {stage}
+            </button>
+          )}
+        </div>
+        {executing ? (
+          <p className="command-error">Running: {executing.message || "starting"}</p>
+        ) : blockers.length ? (
+          <ul className="panel-note">
+            {blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        ) : null}
+      </section>
+
       <section className="panel">
         <div className="panel-heading">
           <h2>Jobs</h2>
@@ -437,11 +507,21 @@ export function RolloutPage() {
                 <td>{r.kind}</td>
                 <td>{r.created}</td>
                 <td className="train-path">{r.checkpoint?.split("/runs/")[1] ?? r.checkpoint}</td>
-                <td>{r.kind === "offline" ? `${r.export} (${r.frames} frames)` : `${r.arm} arm, ${r.steps ?? "…"} steps`}</td>
+                <td>
+                  {r.kind === "offline"
+                    ? `${r.export} (${r.frames} frames)`
+                    : r.kind === "execute"
+                      ? `${r.arm} arm, stage ${r.stage ?? "?"}`
+                      : `${r.arm} arm, ${r.steps ?? "…"} steps`}
+                </td>
                 <td>
                   {r.kind === "offline"
                     ? `${r.posMm?.toFixed(1)} mm vs still ${r.stillMm?.toFixed(1)} mm; images Δ ≤ ${r.viewVsOnlineMm?.toFixed(1)} mm`
-                    : r.replayCheck
+                    : r.kind === "execute"
+                      ? r.result
+                        ? `${r.result.completed ? "completed" : `stopped: ${r.result.stopped}`} (${r.result.chunks} chunks, ${r.result.duration_s.toFixed(1)} s)`
+                        : "running or interrupted"
+                      : r.replayCheck
                       ? `replay ${r.replayCheck.ok ? "identical" : "DIFFERENT"} (max ${r.replayCheck.max_abs_diff.toExponential(1)})`
                       : r.planProblem || "not replayed yet"}
                 </td>

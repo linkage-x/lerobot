@@ -4867,6 +4867,15 @@ button.danger {
 /* Rollout page */
 .rollout-stages { margin: 4px 0 8px 18px; font-size: 13px; }
 .rollout-stage-on strong { color: inherit; }
+.rollout-execute { border-left: 4px solid #bd5b39; }
+button.danger.rollout-stop {
+  background: #b3261e;
+  border-color: #8d1b14;
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 700;
+  padding: 0.6rem 1.4rem;
+}
 .rollout-stage-off { opacity: 0.6; }
 .rollout-figures { display: flex; gap: 16px; flex-wrap: wrap; }
 .rollout-figure { margin: 8px 0; font-size: 12px; max-width: 380px; }

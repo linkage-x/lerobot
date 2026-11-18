@@ -7,7 +7,7 @@ export type Stage = { id: string; label: string; status: string };
 
 export type RolloutJob = {
   id: string;
-  kind: "offline" | "preview" | "replay";
+  kind: "offline" | "preview" | "replay" | "execute";
   checkpoint: string;
   state: "running" | "done" | "failed" | "stopped";
   message: string;
@@ -24,6 +24,17 @@ export type RolloutStatus = {
   profile: string;
   sandbox: string | null;
   recorderConnected: boolean;
+  executeStages?: Record<string, string>;
+  unlock?: Record<string, ArmUnlock>;
+};
+
+export type ArmUnlock = {
+  arm: string;
+  unlocked: boolean;
+  why?: string;
+  by?: string;
+  reason?: string;
+  expires?: string;
 };
 
 export type RolloutCheckpoint = {
@@ -55,6 +66,8 @@ export type ResultRow = {
   steps?: number;
   replayCheck?: { ok: boolean; max_abs_diff: number; steps: number } | null;
   planProblem?: string;
+  stage?: number | null;
+  result?: { completed: boolean; stopped: string; chunks: number; duration_s: number } | null;
 };
 
 export type ErrorSummary = { mean: number; p95: number; by_step: (number | null)[] };
@@ -135,5 +148,7 @@ export const rolloutApi = {
   preview: (checkpoint: string, arm: string, rate: number, readJoints: boolean) =>
     call<{ job: RolloutJob }>("/api/rollout/preview", { checkpoint, arm, rate, readJoints }),
   replay: (record: string) => call<{ job: RolloutJob }>("/api/rollout/replay", { record }),
+  execute: (checkpoint: string, arm: string, stage: number, attended: boolean) =>
+    call<{ job: RolloutJob }>("/api/rollout/execute", { checkpoint, arm, stage, attended }),
   stop: (job: string) => call("/api/rollout/stop", { job })
 };

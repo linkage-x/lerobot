@@ -132,16 +132,21 @@ def _rotvec(R: np.ndarray) -> np.ndarray:
 
 
 def ik(
-    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, iters: int = 400
+    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, iters: int = 400, early_exit: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """Flange poses ``T_target`` (n,4,4) by damped least squares, all at once; ``(q, converged)``.
 
     The nullspace pulls toward the middle of the joint range, and the joints are kept inside it with
     LIMIT_MARGIN_DEG to spare; a pose that cannot be reached there does not converge.
+
+    ``early_exit``: stop as soon as every pose has converged (a control loop's budget: a chunk seeded
+    from where the arm stands converges in tens of iterations, ~10x faster than 400). The answer is
+    then the converged posture nearest the seed, not the one the nullspace drifts to afterwards.
     """
     q = np.array(np.broadcast_to(seed, (len(T_target), 7)), dtype=np.float64)
     mid = (Q_LOWER + Q_UPPER) / 2.0
     eye6 = np.eye(6)
+    tol = np.array([IK_TOL_MM * 1e-3, math.radians(IK_TOL_DEG)])
     for _ in range(iters):
         T, J = arm.kinematics(q)
         e = np.concatenate(
@@ -151,6 +156,10 @@ def ik(
             ],
             axis=1,
         )
+        if early_exit and np.all(np.linalg.norm(e[:, :3], axis=1) < tol[0] * 0.5) and np.all(
+            np.linalg.norm(e[:, 3:], axis=1) < tol[1] * 0.5
+        ):
+            break
         Jt = J.transpose(0, 2, 1)
         A = J @ Jt + 1e-6 * eye6
         dq = (Jt @ np.linalg.solve(A, e[:, :, None]))[:, :, 0]
@@ -177,7 +186,9 @@ _SEED_NUDGES = (
 )
 
 
-def ik_retry(arm: Arm, T_target: np.ndarray, seed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def ik_retry(
+    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, early_exit: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
     """``ik`` from the seed, then from each of _SEED_NUDGES for the poses still not converged."""
     seeds = np.array(np.broadcast_to(seed, (len(T_target), 7)), dtype=np.float64)
     q = np.zeros_like(seeds)
@@ -186,7 +197,9 @@ def ik_retry(arm: Arm, T_target: np.ndarray, seed: np.ndarray) -> tuple[np.ndarr
         todo = ~ok
         if not todo.any():
             break
-        q_try, ok_try = ik(arm, T_target[todo], np.clip(seeds[todo] + nudge, Q_LOWER, Q_UPPER))
+        q_try, ok_try = ik(
+            arm, T_target[todo], np.clip(seeds[todo] + nudge, Q_LOWER, Q_UPPER), early_exit=early_exit
+        )
         q[todo], ok[todo] = q_try, ok_try
     return q, ok
 

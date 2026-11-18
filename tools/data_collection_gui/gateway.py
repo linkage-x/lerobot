@@ -4908,7 +4908,11 @@ def _fr3_pivot_fci_holder(state: GatewayState) -> str:
         if state.profile == "workstation" and recorder is not None and recorder.poll() is None:
             return "FR3 录制器已连接"
     if state.payload_calibration is not None:
-        return state.payload_calibration.fci_user()
+        holder = state.payload_calibration.fci_user()
+        if holder:
+            return holder
+    if state.rollout is not None:
+        return state.rollout.fci_user()
     return ""
 
 
@@ -20311,6 +20315,9 @@ def _start_real_replay(
     conflict = _box_port_conflict(state)
     if conflict:
         raise ValueError(conflict)
+    executing = state.rollout.fci_user() if state.rollout is not None else ""  # its own lock, not state.lock
+    if executing:
+        raise ValueError(f"{executing}，它占着 FR3 的 FCI；先在 Rollout 页停掉")
 
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
@@ -21038,9 +21045,23 @@ def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
             profile=state.profile,
             sandbox=state.sandbox,
             recorder_busy=lambda: state.process is not None and state.process.poll() is None,
+            fci_holder=lambda: _rollout_fci_holder(state),
             gateway_url=f"http://127.0.0.1:{port}",
         )
     return state.rollout
+
+
+def _rollout_fci_holder(state: GatewayState) -> str:
+    """Whatever else holds (or is about to take) an arm's FCI, for a rollout execution; outside state.lock."""
+    holder = _fr3_pivot_fci_holder(state)
+    if holder:
+        return holder
+    with state.fr3_pivot_lock:
+        if state.fr3_pivot_job.get("state") == "collecting":
+            return "FR3 pivot 采集正在进行"
+    if _dual_home_live(state):
+        return "双臂归位正在进行"
+    return ""
 
 
 def _rollout_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str, query: dict[str, list[str]]) -> bool:
@@ -21093,6 +21114,11 @@ def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: st
             state.log("info", f"Rollout preview {job.id} started (arm still, no motion)")
         elif path == "/api/rollout/replay":
             job = manager.start_replay(str(body.get("record") or ""))
+        elif path == "/api/rollout/execute":
+            job = manager.start_execute(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
+                                        int(body.get("stage") or 0), body.get("attended") is True)
+            state.log("warn", f"Rollout execute {job.id} started: stage {job.params.get('stage')} on the "
+                              f"{job.params.get('arm')} arm (unlocked by {job.params.get('unlockBy')}); the arm moves")
         elif path == "/api/rollout/stop":
             _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
             return True
