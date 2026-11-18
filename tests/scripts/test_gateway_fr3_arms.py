@@ -77,3 +77,147 @@ def test_a_recording_from_before_world_stamps_replays_only_on_the_arm_in_fr3_bas
 
 def test_every_arm_s_gripper_box_is_the_arm_s_not_the_operator_s(tmp_path: Path) -> None:
     assert "box3100715645" in gateway._fr3_arm_box_ids(Path.cwd())
+
+
+# --- Device Manager gripper close/open button ---------------------------------
+
+
+class _AnsweringStdin:
+    """The recorder's stdin: answers each arm_gripper line the way thor_record does, on its own thread.
+
+    The answer is applied as the recorder-output consumer applies it -- under ``state.lock`` -- so the
+    POST, which holds that lock, gets it only if its wait really releases the lock.
+    """
+
+    def __init__(self, state: gateway.GatewayState, *, ok: bool = True, answer: bool = True) -> None:
+        self.state, self.ok, self.answer, self.writes = state, ok, answer, []
+
+    def write(self, text: str) -> None:
+        self.writes.append(text)
+        if not self.answer:
+            return
+        _, device_id, width, request = text.strip().split(":")
+        reply = {
+            "request": request,
+            "deviceId": int(device_id),
+            "targetM": float(width),
+            "ok": self.ok,
+            "error": "" if self.ok else "set_mode(1) 失败 rc=-1",
+            "modeBefore": 1,
+            "widthBeforeM": 0.0887,
+        }
+
+        def apply() -> None:
+            with self.state.lock:
+                gateway._apply_recorder_output(self.state, "ARMGRIPPER_DONE " + json.dumps(reply))
+                self.state.recorder_output_applied.notify_all()
+
+        threading.Thread(target=apply, daemon=True).start()
+
+    def flush(self) -> None:
+        pass
+
+
+class _Recorder:
+    pid = 4321
+
+    def __init__(self, stdin: _AnsweringStdin) -> None:
+        self.stdin = stdin
+
+    def poll(self):
+        return None
+
+
+def _gripper_state(tmp_path: Path, monkeypatch, **stdin_kwargs) -> tuple[gateway.GatewayState, _AnsweringStdin]:
+    state = _state(tmp_path)
+    stdin = _AnsweringStdin(state, **stdin_kwargs)
+    state.process = _Recorder(stdin)
+    monkeypatch.setattr(gateway, "_state_is_gmsl2", lambda _state: True)
+    monkeypatch.setattr(gateway, "_gripper_teleop_root", lambda _state: tmp_path / "teleop")
+    return state, stdin
+
+
+def _post(server, path: str, body: dict) -> dict:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as answered:
+        return json.loads(answered.read())
+
+
+def test_the_gripper_button_closes_then_opens_through_the_recorder(tmp_path: Path, monkeypatch) -> None:
+    state, stdin = _gripper_state(tmp_path, monkeypatch)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        closed = _post(server, "/api/fr3/arm-gripper", {"arm": "right", "action": "close"})
+        hold_after_close = json.loads((tmp_path / "teleop" / "hold.json").read_text())
+        opened = _post(server, "/api/fr3/arm-gripper", {"arm": "right", "action": "open"})
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/api/fr3/arm-gripper", timeout=5) as r:
+            listed = json.loads(r.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+    # close = the right arm's replay grasp width (0 m), open = just short of the jaw's 88.7 mm
+    assert stdin.writes == ["arm_gripper:3100715645:0.0000:g1\n", "arm_gripper:3100715645:0.0880:g2\n"]
+    assert closed["ok"] and closed["error"] == ""
+    assert hold_after_close == {**hold_after_close, "device_id": 3100715645, "target_m": 0.0, "mode": 1}
+    assert opened["ok"]
+    assert json.loads((tmp_path / "teleop" / "hold.json").read_text())["target_m"] == 0.088
+    (right,) = listed["arms"]  # the left arm has no gripper BOX wired in
+    assert right["arm"] == "right" and right["deviceId"] == 3100715645
+    assert right["last"]["action"] == "open" and right["last"]["ok"] is True
+    assert listed["refusal"] == ""
+    assert state.lock.acquire(timeout=1)
+    state.lock.release()
+
+
+def test_the_gripper_button_reports_what_the_recorder_answered(tmp_path: Path, monkeypatch) -> None:
+    state, _ = _gripper_state(tmp_path, monkeypatch, ok=False)
+    with state.lock:
+        result = gateway._arm_gripper_command(state, {"arm": "right", "action": "close"})
+    assert not result["ok"] and "set_mode(1)" in result["error"]
+    assert not (tmp_path / "teleop" / "hold.json").exists()  # a failed command is no new hold target
+
+
+def test_a_recorder_that_never_answers_is_reported_not_waited_on(tmp_path: Path, monkeypatch) -> None:
+    state, stdin = _gripper_state(tmp_path, monkeypatch, answer=False)
+    monkeypatch.setattr(gateway, "_ARM_GRIPPER_REPLY_TIMEOUT_S", 0.2)
+    with state.lock:
+        result = gateway._arm_gripper_command(state, {"arm": "right", "action": "open"})
+    assert len(stdin.writes) == 1
+    assert not result["ok"] and "没有回话" in result["error"]
+    assert result["arms"][0]["last"]["ok"] is False
+
+
+def test_the_gripper_button_refuses_without_a_recorder_a_gripper_or_a_clear_action(tmp_path: Path, monkeypatch) -> None:
+    state, stdin = _gripper_state(tmp_path, monkeypatch)
+    with state.lock:
+        toggled = gateway._arm_gripper_command(state, {"arm": "right", "action": "toggle"})
+        unnamed = gateway._arm_gripper_command(state, {"action": "close"})
+        bare = gateway._arm_gripper_command(state, {"arm": "left", "action": "close"})
+        state.process = None
+        offline = gateway._arm_gripper_command(state, {"arm": "right", "action": "close"})
+    assert "close 或 open" in toggled["error"]
+    assert "no default arm" in unnamed["error"]
+    assert "没有接入的夹爪 BOX" in bare["error"]
+    assert "先 Connect" in offline["error"] and "先 Connect" in offline["refusal"]
+    assert stdin.writes == []
+
+
+def test_the_live_width_is_the_arm_box_s_and_only_while_fresh(tmp_path: Path) -> None:
+    import time
+
+    state = _state(tmp_path)
+    jaw = {"distance_m": 0.0476}
+    state.device_preview["box"] = {"active": True, "updatedAt": time.time(), "sensors": {"box3100715645/box_gripper": jaw, "box3906437858/box_gripper": {"distance_m": 0.08}}}
+    assert gateway._arm_gripper_live_width_mm(state, 3100715645) == 47.6
+    state.device_preview["box"] = {"active": True, "updatedAt": time.time(), "sensors": {"box_gripper": jaw}, "status": {"device_id": 3906437858}}
+    assert gateway._arm_gripper_live_width_mm(state, 3100715645) is None  # one BOX, but the handheld
+    state.device_preview["box"]["status"] = {"device_id": 3100715645}
+    assert gateway._arm_gripper_live_width_mm(state, 3100715645) == 47.6
+    state.device_preview["box"]["updatedAt"] = time.time() - 10
+    assert gateway._arm_gripper_live_width_mm(state, 3100715645) is None

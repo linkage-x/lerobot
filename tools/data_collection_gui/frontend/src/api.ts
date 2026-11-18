@@ -32,6 +32,7 @@ import type {
   Fr3MoveToStartResponse,
   Fr3PivotResponse,
   GripperTeleopResponse,
+  ArmGripperResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -1634,6 +1635,30 @@ export class DataCollectionGuiApi {
       const payload = (await response.json()) as Partial<GripperTeleopResponse>;
       if (!response.ok && !payload.job) return null;
       return payload as GripperTeleopResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  // --- FR3 gripper close/open button (Device Manager); rides the connected recorder ---
+  async fetchArmGripper(): Promise<ArmGripperResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/fr3/arm-gripper`, { headers: { Accept: "application/json" } });
+      return response.ok ? ((await response.json()) as ArmGripperResponse) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The action is explicit (never a server-side toggle): a double click repeats, it does not undo.
+  async commandArmGripper(arm: string, action: "close" | "open"): Promise<ArmGripperResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/fr3/arm-gripper`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ arm, action })
+      });
+      return response.ok ? ((await response.json()) as ArmGripperResponse) : null;
     } catch {
       return null;
     }

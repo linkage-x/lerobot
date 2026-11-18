@@ -1746,6 +1746,37 @@ export type GripperTeleopResponse = {
   hold: { device_id: number; target_m: number | null; mode: number | null; written: string } | null;
 };
 
+/** The last close/open the Device Manager button sent to an arm's gripper BOX (ok null = waiting for the recorder). */
+export type ArmGripperCommand = {
+  request?: string;
+  deviceId: number;
+  action?: "close" | "open";
+  targetM?: number;
+  ok: boolean | null;
+  error?: string;
+  modeBefore?: number | null;
+  widthBeforeM?: number | null;
+  sentAt?: number;
+  at?: number;
+};
+
+export type ArmGripperRow = {
+  arm: string;
+  deviceId: number;
+  /** Live jaw width from the recorder's BOX stream; null when absent or stale. */
+  widthMm: number | null;
+  last: ArmGripperCommand | null;
+};
+
+/** GET/POST /api/fr3/arm-gripper: every arm with a gripper BOX, and why no command may go now. */
+export type ArmGripperResponse = {
+  ok: boolean;
+  error: string;
+  refusal: string;
+  openWidthMm: number;
+  arms: ArmGripperRow[];
+};
+
 export type Fr3PivotResponse = {
   ok: boolean;
   error?: string;

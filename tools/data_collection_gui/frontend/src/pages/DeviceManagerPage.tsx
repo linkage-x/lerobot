@@ -3,6 +3,7 @@ import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskExportPlan } from "../shared/ui";
 import { api } from "../apiClient";
+import { ArmGripperPanel } from "./ArmGripperPanel";
 import { TouchHeatmapGrid, numberArray, touchLayoutForSample, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples } from "../touchVisualization";
 
 export function numberValue(value: unknown): number | null {
@@ -533,6 +534,7 @@ export function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
           </label>
         </div>
       </section>
+      <ArmGripperPanel />
       {Object.entries(grouped).map(([kind, items]) => (
         <section className="panel" key={kind}>
           <div className="panel-heading">

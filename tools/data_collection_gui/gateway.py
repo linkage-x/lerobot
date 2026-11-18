@@ -566,6 +566,11 @@ class GatewayState:
     gripper_teleop_process: subprocess.Popen[str] | None = None
     gripper_teleop_job: dict[str, Any] = field(default_factory=dict)
     gripper_teleop_lock: Lock = field(default_factory=Lock)
+    # Device Manager close/open button for an arm's gripper (rides the recorder's stdin; guarded by
+    # `lock`, which the recorder-output consumer holds when it records an ARMGRIPPER_DONE line).
+    arm_gripper_seq: int = 0
+    arm_gripper_replies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    arm_gripper_last: dict[int, dict[str, Any]] = field(default_factory=dict)
     # Two-arm replay (roadmap D4): tools/fr3/dual_fr3_replay_runtime.py, Connect -> at frame 0 -> Execute.
     dual_replay_process: subprocess.Popen[str] | None = None
     dual_replay_job: dict[str, Any] = field(default_factory=dict)
@@ -5978,6 +5983,191 @@ _GRIPPER_TELEOP_ROUTES: dict[str, Callable[[GatewayState, dict[str, Any]], dict[
     "/api/fr3/gripper-teleop/start": _start_gripper_teleop,
     "/api/fr3/gripper-teleop/stop": _stop_gripper_teleop,
 }
+
+
+# --- FR3 gripper close/open button (Device Manager) -------------------------
+#
+# One button per arm with a gripper BOX: press to close, press again to open. While the recorder is
+# connected it owns the BOX port, so the command rides its stdin (``arm_gripper:<id>:<m>:<request>``)
+# and the answer comes back as one ``ARMGRIPPER_DONE {json}`` line. Close is the replay's grasp width
+# (``input.grasp_closed_width_m``, 0 m: a jaw closed on a cube keeps squeezing it, as in the demos);
+# open is just short of the 88.7 mm the jaw opens to, so the motor is not driven into its stop. The jaw
+# stays in control mode afterwards, and teleop's hold.json is updated so a later ⓪ teleop entry
+# holds the new target instead of re-sending a stale one.
+
+_ARM_GRIPPER_OPEN_WIDTH_M = 0.088
+_ARM_GRIPPER_REPLY_TIMEOUT_S = 3.0
+_ARM_GRIPPER_LIVE_MAX_AGE_S = 2.0
+_ARM_GRIPPER_ACTIONS = ("close", "open")
+
+
+def _note_arm_gripper_reply(state: GatewayState, text: str) -> None:
+    """Record the recorder's answer (caller holds ``state.lock``: the recorder-output consumer)."""
+    try:
+        reply = json.loads(text)
+    except json.JSONDecodeError:
+        state.log("warn", "recorder: malformed ARMGRIPPER_DONE payload")
+        return
+    if not isinstance(reply, dict):
+        return
+    reply["at"] = time.time()
+    request = str(reply.get("request") or "")
+    if request:
+        state.arm_gripper_replies[request] = reply
+        for stale in list(state.arm_gripper_replies)[:-20]:
+            state.arm_gripper_replies.pop(stale, None)
+    try:
+        device_id = int(reply.get("deviceId"))
+    except (TypeError, ValueError):
+        return
+    previous = state.arm_gripper_last.get(device_id) or {}
+    if previous.get("request") == request:
+        reply = {**previous, **reply}  # keep the action the gateway sent it with
+    state.arm_gripper_last[device_id] = reply
+    target = reply.get("targetM")
+    if reply.get("ok"):
+        state.log("info", f"FR3 gripper BOX {device_id} -> {float(target) * 1e3:.1f} mm")
+        with suppress(OSError, TypeError, ValueError):
+            hold = _gripper_teleop_root(state) / "hold.json"
+            hold.parent.mkdir(parents=True, exist_ok=True)
+            hold.write_text(
+                json.dumps(
+                    {
+                        "device_id": device_id,
+                        "target_m": float(target),
+                        "mode": 1,
+                        "written": datetime.now().isoformat(timespec="seconds"),
+                        "by": "device manager gripper button",
+                    },
+                    indent=2,
+                )
+            )
+    else:
+        state.log("warn", f"FR3 gripper BOX {device_id} command failed: {reply.get('error') or 'unknown'}")
+
+
+def _arm_gripper_live_width_mm(state: GatewayState, device_id: int) -> float | None:
+    """The gripper BOX's width from the recorder's latest BOX_LIVE snapshot, or None if absent or stale."""
+    box = state.device_preview.get("box")
+    if not isinstance(box, dict) or not box.get("active"):
+        return None
+    if time.time() - float(box.get("updatedAt") or 0.0) > _ARM_GRIPPER_LIVE_MAX_AGE_S:
+        return None
+    sensors = box.get("sensors") if isinstance(box.get("sensors"), dict) else {}
+    jaw = sensors.get(f"box{device_id}/box_gripper")
+    if jaw is None and "box_gripper" in sensors:  # one BOX, unprefixed: only if it is this one
+        status = box.get("status") if isinstance(box.get("status"), dict) else {}
+        if str(status.get("device_id") or "") in ("", str(device_id)):
+            jaw = sensors["box_gripper"]
+    if not isinstance(jaw, dict):
+        return None
+    try:
+        width = float(jaw.get("distance_m"))
+    except (TypeError, ValueError):
+        return None
+    return round(width * 1e3, 1) if math.isfinite(width) else None
+
+
+def _arm_gripper_refusal_reason(state: GatewayState) -> str:
+    """Why no button may send now, or "" (caller holds ``state.lock``)."""
+    recorder = state.process
+    if recorder is None or recorder.poll() is not None:
+        return "录制器没有连接；先 Connect（夹爪指令经录制器发给 BOX）"
+    if not _state_is_gmsl2(state):
+        return "当前录制器不是 GMSL2/BOX 录制器"
+    replay = state.replay_process
+    if replay is not None and replay.poll() is None and state.replay_process_kind == "real":
+        return "真机 replay 正在运行，它在控制 FR3 夹爪"
+    if _gripper_teleop_running(state):
+        return _gripper_teleop_conflict()
+    return ""
+
+
+def _arm_gripper_payload(state: GatewayState) -> dict[str, Any]:
+    """Every arm with a gripper BOX, its live width and the last command (caller holds ``state.lock``)."""
+    arms = []
+    for row in _robot_arms_payload(state).get("arms") or []:
+        device_id = row.get("gripperBox")
+        if device_id in (None, ""):
+            continue
+        device_id = int(device_id)
+        arms.append(
+            {
+                "arm": row.get("arm") or "",
+                "deviceId": device_id,
+                "widthMm": _arm_gripper_live_width_mm(state, device_id),
+                "last": dict(state.arm_gripper_last.get(device_id) or {}) or None,
+            }
+        )
+    return {
+        "ok": True,
+        "error": "",
+        "refusal": _arm_gripper_refusal_reason(state),
+        "openWidthMm": round(_ARM_GRIPPER_OPEN_WIDTH_M * 1e3, 1),
+        "arms": arms,
+    }
+
+
+def _arm_gripper_command(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    """``POST /api/fr3/arm-gripper``: ``{arm, action: close|open}`` (caller holds ``state.lock``).
+
+    The action is explicit, not a server-side toggle: a double click or two open pages then repeat
+    what the button showed instead of undoing it. Waits for the recorder's answer on
+    ``recorder_output_applied``, which releases ``state.lock`` while blocked.
+    """
+
+    def refusal(message: str) -> dict[str, Any]:
+        return {**_arm_gripper_payload(state), "ok": False, "error": message}
+
+    action = str(body.get("action") or "").strip().lower()
+    if action not in _ARM_GRIPPER_ACTIONS:
+        return refusal(f"action 必须是 close 或 open，收到 {action!r}")
+    try:
+        target = _drive_target(state, body.get("arm"), None)
+    except ValueError as exc:
+        return refusal(str(exc))
+    device_id = target.get("corenetic_device_id")
+    if device_id in (None, ""):
+        return refusal(f"{target.get('arm') or '这条臂'}没有接入的夹爪 BOX")
+    device_id = int(device_id)
+    why = _arm_gripper_refusal_reason(state)
+    if why:
+        return refusal(why)
+    if action == "close":
+        settings = _gripper_teleop_settings(state, target.get("replay_config") or None)
+        closed = settings.get("graspClosedWidthM")
+        width_m = float(closed) if closed is not None else 0.0
+    else:
+        width_m = _ARM_GRIPPER_OPEN_WIDTH_M
+    state.arm_gripper_seq += 1
+    request = f"g{state.arm_gripper_seq}"
+    state.arm_gripper_last[device_id] = {
+        "request": request,
+        "deviceId": device_id,
+        "action": action,
+        "targetM": width_m,
+        "ok": None,
+        "error": "",
+        "sentAt": time.time(),
+    }
+    try:
+        _write_recorder_stdin(state.process, f"arm_gripper:{device_id}:{width_m:.4f}:{request}\n")
+    except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
+        state.arm_gripper_last[device_id].update(ok=False, error=f"发不出去：{exc}")
+        return refusal(f"写录制器 stdin 失败：{exc}")
+    deadline = time.monotonic() + _ARM_GRIPPER_REPLY_TIMEOUT_S
+    while request not in state.arm_gripper_replies:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        state.recorder_output_applied.wait(remaining)
+    reply = state.arm_gripper_replies.get(request)
+    if reply is None:
+        message = f"录制器 {_ARM_GRIPPER_REPLY_TIMEOUT_S:g} s 内没有回话（录制器版本早于这个按钮？重新 Connect）"
+        state.arm_gripper_last[device_id].update(ok=False, error=message)
+        return refusal(message)
+    payload = _arm_gripper_payload(state)
+    return {**payload, "ok": bool(reply.get("ok")), "error": str(reply.get("error") or "")}
 
 
 # --- FR3 move to start --------------------------------------------------------
@@ -18421,6 +18611,9 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             if done:
                 state.box_touch_cali_running = False
         return
+    if output.startswith("ARMGRIPPER_DONE "):
+        _note_arm_gripper_reply(state, output.removeprefix("ARMGRIPPER_DONE ").strip())
+        return
     if output.startswith("CALI_LOG ") or output.startswith("CALI_DONE "):
         done = output.startswith("CALI_DONE ")
         line = output.removeprefix("CALI_DONE " if done else "CALI_LOG ").strip()
@@ -20984,6 +21177,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if path == "/api/fr3/arm-gripper":
+            with self.server.state.lock:
+                payload = _arm_gripper_payload(self.server.state)
+            _json_response(self, HTTPStatus.OK, payload)
+            return
         if path == "/api/fr3/gripper-teleop":
             _json_response(
                 self,
@@ -21900,6 +22098,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     result = _trigger_box_six_d_force_cali(self.server.state, origin=True, box_id=box_id)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
+                    return
+                if path == "/api/fr3/arm-gripper":
+                    result = _arm_gripper_command(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/device/calibrate-touch":
                     box_id = (query.get("box_id", [""])[0] or "").strip()
