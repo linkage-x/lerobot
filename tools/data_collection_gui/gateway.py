@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import calibration_promotion as promotion
 from tools.data_collection_gui import fr3_payload_calibration as payload_cal
+from tools.data_collection_gui import hardware_lease
 from tools.data_collection_gui import rollout_runs
 from tools.data_collection_gui import training_runs
 from tools.fr3 import fr3_arms
@@ -551,6 +552,11 @@ class GatewayState:
     # Name of a personal sandbox (run/deploy.sh thor --sandbox NAME), None for production. A sandbox
     # shares the machine with the production gateway, so it never opens cameras, BOXes or robots.
     sandbox: str | None = None
+    # Who of production and the maintainer's dev gateway holds this Thor's hardware right now
+    # (hardware_lease.HardwareLease; run/deploy.sh --dev). None in a sandbox and in tests.
+    hardware_lease: Any = None
+    # The dev gateway's way to production (loopback), for Borrow.
+    production_url: str = ""
     datasets_root: Path | None = None
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
@@ -16739,6 +16745,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             "sandbox": state.sandbox,
             "release": _deployed_release(state.repo_root),
         },
+        "hardwareLease": state.hardware_lease.payload() if state.hardware_lease is not None else None,
         "gateway": {
             "configPath": str(state.config_path),
             "pid": state.recording.pid,
@@ -21054,6 +21061,230 @@ def _sandbox_hardware_refusal(state: GatewayState, method: str, path: str) -> st
     )
 
 
+# --- Hardware lease: production and the maintainer's dev gateway take turns -----------------------
+#
+# hardware_lease.py has the protocol. A hardware request here is one the sandbox guard refuses, plus the
+# Rollout page's preview and execution (a sandbox's rollout manager refuses those itself).
+LEASE_HARDWARE_POST_PREFIXES = SANDBOX_HARDWARE_POST_PREFIXES + ("/api/rollout/preview", "/api/rollout/execute")
+
+
+def _is_hardware_request(method: str, path: str) -> bool:
+    return path.startswith(LEASE_HARDWARE_POST_PREFIXES if method == "POST" else SANDBOX_HARDWARE_GET_PREFIXES)
+
+
+def _hardware_busy(state: GatewayState, port: int) -> list[str]:
+    """What of this gateway still uses the hardware: lending or returning waits until this is empty.
+
+    Camera previews are not on the list: they hold the cameras only while someone looks, and a transfer
+    stops them. Called outside state.lock (it takes the locks it needs).
+    """
+
+    def alive(proc: Any) -> bool:
+        return proc is not None and proc.poll() is None
+
+    out: list[str] = []
+    with state.lock:
+        if alive(state.process):
+            out.append(f"the recorder is connected ({state.recording.state}): Disconnect it")
+        if alive(state.replay_process) and state.replay_process_kind == "real":
+            out.append("a real replay is running")
+        if state.replay_tracker is not None:
+            out.append("a real replay holds the laser tracker")
+        if alive(state.teleop_process):
+            out.append("FR3 teleoperation is running")
+        if alive(state.realsense_preview_process) or any(alive(p) for p in state.realsense_preview_processes.values()):
+            out.append("a RealSense preview is open")
+        if state.calibration_session.active:
+            out.append("a calibration session is open")
+        if state.tracker_mount_session.active:
+            out.append("a tracker-mount session is open")
+        if state.marker_tcp_session.active:
+            out.append("a marker-TCP session is open")
+    for label, lock, attr in (
+        ("an FR3 pivot", state.fr3_pivot_lock, "fr3_pivot_process"),
+        ("FR3 gripper teleop", state.gripper_teleop_lock, "gripper_teleop_process"),
+        ("a two-arm replay", state.dual_replay_lock, "dual_replay_process"),
+        ("the two-arm home", state.dual_home_lock, "dual_home_process"),
+    ):
+        with lock:
+            proc = getattr(state, attr)
+        if alive(proc):
+            out.append(f"{label} is running")
+    if state.payload_calibration is not None:
+        holder = state.payload_calibration.fci_user()
+        if holder:
+            out.append(holder)
+    rollout_user = _rollout(state, port).hardware_user()
+    if rollout_user:
+        out.append(rollout_user)
+    return out
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _dev_repo_refusal(state: GatewayState, dev_repo: str) -> str | None:
+    """A dev tree production may sweep for processes when reclaiming: never production's own tree."""
+    if not dev_repo or not Path(dev_repo).is_absolute():
+        return f"the dev gateway's tree {dev_repo!r} is not an absolute path"
+    tree, own = Path(dev_repo).resolve(), state.repo_root.resolve()
+    if tree == own or tree in own.parents or own in tree.parents or len(tree.parts) < 3:
+        return f"{tree} is not a dev tree beside production ({own})"
+    return None
+
+
+def _hardware_snapshot(handler: BaseHTTPRequestHandler, state: GatewayState) -> None:
+    with state.lock:
+        payload = _snapshot(state)
+    _json_response(handler, HTTPStatus.OK, payload)
+
+
+def _hardware_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """GET /api/hardware/lease: the lease as this gateway sees it, and what of it still uses the hardware."""
+    if path != "/api/hardware/lease":
+        return False
+    lease = state.hardware_lease
+    if lease is None:
+        _json_response(handler, HTTPStatus.OK, {"role": None, "busy": []})
+        return True
+    _json_response(handler, HTTPStatus.OK, {**lease.payload(), "busy": _hardware_busy(state, handler.server.server_address[1])})
+    return True
+
+
+def _hardware_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: str) -> bool:
+    """POST /api/hardware/{borrow,return} (dev gateway), /api/hardware/{lend,reclaim} (production).
+
+    Outside state.lock. Borrow, Return and Reclaim are pressed by a person on a page; Lend is the dev
+    gateway asking production over loopback. Agents call none of them (AGENTS.md section 3).
+    """
+    if not path.startswith("/api/hardware/"):
+        return False
+    lease = state.hardware_lease
+    if lease is None:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "a sandbox has no hardware to lend or borrow"})
+        return True
+    port = handler.server.server_address[1]
+    try:
+        body = _read_json_body(handler)
+        if path == "/api/hardware/lend":
+            _hardware_lend(handler, state, body, port)
+            return True
+        if path == "/api/hardware/borrow":
+            _hardware_borrow(state, port)
+        elif path == "/api/hardware/return":
+            _hardware_return(state, port)
+        elif path == "/api/hardware/reclaim":
+            _hardware_reclaim(state)
+        else:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
+            return True
+    except (hardware_lease.LeaseRefusedError, ValueError) as exc:
+        state.log("warn", f"{path}: {exc}")
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+        return True
+    _hardware_snapshot(handler, state)
+    return True
+
+
+def _hardware_lend(handler: BaseHTTPRequestHandler, state: GatewayState, body: dict[str, Any], port: int) -> None:
+    lease = state.hardware_lease
+    if lease.role != hardware_lease.PRODUCTION:
+        raise hardware_lease.LeaseRefusedError("only the production gateway lends the hardware")
+    if not _is_loopback(handler.client_address[0]):
+        raise hardware_lease.LeaseRefusedError("only a dev gateway on this machine may borrow the hardware")
+    dev_url = str(body.get("devUrl") or "")
+    if not dev_url.startswith("http://127.0.0.1:"):
+        raise hardware_lease.LeaseRefusedError(f"the dev gateway's address {dev_url!r} is not a loopback URL")
+    dev_repo = str(body.get("devRepo") or "")
+    refusal = _dev_repo_refusal(state, dev_repo)
+    if refusal:
+        raise hardware_lease.LeaseRefusedError(refusal)
+    new = hardware_lease.Lease(
+        holder=hardware_lease.DEV, since=hardware_lease.now_utc(), by=str(body.get("by") or "")[:120],
+        devUrl=dev_url, devRepo=str(Path(dev_repo).resolve()), devCommit=str(body.get("devCommit") or "")[:40],
+    )
+    lease.transfer(new, expect=(hardware_lease.PRODUCTION,), busy=lambda: _hardware_busy(state, port),
+                   before_write=lambda: _stop_all_camera_previews(state))
+    state.log("warn", f"Hardware lent to the dev gateway {dev_url} ({new.devRepo}, {new.devCommit[:8]}): "
+                      "this gateway refuses cameras, BOXes, the laser tracker and the arms until it comes back")
+    _json_response(handler, HTTPStatus.OK, {"ok": True, "hardwareLease": lease.payload()})
+
+
+def _hardware_borrow(state: GatewayState, port: int) -> None:
+    lease = state.hardware_lease
+    if lease.role != hardware_lease.DEV:
+        raise hardware_lease.LeaseRefusedError("Borrow is the dev gateway's; production lends")
+    if lease.lease().holder == hardware_lease.DEV:
+        return
+    release = _deployed_release(state.repo_root) or {}
+    url = f"{state.production_url.rstrip('/')}/api/hardware/lend"
+    status, reply = hardware_lease.post_peer(url, {
+        "devUrl": f"http://127.0.0.1:{port}", "devRepo": str(state.repo_root),
+        "by": release.get("by") or "", "devCommit": release.get("commit") or "",
+    })
+    if status == 0:
+        raise hardware_lease.LeaseRefusedError(f"the production gateway ({state.production_url}) did not answer; it lends "
+                                          "the hardware, so it must be running")
+    if status == HTTPStatus.NOT_FOUND:
+        raise hardware_lease.LeaseRefusedError("the production gateway runs a version that cannot lend the hardware; "
+                                          "deploy the hardware lease to production first")
+    if status != HTTPStatus.OK:
+        raise hardware_lease.LeaseRefusedError(f"production did not lend the hardware: {reply.get('error') or status}")
+    state.log("warn", "Borrowed the hardware from production: this dev gateway may now open the cameras, BOXes, "
+                      "the laser tracker and the arms")
+
+
+def _hardware_return(state: GatewayState, port: int) -> None:
+    lease = state.hardware_lease
+    if lease.role != hardware_lease.DEV:
+        raise hardware_lease.LeaseRefusedError("Return is the dev gateway's; production reclaims")
+    if lease.lease().holder != hardware_lease.DEV:
+        return
+    new = hardware_lease.Lease(holder=hardware_lease.PRODUCTION, since=hardware_lease.now_utc(),
+                               by="returned by the dev gateway")
+    lease.transfer(new, expect=(hardware_lease.DEV,), busy=lambda: _hardware_busy(state, port),
+                   before_write=lambda: _stop_all_camera_previews(state))
+    state.log("info", "Returned the hardware to production")
+
+
+def _hardware_reclaim(state: GatewayState) -> None:
+    """Production takes the hardware back: the dev gateway returns it, or its processes are stopped."""
+    lease = state.hardware_lease
+    if lease.role != hardware_lease.PRODUCTION:
+        raise hardware_lease.LeaseRefusedError("Reclaim is production's; the dev gateway returns")
+    current = lease.lease()
+    if current.holder == hardware_lease.PRODUCTION:
+        return
+    if current.holder == hardware_lease.DEV and current.devUrl:
+        status, reply = hardware_lease.post_peer(f"{current.devUrl.rstrip('/')}/api/hardware/return", {}, timeout_s=5.0)
+        if status == HTTPStatus.OK and lease.lease().holder == hardware_lease.PRODUCTION:
+            state.log("info", f"Reclaimed the hardware: the dev gateway {current.devUrl} returned it")
+            return
+        if status != 0:
+            raise hardware_lease.LeaseRefusedError(
+                f"the dev gateway ({current.devUrl}) keeps the hardware: {reply.get('error') or status}. Stop that on "
+                "its page; it returns the hardware once nothing there uses it")
+    # The dev gateway does not answer: whatever still runs in its tree may hold a camera, a BOX or an arm.
+    stopped: list[int] = []
+    if current.devRepo:
+        refusal = _dev_repo_refusal(state, current.devRepo)
+        if refusal:
+            raise hardware_lease.LeaseRefusedError(f"not sweeping the dev tree: {refusal}")
+        stopped = hardware_lease.processes_in(Path(current.devRepo))
+        left = hardware_lease.stop_processes(stopped)
+        if left:
+            raise hardware_lease.LeaseRefusedError(f"processes {left} in {current.devRepo} survived SIGKILL; the hardware "
+                                              "stays with the dev gateway")
+    note = f"reclaimed by production (dev gateway silent; stopped {len(stopped)} process(es) in its tree)"
+    lease.transfer(hardware_lease.Lease(holder=hardware_lease.PRODUCTION, since=hardware_lease.now_utc(), by=note),
+                   expect=(hardware_lease.DEV, hardware_lease.UNKNOWN), busy=lambda: [])
+    state.log("warn", f"Hardware {note}")
+
+
 def _deployed_release(repo_root: Path) -> dict[str, Any] | None:
     """What run/deploy.sh says it put in this tree (DEPLOYED.json), re-read only when the file changes."""
     path = repo_root / DEPLOYED_RELEASE_FILE
@@ -21264,12 +21495,38 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         _json_response(self, HTTPStatus.NO_CONTENT, {})
 
     def do_GET(self) -> None:
+        self._lease_guarded("GET", self._handle_get)
+
+    def do_POST(self) -> None:
+        self._lease_guarded("POST", self._handle_post)
+
+    def _lease_guarded(self, method: str, handle: Callable[[], None]) -> None:
+        """Run a request; one that touches hardware only while this gateway holds the lease (counted in flight)."""
+        lease = self.server.state.hardware_lease
+        path = urlparse(self.path).path
+        if lease is None or not _is_hardware_request(method, path):
+            handle()
+            return
+        refusal = lease.enter()
+        if refusal is not None:
+            if method == "POST":
+                self.server.state.log("warn", f"{path}: {refusal}")
+            _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
+        try:
+            handle()
+        finally:
+            lease.exit()
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
         refusal = _sandbox_hardware_refusal(self.server.state, "GET", path)
         if refusal is not None:
             _json_response(self, HTTPStatus.CONFLICT, {"error": refusal})
+            return
+        if _hardware_get(self, self.server.state, path):
             return
         if _training_get(self, self.server.state, path, query):
             return
@@ -21670,7 +21927,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
 
-    def do_POST(self) -> None:
+    def _handle_post(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
@@ -21697,6 +21954,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 HTTPStatus.CONFLICT,
                 {"error": f"{path} is unavailable in the workstation profile"},
             )
+            return
+        if _hardware_post(self, self.server.state, path):
             return
         if _training_post(self, self.server.state, path):
             return
@@ -22363,6 +22622,8 @@ def make_state(
     gateway_log_path: Path | None = None,
     profile: str = "thor",
     sandbox: str | None = None,
+    hardware_lease_side: Any = None,
+    production_url: str = "",
 ) -> GatewayState:
     if profile not in DEPLOYMENT_PROFILES:
         raise ValueError(f"Unknown deployment profile: {profile}")
@@ -22383,6 +22644,8 @@ def make_state(
         config=config,
         profile=profile,
         sandbox=sandbox or None,
+        hardware_lease=None if sandbox else hardware_lease_side,
+        production_url=production_url,
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
@@ -22401,6 +22664,8 @@ def make_state(
     state.log("info", f"Loaded {profile} config {resolved_config}")
     if state.sandbox:
         state.log("info", f"Sandbox '{state.sandbox}': cameras, BOXes, laser tracker and FR3 arms are off limits")
+    elif state.hardware_lease is not None and state.hardware_lease.role == hardware_lease.DEV:
+        state.log("info", f"Dev gateway: the hardware is used only while borrowed from production ({production_url})")
     if resolved_datasets_root is not None:
         state.log("info", f"Scanning datasets under {resolved_datasets_root}")
     return state
@@ -22421,7 +22686,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="personal sandbox name (set by run/deploy.sh --sandbox): refuse everything that touches hardware",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="the maintainer's dev gateway (set by run/deploy.sh --dev): touch hardware only while borrowed",
+    )
+    parser.add_argument(
+        "--hardware-lease",
+        type=Path,
+        default=None,
+        help=f"production's lease file (default for production: <repo-root>/outputs/{hardware_lease.FILE_NAME})",
+    )
+    parser.add_argument("--production-url", default="http://127.0.0.1:8765", help="dev gateway: production, for Borrow")
+    args = parser.parse_args()
+    if args.dev and (args.sandbox or args.hardware_lease is None):
+        parser.error("--dev needs --hardware-lease (production's lease file) and no --sandbox")
+    return args
+
+
+def _hardware_lease_side(args: argparse.Namespace, repo_root: Path) -> hardware_lease.HardwareLease | None:
+    if args.sandbox:
+        return None
+    if args.dev:
+        return hardware_lease.HardwareLease(args.hardware_lease.resolve(), hardware_lease.DEV)
+    path = args.hardware_lease or repo_root / "outputs" / hardware_lease.FILE_NAME
+    return hardware_lease.HardwareLease(path.resolve(), hardware_lease.PRODUCTION)
 
 
 def _setup_gateway_log(repo_root: Path, requested_log_dir: Path | None) -> tuple[Path, Path]:
@@ -22445,6 +22734,7 @@ def main() -> None:
     state = make_state(
         repo_root, args.config_path, args.datasets_root, args.exports_root,
         log_dir=log_dir, gateway_log_path=gateway_log_path, profile=args.profile, sandbox=args.sandbox,
+        hardware_lease_side=_hardware_lease_side(args, repo_root), production_url=args.production_url,
     )
     if state.profile == "workstation":
         _probe_workstation_devices(state)

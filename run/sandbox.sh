@@ -96,7 +96,7 @@ case "$cmd" in
   status|logs|stop)
     name="${1:-}"
     [[ -n "$name" ]] || { usage >&2; exit 2; }
-    validate_sandbox_name "$name"
+    validate_sandbox_target "$name"
     dir="$(sandbox_dir "$name")"
     case "$cmd" in
       status)
@@ -123,6 +123,9 @@ case "$cmd" in
           pids="$(gateway_pids_for '"'$dir'"')"; [[ -z "$pids" ]] || echo "$pids" | xargs -r kill -9
           echo "sandbox '"$name"': gateway stopped"
         '
+        if [[ "$name" == "$DEV_SANDBOX_NAME" ]]; then
+          echo "If the dev gateway held the hardware, take it back with Reclaim on the production page." >&2
+        fi
         ;;
     esac
     ;;
@@ -136,7 +139,7 @@ case "$cmd" in
     name="${1:-}"
     shift || true
     [[ -n "$name" && $# -gt 0 ]] || { usage >&2; exit 2; }
-    validate_sandbox_name "$name"
+    validate_sandbox_target "$name"
     dir="$(sandbox_dir "$name")"
     for dataset in "$@"; do
       if [[ ! "$dataset" =~ ^[A-Za-z0-9._-]+$ || "$dataset" == .* ]]; then
@@ -172,7 +175,7 @@ case "$cmd" in
   remove)
     name="${1:-}"
     [[ -n "$name" ]] || { usage >&2; exit 2; }
-    validate_sandbox_name "$name"
+    validate_sandbox_target "$name"
     if [[ "${2:-}" != "--yes" ]]; then
       echo "This stops sandbox '$name' and deletes $(sandbox_dir "$name") on ${TARGET_NAME}, including every dataset copied or recorded into it. Production is not touched." >&2
       echo "Run again with --yes to do it: bash run/sandbox.sh ${TARGET_NAME} remove $name --yes" >&2

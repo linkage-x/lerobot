@@ -26,6 +26,21 @@ export type DeployedRelease = {
   station?: string | null;
 };
 
+/** Who of production and the dev gateway holds this Thor's hardware (gateway hardware_lease.py); null in a sandbox. */
+export type HardwareLease = {
+  role: "production" | "dev";
+  holder: "production" | "dev" | "unknown";
+  since: string;
+  by: string;
+  devUrl: string;
+  devRepo: string;
+  devCommit: string;
+  /** This gateway holds the hardware. */
+  mine: boolean;
+  /** Why this gateway may not touch the hardware now; null when it may. */
+  refusal: string | null;
+};
+
 export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator" | "laser_tracker";
 
 export type DeviceStatus = {

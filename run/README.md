@@ -18,6 +18,8 @@
 | 部署副本 | corenetic `hph@192.168.11.44:~/lerobot-box-deploy` | 一份只用于部署的 clone（`box` 分支，含子模块和 LFS 文件）。**不要在里面开发**：守卫要求它干净并且在 `origin/box` 上 |
 | 学生前端 | corenetic 端口 **5180**，systemd 用户服务 `lerobot-frontend-thor1` | 学生打开 <http://192.168.11.44:5180/>。提供的是部署副本里**构建好的 `dist/`**（`vite preview`），只有重新构建并重启服务时页面才会变（第 5 节） |
 
+| 开发网关 | thor1 `/home/nvidia/sandboxes/dev`，端口 **8766** | maintainer 在真机上试分支的地方：借到硬件时才能用相机、BOX、跟踪仪和机械臂（第 7 节） |
+
 corenetic 上的 5173/5174 是 corenetic 账号自己的开发前端，不要占用。
 
 ## 2. 常规生产部署（PR 合入 `box` 之后）
@@ -158,3 +160,36 @@ git -c protocol.file.allow=always submodule update --init --recursive && git sub
 git status --short                          # 必须为空
 rsync -a "$L/" hph@192.168.11.44:/home/hph/lerobot-box-deploy/
 ```
+
+## 7. 开发网关（`--dev`）：在真机上试分支，稳定了再提 PR
+
+开发网关是 Thor 上一个固定的沙箱（`/home/nvidia/sandboxes/dev`，端口 8766）。它和生产分时使用同一套硬件：
+借到硬件期间，它能连录制器、开预览、跑 replay 和 rollout；生产这时暂停自己的硬件功能，离线功能照常。
+协议在 `tools/data_collection_gui/hardware_lease.py`。
+
+```bash
+bash run/deploy.sh thor1 --dev          # 在开发机上执行：任意树（不过生产守卫），本地前端 5173 连 8766
+bash run/sandbox.sh thor1 status dev    # 端口、版本、数据
+bash run/sandbox.sh thor1 logs dev
+bash run/sandbox.sh thor1 stop dev      # 先归还硬件；没还就停了，到生产页面「收回硬件」
+```
+
+1. **部署**：每次部署都会从生产刷新标定（`outputs/calibration`）、world 状态和门禁文件（`world_graph_guard.json`、
+   `cart_check.json`、`box_six_d_origin.json`），并用硬链接带上生产训练好的 checkpoint
+   （`outputs/training/runs`，不占额外空间，已有的同名 run 不覆盖）。开发网关写的东西（录制、rollout 记录、标定结果）只留在它自己的目录里。
+2. **借用**：在开发网关页面顶部的横幅上按「借用硬件」。生产必须空闲：录制器没连接，也没有 replay、rollout、
+   pivot、负载辨识或标定会话在运行。生产的相机预览会被自动关掉。借出后，生产页面显示黄条，所有硬件接口都返回 409。
+3. **使用**：在开发网关上 Connect、预览、Execute，操作和生产一样。真机运动仍然只能由现场的人启动，手放在急停上。
+4. **归还**：先停掉录制器、replay、rollout，再按「归还硬件」。
+5. **收回**：开发网关忘了还，或者已经没有响应时，在生产页面黄条上按「收回硬件」。
+   - 开发网关在线：等于请它归还。它还在用硬件时会拒绝，并说明是什么在用。
+   - 开发网关没响应：先结束 dev 目录里的所有 python 进程（包括录制器、rollout 和正在动的机械臂），再收回。
+
+其他规则：
+- 开发网关持有硬件并且正在用时，`deploy.sh --dev` 会拒绝（exit 76）。持有但空闲时可以部署，新进程继续持有，不用重新借。
+- 部署生产不影响租约：生产部署只结束生产目录里的录制器，借出期间开发网关的录制器不受影响。
+- 租约文件在 `/home/nvidia/lerobot/outputs/hardware_lease.json`，不要手改。读不出来时，两边都不使用硬件，
+  到生产页面按「收回硬件」恢复。
+- 第一次使用前，生产必须已经部署了带租约的版本；否则「借用」会提示生产版本太旧。
+- agent 可以用 `--dev` 部署，也可以用开发网关的离线功能；但不能借用、归还或收回硬件，也不能调用开发网关的硬件接口
+  （AGENTS.md 第 3、4 节）。

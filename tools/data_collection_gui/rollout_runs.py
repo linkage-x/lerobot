@@ -306,6 +306,12 @@ class RolloutManager:
         job = next((j for j in self.jobs.values() if j.state == "running" and j.kind == "execute"), None)
         return f"Rollout 执行 {job.id}（{job.params.get('arm')} 臂，第 {job.params.get('stage')} 步）正在运行" if job else ""
 
+    def hardware_user(self) -> str:
+        """A running preview or execution (they read the cameras and the arm) for the hardware lease, or ""."""
+        self.refresh()
+        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind in ("preview", "execute")), None)
+        return f"Rollout {job.kind} {job.id} is running: stop it on the Rollout page" if job else ""
+
     def start_replay(self, record: str) -> RolloutJob:
         path = Path(record).resolve()
         if (self.root / "records").resolve() not in path.parents or not (path / "record.json").is_file():

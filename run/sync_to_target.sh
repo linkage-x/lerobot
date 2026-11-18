@@ -4,6 +4,7 @@
 # Usage:
 #   bash run/sync_to_target.sh TARGET [rsync options...]            # TARGET from run/targets/ (required)
 #   bash run/sync_to_target.sh TARGET --sandbox NAME [rsync options...]   # your own sandbox on a Thor
+#   bash run/sync_to_target.sh TARGET --dev [rsync options...]            # the maintainer's dev gateway tree
 #
 # Production (the target's repo_dir, e.g. thor1 -> /home/nvidia/lerobot) only takes a clean,
 # reviewed tree: no uncommitted or untracked files, and HEAD already merged into origin/box.
@@ -33,6 +34,7 @@ fi
 refuse_downgrade=0
 maintainer=false
 sandbox=""
+dev=false
 dry_run=false
 rsync_args=()
 expect_sandbox_name=false
@@ -48,6 +50,7 @@ for arg in "$@"; do
     --maintainer) maintainer=true ;;
     --sandbox) expect_sandbox_name=true ;;
     --sandbox=*) sandbox="${arg#--sandbox=}" ;;
+    --dev) dev=true ;;
     -n|--dry-run) dry_run=true; rsync_args+=("$arg") ;;
     *) rsync_args+=("$arg") ;;
   esac
@@ -74,6 +77,14 @@ if [[ -n "$sandbox" ]]; then
     exit 2
   fi
   validate_sandbox_name "$sandbox"
+  remote_dir="$(sandbox_dir "$sandbox")"
+fi
+if $dev; then
+  if [[ -n "$sandbox" || "$TARGET_SANDBOXES" != true ]] || $maintainer; then
+    echo "ERROR: --dev goes alone (no --sandbox, no --maintainer), to a Thor target (run/targets/${target}.json with sandboxes)" >&2
+    exit 2
+  fi
+  sandbox="$DEV_SANDBOX_NAME"
   remote_dir="$(sandbox_dir "$sandbox")"
 fi
 

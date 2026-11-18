@@ -13,6 +13,11 @@ THOR_SANDBOX_BASE="/home/nvidia/sandboxes"
 SANDBOX_PORT_MIN=8770
 SANDBOX_PORT_MAX=8799
 
+# The maintainer's dev gateway (run/deploy.sh TARGET --dev): a sandbox tree with a fixed port that may
+# use the hardware while it has borrowed it from production (tools/data_collection_gui/hardware_lease.py).
+DEV_SANDBOX_NAME="dev"
+DEV_GATEWAY_PORT=8766
+
 # validate_sandbox_name NAME -> exits 2 with a reason when NAME is not usable.
 validate_sandbox_name() {
   local name="$1"
@@ -21,11 +26,16 @@ validate_sandbox_name() {
     exit 2
   fi
   case "$name" in
-    lerobot|production|prod|main|box|thor|workstation)
-      echo "ERROR: '$name' is reserved; name the sandbox after yourself" >&2
+    lerobot|production|prod|main|box|thor|workstation|dev)
+      echo "ERROR: '$name' is reserved; name the sandbox after yourself (the dev gateway is run/deploy.sh --dev)" >&2
       exit 2
       ;;
   esac
+}
+
+# validate_sandbox_target NAME -> validate_sandbox_name, and also the dev gateway's tree (status, logs, stop, ...)
+validate_sandbox_target() {
+  [[ "$1" == "$DEV_SANDBOX_NAME" ]] || validate_sandbox_name "$1"
 }
 
 sandbox_dir() {

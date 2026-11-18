@@ -176,3 +176,26 @@ def test_no_script_picks_a_machine_by_default(tmp_path, argv):
     assert proc.returncode == 2, proc.stderr
     assert "there is no default target" in proc.stderr and "thor2" in proc.stderr
     assert not (tmp_path / "rsync_ran").exists()
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["thor1", "--dev", "--sandbox", "zhangsan"], "--dev goes alone"),
+        (["thor1", "--dev", "--maintainer"], "--dev goes alone"),
+        (["workstation", "--dev"], "--dev goes alone"),
+        (["thor1", "--sandbox", "dev"], "the dev gateway is run/deploy.sh --dev"),
+    ],
+)
+def test_the_dev_gateway_is_deployed_only_as_itself(tmp_path, argv, message):
+    proc = subprocess.run(
+        ["bash", str(RUN / "deploy.sh"), *argv],
+        env=_fake_bin(tmp_path, "upai-pro03"),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=REPO,
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert message in proc.stderr
+    assert not (tmp_path / "rsync_ran").exists()
