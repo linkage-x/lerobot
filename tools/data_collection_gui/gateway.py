@@ -17062,16 +17062,34 @@ def _set_all_device_states(state: GatewayState, device_state: str) -> None:
         device["state"] = device_state
 
 
+# A camera the recorder did not open because it was connected for inference (Rollout page): not a fault.
+# Shown as "推理模式未连接" so nobody power-cycles it or runs recover_argus.sh over it.
+NOT_OPENED_FOR_INFERENCE = "not_opened"
+
+
 def _set_active_device_states(state: GatewayState, device_state: str) -> None:
     for device in state.devices:
-        if device.get("state") != "error":
+        if device.get("state") not in ("error", NOT_OPENED_FOR_INFERENCE):
             device["state"] = device_state
+
+
+def _mark_cameras_not_opened_for_inference(state: GatewayState) -> None:
+    opened = set(state.recording.inferenceCameras)
+    if not opened:
+        return
+    for device in state.devices:
+        if device.get("kind") == "camera" and str(device.get("id")) not in opened:
+            device["state"] = NOT_OPENED_FOR_INFERENCE
 
 
 def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> None:
     configured = [device for device in state.devices if device.get("kind") == kind]
     if not configured:
         return
+    if kind == "camera" and state.recording.inferenceCameras:
+        # only the cameras asked for count: the others were never opened
+        configured = [d for d in configured if str(d.get("id")) in state.recording.inferenceCameras]
+        _mark_cameras_not_opened_for_inference(state)
 
     connected_ids = {
         item.strip()
@@ -17499,6 +17517,7 @@ def _connect_recorder(
     # Force the first viewer poll of the new session to send a demand heartbeat.
     state.recorder_preview_demand_sent_s = 0.0
     _set_all_device_states(state, "warning")
+    _mark_cameras_not_opened_for_inference(state)
     if is_workstation and state.recording.backend == "sim":
         # Nothing physical is opened in a sim session. Leaving the hardware rows at "warning"
         # (the Connect default) would imply the gateway is still waiting on an FR3 that was
@@ -21378,6 +21397,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     device_id=device_id,
                     device=device,
                 )
+                return
+            if isinstance(device, dict) and device.get("state") == NOT_OPENED_FOR_INFERENCE:
+                # an old JPEG of it may still be in tmpfs: never show it as live
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"{device_id}: 推理模式未连接"})
                 return
             params = None if use_recorder_preview else _camera_preview_params(self.server.state, device_id)
             if use_recorder_preview:

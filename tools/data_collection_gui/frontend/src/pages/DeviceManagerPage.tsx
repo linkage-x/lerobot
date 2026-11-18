@@ -317,7 +317,7 @@ export const PREVIEW_MAX_FAILURES = 30;
 export function CameraTile({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
   // Idle snapshots use the gateway's temporary preview pipeline; while the
   // recorder owns the cameras, snapshots come from recorder-owned tmpfs JPEGs.
-  const previewable = device.state !== "error";
+  const previewable = device.state !== "error" && device.state !== "not_opened";
   const config = device.config ?? {};
   const configEntries = Object.entries(config).filter(
     ([, v]) => v != null && typeof v !== "object"
@@ -374,9 +374,11 @@ export function CameraTile({ device, snapshot }: { device: DeviceStatus; snapsho
 
   const placeholder = device.state === "error"
     ? "no signal"
-    : failuresRef.current >= PREVIEW_MAX_FAILURES
-      ? "preview unavailable"
-      : device.state;
+    : device.state === "not_opened"
+      ? stateLabel(device.state)
+      : failuresRef.current >= PREVIEW_MAX_FAILURES
+        ? "preview unavailable"
+        : device.state;
 
   return (
     <div className="camera-tile">
