@@ -10,7 +10,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tools.fr3 import fr3_kinematics as kin, relative_tcp as rt, rollout_execute as rx
+from tools.fr3 import (
+    fr3_kinematics as kin,
+    relative_tcp as rt,
+    rollout_execute as rx,
+    rollout_execute_report as rep,
+)
 
 Q0 = np.array([0.0, -0.4, 0.0, -2.2, 0.0, 1.8, 0.8])
 STEP_DOWN_M = 0.004  # the fake policy: 4 mm down per 33 ms step (120 mm/s)
@@ -107,7 +112,7 @@ def _policy(c: rt.PolicyContract, width=lambda k: 0.088):
 
 
 def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_ext=None, limits=rx.Limits(), width=lambda k: 0.088,
-         gripper=None, stop_flag=lambda: ""):
+         gripper=None, stop_flag=lambda: "", record=None):
     c = _contract()
     clock = Clock()
     arm = FakeArm(clock, f_ext=f_ext)
@@ -126,7 +131,7 @@ def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_e
     result = rx.run_loop(arm=arm, predictor=pred, stage=stage, n_exec=16, limits=limits, fk_tcp=_fk,
                          wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
                          stop_flag=stop_flag, log=lambda **kw: seen.append(kw), gripper=gripper, clock=clock,
-                         sleep=clock.sleep)
+                         sleep=clock.sleep, record=record)
     return result, arm, seen
 
 
@@ -261,3 +266,89 @@ def test_ik_early_exit_converges_to_the_posture_nearest_the_seed():
     # nearest the seed: never further from it than the 400-iteration answer, and smooth step to step
     assert np.abs(q_fast - Q0).sum() <= np.abs(q_full - Q0).sum() + 1e-6
     assert np.abs(np.diff(q_fast, axis=0)).max() < 0.03
+
+
+# ------------------------------------------------------- the report on a record ---
+
+
+def _recorded(tmp_path: Path, stage: rx.Stage, **kw):
+    """A simulated run written by the real Recorder, with the record.json execute() writes around it."""
+    import json
+
+    limits = kw.pop("limits", rx.Limits())
+    meta = {"schema": rx.RECORD_SCHEMA, "kind": "execute", "checkpoint": "ckpt", "contract": _contract().to_dict(),
+            "arm": "right", "n_action_steps": 16, "frame_source": "/dev/shm/lerobot_online_sync",
+            "tcp_tool": np.eye(4).tolist(), **rx.stage_dict(stage, limits)}
+    recorder = rx.Recorder(tmp_path)
+    result, arm, seen = _run(stage, limits=limits, record=recorder, **kw)
+    recorder.close()
+    meta["result"] = {"completed": result.completed, "stopped": result.stopped, "chunks": result.chunks_accepted,
+                      "duration_s": round(result.duration_s, 3), "ticks": result.ticks}
+    (tmp_path / "record.json").write_text(json.dumps(meta, default=str), encoding="utf-8")
+    return result, arm
+
+
+def test_report_reads_a_closed_loop_run_back(tmp_path: Path):
+    result, _ = _recorded(tmp_path, replace(rx.STAGES[2], max_s=2.0), age_s=0.15)
+    r = rep.analyze(tmp_path)
+    assert r["result"]["completed"] and r["chunks"]["accepted"] == result.chunks_accepted >= 3
+    assert r["inputs"]["age_ms"]["p50"] == pytest.approx(150.0, abs=6.0)
+    assert r["timing"]["late_steps"]["min"] >= 4  # a 150 ms old frame: 4-5 steps of 33 ms already past
+    assert r["timing"]["loop_hz"] == pytest.approx(rx.LOOP_HZ, rel=0.05)
+    # the fake arm lags its command by 15 ms at 120 mm/s: ~2 mm behind the policy's targets, never more than a few
+    assert 0.5 < r["motion"]["target_mm"]["p50"] < 3.0 and r["motion"]["target_mm"]["max"] < 5.0
+    assert r["motion"]["tracking_mm"]["max"] < 5.0
+    assert r["motion"]["net_mm"] > 180.0  # 2 s at ~120 mm/s
+    age = next(h for h in r["headroom"] if h["what"] == "frame age")
+    assert age["limit"] == 400.0 and age["use"] == pytest.approx(age["worst"] / 400.0, abs=1e-3)
+    text = rep.format_text(r)
+    assert "TCP vs target" in text and "fewer than" not in text
+
+
+def test_report_on_a_refused_first_chunk_says_the_arm_never_moved(tmp_path: Path):
+    _recorded(tmp_path, rx.STAGES[1], fail_step=5)
+    r = rep.analyze(tmp_path)
+    assert r["chunks"] == {"accepted": 0, "refused": 1, "refusals": [r["chunks"]["refusals"][0]]}
+    assert "step 5" in r["chunks"]["refusals"][0]
+    assert "never commanded" in r["motion"]["note"]
+    assert "never commanded" in rep.format_text(r)
+
+
+def test_report_on_stage_one_warns_that_one_prediction_sets_no_limit(tmp_path: Path):
+    _recorded(tmp_path, rx.STAGES[1])
+    r = rep.analyze(tmp_path)
+    assert r["inputs"]["age_ms"]["n"] == 1
+    assert "fewer than 5 predictions" in rep.format_text(r)
+
+
+def test_report_lists_the_gripper_commands(tmp_path: Path):
+    sent: list[str] = []
+    _recorded(tmp_path, replace(rx.STAGES[3], max_s=1.0), width=lambda k: 0.088 if k < 12 else 0.03, gripper=sent.append)
+    r = rep.analyze(tmp_path)
+    assert sent and [g["action"] for g in r["gripper"]] == sent
+
+
+def test_report_pools_several_runs(tmp_path: Path, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _recorded(a, replace(rx.STAGES[2], max_s=0.8))
+    _recorded(b, replace(rx.STAGES[2], max_s=0.8))
+    out = tmp_path / "r.json"
+    assert rep.main([str(a), str(b), "--json", str(out)]) == 0
+    import json
+
+    data = json.loads(out.read_text())
+    n = sum(run["inputs"]["age_ms"]["n"] for run in data["runs"])
+    assert data["pooled"]["age_ms"]["n"] == n and "pooled over 2 runs" in capsys.readouterr().out
+
+
+def test_report_uses_the_tool_frame_the_run_recorded():
+    T_tool = np.eye(4)
+    T_tool[2, 3] = 0.1
+    fk = rep.tcp_fk({"tcp_tool": T_tool.tolist(), "arm": "right"})
+    np.testing.assert_allclose(fk(np.stack([Q0, Q0])), np.stack([_fk(Q0) @ T_tool] * 2), atol=1e-12)
+
+
+def test_report_refuses_a_preview_record(tmp_path: Path):
+    (tmp_path / "record.json").write_text('{"kind": "preview"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not an execute record"):
+        rep.analyze(tmp_path)
