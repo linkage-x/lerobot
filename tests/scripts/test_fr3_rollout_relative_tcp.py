@@ -255,3 +255,47 @@ def test_execute_endpoint_answers_outside_the_gateway_lock(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_connected_for_inference_the_jobs_read_the_main_bus_if_it_has_the_checkpoints_cameras(tmp_path):
+    spawned = []
+
+    class Proc:
+        pid = 2**22 + 9  # a real integer, never a MagicMock (os.killpg)
+
+    cameras = {"open": ["cam_06"]}
+    manager = _manager(tmp_path, recorder_busy=lambda: True, recorder_cameras=lambda: cameras["open"],
+                       popen=lambda cmd, **k: spawned.append(cmd) or Proc())
+    ckpt = manager.checkpoints()[0]["path"]  # reads cam_10
+    with pytest.raises(rr.RolloutError, match="connected for inference with cam_06 only; this checkpoint reads cam_10"):
+        manager.start_preview(ckpt, "right", 2.0, False)
+    cameras["open"] = ["cam_10"]
+    assert manager.status()["recorderCameras"] == ["cam_10"]
+    with pytest.raises(rr.RolloutError, match=r"0.2..10 Hz"):
+        manager.start_preview(ckpt, "right", 12.0, False)
+    job = manager.start_preview(ckpt, "right", 8.0, False)
+    cmd = spawned[-1]
+    assert cmd[cmd.index("--frame-bus") + 1] == rr.INFERENCE_FRAME_BUS and job.params["frameBus"].startswith("inference bus")
+    manager.jobs[job.id].state = "done"
+
+    _unlock(manager.repo_root)
+    _replayed_preview(manager)
+    job = manager.start_execute(ckpt, "right", 1, attended=True)
+    assert spawned[-1][spawned[-1].index("--frame-bus") + 1] == rr.INFERENCE_FRAME_BUS
+    manager.jobs[job.id].state = "done"
+
+    # a full session: the preview bus, the script's default, and its 5 Hz
+    cameras["open"] = []
+    with pytest.raises(rr.RolloutError, match=r"0.2..5 Hz"):
+        manager.start_preview(ckpt, "right", 8.0, False)
+    job = manager.start_preview(ckpt, "right", 2.0, False)
+    assert "--frame-bus" not in spawned[-1] and job.params["frameBus"].startswith("preview bus")
+
+
+def test_the_inference_bus_is_the_same_on_both_sides_and_tightens_the_frame_age():
+    assert Path(rr.INFERENCE_FRAME_BUS) == ro.INFERENCE_FRAME_BUS
+    assert rr.INFERENCE_FRAME_EVERY_N == ro.INFERENCE_FRAME_EVERY_N == 2
+    assert ro.frame_age_limit_s(ro.INFERENCE_FRAME_BUS) == pytest.approx(0.15)
+    assert ro.frame_age_limit_s(ro.PREVIEW_FRAME_BUS) == pytest.approx(0.40)
+    assert not ro.LiveInputs(_contract(), gateway="http://x", box_id="1", frame_bus=ro.INFERENCE_FRAME_BUS).demand_previews
+    assert ro.LiveInputs(_contract(), gateway="http://x", box_id="1").demand_previews

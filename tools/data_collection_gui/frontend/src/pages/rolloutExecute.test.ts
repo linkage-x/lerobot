@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RolloutCheckpoint, RolloutStatus } from "./rolloutApi";
-import { executeBlockers } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers } from "./rolloutExecute";
 
 const status = (over: Partial<RolloutStatus> = {}): RolloutStatus => ({
   stages: [],
@@ -30,5 +30,19 @@ describe("executeBlockers", () => {
     expect(out.join("|")).toContain("left arm is locked: no file");
     expect(out.join("|")).toContain("Replay check");
     expect(out.join("|")).toContain("e-stop");
+  });
+});
+
+describe("cameraBlocker", () => {
+  const cam10 = { ...ckpt, cameras: ["cam_10"] } as RolloutCheckpoint;
+  it("is silent on a full session and when the inference session has the checkpoint's cameras", () => {
+    expect(cameraBlocker(status(), cam10)).toBe("");
+    expect(cameraBlocker(status({ recorderCameras: ["cam_10"] }), cam10)).toBe("");
+  });
+  it("names the camera an inference session lacks, and blocks execution with it", () => {
+    const s = status({ recorderCameras: ["cam_06"] });
+    expect(cameraBlocker(s, cam10)).toContain("this checkpoint reads cam_10");
+    const out = executeBlockers({ status: s, checkpoint: cam10, arm: "right", attended: true, previewReplayed: true });
+    expect(out).toEqual([cameraBlocker(s, cam10)]);
   });
 });

@@ -24,6 +24,8 @@ export type RolloutStatus = {
   profile: string;
   sandbox: string | null;
   recorderConnected: boolean;
+  // connected for inference: the only cameras the recorder opened ([] = a full session)
+  recorderCameras?: string[];
   executeStages?: Record<string, string>;
   unlock?: Record<string, ArmUnlock>;
 };
@@ -150,5 +152,9 @@ export const rolloutApi = {
   replay: (record: string) => call<{ job: RolloutJob }>("/api/rollout/replay", { record }),
   execute: (checkpoint: string, arm: string, stage: number, attended: boolean) =>
     call<{ job: RolloutJob }>("/api/rollout/execute", { checkpoint, arm, stage, attended }),
-  stop: (job: string) => call("/api/rollout/stop", { job })
+  stop: (job: string) => call("/api/rollout/stop", { job }),
+  // Connect the recorder for inference: only these cameras, the main frame bus at 30 Hz, no episodes.
+  connectForInference: (cameras: string[]) =>
+    call(`/api/handheld/record/connect?${q({ cameras: cameras.join(",") })}`, {}),
+  disconnect: () => call("/api/handheld/record/exit", {})
 };

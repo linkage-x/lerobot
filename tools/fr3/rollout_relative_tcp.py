@@ -12,8 +12,10 @@ What is the same online and offline (user guide #infer-inputs), and where it liv
 
 * images: the full-resolution frame of each camera, cropped and resized by relative_tcp.crop_resize.
   Offline that frame is decoded from the export's 1080p video; online it is the recorder's frame bus
-  (``/dev/shm/lerobot_online_sync_preview``: synchronised NV12 clusters at full resolution; the policy
-  never opens a camera). Offline also predicts from the training view's frames, which is what training
+  (synchronised NV12 clusters at full resolution; the policy never opens a camera): the main bus
+  ``/dev/shm/lerobot_online_sync`` when the recorder was connected for inference (only the policy's
+  cameras, every 2nd 60 fps frame = 30 Hz, ~55-90 ms old), else the preview bus
+  ``/dev/shm/lerobot_online_sync_preview`` of a full session (every 12th frame, 60-263 ms old). Offline also predicts from the training view's frames, which is what training
   saw, so the gap between "what training saw" and "what inference sees" is measured, not assumed.
 * gripper width and external wrench: offline the export's state columns; online the recorder's BOX_LIVE
   snapshot of the arm's gripper BOX, its width through thor_lerobot_v3's own state layout and its
@@ -58,6 +60,10 @@ RESULT_SCHEMA = "fr3_rollout_result/1"
 RECORD_SCHEMA = "fr3_rollout_record/1"
 PROGRESS_PREFIX = "FR3_ROLLOUT "
 PREVIEW_FRAME_BUS = Path("/dev/shm/lerobot_online_sync_preview")
+# Connect for inference (gateway): the recorder opens only the policy's cameras and publishes every
+# INFERENCE_FRAME_EVERY_N-th accepted 60 fps cluster here, idle or not. Same values as rollout_runs.
+INFERENCE_FRAME_BUS = Path("/dev/shm/lerobot_online_sync")
+INFERENCE_FRAME_EVERY_N = 2
 STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
@@ -338,6 +344,13 @@ class PlanContext:
         return self.kin.NOMINAL.fk(np.asarray(q, dtype=np.float64)[None])[0] @ self.T_tool
 
 
+def frame_age_limit_s(frame_bus: Path) -> float:
+    """How old a frame may be when a chunk is predicted from it. The preview bus publishes every 12th
+    frame of 8 cameras (60-263 ms measured 11-18); the inference bus every 2nd of one camera: readout and
+    ISP ~30-40 ms, up to 33 ms to the next publish, the copy -- 0.15 s leaves room (not yet measured)."""
+    return 0.15 if Path(frame_bus) == INFERENCE_FRAME_BUS else 0.40
+
+
 # ------------------------------------------------------------------ preview ---
 
 
@@ -352,11 +365,13 @@ class LiveInputs:
         self.box_id = box_id
         self.client = ThorOnlineSyncFrameClient(frame_bus, cameras=[c.name for c in contract.cameras])
         self.last_seq: int | None = None
+        # the main bus publishes whether or not anyone watches; only the preview bus needs the demand
+        self.demand_previews = Path(frame_bus) != INFERENCE_FRAME_BUS
 
     def keep_previews_on(self) -> None:
         """The recorder publishes the preview frame bus only while someone asks for previews (an idle TTL);
         polling a camera preview is how the gateway passes that demand on (as the Device Manager grid does)."""
-        if time.monotonic() - getattr(self, "_demanded", 0.0) < 1.0:
+        if not self.demand_previews or time.monotonic() - getattr(self, "_demanded", 0.0) < 1.0:
             return
         self._demanded = time.monotonic()
         name = self.contract.cameras[0].name
@@ -633,7 +648,7 @@ def execute(
     if stage not in rx.STAGES:
         raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
     st = rx.STAGES[stage]
-    limits = rx.Limits()
+    limits = rx.Limits(frame_age_s=frame_age_limit_s(frame_bus))
     loaded = rtp.load_checkpoint(checkpoint, device=device)
     c = loaded.contract
     n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
@@ -681,6 +696,7 @@ def execute(
         "n_action_steps": n_exec,
         "unlock": unlock,
         "cart_check": cart or None,
+        "frame_source": str(frame_bus),
         **rx.stage_dict(st, limits),
     }
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")

@@ -11,6 +11,10 @@ execution on the arm by stages (tools/fr3/rollout_execute.py). The preview needs
 the arm: it is refused in a sandbox, off Thor, without the recorder, without the maintainer's unlock for
 that arm (tools/fr3/real_execution_unlock.py), unless the operator confirms someone is at the e-stop, and
 while anything else holds the arm's FCI; while it runs, it is the FCI holder the other arm jobs see.
+
+Which frame bus the jobs read follows how the recorder was connected: connected for inference (the gateway's
+Connect with ``cameras=``: only those cameras, the main bus at 30 Hz, no episodes) the main bus, provided
+it has every camera the checkpoint reads; otherwise the full session's preview bus (~5 Hz).
 """
 
 from __future__ import annotations
@@ -37,6 +41,10 @@ STAGES = (
     {"id": "plan", "label": "Execution plan check: IK, training workspace, collision (no motion)", "status": "available"},
     {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
 )
+# The recorder's main frame bus when connected for inference (gateway _inference_overlay_config):
+# every INFERENCE_FRAME_EVERY_N-th 60 fps cluster. Same values as tools/fr3/rollout_relative_tcp.
+INFERENCE_FRAME_BUS = "/dev/shm/lerobot_online_sync"
+INFERENCE_FRAME_EVERY_N = 2
 EXECUTE_STAGES = {
     1: "one chunk (n_action_steps, ~0.5 s), then hold",
     2: "closed loop, at most 5 s, gripper not commanded",
@@ -79,6 +87,7 @@ class RolloutManager:
         sandbox: str | None = None,
         recorder_busy: Callable[[], bool] = lambda: False,
         fci_holder: Callable[[], str] = lambda: "",
+        recorder_cameras: Callable[[], list[str]] = lambda: [],
         gateway_url: str = "http://127.0.0.1:8765",
         python: str = "",
         popen=subprocess.Popen,
@@ -89,6 +98,8 @@ class RolloutManager:
         self.sandbox = sandbox
         self.recorder_busy = recorder_busy
         self.fci_holder = fci_holder
+        # the cameras of a recorder connected for inference; [] = a full session (or none)
+        self.recorder_cameras = recorder_cameras
         self.gateway_url = gateway_url
         self._popen = popen
         self.python = python or next(
@@ -147,6 +158,24 @@ class RolloutManager:
             raise RolloutError(f"not a relative-TCP checkpoint on this machine: {path}")
         return model
 
+    def frame_source(self, model: Path) -> tuple[list[str], str]:
+        """(script args, label) of the frame bus a live job on ``model`` reads; refused when the recorder was
+        connected for inference without one of the checkpoint's cameras."""
+        cameras = self.recorder_cameras()
+        if not cameras:
+            return [], "preview bus (full session, ~5 Hz)"
+        try:
+            contract = json.loads((Path(model) / "fr3_policy_contract.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RolloutError(f"cannot read the checkpoint's cameras: {exc}") from exc
+        wanted = [str(c.get("name")) for c in contract.get("cameras") or []]
+        missing = [c for c in wanted if c not in cameras]
+        if missing:
+            raise RolloutError(f"the recorder is connected for inference with {', '.join(cameras)} only; this "
+                               f"checkpoint reads {', '.join(missing)} too: disconnect and connect for this checkpoint")
+        return (["--frame-bus", INFERENCE_FRAME_BUS],
+                f"inference bus ({', '.join(cameras)}, {60 // INFERENCE_FRAME_EVERY_N} Hz)")
+
     def _export(self, name: str) -> Path:
         root = (self.exports_root / name).resolve()
         if root.parent != self.exports_root.resolve() or not (root / "meta" / "info.json").is_file():
@@ -200,14 +229,17 @@ class RolloutManager:
             raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
         if arm not in ("right", "left"):
             raise RolloutError("pick the arm")
-        if not 0.2 <= float(rate) <= 5.0:
-            raise RolloutError("rate: 0.2..5 Hz (the preview frame bus publishes about 5 Hz)")
+        bus_args, bus = self.frame_source(model)
+        top = 10.0 if bus_args else 5.0
+        if not 0.2 <= float(rate) <= top:
+            raise RolloutError(f"rate: 0.2..{top:g} Hz (the {bus} limits it)")
         record = self.root / "records" / f"preview_{datetime.now():%Y%m%d_%H%M%S}"
         args = ["preview", "--checkpoint", str(model), "--record", str(record), "--arm", arm,
-                "--gateway", self.gateway_url, "--rate", str(float(rate))]
+                "--gateway", self.gateway_url, "--rate", str(float(rate)), *bus_args]
         if read_joints:
             args.append("--read-joints")
-        return self._spawn("preview", str(model), args, str(record), {"arm": arm, "rate": rate, "readJoints": read_joints})
+        return self._spawn("preview", str(model), args, str(record),
+                           {"arm": arm, "rate": rate, "readJoints": read_joints, "frameBus": bus})
 
     def unlock_status(self, arm: str) -> dict[str, Any]:
         """Whether the maintainer's unlock lets ``arm`` be driven now (for the page; the script re-reads it)."""
@@ -250,11 +282,12 @@ class RolloutManager:
         holder = self.fci_holder()
         if holder:
             raise RolloutError(f"{holder}: it holds the arm's FCI; stop it first")
+        bus_args, bus = self.frame_source(model)
         record = self.root / "records" / f"execute_{datetime.now():%Y%m%d_%H%M%S}"
         args = ["execute", "--checkpoint", str(model), "--record", str(record), "--arm", arm,
-                "--stage", str(int(stage)), "--gateway", self.gateway_url]
+                "--stage", str(int(stage)), "--gateway", self.gateway_url, *bus_args]
         return self._spawn("execute", str(model), args, str(record),
-                           {"arm": arm, "stage": int(stage), "unlockBy": lock.get("by")})
+                           {"arm": arm, "stage": int(stage), "unlockBy": lock.get("by"), "frameBus": bus})
 
     def preview_replayed(self, model: Path) -> bool:
         """Has a preview record of this checkpoint been fed back through the offline path, identically?"""
@@ -374,6 +407,7 @@ class RolloutManager:
             "profile": self.profile,
             "sandbox": self.sandbox,
             "recorderConnected": bool(self.recorder_busy()),
+            "recorderCameras": list(self.recorder_cameras()) if self.recorder_busy() else [],
             "executeStages": {str(k): v for k, v in EXECUTE_STAGES.items()},
             "unlock": {arm: self.unlock_status(arm) for arm in ("right", "left")},
         }
