@@ -5,9 +5,12 @@ Kept out of gateway.py and outside ``state.lock``, like training_runs. Jobs are 
 (tools/fr3/rollout_relative_tcp.py) followed through their log; one at a time, because the online
 preview shares this machine's GPU and the recorder's frame bus with the offline ones.
 
-Stages (rollout_relative_tcp.STAGES): offline prediction, online preview and the execution plan check are
-delivered; execution is not, and nothing here moves an arm. The preview needs the recorder connected
-(its cameras and BOX are the inputs) and is refused in a sandbox, which has no hardware.
+Stages (rollout_relative_tcp.STAGES): offline prediction, online preview, the execution plan check, and
+execution on the arm by stages (tools/fr3/rollout_execute.py). The preview needs the recorder connected
+(its cameras and BOX are the inputs) and is refused in a sandbox, which has no hardware. Execution moves
+the arm: it is refused in a sandbox, off Thor, without the recorder, without the maintainer's unlock for
+that arm (tools/fr3/real_execution_unlock.py), unless the operator confirms someone is at the e-stop, and
+while anything else holds the arm's FCI; while it runs, it is the FCI holder the other arm jobs see.
 """
 
 from __future__ import annotations
@@ -32,8 +35,13 @@ STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
     {"id": "plan", "label": "Execution plan check: IK, training workspace, collision (no motion)", "status": "available"},
-    {"id": "execute", "label": "Execution on the arm", "status": "not delivered"},
+    {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
 )
+EXECUTE_STAGES = {
+    1: "one chunk (n_action_steps, ~0.5 s), then hold",
+    2: "closed loop, at most 5 s, gripper not commanded",
+    3: "closed loop with the gripper, at most 15 s",
+}
 
 
 class RolloutError(RuntimeError):
@@ -47,7 +55,7 @@ def _now() -> str:
 @dataclass
 class RolloutJob:
     id: str
-    kind: str  # offline | preview | replay
+    kind: str  # offline | preview | replay | execute
     checkpoint: str
     state: str = "running"  # running | done | failed | stopped
     message: str = ""
@@ -70,6 +78,7 @@ class RolloutManager:
         profile: str = "thor",
         sandbox: str | None = None,
         recorder_busy: Callable[[], bool] = lambda: False,
+        fci_holder: Callable[[], str] = lambda: "",
         gateway_url: str = "http://127.0.0.1:8765",
         python: str = "",
         popen=subprocess.Popen,
@@ -79,6 +88,7 @@ class RolloutManager:
         self.profile = profile
         self.sandbox = sandbox
         self.recorder_busy = recorder_busy
+        self.fci_holder = fci_holder
         self.gateway_url = gateway_url
         self._popen = popen
         self.python = python or next(
@@ -199,6 +209,73 @@ class RolloutManager:
             args.append("--read-joints")
         return self._spawn("preview", str(model), args, str(record), {"arm": arm, "rate": rate, "readJoints": read_joints})
 
+    def unlock_status(self, arm: str) -> dict[str, Any]:
+        """Whether the maintainer's unlock lets ``arm`` be driven now (for the page; the script re-reads it)."""
+        import sys
+
+        if str(self.repo_root) not in sys.path:
+            sys.path.insert(0, str(self.repo_root))
+        from tools.fr3 import real_execution_unlock as unlock
+
+        try:
+            record = unlock.read(arm, repo_root=self.repo_root, locked="locked")
+        except unlock.RealExecutionLockedError as exc:
+            return {"arm": arm, "unlocked": False, "why": str(exc).removeprefix("locked; ")}
+        return {"arm": arm, "unlocked": True, "by": record.get("by"), "reason": record.get("reason"),
+                "expires": record.get("expires_utc")}
+
+    def start_execute(self, checkpoint: str, arm: str, stage: int, attended: bool) -> RolloutJob:
+        """Drive the arm with the policy, one stage (rollout_execute). Started by a person at the e-stop."""
+        model = self._checkpoint(checkpoint)
+        if self.sandbox:
+            raise RolloutError("a sandbox has no arm: execution runs on the station's own gateway")
+        if self.profile != "thor":
+            raise RolloutError("execution reads the Thor recorder's cameras; this gateway is not a Thor")
+        if arm not in ("right", "left"):
+            raise RolloutError("pick the arm")
+        if int(stage) not in EXECUTE_STAGES:
+            raise RolloutError(f"stage: one of {sorted(EXECUTE_STAGES)}")
+        if not attended:
+            raise RolloutError("the arm moves: confirm that you are at the e-stop")
+        if not self.recorder_busy():
+            raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
+        if not self.preview_replayed(model):
+            raise RolloutError("no preview of this checkpoint has passed its Replay check yet: run the online preview "
+                               "(arm still) and Replay check it first, so the live inputs are known to be the ones "
+                               "the offline path reads")
+        lock = self.unlock_status(arm)
+        if not lock["unlocked"]:
+            raise RolloutError(f"execution on the {arm} arm is locked: {lock['why']} A maintainer who is present "
+                               "unlocks one arm for a bounded time (tools/fr3/real_execution_unlock.py)")
+        holder = self.fci_holder()
+        if holder:
+            raise RolloutError(f"{holder}: it holds the arm's FCI; stop it first")
+        record = self.root / "records" / f"execute_{datetime.now():%Y%m%d_%H%M%S}"
+        args = ["execute", "--checkpoint", str(model), "--record", str(record), "--arm", arm,
+                "--stage", str(int(stage)), "--gateway", self.gateway_url]
+        return self._spawn("execute", str(model), args, str(record),
+                           {"arm": arm, "stage": int(stage), "unlockBy": lock.get("by")})
+
+    def preview_replayed(self, model: Path) -> bool:
+        """Has a preview record of this checkpoint been fed back through the offline path, identically?"""
+        for path in (self.root / "records").glob("*/record.json"):
+            try:
+                r = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (r.get("kind") or "preview") != "preview" or not (r.get("replay_check") or {}).get("ok"):
+                continue
+            with contextlib.suppress(OSError):
+                if Path(str(r.get("checkpoint") or "")).resolve() == Path(model).resolve():
+                    return True
+        return False
+
+    def fci_user(self) -> str:
+        """The running execution, as the other arm jobs' FCI check sees it, or ""."""
+        self.refresh()
+        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind == "execute"), None)
+        return f"Rollout 执行 {job.id}（{job.params.get('arm')} 臂，第 {job.params.get('stage')} 步）正在运行" if job else ""
+
     def start_replay(self, record: str) -> RolloutJob:
         path = Path(record).resolve()
         if (self.root / "records").resolve() not in path.parents or not (path / "record.json").is_file():
@@ -212,6 +289,11 @@ class RolloutManager:
             raise RolloutError(f"{job_id} is not running")
         if _pid_runs(job.pid, SCRIPT):
             os.killpg(int(job.pid), signal.SIGTERM)
+            if job.kind == "execute":
+                # it holds the arm still for HOLD_S, lets the controller go and exits: until then it is the
+                # FCI's holder, and refresh() reads how it ended from its log
+                job.message = "stopping: holding the arm, then letting go"
+                return job.message
         job.state = "stopped"
         job.finishedAt = _now()
         job.message = "stopped by the operator"
@@ -229,10 +311,12 @@ class RolloutManager:
             if job.pid and not _pid_runs(job.pid, SCRIPT):
                 self._read_log(job)
                 if job.last.get("event") == "done":
-                    job.state = "done"
+                    # an execution that ended on a stop condition (or the operator) ran, but did not complete
+                    job.state = "stopped" if job.kind == "execute" and not job.last.get("completed") else "done"
                     job.message = job.message or "done"
                 else:
-                    job.state = "stopped" if job.kind == "preview" and not job.last.get("error") else "failed"
+                    job.state = ("stopped" if job.kind in ("preview", "execute") and not job.last.get("error")
+                                 else "failed")
                     job.message = job.last.get("error") or job.message or "exited; see the log"
                 job.finishedAt = _now()
                 changed = True
@@ -265,8 +349,17 @@ class RolloutManager:
                 job.message = f"waiting: {event.get('error')}"
             elif event.get("event") == "preview":
                 job.message = f"step {event.get('step')}, {event.get('latency_ms', 0):.0f} ms per prediction"
+            elif event.get("event") == "execute":
+                job.message = f"stage {event.get('stage')}: {event.get('label')} (arm under control)"
+            elif event.get("event") == "chunk":
+                job.message = (f"chunk {event.get('index', '?')} taken from step {event.get('k0')}" if event.get("accepted")
+                               else f"stopping: {event.get('why')}")
             elif event.get("event") == "done":
-                job.message = "done"
+                if job.kind == "execute":
+                    job.message = ("completed" if event.get("completed")
+                                   else f"stopped: {event.get('stopped') or 'see the log'}")
+                else:
+                    job.message = "done"
         return True
 
     def status(self) -> dict[str, Any]:
@@ -281,6 +374,8 @@ class RolloutManager:
             "profile": self.profile,
             "sandbox": self.sandbox,
             "recorderConnected": bool(self.recorder_busy()),
+            "executeStages": {str(k): v for k, v in EXECUTE_STAGES.items()},
+            "unlock": {arm: self.unlock_status(arm) for arm in ("right", "left")},
         }
 
     def log_tail(self, job_id: str, lines: int = 120) -> list[str]:
@@ -315,9 +410,10 @@ class RolloutManager:
             except ValueError:
                 continue
             out.append({
-                "path": str(path.parent), "kind": "preview", "created": r.get("created"), "checkpoint": r.get("checkpoint"),
-                "arm": r.get("arm"), "steps": r.get("steps"), "replayCheck": r.get("replay_check"),
-                "planProblem": r.get("plan_problem"),
+                "path": str(path.parent), "kind": r.get("kind") or "preview", "created": r.get("created"),
+                "checkpoint": r.get("checkpoint"), "arm": r.get("arm"), "steps": r.get("steps"),
+                "replayCheck": r.get("replay_check"), "planProblem": r.get("plan_problem"),
+                "stage": (r.get("stage") or {}).get("number"), "result": r.get("result"),
             })
         return out
 

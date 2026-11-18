@@ -5,7 +5,8 @@
     offline   predict on a QC-gated export through the online code path, against what the hand did
     preview   predict on the recorder's live cameras and BOX with the arm still; record every input
     replay    feed a preview record back through the offline path: the predictions must be identical
-    (execution: not delivered -- the arm is never moved by this file)
+    execute   drive the arm with the policy, by stages (rollout_execute): a person at the e-stop starts it,
+              and nothing moves without the maintainer's unlock for that arm (real_execution_unlock)
 
 What is the same online and offline (user guide #infer-inputs), and where it lives:
 
@@ -61,7 +62,7 @@ STAGES = (
     {"id": "offline", "label": "Offline prediction on recordings", "status": "available"},
     {"id": "preview", "label": "Online preview (live cameras + BOX, arm still)", "status": "available"},
     {"id": "plan", "label": "Execution plan check (IK, workspace, collision) on every prediction", "status": "available"},
-    {"id": "execute", "label": "Execution on the arm", "status": "not delivered"},
+    {"id": "execute", "label": "Execution on the arm (stages 1-3, attended, maintainer unlock)", "status": "available"},
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
 WORKSPACE_MARGIN_M = 0.03
@@ -260,40 +261,81 @@ class PlanContext:
         cams, _ = scene.camera_obstacles(repo_root, graph)
         self.obstacles += cams
 
-    def check(self, q_obs: np.ndarray, actions: np.ndarray) -> dict[str, Any]:
+    def evaluate(
+        self, T_obs: np.ndarray, actions: np.ndarray, seed: np.ndarray, *, early_exit: bool = False
+    ) -> dict[str, Any]:
+        """Per step: targets = T_obs · ΔT, their IK from ``seed``, workspace, clearance; ok/why per step.
+
+        ``T_obs`` is the TCP (ARM_FK_FRAME) in the arm's base at the observation; ``seed`` one posture (7,) or
+        one per step (n, 7). ``early_exit`` is the
+        execution loop's IK (kin.ik: stop when every target has converged, the posture nearest the seed).
+        """
         kin = self.kin
-        q_obs = np.asarray(q_obs, dtype=np.float64)
-        T_obs = kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
         targets, widths = rt.targets_from_actions(T_obs, actions)
         flange = targets @ np.linalg.inv(self.T_tool)
-        q_sol, ok = kin.ik_retry(kin.NOMINAL, flange, q_obs)
-        reasons = list(self.problems)
-        if not ok.all():
-            reasons.append(f"IK: {int((~ok).sum())} of {len(ok)} targets not reachable inside the joint walls")
-        inside = None
+        q_sol, ik_ok = kin.ik_retry(kin.NOMINAL, flange, np.asarray(seed, dtype=np.float64), early_exit=early_exit)
+        n = len(targets)
+        inside = np.ones(n, dtype=bool)
         if self.T_base_world is not None:
             T_world_base = np.linalg.inv(self.T_base_world)
             pts = (T_world_base[:3, :3] @ targets[:, :3, 3].T).T + T_world_base[:3, 3]
             lo = np.asarray(self.workspace["p005"]) - WORKSPACE_MARGIN_M
             hi = np.asarray(self.workspace["p995"]) + WORKSPACE_MARGIN_M
             inside = np.all((pts >= lo) & (pts <= hi), axis=1)
-            if not inside.all():
-                reasons.append(f"workspace: {int((~inside).sum())} targets leave the training workspace (+{WORKSPACE_MARGIN_M * 100:.0f} cm)")
         A, B = self.model.place(kin.NOMINAL, q_sol)
         env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
-        min_env = float(env.min()) if env.size else math.inf
+        gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
+        why = []
+        for k in range(n):
+            if self.problems:
+                why.append("; ".join(self.problems))
+            elif not ik_ok[k]:
+                why.append(f"step {k + 1}: IK not reachable inside the joint walls")
+            elif not inside[k]:
+                why.append(f"step {k + 1}: leaves the training workspace (+{WORKSPACE_MARGIN_M * 100:.0f} cm)")
+            elif gap[k] < ENV_MARGIN_M:
+                why.append(f"step {k + 1}: {gap[k] * 1e3:.0f} mm from the carts/table/cameras (needs {ENV_MARGIN_M * 1e3:.0f})")
+            else:
+                why.append("")
+        return {
+            "T": targets,
+            "q": q_sol,
+            "widths": widths,
+            "ok": np.array([not w for w in why]),
+            "why": why,
+            "ik_ok": ik_ok,
+            "inside_workspace": None if self.T_base_world is None else inside,
+            "env_gap_m": gap,
+        }
+
+    def check(self, q_obs: np.ndarray, actions: np.ndarray) -> dict[str, Any]:
+        """The preview's check: every step of the chunk, the arm standing at ``q_obs``."""
+        q_obs = np.asarray(q_obs, dtype=np.float64)
+        T_obs = self.kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
+        ev = self.evaluate(T_obs, actions, q_obs)
+        ok, inside, gap = ev["ik_ok"], ev["inside_workspace"], ev["env_gap_m"]
+        reasons = list(self.problems)
+        if not ok.all():
+            reasons.append(f"IK: {int((~ok).sum())} of {len(ok)} targets not reachable inside the joint walls")
+        if inside is not None and not inside.all():
+            reasons.append(f"workspace: {int((~inside).sum())} targets leave the training workspace (+{WORKSPACE_MARGIN_M * 100:.0f} cm)")
+        min_env = float(gap.min()) if gap.size else math.inf
         if min_env < ENV_MARGIN_M:
             reasons.append(f"collision: {min_env * 1e3:.0f} mm from the carts/table/cameras (needs {ENV_MARGIN_M * 1e3:.0f})")
         return {
             "ok": not reasons,
             "reasons": reasons,
             "tcp_base": T_obs[:3, 3].round(4).tolist(),
-            "targets_base": targets[:, :3, 3].round(4).tolist(),
-            "widths": widths.round(4).tolist(),
+            "targets_base": ev["T"][:, :3, 3].round(4).tolist(),
+            "widths": ev["widths"].round(4).tolist(),
             "ik_ok": ok.tolist(),
             "inside_workspace": None if inside is None else inside.tolist(),
             "min_env_gap_mm": None if not math.isfinite(min_env) else round(min_env * 1e3, 1),
         }
+
+    def tcp(self, q: np.ndarray) -> np.ndarray:
+        """FK to ARM_FK_FRAME in the arm's base."""
+        return self.kin.NOMINAL.fk(np.asarray(q, dtype=np.float64)[None])[0] @ self.T_tool
 
 
 # ------------------------------------------------------------------ preview ---
@@ -335,6 +377,27 @@ class LiveInputs:
             images[cam.name] = frame.as_rgb()
         return images, {"publish_seq": cluster.publish_seq, "sync_ns": cluster.sync_timestamp_ns,
                         "max_delta_ns": cluster.max_delta_ns, "recording": cluster.recording}
+
+    def frames_since(self, min_t_s: float, timeout_s: float = 1.5) -> tuple[dict[str, np.ndarray], float, dict[str, Any]]:
+        """The newest cluster whose capture instant is at or after ``min_t_s`` (CLOCK_MONOTONIC seconds):
+        (images, instant, meta). The instant is the median SOF ``sensor_timestamp_ns`` of the policy's
+        cameras -- CLOCK_MONOTONIC on Thor (measured 11-18: 60-263 ms before time.monotonic at read)."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.keep_previews_on()
+            cluster = self.client.get_latest(timeout_s=0.05)
+            if cluster is not None:
+                stamps = [cluster.frames[c.name].sensor_timestamp_ns for c in self.contract.cameras if c.name in cluster.frames]
+                if len(stamps) == len(self.contract.cameras):
+                    t_img = float(np.median(stamps)) / 1e9
+                    if t_img >= min_t_s:
+                        images = {c.name: cluster.frames[c.name].as_rgb() for c in self.contract.cameras}
+                        return images, t_img, {"publish_seq": cluster.publish_seq, "max_delta_ns": cluster.max_delta_ns,
+                                               "recording": cluster.recording}
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"no frame of {', '.join(c.name for c in self.contract.cameras)} newer than the "
+                                   f"last observation within {timeout_s:g} s (recorder connected, previews on?)")
+            time.sleep(0.01)
 
     def box(self) -> tuple[float, np.ndarray | None, dict[str, Any]]:
         with urllib.request.urlopen(f"{self.gateway}/api/device-preview/box?device=x", timeout=2) as answer:
@@ -517,12 +580,13 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
     c = loaded.contract
     if c.to_dict() != meta["contract"]:
         raise RuntimeError("the checkpoint's contract changed since this record was made")
-    history = np.repeat(np.eye(4)[None], c.history + 1, axis=0)
+    still = np.repeat(np.eye(4)[None], c.history + 1, axis=0)
     diffs = []
     for path in sorted((record_dir / "steps").glob("*.npz")):
         data = np.load(path)
         images = {cam.name: data[f"image_{cam.name}"] for cam in c.cameras}
         wrench = data["wrench"] if c.wrench_names else None
+        history = data["history"] if "history" in data.files else still  # an execute record keeps its FK history
         sample = rtp.observation_sample(c, history, float(data["width"]), images, wrench, already_cropped=True)
         diffs.append(float(np.abs(loaded.predict(sample) - data["actions"]).max()))
     if not diffs:
@@ -531,6 +595,137 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
     meta["replay_check"] = result
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return result
+
+
+# ------------------------------------------------------------------ execute ---
+
+
+EXECUTE_LOCKED = (
+    "executing a policy on the arm is locked: a maintainer who is present unlocks one arm for a bounded time "
+    "(tools/fr3/real_execution_unlock.py); until then the Rollout page runs the preview only"
+)
+
+
+def execute(
+    checkpoint: Path,
+    record_dir: Path,
+    *,
+    arm: str,
+    stage: int,
+    gateway: str,
+    frame_bus: Path = PREVIEW_FRAME_BUS,
+    device: str | None = None,
+    repo_root: Path = _REPO_ROOT,
+) -> dict[str, Any]:
+    """One staged run on the arm (rollout_execute). The unlock is read before anything is loaded."""
+    import cv2
+
+    from tools.fr3 import (
+        fr3_arms,
+        fr3_kinematics as kin,
+        real_execution_unlock,
+        relative_tcp_policy as rtp,
+        rollout_execute as rx,
+    )
+    from tools.thor.gmsl2 import cart_state
+
+    unlock = real_execution_unlock.read(arm, repo_root=repo_root, locked=EXECUTE_LOCKED)
+    if stage not in rx.STAGES:
+        raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
+    st = rx.STAGES[stage]
+    limits = rx.Limits()
+    loaded = rtp.load_checkpoint(checkpoint, device=device)
+    c = loaded.contract
+    n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
+    if not 1 <= n_exec <= c.horizon:
+        raise RuntimeError(f"the checkpoint's n_action_steps ({n_exec}) is not within 1..{c.horizon}")
+    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
+    box_id = str(entry.get("corenetic_device_id") or "")
+    if not box_id:
+        raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
+    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=repo_root)
+    if plan.problems:
+        raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
+    cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
+    live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=frame_bus)
+
+    def observe(min_t: float) -> rx.Observation:
+        images, t_img, meta = live.frames_since(min_t)
+        width, wrench, box_meta = live.box()
+        updated = box_meta.get("updatedAt")
+        meta = {**meta, "box": box_meta,
+                "box_stale_s": None if updated is None else max(0.0, time.time() - float(updated))}
+        return rx.Observation(t_img, {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras},
+                              width, wrench, meta)
+
+    def sample(history: np.ndarray, obs: rx.Observation) -> dict[str, Any]:
+        return rtp.observation_sample(c, history, obs.width, obs.images, obs.wrench, already_cropped=True)
+
+    def plan_fn(T_obs: np.ndarray, actions: np.ndarray, seed: np.ndarray) -> dict[str, Any]:
+        return plan.evaluate(T_obs, actions, seed, early_exit=True)
+
+    # warm-up on a live observation, arm untouched: the first CUDA call is slower than the 100 ms allowed
+    first = observe(time.monotonic() - 1.0)
+    for _ in range(2):
+        loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
+
+    record_dir.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {
+        "schema": rx.RECORD_SCHEMA,
+        "kind": "execute",
+        "created": _now(),
+        "checkpoint": str(Path(checkpoint).resolve()),
+        "contract": c.to_dict(),
+        "arm": arm,
+        "box_id": box_id,
+        "n_action_steps": n_exec,
+        "unlock": unlock,
+        "cart_check": cart or None,
+        **rx.stage_dict(st, limits),
+    }
+    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    recorder = rx.Recorder(record_dir)
+    history = rx.PoseHistory()
+    predictor = rx.Predictor(contract=c, history=history, observe=observe, predict=loaded.predict, plan=plan_fn,
+                             sample=sample, limits=limits)
+    stop = {"why": ""}
+
+    def _signal(*_a) -> None:
+        stop["why"] = stop["why"] or "stopped by the operator"
+
+    def _gripper_error(message: str) -> None:
+        stop["why"] = stop["why"] or message
+
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
+    gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
+    progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
+             cart=cart.get("verdict"), unlock_by=unlock.get("by"))
+    if stop["why"]:
+        raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
+    panda = rx.PandaArm(str(entry["robot_ip"]))
+    predictor.start()
+    sys.setswitchinterval(0.001)
+    resume_gc = rx.hold_gc()
+    try:
+        result = rx.run_loop(
+            arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
+            wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+            stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=first.width,
+            record=recorder,
+        )
+    finally:
+        resume_gc()
+        recorder.close()
+    with contextlib.suppress(Exception):
+        strip = np.concatenate([cv2.resize(img, (int(img.shape[1] * 240 / img.shape[0]), 240)) for img in first.images.values()], axis=1)
+        cv2.imwrite(str(record_dir / "latest.jpg"), cv2.cvtColor(strip, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    meta["result"] = {"completed": result.completed, "stopped": result.stopped, "chunks": result.chunks_accepted,
+                      "duration_s": round(result.duration_s, 3), "ticks": result.ticks,
+                      "end_cursor": round(result.end_cursor, 2)}
+    meta["finished"] = _now()
+    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    return meta
 
 
 # --------------------------------------------------------------------- main ---
@@ -557,6 +752,13 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--read-joints", action="store_true", help="read the arm's joints once at the start (no motion)")
     rep = sub.add_parser("replay")
     rep.add_argument("--record", type=Path, required=True)
+    exe = sub.add_parser("execute", help="moves the arm: a person at the e-stop, the maintainer's unlock")
+    exe.add_argument("--checkpoint", type=Path, required=True)
+    exe.add_argument("--record", type=Path, required=True)
+    exe.add_argument("--arm", choices=("right", "left"), required=True)
+    exe.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
+    exe.add_argument("--gateway", default="http://127.0.0.1:8765")
+    exe.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
     args = ap.parse_args(argv)
     try:
         if args.cmd == "offline":
@@ -573,6 +775,12 @@ def main(argv: list[str] | None = None) -> int:
             meta = preview(args.checkpoint, args.record, arm=args.arm, gateway=args.gateway, rate_hz=args.rate,
                            max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus)
             progress(event="done", steps=meta["steps"])
+        elif args.cmd == "execute":
+            meta = execute(args.checkpoint, args.record, arm=args.arm, stage=args.stage, gateway=args.gateway,
+                           frame_bus=args.frame_bus)
+            r = meta["result"]
+            progress(event="done", completed=r["completed"], stopped=r["stopped"], chunks=r["chunks"],
+                     duration_s=r["duration_s"])
         else:
             progress(event="done", **replay(args.record))
     except Exception as exc:  # noqa: BLE001 -- one line the page can show

@@ -61,7 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.fr3 import fr3_arms  # noqa: E402
+from tools.fr3 import fr3_arms, real_execution_unlock as _unlock  # noqa: E402
 from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 
 _DEFAULT_CHECKPOINT = _REPO_ROOT / 'outputs/train/2026-03-19/10-48-39_act/checkpoints/060000'
@@ -76,8 +76,8 @@ _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask
 _DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 # Real execution (anything without --preview) is locked until the graded release (L0-L3) and the start-pose
 # button exist; see real_execution_unlock. outputs/ is neither deployed over nor committed.
-REAL_EXECUTION_UNLOCK = Path('outputs/fr3_infer_real_unlock.json')
-REAL_EXECUTION_UNLOCK_MAX_H = 12.0
+REAL_EXECUTION_UNLOCK = _unlock.PATH
+REAL_EXECUTION_UNLOCK_MAX_H = _unlock.MAX_SPAN_H
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_ACTION_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_OPENCV_FOURCC = 'MJPG'
@@ -922,17 +922,7 @@ def dataset_alignment_transform(
     return T_B_Ws
 
 
-class RealExecutionLockedError(RuntimeError):
-    """Inference would drive the arm, and no maintainer has unlocked that for this arm."""
-
-
-def _utc(value: Any, field: str) -> datetime.datetime:
-    if not isinstance(value, str):
-        raise RealExecutionLockedError(f'unlock file: {field} must be a UTC time like 2026-11-10T08:00:00Z')
-    try:
-        return datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.UTC)
-    except ValueError as exc:
-        raise RealExecutionLockedError(f'unlock file: {field}={value!r} is not like 2026-11-10T08:00:00Z') from exc
+RealExecutionLockedError = _unlock.RealExecutionLockedError
 
 
 def real_execution_unlock(
@@ -945,53 +935,18 @@ def real_execution_unlock(
     """May this run drive the arm? None for --preview (it never does); the unlock record otherwise.
 
     The guide tells students that inference stops at --preview until the start-pose button and the graded
-    release exist; this is what makes that hold when someone drops --preview from a command. A maintainer
-    who is present unlocks one arm for a bounded time by writing, on the machine that runs inference,
-    <repo>/outputs/fr3_infer_real_unlock.json:
-
-        {"arm": "right", "by": "<maintainer>", "reason": "<why, which checkpoint>",
-         "created_utc": "2026-11-10T08:00:00Z", "expires_utc": "2026-11-10T12:00:00Z"}
-
-    at most REAL_EXECUTION_UNLOCK_MAX_H hours, and deletes it afterwards. It names the arm so an unlock for
-    one arm never drives the other.
+    release exist; this is what makes that hold when someone drops --preview from a command. The unlock
+    itself (a maintainer's bounded, per-arm file) is tools/fr3/real_execution_unlock.py.
     """
     if args.preview:
         return None
-    path = Path(repo_root) / REAL_EXECUTION_UNLOCK
     locked = (
         'real execution of a policy is locked: until the start-pose button and the graded release exist, '
         'inference runs with --preview only (connects, prints targets, never moves the arm). '
         'Add --preview, or have a maintainer who is present unlock this arm '
         '(tools/fr3/fr3_act_infer_real_runtime.py, real_execution_unlock)'
     )
-    if not path.is_file():
-        raise RealExecutionLockedError(f'{locked}; there is no {REAL_EXECUTION_UNLOCK}.')
-    try:
-        record = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError) as exc:
-        raise RealExecutionLockedError(f'{locked}; {REAL_EXECUTION_UNLOCK} is unreadable ({exc}).') from exc
-    if not isinstance(record, dict):
-        raise RealExecutionLockedError(f'{locked}; {REAL_EXECUTION_UNLOCK} is not a JSON object.')
-    if record.get('arm') != arm:
-        raise RealExecutionLockedError(
-            f'{locked}; the unlock is for arm {record.get("arm")!r}, this run drives the {arm} arm.'
-        )
-    for field in ('by', 'reason'):
-        if not str(record.get(field) or '').strip():
-            raise RealExecutionLockedError(f'{locked}; the unlock does not say {field!r}.')
-    created = _utc(record.get('created_utc'), 'created_utc')
-    expires = _utc(record.get('expires_utc'), 'expires_utc')
-    now = now or datetime.datetime.now(datetime.UTC)
-    span_h = (expires - created).total_seconds() / 3600.0
-    if not 0.0 < span_h <= REAL_EXECUTION_UNLOCK_MAX_H:
-        raise RealExecutionLockedError(
-            f'{locked}; the unlock spans {span_h:.1f} h, it may span at most {REAL_EXECUTION_UNLOCK_MAX_H:g} h.'
-        )
-    if not created <= now < expires:
-        raise RealExecutionLockedError(
-            f'{locked}; the unlock is valid {record["created_utc"]} .. {record["expires_utc"]}, not now.'
-        )
-    return record
+    return _unlock.read(arm, repo_root=repo_root, locked=locked, now=now)
 
 
 def das_start_applies(args: argparse.Namespace) -> bool:

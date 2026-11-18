@@ -102,7 +102,7 @@ def test_preview_is_refused_without_the_recorder_in_a_sandbox_or_off_thor(tmp_pa
         workstation.start_preview(workstation.checkpoints()[0]["path"], "right", 2, False)
     with pytest.raises(rr.RolloutError, match="not a relative-TCP checkpoint"):
         manager.start_offline(str(tmp_path), "e1", [], 15)
-    assert [s["status"] for s in manager.status()["stages"]][-1] == "not delivered"
+    assert [s["status"] for s in manager.status()["stages"]][-1] == "available"
 
 
 def test_one_job_at_a_time_and_its_end_is_read_from_its_log(tmp_path):
@@ -139,6 +139,119 @@ def test_rollout_endpoints_answer_outside_the_gateway_lock(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as err:
             urllib.request.urlopen(request, timeout=5)
         assert err.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _unlock(repo: Path, arm: str = "right", hours: float = 2.0) -> None:
+    """A maintainer's unlock, in a test's own repo copy (never the real outputs/)."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    (repo / "outputs").mkdir(parents=True, exist_ok=True)
+    (repo / "outputs" / "fr3_infer_real_unlock.json").write_text(json.dumps({
+        "arm": arm, "by": "maintainer", "reason": "test",
+        "created_utc": (now - timedelta(minutes=1)).strftime(fmt),
+        "expires_utc": (now + timedelta(hours=hours)).strftime(fmt),
+    }))
+
+
+def _replayed_preview(manager: rr.RolloutManager, ok: bool = True) -> None:
+    record = manager.root / "records" / "preview_1"
+    record.mkdir(parents=True)
+    (record / "record.json").write_text(json.dumps({
+        "kind": "preview", "checkpoint": manager.checkpoints()[0]["path"],
+        "replay_check": {"ok": ok, "max_abs_diff": 0.0, "steps": 3},
+    }))
+
+
+def test_execute_is_refused_unless_every_condition_holds(tmp_path):
+    spawned = []
+
+    class Proc:
+        pid = 2**22 + 7  # a real integer, never a MagicMock (os.killpg)
+
+    holder = {"who": ""}
+    manager = _manager(tmp_path, recorder_busy=lambda: True, fci_holder=lambda: holder["who"],
+                       popen=lambda cmd, **k: spawned.append(cmd) or Proc())
+    ckpt = manager.checkpoints()[0]["path"]
+    with pytest.raises(rr.RolloutError, match="e-stop"):
+        manager.start_execute(ckpt, "right", 1, attended=False)
+    with pytest.raises(rr.RolloutError, match="Replay check"):
+        manager.start_execute(ckpt, "right", 1, attended=True)
+    _replayed_preview(manager)
+    with pytest.raises(rr.RolloutError, match="locked: there is no"):
+        manager.start_execute(ckpt, "right", 1, attended=True)
+    _unlock(manager.repo_root, arm="left")
+    with pytest.raises(rr.RolloutError, match="for arm 'left'"):
+        manager.start_execute(ckpt, "right", 1, attended=True)
+    assert manager.status()["unlock"]["left"]["unlocked"] and not manager.status()["unlock"]["right"]["unlocked"]
+    _unlock(manager.repo_root, arm="right")
+    with pytest.raises(rr.RolloutError, match="stage"):
+        manager.start_execute(ckpt, "right", 4, attended=True)
+    holder["who"] = "真机 replay 正在运行"
+    with pytest.raises(rr.RolloutError, match="holds the arm's FCI"):
+        manager.start_execute(ckpt, "right", 1, attended=True)
+    holder["who"] = ""
+    for kw in ({"sandbox": "hph"}, {"profile": "workstation"}):
+        other = _manager(tmp_path / next(iter(kw)), recorder_busy=lambda: True, **kw)
+        _unlock(other.repo_root)
+        _replayed_preview(other)
+        with pytest.raises(rr.RolloutError, match="sandbox|not a Thor"):
+            other.start_execute(other.checkpoints()[0]["path"], "right", 1, attended=True)
+    no_recorder = _manager(tmp_path / "nr")
+    _unlock(no_recorder.repo_root)
+    _replayed_preview(no_recorder)
+    with pytest.raises(rr.RolloutError, match="connect the recorder"):
+        no_recorder.start_execute(no_recorder.checkpoints()[0]["path"], "right", 1, attended=True)
+
+    job = manager.start_execute(ckpt, "right", 2, attended=True)
+    assert spawned[0][1:3] == [rr.SCRIPT, "execute"] and spawned[0][spawned[0].index("--stage") + 1] == "2"
+    assert job.kind == "execute" and job.params["unlockBy"] == "maintainer"
+
+
+def test_a_running_execution_holds_the_fci_for_the_other_arm_jobs(tmp_path):
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", rr.SCRIPT], stdin=subprocess.DEVNULL)
+
+    class Proc:
+        pid = sleeper.pid
+
+    manager = _manager(tmp_path, recorder_busy=lambda: True, popen=lambda *a, **k: Proc())
+    _unlock(manager.repo_root)
+    _replayed_preview(manager)
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    state.rollout = manager
+    try:
+        assert gateway._fr3_pivot_fci_holder(state) == ""
+        manager.start_execute(manager.checkpoints()[0]["path"], "right", 1, attended=True)
+        assert "Rollout 执行" in gateway._fr3_pivot_fci_holder(state)
+        with pytest.raises(rr.RolloutError, match="still running"):
+            manager.start_preview(manager.checkpoints()[0]["path"], "right", 2.0, False)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert gateway._fr3_pivot_fci_holder(state) == ""
+
+
+def test_execute_endpoint_answers_outside_the_gateway_lock(tmp_path):
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    state.rollout = _manager(tmp_path)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with state.lock:
+            request = urllib.request.Request(
+                f"{base}/api/rollout/execute", method="POST",
+                data=json.dumps({"checkpoint": state.rollout.checkpoints()[0]["path"], "arm": "right", "stage": 1,
+                                 "attended": "yes"}).encode(),  # only a literal true confirms
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(request, timeout=5)
+        assert err.value.code == 400 and "e-stop" in json.loads(err.value.read())["error"]
     finally:
         server.shutdown()
         server.server_close()
