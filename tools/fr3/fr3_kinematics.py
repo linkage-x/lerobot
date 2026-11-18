@@ -132,7 +132,13 @@ def _rotvec(R: np.ndarray) -> np.ndarray:
 
 
 def ik(
-    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, iters: int = 400, early_exit: bool = False
+    arm: Arm,
+    T_target: np.ndarray,
+    seed: np.ndarray,
+    *,
+    iters: int = 400,
+    early_exit: bool = False,
+    rest: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Flange poses ``T_target`` (n,4,4) by damped least squares, all at once; ``(q, converged)``.
 
@@ -142,9 +148,13 @@ def ik(
     ``early_exit``: stop as soon as every pose has converged (a control loop's budget: a chunk seeded
     from where the arm stands converges in tens of iterations, ~10x faster than 400). The answer is
     then the converged posture nearest the seed, not the one the nullspace drifts to afterwards.
+
+    ``rest``: the posture the nullspace pulls toward, (7,) or (n,7); default the middle of the joint range.
+    A control loop passes where the arm stands: pulled to the middle, a posture far from it re-postures inside
+    the first step (11-18, wrist near j6 = pi: a 1.3 mm target moved j5 by 0.149 rad and j7 by -0.121).
     """
     q = np.array(np.broadcast_to(seed, (len(T_target), 7)), dtype=np.float64)
-    mid = (Q_LOWER + Q_UPPER) / 2.0
+    mid = (Q_LOWER + Q_UPPER) / 2.0 if rest is None else np.array(np.broadcast_to(rest, q.shape), dtype=np.float64)
     eye6 = np.eye(6)
     tol = np.array([IK_TOL_MM * 1e-3, math.radians(IK_TOL_DEG)])
     for _ in range(iters):
@@ -187,10 +197,12 @@ _SEED_NUDGES = (
 
 
 def ik_retry(
-    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, early_exit: bool = False
+    arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, early_exit: bool = False, rest: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
-    """``ik`` from the seed, then from each of _SEED_NUDGES for the poses still not converged."""
+    """``ik`` from the seed, then from each of _SEED_NUDGES for the poses still not converged (``rest`` as in
+    ``ik``; a nudged try keeps pulling toward the un-nudged ``rest``)."""
     seeds = np.array(np.broadcast_to(seed, (len(T_target), 7)), dtype=np.float64)
+    rests = None if rest is None else np.array(np.broadcast_to(rest, seeds.shape), dtype=np.float64)
     q = np.zeros_like(seeds)
     ok = np.zeros(len(T_target), dtype=bool)
     for nudge in _SEED_NUDGES:
@@ -198,7 +210,8 @@ def ik_retry(
         if not todo.any():
             break
         q_try, ok_try = ik(
-            arm, T_target[todo], np.clip(seeds[todo] + nudge, Q_LOWER, Q_UPPER), early_exit=early_exit
+            arm, T_target[todo], np.clip(seeds[todo] + nudge, Q_LOWER, Q_UPPER), early_exit=early_exit,
+            rest=None if rests is None else rests[todo],
         )
         q[todo], ok[todo] = q_try, ok_try
     return q, ok

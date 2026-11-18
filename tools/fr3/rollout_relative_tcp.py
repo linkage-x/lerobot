@@ -300,7 +300,10 @@ class PlanContext:
         kin = self.kin
         targets, widths = rt.targets_from_actions(T_obs, actions)
         flange = targets @ np.linalg.inv(self.T_tool)
-        q_sol, ik_ok = kin.ik_retry(kin.NOMINAL, flange, np.asarray(seed, dtype=np.float64), early_exit=early_exit)
+        # the nullspace holds the seed's posture (where the arm stands / is commanded), not the range middle:
+        # execution checks every step's joint motion, and a re-posture toward the middle lands in step 1
+        seed = np.asarray(seed, dtype=np.float64)
+        q_sol, ik_ok = kin.ik_retry(kin.NOMINAL, flange, seed, early_exit=early_exit, rest=seed)
         n = len(targets)
         inside = np.ones(n, dtype=bool)
         off_dist = [""] * n
@@ -351,12 +354,27 @@ class PlanContext:
         T_world = np.linalg.inv(self.T_base_world) @ self.tcp(q)
         return self.distribution.start_problem(T_world, width)
 
-    def check(self, q_obs: np.ndarray, actions: np.ndarray, width: float | None = None) -> dict[str, Any]:
-        """The preview's check: the start (A) and every step of the chunk, the arm standing at ``q_obs``."""
+    def check(
+        self, q_obs: np.ndarray, actions: np.ndarray, width: float | None = None, n_exec: int = 0
+    ) -> dict[str, Any]:
+        """The preview's check: the start (A) and every step of the chunk, the arm standing at ``q_obs``.
+
+        With the execution's IK and step limits: the first ``n_exec`` steps (0 = all) are what a first chunk must
+        be able to carry. 11-18: the preview read "would pass" while every chunk of it would have been refused at
+        step 1 by a joint step the preview did not check.
+        """
+        from tools.fr3 import rollout_execute as rx
+
         q_obs = np.asarray(q_obs, dtype=np.float64)
         T_obs = self.kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
-        ev = self.evaluate(T_obs, actions, q_obs)
+        ev = self.evaluate(T_obs, actions, q_obs, early_exit=True)
         ok, inside, gap = ev["ik_ok"], ev["inside_workspace"], ev["env_gap_m"]
+        dist = self.distribution
+        limits = rx.Limits(**rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0]))) if dist else rx.Limits()
+        steps_ok, steps_why = rx.assess(np.concatenate([T_obs[None], ev["T"]]), np.concatenate([q_obs[None], ev["q"]]),
+                                        ev["ok"], ev["why"], limits, gap)
+        need = n_exec if 0 < n_exec <= len(ok) else len(ok)
+        step_limit = next((steps_why[k] for k in range(1, need + 1) if not steps_ok[k] and ev["ok"][k - 1]), "")
         reasons = list(self.problems)
         start = "" if self.problems else self.start_problem(q_obs, width)
         if start:
@@ -372,6 +390,8 @@ class PlanContext:
         min_env = float(gap.min()) if gap.size else math.inf
         if min_env < ENV_MARGIN_M:
             reasons.append(f"collision: {min_env * 1e3:.0f} mm from the carts/table/cameras (needs {ENV_MARGIN_M * 1e3:.0f})")
+        if step_limit and not self.problems:
+            reasons.append(f"execution: {step_limit} (the first {need} steps must be executable)")
         return {
             "ok": not reasons,
             "reasons": reasons,
@@ -383,6 +403,8 @@ class PlanContext:
             "start": start,
             "off_distribution": ev["off_distribution"],
             "min_env_gap_mm": None if not math.isfinite(min_env) else round(min_env * 1e3, 1),
+            "execution_steps": need,
+            "step_limit": step_limit,
         }
 
     def tcp(self, q: np.ndarray) -> np.ndarray:
@@ -554,6 +576,7 @@ def preview(
     box_id = str(entry.get("corenetic_device_id") or "")
     if not box_id:
         raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
+    n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # as execute() reads it
     plan = None
     plan_problem = ""
     try:
@@ -598,7 +621,7 @@ def preview(
         t_pred = time.monotonic()
         actions = loaded.predict(sample)
         latency_ms = (time.monotonic() - t_pred) * 1e3
-        checked = plan.check(q_arm, actions, width) if (plan is not None and q_arm is not None) else None
+        checked = plan.check(q_arm, actions, width, n_exec) if (plan is not None and q_arm is not None) else None
         np.savez_compressed(
             record_dir / "steps" / f"{step:06d}.npz",
             width=np.float64(width),

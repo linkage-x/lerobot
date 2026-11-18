@@ -317,6 +317,95 @@ def test_ik_early_exit_converges_to_the_posture_nearest_the_seed():
     assert np.abs(np.diff(q_fast, axis=0)).max() < 0.03
 
 
+def test_ik_for_execution_holds_the_posture_it_starts_from():
+    """11-18 execute_20261118_171718: the arm stood at the wrist near j6 = pi, j5/j7 away from their middles; the
+    first target, 1.3 mm off, moved j5 by 0.149 rad toward the middle and the chunk was refused. With the seed as
+    the nullspace's rest the same step stays a millimetre's worth of joint motion."""
+    q_arm = np.array([0.9338, -0.8253, -1.253, -2.5983, -0.2913, 3.1651, 0.4173])
+    target = _fk(q_arm)
+    target[:3, 3] += [-0.0005, -0.0012, -0.0005]
+    q_mid, ok_mid = kin.ik_retry(kin.NOMINAL, target[None], q_arm, early_exit=True)
+    q_hold, ok_hold = kin.ik_retry(kin.NOMINAL, target[None], q_arm, early_exit=True, rest=q_arm)
+    assert ok_mid.all() and ok_hold.all()
+    assert np.abs(q_mid[0] - q_arm)[[4, 6]].max() > 0.05  # the re-posture toward the middle
+    assert np.abs(q_hold[0] - q_arm).max() < 0.02
+
+
+def test_rollout_plans_pass_the_seed_as_the_ik_rest():
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    seen = {}
+
+    class Kin:
+        NOMINAL = None
+
+        @staticmethod
+        def ik_retry(arm, flange, seed, *, early_exit, rest):
+            seen.update(seed=seed, rest=rest, early_exit=early_exit)
+            return np.repeat(np.asarray(seed, dtype=float)[None], len(flange), axis=0), np.ones(len(flange), bool)
+
+    class Model:
+        r = np.zeros(0)
+
+        def place(self, arm, q):
+            return np.zeros((0, 3)), np.zeros((0, 3))
+
+        def table_mask(self):
+            return np.zeros(0, bool)
+
+    class Col:
+        def obstacle_gaps(self, *a):
+            return np.zeros(0)
+
+    plan = object.__new__(ro.PlanContext)
+    plan.kin, plan.T_tool, plan.T_base_world, plan.distribution = Kin, np.eye(4), None, None
+    plan.model, plan.col, plan.obstacles, plan.problems = Model(), Col(), [], []
+    actions = np.zeros((4, rt.POSE_DIM + 1))
+    actions[:, 3] = actions[:, 7] = 1.0  # identity rotation columns r00, r11
+    plan.evaluate(_fk(Q0), actions, Q0, early_exit=True)
+    np.testing.assert_array_equal(seen["rest"], Q0)
+    assert seen["early_exit"] is True
+
+
+def test_the_preview_check_names_the_joint_step_execution_would_refuse():
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    jump = {"j5": 0.0}
+
+    class Kin:
+        NOMINAL = kin.NOMINAL
+
+        @staticmethod
+        def ik_retry(arm, flange, seed, *, early_exit, rest):
+            q = np.repeat(np.asarray(seed, dtype=float)[None], len(flange), axis=0)
+            q[:, 4] += jump["j5"]
+            return q, np.ones(len(flange), bool)
+
+    class Model:
+        r = np.zeros(0)
+
+        def place(self, arm, q):
+            return np.zeros((0, 3)), np.zeros((0, 3))
+
+        def table_mask(self):
+            return np.zeros(0, bool)
+
+    class Col:
+        def obstacle_gaps(self, *a):
+            return np.zeros(0)
+
+    plan = object.__new__(ro.PlanContext)
+    plan.kin, plan.T_tool, plan.T_base_world, plan.distribution = Kin, np.eye(4), None, None
+    plan.model, plan.col, plan.obstacles, plan.problems = Model(), Col(), [], []
+    actions = np.zeros((32, rt.POSE_DIM + 1))
+    actions[:, 3] = actions[:, 7] = 1.0
+    assert plan.check(Q0, actions, None, 16)["step_limit"] == ""
+    jump["j5"] = 0.149
+    out = plan.check(Q0, actions, None, 16)
+    assert out["execution_steps"] == 16 and "j5 moves 0.149 rad" in out["step_limit"]
+    assert any(r.startswith("execution: step 1: j5") for r in out["reasons"]) and not out["ok"]
+
+
 # ------------------------------------------------------- the report on a record ---
 
 
