@@ -10691,6 +10691,175 @@ def test_production_gateway_is_not_affected_by_the_sandbox_guard(tmp_path):
     assert gateway._sandbox_hardware_refusal(state, "GET", "/api/replay/dual-fr3/job") is None
 
 
+class _AliveProcess:
+    """A process that is still running, as far as the hardware lease's busy check asks (poll only)."""
+
+    pid = 424242
+
+    def poll(self):
+        return None
+
+
+def _lease_server(state):
+    import threading
+
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _lease_call(base: str, method: str, path: str) -> tuple[int, dict]:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(f"{base}{path}", method=method, data=b"{}" if method == "POST" else None,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_production_lends_the_hardware_to_the_dev_gateway_only_while_idle_and_takes_it_back(tmp_path, monkeypatch):
+    """Two real gateways on one lease file: Borrow, the guard on both sides, Return, and both kinds of Reclaim."""
+    import subprocess
+    import sys
+    import time
+
+    from tools.data_collection_gui import hardware_lease as hl
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *_a, **_k: pytest.fail("no hardware may be launched here"))
+    lease_file = tmp_path / "lerobot" / "outputs" / hl.FILE_NAME
+    prod = _calibration_gateway_state(tmp_path / "lerobot")
+    dev = _calibration_gateway_state(tmp_path / "sandboxes" / "dev")
+    for state in (prod, dev):
+        state.repo_root.mkdir(parents=True, exist_ok=True)
+        state.devices = []
+        state.recording.state = "idle"
+    prod.hardware_lease = hl.HardwareLease(lease_file, hl.PRODUCTION)
+    dev.hardware_lease = hl.HardwareLease(lease_file, hl.DEV)
+    prod_server, prod_url = _lease_server(prod)
+    dev.production_url = prod_url
+    dev_server, dev_url = _lease_server(dev)
+    try:
+        # Before any Borrow: the dev gateway refuses hardware, production does not.
+        code, body = _lease_call(dev_url, "POST", "/api/handheld/record/connect")
+        assert code == 409 and "has not borrowed" in body["error"]
+        code, body = _lease_call(dev_url, "POST", "/api/rollout/execute")
+        assert code == 409 and "has not borrowed" in body["error"]
+        assert gateway._is_hardware_request("POST", "/api/rollout/preview")
+        assert not gateway._is_hardware_request("POST", "/api/rollout/stop")
+        assert prod.hardware_lease.refusal() is None
+
+        # Production lends nothing while its recorder runs.
+        prod.process = _AliveProcess()
+        code, body = _lease_call(dev_url, "POST", "/api/hardware/borrow")
+        assert code == 409 and "the recorder is connected" in body["error"]
+        assert hl.read_lease(lease_file).holder == hl.PRODUCTION
+        prod.process = None
+
+        # ... nor while one of its hardware requests is still being answered.
+        assert prod.hardware_lease.enter() is None
+        code, body = _lease_call(dev_url, "POST", "/api/hardware/borrow")
+        assert code == 409 and "still being answered" in body["error"]
+        prod.hardware_lease.exit()
+
+        code, snap = _lease_call(dev_url, "POST", "/api/hardware/borrow")
+        assert code == 200 and snap["hardwareLease"]["mine"] is True
+        lease = hl.read_lease(lease_file)
+        assert lease.holder == hl.DEV and lease.devUrl == dev_url and lease.devRepo == str(dev.repo_root.resolve())
+        code, body = _lease_call(prod_url, "POST", "/api/handheld/record/connect")
+        assert code == 409 and "lent to the dev gateway" in body["error"]
+        code, body = _lease_call(prod_url, "GET", "/api/device-preview/camera.jpg?device=cam_06")
+        assert code == 409
+        code, snap = _lease_call(prod_url, "GET", "/api/snapshot")
+        assert snap["hardwareLease"]["holder"] == "dev" and snap["hardwareLease"]["mine"] is False
+        # Offline work on production goes on.
+        code, _ = _lease_call(prod_url, "GET", "/api/robot/arms")
+        assert code == 200
+
+        # A dev gateway that still uses the hardware keeps it: its Return and production's Reclaim both say why.
+        dev.process = _AliveProcess()
+        code, body = _lease_call(dev_url, "POST", "/api/hardware/return")
+        assert code == 409 and "the recorder is connected" in body["error"]
+        code, body = _lease_call(prod_url, "POST", "/api/hardware/reclaim")
+        assert code == 409 and "keeps the hardware" in body["error"]
+        assert hl.read_lease(lease_file).holder == hl.DEV
+        code, body = _lease_call(dev_url, "GET", "/api/hardware/lease")
+        assert body["busy"] and "recorder" in body["busy"][0]
+        dev.process = None
+
+        # Reclaim of an idle dev gateway: it returns the hardware itself.
+        code, snap = _lease_call(prod_url, "POST", "/api/hardware/reclaim")
+        assert code == 200 and snap["hardwareLease"]["mine"] is True
+        assert hl.read_lease(lease_file).holder == hl.PRODUCTION
+
+        # Borrow again, then the dev gateway goes silent with a process still running in its tree.
+        code, _ = _lease_call(dev_url, "POST", "/api/hardware/borrow")
+        assert code == 200
+        dev_server.shutdown()
+        dev_server.server_close()
+        dev_server = None
+        monkeypatch.undo()  # the orphan below is a real (harmless) process
+        orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=dev.repo_root,
+                                  stdin=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while orphan.pid not in hl.processes_in(dev.repo_root) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            code, snap = _lease_call(prod_url, "POST", "/api/hardware/reclaim")
+            assert code == 200, snap
+            assert orphan.wait(timeout=5) is not None
+            lease = hl.read_lease(lease_file)
+            assert lease.holder == hl.PRODUCTION and "stopped 1 process" in lease.by
+        finally:
+            if orphan.poll() is None:
+                orphan.kill()
+                orphan.wait()
+    finally:
+        for server in (prod_server, dev_server):
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+    for state in (prod, dev):
+        assert state.lock.acquire(timeout=1)
+        state.lock.release()
+
+
+def test_production_lends_only_to_a_dev_tree_on_this_machine(tmp_path):
+    from tools.data_collection_gui import hardware_lease as hl
+
+    prod = _calibration_gateway_state(tmp_path / "lerobot")
+    prod.hardware_lease = hl.HardwareLease(tmp_path / "lerobot" / "outputs" / hl.FILE_NAME, hl.PRODUCTION)
+
+    class Handler:
+        client_address = ("192.168.11.44", 50000)  # e.g. the students' frontend proxy
+
+    body = {"devUrl": "http://127.0.0.1:8766", "devRepo": str(tmp_path / "sandboxes" / "dev")}
+    with pytest.raises(hl.LeaseRefusedError, match="on this machine"):
+        gateway._hardware_lend(Handler(), prod, body, 8765)
+    Handler.client_address = ("127.0.0.1", 50000)
+    for repo in (str(prod.repo_root), str(tmp_path), "relative/dev"):
+        with pytest.raises(hl.LeaseRefusedError):
+            gateway._hardware_lend(Handler(), prod, {**body, "devRepo": repo}, 8765)
+    with pytest.raises(hl.LeaseRefusedError, match="loopback"):
+        gateway._hardware_lend(Handler(), prod, {**body, "devUrl": "http://10.0.0.5:8766"}, 8765)
+    assert hl.read_lease(prod.hardware_lease.path).holder == hl.PRODUCTION
+
+
+def test_a_sandbox_has_no_hardware_lease(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    state.devices = []
+    state.sandbox = "zhangsan"
+    assert gateway._snapshot(state)["hardwareLease"] is None
+    args = gateway.argparse.Namespace(sandbox="zhangsan", dev=False, hardware_lease=None)
+    assert gateway._hardware_lease_side(args, tmp_path) is None
+    args = gateway.argparse.Namespace(sandbox=None, dev=False, hardware_lease=None)
+    side = gateway._hardware_lease_side(args, tmp_path)
+    assert side.role == "production" and side.path == (tmp_path / "outputs" / "hardware_lease.json").resolve()
+
+
 def test_snapshot_reports_what_deploy_wrote(tmp_path):
     state = _calibration_gateway_state(tmp_path)
     state.devices = []

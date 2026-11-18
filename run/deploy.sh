@@ -8,11 +8,14 @@
 #   bash run/deploy.sh workstation --sync-only
 #   bash run/deploy.sh thor1 --no-frontend
 #   bash run/deploy.sh thor1 --sandbox NAME    # your own sandbox: own directory + port, no hardware
+#   bash run/deploy.sh thor1 --dev             # the dev gateway (port 8766): hardware only while borrowed
 #   python3 run/targets.py list                # the targets (run/targets/*.json) and how to reach them
 #
 # Production only accepts a clean checkout whose HEAD is on origin/box (see run/sync_to_target.sh);
 # a maintainer adds --maintainer to deploy a clean commit that is not merged yet. Students deploy
 # to their sandbox; run/sandbox.sh copies datasets into it and shows/stops/removes it.
+# --dev deploys any tree to the one dev gateway beside production; a person borrows the hardware on its
+# page (production lends it only while idle) and returns it there (run/README.md, "dev gateway").
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +27,7 @@ sync_only=false
 no_frontend=false
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # shellcheck source=run/sandbox_common.sh
@@ -32,6 +35,7 @@ usage() {
 
 sandbox=""
 maintainer=false
+dev=false
 expect_sandbox_name=false
 for arg in "$@"; do
   if $expect_sandbox_name; then
@@ -43,6 +47,7 @@ for arg in "$@"; do
     --sandbox) expect_sandbox_name=true ;;
     --sandbox=*) sandbox="${arg#--sandbox=}" ;;
     --maintainer) maintainer=true ;;
+    --dev) dev=true ;;
     --sync-only) sync_only=true ;;
     --no-frontend) no_frontend=true ;;
     -h|--help)
@@ -81,7 +86,15 @@ config_path="$TARGET_CONFIG"
 gateway_target="$TARGET_GATEWAY_URL"
 
 sync_flags=()
-if [[ -n "$sandbox" ]]; then
+if $dev; then
+  if [[ -n "$sandbox" ]] || $maintainer || [[ "$TARGET_SANDBOXES" != true ]]; then
+    echo "ERROR: --dev goes alone (no --sandbox, no --maintainer), to a Thor target with sandboxes" >&2
+    exit 2
+  fi
+  sandbox="$DEV_SANDBOX_NAME"
+  remote_dir="$(sandbox_dir "$sandbox")"
+  sync_flags+=(--dev)
+elif [[ -n "$sandbox" ]]; then
   if [[ "$TARGET_SANDBOXES" != true ]]; then
     echo "ERROR: ${target} has no sandboxes (run/targets/${target}.json); they exist only on Thor targets" >&2
     exit 2
@@ -161,7 +174,7 @@ restart_log="$(mktemp)"
 trap 'rm -f "$restart_log"' EXIT
 restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o -E 75 '$deploy_lock' bash -s -- '$remote_dir' '$profile' '$config_path' '$sandbox' '$production_dir' '$SANDBOX_PORT_MIN' '$SANDBOX_PORT_MAX' '$THOR_SANDBOX_BASE' '$TARGET_PORT' '$TARGET_BOX_NET_ADDR'" \
+  "flock -n -o -E 75 '$deploy_lock' bash -s -- '$remote_dir' '$profile' '$config_path' '$sandbox' '$production_dir' '$SANDBOX_PORT_MIN' '$SANDBOX_PORT_MAX' '$THOR_SANDBOX_BASE' '$TARGET_PORT' '$TARGET_BOX_NET_ADDR' '$dev' '$DEV_GATEWAY_PORT'" \
   <<'REMOTE' 2>&1 | tee "$restart_log" || restart_rc=${PIPESTATUS[0]}
 set -euo pipefail
 
@@ -175,8 +188,14 @@ port_max="$7"
 sandbox_base="$8"
 port="$9"
 box_net_addr="${10}"
+dev="${11}"
+dev_port="${12}"
+production_port="$port"
 gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
 
+if [[ "$dev" == true ]]; then
+  echo "$dev_port" >"$repo_dir/.sandbox_port"
+fi
 if [[ -n "$sandbox" ]]; then
   # One port per sandbox, kept across deploys in .sandbox_port (excluded from the sync).
   if [[ -s "$repo_dir/.sandbox_port" ]]; then
@@ -211,20 +230,66 @@ if [[ -n "$sandbox" ]]; then
     fi
   done
   mkdir -p "$repo_dir/outputs/datasets" "$repo_dir/outputs/exports"
-  if [[ ! -e "$repo_dir/outputs/calibration" ]]; then
+  if [[ "$dev" == true ]]; then
+    # The dev gateway records and moves arms with production's calibration and gates as they are now,
+    # refreshed on every deploy; what it writes stays in its own copies.
+    echo "    refreshing production's calibration, world state and gates into the dev tree..."
+    mkdir -p "$repo_dir/outputs/calibration"
+    rsync -a --delete "$production_dir/outputs/calibration/" "$repo_dir/outputs/calibration/"
+    for state_file in tools/thor/gmsl2/world/world_registration.json tools/thor/gmsl2/world/world_stable_source.json \
+        outputs/box_six_d_origin.json outputs/world_graph_guard.json outputs/cart_check.json; do
+      if [[ -e "$production_dir/$state_file" ]]; then
+        mkdir -p "$(dirname "$repo_dir/$state_file")"
+        cp -a "$production_dir/$state_file" "$repo_dir/$state_file"
+      else
+        rm -f "$repo_dir/$state_file"
+      fi
+    done
+    # Production's trained checkpoints, for the Rollout page: hard links (same disk, no copy), and never
+    # over a run the dev tree already has. Rollout only reads them.
+    if [[ -d "$production_dir/outputs/training/runs" ]]; then
+      mkdir -p "$repo_dir/outputs/training/runs"
+      rsync -a --ignore-existing --link-dest="$production_dir/outputs/training/runs/" \
+        "$production_dir/outputs/training/runs/" "$repo_dir/outputs/training/runs/"
+    fi
+  elif [[ ! -e "$repo_dir/outputs/calibration" ]]; then
     echo "    first deploy: copying production calibration into the sandbox..."
     cp -a "$production_dir/outputs/calibration" "$repo_dir/outputs/calibration"
   fi
 fi
 echo "GATEWAY_PORT=${port}"
 
+# A dev gateway that holds the hardware and is using it (recorder, replay, rollout, ...) is not
+# restarted under the person at the e-stop: they stop it on its page first (or Return the hardware).
+if [[ "$dev" == true ]]; then
+  lease_state="$(python3 - "$port" <<'PY' || true
+import json, sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(f"http://127.0.0.1:{sys.argv[1]}/api/hardware/lease", timeout=5) as r:
+        lease = json.load(r)
+except Exception:
+    sys.exit(0)  # not running (or too old to say): nothing of it to interrupt
+if lease.get("mine") and lease.get("busy"):
+    print("; ".join(lease["busy"]))
+PY
+)"
+  if [[ -n "$lease_state" ]]; then
+    echo "ERROR: the dev gateway holds the hardware and is using it: ${lease_state}" >&2
+    echo "       stop that on its page (http://<thor>:${port}/) before redeploying it" >&2
+    exit 76
+  fi
+fi
+
+# Only processes running in THIS tree (working directory): the dev gateway's recorder runs the same
+# script from its own tree, and a production deploy must not kill it while it holds the hardware.
 matching_pids() {
   local pattern="$1"
-  python3 - "$pattern" <<'PY'
+  python3 - "$pattern" "$repo_dir" <<'PY'
 import os
 import sys
 
-pattern = sys.argv[1]
+pattern, repo_dir = sys.argv[1], os.path.realpath(sys.argv[2])
 for name in os.listdir("/proc"):
     if not name.isdigit():
         continue
@@ -236,9 +301,10 @@ for name in os.listdir("/proc"):
             for item in open(f"/proc/{name}/cmdline", "rb").read().split(b"\0")
             if item
         ]
+        cwd = os.path.realpath(os.readlink(f"/proc/{name}/cwd"))
     except OSError:
         continue
-    if pattern in " ".join(args):
+    if pattern in " ".join(args) and cwd == repo_dir:
         print(name)
 PY
 }
@@ -324,7 +390,11 @@ gateway_log_since() {
 }
 
 stop_pids gateway_pids
-if [[ -n "$sandbox" ]]; then
+if [[ "$dev" == true ]]; then
+  # Whatever the last dev gateway left running in its tree (a recorder, a rollout job): the check above
+  # found it idle or not running, so this only clears orphans.
+  stop_pids matching_pids "python"
+elif [[ -n "$sandbox" ]]; then
   : # a sandbox never starts a recorder or teleop process (no hardware), so there is none to stop
 # The gateway spawns the recorder (thor_record.py) as a child; killing the
 # gateway can orphan it, and it holds box_client.py + the box/camera (Argus)
@@ -395,7 +465,10 @@ if [[ -n "$xdg_runtime_dir" ]]; then
 fi
 
 sandbox_args=()
-if [[ -n "$sandbox" ]]; then
+if [[ "$dev" == true ]]; then
+  sandbox_args=(--dev --hardware-lease "$production_dir/outputs/hardware_lease.json"
+                --production-url "http://127.0.0.1:${production_port}")
+elif [[ -n "$sandbox" ]]; then
   sandbox_args=(--sandbox "$sandbox")
 fi
 
@@ -433,7 +506,11 @@ if [[ -z "$new_pids" ]]; then
   fi
   exit 1
 fi
-echo "${profile} gateway started (pid $(echo "$new_pids" | head -1), port ${port}${sandbox:+, sandbox ${sandbox}})"
+dev_note=""
+if [[ "$dev" == true ]]; then
+  dev_note=", dev gateway: borrow the hardware on its page"
+fi
+echo "${profile} gateway started (pid $(echo "$new_pids" | head -1), port ${port}${sandbox:+, sandbox ${sandbox}}${dev_note})"
 if [[ -n "$started_log" ]]; then
   echo "--- ${started_log}"
   tail -5 "$started_log"
@@ -453,6 +530,8 @@ fi
 if [[ $restart_rc -eq 75 ]]; then
   echo "ERROR: another deploy is already restarting the ${profile} gateway on ${remote}" >&2
   exit 75
+elif [[ $restart_rc -eq 76 ]]; then
+  exit 76
 elif [[ $restart_rc -ne 0 ]]; then
   echo "ERROR: ${profile} gateway restart failed (exit ${restart_rc})" >&2
   exit "$restart_rc"

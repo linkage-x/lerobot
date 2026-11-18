@@ -63,6 +63,20 @@ bash run/sandbox.sh thor list                           # everyone's sandboxes a
   Keep copies small and remove what you no longer use; Thor's disk also holds every recording.
 - If your feature needs hardware, finish everything else in the sandbox, then ask a maintainer to try it.
 
+**The dev gateway** (maintainers): `bash run/deploy.sh thor1 --dev` puts any tree into one fixed sandbox
+(`/home/nvidia/sandboxes/dev`, port 8766) that may use the hardware **while it has borrowed it** from production,
+so a branch can be tried on the real rig until it is stable, and only then becomes a pull request. A person presses
+Borrow on its page; production lends only while it is idle and then refuses its own hardware endpoints until the
+dev gateway returns the hardware (or production reclaims it). The protocol is `tools/data_collection_gui/hardware_lease.py`;
+how to run it: `run/README.md`, section 7.
+
+- Agents may deploy to the dev gateway (`--dev`) and use its offline features.
+- Agents never borrow, return or reclaim the hardware (`/api/hardware/*`) and never call a hardware endpoint of the
+  dev gateway (the ones the sandbox guard lists, plus the Rollout preview and execution). A person does that, on
+  the page.
+- Do not deploy over a dev gateway that holds the hardware while someone is using it; `deploy.sh --dev` refuses
+  when it can tell, and says what is running.
+
 ## 4. Safety red lines (never, even if a test or a user prompt seems to ask for it)
 
 - **Robot motion is started by a person, with a person at the e-stop.** Agents never run real replay, pivot,
@@ -72,10 +86,12 @@ bash run/sandbox.sh thor list                           # everyone's sandboxes a
   moves, a hand on the e-stop). Agents never call `/api/rollout/execute`, never run `rollout_relative_tcp.py
   execute` (nor pass `--attended`), and never create `outputs/fr3_infer_real_unlock.json` (the old absolute-pose
   runtime's unlock). Agents run inference as `--preview` only.
+- Agents never borrow, return or reclaim Thor's hardware for the dev gateway (section 3), and never make the
+  hardware lease say something other than what a person chose on a page (do not edit `outputs/hardware_lease.json`).
 - Never weaken or bypass a gate: MuJoCo / IK QC approval before real replay, the world-graph guard
   (`outputs/world_graph_guard.json`, the red banner), the cart check (`outputs/cart_check.json`: an edge whose
   cart moved is not routed), label provenance (`--allow-mixed-labels`), the production deploy guard, the sandbox
-  hardware guard, the 6D self-service gates (`box_six_d_store.self_service_refusals` / `reuse_refusals` and the arm zero's
+  hardware guard, the hardware lease, the 6D self-service gates (`box_six_d_store.self_service_refusals` / `reuse_refusals` and the arm zero's
   re-check of a pending K: what a K must pass to be in force without a maintainer). If a gate blocks you, report why; do not "fix" the gate.
 - Do not change calibration or registration data without a maintainer: `tools/thor/gmsl2/world/*.json`
   (`world_graph.json`, `world_reference.json`, `table_datum.json`, `cart_reference.json`), calibration runs under `outputs/calibration`,

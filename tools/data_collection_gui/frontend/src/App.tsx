@@ -5,6 +5,7 @@ import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
 import { StatusDot, Metric, stateLabel, processingStatusLabel, taskExportPlan, userGuideUrl } from "./shared/ui";
+import { leaseBanner } from "./shared/hardwareLease";
 import { CalibrationPage } from "./calibration/CalibrationPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { historyRepo, deviceBoxId } from "./calibration/adapters";
@@ -429,6 +430,34 @@ function App() {
           {" · "}这不是生产网关：相机、BOX、激光跟踪仪和机械臂在这里都不可用，数据是你自己复制进来的副本。
         </div>
       ) : null}
+      {(() => {
+        const banner = leaseBanner(
+          snapshot.hardwareLease,
+          snapshot.deployment.release?.commit ?? "",
+          snapshot.deployment.release?.branch ?? ""
+        );
+        if (!banner) return null;
+        return (
+          <div className={banner.tone === "info" ? "sandbox-banner" : "command-error"} role="status">
+            <span>{banner.text}</span>
+            {banner.action ? (
+              <button
+                type="button"
+                className="topbar-btn"
+                disabled={busy}
+                onClick={() => {
+                  if (banner.action && window.confirm(banner.confirm)) {
+                    const action = banner.action;
+                    void run(() => api.hardwareLease(action));
+                  }
+                }}
+              >
+                {banner.label}
+              </button>
+            ) : null}
+          </div>
+        );
+      })()}
       {graphGuardBlocks(snapshot.worldGraphGuard) ? (
         <div className="command-error" role="alert">
           {graphGuardLines(snapshot.worldGraphGuard).map((line, i) => (

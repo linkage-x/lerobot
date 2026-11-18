@@ -11,6 +11,7 @@ import type {
   DatasetExportStatus,
   DeploymentProfile,
   DeviceStatus,
+  HardwareLease,
   BoxPreviewPayload,
   BoxCaliLog,
   EventLogItem,
@@ -86,6 +87,8 @@ const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: numb
 
 export type GuiSnapshot = {
   deployment: DeploymentProfile;
+  /** Hardware time-sharing between production and the dev gateway; null/absent in a sandbox or an older gateway. */
+  hardwareLease?: HardwareLease | null;
   gateway: GatewayStatus;
   configSummary: ConfigSummary;
   devices: DeviceStatus[];
@@ -1888,6 +1891,12 @@ export class DataCollectionGuiApi {
     }
     this.log("info", `Deleted task: ${taskId}`);
     return this.getSnapshot();
+  }
+
+  // --- Hardware time-sharing (dev gateway: borrow/return; production: reclaim). Pressed by a person. ---
+  async hardwareLease(action: "borrow" | "return" | "reclaim"): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot(`/api/hardware/${action}`, {});
+    return remote ?? structuredClone(this.snapshot);
   }
 
   async exportTask(taskId: string): Promise<GuiSnapshot> {
