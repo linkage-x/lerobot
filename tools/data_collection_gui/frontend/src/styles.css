@@ -4868,3 +4868,43 @@ button.danger {
 .rollout-key-truth { color: #1f9d55; font-weight: 600; }
 .rollout-key-still { color: #c0392b; font-weight: 600; }
 .rollout-live { margin-top: 8px; }
+
+/* Device Manager: FR3 gripper close/open button (ArmGripperPanel). */
+.arm-gripper-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.arm-gripper-row button {
+  min-width: 96px;
+}
+
+.arm-gripper-last,
+.arm-gripper-note {
+  opacity: 0.75;
+}
+
+.arm-gripper-note {
+  margin: 6px 0;
+  font-size: 0.85em;
+}
+
+.arm-gripper-error {
+  color: #c0392b;
+  opacity: 1;
+}
+
+/* Rollout page: the same button inside the online preview panel. */
+.arm-gripper-embedded {
+  border-top: 1px solid rgba(127, 127, 127, 0.25);
+  margin: 8px 0;
+  padding-top: 8px;
+}
+
+.arm-gripper-embedded h3 {
+  margin: 0;
+  font-size: 1em;
+}

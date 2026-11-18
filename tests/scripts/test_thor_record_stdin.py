@@ -188,3 +188,93 @@ def test_a_child_making_stdin_nonblocking_does_not_end_the_session():
     proc.stdin.close()  # a real EOF still ends the session
     proc.wait(timeout=15)
     assert proc.stdout.read().strip() == "discard,start,quit"
+
+
+def test_arm_gripper_is_a_side_effect_with_its_request_id():
+    seen: list[tuple] = []
+
+    queue = _drain("arm_gripper:3100715645:0.0000:g7\n", on_arm_gripper=lambda *a: seen.append(a))
+
+    assert seen == [(3100715645, 0.0, "g7")]
+    assert [cmd.kind for cmd in queue] == ["quit"]
+
+
+def test_a_malformed_arm_gripper_command_is_dropped_not_guessed():
+    seen: list[tuple] = []
+
+    for line in ("arm_gripper:3100715645\n", "arm_gripper:abc:0.01:g1\n", "arm_gripper:3100715645:0.5:g1\n"):
+        queue = _drain(line, on_arm_gripper=lambda *a: seen.append(a))
+        assert [cmd.kind for cmd in queue] == ["quit"]
+    assert seen == []
+
+
+class _FakeGripperBox:
+    def __init__(self, mode: int, width: float | None):
+        self.mode, self.width, self.calls = mode, width, []
+
+    def read(self):
+        return {"sensors": {"box_gripper": {"distance_m": self.width}}}
+
+    def get_mode(self, timeout_ms: int = 100):
+        return 0, self.mode
+
+    def set_mode(self, mode: int) -> int:
+        self.calls.append(("set_mode", mode))
+        self.mode = mode
+        return 0
+
+    def set_clamp_pos(self, pos_m: float) -> int:
+        self.calls.append(("set_clamp_pos", pos_m))
+        return 0
+
+
+class _FakePool:
+    def __init__(self, client):
+        self.client = client
+
+    def client_for_device(self, device_id: int):
+        return self.client if device_id == 3100715645 else None
+
+
+def _gripper_replies(monkeypatch, box, device_id: int = 3100715645, width_m: float = 0.0) -> list[dict]:
+    import json
+
+    lines: list[str] = []
+    monkeypatch.setattr(tr, "_emit", lines.append)
+    tr._run_arm_gripper(_FakePool(box), device_id, width_m, "g1")
+    assert all(line.startswith("ARMGRIPPER_DONE ") for line in lines)
+    return [json.loads(line.removeprefix("ARMGRIPPER_DONE ")) for line in lines]
+
+
+def test_arm_gripper_out_of_control_mode_preloads_the_held_width_first(monkeypatch):
+    box = _FakeGripperBox(mode=0, width=0.0887)
+
+    (reply,) = _gripper_replies(monkeypatch, box, width_m=0.0)
+
+    # what the jaw holds, then control mode, then the target -- never mode 0
+    assert box.calls == [("set_clamp_pos", 0.0887), ("set_mode", 1), ("set_clamp_pos", 0.0)]
+    assert reply == {**reply, "ok": True, "request": "g1", "modeBefore": 0, "widthBeforeM": 0.0887}
+
+
+def test_arm_gripper_in_control_mode_only_sends_the_target(monkeypatch):
+    box = _FakeGripperBox(mode=1, width=0.0476)
+
+    (reply,) = _gripper_replies(monkeypatch, box, width_m=0.088)
+
+    assert box.calls == [("set_clamp_pos", 0.088)]
+    assert reply["ok"]
+
+
+def test_arm_gripper_without_a_width_reading_does_not_switch_modes(monkeypatch):
+    box = _FakeGripperBox(mode=0, width=None)
+
+    (reply,) = _gripper_replies(monkeypatch, box)
+
+    assert box.calls == []
+    assert not reply["ok"] and "没有开度读数" in reply["error"]
+
+
+def test_arm_gripper_for_a_box_the_recorder_does_not_have_is_an_error_line(monkeypatch):
+    (reply,) = _gripper_replies(monkeypatch, _FakeGripperBox(mode=1, width=0.05), device_id=42)
+
+    assert not reply["ok"] and "42" in reply["error"]

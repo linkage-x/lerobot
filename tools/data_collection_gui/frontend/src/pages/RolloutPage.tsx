@@ -8,6 +8,7 @@ import {
   type RolloutStatus,
   rolloutApi
 } from "./rolloutApi";
+import { ArmGripperPanel } from "./ArmGripperPanel";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -377,6 +378,7 @@ export function RolloutPage() {
             </button>
           )}
         </div>
+        <ArmGripperPanel embedded arm={arm} />
         {activePreview ? (
           <PreviewLive record={activePreview.out} running={activePreview.state === "running"} />
         ) : null}

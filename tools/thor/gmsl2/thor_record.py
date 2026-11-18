@@ -687,6 +687,82 @@ def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
         _CALI_LOCK.release()
 
 
+# FR3 gripper BOX: control mode, where the jaw holds what the host last sent. Mode 0 hands the jaw to
+# that BOX's own trigger, which on the arm means it opens -- never sent from here.
+_ARM_GRIPPER_CONTROL_MODE = 1
+_ARM_GRIPPER_LOCK = threading.Lock()
+
+
+def _parse_arm_gripper(arg: str) -> tuple[int, float, str] | None:
+    """``<device_id>:<width_m>[:<request>]`` -> ``(device_id, width_m, request)``, or None if malformed."""
+    parts = arg.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        device_id, width_m = int(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    if device_id <= 0 or not (0.0 <= width_m <= 0.1):
+        return None
+    return device_id, width_m, parts[2].strip() if len(parts) == 3 else ""
+
+
+def _run_arm_gripper(box: Any, device_id: int, width_m: float, request: str = "") -> None:
+    """Send the FR3 gripper BOX to ``width_m``; answer with one ``ARMGRIPPER_DONE {json}`` line.
+
+    While connected the recorder owns the BOX port (:15000), so the Device Manager's close/open
+    button rides its stdin. The order is fr3_gripper_teleop's and CoreneticGripperHardwareDriver's:
+    a BOX not yet in control mode first gets the width it holds, then set_mode(1), then the target,
+    so firmware that latches early never acts on a stale or zero target.
+    """
+    result: dict[str, Any] = {
+        "request": request,
+        "deviceId": device_id,
+        "targetM": width_m,
+        "ok": False,
+        "error": "",
+        "modeBefore": None,
+        "widthBeforeM": None,
+    }
+    if not _ARM_GRIPPER_LOCK.acquire(blocking=False):
+        result["error"] = "上一条夹爪指令还没发完"
+        _emit("ARMGRIPPER_DONE " + json.dumps(result, ensure_ascii=False))
+        return
+    try:
+        client = box.client_for_device(device_id)
+        if client is None:
+            raise RuntimeError(f"录制器没有发现 BOX {device_id}")
+        jaw = (client.read().get("sensors") or {}).get("box_gripper") or {}
+        try:
+            width = float(jaw.get("distance_m"))
+        except (TypeError, ValueError):
+            width = float("nan")
+        width_known = math.isfinite(width)
+        result["widthBeforeM"] = width if width_known else None
+        rc, mode = 1, -1
+        for _ in range(3):
+            rc, mode = client.get_mode()
+            if rc == 0:
+                break
+        result["modeBefore"] = mode if rc == 0 else None
+        if rc != 0 or mode != _ARM_GRIPPER_CONTROL_MODE:
+            if not width_known:
+                raise RuntimeError("夹爪不在控制模式且没有开度读数，不切模式")
+            client.set_clamp_pos(width)
+            rc_mode = client.set_mode(_ARM_GRIPPER_CONTROL_MODE)
+            if rc_mode != 0:
+                raise RuntimeError(f"set_mode(1) 失败 rc={rc_mode}")
+        rc_pos = client.set_clamp_pos(width_m)
+        if rc_pos != 0:
+            raise RuntimeError(f"set_clamp_pos({width_m:.4f}) 失败 rc={rc_pos}")
+        result["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - a gripper command must never crash the recorder
+        result["error"] = str(exc)
+    finally:
+        _ARM_GRIPPER_LOCK.release()
+    _emit("ARMGRIPPER_DONE " + json.dumps(result, ensure_ascii=False))
+
+
 def _stdin_was_made_nonblocking() -> bool:
     """Restore a blocking stdin and say whether it had been made non-blocking."""
     try:
@@ -709,6 +785,7 @@ def _read_stdin_loop(
     on_episode_time: Callable[[float], None] | None = None,
     on_capture_root: Callable[[str], None] | None = None,
     on_capture_intent: Callable[[str], None] | None = None,
+    on_arm_gripper: Callable[[int, float, str], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -798,6 +875,16 @@ def _read_stdin_loop(
             # memory and is gone on restart.
             if on_capture_intent is not None:
                 on_capture_intent(box_id)
+        elif cmd_key == "arm_gripper":
+            # `arm_gripper:<device_id>:<width_m>:<request>` sends an FR3 gripper BOX to a width (the
+            # Device Manager's close/open button; the recorder holds the BOX port). Side-effect, not
+            # an FSM command; a malformed one is dropped, never guessed at.
+            parsed = _parse_arm_gripper(box_id)
+            if parsed is None:
+                logger.warning("ignoring malformed arm_gripper command: %r", line)
+                continue
+            if on_arm_gripper is not None:
+                on_arm_gripper(*parsed)
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -2232,13 +2319,20 @@ def main(argv: list[str] | None = None) -> int:
             return
         pending_capture_intent = payload
 
+    def _trigger_arm_gripper(device_id: int, width_m: float, request: str) -> None:
+        # Same offload pattern: the stdin reader never waits on the SDK.
+        threading.Thread(
+            target=_run_arm_gripper, args=(box, device_id, width_m, request),
+            daemon=True, name="thor-record-arm-gripper",
+        ).start()
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
         args=(
             cmd_queue, stop_event, _note_preview_demand,
             _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
             _trigger_touch_cali, _note_episode_time,
-            _note_capture_root, _note_capture_intent,
+            _note_capture_root, _note_capture_intent, _trigger_arm_gripper,
         ),
         daemon=True, name="thor-record-stdin",
     )
