@@ -746,11 +746,13 @@ def accept(
         return f"step {bad[0]} of the {n_exec} it must be able to carry is not executable: {chunk.why[bad[0]]}"
     if not first:
         q_new, _, _ = chunk.command(now)
-        dq = float(np.abs(q_new - q_cmd).max())
+        gap = np.abs(q_new - q_cmd)
+        dq = float(gap.max())
         mm, _ = pose_gap(T_cmd, fk(q_new))
         if mm > limits.switch_mm or dq > limits.switch_joint_rad:
             return (
-                f"the new chunk is {mm:.1f} mm / {dq:.3f} rad from the command it would replace "
+                f"the new chunk is {mm:.1f} mm / {dq:.3f} rad (j{int(gap.argmax()) + 1}; joints "
+                f"{np.round(q_new - q_cmd, 3).tolist()}) from the command it would replace "
                 f"(limit {limits.switch_mm:g} mm / {limits.switch_joint_rad:g} rad)"
             )
     return ""
@@ -1567,6 +1569,7 @@ class Recorder:
         if pred.chunk is not None:
             c = pred.chunk
             row.update(index=c.index, k0=c.k0, end=c.end, t0=c.t0, offsets=c.offsets.round(5).tolist(),
+                       q=c.q.round(5).tolist(),  # the anchor's measured joints, then each step's IK
                        ok=c.ok.tolist(), why_steps=c.why,
                        targets_base=c.T[:, :3, 3].round(5).tolist(), widths=c.widths.round(4).tolist(),
                        plan=pred.plan)
