@@ -118,6 +118,10 @@ class Limits:
     # ... but a step needing more than this many times its 33 ms is refused: an IK branch change or a wild
     # prediction, not speed (11-19 runs needed at most 1.53 within what a chunk must carry, 1.98 at step 32)
     step_stretch_max: float = 2.0
+    # what a step does beyond moving the TCP (its joint motion minus J+ of its own TCP motion): a re-posture,
+    # i.e. an IK branch change, refused whatever the speed. 11-19 runs: at most 0.008 rad per step; the
+    # IK pulled to the range middle (11-18) re-postured 0.69 rad in step 1
+    reposture_rad: float = 0.05
     # a newer chunk against the command it replaces, at the moment of the switch
     switch_mm: float = 15.0
     switch_joint_rad: float = 0.05
@@ -445,6 +449,22 @@ def step_limits(step1_m: float | None, step1_deg: float | None) -> dict[str, flo
     return out
 
 
+def reposture(q: np.ndarray) -> np.ndarray:
+    """(n,) per step (0 = anchor): the largest joint motion not explained by the step's own flange motion
+    (dq - J(q[k-1])^+ dx, radians). A step that only moves the TCP is ~0; a branch change is not."""
+    from tools.fr3 import fr3_kinematics as kin
+
+    q = np.asarray(q, dtype=np.float64)
+    out = np.zeros(len(q))
+    if len(q) < 2:
+        return out
+    T, J = kin.NOMINAL.kinematics(q)
+    for k in range(1, len(q)):
+        dx = np.r_[T[k][:3, 3] - T[k - 1][:3, 3], _rotvec(T[k][:3, :3] @ T[k - 1][:3, :3].T)]
+        out[k] = float(np.abs((q[k] - q[k - 1]) - np.linalg.pinv(J[k - 1]) @ dx).max())
+    return out
+
+
 def assess(
     T: np.ndarray,
     q: np.ndarray,
@@ -460,6 +480,7 @@ def assess(
     n = len(q)
     ok = np.ones(n, dtype=bool)
     why = [""] * n
+    rep = reposture(q)
     for k in range(1, n):
         reason = ""
         if not ok[k - 1]:
@@ -482,6 +503,9 @@ def assess(
                 reason = (f"step {k}: j{j + 1} moves {abs(q[k][j] - q[k - 1][j]):.3f} rad in one step "
                           f"(limit {limits.step_joint_rad * JOINT_SCALE[j]:.3f} x{limits.step_stretch_max:g} "
                           "slowed down; an IK branch change?)")
+            elif rep[k] > limits.reposture_rad:
+                reason = (f"step {k}: the arm re-postures {rep[k]:.3f} rad beyond what the TCP's motion needs "
+                          f"(limit {limits.reposture_rad:g}; an IK branch change)")
         if reason:
             ok[k] = False
             why[k] = reason

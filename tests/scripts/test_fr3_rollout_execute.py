@@ -234,6 +234,22 @@ def test_a_step_too_fast_for_a_joint_is_slowed_down_not_refused():
     assert not result.completed and "in one step" in result.stopped
 
 
+def test_a_re_posture_is_refused_however_slowly_it_could_be_run():
+    # 11-18: IK pulled to the middle of the joint range re-postures the arm in step 1 for a 4 mm target
+    T0 = _fk(Q0)
+    T = np.repeat(T0[None], 3, axis=0)
+    T[1:, 2, 3] -= [0.002, 0.004]
+    q_mid, ok = kin.ik(kin.NOMINAL, T[1:], Q0)  # rest: the range middle
+    q_held, _ = kin.ik(kin.NOMINAL, T[1:], Q0, rest=Q0)
+    assert ok.all()
+    held = np.vstack([Q0, q_held])
+    ok, _ = rx.assess(T, held, np.ones(2, bool), ["", ""], rx.Limits())
+    assert ok.all() and rx.reposture(held).max() < 0.01
+    mid = np.vstack([Q0, q_mid])
+    ok, why = rx.assess(T, mid, np.ones(2, bool), ["", ""], rx.Limits(step_stretch_max=1e9))  # speed not the issue
+    assert not ok[1] and "re-postures" in why[1] and "IK branch change" in why[1]
+
+
 def test_retime_keeps_the_policys_timing_unless_a_joint_needs_longer():
     q = np.zeros((6, 7))
     q[:, 0] = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]  # 0.3 rad/s: well under 1.5
