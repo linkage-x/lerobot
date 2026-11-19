@@ -759,6 +759,7 @@ class Prediction:
     history: np.ndarray | None = None
     actions: np.ndarray | None = None
     plan: dict[str, Any] = field(default_factory=dict)
+    timing: dict[str, float] = field(default_factory=dict)  # monotonic instant each phase began (Predictor.busy)
 
 
 class Predictor:
@@ -782,6 +783,16 @@ class Predictor:
         self.thread = threading.Thread(target=self._run, daemon=True, name="rollout-predictor")
         self.count = 0
         self.offsets_s = [o / float(contract.fps) for o in contract.history_offsets]
+        # the phase the thread is in and since when ("" = idle): a run that stops while a prediction is
+        # pending records where it was (11-19: a second chunk never came back and nothing said why)
+        self.busy: tuple[str, float] = ("", 0.0)
+        self._timing: dict[str, float] = {}
+
+    def _phase(self, name: str) -> None:
+        t = self.clock()
+        self.busy = (name, t)
+        if name:
+            self._timing[name] = t
 
     def start(self) -> None:
         self.thread.start()
@@ -790,7 +801,7 @@ class Predictor:
         """``seed``: the joints to start each target's IK from -- one posture, or a function of time (the
         chunk being executed: each step of the next chunk starts from the posture the current one has at
         that instant, so the arm's redundancy is not resolved differently at the switch)."""
-        self.requests.put((min_t, seed if callable(seed) else np.array(seed, dtype=float)))
+        self.requests.put((min_t, seed if callable(seed) else np.array(seed, dtype=float), self.clock()))
 
     def close(self) -> None:
         self.requests.put(None)
@@ -800,11 +811,16 @@ class Predictor:
             item = self.requests.get()
             if item is None:
                 return
-            min_t, seed = item
-            self.results.put(self.once(min_t, seed))
+            min_t, seed, t_request = item
+            self._timing = {"requested": t_request}
+            pred = self.once(min_t, seed)
+            pred.timing = dict(self._timing)
+            self._phase("")
+            self.results.put(pred)
 
     def once(self, min_t: float, seed: np.ndarray) -> Prediction:
         L = self.limits
+        self._phase("observe")
         try:
             obs = self.observe(min_t)
         except Exception as exc:  # noqa: BLE001 -- stops the run, with the reason
@@ -820,6 +836,7 @@ class Predictor:
             hist = self.history.poses(obs.t_img, self.offsets_s)
         except RuntimeError as exc:
             return Prediction(obs, None, error=f"TCP history: {exc}", age_s=age)
+        self._phase("predict")
         t = self.clock()
         actions = np.asarray(self.predict(self.sample(hist, obs)), dtype=np.float64)
         latency = self.clock() - t
@@ -827,6 +844,7 @@ class Predictor:
             return Prediction(obs, None, error=f"prediction took {latency * 1e3:.0f} ms (limit {L.predict_s * 1e3:.0f})",
                               latency_s=latency, age_s=age, history=hist, actions=actions)
         H = len(actions)
+        self._phase("plan")
         if callable(seed):
             seed = np.stack([seed(obs.t_img + k * self.c.step_s) for k in range(1, H + 1)])
         plan = self.plan(hist[-1], smooth_steps(actions), seed)  # the record keeps the policy's own actions
@@ -835,6 +853,7 @@ class Predictor:
         gap = plan.get("env_gap_m")
         ok, why = assess(T, q, np.asarray(plan["ok"], dtype=bool), list(plan["why"]), L,
                          None if gap is None else np.asarray(gap, dtype=float))
+        self._phase("chunk")
         chunk = Chunk(self.count, obs.t_img, obs.t_img, self.c.step_s, T, q, ok, why, actions[:H, rt.POSE_DIM].copy())
         self.count += 1
         return Prediction(obs, chunk, latency_s=latency, age_s=age, history=hist, actions=actions,
@@ -940,7 +959,10 @@ def run_loop(
                 kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=T_meas, T_cmd=T_cmd, loop_dt=loop_dt,
                                    limits=limits, wall_lower=wall_lower, wall_upper=wall_upper,
                                    f_avg=np.mean(f_window, axis=0))
-                if why:
+                if why:  # the tick that tripped, against the command it was judged by (phase 1)
+                    if record:
+                        record({"tick": {"t": now, "q": q, "dq": dq, "f_ext": f_ext, "q_cmd": q_cmd.copy(),
+                                         "cursor": cursor, "chunk": -1 if chunk is None else chunk.index, "phase": 1}})
                     break
             if now - t_start > stage.max_s:
                 why = f"reached the stage's {stage.max_s:g} s"
@@ -1017,12 +1039,19 @@ def run_loop(
         why, kind = f"{type(exc).__name__}: {exc}", "robot"
     finally:
         # hold: the last validated command, or where the arm is after contact, tracking or a robot error
+        busy, since = predictor.busy
+        if record and busy:
+            record({"event": {"kind": "predictor", "t": clock(), "phase": busy, "since": since}})
         try:
             q, _, _ = arm.read()
             q_hold = q if kind in HOLD_MEASURED else q_cmd
             t_hold = clock()
             while clock() - t_hold < HOLD_S:
                 arm.command(q_hold, np.zeros(7))
+                if record:  # what the arm did after the stop (phase 2): an overshoot shows here
+                    qh, dqh, fh = arm.read()
+                    record({"tick": {"t": clock(), "q": qh, "dq": dqh, "f_ext": fh, "q_cmd": q_hold.copy(),
+                                     "cursor": cursor, "chunk": -1 if chunk is None else chunk.index, "phase": 2}})
                 sleep(period)
         except Exception as exc:  # noqa: BLE001 -- the controller is let go below either way
             why = why or f"hold: {type(exc).__name__}: {exc}"
@@ -1081,6 +1110,8 @@ class Recorder:
             row["t_img"] = pred.obs.t_img
             row["obs_meta"] = pred.obs.meta
             row["width"] = pred.obs.width
+        if pred.timing:
+            row["timing"] = {k: round(v, 4) for k, v in pred.timing.items()}
         if pred.chunk is not None:
             c = pred.chunk
             row.update(index=c.index, k0=c.k0, end=c.end, t0=c.t0, offsets=c.offsets.round(5).tolist(),
@@ -1108,7 +1139,9 @@ class Recorder:
         if not self.ticks:
             return
         keys = ("t", "q", "dq", "f_ext", "q_cmd", "cursor", "chunk")
-        np.savez_compressed(self.dir / "ticks.npz", **{k: np.asarray([row[k] for row in self.ticks]) for k in keys})
+        arrays = {k: np.asarray([row[k] for row in self.ticks]) for k in keys}
+        arrays["phase"] = np.asarray([row.get("phase", 0) for row in self.ticks])  # 0 run, 1 the stop's tick, 2 hold
+        np.savez_compressed(self.dir / "ticks.npz", **arrays)
 
 
 def _jsonable(value: Any) -> Any:

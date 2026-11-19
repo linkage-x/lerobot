@@ -140,6 +140,11 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
     }
     later = accepted[1:]
     gaps = np.diff([r["t"] for r in accepted]) * 1e3 if len(accepted) > 1 else []
+    after: dict[str, np.ndarray] = {}
+    if ticks and "phase" in ticks:  # 11-19 on: the stop's own tick (1) and the hold after it (2) are recorded
+        run = ticks["phase"] == 0
+        after = {k: v[~run] for k, v in ticks.items()}
+        ticks = {k: v[run] for k, v in ticks.items()} if run.any() else {}
     t_end = float(ticks["t"][-1]) if ticks else (rows[-1]["t"] if rows else 0.0)
     executed = _executed_steps(rows, t_end, dt)
     report["timing"] = {
@@ -191,10 +196,40 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
         arm["wall_joint"] = int(np.degrees(np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q)).min(axis=0).argmin()) + 1
     else:
         arm["note"] = "no ticks: the arm was never commanded (the first chunk was refused, or the run stopped before it)"
+    if after:
+        fk = fk or tcp_fk(meta, repo_root)
+        report["stop"] = _stop_block(ticks, after, fk)
+    report["predictor_at_stop"] = [ev for ev in events if ev.get("kind") == "predictor"]
+    report["prediction_timing_ms"] = [
+        {k: round((v - r["timing"]["requested"]) * 1e3, 1) for k, v in r["timing"].items()}
+        for r in rows if (r.get("timing") or {}).get("requested") is not None
+    ]
     report["motion"] = arm
     report["gripper"] = [ev for ev in events if ev.get("kind") == "gripper"]
     report["headroom"] = _headroom(report, limits, n_exec)
     return report
+
+
+def _stop_block(ticks: dict[str, np.ndarray], after: dict[str, np.ndarray], fk) -> dict[str, Any]:
+    """The tick that tripped the stop (how long after the one before, how far off its command) and the hold
+    after it (how far the arm went past where the stop found it)."""
+    out: dict[str, Any] = {}
+    trip = np.flatnonzero(after["phase"] == 1)
+    if trip.size:
+        i = int(trip[0])
+        P = fk(after["q"][i : i + 1])[0, :3, 3]
+        P_cmd = fk(after["q_cmd"][i : i + 1])[0, :3, 3]
+        out["trip"] = {
+            "loop_dt_ms": round(float(after["t"][i] - ticks["t"][-1]) * 1e3, 1) if ticks else None,
+            "tracking_mm": round(float(np.linalg.norm(P - P_cmd)) * 1e3, 1),
+            "joint_speed_rad_s": round(float(np.abs(after["dq"][i]).max()), 3),
+        }
+    hold = after["phase"] == 2
+    if hold.any():
+        P = fk(after["q"][hold])[:, :3, 3]
+        out["hold"] = {"ticks": int(hold.sum()), "travel_mm": round(float(np.linalg.norm(P - P[0], axis=1).max()) * 1e3, 1),
+                       "joint_speed_first_rad_s": round(float(np.abs(after["dq"][hold][0]).max()), 3)}
+    return out
 
 
 def _headroom(report: dict[str, Any], limits: dict[str, Any], n_exec: int) -> list[dict[str, Any]]:
@@ -240,7 +275,8 @@ def pooled(reports: list[dict[str, Any]], record_dirs: list[Path]) -> dict[str, 
         lat += [r["latency_ms"] for r in rows if r.get("latency_ms")]
         late += [int(r["k0"]) - 1 for r in [r for r in rows if r.get("accepted")][1:]]
         if ticks:
-            loop += (np.diff(ticks["t"]) * 1e3).tolist()
+            t = ticks["t"][ticks["phase"] == 0] if "phase" in ticks else ticks["t"]
+            loop += (np.diff(t) * 1e3).tolist()
     return {"runs": len(reports), "age_ms": stats(age), "latency_ms": stats(lat), "late_steps": stats(late),
             "loop_ms": stats(loop)}
 
@@ -291,6 +327,19 @@ def format_text(report: dict[str, Any]) -> str:
         ]
     for ev in report["gripper"]:
         lines.append(f"  gripper {ev.get('action')} at step {ev.get('cursor')}")
+    stop = report.get("stop") or {}
+    if stop.get("trip"):
+        tr = stop["trip"]
+        lines.append(f"  the stop's tick   {tr['loop_dt_ms']} ms after the one before, TCP {tr['tracking_mm']} mm off its "
+                     f"command, fastest joint {tr['joint_speed_rad_s']} rad/s")
+    if stop.get("hold"):
+        h = stop["hold"]
+        lines.append(f"  hold after stop   TCP moved {h['travel_mm']} mm from where the stop found it ({h['ticks']} ticks)")
+    for ev in report.get("predictor_at_stop") or []:
+        lines.append(f"  predictor at stop in '{ev.get('phase')}' for {(ev['t'] - ev['since']) * 1e3:.0f} ms")
+    for k, tm in enumerate(report.get("prediction_timing_ms") or []):
+        phases = ", ".join(f"{name} +{v:g}" for name, v in tm.items() if name != "requested")
+        lines.append(f"  prediction {k} ms after request: {phases}")
     if report["headroom"]:
         lines.append("headroom (worst / stop)")
         if report["inputs"]["age_ms"].get("n", 0) < FEW_PREDICTIONS:

@@ -112,10 +112,10 @@ def _policy(c: rt.PolicyContract, width=lambda k: 0.088, step=(0.0, 0.0, -STEP_D
 
 
 def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_ext=None, limits=rx.Limits(), width=lambda k: 0.088,
-         gripper=None, stop_flag=lambda: "", record=None, start_check=None, step=(0.0, 0.0, -STEP_DOWN_M)):
+         gripper=None, stop_flag=lambda: "", record=None, start_check=None, step=(0.0, 0.0, -STEP_DOWN_M), arm_cls=None):
     c = _contract()
     clock = Clock()
-    arm = FakeArm(clock, f_ext=f_ext)
+    arm = (arm_cls or FakeArm)(clock, f_ext=f_ext)
     history = rx.PoseHistory()
     seen: list[dict] = []
 
@@ -576,6 +576,53 @@ def test_report_reads_a_closed_loop_run_back(tmp_path: Path):
     assert age["limit"] == 400.0 and age["use"] == pytest.approx(age["worst"] / 400.0, abs=1e-3)
     text = rep.format_text(r)
     assert "TCP vs target" in text and "fewer than" not in text
+
+
+def test_report_shows_the_tick_that_stopped_the_run_and_the_hold_after_it(tmp_path: Path):
+    class Overshoots(FakeArm):  # 11-19 120252: 2 mm behind at the last recorded tick, 20.4 mm at the stop's
+        def read(self):
+            q, dq, f = super().read()
+            if self.clock() > 1000.6:
+                q = q + np.array([0.0, 0.0, 0.0, 0.08, 0.0, 0.0, 0.0])
+            return q, dq, f
+
+    result, _ = _recorded(tmp_path, replace(rx.STAGES[2], max_s=2.0), arm_cls=Overshoots)
+    assert "off its command" in result.stopped
+    r = rep.analyze(tmp_path)
+    assert r["motion"]["tracking_mm"]["max"] < 5.0  # the run's own ticks: the stop's is reported apart
+    trip = r["stop"]["trip"]
+    assert trip["tracking_mm"] > 20.0 and 0.0 < trip["loop_dt_ms"] < 10.0
+    assert r["stop"]["hold"]["ticks"] >= int(rx.HOLD_S * rx.LOOP_HZ) - 2
+    assert r["timing"]["loop_ms"]["max"] < 10.0  # the hold's ticks do not count as loop periods
+    text = rep.format_text(r)
+    assert "the stop's tick" in text and "hold after stop" in text
+
+
+def test_predictor_records_when_each_phase_began():
+    c = _contract()
+    clock = Clock()
+    history = rx.PoseHistory()
+    for k in range(40):
+        history.add(clock() - 0.5 + k * 0.0125, _fk(Q0), Q0)
+
+    def observe(min_t):
+        clock.sleep(0.02)
+        return rx.Observation(clock() - 0.03, {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None, {"box_stale_s": 0.02})
+
+    def predict(sample):
+        clock.sleep(0.03)
+        return _policy(c)(sample)
+
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=predict, plan=_plan(), sample=lambda h, o: {},
+                        limits=rx.Limits(), clock=clock)
+    pred.request(min_t=clock() - 1.0, seed=Q0)
+    pred.close()
+    pred._run()  # in this thread: the request, then the close
+    out = pred.results.get_nowait()
+    assert out.chunk is not None and pred.busy == ("", pred.busy[1])
+    tm = out.timing
+    assert list(tm) == ["requested", "observe", "predict", "plan", "chunk"]
+    assert tm["predict"] - tm["observe"] == pytest.approx(0.02) and tm["plan"] - tm["predict"] == pytest.approx(0.03)
 
 
 def test_report_on_a_refused_first_chunk_says_the_arm_never_moved(tmp_path: Path):
