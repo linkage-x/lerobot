@@ -301,3 +301,27 @@ def test_the_inference_bus_is_the_same_on_both_sides_and_tightens_the_frame_age(
     assert ro.frame_age_limit_s(ro.PREVIEW_FRAME_BUS) == pytest.approx(0.40)
     assert not ro.LiveInputs(_contract(), gateway="http://x", box_id="1", frame_bus=ro.INFERENCE_FRAME_BUS).demand_previews
     assert ro.LiveInputs(_contract(), gateway="http://x", box_id="1").demand_previews
+
+
+def test_live_jobs_wait_until_the_recorder_has_brought_every_sensor_up(tmp_path):
+    spawned = []
+
+    class Proc:
+        pid = 2**22 + 11  # a real integer, never a MagicMock (os.killpg)
+
+    rec = {"state": "connecting", "sensors": [{"id": "cam_10", "kind": "camera", "state": "running"},
+                                              {"id": "box/gripper", "kind": "box_collection", "state": "warning"}]}
+    manager = _manager(tmp_path, recorder_busy=lambda: True, recorder_cameras=lambda: ["cam_10"],
+                       recorder_sensors=lambda: rec, popen=lambda cmd, **k: spawned.append(cmd) or Proc())
+    ckpt = manager.checkpoints()[0]["path"]
+    readiness = manager.status()["recorder"]
+    assert readiness["pending"] and not readiness["ready"] and not readiness["failed"]
+    with pytest.raises(rr.RolloutError, match=r"still connecting \(not ready yet: box/gripper\)"):
+        manager.start_preview(ckpt, "right", 2.0, False)
+    assert not spawned
+    rec["sensors"][1]["state"] = "error"  # a failed connect is not pending: Disconnect may tear it down
+    assert manager.status()["recorder"]["failed"] and not manager.status()["recorder"]["pending"]
+    rec["state"], rec["sensors"][1]["state"] = "armed", "running"
+    assert manager.status()["recorder"]["ready"]
+    manager.start_preview(ckpt, "right", 2.0, False)
+    assert spawned

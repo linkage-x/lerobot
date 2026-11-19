@@ -21403,9 +21403,20 @@ def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
             recorder_busy=lambda: state.process is not None and state.process.poll() is None,
             fci_holder=lambda: _rollout_fci_holder(state),
             recorder_cameras=lambda: list(state.recording.inferenceCameras),
+            recorder_sensors=lambda: _rollout_recorder_sensors(state),
             gateway_url=f"http://127.0.0.1:{port}",
         )
     return state.rollout
+
+
+def _rollout_recorder_sensors(state: GatewayState) -> dict[str, Any]:
+    """The recorder's state and the rows of the sensors it opened (cameras, BOXes); read without state.lock."""
+    sensors = [
+        {"id": str(d.get("id")), "kind": str(d.get("kind")), "state": str(d.get("state"))}
+        for d in list(state.devices)
+        if d.get("kind") in ("camera", "box_collection") and d.get("state") != NOT_OPENED_FOR_INFERENCE
+    ]
+    return {"state": state.recording.state, "sensors": sensors}
 
 
 def _rollout_fci_holder(state: GatewayState) -> str:

@@ -104,6 +104,7 @@ class RolloutManager:
         recorder_busy: Callable[[], bool] = lambda: False,
         fci_holder: Callable[[], str] = lambda: "",
         recorder_cameras: Callable[[], list[str]] = lambda: [],
+        recorder_sensors: Callable[[], dict[str, Any]] = lambda: {"state": "armed", "sensors": []},
         gateway_url: str = "http://127.0.0.1:8765",
         python: str = "",
         popen=subprocess.Popen,
@@ -116,6 +117,8 @@ class RolloutManager:
         self.fci_holder = fci_holder
         # the cameras of a recorder connected for inference; [] = a full session (or none)
         self.recorder_cameras = recorder_cameras
+        # the recorder's state and its sensors' rows ({id, kind, state}), for "are all inputs ready"
+        self.recorder_sensors = recorder_sensors
         self.gateway_url = gateway_url
         self._popen = popen
         self.python = python or next(
@@ -241,8 +244,7 @@ class RolloutManager:
             raise RolloutError("a sandbox has no cameras or BOXes: the online preview runs on the station's own gateway")
         if self.profile != "thor":
             raise RolloutError("the online preview reads the Thor recorder's cameras; this gateway is not a Thor")
-        if not self.recorder_busy():
-            raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
+        self._require_ready_recorder()
         if arm not in ("right", "left"):
             raise RolloutError("pick the arm")
         bus_args, bus = self.frame_source(model)
@@ -270,8 +272,7 @@ class RolloutManager:
             raise RolloutError(f"stage: one of {sorted(EXECUTE_STAGES)}")
         if not attended:
             raise RolloutError("the arm moves: confirm in the dialog that a hand is on the e-stop")
-        if not self.recorder_busy():
-            raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
+        self._require_ready_recorder()
         if not self.preview_replayed(model):
             raise RolloutError("no preview of this checkpoint has passed its Replay check yet: run the online preview "
                                "(arm still) and Replay check it first, so the live inputs are known to be the ones "
@@ -398,6 +399,37 @@ class RolloutManager:
                     job.message = "done"
         return True
 
+    def recorder_readiness(self) -> dict[str, Any]:
+        """Is every sensor the recorder opened streaming? ``pending`` = still connecting (nothing failed yet).
+
+        The recorder says "Episode N ready" only after each camera and BOX it opened came up; until then a
+        job would read no frames, and a Disconnect lands in the middle of the cameras' start.
+        """
+        if not self.recorder_busy():
+            return {"state": "idle", "sensors": [], "ready": False, "pending": False, "failed": False}
+        info = self.recorder_sensors() or {}
+        state = str(info.get("state") or "")
+        sensors = [dict(s) for s in info.get("sensors") or []]
+        failed = state == "error" or any(s.get("state") == "error" for s in sensors)
+        pending = not failed and state == "connecting"
+        ready = not failed and not pending and all(s.get("state") == "running" for s in sensors)
+        return {"state": state, "sensors": sensors, "ready": ready, "pending": pending, "failed": failed}
+
+    def _require_ready_recorder(self) -> None:
+        """Refuse a live job while the recorder is still bringing its sensors up (no frames to read yet).
+
+        Only "still connecting" refuses: a BOX row that goes stale later (a handheld BOX the policy does not
+        read) must not block the arm's job; the job checks its own inputs.
+        """
+        if not self.recorder_busy():
+            raise RolloutError("connect the recorder first (Live Record): its cameras and BOX are the policy's inputs")
+        readiness = self.recorder_readiness()
+        if readiness["pending"]:
+            waiting = [str(s.get("id")) for s in readiness["sensors"] if s.get("state") != "running"]
+            raise RolloutError("the recorder is still connecting"
+                               + (f" (not ready yet: {', '.join(waiting)})" if waiting else "")
+                               + ": wait until every camera and BOX streams")
+
     def status(self) -> dict[str, Any]:
         self.refresh()
         with self.lock:
@@ -411,6 +443,7 @@ class RolloutManager:
             "sandbox": self.sandbox,
             "recorderConnected": bool(self.recorder_busy()),
             "recorderCameras": list(self.recorder_cameras()) if self.recorder_busy() else [],
+            "recorder": self.recorder_readiness(),
             "executeStages": {str(k): v for k, v in EXECUTE_STAGES.items()},
         }
 

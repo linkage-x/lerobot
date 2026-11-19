@@ -13,6 +13,18 @@ export function cameraBlocker(status: RolloutStatus | null, checkpoint: RolloutC
     : "";
 }
 
+// While the recorder is still connecting, nothing may start or stop it from this page: the Disconnect
+// button waits until every camera and BOX it opened streams (or one has failed, so it can be torn down).
+export function recorderConnecting(status: RolloutStatus | null): { pending: boolean; label: string } {
+  const r = status?.recorder;
+  if (!status?.recorderConnected || !r?.pending) return { pending: false, label: "" };
+  const ready = r.sensors.filter((s) => s.state === "running").length;
+  return {
+    pending: true,
+    label: r.sensors.length ? `Connecting… ${ready}/${r.sensors.length} sensors ready` : "Connecting…"
+  };
+}
+
 export function executeBlockers(args: {
   status: RolloutStatus | null;
   checkpoint: RolloutCheckpoint | undefined;
@@ -26,6 +38,7 @@ export function executeBlockers(args: {
   if (!checkpoint) out.push("pick a checkpoint");
   else if (!checkpoint.hasWorkspace) out.push("the checkpoint carries no training workspace");
   if (!status.recorderConnected) out.push("connect the recorder");
+  else if (recorderConnecting(status).pending) out.push("the recorder is still connecting");
   const cameras = cameraBlocker(status, checkpoint);
   if (cameras) out.push(cameras);
   if (status.jobs.some((j) => j.state === "running")) out.push("another rollout job is running");

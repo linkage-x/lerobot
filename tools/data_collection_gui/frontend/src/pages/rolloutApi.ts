@@ -18,6 +18,14 @@ export type RolloutJob = {
   last: Record<string, unknown>;
 };
 
+export type RecorderReadiness = {
+  state: string;
+  sensors: { id: string; kind: string; state: string }[];
+  ready: boolean;
+  pending: boolean;
+  failed: boolean;
+};
+
 export type RolloutStatus = {
   stages: Stage[];
   jobs: RolloutJob[];
@@ -26,6 +34,8 @@ export type RolloutStatus = {
   recorderConnected: boolean;
   // connected for inference: the only cameras the recorder opened ([] = a full session)
   recorderCameras?: string[];
+  // pending = the recorder is still bringing its cameras and BOXes up (it has not said "Episode N ready")
+  recorder?: RecorderReadiness;
   executeStages?: Record<string, string>;
 };
 

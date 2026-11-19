@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RolloutCheckpoint, RolloutStatus } from "./rolloutApi";
-import { cameraBlocker, executeBlockers } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers, recorderConnecting } from "./rolloutExecute";
 
 const status = (over: Partial<RolloutStatus> = {}): RolloutStatus => ({
   stages: [],
@@ -40,5 +40,25 @@ describe("cameraBlocker", () => {
     expect(cameraBlocker(s, cam10)).toContain("this checkpoint reads cam_10");
     const out = executeBlockers({ status: s, checkpoint: cam10, previewReplayed: true });
     expect(out).toEqual([cameraBlocker(s, cam10)]);
+  });
+});
+
+describe("recorderConnecting", () => {
+  const sensors = [
+    { id: "cam_10", kind: "camera", state: "running" },
+    { id: "box/gripper", kind: "box_collection", state: "warning" }
+  ];
+  it("holds Disconnect while the recorder brings its sensors up, counting the ready ones", () => {
+    const s = status({ recorder: { state: "connecting", sensors, ready: false, pending: true, failed: false } });
+    expect(recorderConnecting(s)).toEqual({ pending: true, label: "Connecting… 1/2 sensors ready" });
+    expect(executeBlockers({ status: s, checkpoint: ckpt, previewReplayed: true })).toEqual([
+      "the recorder is still connecting"
+    ]);
+  });
+  it("releases it once every sensor streams, or once one failed (so a broken connect can be torn down)", () => {
+    const ready = sensors.map((x) => ({ ...x, state: "running" }));
+    expect(recorderConnecting(status({ recorder: { state: "armed", sensors: ready, ready: true, pending: false, failed: false } })).pending).toBe(false);
+    expect(recorderConnecting(status({ recorder: { state: "error", sensors, ready: false, pending: false, failed: true } })).pending).toBe(false);
+    expect(recorderConnecting(status({ recorderConnected: false })).pending).toBe(false);
   });
 });

@@ -9,7 +9,7 @@ import {
   rolloutApi
 } from "./rolloutApi";
 import { ArmGripperPanel } from "./ArmGripperPanel";
-import { cameraBlocker, executeBlockers } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers, recorderConnecting } from "./rolloutExecute";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -255,6 +255,7 @@ export function RolloutPage() {
   const openCameras = status?.recorderCameras ?? [];
   const forInference = Boolean(status?.recorderConnected && openCameras.length);
   const wrongCameras = cameraBlocker(status, ckpt);
+  const connecting = recorderConnecting(status);
   const executing = running?.kind === "execute" ? running : undefined;
   const episodeList = useMemo(
     () => episodes.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n >= 0),
@@ -357,7 +358,9 @@ export function RolloutPage() {
           <span>
             {!status?.recorderConnected
               ? "recorder not connected"
-              : forInference
+              : connecting.pending
+                ? connecting.label
+                : forInference
                 ? `connected for inference: ${openCameras.join(", ")} at 30 Hz`
                 : "recorder connected (full session, preview bus ~5 Hz)"}
           </span>
@@ -369,6 +372,10 @@ export function RolloutPage() {
               onClick={() => ckpt && act(() => rolloutApi.connectForInference(ckpt.cameras))}
             >
               Connect for inference ({ckpt?.cameras.join(", ") || "pick a checkpoint"})
+            </button>
+          ) : connecting.pending ? (
+            <button disabled title="Disconnect is available once every camera and BOX streams">
+              {connecting.label}
             </button>
           ) : forInference ? (
             <button disabled={Boolean(running)} onClick={() => act(() => rolloutApi.disconnect())}>
@@ -410,7 +417,7 @@ export function RolloutPage() {
             </button>
           ) : (
             <button
-              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected || Boolean(wrongCameras)}
+              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected || connecting.pending || Boolean(wrongCameras)}
               onClick={() => act(() => rolloutApi.preview(checkpoint, arm, rate, readJoints))}
             >
               Start preview
