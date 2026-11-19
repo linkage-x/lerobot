@@ -23,7 +23,8 @@ What is the same online and offline (user guide #infer-inputs), and where it liv
   zero; an export takes the bias from each episode's still ends -- recorded in every preview record).
 * TCP history: offline the tracked TCP; online the arm's FK at ARM_FK_FRAME. In preview the arm does not
   move, so the history is "not moving" whatever the FK (exact, not an approximation, while it stands
-  still); FK of the arm's joints is still read once for the execution plan check.
+  still); the arm's joints are still read for the execution plan check, again every JOINT_REFRESH_S
+  (:class:`JointWatcher`) so the check follows the arm when a person moves it to another start pose.
 
 The execution plan check (:meth:`PlanContext.check`) is the execution layer's first half, run on every preview
 prediction and never followed by motion: targets = FK(q_obs) · ΔT in the arm's base; IK reachability
@@ -545,6 +546,66 @@ def read_arm_joints(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
     raise RuntimeError(f"could not read the {arm} arm's joints: {(result.stderr or result.stdout).strip()[-300:]}")
 
 
+JOINT_REFRESH_S = 1.0  # the pause between two reads of the arm's joints during a preview
+JOINT_STALE_S = 5.0  # a plan check needs joints read this recently: the person may be moving the arm
+
+
+class JointWatcher:
+    """The arm's joints, read again and again while a preview runs (each read connects, reads, disconnects:
+    no motion), so the plan check follows the arm when a person moves it to another start pose. 11-19: the
+    joints were read once at the start, and "would pass" kept judging the pose the arm had left."""
+
+    def __init__(self, read, first: np.ndarray, *, refresh_s: float = JOINT_REFRESH_S, clock=time.monotonic):
+        import threading
+
+        self._read = read
+        self._clock = clock
+        self._refresh_s = refresh_s
+        self._lock = threading.Lock()
+        self._q = np.asarray(first, dtype=np.float64)
+        self._at = clock()
+        self._error = ""
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="joint-watcher", daemon=True)
+
+    def start(self) -> JointWatcher:
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+        self._thread.join(timeout=2.0)  # a read under way finishes on its own (30 s timeout); the thread is a daemon
+
+    def poll(self) -> None:
+        """One read; the loop calls it, a test may too."""
+        try:
+            q = np.asarray(self._read(), dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001 -- kept for the page; the last joints age out
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"[-300:]
+            return
+        with self._lock:
+            self._q, self._at, self._error = q, self._clock(), ""
+
+    def _loop(self) -> None:
+        while not self._done.wait(self._refresh_s):
+            self.poll()
+
+    def latest(self) -> tuple[np.ndarray, float, str]:
+        """The last joints read, their age in seconds and the last read's error ("" when it succeeded)."""
+        with self._lock:
+            return self._q.copy(), self._clock() - self._at, self._error
+
+
+def joints_for_check(watcher: JointWatcher | None, q_fixed: np.ndarray | None) -> tuple[np.ndarray | None, dict | None]:
+    """The joints the plan check may use now and what the page shows about them: None when they are too old."""
+    if watcher is None:
+        return q_fixed, None if q_fixed is None else {"source": "given", "age_s": None, "error": ""}
+    q, age, error = watcher.latest()
+    info = {"source": "read", "age_s": round(age, 1), "error": error, "q": q.round(5).tolist()}
+    return (q if age <= JOINT_STALE_S else None), info
+
+
 _STOP = False
 
 
@@ -564,8 +625,10 @@ def preview(
     q_arm: np.ndarray | None = None,
     device: str | None = None,
     frame_bus: Path = PREVIEW_FRAME_BUS,
+    joints: JointWatcher | None = None,
 ) -> dict[str, Any]:
-    """Predict on live inputs with the arm still; record each step's inputs and outputs under ``record_dir``."""
+    """Predict on live inputs with the arm still; record each step's inputs and outputs under ``record_dir``.
+    With ``joints`` the plan check uses the joints read last (not older than JOINT_STALE_S), else ``q_arm``."""
     import cv2
 
     from tools.fr3 import fr3_arms, relative_tcp_policy as rtp
@@ -595,6 +658,7 @@ def preview(
         "arm": arm,
         "box_id": box_id,
         "q_arm": None if q_arm is None else q_arm.tolist(),
+        "q_arm_refresh": None if joints is None else f"read again every {JOINT_REFRESH_S:g} s, used up to {JOINT_STALE_S:g} s old",
         "tcp_history": "arm still: every history pose equals the current one (exact while it does not move)",
         "wrench_bias": "live: this Connect's last BOX zero (an export takes each episode's still ends)" if c.wrench_names else None,
         "frame_source": str(frame_bus),
@@ -621,7 +685,8 @@ def preview(
         t_pred = time.monotonic()
         actions = loaded.predict(sample)
         latency_ms = (time.monotonic() - t_pred) * 1e3
-        checked = plan.check(q_arm, actions, width, n_exec) if (plan is not None and q_arm is not None) else None
+        q_now, joint_info = joints_for_check(joints, q_arm)
+        checked = plan.check(q_now, actions, width, n_exec) if (plan is not None and q_now is not None) else None
         np.savez_compressed(
             record_dir / "steps" / f"{step:06d}.npz",
             width=np.float64(width),
@@ -643,6 +708,7 @@ def preview(
             "targets_tcp_mm": (rel[:, :3, 3] * 1e3).round(1).tolist(),
             "widths": actions[:, rt.POSE_DIM].round(4).tolist(),
             "plan": checked,
+            "joints": joint_info,
         }
         (record_dir / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
         with (record_dir / "steps.jsonl").open("a", encoding="utf-8") as handle:
@@ -844,7 +910,7 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
     pre.add_argument("--steps", type=int, default=0)
     pre.add_argument("--q", default="", help="the arm's joints (JSON list, rad) for the plan check")
-    pre.add_argument("--read-joints", action="store_true", help="read the arm's joints once at the start (no motion)")
+    pre.add_argument("--read-joints", action="store_true", help="read the arm's joints at the start and again every JOINT_REFRESH_S (no motion)")
     rep = sub.add_parser("replay")
     rep.add_argument("--record", type=Path, required=True)
     exe = sub.add_parser("execute", help="moves the arm: started from the Rollout page, a hand on the e-stop")
@@ -866,11 +932,17 @@ def main(argv: list[str] | None = None) -> int:
                      pos_mm=result["error"]["pos_mm"].get("mean"))
         elif args.cmd == "preview":
             q = np.asarray(json.loads(args.q), dtype=np.float64) if args.q else None
+            watcher = None
             if q is None and args.read_joints:
-                q = read_arm_joints(args.arm)
+                q = read_arm_joints(args.arm)  # the first read fails the preview loudly; later ones are shown
                 progress(event="joints", q=q.round(5).tolist())
-            meta = preview(args.checkpoint, args.record, arm=args.arm, gateway=args.gateway, rate_hz=args.rate,
-                           max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus)
+                watcher = JointWatcher(lambda: read_arm_joints(args.arm), q).start()
+            try:
+                meta = preview(args.checkpoint, args.record, arm=args.arm, gateway=args.gateway, rate_hz=args.rate,
+                               max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus, joints=watcher)
+            finally:
+                if watcher is not None:
+                    watcher.stop()
             progress(event="done", steps=meta["steps"])
         elif args.cmd == "execute":
             if not args.attended:

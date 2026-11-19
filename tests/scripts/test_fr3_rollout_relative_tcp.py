@@ -89,6 +89,52 @@ def _manager(tmp_path: Path, **kw) -> rr.RolloutManager:
     return rr.RolloutManager(repo, exports_root=tmp_path / "exports", python=sys.executable, **kw)
 
 
+def test_the_preview_plan_check_follows_the_arm_when_a_person_moves_it():
+    now = [100.0]
+    reads = iter([np.full(7, 0.2), RuntimeError("connection refused")])
+
+    def read():
+        r = next(reads)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    watcher = ro.JointWatcher(read, np.zeros(7), clock=lambda: now[0])  # never started: polled by hand
+    q, info = ro.joints_for_check(watcher, None)
+    assert np.allclose(q, 0.0) and info["age_s"] == 0.0 and info["source"] == "read"
+    now[0] += 1.0
+    watcher.poll()  # the arm was moved: the next check judges the new pose
+    q, info = ro.joints_for_check(watcher, None)
+    assert np.allclose(q, 0.2) and info["age_s"] == 0.0 and info["error"] == ""
+    now[0] += 1.0
+    watcher.poll()  # a failed read keeps the last joints while they are recent, and says why
+    q, info = ro.joints_for_check(watcher, None)
+    assert np.allclose(q, 0.2) and "connection refused" in info["error"]
+    now[0] += ro.JOINT_STALE_S
+    q, info = ro.joints_for_check(watcher, None)  # too old to vouch for the pose the arm stands in
+    assert q is None and info["age_s"] > ro.JOINT_STALE_S
+    q, info = ro.joints_for_check(None, np.ones(7))  # joints given on the command line stay as given
+    assert np.allclose(q, 1.0) and info["source"] == "given"
+    assert ro.joints_for_check(None, None) == (None, None)
+
+
+def test_the_joint_watcher_reads_until_stopped():
+    seen = threading.Event()
+    calls = []
+
+    def read():
+        calls.append(1)
+        seen.set()
+        return np.full(7, len(calls), dtype=float)
+
+    watcher = ro.JointWatcher(read, np.zeros(7), refresh_s=0.01).start()
+    assert seen.wait(2.0)
+    watcher.stop()
+    n = len(calls)
+    assert n >= 1 and not watcher._thread.is_alive()
+    assert watcher.latest()[0][0] == n
+
+
 def test_preview_is_refused_without_the_recorder_in_a_sandbox_or_off_thor(tmp_path):
     manager = _manager(tmp_path)
     ckpt = manager.checkpoints()[0]

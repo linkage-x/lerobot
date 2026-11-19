@@ -147,6 +147,7 @@ function PreviewLive({ record, running }: { record: string; running: boolean }) 
   }, [record, running]);
   const targets = latest.targets_tcp_mm ?? [];
   const plan = latest.plan;
+  const joints = latest.joints;
   return (
     <div className="rollout-live">
       {latest.step != null ? (
@@ -185,10 +186,17 @@ function PreviewLive({ record, running }: { record: string; running: boolean }) 
               Execution plan check: {plan.ok ? "would pass" : "would stop"} — IK {plan.ik_ok.filter(Boolean).length}/
               {plan.ik_ok.length}, environment gap {plan.min_env_gap_mm ?? "—"} mm
               {plan.reasons.length ? `; ${plan.reasons.join("; ")}` : ""}
+              {joints?.source === "read" ? ` (joints read ${joints.age_s} s before this prediction)` : ""}
+            </p>
+          ) : joints?.source === "read" ? (
+            <p className="command-error">
+              No plan check: the arm's joints were last read {joints.age_s} s ago
+              {joints.error ? ` (${joints.error})` : ""}; a check needs joints at most 5 s old.
             </p>
           ) : (
             <p className="panel-note">No plan check: the arm's joints were not read for this preview.</p>
           )}
+          {plan && joints?.error ? <p className="panel-note">Last joint read failed: {joints.error}</p> : null}
         </>
       ) : null}
     </div>
@@ -399,8 +407,9 @@ export function RolloutPage() {
           The policy reads the recorder's live frames (it never opens a camera) and the arm gripper BOX's width
           {ckpt?.wrench ? " and external wrench" : ""}, with the arm standing still; nothing is sent to the arm. Every
           step's inputs and outputs are recorded, and Replay check feeds them back through the offline path: the
-          predictions must be identical. Reading the joints connects to the arm once to read its position (no
-          motion) so each prediction can go through the execution plan check.
+          predictions must be identical. Reading the joints connects to the arm about once a second to read its
+          position (connect, read, disconnect: no motion) so each prediction goes through the execution plan check
+          at the pose the arm stands in now, also after you move it to another start pose.
         </p>
         <div className="control-row">
           <select value={arm} onChange={(e) => setArm(e.target.value)}>
@@ -414,7 +423,7 @@ export function RolloutPage() {
           </label>
           <label className="train-inline">
             <input type="checkbox" checked={readJoints} onChange={(e) => setReadJoints(e.target.checked)} />
-            read the arm's joints once (for the plan check)
+            read the arm's joints (for the plan check)
           </label>
           {running?.kind === "preview" ? (
             <button className="danger" onClick={() => act(() => rolloutApi.stop(running.id))}>

@@ -120,6 +120,7 @@ export type PreviewLatest = {
     ik_ok: boolean[];
     inside_workspace: boolean[] | null;
   } | null;
+  joints?: { source: "given" | "read"; age_s: number | null; error: string; q?: number[] } | null;
 };
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
