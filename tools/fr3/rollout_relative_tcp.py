@@ -73,9 +73,16 @@ STAGES = (
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
 START_TRIES = 24  # a move to a training start: random training starts tried until one has a clear path
+START_SINGULAR_GIVE_UP = 6  # ... but this many in a row whose only ways cross a singularity: the arm stands where none leads out
 START_J2_MARGIN_RAD = 0.25  # a start posture with |j2| under this is flagged: near the shoulder singularity
 START_MARGIN_TIE_RAD = 0.05  # postures whose margins differ less than this: the one with the least travel
 START_FOLLOW_JUMP_RAD = 0.3  # a joint jump this large between two points of the opening: the posture cannot follow it
+#: the smallest singular value of the flange Jacobian (kin.NOMINAL, m and rad) a start, the path to it and, when
+#: any posture allows, the opening keep. 11-19: near a singularity the FR3 stops estimating the external wrench
+#: (O_F_ext_hat_K exactly 0, robot mode kIdle, the status light yellow) and the run's force stop would be blind;
+#: over 3615 ticks of that day's runs and moves the estimate was gone at sigma_min 0.045-0.088 and there at
+#: 0.081-0.30 (a threshold of 0.083 sorts 99.1 %); moves to a start died mid-path four times. 0.11: ~25 % above.
+START_SIGMA_MIN = 0.11
 START_PATH_STEP_RAD = 0.02  # the path's clearance is checked every this much of its largest joint
 WORKSPACE_MARGIN_M = 0.03
 
@@ -421,6 +428,20 @@ class PlanContext:
         """FK to ARM_FK_FRAME in the arm's base."""
         return self.kin.NOMINAL.fk(np.asarray(q, dtype=np.float64)[None])[0] @ self.T_tool
 
+    def blend_problem(self, qs: np.ndarray) -> str:
+        """"" or why a takeover's blend (postures ``qs``) may not run: it comes nearer the carts, the table or
+        the cameras than ENV_MARGIN_M (the steps of both chunks were checked; the blend between them was not)."""
+        A, B = self.model.place(self.kin.NOMINAL, np.asarray(qs, dtype=np.float64))
+        env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
+        if not env.size:
+            return ""
+        gap = env.reshape(len(qs), -1).min(axis=1)
+        k = int(np.argmin(gap))
+        if gap[k] >= ENV_MARGIN_M:
+            return ""
+        return (f"the takeover's blend comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras "
+                f"{k / max(len(qs) - 1, 1):.0%} of the way (needs {ENV_MARGIN_M * 1e3:.0f})")
+
     def plan_to_start(self, q_now: np.ndarray, *, rng: np.random.Generator, tries: int = START_TRIES) -> dict[str, Any]:
         """A move from ``q_now`` to a real training start: one of the poses of the episodes' first second
         (rollout_distribution), drawn at random until one has a clear path (at most ``tries``).
@@ -455,18 +476,44 @@ class PlanContext:
         def room(q: np.ndarray) -> float:
             return float(min(abs(q[1]), np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q).min()))
 
-        def room_along(q0: np.ndarray, flanges: np.ndarray) -> float:
-            q, worst = q0, room(q0)
+        def way(q_goal: np.ndarray) -> tuple[str, float, float]:
+            """("" or why not, the smallest sigma_min, the smallest clearance) along the straight joint path."""
+            n = max(2, int(math.ceil(float(np.abs(q_goal - q_now).max()) / START_PATH_STEP_RAD)) + 1)
+            path = q_now + np.linspace(0.0, 1.0, n)[:, None] * (q_goal - q_now)
+            sig = sigma_min(path)
+            ks = int(np.argmin(sig))
+            if sig[ks] < min(START_SIGMA_MIN, float(sig[0])) - 1e-3:
+                return (f"the path passes near a singularity {ks / (n - 1):.0%} of the way (sigma_min {sig[ks]:.3f} < "
+                        f"{START_SIGMA_MIN}: the force estimate would drop)"), float(sig[ks]), math.nan
+            A, B = self.model.place(kin.NOMINAL, path)
+            env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
+            gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
+            need = min(ENV_MARGIN_M, float(gap[0]) - 0.005)
+            k = int(np.argmin(gap))
+            if gap[k] < need:
+                return (f"the path comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras {k / (n - 1):.0%} of "
+                        f"the way (needs {need * 1e3:.0f})"), float(sig[ks]), float(gap[k])
+            return "", float(sig[ks]), float(gap[k])
+
+        def room_along(q0: np.ndarray, flanges: np.ndarray) -> tuple[float, float]:
+            """(the smallest room, the smallest sigma_min) along the opening; room -inf when it is lost."""
+            q, worst, sig = q0, room(q0), sigma_min(q0[None])[0]
             for F in flanges:
                 q_next, ok = kin.ik(kin.NOMINAL, F[None], q, rest=q, early_exit=True)
                 if not ok[0] or np.abs(q_next[0] - q).max() > START_FOLLOW_JUMP_RAD:
-                    return -math.inf
+                    return -math.inf, sig
                 q = q_next[0]
-                worst = min(worst, room(q))
-            return worst
-        last, tried = "", 0
+                worst, sig = min(worst, room(q)), min(sig, sigma_min(q[None])[0])
+            return worst, sig
+        last, tried, singular_ways = "", 0, 0
         for idx in rng.permutation(len(dist.start_p))[: max(1, tries)]:
             tried += 1
+            if singular_ways >= START_SINGULAR_GIVE_UP:
+                tried -= 1
+                return {"ok": False, "tried": tried,
+                        "why": (f"from here every way to the {tried} training starts tried crosses a singularity (the "
+                                "force estimate would drop on the way): guide the arm by hand toward its usual posture "
+                                f"(j2 negative, away from 0), then move again (the last: {last})")}
             T_world = rt.pose7_to_matrix(np.concatenate([dist.start_p[idx], dist.start_q[idx]]))
             flange = (self.T_base_world @ T_world @ np.linalg.inv(self.T_tool))[None]
             found = []
@@ -481,45 +528,66 @@ class PlanContext:
             for q in found:
                 if all(np.abs(q - d).max() > 0.05 for d in distinct):
                     distinct.append(q)
+            singular = [q for q in distinct if sigma_min(q[None])[0] < START_SIGMA_MIN]
+            distinct = [q for q in distinct if sigma_min(q[None])[0] >= START_SIGMA_MIN]
+            if not distinct:
+                last = (f"training start {idx}: every posture there is near a singularity (sigma_min "
+                        f"{max(sigma_min(np.array(singular))):.3f} < {START_SIGMA_MIN}: no force estimate)")
+                continue
+            # each posture's way there first (cheap): never nearer a singularity than the arm stands now (it may
+            # stand near one: the way out is allowed), the capsule clearance all along; only those are followed
+            ways = [way(q) for q in distinct]
+            if all(w[0] for w in ways):
+                last = f"training start {idx}: {ways[0][0]}"
+                singular_ways = singular_ways + 1 if all("singularity" in w[0] for w in ways) else 0
+                continue
+            singular_ways = 0
             opening = dist.opening_of(int(idx))
+            follow = None
             if len(opening):
                 near = int(np.argmin(np.linalg.norm(opening[:, :3] - dist.start_p[idx], axis=1)))
                 follow = self.T_base_world @ rt.pose7_to_matrix(opening[near:]) @ np.linalg.inv(self.T_tool)
-                rooms = [room_along(q, follow) for q in distinct]
-            else:  # a distribution cached before the openings were kept: the room at the start
-                rooms = [room(q) for q in distinct]
-            best = max(rooms)
-            if not math.isfinite(best):
-                last = f"training start {idx}: no posture there can follow the episode's opening"
+            along = [(-math.inf, 0.0) if w[0] else  # not reachable from here: not followed
+                     room_along(q, follow) if follow is not None else (room(q), float(sigma_min(q[None])[0]))
+                     for q, w in zip(distinct, ways, strict=True)]
+            rooms = [r for r, _ in along]
+            keeps = [sig >= START_SIGMA_MIN for _, sig in along]
+            usable = [i for i in range(len(distinct)) if math.isfinite(rooms[i])]
+            if not usable:
+                last = f"training start {idx}: no posture reachable from here can follow the episode's opening"
                 continue
-            q_goal = min((q for q, r in zip(distinct, rooms, strict=True) if r >= best - START_MARGIN_TIE_RAD),
-                         key=lambda q: float(np.abs(q - q_now).max()))
+            # the force estimate kept along the opening first (when any posture does), then the room
+            pool = [i for i in usable if keeps[i] or not any(keeps[j] for j in usable)]
+            best = max(rooms[i] for i in pool)
+            pick = min((i for i in pool if rooms[i] >= best - START_MARGIN_TIE_RAD),
+                       key=lambda i: float(np.abs(distinct[i] - q_now).max()))
+            q_goal, opening_sigma = distinct[pick], along[pick][1]
+            _, path_sigma_min, gap_min = ways[pick]
             problem = dist.start_problem(T_world_base @ self.tcp(q_goal), None)
             if problem:
                 last = f"training start {idx}: {problem}"
-                continue
-            n = max(2, int(math.ceil(float(np.abs(q_goal - q_now).max()) / START_PATH_STEP_RAD)) + 1)
-            path = q_now + np.linspace(0.0, 1.0, n)[:, None] * (q_goal - q_now)
-            A, B = self.model.place(kin.NOMINAL, path)
-            env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
-            gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
-            need = min(ENV_MARGIN_M, float(gap[0]) - 0.005)
-            k = int(np.argmin(gap))
-            if gap[k] < need:
-                last = (f"training start {idx}: the path comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras "
-                        f"{k / (n - 1):.0%} of the way (needs {need * 1e3:.0f})")
                 continue
             return {
                 "ok": True, "why": "", "tried": tried, "index": int(idx),
                 "T_world": T_world.round(6).tolist(), "q_goal": q_goal.round(6).tolist(),
                 "j2": round(float(q_goal[1]), 3), "near_shoulder_singularity": bool(abs(q_goal[1]) < START_J2_MARGIN_RAD),
                 "room_rad": round(best, 3), "room_at_start_rad": round(room(q_goal), 3), "postures": len(distinct),
+                "sigma_min_start": round(float(sigma_min(q_goal[None])[0]), 3),
+                "sigma_min_path": round(path_sigma_min, 3), "sigma_min_opening": round(float(opening_sigma), 3),
                 "followed_opening": bool(len(opening)),
                 "max_joint_move_deg": round(math.degrees(float(np.abs(q_goal - q_now).max())), 1),
-                "min_env_gap_mm": None if not math.isfinite(gap[k]) else round(float(gap[k]) * 1e3, 1),
+                "min_env_gap_mm": None if not math.isfinite(gap_min) else round(gap_min * 1e3, 1),
             }
         return {"ok": False, "tried": tried,
                 "why": f"none of the {tried} training starts tried has a clear path from here (the last: {last})"}
+
+
+def sigma_min(q: np.ndarray) -> np.ndarray:
+    """(n,) the smallest singular value of the flange Jacobian at each posture (kin.NOMINAL, m and rad)."""
+    from tools.fr3 import fr3_kinematics as kin
+
+    _, J = kin.NOMINAL.kinematics(np.asarray(q, dtype=np.float64))
+    return np.linalg.svd(J, compute_uv=False)[:, -1]
 
 
 def frame_age_limit_s(frame_bus: Path) -> float:
@@ -956,6 +1024,11 @@ def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None =
     finally:
         rx.normal_thread()
         recorder.close()
+    if not result.completed and "no external force estimate" in result.stopped:
+        here = float(sigma_min(q_now[None])[0])
+        if here < START_SIGMA_MIN:
+            result.stopped += (f" -- the arm stands near a singularity (sigma_min {here:.3f} < {START_SIGMA_MIN}; the "
+                               "status light is yellow): guide it a little away by hand, then move again")
     q_end = panda.read()[0]
     start = plan.distribution.start_problem(np.linalg.inv(plan.T_base_world) @ plan.tcp(q_end), None)
     meta["result"] = {"completed": result.completed, "stopped": result.stopped, "duration_s": round(result.duration_s, 3),
@@ -1132,6 +1205,7 @@ def execute(
                     wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
                     stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=width_now,
                     record=recorder, start_check=lambda q: plan.start_problem(q, width_now),
+                    blend_check=plan.blend_problem,
                 )
             finally:
                 resume_gc()

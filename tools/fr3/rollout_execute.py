@@ -607,6 +607,9 @@ BLEND_S = 0.15
 #: joint's speed limit (11-19 11:40: a 0.15 s blend over a ~14 mrad gap put j1 at 1.64 rad/s, cap 1.5)
 BLEND_SPEED_SHARE = 0.1
 BLEND_MAX_S = 1.0  # a switch_joint_rad gap within BLEND_SPEED_SHARE: 1.5 x 0.10 / (0.1 x 1.5 rad/s)
+#: the blend's command is neither chunk's (both were checked step by step): its clearance is checked at this many
+#: postures along it before a takeover is accepted (11-19: a 50 mm gap blended over up to 1 s, near the table)
+BLEND_CHECK_POINTS = 9
 
 
 def blend_duration(gap: np.ndarray, limits: Limits, dt: float) -> float:
@@ -1226,8 +1229,10 @@ def run_loop(
     loop_hz: float = LOOP_HZ,
     record: Callable[[dict[str, Any]], None] | None = None,
     start_check: Callable[[np.ndarray], str] | None = None,
+    blend_check: Callable[[np.ndarray], str] | None = None,
 ) -> RunResult:
-    """The control loop. Returns why it stopped ("" when the stage ran to its end)."""
+    """The control loop. Returns why it stopped ("" when the stage ran to its end). ``blend_check(qs)``: ""
+    or why a takeover's blend (BLEND_CHECK_POINTS postures along it) may not be run -- the clearance."""
     period = 1.0 / loop_hz
     q, dq, f0 = arm.read()
     if np.abs(dq).max() > limits.start_speed_rad_s:
@@ -1312,6 +1317,13 @@ def run_loop(
                 new = pred.chunk
                 refusal = accept(new, now, first=chunk is None, n_exec=n_exec, q_cmd=q_cmd, T_cmd=T_cmd,
                                  limits=limits, fk=fk_tcp, end_cap=n_exec if stage.chunks and chunk is None else None)
+                if not refusal and chunk is not None:  # from the running command onto the new chunk
+                    qn0, dqn0, _ = new.command(now)
+                    r1, v1 = q_cmd + dq_cmd * loop_dt - qn0, dq_cmd - dqn0  # what this tick would have commanded
+                    t_end = now + blend_duration(r1, limits, new.dt)
+                    if blend_check is not None:  # the blend's own path: neither chunk's checked steps
+                        refusal = blend_check(np.array([blend(new, t, now, t_end, r1, v1)[0]
+                                                        for t in np.linspace(now, t_end, BLEND_CHECK_POINTS)]))
                 log(event="chunk", index=new.index, accepted=not refusal, why=refusal, k0=new.k0, end=new.end,
                     latency_ms=round(pred.latency_s * 1e3, 1), age_ms=round(pred.age_s * 1e3, 1))
                 if record:
@@ -1319,11 +1331,8 @@ def run_loop(
                 if refusal:
                     why = refusal
                     break
-                if chunk is not None:  # from the running command onto the new chunk (blend, blend_duration)
-                    qn0, dqn0, _ = new.command(now)
-                    r0, v0 = q_cmd + dq_cmd * loop_dt - qn0, dq_cmd - dqn0  # what this tick would have commanded
-                    blending, blend_from = True, now
-                    blend_to = now + blend_duration(r0, limits, new.dt)
+                if chunk is not None:
+                    r0, v0, blending, blend_from, blend_to = r1, v1, True, now, t_end
                 chunk = new
                 accepted += 1
                 replan_at = max(1, n_exec - max(0, new.k0 - 1))

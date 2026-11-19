@@ -488,6 +488,34 @@ def test_the_consistency_gap_compares_two_predictions_at_the_same_instant():
     np.testing.assert_allclose(g["training"], [20.0, 20.0, 0.0], atol=1e-6) and len(g["held_out"]) == 0
 
 
+def test_a_takeover_whose_blend_would_come_too_near_the_table_is_refused():
+    """The blend runs neither chunk's checked steps: its own postures are checked before it is taken."""
+    seen = []
+
+    def near_table(qs):
+        seen.append(len(qs))
+        return "the takeover's blend comes 4 mm from the carts/table/cameras 30% of the way (needs 10)"
+
+    c = _contract()
+    clock = Clock()
+    arm = FakeArm(clock)
+    history = rx.PoseHistory()
+
+    def observe(min_t):
+        return rx.Observation(max(min_t, clock() - 0.15), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
+                              {"box_stale_s": 0.02})
+
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c), plan=_plan(),
+                        sample=lambda h, o: {"history": h}, limits=rx.Limits(), clock=clock)
+    pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
+    result = rx.run_loop(arm=arm, predictor=pred, stage=replace(rx.STAGES[2], max_s=2.0), n_exec=16, limits=rx.Limits(),
+                         fk_tcp=_fk, wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+                         stop_flag=lambda: "", log=lambda **kw: None, clock=clock, sleep=clock.sleep,
+                         blend_check=near_table)
+    assert result.chunks_accepted == 1 and "blend comes 4 mm" in result.stopped  # the first chunk has no blend
+    assert seen == [rx.BLEND_CHECK_POINTS]
+
+
 def test_assess_ends_a_chunk_at_its_first_step_too_fast():
     T = np.repeat(np.eye(4)[None], 5, axis=0)
     T[:, 0, 3] = [0, 0.005, 0.010, 0.040, 0.045]  # step 3 jumps 30 mm
@@ -957,6 +985,8 @@ def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0
 
 
 def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singularity():
+    from tools.fr3 import rollout_relative_tcp as ro
+
     q_start = np.array([1.1, -0.5, -1.0, -2.25, 0.1, 2.9, 0.7])  # j2 well away from 0
     T_start = _fk(q_start) @ np.eye(4)
     plan = _start_plan([T_start])
@@ -968,12 +998,20 @@ def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singul
 
     # 11-19 (170940): standing in the other shoulder branch (j2 ~ 0, j3 near its wall), the start is still
     # reached in the posture with room in every joint, not the branch the arm happens to be in
+    # (that posture also stands near a singularity, sigma_min 0.085: the yellow light, no force estimate)
     flipped = np.array([2.14, -0.02, -2.11, -2.09, -0.02, 2.4, 0.8])
-    out = plan.plan_to_start(flipped, rng=np.random.default_rng(0))
-    q_goal = np.array(out["q_goal"])
-    walls = np.minimum(q_goal - kin._WALL_LOWER, kin._WALL_UPPER - q_goal).min()
-    assert out["ok"] and out["room_rad"] >= 0.3 and walls >= 0.3 and abs(q_goal[1]) >= 0.3
-    assert not out["followed_opening"]  # no opening stored: the room at the start
+    elbow_up = q_start + np.array([0.3, 0.1, -0.2, 0.2, 0.0, 0.1, 0.0])  # elsewhere, clear of singularities
+    for q_here in (elbow_up, flipped):
+        out = plan.plan_to_start(q_here, rng=np.random.default_rng(0))
+        if not out["ok"]:  # the only way to the start's usual branch crosses j2 = 0 near a singularity
+            assert "near a singularity" in out["why"] and q_here is flipped
+            continue
+        q_goal = np.array(out["q_goal"])
+        walls = np.minimum(q_goal - kin._WALL_LOWER, kin._WALL_UPPER - q_goal).min()
+        assert out["sigma_min_start"] >= ro.START_SIGMA_MIN  # the start keeps the force estimate
+        assert out["sigma_min_path"] >= min(ro.START_SIGMA_MIN, ro.sigma_min(q_here[None])[0]) - 1e-3  # never nearer
+        if q_here is elbow_up:
+            assert out["room_rad"] >= 0.3 and walls >= 0.3 and abs(q_goal[1]) >= 0.3 and not out["followed_opening"]
 
     # with the episode's opening (12 cm down from the start), the room is the smallest along it
     down = []
@@ -995,6 +1033,28 @@ def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singul
     beyond[5] = -0.2  # past panda_py's wall on j6
     out = plan.plan_to_start(beyond, rng=np.random.default_rng(0))
     assert not out["ok"] and "walls now" in out["why"]
+
+
+def test_no_start_posture_near_a_singularity_where_the_robot_stops_estimating_force():
+    """11-19: at sigma_min 0.045-0.088 the FR3 reported no external wrench (yellow light); 0.081-0.30 it did."""
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    singular = np.array([0.23, -0.58, -0.43, -2.73, 0.71, 3.29, 0.07])  # tostart_174159's end: estimate gone
+    fine = np.array([0.84, -0.57, -1.12, -2.63, 0.01, 3.22, 0.45])  # tostart_173708's end: estimate there
+    assert ro.sigma_min(singular[None])[0] < 0.083 < ro.sigma_min(fine[None])[0]
+    q_now = np.array([1.0, -0.6, -0.9, -2.3, 0.1, 2.85, 0.65])
+    out = _start_plan([_fk(singular)]).plan_to_start(q_now, rng=np.random.default_rng(0))
+    if out["ok"]:  # another branch reaches the same pose clear of the singularity
+        assert out["sigma_min_start"] >= ro.START_SIGMA_MIN and out["sigma_min_path"] >= ro.START_SIGMA_MIN
+    else:
+        assert "near a singularity" in out["why"]
+
+
+def test_the_blend_check_measures_the_blends_own_postures():
+    qs = np.repeat(Q0[None], 9, axis=0)
+    assert _start_plan([_fk(Q0)]).blend_problem(qs) == ""
+    near = _start_plan([_fk(Q0)], gap=lambda path: np.linspace(0.05, 0.004, len(path)))
+    assert "blend comes 4 mm from the carts/table/cameras 100% of the way" in near.blend_problem(qs)
 
 
 def _shift(dx: float) -> np.ndarray:
