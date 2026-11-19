@@ -175,6 +175,12 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
         arm["net_mm"] = round(float(np.linalg.norm(P[-1] - P[0]) * 1e3), 1)
         f = ticks["f_ext"][:, :3]
         arm["force_n"] = stats(np.linalg.norm(f - f[0], axis=1))
+        # what the stop holds against force_n (11-19 on): the force averaged over the loop's window
+        from tools.fr3.rollout_execute import FORCE_WINDOW_S, LOOP_HZ
+
+        w = max(1, round(FORCE_WINDOW_S * LOOP_HZ))
+        avg = np.stack([np.convolve(f[:, i] - f[0, i], np.ones(w) / w, mode="valid") for i in range(3)], axis=1) if len(f) >= w else f - f[0]
+        arm["force_avg_n"] = stats(np.linalg.norm(avg, axis=1))
         speed = np.abs(ticks["dq"]).max(axis=1)
         arm["joint_speed_rad_s"] = stats(speed)
         from tools.fr3 import fr3_kinematics as kin
@@ -211,7 +217,11 @@ def _headroom(report: dict[str, Any], limits: dict[str, Any], n_exec: int) -> li
     add("late steps", tim["late_steps"], float(n_exec) if n_exec else None, "steps")
     add("loop period", tim.get("loop_ms"), _ms(limits.get("loop_stall_s"), s), "ms")
     add("tracking", arm.get("tracking_mm"), limits.get("tracking_mm"), "mm")
-    add("external force", arm.get("force_n"), limits.get("force_n"), "N")
+    if limits.get("force_peak_n") is not None:  # 11-19 on: averaged against force_n, one tick against the peak
+        add("external force (50 ms)", arm.get("force_avg_n"), limits.get("force_n"), "N")
+        add("external force (tick)", arm.get("force_n"), limits.get("force_peak_n"), "N")
+    else:
+        add("external force", arm.get("force_n"), limits.get("force_n"), "N")
     add("joint speed", arm.get("joint_speed_rad_s"), limits.get("joint_speed_rad_s"), "rad/s")
     add("wall margin", arm.get("wall_margin_deg"), limits.get("wall_deg"), "deg", worst="min", inverse=True)
     return rows
@@ -275,6 +285,7 @@ def format_text(report: dict[str, Any]) -> str:
             f"  TCP vs target      {_fmt_stats(arm['target_mm'], 'mm')}  (at each executed step's due time)",
             f"  moved              {arm['path_mm']:g} mm along the path, {arm['net_mm']:g} mm net",
             f"  external force     {_fmt_stats(arm['force_n'], 'N')}  (against the first tick)",
+            f"    averaged 50 ms   {_fmt_stats(arm.get('force_avg_n'), 'N')}",
             f"  fastest joint      {_fmt_stats(arm['joint_speed_rad_s'], 'rad/s')}",
             f"  wall margin        min {arm['wall_margin_deg']['min']:g} deg (j{arm['wall_joint']})",
         ]

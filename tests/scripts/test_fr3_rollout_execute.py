@@ -189,6 +189,48 @@ def test_contact_stops_and_holds_where_the_arm_is():
     np.testing.assert_allclose(arm.commands[-1], arm.q, atol=1e-3)
 
 
+def test_a_force_swing_in_motion_does_not_stop_but_a_lasting_force_or_an_impact_does():
+    # 11-19: O_F_ext swings +-10 N for a few ticks with the TCP's acceleration, nothing touched
+    swing = lambda t: np.array([18.0 if 1000.60 < t < 1000.611 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
+    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=swing)
+    assert result.completed, result.stopped
+    impact = lambda t: np.array([30.0 if 1000.60 < t < 1000.606 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
+    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=impact)
+    assert "in one tick (limit 25)" in result.stopped
+    lasting = lambda t: np.array([16.0 if t > 1000.6 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
+    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=lasting)
+    assert "over 50 ms (limit 15)" in result.stopped
+
+
+def test_a_chunk_brakes_to_its_last_step_over_several_steps():
+    q = np.zeros((33, 7))
+    q[:, 0] = np.cumsum(np.r_[0.0, np.full(32, 0.045)])  # 1.35 rad/s to the end (end = 20)
+    T = np.repeat(np.eye(4)[None], 33, axis=0)
+    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(33, bool), [""] * 33, np.zeros(32))
+    ch.prepare(rx.Limits(), 20)
+    ts = np.arange(0.0, ch.offsets[20], 0.0005)
+    dq = np.array([ch.command(t)[1] for t in ts])
+    assert np.abs(ch.command(ch.offsets[20])[1]).max() == 0.0
+    # planned at BRAKE_SHARE of it; the cubic between steps adds up to about 2x of that
+    assert (np.abs(np.diff(dq[:, 0])) / 0.0005).max() < 1.5 * rx.STOP_ACCELERATION[0]
+    assert (ch.stretch()[:20] > 1.01).sum() >= 3  # spread over several steps, not all in the last
+
+
+def test_a_first_chunk_starts_from_rest_within_the_stop_acceleration():
+    q = np.zeros((6, 7))
+    q[1:, 0] = 0.012 + 0.002 * np.arange(5)  # step 1: 12 mrad at once (the policy's 1-2 mm offset), then slow
+    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=True, end=5)
+    T = np.repeat(np.eye(4)[None], 6, axis=0)
+    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(6, bool), [""] * 6, np.zeros(5), still_start=True)
+    ch.prepare(rx.Limits(), 5)
+    np.testing.assert_allclose(ch.offsets, off)
+    assert off[1] > 1 / 30  # the first step takes longer than 33 ms
+    ts = np.arange(0.0, off[1], 0.0005)
+    dq = np.array([ch.command(t)[1] for t in ts])
+    # planned at BRAKE_SHARE of it; an uneven step (12 mrad, then 2) lets the cubic add about half again
+    assert (np.abs(np.diff(dq, axis=0)) / 0.0005 / rx.STOP_ACCELERATION).max() < 1.6
+
+
 def test_inputs_too_old_stop_before_anything_moves():
     result, arm, _ = _run(rx.STAGES[2], age_s=0.6, stale_frames=True)
     assert "ms old" in result.stopped
@@ -221,14 +263,14 @@ def _speeds(commands: list[np.ndarray], ticks: int) -> np.ndarray:
 def test_a_step_too_fast_for_a_joint_is_slowed_down_not_refused():
     # 24 mm per step along the TCP's y: more joint motion per step than allowed at Q0
     lim = rx.Limits(step_mm=36.0)
-    stage = replace(rx.STAGES[2], max_s=0.8)
+    stage = replace(rx.STAGES[2], max_s=1.3)  # from rest it ramps up first
     result, arm, seen = _run(stage, limits=lim, step=(0.0, 0.024, 0.0), age_s=0.05)
     assert result.completed, result.stopped
     assert result.chunks_accepted >= 2  # through a switch (blended) as well
     v = _speeds(arm.commands, result.ticks)
     vmax = rx.joint_speed_limit(lim, 1 / 30)
     assert (np.abs(v) / vmax).max() < 1.02  # never commanded faster than the limit
-    assert (np.abs(v) / vmax).max() > 0.9  # ... and it did run at it: slowed only as much as needed
+    assert (np.abs(v) / vmax).max() > 0.75  # ... and it ran close to it (ramps up from rest, brakes ahead)
     # what 11-19's stage 2 met: refusing such a step (no slowing allowed) stops the run
     result, _, _ = _run(stage, limits=replace(lim, step_stretch_max=1.0), step=(0.0, 0.024, 0.0), age_s=0.05)
     assert not result.completed and "in one step" in result.stopped
@@ -254,8 +296,9 @@ def test_retime_keeps_the_policys_timing_unless_a_joint_needs_longer():
     q = np.zeros((6, 7))
     q[:, 0] = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]  # 0.3 rad/s: well under 1.5
     off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
-    # the policy's timing, except the last step (the arm comes to rest there within STOP_ACCELERATION)
-    np.testing.assert_allclose(off[:5], np.arange(5) / 30, atol=1e-9)
+    # the policy's timing, except where it brakes to rest on the last step (within STOP_ACCELERATION)
+    np.testing.assert_allclose(off[:4], np.arange(4) / 30, atol=1e-9)
+    assert off[5] > 5 / 30
     q[3:, 0] += 0.06  # step 3 asks 0.07 rad in 33 ms
     off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
     assert np.diff(off)[2] > 1.4 / 30 and np.diff(off)[0] == pytest.approx(1 / 30)

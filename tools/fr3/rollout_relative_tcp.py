@@ -367,7 +367,7 @@ class PlanContext:
 
         q_obs = np.asarray(q_obs, dtype=np.float64)
         T_obs = self.kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
-        ev = self.evaluate(T_obs, actions, q_obs, early_exit=True)
+        ev = self.evaluate(T_obs, rx.smooth_steps(actions), q_obs, early_exit=True)  # as execution plans it
         ok, inside, gap = ev["ik_ok"], ev["inside_workspace"], ev["env_gap_m"]
         dist = self.distribution
         limits = rx.Limits(**rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0]))) if dist else rx.Limits()

@@ -127,8 +127,13 @@ class Limits:
     switch_joint_rad: float = 0.05
     # the TCP (FK of the measured joints) against FK of the command
     tracking_mm: float = 20.0
-    # |O_F_ext - its reading at the start|, force part
+    # |O_F_ext - its reading at the start|, force part, averaged over FORCE_WINDOW_S ...
+    # 11-19: O_F_ext is FR3's model estimate; in motion it swings +-5-10 N within 20-40 ms with the TCP's
+    # acceleration (60-75% of x/z explained by a, v) and stopped five runs at 12-15.5 N raw with nothing
+    # touched; averaged over 50 ms the same runs peaked at 4.3-8.8 N. A contact lasts: the average sees it
     force_n: float = 15.0
+    # ... and raw, any single tick: an impact is not waited for
+    force_peak_n: float = 25.0
     # a measured joint speed no plan here asks for (oscillation, runaway); j5-j7 x JOINT_SCALE
     joint_speed_rad_s: float = 1.6
     # a measured joint within this of panda_py's wall (IK keeps 3 deg; Monitor of fr3_pivot_auto keeps 1)
@@ -149,6 +154,7 @@ JOINT_SCALE = FR3_VELOCITY_LIMITS / FR3_VELOCITY_LIMITS.min()  # the joint limit
 STEP_MM_CEILING = 40.0  # 1.2 m/s, whatever the data says: well under the FR3's Cartesian limit (1.7 m/s)
 STEP_DEG_CEILING = 8.0  # 240 deg/s
 LOOP_HZ = 200.0
+FORCE_WINDOW_S = 0.05  # Limits.force_n is held against O_F_ext averaged over this long
 HOLD_S = 0.5  # the controller holds the last command this long after a stop, then lets go
 GRIPPER_CLOSE_BELOW_M = 0.050  # replay's grasp: below this the jaw is sent to 0 (squeeze, as in the demos)
 GRIPPER_OPEN_ABOVE_M = 0.060  # hysteresis: back open only above this
@@ -262,6 +268,27 @@ class PoseHistory:
 # --------------------------------------------------------------------- chunks ---
 
 
+def smooth_steps(actions: np.ndarray) -> np.ndarray:
+    """The predicted poses (relative to the anchor) through [1, 2, 1] / 4 over the steps; the width unchanged.
+
+    11-19: ACT's chunks zigzag -- from about step 12 every other step is 20-27% longer (the step-to-step
+    change of velocity flips sign 9 times in 10), a 15 Hz ripple the demonstrations do not have (at the
+    training's stride the flips are random, 0.51). Commanded, it shakes the arm at 15 Hz and FR3's O_F_ext
+    swings +-10 N with it. The filter removes exactly that period (zero gain at 2 steps), passes the slow
+    motion with no lag (symmetric), and moves a step by a fraction of the ripple (~1 mm at 0.3 m/s). The
+    anchor (identity) is the step before step 1; the step after the last is extrapolated linearly, so the
+    end is not pulled back. Everything after it (IK, every check) sees the filtered steps."""
+    a = np.array(actions, dtype=np.float64)
+    if len(a) < 2:
+        return a
+    pose = a[:, : rt.POSE_DIM]
+    anchor = rt.encode(np.eye(4)[None])[0]
+    before = np.vstack([anchor, pose[:-1]])
+    after = np.vstack([pose[1:], 2.0 * pose[-1] - pose[-2]])
+    a[:, : rt.POSE_DIM] = (before + 2.0 * pose + after) / 4.0
+    return a
+
+
 def joint_speed_limit(limits: Limits, dt: float) -> np.ndarray:
     """(7,) rad/s: what a command may ask of each joint (``step_joint_rad`` per step, JOINT_SCALE)."""
     return limits.step_joint_rad * JOINT_SCALE / dt
@@ -306,15 +333,8 @@ def _segment_peak_speeds(q: np.ndarray, h: np.ndarray, m: np.ndarray) -> np.ndar
 
 #: FR3 joint acceleration limits (rad/s^2, Franka's datasheet), half of which the stop on the last step may use
 FR3_ACCELERATION_LIMITS = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0])
-STOP_ACCELERATION = 0.5 * FR3_ACCELERATION_LIMITS
-
-
-def _segment_end_accelerations(q: np.ndarray, h: np.ndarray, m: np.ndarray, k: int) -> np.ndarray:
-    """(7,) the largest |acceleration| of each joint in segment k (linear in u: at one of its ends)."""
-    p0, p1, m0, m1 = q[k], q[k + 1], m[k] * h[k], m[k + 1] * h[k]
-    a0 = -6 * p0 - 4 * m0 + 6 * p1 - 2 * m1
-    a1 = 6 * p0 + 2 * m0 - 6 * p1 + 4 * m1
-    return np.maximum(np.abs(a0), np.abs(a1)) / h[k] ** 2
+STOP_ACCELERATION = 0.5 * FR3_ACCELERATION_LIMITS  # also the start of a first chunk, from rest
+BRAKE_SHARE = 0.4  # the speed profile plans with this share of it: the cubic between steps adds up to ~2x
 
 
 def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: int) -> np.ndarray:
@@ -322,24 +342,46 @@ def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: 
     ``joint_speed_limit`` -- that segment takes longer. The path (every validated step) is unchanged; only
     when the arm gets there. 11-19: refusing such a chunk stopped stage 2 where the policy asked 0.5 m/s, and
     a linear command's speed jumps at every step rang the joint impedance into a false 15 N contact.
-    The last step (``end``, where the arm comes to rest) also takes long enough to stop within
-    STOP_ACCELERATION."""
+
+    The arm also brakes to rest on ``end`` and, from rest, starts within BRAKE_SHARE x STOP_ACCELERATION:
+    a speed profile along the steps (w_k, steps/s at each step; a forward pass from a still start, a backward
+    pass from the end), so braking spreads over as many steps as it needs. 11-19: a policy's step 1 is 1-2 mm
+    off the anchor even standing still, done in 33 ms from rest it shook the arm (O_F_ext 4-12 N at the start
+    of every run); braking only in the last step put 30-60 rad/s^2 into the one before it. The policy's own
+    accelerations in between are kept."""
     n = len(q)
     if n < 2:
         return np.zeros(n)
     vmax = joint_speed_limit(limits, dt)
-    h = dt * np.maximum(1.0, (np.abs(np.diff(q, axis=0)) / (vmax * dt)).max(axis=1))
-    for _ in range(12):  # a stretched segment lowers its neighbours' knot speeds: converges in a few passes
-        m = hermite_tangents(q, h, still_start=still_start, end=end)
-        over = (_segment_peak_speeds(q, h, m) / vmax).max(axis=1)
-        stop = 1.0
-        if 0 < end < n:
-            stop = float((_segment_end_accelerations(q, h, m, end - 1) / STOP_ACCELERATION).max())
-        if over.max() <= 1.0 + 1e-6 and stop <= 1.0 + 1e-6:
+    dq = np.abs(np.diff(q, axis=0))  # (n-1, 7) per segment
+    seg_cap = np.minimum(1.0 / dt, (vmax / np.maximum(dq, 1e-12)).min(axis=1))  # steps/s within each segment
+    alpha = (BRAKE_SHARE * STOP_ACCELERATION / np.maximum(dq, 1e-12)).min(axis=1)  # steps/s^2 in each segment
+    w = np.empty(n)
+    w[0], w[-1] = seg_cap[0], seg_cap[-1]
+    w[1:-1] = np.minimum(seg_cap[:-1], seg_cap[1:])
+    last = end if 0 < end < n else n - 1
+    if 0 < end < n:
+        w[end] = 0.0
+        for k in range(end - 1, -1, -1):
+            w[k] = min(w[k], math.sqrt(w[k + 1] ** 2 + 2.0 * alpha[k]))
+    if still_start:
+        w[0] = 0.0
+        for k in range(last):
+            w[k + 1] = min(w[k + 1], math.sqrt(w[k] ** 2 + 2.0 * alpha[k]))
+    h = np.empty(n - 1)
+    for k in range(n - 1):
+        mean = (w[k] + w[k + 1]) / 2.0  # never above seg_cap[k]: both ends are capped by it
+        if k >= last:  # past the end: never run, the plain cap
+            h[k] = max(dt, 1.0 / seg_cap[k])
+        elif mean > 0:
+            h[k] = max(dt, 1.0 / mean)
+        else:  # from rest to rest within one step
+            h[k] = 2.0 / math.sqrt(alpha[k])
+    for _ in range(12):  # the cubic between steps can exceed a secant: stretch those segments until it does not
+        over = (_segment_peak_speeds(q, h, hermite_tangents(q, h, still_start=still_start, end=end)) / vmax).max(axis=1)
+        if over.max() <= 1.0 + 1e-6:
             break
         h = np.where(over > 1.0, h * over * 1.001, h)
-        if stop > 1.0:
-            h[end - 1] *= math.sqrt(stop) * 1.001
     return np.concatenate([[0.0], np.cumsum(h)])
 
 
@@ -576,17 +618,22 @@ def tick_problem(
     limits: Limits,
     wall_lower: np.ndarray,
     wall_upper: np.ndarray,
+    f_avg: np.ndarray | None = None,
 ) -> tuple[str, str]:
-    """(kind, why) or ("", ""). Kinds "speed", "force", "tracking" hold where the arm is, not its command."""
+    """(kind, why) or ("", ""). Kinds "speed", "force", "tracking" hold where the arm is, not its command.
+    ``f_avg``: O_F_ext averaged over FORCE_WINDOW_S (default: this tick's)."""
     speed = np.abs(dq)
     over = speed / (limits.joint_speed_rad_s * JOINT_SCALE)
     if over.max() > 1.0:
         j = int(over.argmax())
         return "speed", (f"j{j + 1} turns at {speed[j]:.2f} rad/s (limit {limits.joint_speed_rad_s * JOINT_SCALE[j]:.2f}: "
                          "oscillation or runaway)")
-    force = float(np.linalg.norm(np.asarray(f_ext)[:3] - np.asarray(f0)[:3]))
+    peak = float(np.linalg.norm(np.asarray(f_ext)[:3] - np.asarray(f0)[:3]))
+    if peak > limits.force_peak_n:
+        return "force", f"external force {peak:.1f} N in one tick (limit {limits.force_peak_n:g})"
+    force = peak if f_avg is None else float(np.linalg.norm(np.asarray(f_avg)[:3] - np.asarray(f0)[:3]))
     if force > limits.force_n:
-        return "force", f"external force {force:.1f} N (limit {limits.force_n:g})"
+        return "force", (f"external force {force:.1f} N over {FORCE_WINDOW_S * 1e3:.0f} ms (limit {limits.force_n:g})")
     mm, _ = pose_gap(T_meas, T_cmd)
     if mm > limits.tracking_mm:
         return "tracking", f"TCP {mm:.1f} mm off its command (limit {limits.tracking_mm:g})"
@@ -767,7 +814,7 @@ class Predictor:
         H = len(actions)
         if callable(seed):
             seed = np.stack([seed(obs.t_img + k * self.c.step_s) for k in range(1, H + 1)])
-        plan = self.plan(hist[-1], actions, seed)
+        plan = self.plan(hist[-1], smooth_steps(actions), seed)  # the record keeps the policy's own actions
         T = np.concatenate([hist[-1][None], plan["T"]])
         q = np.concatenate([self.history.q_at(obs.t_img)[None], plan["q"]])
         gap = plan.get("env_gap_m")
@@ -862,6 +909,7 @@ def run_loop(
     predictor.request(min_t=t_start + span + 0.005, seed=q_cmd)
     pending = True
     replan_at = max(1, n_exec - 6)  # updated from each chunk's measured lateness
+    f_window: deque[np.ndarray] = deque(maxlen=max(1, round(FORCE_WINDOW_S * loop_hz)))
     try:
         while True:
             now = clock()
@@ -872,9 +920,11 @@ def run_loop(
             why = stop_flag()
             if why:
                 break
+            f_window.append(np.asarray(f_ext, dtype=np.float64))
             if ticks > 0:
                 kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=T_meas, T_cmd=T_cmd, loop_dt=loop_dt,
-                                   limits=limits, wall_lower=wall_lower, wall_upper=wall_upper)
+                                   limits=limits, wall_lower=wall_lower, wall_upper=wall_upper,
+                                   f_avg=np.mean(f_window, axis=0))
                 if why:
                     break
             if now - t_start > stage.max_s:
@@ -971,7 +1021,10 @@ def run_loop(
 
 class Recorder:
     """Every prediction's inputs and outputs (replayable through the offline path), every tick, and the
-    gripper's commands. Read back by rollout_execute_report."""
+    gripper's commands. Read back by rollout_execute_report.
+
+    A prediction (its images, npz, a json line) is written by a thread of its own: 11-19, written from the
+    control loop it stalled the loop ~20 ms at every chunk, the command then jumped 0.65 step in one tick."""
 
     def __init__(self, record_dir: Path):
         self.dir = Path(record_dir)
@@ -980,6 +1033,19 @@ class Recorder:
         self.events: list[dict[str, Any]] = []
         self.n = 0
         self.lock = threading.Lock()
+        self._todo: queue.Queue = queue.Queue()
+        self._writer = threading.Thread(target=self._write_loop, daemon=True, name="rollout-recorder")
+        self._writer.start()
+
+    def _write_loop(self) -> None:
+        while True:
+            item = self._todo.get()
+            if item is None:
+                return
+            try:
+                self._write(item)
+            except Exception as exc:  # noqa: BLE001 -- a lost record line must not take the run down
+                print(f"rollout recorder: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def __call__(self, item: dict[str, Any]) -> None:
         if "tick" in item:
@@ -988,6 +1054,9 @@ class Recorder:
         if "event" in item:
             self.events.append(item["event"])
             return
+        self._todo.put(item)
+
+    def _write(self, item: dict[str, Any]) -> None:
         pred: Prediction = item["prediction"]
         row: dict[str, Any] = {"step": self.n, "t": item["t"], "accepted": item["accepted"], "why": item["why"],
                                "error": pred.error, "latency_ms": round(pred.latency_s * 1e3, 2),
@@ -1016,6 +1085,8 @@ class Recorder:
         self.n += 1
 
     def close(self) -> None:
+        self._todo.put(None)
+        self._writer.join(timeout=30)
         if self.events:
             (self.dir / "events.json").write_text(json.dumps(self.events, default=_jsonable), encoding="utf-8")
         if not self.ticks:
@@ -1069,4 +1140,6 @@ def stage_dict(stage: Stage, limits: Limits) -> dict[str, Any]:
             "gripper": {"close_below_m": GRIPPER_CLOSE_BELOW_M, "open_above_m": GRIPPER_OPEN_ABOVE_M,
                         "lead_s": GRIPPER_LEAD_S, "min_interval_s": GRIPPER_MIN_INTERVAL_S},
             "joint_stiffness": JOINT_STIFFNESS.tolist(), "joint_damping": JOINT_DAMPING.tolist(),
+            "step_filter": "smooth_steps: [1, 2, 1] / 4 over the predicted poses before IK and every check",
+            "force_window_s": FORCE_WINDOW_S,
             "time_convention": TIME_CONVENTION}
