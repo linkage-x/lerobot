@@ -625,3 +625,14 @@ def test_report_refuses_a_preview_record(tmp_path: Path):
     (tmp_path / "record.json").write_text('{"kind": "preview"}', encoding="utf-8")
     with pytest.raises(ValueError, match="not an execute record"):
         rep.analyze(tmp_path)
+
+
+def test_a_takeover_blends_longer_over_a_larger_gap_so_its_own_speed_stays_small():
+    lim, dt = rx.Limits(), 1 / 30
+    vmax = rx.joint_speed_limit(lim, dt)
+    assert rx.blend_duration(np.zeros(7), lim, dt) == rx.BLEND_S
+    gap = np.zeros(7)
+    gap[0] = 0.014  # 11:40: a 0.15 s blend over this put j1 at 1.64 rad/s
+    T = rx.blend_duration(gap, lim, dt)
+    assert T > rx.BLEND_S and 1.5 * gap[0] / T <= rx.BLEND_SPEED_SHARE * vmax[0] + 1e-9
+    assert rx.blend_duration(np.full(7, 1.0), lim, dt) == rx.BLEND_MAX_S

@@ -465,6 +465,16 @@ class Chunk:
 #: a newer chunk takes over from the running one over this long (smoothstep), not in one tick: the two
 #: predictions differ by up to switch_mm / switch_joint_rad at the switch, and in their speed
 BLEND_S = 0.15
+#: ... longer when the two differ more: the blend's own term (dw/dt x the gap) adds at most this share of a
+#: joint's speed limit (11-19 11:40: a 0.15 s blend over a ~14 mrad gap put j1 at 1.64 rad/s, cap 1.5)
+BLEND_SPEED_SHARE = 0.1
+BLEND_MAX_S = 0.5
+
+
+def blend_duration(gap: np.ndarray, limits: Limits, dt: float) -> float:
+    """How long a takeover blends over a joint gap (rad, per joint): smoothstep's peak dw/dt is 1.5 / T."""
+    share = (np.abs(gap) / (BLEND_SPEED_SHARE * joint_speed_limit(limits, dt))).max()
+    return float(min(BLEND_MAX_S, max(BLEND_S, 1.5 * share)))
 
 
 def blend(old: Chunk, new: Chunk, t: float, t_from: float, t_to: float) -> tuple[np.ndarray, np.ndarray]:
@@ -956,9 +966,10 @@ def run_loop(
                 if refusal:
                     why = refusal
                     break
-                if chunk is not None:  # blend out over BLEND_S, no longer than the old one's run remains
+                if chunk is not None:  # blend out (blend_duration), no longer than the old one's run remains
                     previous, blend_from = chunk, now
-                    blend_to = min(now + BLEND_S, chunk.time_of(chunk.end))
+                    span = blend_duration(new.command(now)[0] - q_cmd, limits, new.dt)
+                    blend_to = min(now + span, chunk.time_of(chunk.end))
                 chunk = new
                 accepted += 1
                 replan_at = max(1, n_exec - max(0, new.k0 - 1))
