@@ -91,7 +91,7 @@ class FakeArm:
 def _plan(fail_step: int | None = None):
     def plan(T_obs, actions, seed):
         targets, widths = rt.targets_from_actions(T_obs, actions)
-        q, ok = kin.ik_retry(kin.NOMINAL, targets, seed, early_exit=True)
+        q, ok = kin.ik_retry(kin.NOMINAL, targets, seed, early_exit=True, rest=seed)  # as PlanContext.evaluate
         why = ["" if o else "IK" for o in ok]
         ok = ok.copy()
         if fail_step is not None:
@@ -102,17 +102,17 @@ def _plan(fail_step: int | None = None):
     return plan
 
 
-def _policy(c: rt.PolicyContract, width=lambda k: 0.088):
+def _policy(c: rt.PolicyContract, width=lambda k: 0.088, step=(0.0, 0.0, -STEP_DOWN_M)):
     def predict(_sample):
         T = np.repeat(np.eye(4)[None], c.horizon, axis=0)
-        T[:, 2, 3] = -STEP_DOWN_M * np.arange(1, c.horizon + 1)
+        T[:, :3, 3] = np.outer(np.arange(1, c.horizon + 1), step)
         return np.concatenate([rt.encode(T), np.array([[width(k)] for k in range(c.horizon)])], axis=1)
 
     return predict
 
 
 def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_ext=None, limits=rx.Limits(), width=lambda k: 0.088,
-         gripper=None, stop_flag=lambda: "", record=None, start_check=None):
+         gripper=None, stop_flag=lambda: "", record=None, start_check=None, step=(0.0, 0.0, -STEP_DOWN_M)):
     c = _contract()
     clock = Clock()
     arm = FakeArm(clock, f_ext=f_ext)
@@ -124,7 +124,7 @@ def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_e
         return rx.Observation(t_img, {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
                               {"box_stale_s": 0.02})
 
-    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c, width), plan=_plan(fail_step),
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c, width, step), plan=_plan(fail_step),
                         sample=lambda h, o: {"history": h}, limits=limits, clock=clock)
     # synchronous: each request is answered before the loop's next tick (the thread is not started)
     pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
@@ -214,6 +214,77 @@ def test_stage_three_closes_the_gripper_ahead_of_the_predicted_width():
     assert sent[:1] == ["close"]
 
 
+def _speeds(commands: list[np.ndarray], ticks: int) -> np.ndarray:
+    return np.diff(np.stack(commands[:ticks]), axis=0) / 0.005  # rad/s per joint, per 5 ms tick
+
+
+def test_a_step_too_fast_for_a_joint_is_slowed_down_not_refused():
+    # 24 mm per step along the TCP's y: more joint motion per step than allowed at Q0
+    lim = rx.Limits(step_mm=36.0)
+    stage = replace(rx.STAGES[2], max_s=0.8)
+    result, arm, seen = _run(stage, limits=lim, step=(0.0, 0.024, 0.0), age_s=0.05)
+    assert result.completed, result.stopped
+    assert result.chunks_accepted >= 2  # through a switch (blended) as well
+    v = _speeds(arm.commands, result.ticks)
+    vmax = rx.joint_speed_limit(lim, 1 / 30)
+    assert (np.abs(v) / vmax).max() < 1.02  # never commanded faster than the limit
+    assert (np.abs(v) / vmax).max() > 0.9  # ... and it did run at it: slowed only as much as needed
+    # what 11-19's stage 2 met: refusing such a step (no slowing allowed) stops the run
+    result, _, _ = _run(stage, limits=replace(lim, step_stretch_max=1.0), step=(0.0, 0.024, 0.0), age_s=0.05)
+    assert not result.completed and "in one step" in result.stopped
+
+
+def test_retime_keeps_the_policys_timing_unless_a_joint_needs_longer():
+    q = np.zeros((6, 7))
+    q[:, 0] = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]  # 0.3 rad/s: well under 1.5
+    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
+    # the policy's timing, except the last step (the arm comes to rest there within STOP_ACCELERATION)
+    np.testing.assert_allclose(off[:5], np.arange(5) / 30, atol=1e-9)
+    q[3:, 0] += 0.06  # step 3 asks 0.07 rad in 33 ms
+    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
+    assert np.diff(off)[2] > 1.4 / 30 and np.diff(off)[0] == pytest.approx(1 / 30)
+
+
+def test_the_command_passes_every_step_with_continuous_speed_never_over_the_limit():
+    rng = np.random.default_rng(0)
+    q = np.cumsum(np.c_[rng.uniform(0.0, 0.08, (33, 1)), rng.uniform(-0.03, 0.03, (33, 6))], axis=0)  # uneven, fast
+    q[0] = 0.0
+    T = np.repeat(np.eye(4)[None], 33, axis=0)
+    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(33, bool), [""] * 33, np.zeros(32), still_start=True)
+    ch.prepare(rx.Limits(), 32)
+    for k in range(33):
+        np.testing.assert_allclose(ch.command(ch.offsets[k])[0], q[k], atol=1e-12)
+    ts = np.arange(0.0, ch.offsets[-1], 0.001)
+    dq = np.array([ch.command(t)[1] for t in ts])
+    vmax = rx.joint_speed_limit(rx.Limits(), 1 / 30)
+    assert (np.abs(dq) / vmax).max() <= 1.0 + 1e-3
+    for k in range(1, 32):  # the speed is continuous through every step (a linear command jumps there)
+        before, after = ch.command(ch.offsets[k] - 1e-7)[1], ch.command(ch.offsets[k] + 1e-7)[1]
+        assert np.abs(before - after).max() < 1e-3
+    assert np.abs(ch.command(0.0)[1]).max() == 0.0 and np.abs(ch.command(ch.offsets[-1])[1]).max() == 0.0
+    # monotone: between two steps no joint leaves their range
+    for k in range(32):
+        seg = np.array([ch.command(t)[0] for t in np.linspace(ch.offsets[k], ch.offsets[k + 1], 20)])
+        lo, hi = np.minimum(q[k], q[k + 1]) - 1e-12, np.maximum(q[k], q[k + 1]) + 1e-12
+        assert ((seg >= lo) & (seg <= hi)).all()
+
+
+def test_a_newer_chunk_takes_over_without_a_jump():
+    T = np.repeat(np.eye(4)[None], 5, axis=0)
+    qa = np.outer(np.arange(5), np.full(7, 0.01))
+    qb = qa + 0.02  # the newer prediction: 0.02 rad off the running one
+    old = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, qa, np.ones(5, bool), [""] * 5, np.zeros(4))
+    new = rx.Chunk(1, 0.0, 0.0, 1 / 30, T, qb, np.ones(5, bool), [""] * 5, np.zeros(4))
+    old.prepare(rx.Limits(), 4)
+    new.prepare(rx.Limits(), 4)
+    t0, t1 = 0.03, 0.03 + rx.BLEND_S * 0.5
+    np.testing.assert_allclose(rx.blend(old, new, t0, t0, t1)[0], old.command(t0)[0])
+    np.testing.assert_allclose(rx.blend(old, new, t1, t0, t1)[0], new.command(t1)[0])
+    ts = np.linspace(t0, t1, 200)
+    qs = np.array([rx.blend(old, new, t, t0, t1)[0] for t in ts])
+    assert np.abs(np.diff(qs, axis=0)).max() < 0.02 / 50  # spread over the window, not one tick
+
+
 def test_assess_ends_a_chunk_at_its_first_step_too_fast():
     T = np.repeat(np.eye(4)[None], 5, axis=0)
     T[:, 0, 3] = [0, 0.005, 0.010, 0.040, 0.045]  # step 3 jumps 30 mm
@@ -251,9 +322,12 @@ def test_joint_limits_scale_with_each_joints_own_speed_limit():
     q[1, 6] = 0.08  # j7: within 0.05 x 2.0
     ok, _ = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
     assert ok.all()
-    q[1, 0] = 0.06  # j1: over 0.05
+    q[1, 0] = 0.06  # j1: over 0.05, but within x2 of it: slowed down (retime), not refused
+    ok, _ = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
+    assert ok.all()
+    q[1, 0] = 0.11  # more than twice: an IK branch change, refused
     ok, why = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
-    assert not ok[1] and "j1 moves 0.060 rad in one step (limit 0.050" in why[1]
+    assert not ok[1] and "j1 moves 0.110 rad in one step (limit 0.050 x2 slowed down" in why[1]
     kw = {"f_ext": np.zeros(6), "f0": np.zeros(6), "T_meas": np.eye(4), "T_cmd": np.eye(4), "loop_dt": 0.005,
           "limits": rx.Limits(), "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
           "q": np.array([0, 0, 0, -1.5, 0, 1.5, 0.0])}
@@ -400,9 +474,11 @@ def test_the_preview_check_names_the_joint_step_execution_would_refuse():
     actions = np.zeros((32, rt.POSE_DIM + 1))
     actions[:, 3] = actions[:, 7] = 1.0
     assert plan.check(Q0, actions, None, 16)["step_limit"] == ""
-    jump["j5"] = 0.149
+    jump["j5"] = 0.149  # 11-18's re-posture: within x2 of j5's 0.10 per step -- execution slows it, passes
+    assert plan.check(Q0, actions, None, 16)["step_limit"] == ""
+    jump["j5"] = 0.25
     out = plan.check(Q0, actions, None, 16)
-    assert out["execution_steps"] == 16 and "j5 moves 0.149 rad" in out["step_limit"]
+    assert out["execution_steps"] == 16 and "j5 moves 0.250 rad" in out["step_limit"]
     assert any(r.startswith("execution: step 1: j5") for r in out["reasons"]) and not out["ok"]
 
 

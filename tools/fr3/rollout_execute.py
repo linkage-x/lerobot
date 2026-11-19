@@ -17,10 +17,18 @@ saw each image with the hand's pose of the same instant, so every input is taken
 time (its SOF ``sensor_timestamp_ns``, CLOCK_MONOTONIC on Thor -- the instant the training labels are stamped
 with, exposure offset 0.0 as in production): the TCP history and the anchor ``T_obs`` are the FK buffer
 interpolated there, and step k of the chunk is due at ``t_img + k*dt``. A chunk that arrives late is
-joined at its first step still in the future; the steps whose time has passed are not executed. Nothing is
-slowed down: the policy reads speed from its history, and a slowed arm would feed it a history training
-never had. The first chunk is the exception: the arm stood still up to that moment, so its anchor is the
-moment it is accepted (step 1 is then 33 ms away, not already late).
+joined at its first step still in the future; the steps whose time has passed are not executed. The
+policy's speed is kept (it reads speed from its history, and a slowed arm feeds it a history training never
+had) except where a joint would have to turn faster than ``Limits.step_joint_rad`` per step: that step is
+given more time (``retime``; the path is unchanged), up to ``step_stretch_max``. The first chunk is the
+exception: the arm stood still up to that moment, so its anchor is the moment it is accepted (step 1 is then
+33 ms away, not already late).
+
+**The command is smooth.** Between steps the joints follow a monotone cubic (PCHIP: continuous speed, never
+past a validated step), at rest at the first chunk's anchor and at the last step a chunk may run to; a newer
+chunk takes over over ``BLEND_S``. 11-19: a linear command's speed jumped at every 33 ms step (the policy's
+steps are uneven), the joint impedance rang at 25-40 Hz and O_F_ext read +-10 N without contact (stage 3
+stopped at 15.2 N with the jaw 200 mm from anything).
 
 **Every step is checked before it is commanded** (``assess``): IK inside the joint walls, the training
 workspace, the capsule model's clearance to carts/table/cameras (rollout_relative_tcp.PlanContext), at most
@@ -101,8 +109,15 @@ class Limits:
     # one 33 ms step in j1-j4: 1.5 rad/s, about 60% of their limit (2.62 rad/s); j5-j7 scale with their own
     # limits (JOINT_SCALE: 2.0 / 1.6 / 2.0 x). 11-18 demonstrations through IK: j5/j7 above 0.05 rad in ~6%
     # of steps, within their own 60% in ~2%; j1/j3 above in ~6% too, but at up to 4 rad/s -- past the
-    # hardware's 2.62 -- an IK redundancy matter, not a limit to loosen
+    # hardware's 2.62 -- an IK redundancy matter, not a limit to loosen.
+    # 11-19: it is the commanded joint SPEED (retime: a step that needs more is given more time, the path
+    # unchanged), no longer a refusal by itself. Stage 2 was refused at j1 0.063 rad/step: the policy asked
+    # 0.5 m/s (in its training, step1 36 mm) where q0 (j1 +54, j3 -72, j6 ~ pi) leaves no elbow redundancy
+    # (the null space is j5/j7), so j1 had to turn 32 deg for an 11.5 deg azimuth change.
     step_joint_rad: float = 0.05
+    # ... but a step needing more than this many times its 33 ms is refused: an IK branch change or a wild
+    # prediction, not speed (11-19 runs needed at most 1.53 within what a chunk must carry, 1.98 at step 32)
+    step_stretch_max: float = 2.0
     # a newer chunk against the command it replaces, at the moment of the switch
     switch_mm: float = 15.0
     switch_joint_rad: float = 0.05
@@ -243,9 +258,91 @@ class PoseHistory:
 # --------------------------------------------------------------------- chunks ---
 
 
+def joint_speed_limit(limits: Limits, dt: float) -> np.ndarray:
+    """(7,) rad/s: what a command may ask of each joint (``step_joint_rad`` per step, JOINT_SCALE)."""
+    return limits.step_joint_rad * JOINT_SCALE / dt
+
+
+def hermite_tangents(q: np.ndarray, h: np.ndarray, *, still_start: bool, end: int) -> np.ndarray:
+    """(n, 7) knot velocities (rad/s) of a monotone cubic (PCHIP, Fritsch-Butland) through ``q`` (n, 7) with
+    segment durations ``h`` (n-1,). Between two knots no joint leaves their range (no overshoot past a
+    validated step) and a knot's velocity never exceeds its neighbouring secants. Zero at knot 0 when the arm
+    stood still there, and at ``end``: the arm comes to rest on the last step it may run to."""
+    n = len(q)
+    d = np.diff(q, axis=0) / h[:, None]
+    m = np.zeros_like(q)
+    if n > 2:
+        h0, h1 = h[:-1, None], h[1:, None]
+        w1, w2 = 2.0 * h1 + h0, h1 + 2.0 * h0
+        d0, d1 = d[:-1], d[1:]
+        same = d0 * d1 > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            hm = (w1 + w2) / (w1 / d0 + w2 / d1)
+        m[1:-1] = np.where(same, hm, 0.0)
+    if n > 1:
+        m[0] = 0.0 if still_start else d[0]
+        m[-1] = d[-1]
+    if 0 < end < n:
+        m[end] = 0.0
+    return m
+
+
+_U = np.linspace(0.0, 1.0, 17)
+
+
+def _segment_peak_speeds(q: np.ndarray, h: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """(n-1, 7) the largest |velocity| of each joint inside each Hermite segment (sampled, 17 points)."""
+    u = _U[None, :, None]
+    p0, p1 = q[:-1, None], q[1:, None]
+    hh = h[:, None, None]
+    m0, m1 = m[:-1, None] * hh, m[1:, None] * hh
+    dp = (6 * u**2 - 6 * u) * p0 + (3 * u**2 - 4 * u + 1) * m0 + (-6 * u**2 + 6 * u) * p1 + (3 * u**2 - 2 * u) * m1
+    return np.abs(dp / hh).max(axis=1)
+
+
+#: FR3 joint acceleration limits (rad/s^2, Franka's datasheet), half of which the stop on the last step may use
+FR3_ACCELERATION_LIMITS = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0])
+STOP_ACCELERATION = 0.5 * FR3_ACCELERATION_LIMITS
+
+
+def _segment_end_accelerations(q: np.ndarray, h: np.ndarray, m: np.ndarray, k: int) -> np.ndarray:
+    """(7,) the largest |acceleration| of each joint in segment k (linear in u: at one of its ends)."""
+    p0, p1, m0, m1 = q[k], q[k + 1], m[k] * h[k], m[k + 1] * h[k]
+    a0 = -6 * p0 - 4 * m0 + 6 * p1 - 2 * m1
+    a1 = 6 * p0 + 2 * m0 - 6 * p1 + 4 * m1
+    return np.maximum(np.abs(a0), np.abs(a1)) / h[k] ** 2
+
+
+def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: int) -> np.ndarray:
+    """(n,) each step's time from the anchor: k*dt, except where a joint would turn faster than
+    ``joint_speed_limit`` -- that segment takes longer. The path (every validated step) is unchanged; only
+    when the arm gets there. 11-19: refusing such a chunk stopped stage 2 where the policy asked 0.5 m/s, and
+    a linear command's speed jumps at every step rang the joint impedance into a false 15 N contact.
+    The last step (``end``, where the arm comes to rest) also takes long enough to stop within
+    STOP_ACCELERATION."""
+    n = len(q)
+    if n < 2:
+        return np.zeros(n)
+    vmax = joint_speed_limit(limits, dt)
+    h = dt * np.maximum(1.0, (np.abs(np.diff(q, axis=0)) / (vmax * dt)).max(axis=1))
+    for _ in range(12):  # a stretched segment lowers its neighbours' knot speeds: converges in a few passes
+        m = hermite_tangents(q, h, still_start=still_start, end=end)
+        over = (_segment_peak_speeds(q, h, m) / vmax).max(axis=1)
+        stop = 1.0
+        if 0 < end < n:
+            stop = float((_segment_end_accelerations(q, h, m, end - 1) / STOP_ACCELERATION).max())
+        if over.max() <= 1.0 + 1e-6 and stop <= 1.0 + 1e-6:
+            break
+        h = np.where(over > 1.0, h * over * 1.001, h)
+        if stop > 1.0:
+            h[end - 1] *= math.sqrt(stop) * 1.001
+    return np.concatenate([[0.0], np.cumsum(h)])
+
+
 @dataclass
 class Chunk:
-    """One prediction made executable: step k (0 = the anchor) is due at ``t0 + k*dt``."""
+    """One prediction made executable: step k (0 = the anchor) is due at ``t0 + offsets[k]`` -- ``k*dt``
+    unless a joint needed longer (``retime``, set when the chunk is accepted)."""
 
     index: int
     t_obs: float  # the observation instant (the image's)
@@ -258,28 +355,81 @@ class Chunk:
     widths: np.ndarray  # (H,) predicted gripper width at steps 1..H
     k0: int = 0  # first step still in the future when it was accepted
     end: int = 0  # the last step it may run to (stage 1: n_action_steps)
+    offsets: np.ndarray | None = None  # (H+1,) s from t0 per step; None = k*dt
+    still_start: bool = False  # the arm stood still at the anchor (the first chunk)
+    _m: np.ndarray | None = field(default=None, repr=False)  # knot velocities for (offsets, end)
+
+    def __post_init__(self) -> None:
+        if self.offsets is None:
+            self.offsets = self.dt * np.arange(len(self.q), dtype=np.float64)
 
     @property
     def horizon(self) -> int:
         return len(self.q) - 1
 
+    def prepare(self, limits: Limits, end: int) -> None:
+        """Fix the run's last step and the steps' times (retime) for that end."""
+        self.end = end
+        self.offsets = retime(self.q, self.dt, limits, still_start=self.still_start, end=end)
+        self._m = None
+
+    def stretch(self) -> np.ndarray:
+        """(H,) each step's duration over dt (1 = the policy's speed)."""
+        return np.diff(self.offsets) / self.dt
+
     def cursor(self, t: float) -> float:
-        return (t - self.t0) / self.dt
+        """Where in the chunk time t is, in steps (fractional); beyond the knots at dt per step."""
+        tau = t - self.t0
+        off = self.offsets
+        if tau <= 0.0:
+            return tau / self.dt
+        if tau >= off[-1]:
+            return self.horizon + (tau - off[-1]) / self.dt
+        k = int(np.searchsorted(off, tau, side="right")) - 1
+        return k + (tau - off[k]) / (off[k + 1] - off[k])
+
+    def time_of(self, cursor: float) -> float:
+        k = int(min(max(math.floor(cursor), 0), self.horizon - 1))
+        return self.t0 + self.offsets[k] + (cursor - k) * (self.offsets[k + 1] - self.offsets[k])
 
     def command(self, t: float) -> tuple[np.ndarray, np.ndarray, float]:
-        """(q, dq, cursor) at time t, linear between steps, clamped to [0, end]."""
+        """(q, dq, cursor) at time t on the monotone cubic through the steps, clamped to [0, end]; at rest at
+        ``end`` (and at the anchor of a first chunk)."""
         c = min(max(self.cursor(t), 0.0), float(self.end))
-        k = min(int(math.floor(c)), self.end - 1) if self.end > 0 else 0
-        s = c - k
         if self.end == 0:
             return self.q[0].copy(), np.zeros(7), c
-        q = self.q[k] + s * (self.q[k + 1] - self.q[k])
-        dq = (self.q[k + 1] - self.q[k]) / self.dt if c < self.end else np.zeros(7)
+        if self._m is None:
+            self._m = hermite_tangents(self.q, np.diff(self.offsets), still_start=self.still_start, end=self.end)
+        k = min(int(math.floor(c)), self.end - 1)
+        u = c - k
+        h = self.offsets[k + 1] - self.offsets[k]
+        p0, p1, m0, m1 = self.q[k], self.q[k + 1], self._m[k] * h, self._m[k + 1] * h
+        u2, u3 = u * u, u * u * u
+        q = (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * m0 + (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * m1
+        if c >= self.end:
+            return q, np.zeros(7), c
+        dq = ((6 * u2 - 6 * u) * p0 + (3 * u2 - 4 * u + 1) * m0 + (-6 * u2 + 6 * u) * p1 + (3 * u2 - 2 * u) * m1) / h
         return q, dq, c
 
     def width_at(self, cursor: float) -> float:
         k = int(min(max(round(cursor), 1), self.horizon))
         return float(self.widths[k - 1])
+
+
+#: a newer chunk takes over from the running one over this long (smoothstep), not in one tick: the two
+#: predictions differ by up to switch_mm / switch_joint_rad at the switch, and in their speed
+BLEND_S = 0.15
+
+
+def blend(old: Chunk, new: Chunk, t: float, t_from: float, t_to: float) -> tuple[np.ndarray, np.ndarray]:
+    """(q, dq) at t going from ``old``'s command to ``new``'s between t_from and t_to (C1 smoothstep)."""
+    qn, dqn, _ = new.command(t)
+    if t >= t_to or t_to <= t_from:
+        return qn, dqn
+    qo, dqo, _ = old.command(t)
+    s = min(max((t - t_from) / (t_to - t_from), 0.0), 1.0)
+    w, dw = s * s * (3 - 2 * s), 6 * s * (1 - s) / (t_to - t_from)
+    return (1 - w) * qo + w * qn, (1 - w) * dqo + w * dqn + dw * (qn - qo)
 
 
 def step_limits(step1_m: float | None, step1_deg: float | None) -> dict[str, float]:
@@ -327,10 +477,11 @@ def assess(
                 reason = f"step {k}: {mm:.1f} mm in one step (limit {limits.step_mm:g})"
             elif deg > limits.step_deg:
                 reason = f"step {k}: {deg:.1f}° in one step (limit {limits.step_deg:g})"
-            elif over.max() > 1.0:
+            elif over.max() > limits.step_stretch_max:
                 j = int(over.argmax())
                 reason = (f"step {k}: j{j + 1} moves {abs(q[k][j] - q[k - 1][j]):.3f} rad in one step "
-                          f"(limit {limits.step_joint_rad * JOINT_SCALE[j]:.3f}; an IK branch change?)")
+                          f"(limit {limits.step_joint_rad * JOINT_SCALE[j]:.3f} x{limits.step_stretch_max:g} "
+                          "slowed down; an IK branch change?)")
         if reason:
             ok[k] = False
             why[k] = reason
@@ -347,11 +498,18 @@ def accept(
     T_cmd: np.ndarray,
     limits: Limits,
     fk: Callable[[np.ndarray], np.ndarray],
+    end_cap: int | None = None,
 ) -> str:
-    """Take the chunk (sets k0, end; the first one is re-anchored to ``now``), or say why not."""
+    """Take the chunk (sets k0, end and the steps' times; the first one is re-anchored to ``now``), or say
+    why not. ``end_cap``: the last step it may run to whatever else is executable (stage 1: n_action_steps)."""
     H = chunk.horizon
+    executable = np.flatnonzero(chunk.ok)
+    end = min(int(executable.max()) if executable.size else 0, H, H if end_cap is None else end_cap)
     if first:
         chunk.t0 = now
+        chunk.still_start = True
+    chunk.prepare(limits, end)  # before k0: a slowed step is due later, so fewer have passed
+    if first:
         chunk.k0 = 1
         mm, deg = pose_gap(T_cmd, chunk.T[1])
         if mm > limits.first_target_mm or deg > limits.first_target_deg:
@@ -367,8 +525,6 @@ def accept(
     bad = [k for k in range(chunk.k0, need + 1) if not chunk.ok[k]]
     if bad:
         return f"step {bad[0]} of the {n_exec} it must be able to carry is not executable: {chunk.why[bad[0]]}"
-    last_ok = int(np.flatnonzero(chunk.ok).max())
-    chunk.end = min(last_ok, H)
     if not first:
         q_new, _, _ = chunk.command(now)
         dq = float(np.abs(q_new - q_cmd).max())
@@ -666,6 +822,8 @@ def run_loop(
     T_cmd = fk_tcp(q_cmd)
     arm.start(q_cmd)
     chunk: Chunk | None = None
+    previous: Chunk | None = None  # the chunk being blended out (BLEND_S)
+    blend_from = blend_to = 0.0
     accepted = 0
     pending = False
     decider = GripperDecider(width_now)
@@ -716,9 +874,7 @@ def run_loop(
                     break
                 new = pred.chunk
                 refusal = accept(new, now, first=chunk is None, n_exec=n_exec, q_cmd=q_cmd, T_cmd=T_cmd,
-                                 limits=limits, fk=fk_tcp)
-                if stage.chunks and chunk is None:
-                    new.end = min(new.end, n_exec)
+                                 limits=limits, fk=fk_tcp, end_cap=n_exec if stage.chunks and chunk is None else None)
                 log(event="chunk", index=new.index, accepted=not refusal, why=refusal, k0=new.k0, end=new.end,
                     latency_ms=round(pred.latency_s * 1e3, 1), age_ms=round(pred.age_s * 1e3, 1))
                 if record:
@@ -726,13 +882,21 @@ def run_loop(
                 if refusal:
                     why = refusal
                     break
+                if chunk is not None:  # blend out over BLEND_S, no longer than the old one's run remains
+                    previous, blend_from = chunk, now
+                    blend_to = min(now + BLEND_S, chunk.time_of(chunk.end))
                 chunk = new
                 accepted += 1
                 replan_at = max(1, n_exec - max(0, new.k0 - 1))
             if chunk is None:
                 arm.command(q_cmd, np.zeros(7))
             else:
-                q_cmd, dq_cmd, cursor = chunk.command(now)
+                if previous is not None and now < blend_to:
+                    q_cmd, dq_cmd = blend(previous, chunk, now, blend_from, blend_to)
+                    cursor = chunk.cursor(now)
+                else:
+                    previous = None
+                    q_cmd, dq_cmd, cursor = chunk.command(now)
                 T_cmd = fk_tcp(q_cmd)
                 arm.command(q_cmd, dq_cmd)
                 if cursor >= chunk.end:
@@ -747,7 +911,7 @@ def run_loop(
                     pending = True
                     replan_at = math.inf
                 if gripper is not None and stage.gripper:
-                    action = decider.decide(chunk.width_at(cursor + GRIPPER_LEAD_S / chunk.dt), now)
+                    action = decider.decide(chunk.width_at(chunk.cursor(now + GRIPPER_LEAD_S)), now)
                     if action:
                         gripper(action)
                         log(event="gripper", action=action, cursor=round(cursor, 2))
@@ -810,7 +974,8 @@ class Recorder:
             row["width"] = pred.obs.width
         if pred.chunk is not None:
             c = pred.chunk
-            row.update(index=c.index, k0=c.k0, end=c.end, t0=c.t0, ok=c.ok.tolist(), why_steps=c.why,
+            row.update(index=c.index, k0=c.k0, end=c.end, t0=c.t0, offsets=c.offsets.round(5).tolist(),
+                       ok=c.ok.tolist(), why_steps=c.why,
                        targets_base=c.T[:, :3, 3].round(5).tolist(), widths=c.widths.round(4).tolist(),
                        plan=pred.plan)
         if pred.obs is not None and pred.actions is not None and pred.history is not None:

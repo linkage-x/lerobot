@@ -12,7 +12,7 @@ For each run:
   each chunk ran before the next took over, the interval between chunks, the loop period.
 - **motion**: the TCP (FK of the measured joints) against FK of the command at every tick (what the
   ``tracking_mm`` stop watches), and against the policy's target at each executed step's due time
-  ``t0 + k*dt`` -- what the policy asked against what the arm did; the external force against the first
+  ``t0 + offsets[k]`` (``k*dt`` unless retimed) -- what the policy asked against what the arm did; the external force against the first
   tick, the fastest joint, the closest panda_py wall.
 - **headroom**: the worst value of each against its stop (``Limits``) -- what to look at before tightening or
   loosening one. A limit is changed from several runs' worst values, not from one -- and not from stage 1,
@@ -96,9 +96,13 @@ def _executed_steps(rows: list[dict[str, Any]], t_end: float, dt: float) -> list
     for i, r in enumerate(taken):
         until = taken[i + 1]["t"] if i + 1 < len(taken) else t_end
         k0, end, t0 = int(r["k0"]), int(r["end"]), float(r["t0"])
-        ks = [k for k in range(k0, end + 1) if t0 + k * dt <= until + 1e-9]
+        n = len(r["targets_base"])
+        offsets = r.get("offsets") or [k * dt for k in range(n)]  # retimed steps (11-19); before: k*dt
+        ks = [k for k in range(k0, end + 1) if t0 + offsets[k] <= until + 1e-9]
         out.append({"index": r.get("index"), "k0": k0, "end": end, "t": r["t"], "t0": t0,
-                    "steps": ks, "due": [t0 + k * dt for k in ks], "targets": np.asarray(r["targets_base"], dtype=np.float64)})
+                    "steps": ks, "due": [t0 + offsets[k] for k in ks],
+                    "stretch": [(offsets[k] - offsets[k - 1]) / dt for k in ks],
+                    "targets": np.asarray(r["targets_base"], dtype=np.float64)})
     return out
 
 
@@ -141,6 +145,8 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
     report["timing"] = {
         "late_steps": stats([int(r["k0"]) - 1 for r in later]),
         "steps_run_per_chunk": stats([len(e["steps"]) for e in executed]),
+        # each executed step's duration over dt: 1 = the policy's speed, more = slowed for a joint (retime)
+        "stretch": stats([x for e in executed for x in e["stretch"]]),
         "chunk_interval_ms": stats(gaps),
     }
 
@@ -255,6 +261,7 @@ def format_text(report: dict[str, Any]) -> str:
         "timing",
         f"  later chunks late  {_fmt_stats(tim['late_steps'], 'steps')}",
         f"  steps run / chunk  {_fmt_stats(tim['steps_run_per_chunk'], 'steps')}",
+        f"  step stretch       {_fmt_stats(tim.get('stretch'), 'x dt')}  (1 = the policy's speed; more = slowed for a joint)",
         f"  chunk interval     {_fmt_stats(tim['chunk_interval_ms'], 'ms')}",
     ]
     if "loop_ms" in tim:
