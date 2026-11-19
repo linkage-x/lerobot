@@ -502,10 +502,12 @@ export function RolloutPage() {
         </div>
         <p className="panel-note">
           Move to a training start: one of the poses of this checkpoint's training episodes in their first second,
-          drawn at random, with its joints chosen clear of the shoulder singularity (j2 away from 0) and the path in
-          joint space kept 10 mm from carts/table/cameras — refused, nothing moving, when no start drawn has such a
-          path. Slow (≤ 0.3 rad/s), with the execution's stops; Stop brakes the arm to rest. Open the gripper
-          yourself (the training starts were open).
+          drawn at random, with its joints chosen with room along the motion that follows and clear of singularities
+          (where the FR3 stops estimating force: the yellow light), the path in joint space kept 10 mm from
+          carts/table/cameras — refused, nothing moving, when no start drawn has such a path. Slow (≤ 0.3 rad/s);
+          the path being checked, it runs without the force estimate (a live one still stops on force) and stops
+          when the arm is 8 mm off its command (a contact); Stop brakes the arm to rest. Open the gripper yourself
+          (the training starts were open).
         </p>
         {executing ? (
           <p className="command-error">Running: {executing.message || "starting"}</p>

@@ -1441,6 +1441,10 @@ def brake_and_hold(arm: ArmIO, kind: str, q_cmd: np.ndarray, dq_cmd: np.ndarray,
 
 MOVE_SPEED_RAD_S = 0.3  # j1-j4 peak (the wrist by JOINT_SCALE): about panda_py's move_to_start speed
 MOVE_ACCELERATION = 0.25 * FR3_ACCELERATION_LIMITS
+#: a planned move (its path checked for clearance before it starts) does not need the force estimate, which the
+#: FR3 drops near a singularity; what catches a contact then is the tracking error, held to this. 11-19: over
+#: 14960 ticks of thirteen moves to a start the TCP was at most 3.9 mm off its command (p99.9 3.8)
+MOVE_TRACKING_MM = 8.0
 
 
 def joint_move(q0: np.ndarray, q1: np.ndarray, *, speed: float = MOVE_SPEED_RAD_S,
@@ -1474,10 +1478,13 @@ def run_joint_move(
     loop_hz: float = LOOP_HZ,
     record: Callable[[dict[str, Any]], None] | None = None,
     q_planned: np.ndarray | None = None,
+    force_estimate_required: bool = True,
 ) -> RunResult:
     """Drive the arm to ``q_goal`` along ``joint_move`` with the run's stops (tick_problem, a silent force
     estimate, the operator's stop); any stop brakes to rest (brake_and_hold). ``q_planned``: the joints the
-    move was planned from; refused when the arm stands elsewhere now (the plan's checks were for that path)."""
+    move was planned from; refused when the arm stands elsewhere now (the plan's checks were for that path).
+    ``force_estimate_required`` False (a move whose path was checked, with ``limits.tracking_mm`` held to
+    MOVE_TRACKING_MM): an estimate of exactly 0 neither refuses nor stops it; a live one still stops on force."""
     period = 1.0 / loop_hz
     q, dq, f0 = arm.read()
     if np.abs(dq).max() > limits.start_speed_rad_s:
@@ -1486,7 +1493,7 @@ def run_joint_move(
         return RunResult("the arm moved since the move was planned; plan again", False, 0, 0.0, 0, 0.0)
     t_start = clock()
     q, refusal = _stand_still(arm, max(3, int(0.15 * loop_hz)), lambda t, qq: None, clock, sleep, period)
-    if refusal:
+    if refusal and force_estimate_required:
         return RunResult(refusal, False, 0, clock() - t_start, 0, 0.0)
     duration, path = joint_move(q, q_goal)
     q_cmd, dq_cmd = q.copy(), np.zeros(7)
@@ -1504,16 +1511,22 @@ def run_joint_move(
             why = stop_flag()
             if why:
                 break
-            f_window.append(np.asarray(f_ext, dtype=np.float64))
             silent = 0 if np.any(f_ext) else silent + 1
-            if silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
+            if force_estimate_required and silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
                 why, kind = (f"the external force estimate read exactly 0 for {silent} ticks{_condition(arm)}: "
                              "the force stop is blind"), "force"
                 break
+            if not silent:
+                if not np.any(f0):  # the estimate came (back) after none at the start: its first reading is the zero
+                    f0 = np.asarray(f_ext, dtype=np.float64)
+                f_window.append(np.asarray(f_ext, dtype=np.float64))
             if ticks > 0:
-                kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=fk_tcp(q), T_cmd=fk_tcp(q_cmd),
+                # a gone estimate (allowed here) is no force: judged at its reference, the rest as always
+                f_tick = f0 if silent else f_ext
+                f_avg = np.mean(f_window, axis=0) if f_window else f0
+                kind, why = tick_problem(q=q, dq=dq, f_ext=f_tick, f0=f0, T_meas=fk_tcp(q), T_cmd=fk_tcp(q_cmd),
                                          loop_dt=loop_dt, limits=limits, wall_lower=wall_lower, wall_upper=wall_upper,
-                                         f_avg=np.mean(f_window, axis=0))
+                                         f_avg=f_avg)
                 if why:
                     break
             t = now - t0

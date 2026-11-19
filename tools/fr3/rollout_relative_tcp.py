@@ -993,6 +993,7 @@ def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None =
     signal.signal(signal.SIGTERM, _signal)
     signal.signal(signal.SIGINT, _signal)
     record_dir.mkdir(parents=True, exist_ok=True)
+    move_limits = rx.Limits(tracking_mm=rx.MOVE_TRACKING_MM)
     panda = rx.PandaArm(str(entry["robot_ip"]))
     q_now = panda.read()[0]
     chosen = plan.plan_to_start(q_now, rng=np.random.default_rng(seed))
@@ -1003,7 +1004,9 @@ def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None =
         "move": {"speed_rad_s": rx.MOVE_SPEED_RAD_S, "acceleration": rx.MOVE_ACCELERATION.tolist(),
                  "profile": "straight in joint space, minimum jerk, every joint together"},
         "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
-        **rx.stage_dict(rx.Stage(0, 0, 0.0, False, "move to a training start"), rx.Limits()),
+        "force_estimate": "not required: the path is checked before the move; tracking held to "
+                          f"{rx.MOVE_TRACKING_MM:g} mm, a live estimate still stops on force",
+        **rx.stage_dict(rx.Stage(0, 0, 0.0, False, "move to a training start"), move_limits),
     }
     (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
     if not chosen["ok"]:
@@ -1017,18 +1020,13 @@ def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None =
     meta["realtime"] = f"SCHED_FIFO {rx.RT_PRIORITY}" if not realtime else f"not granted: {realtime}"
     try:
         result = rx.run_joint_move(
-            arm=panda, q_goal=np.asarray(chosen["q_goal"], dtype=np.float64), limits=rx.Limits(), fk_tcp=plan.tcp,
+            arm=panda, q_goal=np.asarray(chosen["q_goal"], dtype=np.float64), limits=move_limits, fk_tcp=plan.tcp,
             wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, stop_flag=lambda: stop["why"], log=progress,
-            record=recorder, q_planned=q_now,
+            record=recorder, q_planned=q_now, force_estimate_required=False,
         )
     finally:
         rx.normal_thread()
         recorder.close()
-    if not result.completed and "no external force estimate" in result.stopped:
-        here = float(sigma_min(q_now[None])[0])
-        if here < START_SIGMA_MIN:
-            result.stopped += (f" -- the arm stands near a singularity (sigma_min {here:.3f} < {START_SIGMA_MIN}; the "
-                               "status light is yellow): guide it a little away by hand, then move again")
     q_end = panda.read()[0]
     start = plan.distribution.start_problem(np.linalg.inv(plan.T_base_world) @ plan.tcp(q_end), None)
     meta["result"] = {"completed": result.completed, "stopped": result.stopped, "duration_s": round(result.duration_s, 3),

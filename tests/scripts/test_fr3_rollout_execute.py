@@ -946,6 +946,38 @@ def test_the_move_to_a_start_refuses_a_moved_arm_and_a_dead_force_estimate_and_b
     assert result.stopped == "stopped by the operator" and arm.stopped
 
 
+def test_a_planned_move_runs_without_the_force_estimate_and_still_stops_on_tracking():
+    """The move to a training start: its path is checked; the FR3 drops the estimate near a singularity."""
+    goal = Q0 + np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    def silent(clock, f_ext=None):
+        a = FakeArm(clock, f_ext=f_ext)
+        a.bias = 0.0
+        return a
+
+    clock = Clock()
+    arm = silent(clock)
+    lim = rx.Limits(tracking_mm=rx.MOVE_TRACKING_MM)
+    run = {"limits": lim, "fk_tcp": _fk, "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
+           "stop_flag": lambda: "", "log": lambda **kw: None, "force_estimate_required": False}
+    result = rx.run_joint_move(arm=arm, q_goal=goal, clock=clock, sleep=clock.sleep, **run)
+    assert result.completed and np.abs(arm.q - goal).max() < 1e-3  # no estimate at all: refused neither at start nor on the way
+
+    class Blocked(FakeArm):  # something in the way: the arm stops following its command
+        def _advance(self):
+            if self.clock() <= 1000.9:
+                super()._advance()
+            else:
+                self.t = self.clock()
+                self.dq = np.zeros(7)
+
+    clock = Clock()
+    arm = Blocked(clock)
+    arm.bias = 0.0
+    result = rx.run_joint_move(arm=arm, q_goal=goal, clock=clock, sleep=clock.sleep, **run)
+    assert "off its command" in result.stopped and "limit 8" in result.stopped
+
+
 class _StartDist:
     def __init__(self, T_world: list[np.ndarray], opening: list[np.ndarray] | None = None):
         self.start_p = np.array([T[:3, 3] for T in T_world])
