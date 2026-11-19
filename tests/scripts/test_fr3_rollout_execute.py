@@ -632,7 +632,18 @@ def test_a_takeover_blends_longer_over_a_larger_gap_so_its_own_speed_stays_small
     vmax = rx.joint_speed_limit(lim, dt)
     assert rx.blend_duration(np.zeros(7), lim, dt) == rx.BLEND_S
     gap = np.zeros(7)
-    gap[0] = 0.014  # 11:40: a 0.15 s blend over this put j1 at 1.64 rad/s
+    gap[0] = 0.03
     T = rx.blend_duration(gap, lim, dt)
     assert T > rx.BLEND_S and 1.5 * gap[0] / T <= rx.BLEND_SPEED_SHARE * vmax[0] + 1e-9
     assert rx.blend_duration(np.full(7, 1.0), lim, dt) == rx.BLEND_MAX_S
+    # a chunk keeps that share free: a takeover at full speed stays under the cap (11:40: 1.64 rad/s, cap 1.5)
+    q = np.outer(np.arange(33), np.r_[0.06, np.zeros(6)])  # wants 1.8 rad/s on j1
+    T = np.repeat(np.eye(4)[None], 33, axis=0)
+    old = rx.Chunk(0, 0.0, 0.0, dt, T, q, np.ones(33, bool), [""] * 33, np.zeros(32))
+    new = rx.Chunk(1, 0.0, 0.0, dt, T, q + gap, np.ones(33, bool), [""] * 33, np.zeros(32))
+    old.prepare(lim, 32)
+    new.prepare(lim, 32)
+    t0 = old.offsets[5]
+    t1 = t0 + rx.blend_duration(new.command(t0)[0] - old.command(t0)[0], lim, dt)
+    v = np.array([rx.blend(old, new, t, t0, t1)[1] for t in np.linspace(t0, t1, 200)])
+    assert np.abs(v[:, 0]).max() <= vmax[0] + 1e-6

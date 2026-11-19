@@ -352,7 +352,9 @@ def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: 
     n = len(q)
     if n < 2:
         return np.zeros(n)
-    vmax = joint_speed_limit(limits, dt)
+    # a takeover's blend may add BLEND_SPEED_SHARE of the cap on top of a chunk's own speed (11:40: chunk at
+    # the cap + blend = 1.64 rad/s): the chunk keeps that share free, so the command never exceeds the cap
+    vmax = joint_speed_limit(limits, dt) * (1.0 - BLEND_SPEED_SHARE)
     dq = np.abs(np.diff(q, axis=0))  # (n-1, 7) per segment
     seg_cap = np.minimum(1.0 / dt, (vmax / np.maximum(dq, 1e-12)).min(axis=1))  # steps/s within each segment
     alpha = (BRAKE_SHARE * STOP_ACCELERATION / np.maximum(dq, 1e-12)).min(axis=1)  # steps/s^2 in each segment
