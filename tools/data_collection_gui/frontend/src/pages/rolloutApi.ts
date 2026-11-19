@@ -106,6 +106,8 @@ export type OfflineResult = {
 export type PreviewLatest = {
   step?: number;
   time?: string;
+  // no prediction now: an input is missing (e.g. the arm's gripper BOX stopped streaming)
+  blocked?: string;
   width?: number;
   wrench?: number[] | null;
   latency_ms?: number;

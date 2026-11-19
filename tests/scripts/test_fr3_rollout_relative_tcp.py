@@ -56,6 +56,31 @@ def test_live_width_and_wrench_come_from_the_arms_box_in_the_recorders_layout():
         _live(_contract()).box_from_snapshot(single)
 
 
+def test_a_gripper_box_that_dropped_out_is_not_read_from_its_last_values():
+    """11-19: an unplugged gripper BOX keeps its last values in BOX_LIVE, which still comes at 10 Hz."""
+
+    def snap(gripper_age, six_d_age=0.01, seen=True):
+        row = lambda age: {"seen": seen, "fresh": age <= 1.0, "last_seen_age_s": age}  # noqa: E731
+        return {
+            "sensors": {"box3100715645/box_gripper": {"distance_m": 0.031},
+                        "box3100715645/box_six_d_force": {"fxyz_mxyz_external": [0.5, 0, -1.0, 0, 0, 0.01]},
+                        "box3906437858/box_gripper": {"distance_m": 0.07}},
+            "status": {"sensor_status": {"box3100715645/box_gripper": row(gripper_age),
+                                         "box3100715645/box_six_d_force": row(six_d_age),
+                                         "box3906437858/box_gripper": row(0.0)}},
+        }
+
+    width, _, meta = _live(_contract(wrench=True)).box_from_snapshot(snap(0.02))
+    assert width == pytest.approx(0.031) and meta["dataAgeS"] == pytest.approx(0.02)
+    with pytest.raises(RuntimeError, match=r"3100715645 is not streaming \(box3100715645/box_gripper: last sample 4.0 s"):
+        _live(_contract()).box_from_snapshot(snap(4.0))
+    with pytest.raises(RuntimeError, match="box_six_d_force: last sample 0.8 s"):
+        _live(_contract(wrench=True)).box_from_snapshot(snap(0.02, six_d_age=0.8))
+    _live(_contract()).box_from_snapshot(snap(0.02, six_d_age=0.8))  # a policy without the wrench does not need it
+    with pytest.raises(RuntimeError, match="sent nothing since Connect"):
+        _live(_contract()).box_from_snapshot(snap(0.0, seen=False))
+
+
 def test_chunk_errors_measure_position_rotation_width_and_skip_padding():
     T = np.repeat(np.eye(4)[None], 3, axis=0)
     gt = np.concatenate([rt.encode(T), np.full((3, 1), 0.04)], axis=1)

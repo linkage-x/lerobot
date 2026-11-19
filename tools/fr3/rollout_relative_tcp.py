@@ -423,6 +423,34 @@ def frame_age_limit_s(frame_bus: Path) -> float:
 # ------------------------------------------------------------------ preview ---
 
 
+BOX_SENSOR_STALE_S = 0.5  # the arm's gripper BOX: its own newest sample of a sensor the policy reads, at most this old
+
+
+def box_sensor_problem(snapshot: dict[str, Any], sensors: list[str]) -> tuple[str, float | None]:
+    """("" or why, the oldest age in seconds) of the BOX's own samples of ``sensors`` (namespaced as in
+    ``snapshot["sensors"]``) when the recorder read this snapshot.
+
+    11-19: a gripper BOX that drops out (unplugged, powered off) leaves its last values in the recorder's
+    BOX_LIVE, which keeps coming at 10 Hz; the gateway's ``active``/``updatedAt`` only say the recorder still
+    sends. ``status.sensor_status`` says when each sensor last delivered. Without it nothing is judged."""
+    table = (snapshot.get("status") or {}).get("sensor_status")
+    if not isinstance(table, dict) or not table:
+        return "", None
+    oldest = 0.0
+    for sid in sensors:
+        row = table.get(sid)
+        if not isinstance(row, dict):
+            return f"the BOX reports no status for {sid}", None
+        age = row.get("last_seen_age_s")
+        if not row.get("seen") or age is None:
+            return f"{sid} has sent nothing since Connect", None
+        age = float(age)
+        oldest = max(oldest, age)
+        if age > BOX_SENSOR_STALE_S or row.get("fresh") is False:
+            return f"{sid}: last sample {age:.1f} s ago (limit {BOX_SENSOR_STALE_S:g} s)", age
+    return "", oldest
+
+
 class LiveInputs:
     """The recorder's frame bus and BOX_LIVE snapshot (through the gateway), for one policy contract."""
 
@@ -514,6 +542,11 @@ class LiveInputs:
         width_i = next((i for i, n in enumerate(names) if n.endswith(rd.WIDTH_SUFFIX)), None)
         if width_i is None:
             raise RuntimeError(f"the live BOX state has no {rd.WIDTH_SUFFIX}")
+        used = [prefix + "box_gripper"] + ([prefix + "box_six_d_force"] if self.contract.wrench_names else [])
+        problem, data_age = box_sensor_problem(snapshot, used)
+        if problem:
+            raise RuntimeError(f"the arm's gripper BOX {self.box_id} is not streaming ({problem}): "
+                               "disconnected or powered off? Its last values are not used")
         wrench = None
         if self.contract.wrench_names:
             six = snapshot["sensors"].get(prefix + "box_six_d_force") or {}
@@ -522,7 +555,8 @@ class LiveInputs:
                 raise RuntimeError(f"no live external wrench for BOX {self.box_id}: {six.get('external_note') or 'no 6D reading'}")
             wrench = np.asarray(ext[:6], dtype=np.float64)
         payload = payload or {}
-        return float(values[width_i]), wrench, {"updatedAt": payload.get("updatedAt"), "staleS": payload.get("staleS")}
+        return float(values[width_i]), wrench, {"updatedAt": payload.get("updatedAt"), "staleS": payload.get("staleS"),
+                                                "dataAgeS": data_age}
 
 
 def read_arm_joints(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
@@ -678,6 +712,8 @@ def preview(
             width, wrench, box_meta = live.box()
         except Exception as exc:  # noqa: BLE001 -- the page shows it and the loop keeps trying
             progress(event="wait", error=str(exc))
+            # no prediction from these inputs: the page must not keep showing the last one as current
+            (record_dir / "latest.json").write_text(json.dumps({"time": _now(), "blocked": str(exc)}), encoding="utf-8")
             time.sleep(1.0)
             continue
         cropped = {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras}
@@ -806,8 +842,10 @@ def execute(
         images, t_img, meta = live.frames_since(min_t)
         width, wrench, box_meta = live.box()
         updated = box_meta.get("updatedAt")
-        meta = {**meta, "box": box_meta,
-                "box_stale_s": None if updated is None else max(0.0, time.time() - float(updated))}
+        stale = None if updated is None else max(0.0, time.time() - float(updated))
+        if stale is not None and box_meta.get("dataAgeS") is not None:
+            stale += float(box_meta["dataAgeS"])  # the BOX's own sample was this old when the recorder sent it
+        meta = {**meta, "box": box_meta, "box_stale_s": stale}
         return rx.Observation(t_img, {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras},
                               width, wrench, meta)
 

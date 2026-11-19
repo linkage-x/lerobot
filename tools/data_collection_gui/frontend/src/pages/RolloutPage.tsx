@@ -148,6 +148,13 @@ function PreviewLive({ record, running }: { record: string; running: boolean }) 
   const targets = latest.targets_tcp_mm ?? [];
   const plan = latest.plan;
   const joints = latest.joints;
+  if (latest.blocked) {
+    return (
+      <div className="rollout-live">
+        <p className="command-error">Preview blocked, no prediction: {latest.blocked}</p>
+      </div>
+    );
+  }
   return (
     <div className="rollout-live">
       {latest.step != null ? (
