@@ -196,11 +196,18 @@ _SEED_NUDGES = (
 )
 
 
+#: ``ik_retry(early_exit=True)`` (a control loop's plan) gives each try this many iterations, not 400. 11-19: of the
+#: 864 targets of every chunk executed that day, 861 converged within 40 iterations from the observed posture and
+#: the other 3 not within 400; those 400 (one pose holds the whole batch) took 138 ms and the chunk came 8 steps late.
+EARLY_EXIT_ITERS = 60
+
+
 def ik_retry(
     arm: Arm, T_target: np.ndarray, seed: np.ndarray, *, early_exit: bool = False, rest: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """``ik`` from the seed, then from each of _SEED_NUDGES for the poses still not converged (``rest`` as in
-    ``ik``; a nudged try keeps pulling toward the un-nudged ``rest``)."""
+    ``ik``; a nudged try keeps pulling toward the un-nudged ``rest``). With ``early_exit`` each try has
+    EARLY_EXIT_ITERS iterations."""
     seeds = np.array(np.broadcast_to(seed, (len(T_target), 7)), dtype=np.float64)
     rests = None if rest is None else np.array(np.broadcast_to(rest, seeds.shape), dtype=np.float64)
     q = np.zeros_like(seeds)
@@ -211,7 +218,7 @@ def ik_retry(
             break
         q_try, ok_try = ik(
             arm, T_target[todo], np.clip(seeds[todo] + nudge, Q_LOWER, Q_UPPER), early_exit=early_exit,
-            rest=None if rests is None else rests[todo],
+            rest=None if rests is None else rests[todo], iters=EARLY_EXIT_ITERS if early_exit else 400,
         )
         q[todo], ok[todo] = q_try, ok_try
     return q, ok

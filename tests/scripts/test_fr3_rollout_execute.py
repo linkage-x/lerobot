@@ -668,6 +668,22 @@ def test_ik_early_exit_converges_to_the_posture_nearest_the_seed():
     assert np.abs(np.diff(q_fast, axis=0)).max() < 0.03
 
 
+def test_an_unreachable_target_does_not_hold_a_plan_up_for_the_whole_iteration_budget():
+    """11-19 (163001): 3 targets that never converged kept a 32-target batch iterating 400 times (138 ms)."""
+    import time
+
+    targets = np.repeat(kin.NOMINAL.fk(Q0[None]), 32, axis=0)
+    targets[-3:, 0, 3] += 2.0  # 2 m away: out of reach
+    t = time.perf_counter()
+    _, ok = kin.ik_retry(kin.NOMINAL, targets, Q0, early_exit=True, rest=Q0)
+    fast = time.perf_counter() - t
+    t = time.perf_counter()
+    kin.ik(kin.NOMINAL, targets, Q0, early_exit=True, rest=Q0)  # one try at the full 400
+    full = time.perf_counter() - t
+    assert ok[:-3].all() and not ok[-3:].any()
+    assert fast < full  # five tries at EARLY_EXIT_ITERS cost less than one at 400
+
+
 def test_ik_for_execution_holds_the_posture_it_starts_from():
     """11-18 execute_20261118_171718: the arm stood at the wrist near j6 = pi, j5/j7 away from their middles; the
     first target, 1.3 mm off, moved j5 by 0.149 rad toward the middle and the chunk was refused. With the seed as
