@@ -292,12 +292,9 @@ class SharedPoseHistory:
         self.span_s, self.capacity = float(span_s), int(capacity)
         self.owner = name is None
         size = 16 + 8 * self.capacity * (1 + 16 + 7)
+        # a spawned reader shares the owner's resource tracker: its attach registers the same name again (a
+        # set) and the owner's unlink unregisters it; unregistering here would drop the owner's entry
         self.shm = shared_memory.SharedMemory(name=name, create=self.owner, size=size if self.owner else 0)
-        if not self.owner:  # Python < 3.13 tracks an attached block too and would unlink it when this process ends
-            with contextlib.suppress(Exception):
-                from multiprocessing import resource_tracker
-
-                resource_tracker.unregister(self.shm._name, "shared_memory")  # noqa: SLF001
         buf, n = self.shm.buf, self.capacity
         self._head = np.ndarray((2,), dtype=np.int64, buffer=buf, offset=0)  # sequence, entries written
         self._t = np.ndarray((n,), dtype=np.float64, buffer=buf, offset=16)
