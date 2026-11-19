@@ -135,3 +135,16 @@ def test_for_checkpoint_refuses_a_missing_or_different_export(tmp_path):
         rd.for_checkpoint(prov, _contract(), tmp_path)
     with pytest.raises(rd.DistributionError, match="names no training export"):
         rd.for_checkpoint({}, _contract(), tmp_path)
+
+
+def test_a_dev_gateway_finds_the_export_in_productions_tree(tmp_path, monkeypatch):
+    prov = {"exports": [{"name": "exp_c", "episodes": 6, "frames": 900}], "workspace": {"frame": "w"}}
+    production = tmp_path / "production" / "outputs" / "exports"
+    _export(production / "exp_c", 6, 900)
+    monkeypatch.delenv(rd.PRODUCTION_EXPORTS_ENV, raising=False)
+    with pytest.raises(rd.DistributionError, match="not on this machine"):
+        rd._export_root(prov["exports"][0], tmp_path / "dev")
+    monkeypatch.setenv(rd.PRODUCTION_EXPORTS_ENV, str(production))
+    assert rd._export_root(prov["exports"][0], tmp_path / "dev") == production / "exp_c"
+    _export(tmp_path / "dev" / "outputs" / "exports" / "exp_c", 6, 900)  # its own copy comes first
+    assert rd._export_root(prov["exports"][0], tmp_path / "dev") == tmp_path / "dev" / "outputs" / "exports" / "exp_c"

@@ -266,6 +266,12 @@ if [[ -n "$sandbox" ]]; then
       rsync -a --ignore-existing --link-dest="$production_dir/outputs/training/runs/" \
         "$production_dir/outputs/training/runs/" "$repo_dir/outputs/training/runs/"
     fi
+    # ... and the training distributions production already built from their exports (small, keyed by
+    # checkpoint and export content, so a cached one is the same one the dev side would build).
+    if [[ -d "$production_dir/outputs/rollout/distribution" ]]; then
+      mkdir -p "$repo_dir/outputs/rollout/distribution"
+      cp -an "$production_dir/outputs/rollout/distribution/." "$repo_dir/outputs/rollout/distribution/"
+    fi
   elif [[ ! -e "$repo_dir/outputs/calibration" ]]; then
     echo "    first deploy: copying production calibration into the sandbox..."
     cp -a "$production_dir/outputs/calibration" "$repo_dir/outputs/calibration"
@@ -482,6 +488,8 @@ sandbox_args=()
 if [[ "$dev" == true ]]; then
   sandbox_args=(--dev --hardware-lease "$production_dir/outputs/hardware_lease.json"
                 --production-url "http://127.0.0.1:${production_port}")
+  # the Rollout plan check's training distribution reads production's exports (read-only, never copied)
+  gateway_env+=(LEROBOT_PRODUCTION_EXPORTS="$production_dir/outputs/exports")
 elif [[ -n "$sandbox" ]]; then
   sandbox_args=(--sandbox "$sandbox")
 fi

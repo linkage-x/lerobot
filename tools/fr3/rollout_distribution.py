@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -302,8 +303,17 @@ def _holdout_check(dist: Distribution, holdout: Sequence[Episode], fps: float, o
 # ------------------------------------------------------- from a checkpoint ---
 
 
+# A dev gateway (run/deploy.sh --dev) reads the training exports in production's tree, read-only: they are
+# gigabytes, and a hard-linked copy would share the files a dev-side rewrite changes in place.
+PRODUCTION_EXPORTS_ENV = "LEROBOT_PRODUCTION_EXPORTS"
+
+
 def _export_root(entry: dict[str, Any], repo_root: Path) -> Path:
-    for candidate in (Path(str(entry.get("root") or "")), repo_root / "outputs" / "exports" / str(entry.get("name") or "")):
+    name = str(entry.get("name") or "")
+    candidates = [Path(str(entry.get("root") or "")), repo_root / "outputs" / "exports" / name]
+    if os.environ.get(PRODUCTION_EXPORTS_ENV):
+        candidates.append(Path(os.environ[PRODUCTION_EXPORTS_ENV]) / name)
+    for candidate in candidates:
         if candidate.name and (candidate / "meta" / "info.json").is_file():
             return candidate
     raise DistributionError(f"the training export {entry.get('name')!r} is not on this machine "
