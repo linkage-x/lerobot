@@ -512,29 +512,6 @@ class RolloutManager:
         except (OSError, ValueError):
             return {}
 
-    def live_image(self, camera: str, frame_bus: str = INFERENCE_FRAME_BUS, width: int = 480) -> bytes:
-        """The recorder's newest frame of ``camera`` as a JPEG, read from its frame bus (shared memory: it never
-        opens a camera). 11-19: the page's picture came only from a running preview's record, so it froze when
-        the preview ended and never moved during an execution."""
-        if not re.fullmatch(r"cam_\d{2}", camera or ""):
-            raise RolloutError(f"not a camera: {camera!r}")
-        if not self.recorder_busy():
-            raise RolloutError("the recorder is not connected")
-        import cv2  # local: only this picture needs it
-
-        from tools.thor.gmsl2.online_sync_frame_client import ThorOnlineSyncFrameClient
-
-        cluster = ThorOnlineSyncFrameClient(frame_bus, cameras=[camera]).get_latest(timeout_s=0.5)
-        if cluster is None or camera not in cluster.frames:
-            raise RolloutError(f"no {camera} frame on the recorder's frame bus")
-        rgb = cluster.frames[camera].as_rgb()
-        h, w = rgb.shape[:2]
-        small = cv2.resize(rgb, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(small, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ok:
-            raise RolloutError(f"{camera}: JPEG encoding failed")
-        return buf.tobytes()
-
     def preview_image(self, record: str) -> bytes:
         p = Path(record).resolve()
         if (self.root / "records").resolve() not in p.parents:

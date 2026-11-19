@@ -148,7 +148,6 @@ export const rolloutApi = {
   log: (job: string) => call<{ lines: string[] }>(`/api/rollout/log?${q({ job })}`).then((r) => r.lines),
   latest: (record: string) => call<PreviewLatest>(`/api/rollout/preview-latest?${q({ record })}`),
   previewImageUrl: (record: string, tick: number) => `${base}/api/rollout/preview.jpg?${q({ record, t: String(tick) })}`,
-  liveImageUrl: (camera: string, tick: number) => `${base}/api/rollout/live.jpg?${q({ camera, t: String(tick) })}`,
   offline: (checkpoint: string, exportName: string, episodes: number[], stride: number) =>
     call<{ job: RolloutJob }>("/api/rollout/offline", { checkpoint, export: exportName, episodes, stride }),
   preview: (checkpoint: string, arm: string, rate: number, readJoints: boolean) =>
