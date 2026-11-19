@@ -55,6 +55,7 @@ class FakeArm:
         self.cmd = self.q.copy()
         self.t = clock()
         self.f_ext = f_ext or (lambda t: np.zeros(6))
+        self.bias = 0.05
         self.started = self.stopped = False
         self.commands: list[np.ndarray] = []
 
@@ -70,7 +71,8 @@ class FakeArm:
 
     def read(self):
         self._advance()
-        return self.q.copy(), self.dq.copy(), np.asarray(self.f_ext(self.clock()), dtype=float)
+        # + a small constant: a real estimate is never exactly 0 (exactly 0 means no estimate, which stops a run)
+        return self.q.copy(), self.dq.copy(), np.asarray(self.f_ext(self.clock()), dtype=float) + self.bias
 
     def start(self, q):
         self.started = True
@@ -301,7 +303,73 @@ def test_retime_keeps_the_policys_timing_unless_a_joint_needs_longer():
     assert off[5] > 5 / 30
     q[3:, 0] += 0.06  # step 3 asks 0.07 rad in 33 ms
     off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
-    assert np.diff(off)[2] > 1.4 / 30 and np.diff(off)[0] == pytest.approx(1 / 30)
+    h = np.diff(off)
+    assert h[2] > 1.4 / 30  # the fast step itself
+    assert 1 / 30 < h[1] < h[2]  # and the arm speeds up into it within STOP_ACCELERATION, not in one knot
+
+
+def test_a_sharp_change_of_direction_is_passed_slowly_or_ends_the_chunk_before_it():
+    """11-19 (160814): j2 through 0, the IK turned j1 around at 29 rad/s² under every speed limit."""
+    dt = 1 / 30
+    smooth = np.zeros((12, 7))
+    smooth[:, 0] = 0.02 * np.arange(12)  # 0.6 rad/s, straight on
+    assert np.isinf(rx.turn_speed_cap(smooth)[1:-1]).all() or (rx.turn_speed_cap(smooth)[1:-1] > 1e3).all()
+    np.testing.assert_allclose(np.diff(rx.retime(smooth, dt, rx.Limits(), still_start=False, end=0))[:8], dt, atol=1e-9)
+
+    turn = smooth.copy()
+    turn[6:, 0] = turn[5, 0] - 0.008 * np.arange(1, 7)  # turns from +0.6 to -0.24 rad/s at step 5
+    a = np.abs(turn[6, 0] - 2 * turn[5, 0] + turn[4, 0]) / dt**2  # 25 rad/s², over STOP_ACCELERATION (7.5)
+    cap = rx.turn_speed_cap(turn)[5]
+    assert cap * dt == pytest.approx(np.sqrt(rx.STOP_ACCELERATION[0] / (a * dt * dt)) * dt)
+    h = np.diff(rx.retime(turn, dt, rx.Limits(), still_start=False, end=0))
+    assert h[4] > dt and h[5] > dt  # slowed into and out of the turn
+    T = np.repeat(np.eye(4)[None], 12, axis=0)
+    ok, why = rx.assess(T, turn, np.ones(11, bool), [""] * 11, rx.Limits(), dt=dt)
+    assert ok[:6].all() and ok[5]  # x1.8 slowed: within step_stretch_max, run through slowly
+    sharp = smooth.copy()
+    sharp[6:, 0] = sharp[5, 0] - 0.03 * np.arange(1, 7)  # +0.6 to -0.9 rad/s: x2.6 slowed
+    ok, why = rx.assess(T, sharp, np.ones(11, bool), [""] * 11, rx.Limits(), dt=dt)
+    assert ok[:6].all() and not ok[6] and "changes direction at step 5" in why[6] and "j1" in why[6]
+
+
+def test_a_stop_brakes_every_joint_to_rest_together_then_holds():
+    v0 = np.array([2.0, -1.0, 0.0, 0.0, 3.0, 0.0, 0.0])
+    dur, at = rx.stop_motion(np.zeros(7), v0)
+    assert pytest.approx(3.0 / 15.0) == dur  # the joint that needs longest (j5, 3 rad/s), at its rating
+    _, dq_mid = at(dur / 2)
+    np.testing.assert_allclose(dq_mid, v0 / 2)  # together: the direction of motion kept
+    q_end, dq_end = at(dur + 1.0)
+    np.testing.assert_allclose(dq_end, 0.0)
+    np.testing.assert_allclose(q_end, v0 * dur / 2)
+    assert rx.stop_motion(np.ones(7), np.zeros(7))[0] == 0.0
+
+
+def test_a_stop_in_motion_brakes_instead_of_stepping_the_speed_to_zero():
+    ticks = []
+    result, _, _ = _run(replace(rx.STAGES[2], max_s=2.0), f_ext=lambda t: np.array([0, 0, 20.0 if t > 1000.6 else 0.0, 0, 0, 0]),
+                        record=lambda item: ticks.append(item["tick"]) if "tick" in item else None)
+    assert "external force" in result.stopped
+    hold = np.array([t["q_cmd"] for t in ticks if t.get("phase") == 2])
+    steps = np.abs(np.diff(hold, axis=0)).max(axis=1)
+    assert steps[0] > 0 and steps[-1] == 0.0  # the command still moves right after the stop (braking), then stands
+
+
+def test_no_external_force_estimate_refuses_the_start_and_one_that_goes_silent_stops():
+    def silent_arm(clock, f_ext=None):
+        arm = FakeArm(clock, f_ext=f_ext)
+        arm.bias = 0.0
+        return arm
+
+    result, arm, _ = _run(rx.STAGES[2], arm_cls=silent_arm)
+    assert "no external force estimate" in result.stopped and not arm.started
+
+    class GoesSilent(FakeArm):
+        def read(self):
+            q, dq, f = super().read()
+            return q, dq, (np.zeros(6) if self.clock() > 1000.5 else f)
+
+    result, arm, _ = _run(replace(rx.STAGES[2], max_s=2.0), arm_cls=GoesSilent)
+    assert "read exactly 0" in result.stopped and arm.started
 
 
 def test_the_command_passes_every_step_with_continuous_speed_never_over_the_limit():

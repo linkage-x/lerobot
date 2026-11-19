@@ -160,7 +160,8 @@ STEP_MM_CEILING = 40.0  # 1.2 m/s, whatever the data says: well under the FR3's 
 STEP_DEG_CEILING = 8.0  # 240 deg/s
 LOOP_HZ = 200.0
 FORCE_WINDOW_S = 0.05  # Limits.force_n is held against O_F_ext averaged over this long
-HOLD_S = 0.5  # the controller holds the last command this long after a stop, then lets go
+HOLD_S = 0.5  # after a stop the arm brakes to rest (stop_motion), is held there this long, then let go
+FORCE_SILENT_S = 0.1  # O_F_ext_hat_K exactly 0 this long while running: the force estimate is gone, stop
 GRIPPER_CLOSE_BELOW_M = 0.050  # replay's grasp: below this the jaw is sent to 0 (squeeze, as in the demos)
 GRIPPER_OPEN_ABOVE_M = 0.060  # hysteresis: back open only above this
 GRIPPER_LEAD_S = 0.20  # the jaw lags its command; the width of 0.2 s ahead is what is sent
@@ -429,6 +430,41 @@ def _segment_peak_speeds(q: np.ndarray, h: np.ndarray, m: np.ndarray) -> np.ndar
 FR3_ACCELERATION_LIMITS = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0])
 STOP_ACCELERATION = 0.5 * FR3_ACCELERATION_LIMITS  # also the start of a first chunk, from rest
 BRAKE_SHARE = 0.4  # the speed profile plans with this share of it: the cubic between steps adds up to ~2x
+STEP_DT = 1.0 / 30.0  # a policy step when nothing else says (fps / frame_stride of every checkpoint so far)
+
+
+def turn_speed_cap(q: np.ndarray) -> np.ndarray:
+    """(n,) the fastest each knot may be passed, in steps/s, for the joints' change of direction there to stay
+    within STOP_ACCELERATION: along a fixed path a joint's acceleration is q''·ṡ² + q'·s̈, and q'' (rad/step²,
+    the second difference of the steps) is the part a speed cap alone never bounds (inf where not judged).
+
+    11-19 (execute_20261119_160814): the policy's path took j2 through 0, where j1 and j3 are collinear; the IK
+    turned j1 from +0.85 to -1.16 rad/s within 70 ms (29 rad/s², twice the FR3's rating) under every speed
+    limit. The arm overshot the command to 2.05 rad/s. Commands of normal runs stay within ~0.5x the rating."""
+    n = len(q)
+    cap = np.full(n, np.inf)
+    if n >= 3:
+        d2 = np.abs(q[2:] - 2.0 * q[1:-1] + q[:-2])
+        cap[1:-1] = np.sqrt((STOP_ACCELERATION / np.maximum(d2, 1e-12)).min(axis=1))
+    return cap
+
+
+def stop_motion(q0: np.ndarray, v0: np.ndarray, accel: np.ndarray = FR3_ACCELERATION_LIMITS):
+    """(duration, at(t) -> (q, dq)): every joint brakes from ``v0`` to rest together, along the current direction
+    in joint space, the joint that needs it longest at its rated deceleration; then holds where it stopped.
+
+    11-19 (execute_20261119_160814): a stop held the measured joints with a zero speed while j1/j3 turned at
+    2 rad/s; the impedance let the arm run 0.15 rad past and threw it back to 2.58 rad/s, and the robot's own
+    velocity reflex aborted. A stop is a braking trajectory, not a step in the commanded speed."""
+    q0, v0 = np.asarray(q0, dtype=np.float64), np.asarray(v0, dtype=np.float64)
+    T = float(np.max(np.abs(v0) / accel))
+
+    def at(t: float) -> tuple[np.ndarray, np.ndarray]:
+        if T <= 0.0 or t >= T:
+            return q0 + 0.5 * v0 * T, np.zeros(7)
+        return q0 + v0 * (t - 0.5 * t * t / T), v0 * (1.0 - t / T)
+
+    return T, at
 
 
 def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: int) -> np.ndarray:
@@ -455,6 +491,7 @@ def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: 
     w = np.empty(n)
     w[0], w[-1] = seg_cap[0], seg_cap[-1]
     w[1:-1] = np.minimum(seg_cap[:-1], seg_cap[1:])
+    w = np.minimum(w, turn_speed_cap(q))  # a sharp change of direction is passed slowly (the passes ramp to it)
     last = end if 0 < end < n else n - 1
     if 0 < end < n:
         w[end] = 0.0
@@ -462,8 +499,8 @@ def retime(q: np.ndarray, dt: float, limits: Limits, *, still_start: bool, end: 
             w[k] = min(w[k], math.sqrt(w[k + 1] ** 2 + 2.0 * alpha[k]))
     if still_start:
         w[0] = 0.0
-        for k in range(last):
-            w[k + 1] = min(w[k + 1], math.sqrt(w[k] ** 2 + 2.0 * alpha[k]))
+    for k in range(last):  # from a still start, and out of every slow knot: within the acceleration
+        w[k + 1] = min(w[k + 1], math.sqrt(w[k] ** 2 + 2.0 * alpha[k]))
     h = np.empty(n - 1)
     for k in range(n - 1):
         mean = (w[k] + w[k + 1]) / 2.0  # never above seg_cap[k]: both ends are capped by it
@@ -620,15 +657,19 @@ def assess(
     plan_why: list[str],
     limits: Limits,
     gap: np.ndarray | None = None,
+    dt: float = STEP_DT,
 ) -> tuple[np.ndarray, list[str]]:
     """Per step (0 = anchor): may it be commanded? A step fails on the plan check or on a STEP limit
     against the step before it, and every step after a failed one fails with it. ``gap`` (per target, m):
     the arm's clearance to the carts/table/cameras there; closer than ``near_clearance_m`` the step limit
-    is ``near_step_mm``."""
+    is ``near_step_mm``. A step after a turn that could only be passed slowed more than ``step_stretch_max``
+    (turn_speed_cap) fails too: the chunk then ends at rest on the turn instead of running through it. The
+    turns at the anchor and step 1 are not judged (the anchor is measured; a first chunk starts from rest)."""
     n = len(q)
     ok = np.ones(n, dtype=bool)
     why = [""] * n
     rep = reposture(q)
+    turn = turn_speed_cap(q)
     for k in range(1, n):
         reason = ""
         if not ok[k - 1]:
@@ -651,6 +692,12 @@ def assess(
                 reason = (f"step {k}: j{j + 1} moves {abs(q[k][j] - q[k - 1][j]):.3f} rad in one step "
                           f"(limit {limits.step_joint_rad * JOINT_SCALE[j]:.3f} x{limits.step_stretch_max:g} "
                           "slowed down; an IK branch change?)")
+            elif k >= 3 and 1.0 / (dt * turn[k - 1]) > limits.step_stretch_max:
+                d2 = np.abs(q[k] - 2.0 * q[k - 1] + q[k - 2]) / (dt * dt)
+                j = int((d2 / STOP_ACCELERATION).argmax())
+                reason = (f"step {k}: j{j + 1} changes direction at step {k - 1} by {d2[j]:.0f} rad/s² at the policy's "
+                          f"speed; within {STOP_ACCELERATION[j]:g} it would need x{1.0 / (dt * turn[k - 1]):.1f} slowed "
+                          f"(limit x{limits.step_stretch_max:g}; a singularity, e.g. j2 near 0?)")
             elif rep[k] > limits.reposture_rad:
                 reason = (f"step {k}: the arm re-postures {rep[k]:.3f} rad beyond what the TCP's motion needs "
                           f"(limit {limits.reposture_rad:g}; an IK branch change)")
@@ -952,7 +999,7 @@ class Predictor:
         q = np.concatenate([self.history.q_at(obs.t_img)[None], plan["q"]])
         gap = plan.get("env_gap_m")
         ok, why = assess(T, q, np.asarray(plan["ok"], dtype=bool), list(plan["why"]), L,
-                         None if gap is None else np.asarray(gap, dtype=float))
+                         None if gap is None else np.asarray(gap, dtype=float), dt=self.c.step_s)
         self._phase("chunk")
         chunk = Chunk(self.count, obs.t_img, obs.t_img, self.c.step_s, T, q, ok, why, actions[:H, rt.POSE_DIM].copy())
         self.count += 1
@@ -1167,11 +1214,17 @@ def run_loop(
         return RunResult(refusal, False, 0, 0.0, 0, 0.0)
     t_start = clock()
     # a short still history before anything is asked: the first observation's history is "standing still"
+    still_forces = []
     for _ in range(max(3, int(0.15 * loop_hz))):
-        q, dq, _ = arm.read()
+        q, dq, f = arm.read()
         history.add(clock(), fk_tcp(q), q)
+        still_forces.append(np.asarray(f, dtype=np.float64))
         sleep(period)
+    if not np.any(still_forces):  # an estimate always carries noise; exactly 0 throughout is no estimate
+        return RunResult(f"the arm reports no external force estimate (O_F_ext_hat_K exactly 0 on all {len(still_forces)} "
+                         "reads standing still): the force stop would be blind; nothing moved", False, 0, clock() - t_start, 0, 0.0)
     q_cmd = q.copy()
+    dq_cmd = np.zeros(7)
     T_cmd = fk_tcp(q_cmd)
     arm.start(q_cmd)
     chunk: Chunk | None = None
@@ -1192,6 +1245,7 @@ def run_loop(
     pending = True
     replan_at = max(1, n_exec - 6)  # updated from each chunk's measured lateness
     f_window: deque[np.ndarray] = deque(maxlen=max(1, round(FORCE_WINDOW_S * loop_hz)))
+    silent = 0  # ticks in a row with O_F_ext_hat_K exactly 0
     try:
         while True:
             now = clock()
@@ -1203,6 +1257,10 @@ def run_loop(
             if why:
                 break
             f_window.append(np.asarray(f_ext, dtype=np.float64))
+            silent = 0 if np.any(f_ext) else silent + 1
+            if silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
+                why, kind = f"the external force estimate read exactly 0 for {silent} ticks: the force stop is blind", "force"
+                break
             if ticks > 0:
                 kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=T_meas, T_cmd=T_cmd, loop_dt=loop_dt,
                                    limits=limits, wall_lower=wall_lower, wall_upper=wall_upper,
@@ -1249,7 +1307,8 @@ def run_loop(
                 accepted += 1
                 replan_at = max(1, n_exec - max(0, new.k0 - 1))
             if chunk is None:
-                arm.command(q_cmd, np.zeros(7))
+                dq_cmd = np.zeros(7)
+                arm.command(q_cmd, dq_cmd)
             else:
                 if previous is not None and now < blend_to:
                     q_cmd, dq_cmd = blend(previous, chunk, now, blend_from, blend_to)
@@ -1286,16 +1345,19 @@ def run_loop(
     except Exception as exc:  # noqa: BLE001 -- a robot error ends the run; the hold below still runs
         why, kind = f"{type(exc).__name__}: {exc}", "robot"
     finally:
-        # hold: the last validated command, or where the arm is after contact, tracking or a robot error
+        # brake to rest (stop_motion) from the last validated command, or from where the arm is and how it
+        # moves after contact, tracking, speed or a robot error; then hold there
         busy, since = predictor.busy
         if record and busy:
             record({"event": {"kind": "predictor", "t": clock(), "phase": busy, "since": since}})
         try:
-            q, _, _ = arm.read()
-            q_hold = q if kind in HOLD_MEASURED else q_cmd
+            q, dq, _ = arm.read()
+            q0, v0 = (q, dq) if kind in HOLD_MEASURED else (q_cmd, dq_cmd)
+            t_brake, brake = stop_motion(q0, v0)
             t_hold = clock()
-            while clock() - t_hold < HOLD_S:
-                arm.command(q_hold, np.zeros(7))
+            while clock() - t_hold < t_brake + HOLD_S:
+                q_hold, dq_hold = brake(clock() - t_hold)
+                arm.command(q_hold, dq_hold)
                 if record:  # what the arm did after the stop (phase 2): an overshoot shows here
                     qh, dqh, fh = arm.read()
                     record({"tick": {"t": clock(), "q": qh, "dq": dqh, "f_ext": fh, "q_cmd": q_hold.copy(),
@@ -1438,5 +1500,7 @@ def stage_dict(stage: Stage, limits: Limits) -> dict[str, Any]:
                         "lead_s": GRIPPER_LEAD_S, "min_interval_s": GRIPPER_MIN_INTERVAL_S},
             "joint_stiffness": JOINT_STIFFNESS.tolist(), "joint_damping": JOINT_DAMPING.tolist(),
             "step_filter": "smooth_steps: [1, 2, 1] / 4 over the predicted poses before IK and every check",
-            "force_window_s": FORCE_WINDOW_S,
+            "force_window_s": FORCE_WINDOW_S, "force_silent_s": FORCE_SILENT_S,
+            "stop": "brake to rest together at the rated deceleration (stop_motion), then hold",
+            "turns": "a knot is passed within STOP_ACCELERATION of change of direction (turn_speed_cap)",
             "time_convention": TIME_CONVENTION}

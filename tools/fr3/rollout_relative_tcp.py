@@ -238,6 +238,8 @@ def arm_tcp_tool(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
 class PlanContext:
     """What the execution plan check needs about one arm, read once: tool frame, edge, workspace, scene."""
 
+    step_s = 1.0 / 30.0  # a policy step (the contract's, when given)
+
     def __init__(self, arm: str, workspace: dict[str, Any] | None, repo_root: Path = _REPO_ROOT, *,
                  provenance: dict[str, Any] | None = None, contract: rt.PolicyContract | None = None):
         from tools.fr3 import (
@@ -251,6 +253,8 @@ class PlanContext:
         self.arm = arm
         self.kin = kin
         self.col = col
+        if contract is not None:
+            self.step_s = contract.step_s
         self.problems: list[str] = []
         self.T_tool = arm_tcp_tool(arm, repo_root=repo_root)
         self.base = fr3_arms.base_world_id(arm)
@@ -373,7 +377,7 @@ class PlanContext:
         dist = self.distribution
         limits = rx.Limits(**rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0]))) if dist else rx.Limits()
         steps_ok, steps_why = rx.assess(np.concatenate([T_obs[None], ev["T"]]), np.concatenate([q_obs[None], ev["q"]]),
-                                        ev["ok"], ev["why"], limits, gap)
+                                        ev["ok"], ev["why"], limits, gap, dt=self.step_s)
         need = n_exec if 0 < n_exec <= len(ok) else len(ok)
         step_limit = next((steps_why[k] for k in range(1, need + 1) if not steps_ok[k] and ev["ok"][k - 1]), "")
         reasons = list(self.problems)
