@@ -330,3 +330,28 @@ def test_live_jobs_wait_until_the_recorder_has_brought_every_sensor_up(tmp_path)
     assert manager.status()["recorder"]["ready"]
     manager.start_preview(ckpt, "right", 2.0, False)
     assert spawned
+
+
+def test_the_live_picture_is_the_recorders_newest_frame_and_needs_it_connected(tmp_path: Path) -> None:
+    import json
+
+    bus = tmp_path / "bus"
+    bus.mkdir()
+    w, h = 64, 36
+    (bus / "slot0_cam_10.nv12").write_bytes(bytes([128]) * (w * h * 3 // 2))
+    (bus / "latest_cluster.json").write_text(json.dumps({
+        "version": 1, "publish_seq": 7, "slot": 0, "recording": False, "episode_index": -1, "logical_frame_index": 7,
+        "sync_source": "sof_tsc_ns", "format": "nv12", "width": w, "height": h, "min_sof_tsc_ns": 1, "max_sof_tsc_ns": 1,
+        "max_delta_ns": 0, "cameras": {"cam_10": {"path": str(bus / "slot0_cam_10.nv12"), "camera": "cam_10"}},
+    }))
+    connected = {"on": False}
+    mgr = _manager(tmp_path, recorder_busy=lambda: connected["on"])
+    with pytest.raises(rr.RolloutError, match="not connected"):
+        mgr.live_image("cam_10", frame_bus=str(bus))
+    connected["on"] = True
+    jpg = mgr.live_image("cam_10", frame_bus=str(bus), width=32)
+    assert jpg[:2] == b"\xff\xd8"  # a JPEG
+    with pytest.raises(rr.RolloutError, match="no cam_06 frame"):
+        mgr.live_image("cam_06", frame_bus=str(bus))
+    with pytest.raises(rr.RolloutError, match="not a camera"):
+        mgr.live_image("../etc", frame_bus=str(bus))

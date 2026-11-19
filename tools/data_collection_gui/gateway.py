@@ -21453,8 +21453,8 @@ def _rollout_get(handler: BaseHTTPRequestHandler, state: GatewayState, path: str
             _json_response(handler, HTTPStatus.OK, {"lines": manager.log_tail(arg("job"))})
         elif path == "/api/rollout/preview-latest":
             _json_response(handler, HTTPStatus.OK, manager.preview_latest(arg("record")))
-        elif path == "/api/rollout/preview.jpg":
-            data = manager.preview_image(arg("record"))
+        elif path in ("/api/rollout/preview.jpg", "/api/rollout/live.jpg"):
+            data = manager.preview_image(arg("record")) if path.endswith("preview.jpg") else manager.live_image(arg("camera"))
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", "image/jpeg")
             handler.send_header("Content-Length", str(len(data)))

@@ -127,6 +127,26 @@ function OfflineDetail({ path }: { path: string }) {
   );
 }
 
+/** The recorder's newest frame of each camera, once a second while it is connected for inference (read from
+ * its frame bus: no camera is opened). The preview's own picture is what the policy saw at its last step. */
+function LiveCameras({ cameras }: { cameras: string[] }) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((t) => t + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return (
+    <div className="rollout-live">
+      {cameras.map((cam) => (
+        <figure key={cam} className="rollout-live-camera">
+          <img className="train-preview" alt={`${cam} live`} src={rolloutApi.liveImageUrl(cam, tick)} />
+          <figcaption className="panel-note">{cam} live (the recorder's frame bus, once a second)</figcaption>
+        </figure>
+      ))}
+    </div>
+  );
+}
+
 function PreviewLive({ record, running }: { record: string; running: boolean }) {
   const [latest, setLatest] = useState<PreviewLatest>({});
   const [tick, setTick] = useState(0);
@@ -430,6 +450,7 @@ export function RolloutPage() {
           )}
         </div>
         <ArmGripperPanel embedded arm={arm} />
+        {forInference ? <LiveCameras cameras={openCameras} /> : null}
         {activePreview ? (
           <PreviewLive record={activePreview.out} running={activePreview.state === "running"} />
         ) : null}
