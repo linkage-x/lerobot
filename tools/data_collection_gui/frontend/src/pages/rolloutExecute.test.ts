@@ -50,7 +50,12 @@ describe("recorderConnecting", () => {
   ];
   it("holds Disconnect while the recorder brings its sensors up, counting the ready ones", () => {
     const s = status({ recorder: { state: "connecting", sensors, ready: false, pending: true, failed: false } });
-    expect(recorderConnecting(s)).toEqual({ pending: true, label: "Connecting… 1/2 sensors ready" });
+    expect(recorderConnecting(s)).toEqual({
+      pending: true,
+      stuck: false,
+      label: "Connecting… 1/2 sensors ready",
+      waiting: ["box/gripper"]
+    });
     expect(executeBlockers({ status: s, checkpoint: ckpt, previewReplayed: true })).toEqual([
       "the recorder is still connecting"
     ]);
@@ -60,5 +65,9 @@ describe("recorderConnecting", () => {
     expect(recorderConnecting(status({ recorder: { state: "armed", sensors: ready, ready: true, pending: false, failed: false } })).pending).toBe(false);
     expect(recorderConnecting(status({ recorder: { state: "error", sensors, ready: false, pending: false, failed: true } })).pending).toBe(false);
     expect(recorderConnecting(status({ recorderConnected: false })).pending).toBe(false);
+  });
+  it("lets a connect stuck past the gateway's limit be cancelled, naming what never came up", () => {
+    const s = status({ recorder: { state: "connecting", sensors, ready: false, pending: true, failed: false, stuck: true, elapsedS: 61 } });
+    expect(recorderConnecting(s)).toMatchObject({ pending: true, stuck: true, waiting: ["box/gripper"] });
   });
 });

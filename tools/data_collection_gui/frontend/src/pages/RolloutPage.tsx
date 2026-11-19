@@ -373,8 +373,13 @@ export function RolloutPage() {
             >
               Connect for inference ({ckpt?.cameras.join(", ") || "pick a checkpoint"})
             </button>
+          ) : connecting.stuck ? (
+            <button onClick={() => act(() => rolloutApi.disconnect())}>
+              Cancel connect (not ready after {Math.round(status?.recorder?.elapsedS ?? 0)} s
+              {connecting.waiting.length ? `: ${connecting.waiting.join(", ")}` : ""})
+            </button>
           ) : connecting.pending ? (
-            <button disabled title="Disconnect is available once every camera and BOX streams">
+            <button disabled title="Disconnect is available once every camera and BOX streams (or after 60 s)">
               {connecting.label}
             </button>
           ) : forInference ? (

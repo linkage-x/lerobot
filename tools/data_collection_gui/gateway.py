@@ -21416,7 +21416,9 @@ def _rollout_recorder_sensors(state: GatewayState) -> dict[str, Any]:
         for d in list(state.devices)
         if d.get("kind") in ("camera", "box_collection") and d.get("state") != NOT_OPENED_FOR_INFERENCE
     ]
-    return {"state": state.recording.state, "sensors": sensors}
+    started = state.process_started_at_s
+    elapsed = None if started is None else round(max(0.0, time.monotonic() - started), 1)
+    return {"state": state.recording.state, "sensors": sensors, "elapsedS": elapsed}
 
 
 def _rollout_fci_holder(state: GatewayState) -> str:

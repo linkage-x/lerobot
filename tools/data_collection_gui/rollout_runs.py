@@ -93,6 +93,10 @@ class RolloutJob:
     logOffset: int = 0
 
 
+# A connect that has not brought every sensor up after this long is stuck: the page offers to cancel it.
+CONNECT_STUCK_S = 60.0
+
+
 class RolloutManager:
     def __init__(
         self,
@@ -403,17 +407,24 @@ class RolloutManager:
         """Is every sensor the recorder opened streaming? ``pending`` = still connecting (nothing failed yet).
 
         The recorder says "Episode N ready" only after each camera and BOX it opened came up; until then a
-        job would read no frames, and a Disconnect lands in the middle of the cameras' start.
+        job would read no frames, and the page holds Disconnect -- except when nothing failed yet the connect
+        has taken ``CONNECT_STUCK_S`` (``stuck``): then it may be cancelled.
         """
         if not self.recorder_busy():
-            return {"state": "idle", "sensors": [], "ready": False, "pending": False, "failed": False}
+            return {"state": "idle", "sensors": [], "ready": False, "pending": False, "failed": False,
+                    "stuck": False, "elapsedS": None}
         info = self.recorder_sensors() or {}
         state = str(info.get("state") or "")
         sensors = [dict(s) for s in info.get("sensors") or []]
+        elapsed = info.get("elapsedS")
         failed = state == "error" or any(s.get("state") == "error" for s in sensors)
         pending = not failed and state == "connecting"
         ready = not failed and not pending and all(s.get("state") == "running" for s in sensors)
-        return {"state": state, "sensors": sensors, "ready": ready, "pending": pending, "failed": failed}
+        # a sensor that hangs without saying it failed (Argus stuck, cam_03's buffer timeouts) must not leave
+        # the recorder connected for good: on a dev gateway that also keeps the hardware from going back
+        stuck = pending and elapsed is not None and float(elapsed) >= CONNECT_STUCK_S
+        return {"state": state, "sensors": sensors, "ready": ready, "pending": pending, "failed": failed,
+                "stuck": stuck, "elapsedS": elapsed}
 
     def _require_ready_recorder(self) -> None:
         """Refuse a live job while the recorder is still bringing its sensors up (no frames to read yet).

@@ -316,6 +316,11 @@ def test_live_jobs_wait_until_the_recorder_has_brought_every_sensor_up(tmp_path)
     ckpt = manager.checkpoints()[0]["path"]
     readiness = manager.status()["recorder"]
     assert readiness["pending"] and not readiness["ready"] and not readiness["failed"]
+    assert not readiness["stuck"]  # no elapsed time reported: never called stuck
+    rec["elapsedS"] = rr.CONNECT_STUCK_S - 1
+    assert not manager.status()["recorder"]["stuck"]
+    rec["elapsedS"] = rr.CONNECT_STUCK_S + 1  # hung without failing: the page may cancel it
+    assert manager.status()["recorder"]["stuck"] and manager.status()["recorder"]["pending"]
     with pytest.raises(rr.RolloutError, match=r"still connecting \(not ready yet: box/gripper\)"):
         manager.start_preview(ckpt, "right", 2.0, False)
     assert not spawned

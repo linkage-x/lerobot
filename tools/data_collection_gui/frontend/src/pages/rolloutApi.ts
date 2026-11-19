@@ -24,6 +24,9 @@ export type RecorderReadiness = {
   ready: boolean;
   pending: boolean;
   failed: boolean;
+  // still connecting after the gateway's limit (60 s) with nothing failed: may be cancelled
+  stuck?: boolean;
+  elapsedS?: number | null;
 };
 
 export type RolloutStatus = {
