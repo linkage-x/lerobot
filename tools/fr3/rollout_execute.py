@@ -135,7 +135,10 @@ class Limits:
     # ... and raw, any single tick: an impact is not waited for
     force_peak_n: float = 25.0
     # a measured joint speed no plan here asks for (oscillation, runaway); j5-j7 x JOINT_SCALE
-    joint_speed_rad_s: float = 1.6
+    # 11-19 (a person's decision, 11:40 run): 1.6 sat 7% over the commanded cap (1.5) and the joint impedance's
+    # catch-up runs up to 10% (0.15 rad/s) over its command, which stopped stage 2 at j3 1.64; 1.9 is 73% of
+    # the hardware's 2.62, 27% over anything commanded
+    joint_speed_rad_s: float = 1.9
     # a measured joint within this of panda_py's wall (IK keeps 3 deg; Monitor of fr3_pivot_auto keeps 1)
     wall_deg: float = 1.0
     # inputs: the preview frame bus publishes ~5 Hz (age 60-263 ms measured 11-18); execute() takes 0.15 s on

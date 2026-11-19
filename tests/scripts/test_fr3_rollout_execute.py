@@ -390,9 +390,9 @@ def test_joint_limits_scale_with_each_joints_own_speed_limit():
     kw = {"f_ext": np.zeros(6), "f0": np.zeros(6), "T_meas": np.eye(4), "T_cmd": np.eye(4), "loop_dt": 0.005,
           "limits": rx.Limits(), "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
           "q": np.array([0, 0, 0, -1.5, 0, 1.5, 0.0])}
-    assert rx.tick_problem(dq=np.array([0, 0, 0, 0, 0, 0, 3.0]), **kw) == ("", "")  # j7 under 1.6 x 2.0
+    assert rx.tick_problem(dq=np.array([0, 0, 0, 0, 0, 0, 3.0]), **kw) == ("", "")  # j7 under 1.9 x 2.0
     kind, why = rx.tick_problem(dq=np.array([0, 0, 2.0, 0, 0, 0, 0]), **kw)
-    assert kind == "speed" and "j3 turns at 2.00 rad/s (limit 1.60" in why
+    assert kind == "speed" and "j3 turns at 2.00 rad/s (limit 1.90" in why
 
 
 def test_history_is_read_at_the_observation_instant():
