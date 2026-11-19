@@ -1020,7 +1020,11 @@ class ProcessPredictor:
             if time.monotonic() > deadline:
                 self.close()
                 raise RuntimeError(f"the predictor's process was not ready within {self.ready_timeout_s:g} s")
-        kind, payload = self.conn.recv()
+        try:
+            kind, payload = self.conn.recv()
+        except (EOFError, OSError):  # it ended: poll() sees the closed pipe as readable
+            self.process.join(2.0)
+            raise RuntimeError(f"the predictor's process ended before it was ready (exit code {self.process.exitcode})") from None
         if kind != "ready":
             self.close()
             raise RuntimeError(str(payload))

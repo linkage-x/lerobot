@@ -508,6 +508,21 @@ def test_a_predictor_process_that_cannot_load_says_why_before_anything_moves():
         history.close()
 
 
+def _process_dies(**_kw):
+    import os
+
+    os._exit(3)  # noqa: SLF001 -- a crash while loading (CUDA, a segfault): no message comes back
+
+
+def test_a_predictor_process_that_dies_while_loading_says_so():
+    history = rx.SharedPoseHistory()
+    try:
+        with pytest.raises(RuntimeError, match=r"ended before it was ready \(exit code 3\)"):
+            rx.ProcessPredictor((__name__, "_process_dies", {}), history=history).start()
+    finally:
+        history.close()
+
+
 def test_the_predictor_process_ending_is_a_prediction_error_that_stops_the_run():
     history = rx.SharedPoseHistory()
     pred = rx.ProcessPredictor((__name__, "_process_parts", {"hang_s": 30.0}), history=history)
