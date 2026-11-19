@@ -843,17 +843,21 @@ def test_the_move_to_a_start_refuses_a_moved_arm_and_a_dead_force_estimate_and_b
 
 
 class _StartDist:
-    def __init__(self, T_world: list[np.ndarray]):
+    def __init__(self, T_world: list[np.ndarray], opening: list[np.ndarray] | None = None):
         self.start_p = np.array([T[:3, 3] for T in T_world])
         self.start_q = np.array([rt.matrix_to_quat_xyzw(T[:3, :3]) for T in T_world])
         self.summary = {}
+        self.opening = np.array([rt.matrix_to_pose7(T) for T in opening or []]).reshape(-1, 7)
+
+    def opening_of(self, row):
+        return self.opening
 
     def start_problem(self, T_world, width):
         d = np.linalg.norm(self.start_p - T_world[:3, 3], axis=1).min()
         return "" if d < 0.02 else f"start: {d * 1e3:.0f} mm from any training start"
 
 
-def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0.5)):
+def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0.5), opening=None):
     from tools.fr3 import rollout_relative_tcp as ro
 
     class Model:
@@ -872,7 +876,7 @@ def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0
     plan = object.__new__(ro.PlanContext)
     plan.kin, plan.T_tool, plan.T_base_world = kin, np.eye(4), np.eye(4)
     plan.model, plan.col, plan.obstacles, plan.problems = Model(), Col(), [], []
-    plan.distribution = _StartDist(T_world)
+    plan.distribution = _StartDist(T_world, opening)
     return plan
 
 
@@ -884,7 +888,28 @@ def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singul
     out = plan.plan_to_start(q_now, rng=np.random.default_rng(0))
     assert out["ok"] and out["index"] == 0 and not out["near_shoulder_singularity"]
     np.testing.assert_allclose(_fk(np.array(out["q_goal"]))[:3, 3], T_start[:3, 3], atol=1e-3)
-    assert abs(out["q_goal"][1]) >= 0.25
+    assert abs(out["q_goal"][1]) >= 0.25 and out["room_rad"] >= 0.25
+
+    # 11-19 (170940): standing in the other shoulder branch (j2 ~ 0, j3 near its wall), the start is still
+    # reached in the posture with room in every joint, not the branch the arm happens to be in
+    flipped = np.array([2.14, -0.02, -2.11, -2.09, -0.02, 2.4, 0.8])
+    out = plan.plan_to_start(flipped, rng=np.random.default_rng(0))
+    q_goal = np.array(out["q_goal"])
+    walls = np.minimum(q_goal - kin._WALL_LOWER, kin._WALL_UPPER - q_goal).min()
+    assert out["ok"] and out["room_rad"] >= 0.3 and walls >= 0.3 and abs(q_goal[1]) >= 0.3
+    assert not out["followed_opening"]  # no opening stored: the room at the start
+
+    # with the episode's opening (12 cm down from the start), the room is the smallest along it
+    down = []
+    for k in range(13):
+        T = T_start.copy()
+        T[2, 3] -= 0.01 * k
+        down.append(T)
+    out = _start_plan([T_start], opening=down).plan_to_start(q_now, rng=np.random.default_rng(0))
+    assert out["ok"] and out["followed_opening"] and out["room_rad"] <= out["room_at_start_rad"] + 1e-9
+    away = [T_start] + [T_start @ _shift(2.0)]  # an opening the arm cannot follow
+    out = _start_plan([T_start], opening=away).plan_to_start(q_now, rng=np.random.default_rng(0))
+    assert not out["ok"] and "follow the episode's opening" in out["why"]
 
     blocked = _start_plan([T_start], gap=lambda path: np.linspace(0.3, 0.004, len(path)))
     out = blocked.plan_to_start(q_now, rng=np.random.default_rng(0))
@@ -894,6 +919,12 @@ def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singul
     beyond[5] = -0.2  # past panda_py's wall on j6
     out = plan.plan_to_start(beyond, rng=np.random.default_rng(0))
     assert not out["ok"] and "walls now" in out["why"]
+
+
+def _shift(dx: float) -> np.ndarray:
+    T = np.eye(4)
+    T[0, 3] = dx
+    return T
 
 
 def test_moving_to_a_start_without_attended_loads_nothing_and_moves_nothing(tmp_path: Path, monkeypatch, capsys):

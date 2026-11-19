@@ -46,7 +46,9 @@ FLOOR_STEP_DEG = 2.0
 START_WIDTH_SLACK_M = 0.010
 EARLY_S = 1.0  # an episode's "start": its first second (the hand is still or just leaving)
 SUBSAMPLE = 2  # 60 fps exports -> 30 Hz reference points
-VERSION = 1  # bump when what is computed changes (the cache key carries it)
+VERSION = 2  # bump when what is computed changes (the cache key carries it). 2: the episodes' openings
+OPENING_S = 4.0  # an episode's "opening": its first seconds, the motion a start leads into (the reach, the descent)
+OPENING_HZ = 10.0
 
 
 class DistributionError(RuntimeError):
@@ -97,6 +99,15 @@ class Distribution:
     step_m: np.ndarray  # (H,) step k's largest displacement from the anchor
     step_deg: np.ndarray
     summary: dict[str, Any] = field(default_factory=dict)
+    start_ep: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # (M,) each start's episode
+    opening: np.ndarray = field(default_factory=lambda: np.zeros((0, 7)))  # (K, 7) world TCP, OPENING_S at OPENING_HZ
+    opening_ep: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # (K,) their episode
+
+    def opening_of(self, start_row: int) -> np.ndarray:
+        """(n, 7): the opening of the episode that start row ``start_row`` is from (empty when not stored)."""
+        if not len(self.start_ep):
+            return np.zeros((0, 7))
+        return self.opening[self.opening_ep == self.start_ep[start_row]]
 
     # ------------------------------------------------------------- checks ---
 
@@ -148,7 +159,8 @@ class Distribution:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, P=self.P, Q=self.Q, start_p=self.start_p, start_q=self.start_q,
-                            step_m=self.step_m, step_deg=self.step_deg,
+                            step_m=self.step_m, step_deg=self.step_deg, start_ep=self.start_ep,
+                            opening=self.opening, opening_ep=self.opening_ep,
                             meta=np.array(json.dumps({
                                 "frame": self.frame, "start_width": list(self.start_width), "pos_m": self.pos_m,
                                 "rot_deg": self.rot_deg, "start_pos_m": self.start_pos_m,
@@ -158,9 +170,10 @@ class Distribution:
     def load(cls, path: Path) -> Distribution:
         with np.load(path) as z:
             meta = json.loads(str(z["meta"]))
+            extra = {k: z[k] for k in ("start_ep", "opening", "opening_ep") if k in z.files}
             return cls(meta["frame"], z["P"], z["Q"], z["start_p"], z["start_q"], tuple(meta["start_width"]),
                        meta["pos_m"], meta["rot_deg"], meta["start_pos_m"], meta["start_rot_deg"],
-                       z["step_m"], z["step_deg"], meta["summary"])
+                       z["step_m"], z["step_deg"], meta["summary"], **extra)
 
 
 # ---------------------------------------------------------------- building ---
@@ -238,12 +251,20 @@ def build(episodes: Sequence[Episode], *, fps: float, offsets: Sequence[int], fr
     step_m = np.maximum(FLOOR_STEP_M, MARGIN * step_m)
     step_deg = np.maximum(FLOOR_STEP_DEG, MARGIN * step_deg)
     lo, hi = (min(first_widths), max(first_widths)) if first_widths else (0.0, 1.0)
+    openings = []
+    for e in eps:
+        ok = np.flatnonzero(_finite(e.poses))
+        keep = ok[ok <= ok[0] + OPENING_S * fps][:: max(1, round(fps / OPENING_HZ))]
+        openings.append((e.index, e.poses[keep]))
 
     dist = Distribution(
         frame, np.concatenate([p for _, p, _ in pts]), np.concatenate([q for _, _, q in pts]),
         np.concatenate([p for _, p, _ in starts]), np.concatenate([q for _, _, q in starts]),
         (lo - START_WIDTH_SLACK_M, hi + START_WIDTH_SLACK_M), pos_m, rot_deg, start_pos_m, start_rot_deg,
         step_m, step_deg,
+        start_ep=np.concatenate([np.full(len(p), i, dtype=np.int64) for i, p, _ in starts]),
+        opening=np.concatenate([o for _, o in openings]),
+        opening_ep=np.concatenate([np.full(len(o), i, dtype=np.int64) for i, o in openings]),
     )
     dist.summary = {
         "version": VERSION,

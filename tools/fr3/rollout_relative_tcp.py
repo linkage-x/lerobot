@@ -73,7 +73,9 @@ STAGES = (
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
 START_TRIES = 24  # a move to a training start: random training starts tried until one has a clear path
-START_J2_MARGIN_RAD = 0.25  # its posture: j2 at least this far from 0 when any IK branch allows (j1, j3 collinear)
+START_J2_MARGIN_RAD = 0.25  # a start posture with |j2| under this is flagged: near the shoulder singularity
+START_MARGIN_TIE_RAD = 0.05  # postures whose margins differ less than this: the one with the least travel
+START_FOLLOW_JUMP_RAD = 0.3  # a joint jump this large between two points of the opening: the posture cannot follow it
 START_PATH_STEP_RAD = 0.02  # the path's clearance is checked every this much of its largest joint
 WORKSPACE_MARGIN_M = 0.03
 
@@ -423,10 +425,16 @@ class PlanContext:
         """A move from ``q_now`` to a real training start: one of the poses of the episodes' first second
         (rollout_distribution), drawn at random until one has a clear path (at most ``tries``).
 
-        Its joints: IK from where the arm stands, the ready posture and the nudged seeds; of the branches that
-        converge, one with j2 at least START_J2_MARGIN_RAD from 0 (11-19, 160814: a start at j2 = -0.16 took
-        the arm through the shoulder singularity), then the least joint travel. The FK of those joints must
-        pass the start check itself. The path is the straight line in joint space (rollout_execute.joint_move);
+        Its joints: IK from where the arm stands and from the ready posture, each also nudged; of the distinct
+        postures that converge, the one with the most room along the motion that follows: from each posture,
+        the opening of the episode the start is from (its first OPENING_S, rollout_distribution) is followed by
+        IK point to point, and its room is the smallest, all along, of |j2| (the shoulder singularity: j1 and j3
+        collinear) and every joint's distance to panda_py's walls; a posture that loses the opening (no IK, or
+        a joint jumping START_FOLLOW_JUMP_RAD) has none. Within START_MARGIN_TIE_RAD of the best: the least joint
+        travel. 11-19: a start at j2 = -0.16 took the arm through the shoulder singularity (160814); preferring
+        room at the start alone chose the other shoulder branch (j2 +0.39, j3 0.27 rad from its wall), where 77
+        mm of the policy's descent took j2 to 0.14 (170940) -- in the usual branch the same task moved j2 0.02.
+        The FK of the joints must pass the start check itself. The path is the straight line in joint space (rollout_execute.joint_move);
         all along it the capsule model keeps ENV_MARGIN_M from the carts, the table and the cameras (or never
         closer than now, when it already is). ``ok`` False with ``why`` when none does; nothing moves."""
         kin = self.kin
@@ -442,7 +450,20 @@ class PlanContext:
                     "why": f"{', '.join(f'j{j + 1}' for j in beyond)} past panda_py's walls now: guide the arm in Desk"}
         dist = self.distribution
         T_world_base = np.linalg.inv(self.T_base_world)
-        seeds = [q_now, kin.Q_READY] + [np.clip(q_now + n, kin.Q_LOWER, kin.Q_UPPER) for n in kin._SEED_NUDGES[1:]]
+        seeds = [np.clip(base + n, kin.Q_LOWER, kin.Q_UPPER) for base in (q_now, kin.Q_READY) for n in kin._SEED_NUDGES]
+
+        def room(q: np.ndarray) -> float:
+            return float(min(abs(q[1]), np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q).min()))
+
+        def room_along(q0: np.ndarray, flanges: np.ndarray) -> float:
+            q, worst = q0, room(q0)
+            for F in flanges:
+                q_next, ok = kin.ik(kin.NOMINAL, F[None], q, rest=q, early_exit=True)
+                if not ok[0] or np.abs(q_next[0] - q).max() > START_FOLLOW_JUMP_RAD:
+                    return -math.inf
+                q = q_next[0]
+                worst = min(worst, room(q))
+            return worst
         last, tried = "", 0
         for idx in rng.permutation(len(dist.start_p))[: max(1, tries)]:
             tried += 1
@@ -456,7 +477,23 @@ class PlanContext:
             if not found:
                 last = f"training start {idx}: no IK inside the joint walls"
                 continue
-            q_goal = min(found, key=lambda q: (abs(q[1]) < START_J2_MARGIN_RAD, float(np.abs(q - q_now).max())))
+            distinct: list[np.ndarray] = []
+            for q in found:
+                if all(np.abs(q - d).max() > 0.05 for d in distinct):
+                    distinct.append(q)
+            opening = dist.opening_of(int(idx))
+            if len(opening):
+                near = int(np.argmin(np.linalg.norm(opening[:, :3] - dist.start_p[idx], axis=1)))
+                follow = self.T_base_world @ rt.pose7_to_matrix(opening[near:]) @ np.linalg.inv(self.T_tool)
+                rooms = [room_along(q, follow) for q in distinct]
+            else:  # a distribution cached before the openings were kept: the room at the start
+                rooms = [room(q) for q in distinct]
+            best = max(rooms)
+            if not math.isfinite(best):
+                last = f"training start {idx}: no posture there can follow the episode's opening"
+                continue
+            q_goal = min((q for q, r in zip(distinct, rooms, strict=True) if r >= best - START_MARGIN_TIE_RAD),
+                         key=lambda q: float(np.abs(q - q_now).max()))
             problem = dist.start_problem(T_world_base @ self.tcp(q_goal), None)
             if problem:
                 last = f"training start {idx}: {problem}"
@@ -476,6 +513,8 @@ class PlanContext:
                 "ok": True, "why": "", "tried": tried, "index": int(idx),
                 "T_world": T_world.round(6).tolist(), "q_goal": q_goal.round(6).tolist(),
                 "j2": round(float(q_goal[1]), 3), "near_shoulder_singularity": bool(abs(q_goal[1]) < START_J2_MARGIN_RAD),
+                "room_rad": round(best, 3), "room_at_start_rad": round(room(q_goal), 3), "postures": len(distinct),
+                "followed_opening": bool(len(opening)),
                 "max_joint_move_deg": round(math.degrees(float(np.abs(q_goal - q_now).max())), 1),
                 "min_env_gap_mm": None if not math.isfinite(gap[k]) else round(float(gap[k]) * 1e3, 1),
             }
