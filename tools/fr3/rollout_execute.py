@@ -856,7 +856,19 @@ class PandaArm:
 
     def read(self):
         s = self.panda.get_state() if self.running else self.panda.get_robot().read_once()
+        self.last = s
         return np.asarray(s.q, dtype=float), np.asarray(s.dq, dtype=float), np.asarray(s.O_F_ext_hat_K, dtype=float)
+
+    def condition(self) -> str:
+        """The robot's own mode and active errors at the last read, for a stop's message: 11-19, O_F_ext_hat_K
+        read exactly 0 for minutes at a time, and once "Move command rejected: not possible in the current
+        mode" -- the robot's state, which its status light shows, not anything this side sent."""
+        s = getattr(self, "last", None)
+        if s is None:
+            return ""
+        errors = [n for n in dir(s.current_errors) if not n.startswith("_") and getattr(s.current_errors, n) is True]
+        mode = getattr(s.robot_mode, "name", str(s.robot_mode))
+        return f"robot mode {mode}" + (f", errors: {', '.join(errors)}" if errors else "")
 
     def start(self, q):
         self.panda.start_controller(self.ctrl)
@@ -1254,7 +1266,8 @@ def run_loop(
             f_window.append(np.asarray(f_ext, dtype=np.float64))
             silent = 0 if np.any(f_ext) else silent + 1
             if silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
-                why, kind = f"the external force estimate read exactly 0 for {silent} ticks: the force stop is blind", "force"
+                why, kind = (f"the external force estimate read exactly 0 for {silent} ticks{_condition(arm)}: "
+                             "the force stop is blind"), "force"
                 break
             if ticks > 0:
                 kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=T_meas, T_cmd=T_cmd, loop_dt=loop_dt,
@@ -1367,8 +1380,14 @@ def _stand_still(arm: ArmIO, n: int, on_read: Callable[[float, np.ndarray], None
         sleep(period)
     if not np.any(forces):
         return q, (f"the arm reports no external force estimate (O_F_ext_hat_K exactly 0 on all {n} reads standing "
-                   "still): the force stop would be blind; nothing moved")
+                   f"still{_condition(arm)}): the force stop would be blind; nothing moved")
     return q, ""
+
+
+def _condition(arm: ArmIO) -> str:
+    """"; <robot mode, errors>" when the arm can say (PandaArm.condition), else ""."""
+    text = arm.condition() if hasattr(arm, "condition") else ""
+    return f"; {text}" if text else ""
 
 
 def brake_and_hold(arm: ArmIO, kind: str, q_cmd: np.ndarray, dq_cmd: np.ndarray, why: str, *, record, clock, sleep,
@@ -1466,7 +1485,8 @@ def run_joint_move(
             f_window.append(np.asarray(f_ext, dtype=np.float64))
             silent = 0 if np.any(f_ext) else silent + 1
             if silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
-                why, kind = f"the external force estimate read exactly 0 for {silent} ticks: the force stop is blind", "force"
+                why, kind = (f"the external force estimate read exactly 0 for {silent} ticks{_condition(arm)}: "
+                             "the force stop is blind"), "force"
                 break
             if ticks > 0:
                 kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=fk_tcp(q), T_cmd=fk_tcp(q_cmd),

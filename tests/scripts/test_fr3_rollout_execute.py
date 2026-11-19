@@ -363,6 +363,14 @@ def test_no_external_force_estimate_refuses_the_start_and_one_that_goes_silent_s
     result, arm, _ = _run(rx.STAGES[2], arm_cls=silent_arm)
     assert "no external force estimate" in result.stopped and not arm.started
 
+    def says_its_mode(clock, f_ext=None):
+        arm = silent_arm(clock, f_ext)
+        arm.condition = lambda: "robot mode kUserStopped"
+        return arm
+
+    result, _, _ = _run(rx.STAGES[2], arm_cls=says_its_mode)
+    assert "standing still; robot mode kUserStopped)" in result.stopped  # the robot's own state, in the message
+
     class GoesSilent(FakeArm):
         def read(self):
             q, dq, f = super().read()
