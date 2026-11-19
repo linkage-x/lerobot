@@ -392,6 +392,8 @@ class RolloutManager:
                 job.message = f"step {event.get('step')}, {event.get('latency_ms', 0):.0f} ms per prediction"
             elif event.get("event") == "execute":
                 job.message = f"stage {event.get('stage')}: {event.get('label')} (arm under control)"
+                if str(event.get("realtime") or "").startswith("not granted"):
+                    job.message += f"; the control loop runs WITHOUT real-time priority ({event.get('realtime')})"
             elif event.get("event") == "chunk":
                 job.message = (f"chunk {event.get('index', '?')} taken from step {event.get('k0')}" if event.get("accepted")
                                else f"stopping: {event.get('why')}")

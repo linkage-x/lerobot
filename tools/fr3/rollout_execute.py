@@ -42,9 +42,11 @@ executable, or a newer chunk does not come, the arm holds. It never clips or det
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import math
+import os
 import queue
 import sys
 import threading
@@ -236,36 +238,128 @@ class PoseHistory:
         """The measured joints at t (linear; the newest when t is past it)."""
         with self.lock:
             ts, qs = list(self.t), list(self.q)
-        if not ts:
-            raise RuntimeError("no FK read yet")
-        i = int(np.clip(np.searchsorted(ts, t), 1, len(ts) - 1)) if len(ts) > 1 else 0
-        if len(ts) == 1 or t >= ts[-1]:
-            return qs[-1].copy()
-        if t <= ts[0]:
-            return qs[0].copy()
-        s = (t - ts[i - 1]) / (ts[i] - ts[i - 1])
-        return qs[i - 1] + s * (qs[i] - qs[i - 1])
+        return _q_at(ts, qs, t)
 
     def at(self, t: float, *, slack_s: float = 0.02) -> np.ndarray:
         with self.lock:
             ts, Ts = list(self.t), list(self.T)
-        if not ts:
-            raise RuntimeError("no FK read yet")
-        if t < ts[0] - 1e-9:
-            raise RuntimeError(f"the FK buffer starts {ts[0] - t:.3f} s after the instant asked for")
-        if t > ts[-1]:
-            if t - ts[-1] > slack_s:
-                raise RuntimeError(f"no FK within {slack_s * 1e3:.0f} ms of the observation (last {t - ts[-1]:.3f} s before)")
-            return Ts[-1].copy()
-        i = int(np.searchsorted(ts, t))
-        if i == 0 or ts[i] == t:
-            return Ts[i].copy()
-        s = (t - ts[i - 1]) / (ts[i] - ts[i - 1])
-        return interpolate_pose(Ts[i - 1], Ts[i], s)
+        return _pose_at(ts, Ts, t, slack_s)
 
     def poses(self, t_obs: float, offsets_s: list[float]) -> np.ndarray:
         """(len(offsets), 4, 4): the TCP at t_obs + each offset (offsets <= 0, the last one 0)."""
         return np.stack([self.at(t_obs + o) for o in offsets_s])
+
+
+def _q_at(ts, qs, t: float) -> np.ndarray:
+    if not len(ts):
+        raise RuntimeError("no FK read yet")
+    i = int(np.clip(np.searchsorted(ts, t), 1, len(ts) - 1)) if len(ts) > 1 else 0
+    if len(ts) == 1 or t >= ts[-1]:
+        return np.array(qs[-1], dtype=np.float64)
+    if t <= ts[0]:
+        return np.array(qs[0], dtype=np.float64)
+    s = (t - ts[i - 1]) / (ts[i] - ts[i - 1])
+    return qs[i - 1] + s * (qs[i] - qs[i - 1])
+
+
+def _pose_at(ts, Ts, t: float, slack_s: float) -> np.ndarray:
+    if not len(ts):
+        raise RuntimeError("no FK read yet")
+    if t < ts[0] - 1e-9:
+        raise RuntimeError(f"the FK buffer starts {ts[0] - t:.3f} s after the instant asked for")
+    if t > ts[-1]:
+        if t - ts[-1] > slack_s:
+            raise RuntimeError(f"no FK within {slack_s * 1e3:.0f} ms of the observation (last {t - ts[-1]:.3f} s before)")
+        return np.array(Ts[-1], dtype=np.float64)
+    i = int(np.searchsorted(ts, t))
+    if i == 0 or ts[i] == t:
+        return np.array(Ts[i], dtype=np.float64)
+    s = (t - ts[i - 1]) / (ts[i] - ts[i - 1])
+    return interpolate_pose(Ts[i - 1], Ts[i], s)
+
+
+class SharedPoseHistory:
+    """PoseHistory in shared memory: the control loop writes it, the predictor's process reads it.
+
+    The writer never waits (a sequence counter, odd while an entry is written; a reader copies, and copies
+    again when the counter moved), so a reader in another process can never hold the loop up."""
+
+    CAPACITY = 2048  # entries: more than span_s at LOOP_HZ
+
+    def __init__(self, span_s: float = 3.0, *, name: str | None = None, capacity: int = CAPACITY):
+        from multiprocessing import shared_memory
+
+        self.span_s, self.capacity = float(span_s), int(capacity)
+        self.owner = name is None
+        size = 16 + 8 * self.capacity * (1 + 16 + 7)
+        self.shm = shared_memory.SharedMemory(name=name, create=self.owner, size=size if self.owner else 0)
+        if not self.owner:  # Python < 3.13 tracks an attached block too and would unlink it when this process ends
+            with contextlib.suppress(Exception):
+                from multiprocessing import resource_tracker
+
+                resource_tracker.unregister(self.shm._name, "shared_memory")  # noqa: SLF001
+        buf, n = self.shm.buf, self.capacity
+        self._head = np.ndarray((2,), dtype=np.int64, buffer=buf, offset=0)  # sequence, entries written
+        self._t = np.ndarray((n,), dtype=np.float64, buffer=buf, offset=16)
+        self._T = np.ndarray((n, 4, 4), dtype=np.float64, buffer=buf, offset=16 + 8 * n)
+        self._q = np.ndarray((n, 7), dtype=np.float64, buffer=buf, offset=16 + 8 * n * 17)
+        if self.owner:
+            self._head[:] = 0
+
+    def spec(self) -> tuple[str, float, int]:
+        return self.shm.name, self.span_s, self.capacity
+
+    @classmethod
+    def attach(cls, spec: tuple[str, float, int]) -> SharedPoseHistory:
+        name, span_s, capacity = spec
+        return cls(span_s, name=name, capacity=capacity)
+
+    def add(self, t: float, T: np.ndarray, q: np.ndarray | None = None) -> None:
+        i = int(self._head[1]) % self.capacity
+        self._head[0] += 1  # odd: an entry is being written
+        self._T[i] = T
+        self._q[i] = np.nan if q is None else q
+        self._t[i] = t
+        self._head[1] += 1
+        self._head[0] += 1
+
+    def _arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        for _ in range(1000):
+            seq = int(self._head[0])
+            if seq % 2 == 0:
+                n = int(self._head[1])
+                t, T, q = self._t.copy(), self._T.copy(), self._q.copy()
+                if int(self._head[0]) == seq:
+                    break
+            time.sleep(0)
+        else:
+            raise RuntimeError("the FK buffer kept changing while it was read")
+        m = min(n, self.capacity)
+        idx = np.arange(n - m, n) % self.capacity
+        t, T, q = t[idx], T[idx], q[idx]
+        if m:
+            keep = t >= t[-1] - self.span_s
+            t, T, q = t[keep], T[keep], q[keep]
+        return t, T, q
+
+    def q_at(self, t: float) -> np.ndarray:
+        ts, _, qs = self._arrays()
+        return _q_at(ts, qs, t)
+
+    def at(self, t: float, *, slack_s: float = 0.02) -> np.ndarray:
+        ts, Ts, _ = self._arrays()
+        return _pose_at(ts, Ts, t, slack_s)
+
+    def poses(self, t_obs: float, offsets_s: list[float]) -> np.ndarray:
+        ts, Ts, _ = self._arrays()
+        return np.stack([_pose_at(ts, Ts, t_obs + o, 0.02) for o in offsets_s])
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.shm.close()
+        if self.owner:
+            with contextlib.suppress(Exception):
+                self.shm.unlink()
 
 
 # --------------------------------------------------------------------- chunks ---
@@ -772,8 +866,9 @@ class Predictor:
     """
 
     def __init__(self, *, contract: rt.PolicyContract, history: PoseHistory, observe, predict, plan, sample,
-                 limits: Limits, clock=time.monotonic):
+                 limits: Limits, clock=time.monotonic, on_phase: Callable[[str, float], None] | None = None):
         self.c = contract
+        self.on_phase = on_phase
         self.history = history
         self.observe, self.predict, self.plan, self.sample = observe, predict, plan, sample
         self.limits = limits
@@ -793,15 +888,17 @@ class Predictor:
         self.busy = (name, t)
         if name:
             self._timing[name] = t
+        if self.on_phase is not None:
+            self.on_phase(name, t)
 
     def start(self) -> None:
         self.thread.start()
 
-    def request(self, *, min_t: float, seed: np.ndarray | Callable[[float], np.ndarray]) -> None:
-        """``seed``: the joints to start each target's IK from -- one posture, or a function of time (the
-        chunk being executed: each step of the next chunk starts from the posture the current one has at
-        that instant, so the arm's redundancy is not resolved differently at the switch)."""
-        self.requests.put((min_t, seed if callable(seed) else np.array(seed, dtype=float), self.clock()))
+    def request(self, *, min_t: float, seed: np.ndarray | Chunk) -> None:
+        """``seed``: the joints to start each target's IK from -- one posture, or the chunk being executed
+        (each step of the next chunk starts from the posture the current one has at that instant, so the
+        arm's redundancy is not resolved differently at the switch)."""
+        self.requests.put((min_t, seed if isinstance(seed, Chunk) else np.array(seed, dtype=float), self.clock()))
 
     def close(self) -> None:
         self.requests.put(None)
@@ -811,14 +908,20 @@ class Predictor:
             item = self.requests.get()
             if item is None:
                 return
-            min_t, seed, t_request = item
-            self._timing = {"requested": t_request}
-            pred = self.once(min_t, seed)
-            pred.timing = dict(self._timing)
-            self._phase("")
-            self.results.put(pred)
+            self.results.put(self.serve(*item))
 
-    def once(self, min_t: float, seed: np.ndarray) -> Prediction:
+    def serve(self, min_t: float, seed: np.ndarray | Chunk, t_request: float) -> Prediction:
+        """One request: its prediction, with when each phase began; an exception is the prediction's error."""
+        self._timing = {"requested": t_request}
+        try:
+            pred = self.once(min_t, seed)
+        except Exception as exc:  # noqa: BLE001 -- stops the run, with the reason (a dead thread said nothing)
+            pred = Prediction(None, None, error=f"predictor: {type(exc).__name__}: {exc}")
+        pred.timing = dict(self._timing)
+        self._phase("")
+        return pred
+
+    def once(self, min_t: float, seed: np.ndarray | Chunk) -> Prediction:
         L = self.limits
         self._phase("observe")
         try:
@@ -845,8 +948,8 @@ class Predictor:
                               latency_s=latency, age_s=age, history=hist, actions=actions)
         H = len(actions)
         self._phase("plan")
-        if callable(seed):
-            seed = np.stack([seed(obs.t_img + k * self.c.step_s) for k in range(1, H + 1)])
+        if isinstance(seed, Chunk):
+            seed = np.stack([seed.command(obs.t_img + k * self.c.step_s)[0] for k in range(1, H + 1)])
         plan = self.plan(hist[-1], smooth_steps(actions), seed)  # the record keeps the policy's own actions
         T = np.concatenate([hist[-1][None], plan["T"]])
         q = np.concatenate([self.history.q_at(obs.t_img)[None], plan["q"]])
@@ -858,6 +961,150 @@ class Predictor:
         self.count += 1
         return Prediction(obs, chunk, latency_s=latency, age_s=age, history=hist, actions=actions,
                           plan={k: v for k, v in plan.items() if k not in ("T", "q", "ok", "why")})
+
+
+PHASES = ("", "observe", "predict", "plan", "chunk")
+
+
+class _PipeResults:
+    """``get_nowait`` as on a queue: a prediction from the process, or its end as a prediction's error."""
+
+    def __init__(self, owner: ProcessPredictor):
+        self.owner = owner
+        self.ended = False
+
+    def get_nowait(self) -> Prediction:
+        conn, process = self.owner.conn, self.owner.process
+        with contextlib.suppress(EOFError, OSError):
+            if conn.poll():
+                return conn.recv()
+        if not process.is_alive() and not self.ended:
+            self.ended = True
+            return Prediction(None, None, error=f"the predictor's process ended (exit code {process.exitcode})")
+        raise queue.Empty
+
+
+class ProcessPredictor:
+    """The Predictor in a process of its own, so nothing it computes can hold the control loop up.
+
+    11-19 (execute_20261119_153440): in a thread of the loop's process, one plan (IK retries) took 513 ms
+    and the 200 Hz loop missed 133 ms; the controller kept the last command and its feed-forward speed, the
+    arm ran 17 mm past it. The process is spawned (CUDA cannot be forked): ``build`` = (module, function,
+    kwargs) runs there and returns the Predictor's parts, ``{"contract", "limits", "observe", "predict",
+    "plan", "sample", "info"}``; ``info`` comes back from :meth:`start`. It reads the loop's FK through a
+    :class:`SharedPoseHistory`, and ends when told to or when this process's end of the pipe closes."""
+
+    def __init__(self, build: tuple[str, str, dict[str, Any]], *, history: SharedPoseHistory,
+                 clock=time.monotonic, ready_timeout_s: float = 300.0):
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        self.history, self.clock, self.ready_timeout_s = history, clock, ready_timeout_s
+        self.conn, self._child_conn = ctx.Pipe()
+        self._busy = ctx.Array("d", 2, lock=False)  # PHASES index, since (monotonic)
+        self.process = ctx.Process(target=_predictor_process, name="rollout-predictor", daemon=True,
+                                   args=(build, self._child_conn, self._busy, history.spec()))
+        self.results = _PipeResults(self)
+        self.offsets_s: list[float] = []
+        self.info: dict[str, Any] = {}
+        self._closed = False
+
+    def start(self) -> dict[str, Any]:
+        """Start it and wait until the policy is loaded and warmed up: its ``info``. Raises its error."""
+        self.process.start()
+        self._child_conn.close()  # the child's end lives only in the child: its recv sees EOF when we are gone
+        deadline = time.monotonic() + self.ready_timeout_s
+        while not self.conn.poll(0.5):
+            if not self.process.is_alive():
+                raise RuntimeError(f"the predictor's process ended before it was ready (exit code {self.process.exitcode})")
+            if time.monotonic() > deadline:
+                self.close()
+                raise RuntimeError(f"the predictor's process was not ready within {self.ready_timeout_s:g} s")
+        kind, payload = self.conn.recv()
+        if kind != "ready":
+            self.close()
+            raise RuntimeError(str(payload))
+        self.info = payload
+        self.offsets_s = list(payload["offsets_s"])
+        return payload
+
+    def request(self, *, min_t: float, seed: np.ndarray | Chunk) -> None:
+        self.conn.send((min_t, seed if isinstance(seed, Chunk) else np.array(seed, dtype=float), self.clock()))
+
+    @property
+    def busy(self) -> tuple[str, float]:
+        code = int(self._busy[0])
+        return (PHASES[code] if 0 <= code < len(PHASES) else "?", float(self._busy[1]))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self.conn.send(None)
+        if self.process.pid is not None:
+            self.process.join(5.0)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(2.0)
+        with contextlib.suppress(Exception):
+            self.conn.close()
+
+
+def _predictor_process(build, conn, busy, history_spec) -> None:
+    """The predictor's process (ProcessPredictor). A person's stop reaches the loop's process, which ends
+    the run and then this process; SIGINT/SIGTERM here would only cut a prediction short."""
+    import importlib
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        module, name, kwargs = build
+        parts = getattr(importlib.import_module(module), name)(**kwargs)
+        history = SharedPoseHistory.attach(history_spec)
+
+        def on_phase(phase: str, t: float) -> None:
+            busy[1] = t
+            busy[0] = PHASES.index(phase) if phase in PHASES else -1
+
+        predictor = Predictor(contract=parts["contract"], history=history, observe=parts["observe"],
+                              predict=parts["predict"], plan=parts["plan"], sample=parts["sample"],
+                              limits=parts["limits"], on_phase=on_phase)
+        conn.send(("ready", {**parts.get("info", {}), "offsets_s": predictor.offsets_s}))
+    except Exception as exc:  # noqa: BLE001 -- the loop's process raises it; nothing has moved
+        with contextlib.suppress(Exception):
+            conn.send(("error", f"{type(exc).__name__}: {exc}"))
+        return
+    while True:
+        try:
+            item = conn.recv()
+        except (EOFError, OSError):
+            return
+        if item is None:
+            return
+        try:
+            conn.send(predictor.serve(*item))
+        except (BrokenPipeError, OSError):
+            return
+
+
+RT_PRIORITY = 80  # SCHED_FIFO for the control loop's thread (Thor: the gateway's rtprio limit is 99)
+
+
+def realtime_thread(priority: int = RT_PRIORITY) -> str:
+    """SCHED_FIFO at ``priority`` for the calling thread: "" when granted, else why not. Threads it starts
+    afterwards inherit it (panda_py's 1 kHz control thread, started by ``arm.start``)."""
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
+    except (AttributeError, OSError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+def normal_thread() -> None:
+    with contextlib.suppress(AttributeError, OSError):
+        os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
 
 
 def hold_gc() -> Callable[[], None]:
@@ -891,7 +1138,7 @@ class RunResult:
 def run_loop(
     *,
     arm: ArmIO,
-    predictor: Predictor,
+    predictor: Predictor | ProcessPredictor,
     stage: Stage,
     n_exec: int,
     limits: Limits,
@@ -1019,7 +1266,7 @@ def run_loop(
                     why = f"chunk {chunk.index} reached step {chunk.end} ({nxt}) before a newer chunk was taken"
                     break
                 if (not pending) and (stage.chunks == 0 or accepted < stage.chunks) and cursor >= replan_at:
-                    predictor.request(min_t=chunk.t_obs + 1e-3, seed=lambda t, ch=chunk: ch.command(t)[0])
+                    predictor.request(min_t=chunk.t_obs + 1e-3, seed=chunk)
                     pending = True
                     replan_at = math.inf
                 if gripper is not None and stage.gripper:

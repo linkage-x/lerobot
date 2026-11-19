@@ -409,6 +409,141 @@ def test_history_is_read_at_the_observation_instant():
         h.at(10.5)
 
 
+def test_the_shared_history_reads_back_like_the_in_process_one():
+    """The loop writes its FK into shared memory; the predictor's process reads it (wrapping the ring)."""
+    local, shared = rx.PoseHistory(span_s=0.5), rx.SharedPoseHistory(span_s=0.5, capacity=64)
+    try:
+        reader = rx.SharedPoseHistory.attach(shared.spec())
+        for i in range(150):  # more than the ring holds
+            T = np.eye(4)
+            T[0, 3] = 0.001 * i
+            for h in (local, shared):
+                h.add(10.0 + 0.005 * i, T, np.full(7, float(i)))
+        for t in (10.6, 10.6025, 10.745, 10.75, 10.76):
+            np.testing.assert_allclose(reader.at(t), local.at(t))
+            np.testing.assert_allclose(reader.q_at(t), local.q_at(t))
+        np.testing.assert_allclose(reader.poses(10.74, [-0.02, -0.01, 0.0]), local.poses(10.74, [-0.02, -0.01, 0.0]))
+        with pytest.raises(RuntimeError, match="starts"):
+            reader.at(10.0)  # older than the ring (and the span)
+        with pytest.raises(RuntimeError, match="no FK within"):
+            reader.at(11.0)
+        reader.close()
+    finally:
+        shared.close()
+
+
+def _process_parts(*, fail: str = "", hang_s: float = 0.0):
+    """ProcessPredictor's build, in the spawned process: the fake policy and plan, frames on real time."""
+    import time
+
+    if fail:
+        raise RuntimeError(fail)
+    c = _contract()
+
+    def observe(min_t):
+        time.sleep(hang_s)
+        return rx.Observation(max(min_t, time.monotonic() - 0.03), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088,
+                              None, {"box_stale_s": 0.02})
+
+    return {"contract": c, "limits": rx.Limits(), "observe": observe, "predict": _policy(c), "plan": _plan(),
+            "sample": lambda h, o: {}, "info": {"n_exec": 16, "first_width": 0.088}}
+
+
+def _fill(history, seconds: float = 0.5) -> None:
+    import time
+
+    now = time.monotonic()
+    for k in range(int(seconds * 200) + 1):
+        history.add(now - seconds + k * 0.005, _fk(Q0), Q0)
+
+
+def _wait_result(pred, timeout_s: float = 30.0):
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            return pred.results.get_nowait()
+        except queue.Empty:
+            time.sleep(0.01)
+    raise AssertionError("no prediction from the predictor's process")
+
+
+def test_the_predictor_runs_in_its_own_process_and_plans_like_the_thread():
+    history = rx.SharedPoseHistory()
+    pred = rx.ProcessPredictor((__name__, "_process_parts", {}), history=history)
+    try:
+        info = pred.start()
+        assert info["n_exec"] == 16 and pred.offsets_s == [-4 / 60, -2 / 60, 0.0]
+        _fill(history)
+        import time
+
+        pred.request(min_t=time.monotonic() - 0.2, seed=Q0)
+        first = _wait_result(pred)
+        assert first.error == "" and first.chunk is not None
+        assert list(first.timing) == ["requested", "observe", "predict", "plan", "chunk"]
+        _fill(history)
+        pred.request(min_t=first.obs.t_img + 1e-3, seed=first.chunk)  # a replan: seeded from the running chunk
+        second = _wait_result(pred)
+        assert second.error == "" and second.chunk is not None and pred.busy[0] == ""
+
+        local = rx.PoseHistory()
+        _fill(local)
+        thread = rx.Predictor(contract=_contract(), history=local, observe=_process_parts()["observe"],
+                              predict=_policy(_contract()), plan=_plan(), sample=lambda h, o: {}, limits=rx.Limits())
+        same = thread.serve(time.monotonic() - 0.2, Q0, time.monotonic())
+        np.testing.assert_allclose(first.chunk.q, same.chunk.q, atol=1e-9)
+    finally:
+        pred.close()
+        history.close()
+    assert not pred.process.is_alive()
+
+
+def test_a_predictor_process_that_cannot_load_says_why_before_anything_moves():
+    history = rx.SharedPoseHistory()
+    try:
+        with pytest.raises(RuntimeError, match="no such checkpoint"):
+            rx.ProcessPredictor((__name__, "_process_parts", {"fail": "no such checkpoint"}), history=history).start()
+    finally:
+        history.close()
+
+
+def test_the_predictor_process_ending_is_a_prediction_error_that_stops_the_run():
+    history = rx.SharedPoseHistory()
+    pred = rx.ProcessPredictor((__name__, "_process_parts", {"hang_s": 30.0}), history=history)
+    try:
+        pred.start()
+        import time
+
+        pred.request(min_t=time.monotonic(), seed=Q0)
+        time.sleep(0.3)
+        assert pred.busy[0] == "observe"  # the loop's record says where it was
+        pred.process.kill()
+        out = _wait_result(pred)
+        assert out.chunk is None and "predictor's process ended" in out.error
+        with pytest.raises(queue.Empty):
+            pred.results.get_nowait()  # said once
+    finally:
+        pred.close()
+        history.close()
+
+
+def test_the_loop_thread_asks_for_real_time_priority_and_says_when_refused(monkeypatch):
+    import os
+
+    calls = []
+    monkeypatch.setattr(os, "sched_setscheduler", lambda pid, policy, param: calls.append((pid, policy, param.sched_priority)))
+    assert rx.realtime_thread() == ""
+    assert calls == [(0, os.SCHED_FIFO, rx.RT_PRIORITY)]
+
+    def refuse(*_a):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "sched_setscheduler", refuse)
+    assert "Operation not permitted" in rx.realtime_thread()
+    rx.normal_thread()  # never raises
+
+
 def test_gripper_hysteresis_and_interval():
     g = rx.GripperDecider(0.088)
     assert g.decide(0.055, 0.0) == ""

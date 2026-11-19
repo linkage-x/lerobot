@@ -793,50 +793,36 @@ NOT_ATTENDED = (
 )
 
 
-def execute(
-    checkpoint: Path,
-    record_dir: Path,
-    *,
-    arm: str,
-    stage: int,
-    gateway: str,
-    frame_bus: Path = PREVIEW_FRAME_BUS,
-    device: str | None = None,
-    repo_root: Path = _REPO_ROOT,
-) -> dict[str, Any]:
-    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``."""
-    import cv2
+def execution_limits(plan: PlanContext, frame_bus: Path):
+    """The run's limits: the per-step ones are the checkpoint's own, what one step of its demonstrations did
+    (rollout_execute.step_limits). Both of execute's processes compute them the same way."""
+    from tools.fr3 import rollout_execute as rx
 
-    from tools.fr3 import (
-        fr3_arms,
-        fr3_kinematics as kin,
-        relative_tcp_policy as rtp,
-        rollout_execute as rx,
-    )
-    from tools.thor.gmsl2 import cart_state
+    dist = plan.distribution
+    return rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
+                     **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
 
-    if stage not in rx.STAGES:
-        raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
-    st = rx.STAGES[stage]
-    loaded = rtp.load_checkpoint(checkpoint, device=device)
+
+def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bus: str, device: str | None,
+                            repo_root: str) -> dict[str, Any]:
+    """In the predictor's own process (rollout_execute.ProcessPredictor): the policy, the planner and the
+    live inputs, warmed up on a live observation (the arm untouched). ``info`` goes back to the loop."""
+    from tools.fr3 import fr3_arms, relative_tcp_policy as rtp, rollout_execute as rx
+
+    root, bus = Path(repo_root), Path(frame_bus)
+    loaded = rtp.load_checkpoint(Path(checkpoint), device=device)
     c = loaded.contract
     n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
     if not 1 <= n_exec <= c.horizon:
         raise RuntimeError(f"the checkpoint's n_action_steps ({n_exec}) is not within 1..{c.horizon}")
-    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
+    entry = fr3_arms.resolve(fr3_arms.load(repo_root=root), arm)
     box_id = str(entry.get("corenetic_device_id") or "")
-    if not box_id:
-        raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
-    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=repo_root, provenance=loaded.provenance,
+    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=root, provenance=loaded.provenance,
                        contract=c)
     if plan.problems:
         raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
-    # the per-step limits are the checkpoint's own: what one step of its demonstrations did (rx.step_limits)
-    dist = plan.distribution
-    limits = rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
-                       **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
-    cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
-    live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=frame_bus)
+    limits = execution_limits(plan, bus)
+    live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=bus)
 
     def observe(min_t: float) -> rx.Observation:
         images, t_img, meta = live.frames_since(min_t)
@@ -859,65 +845,126 @@ def execute(
     first = observe(time.monotonic() - 1.0)
     for _ in range(2):
         loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
+    return {"contract": c, "limits": limits, "observe": observe, "predict": loaded.predict, "plan": plan_fn,
+            "sample": sample,
+            "info": {"contract": c.to_dict(), "provenance": loaded.provenance, "n_exec": n_exec,
+                     "first_width": first.width, "first_images": first.images}}
 
-    record_dir.mkdir(parents=True, exist_ok=True)
-    meta: dict[str, Any] = {
-        "schema": rx.RECORD_SCHEMA,
-        "kind": "execute",
-        "created": _now(),
-        "checkpoint": str(Path(checkpoint).resolve()),
-        "contract": c.to_dict(),
-        "arm": arm,
-        "box_id": box_id,
-        "n_action_steps": n_exec,
-        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
-        "cart_check": cart or None,
-        "frame_source": str(frame_bus),
-        "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
-        "distribution": plan.distribution.summary if plan.distribution is not None else None,
-        "step_limits": {"from_training_mm": round(float(dist.step_m[0]) * 1e3, 1),
-                        "from_training_deg": round(float(dist.step_deg[0]), 2),
-                        "ceiling_mm": rx.STEP_MM_CEILING, "ceiling_deg": rx.STEP_DEG_CEILING,
-                        "used_mm": limits.step_mm, "used_deg": limits.step_deg,
-                        "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
-        **rx.stage_dict(st, limits),
-    }
-    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    recorder = rx.Recorder(record_dir)
-    history = rx.PoseHistory()
-    predictor = rx.Predictor(contract=c, history=history, observe=observe, predict=loaded.predict, plan=plan_fn,
-                             sample=sample, limits=limits)
-    stop = {"why": ""}
 
-    def _signal(*_a) -> None:
-        stop["why"] = stop["why"] or "stopped by the operator"
+def execute(
+    checkpoint: Path,
+    record_dir: Path,
+    *,
+    arm: str,
+    stage: int,
+    gateway: str,
+    frame_bus: Path = PREVIEW_FRAME_BUS,
+    device: str | None = None,
+    repo_root: Path = _REPO_ROOT,
+) -> dict[str, Any]:
+    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``.
 
-    def _gripper_error(message: str) -> None:
-        stop["why"] = stop["why"] or message
+    Two processes: this one runs the 200 Hz loop (SCHED_FIFO, no policy, no torch); the policy, the planner
+    and the live inputs run in a spawned one (rollout_execute.ProcessPredictor), so a slow prediction or
+    plan can delay a chunk -- which the loop judges -- but never the loop itself."""
+    import cv2
 
-    signal.signal(signal.SIGTERM, _signal)
-    signal.signal(signal.SIGINT, _signal)
-    gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
-    progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
-             cart=cart.get("verdict"))
-    if stop["why"]:
-        raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
-    panda = rx.PandaArm(str(entry["robot_ip"]))
-    predictor.start()
-    sys.setswitchinterval(0.001)
-    resume_gc = rx.hold_gc()
+    from tools.fr3 import fr3_arms, fr3_kinematics as kin, rollout_execute as rx
+    from tools.thor.gmsl2 import cart_state
+
+    if stage not in rx.STAGES:
+        raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
+    st = rx.STAGES[stage]
+    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
+    box_id = str(entry.get("corenetic_device_id") or "")
+    if not box_id:
+        raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
+    history = rx.SharedPoseHistory()
+    predictor = rx.ProcessPredictor(
+        (__name__ if __name__ != "__main__" else "tools.fr3.rollout_relative_tcp", "execute_predictor_parts",
+         {"checkpoint": str(checkpoint), "arm": arm, "gateway": gateway, "frame_bus": str(frame_bus),
+          "device": device, "repo_root": str(repo_root)}),
+        history=history,
+    )
     try:
-        result = rx.run_loop(
-            arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
-            wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
-            stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=first.width,
-            record=recorder, start_check=lambda q: plan.start_problem(q, first.width),
-        )
+        info = predictor.start()
+        c = rt.PolicyContract.from_dict(info["contract"])
+        n_exec = int(info["n_exec"])
+        width_now = float(info["first_width"])
+        provenance = info["provenance"]
+        plan = PlanContext(arm, provenance.get("workspace"), repo_root=repo_root, provenance=provenance, contract=c)
+        if plan.problems:
+            raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
+        dist = plan.distribution
+        limits = execution_limits(plan, frame_bus)
+        cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
+
+        record_dir.mkdir(parents=True, exist_ok=True)
+        meta: dict[str, Any] = {
+            "schema": rx.RECORD_SCHEMA,
+            "kind": "execute",
+            "created": _now(),
+            "checkpoint": str(Path(checkpoint).resolve()),
+            "contract": c.to_dict(),
+            "arm": arm,
+            "box_id": box_id,
+            "n_action_steps": n_exec,
+            "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
+            "cart_check": cart or None,
+            "frame_source": str(frame_bus),
+            "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
+            "distribution": plan.distribution.summary if plan.distribution is not None else None,
+            "step_limits": {"from_training_mm": round(float(dist.step_m[0]) * 1e3, 1),
+                            "from_training_deg": round(float(dist.step_deg[0]), 2),
+                            "ceiling_mm": rx.STEP_MM_CEILING, "ceiling_deg": rx.STEP_DEG_CEILING,
+                            "used_mm": limits.step_mm, "used_deg": limits.step_deg,
+                            "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
+            "predictor": "own process (spawned), FK through shared memory",
+            **rx.stage_dict(st, limits),
+        }
+        (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+        recorder = rx.Recorder(record_dir)
+        stop = {"why": ""}
+
+        def _signal(*_a) -> None:
+            stop["why"] = stop["why"] or "stopped by the operator"
+
+        def _gripper_error(message: str) -> None:
+            stop["why"] = stop["why"] or message
+
+        signal.signal(signal.SIGTERM, _signal)
+        signal.signal(signal.SIGINT, _signal)
+        gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
+        try:
+            # SCHED_FIFO from here: this thread (the loop) and the threads it starts (panda_py's control
+            # thread); the recorder's and the gripper's threads above keep the normal policy
+            realtime = rx.realtime_thread()
+            meta["realtime"] = f"SCHED_FIFO {rx.RT_PRIORITY}" if not realtime else f"not granted: {realtime}"
+            progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
+                     cart=cart.get("verdict"), realtime=meta["realtime"])
+            if stop["why"]:
+                raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
+            panda = rx.PandaArm(str(entry["robot_ip"]))
+            sys.setswitchinterval(0.001)
+            resume_gc = rx.hold_gc()
+            try:
+                result = rx.run_loop(
+                    arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
+                    wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+                    stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=width_now,
+                    record=recorder, start_check=lambda q: plan.start_problem(q, width_now),
+                )
+            finally:
+                resume_gc()
+        finally:
+            rx.normal_thread()
+            recorder.close()
     finally:
-        resume_gc()
-        recorder.close()
+        predictor.close()
+        history.close()
     with contextlib.suppress(Exception):
-        strip = np.concatenate([cv2.resize(img, (int(img.shape[1] * 240 / img.shape[0]), 240)) for img in first.images.values()], axis=1)
+        images = info["first_images"]
+        strip = np.concatenate([cv2.resize(img, (int(img.shape[1] * 240 / img.shape[0]), 240)) for img in images.values()], axis=1)
         cv2.imwrite(str(record_dir / "latest.jpg"), cv2.cvtColor(strip, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
     meta["result"] = {"completed": result.completed, "stopped": result.stopped, "chunks": result.chunks_accepted,
                       "duration_s": round(result.duration_s, 3), "ticks": result.ticks,
