@@ -72,6 +72,9 @@ STAGES = (
     {"id": "execute", "label": "Execution on the arm (stages 1-3, a hand on the e-stop)", "status": "available"},
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
+START_TRIES = 24  # a move to a training start: random training starts tried until one has a clear path
+START_J2_MARGIN_RAD = 0.25  # its posture: j2 at least this far from 0 when any IK branch allows (j1, j3 collinear)
+START_PATH_STEP_RAD = 0.02  # the path's clearance is checked every this much of its largest joint
 WORKSPACE_MARGIN_M = 0.03
 
 
@@ -415,6 +418,69 @@ class PlanContext:
     def tcp(self, q: np.ndarray) -> np.ndarray:
         """FK to ARM_FK_FRAME in the arm's base."""
         return self.kin.NOMINAL.fk(np.asarray(q, dtype=np.float64)[None])[0] @ self.T_tool
+
+    def plan_to_start(self, q_now: np.ndarray, *, rng: np.random.Generator, tries: int = START_TRIES) -> dict[str, Any]:
+        """A move from ``q_now`` to a real training start: one of the poses of the episodes' first second
+        (rollout_distribution), drawn at random until one has a clear path (at most ``tries``).
+
+        Its joints: IK from where the arm stands, the ready posture and the nudged seeds; of the branches that
+        converge, one with j2 at least START_J2_MARGIN_RAD from 0 (11-19, 160814: a start at j2 = -0.16 took
+        the arm through the shoulder singularity), then the least joint travel. The FK of those joints must
+        pass the start check itself. The path is the straight line in joint space (rollout_execute.joint_move);
+        all along it the capsule model keeps ENV_MARGIN_M from the carts, the table and the cameras (or never
+        closer than now, when it already is). ``ok`` False with ``why`` when none does; nothing moves."""
+        kin = self.kin
+        q_now = np.asarray(q_now, dtype=np.float64)
+        if self.problems:
+            return {"ok": False, "why": "; ".join(self.problems), "tried": 0}
+        if self.T_base_world is None or self.distribution is None:
+            return {"ok": False, "why": "no training distribution: the checkpoint says nothing about where episodes began",
+                    "tried": 0}
+        beyond = np.flatnonzero((q_now < kin._WALL_LOWER) | (q_now > kin._WALL_UPPER))
+        if beyond.size:
+            return {"ok": False, "tried": 0,
+                    "why": f"{', '.join(f'j{j + 1}' for j in beyond)} past panda_py's walls now: guide the arm in Desk"}
+        dist = self.distribution
+        T_world_base = np.linalg.inv(self.T_base_world)
+        seeds = [q_now, kin.Q_READY] + [np.clip(q_now + n, kin.Q_LOWER, kin.Q_UPPER) for n in kin._SEED_NUDGES[1:]]
+        last, tried = "", 0
+        for idx in rng.permutation(len(dist.start_p))[: max(1, tries)]:
+            tried += 1
+            T_world = rt.pose7_to_matrix(np.concatenate([dist.start_p[idx], dist.start_q[idx]]))
+            flange = (self.T_base_world @ T_world @ np.linalg.inv(self.T_tool))[None]
+            found = []
+            for seed in seeds:
+                q, ok = kin.ik(kin.NOMINAL, flange, seed, rest=seed)
+                if ok[0]:
+                    found.append(q[0])
+            if not found:
+                last = f"training start {idx}: no IK inside the joint walls"
+                continue
+            q_goal = min(found, key=lambda q: (abs(q[1]) < START_J2_MARGIN_RAD, float(np.abs(q - q_now).max())))
+            problem = dist.start_problem(T_world_base @ self.tcp(q_goal), None)
+            if problem:
+                last = f"training start {idx}: {problem}"
+                continue
+            n = max(2, int(math.ceil(float(np.abs(q_goal - q_now).max()) / START_PATH_STEP_RAD)) + 1)
+            path = q_now + np.linspace(0.0, 1.0, n)[:, None] * (q_goal - q_now)
+            A, B = self.model.place(kin.NOMINAL, path)
+            env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
+            gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
+            need = min(ENV_MARGIN_M, float(gap[0]) - 0.005)
+            k = int(np.argmin(gap))
+            if gap[k] < need:
+                last = (f"training start {idx}: the path comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras "
+                        f"{k / (n - 1):.0%} of the way (needs {need * 1e3:.0f})")
+                continue
+            return {
+                "ok": True, "why": "", "tried": tried, "index": int(idx),
+                "T_world": T_world.round(6).tolist(), "q_goal": q_goal.round(6).tolist(),
+                "j2": round(float(q_goal[1]), 3), "near_shoulder_singularity": bool(abs(q_goal[1]) < START_J2_MARGIN_RAD),
+                "max_joint_move_deg": round(math.degrees(float(np.abs(q_goal - q_now).max())), 1),
+                "min_env_gap_mm": None if not math.isfinite(gap[k]) else round(float(gap[k]) * 1e3, 1),
+            }
+        return {"ok": False, "tried": tried,
+                "why": f"none of the {tried} training starts tried has a clear path from here (the last: {last})"}
 
 
 def frame_age_limit_s(frame_bus: Path) -> float:
@@ -791,6 +857,76 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
 # ------------------------------------------------------------------ execute ---
 
 
+MOVE_NOT_ATTENDED = (
+    "the move to a training start moves the arm: it is started from the Rollout page by a person with a hand on "
+    "the e-stop, who confirms its dialog (--attended); nothing was loaded and nothing moved"
+)
+
+
+def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None = None,
+             repo_root: Path = _REPO_ROOT) -> dict[str, Any]:
+    """Move the arm to a random real start of the checkpoint's training episodes (PlanContext.plan_to_start),
+    slowly, with the execution's stops (rollout_execute.run_joint_move). No policy runs; the gripper is not
+    touched. The caller (main) has checked ``--attended``."""
+    from tools.fr3 import fr3_arms, fr3_kinematics as kin, rollout_execute as rx
+
+    model = Path(checkpoint)
+    c = rt.PolicyContract.read(model)
+    prov_path = model / rt.PROVENANCE_FILE
+    provenance = json.loads(prov_path.read_text(encoding="utf-8")) if prov_path.is_file() else {}
+    plan = PlanContext(arm, provenance.get("workspace"), repo_root=repo_root, provenance=provenance, contract=c)
+    if plan.problems:
+        raise RuntimeError("the start cannot be checked for this arm: " + "; ".join(plan.problems))
+    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
+    stop = {"why": ""}
+
+    def _signal(*_a) -> None:
+        stop["why"] = stop["why"] or "stopped by the operator"
+
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
+    record_dir.mkdir(parents=True, exist_ok=True)
+    panda = rx.PandaArm(str(entry["robot_ip"]))
+    q_now = panda.read()[0]
+    chosen = plan.plan_to_start(q_now, rng=np.random.default_rng(seed))
+    meta: dict[str, Any] = {
+        "schema": rx.RECORD_SCHEMA, "kind": "to_start", "created": _now(), "checkpoint": str(model.resolve()),
+        "arm": arm, "seed": seed, "q_now": q_now.round(6).tolist(), "plan": chosen,
+        "tcp_tool": plan.T_tool.tolist(), "distribution": plan.distribution.summary,
+        "move": {"speed_rad_s": rx.MOVE_SPEED_RAD_S, "acceleration": rx.MOVE_ACCELERATION.tolist(),
+                 "profile": "straight in joint space, minimum jerk, every joint together"},
+        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
+        **rx.stage_dict(rx.Stage(0, 0, 0.0, False, "move to a training start"), rx.Limits()),
+    }
+    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    if not chosen["ok"]:
+        raise RuntimeError(f"{chosen['why']}; nothing moved")
+    progress(event="to_start", index=chosen["index"], tried=chosen["tried"], j2=chosen["j2"],
+             max_joint_move_deg=chosen["max_joint_move_deg"], min_env_gap_mm=chosen["min_env_gap_mm"])
+    if stop["why"]:
+        raise RuntimeError(f"{stop['why']} before the arm was taken; nothing moved")
+    recorder = rx.Recorder(record_dir)
+    realtime = rx.realtime_thread()
+    meta["realtime"] = f"SCHED_FIFO {rx.RT_PRIORITY}" if not realtime else f"not granted: {realtime}"
+    try:
+        result = rx.run_joint_move(
+            arm=panda, q_goal=np.asarray(chosen["q_goal"], dtype=np.float64), limits=rx.Limits(), fk_tcp=plan.tcp,
+            wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, stop_flag=lambda: stop["why"], log=progress,
+            record=recorder, q_planned=q_now,
+        )
+    finally:
+        rx.normal_thread()
+        recorder.close()
+    q_end = panda.read()[0]
+    start = plan.distribution.start_problem(np.linalg.inv(plan.T_base_world) @ plan.tcp(q_end), None)
+    meta["result"] = {"completed": result.completed, "stopped": result.stopped, "duration_s": round(result.duration_s, 3),
+                      "ticks": result.ticks, "progress": round(result.end_cursor, 3), "q_end": q_end.round(6).tolist(),
+                      "start_check": start or "inside the training starts (the gripper width is not judged here)"}
+    meta["finished"] = _now()
+    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    return meta
+
+
 NOT_ATTENDED = (
     "execute moves the arm: it is started from the Rollout page by a person with a hand on the e-stop, who "
     "confirms its dialog (--attended); nothing was loaded and nothing moved"
@@ -1011,6 +1147,13 @@ def main(argv: list[str] | None = None) -> int:
     exe.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
     exe.add_argument("--attended", action="store_true",
                      help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
+    tos = sub.add_parser("to-start", help="moves the arm to a training start: from the Rollout page, a hand on the e-stop")
+    tos.add_argument("--checkpoint", type=Path, required=True)
+    tos.add_argument("--record", type=Path, required=True)
+    tos.add_argument("--arm", choices=("right", "left"), required=True)
+    tos.add_argument("--seed", type=int, default=None)
+    tos.add_argument("--attended", action="store_true",
+                     help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "offline":
@@ -1041,6 +1184,13 @@ def main(argv: list[str] | None = None) -> int:
             r = meta["result"]
             progress(event="done", completed=r["completed"], stopped=r["stopped"], chunks=r["chunks"],
                      duration_s=r["duration_s"])
+        elif args.cmd == "to-start":
+            if not args.attended:
+                raise RuntimeError(MOVE_NOT_ATTENDED)
+            meta = to_start(args.checkpoint, args.record, arm=args.arm, seed=args.seed)
+            r = meta["result"]
+            progress(event="done", completed=r["completed"], stopped=r["stopped"], duration_s=r["duration_s"],
+                     start_check=r["start_check"])
         else:
             progress(event="done", **replay(args.record))
     except Exception as exc:  # noqa: BLE001 -- one line the page can show

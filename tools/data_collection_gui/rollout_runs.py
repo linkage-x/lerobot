@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT = "tools/fr3/rollout_relative_tcp.py"
+ARM_KINDS = ("execute", "tostart")  # the jobs that move an arm: they hold its FCI while they run
 PROGRESS_PREFIX = "FR3_ROLLOUT "
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$")
 STAGES = (
@@ -291,6 +292,25 @@ class RolloutManager:
         return self._spawn("execute", str(model), args, str(record),
                            {"arm": arm, "stage": int(stage), "attended": True, "frameBus": bus})
 
+    def start_to_start(self, checkpoint: str, arm: str, attended: bool) -> RolloutJob:
+        """Move the arm to a random real start of the checkpoint's training episodes (rollout_relative_tcp
+        to-start): no policy, no cameras, the gripper untouched. Started by a person at the e-stop."""
+        model = self._checkpoint(checkpoint)
+        if self.sandbox:
+            raise RolloutError("a sandbox has no arm: the move runs on the station's own gateway")
+        if self.profile != "thor":
+            raise RolloutError("the training starts are checked in the Thor station's world; this gateway is not a Thor")
+        if arm not in ("right", "left"):
+            raise RolloutError("pick the arm")
+        if not attended:
+            raise RolloutError("the arm moves: confirm in the dialog that a hand is on the e-stop")
+        holder = self.fci_holder()
+        if holder:
+            raise RolloutError(f"{holder}: it holds the arm's FCI; stop it first")
+        record = self.root / "records" / f"tostart_{datetime.now():%Y%m%d_%H%M%S}"
+        args = ["to-start", "--checkpoint", str(model), "--record", str(record), "--arm", arm, "--attended"]
+        return self._spawn("tostart", str(model), args, str(record), {"arm": arm, "attended": True})
+
     def preview_replayed(self, model: Path) -> bool:
         """Has a preview record of this checkpoint been fed back through the offline path, identically?"""
         for path in (self.root / "records").glob("*/record.json"):
@@ -308,13 +328,17 @@ class RolloutManager:
     def fci_user(self) -> str:
         """The running execution, as the other arm jobs' FCI check sees it, or ""."""
         self.refresh()
-        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind == "execute"), None)
-        return f"Rollout 执行 {job.id}（{job.params.get('arm')} 臂，第 {job.params.get('stage')} 步）正在运行" if job else ""
+        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind in ARM_KINDS), None)
+        if job is None:
+            return ""
+        if job.kind == "tostart":
+            return f"Rollout 移到训练起点 {job.id}（{job.params.get('arm')} 臂）正在运行"
+        return f"Rollout 执行 {job.id}（{job.params.get('arm')} 臂，第 {job.params.get('stage')} 步）正在运行"
 
     def hardware_user(self) -> str:
         """A running preview or execution (they read the cameras and the arm) for the hardware lease, or ""."""
         self.refresh()
-        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind in ("preview", "execute")), None)
+        job = next((j for j in self.jobs.values() if j.state == "running" and j.kind in ("preview", *ARM_KINDS)), None)
         return f"Rollout {job.kind} {job.id} is running: stop it on the Rollout page" if job else ""
 
     def start_replay(self, record: str) -> RolloutJob:
@@ -397,8 +421,11 @@ class RolloutManager:
             elif event.get("event") == "chunk":
                 job.message = (f"chunk {event.get('index', '?')} taken from step {event.get('k0')}" if event.get("accepted")
                                else f"stopping: {event.get('why')}")
+            elif event.get("event") == "to_start":
+                job.message = (f"moving to training start {event.get('index')} (j2 {event.get('j2')}, up to "
+                               f"{event.get('max_joint_move_deg')}° of joint travel; arm under control)")
             elif event.get("event") == "done":
-                if job.kind == "execute":
+                if job.kind in ARM_KINDS:
                     job.message = ("completed" if event.get("completed")
                                    else f"stopped: {event.get('stopped') or 'see the log'}")
                 else:

@@ -21065,7 +21065,9 @@ def _sandbox_hardware_refusal(state: GatewayState, method: str, path: str) -> st
 #
 # hardware_lease.py has the protocol. A hardware request here is one the sandbox guard refuses, plus the
 # Rollout page's preview and execution (a sandbox's rollout manager refuses those itself).
-LEASE_HARDWARE_POST_PREFIXES = SANDBOX_HARDWARE_POST_PREFIXES + ("/api/rollout/preview", "/api/rollout/execute")
+LEASE_HARDWARE_POST_PREFIXES = SANDBOX_HARDWARE_POST_PREFIXES + (
+    "/api/rollout/preview", "/api/rollout/execute", "/api/rollout/to-start",
+)
 
 
 def _is_hardware_request(method: str, path: str) -> bool:
@@ -21489,6 +21491,11 @@ def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: st
                                         int(body.get("stage") or 0), body.get("attended") is True)
             state.log("warn", f"Rollout execute {job.id} started: stage {job.params.get('stage')} on the "
                               f"{job.params.get('arm')} arm (operator confirmed: hand on the e-stop); the arm moves")
+        elif path == "/api/rollout/to-start":
+            job = manager.start_to_start(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
+                                         body.get("attended") is True)
+            state.log("warn", f"Rollout move to a training start {job.id} started on the {job.params.get('arm')} arm "
+                              "(operator confirmed: hand on the e-stop); the arm moves")
         elif path == "/api/rollout/stop":
             _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
             return True

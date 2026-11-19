@@ -293,6 +293,31 @@ def test_execute_is_refused_unless_every_condition_holds(tmp_path):
     assert job.kind == "execute" and job.params["attended"] is True
 
 
+def test_the_move_to_a_training_start_is_refused_unless_attended_and_free_and_holds_the_fci(tmp_path):
+    spawned = []
+
+    class Proc:
+        pid = 2**22 + 11  # a real integer, never a MagicMock (os.killpg)
+
+    holder = {"who": ""}
+    manager = _manager(tmp_path, fci_holder=lambda: holder["who"], popen=lambda cmd, **k: spawned.append(cmd) or Proc())
+    ckpt = manager.checkpoints()[0]["path"]
+    with pytest.raises(rr.RolloutError, match="e-stop"):
+        manager.start_to_start(ckpt, "right", attended=False)
+    holder["who"] = "真机 replay 正在运行"
+    with pytest.raises(rr.RolloutError, match="holds the arm's FCI"):
+        manager.start_to_start(ckpt, "right", attended=True)
+    holder["who"] = ""
+    for kw in ({"sandbox": "hph"}, {"profile": "workstation"}):
+        other = _manager(tmp_path / next(iter(kw)), **kw)
+        with pytest.raises(rr.RolloutError, match="sandbox|not a Thor"):
+            other.start_to_start(other.checkpoints()[0]["path"], "right", attended=True)
+    job = manager.start_to_start(ckpt, "right", attended=True)  # no recorder, no replayed preview needed
+    assert spawned[0][1:3] == [rr.SCRIPT, "to-start"] and "--attended" in spawned[0]
+    assert job.kind == "tostart" and job.params == {"arm": "right", "attended": True}
+    assert gateway._is_hardware_request("POST", "/api/rollout/to-start")  # a dev gateway needs the lease for it
+
+
 def test_jobs_find_the_venvs_cmeel_libraries_for_panda_py(tmp_path):
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
@@ -350,6 +375,28 @@ def test_execute_endpoint_answers_outside_the_gateway_lock(tmp_path):
                 f"{base}/api/rollout/execute", method="POST",
                 data=json.dumps({"checkpoint": state.rollout.checkpoints()[0]["path"], "arm": "right", "stage": 1,
                                  "attended": "yes"}).encode(),  # only a literal true confirms
+                headers={"Content-Type": "application/json"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(request, timeout=5)
+        assert err.value.code == 400 and "e-stop" in json.loads(err.value.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_to_start_endpoint_answers_outside_the_gateway_lock_and_wants_a_literal_confirmation(tmp_path):
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    state.rollout = _manager(tmp_path)
+    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with state.lock:
+            request = urllib.request.Request(
+                f"{base}/api/rollout/to-start", method="POST",
+                data=json.dumps({"checkpoint": state.rollout.checkpoints()[0]["path"], "arm": "right",
+                                 "attended": 1}).encode(),
                 headers={"Content-Type": "application/json"},
             )
             with pytest.raises(urllib.error.HTTPError) as err:

@@ -775,6 +775,138 @@ def test_the_preview_check_names_the_joint_step_execution_would_refuse():
     assert any(r.startswith("execution: step 1: j5") for r in out["reasons"]) and not out["ok"]
 
 
+# ------------------------------------------------------ a move to a training start ---
+
+
+def test_a_joint_move_is_a_straight_minimum_jerk_line_within_its_speed_and_acceleration():
+    q1 = Q0 + np.array([0.6, -0.2, 0.3, 0.1, 0.0, 0.0, 0.9])
+    T, at = rx.joint_move(Q0, q1)
+    ts = np.linspace(0.0, T, 2001)
+    q = np.array([at(t)[0] for t in ts])
+    dq = np.array([at(t)[1] for t in ts])
+    np.testing.assert_allclose(q[0], Q0) and np.testing.assert_allclose(q[-1], q1)
+    np.testing.assert_allclose(dq[0], 0.0, atol=1e-12) and np.testing.assert_allclose(dq[-1], 0.0, atol=1e-12)
+    assert (np.abs(dq) <= rx.MOVE_SPEED_RAD_S * rx.JOINT_SCALE + 1e-6).all()
+    acc = np.diff(dq, axis=0) / np.diff(ts)[:, None]
+    assert (np.abs(acc) <= rx.MOVE_ACCELERATION * 1.01).all()
+    s = (q[:, [0, 6]] - Q0[[0, 6]]) / (q1 - Q0)[[0, 6]]  # every joint the same share of its way: a straight line
+    np.testing.assert_allclose(s[:, 0], s[:, 1], atol=1e-9)
+
+
+def _move(q_goal, *, arm_cls=FakeArm, f_ext=None, stop_flag=lambda: "", q_planned=None, record=None):
+    clock = Clock()
+    arm = arm_cls(clock, f_ext=f_ext)
+    seen = []
+    result = rx.run_joint_move(arm=arm, q_goal=q_goal, limits=rx.Limits(), fk_tcp=_fk, wall_lower=kin._WALL_LOWER,
+                               wall_upper=kin._WALL_UPPER, stop_flag=stop_flag, log=lambda **kw: seen.append(kw),
+                               clock=clock, sleep=clock.sleep, q_planned=q_planned, record=record)
+    return result, arm, seen
+
+
+def test_the_move_to_a_start_gets_there_and_lets_go():
+    goal = Q0 + np.array([0.2, -0.1, 0.1, 0.05, 0.0, 0.0, 0.3])
+    result, arm, seen = _move(goal, q_planned=Q0)
+    assert result.completed and result.stopped == "" and arm.started and arm.stopped
+    np.testing.assert_allclose(arm.q, goal, atol=1e-3)
+    assert seen[0]["event"] == "move" and seen[0]["duration_s"] > 1.0
+
+
+def test_the_move_to_a_start_refuses_a_moved_arm_and_a_dead_force_estimate_and_brakes_on_a_stop():
+    goal = Q0 + np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    result, arm, _ = _move(goal, q_planned=Q0 + 0.05)
+    assert "moved since the move was planned" in result.stopped and not arm.started
+
+    def silent(clock, f_ext=None):
+        a = FakeArm(clock, f_ext=f_ext)
+        a.bias = 0.0
+        return a
+
+    result, arm, _ = _move(goal, arm_cls=silent)
+    assert "no external force estimate" in result.stopped and not arm.started
+
+    ticks = []
+    result, arm, _ = _move(goal, f_ext=lambda t: np.array([0, 0, 20.0 if t > 1000.8 else 0.0, 0, 0, 0]),
+                           record=lambda item: ticks.append(item["tick"]) if "tick" in item else None)
+    assert "external force" in result.stopped and not result.completed and arm.stopped
+    hold = np.array([t["q_cmd"] for t in ticks if t.get("phase") == 2])
+    assert np.abs(np.diff(hold, axis=0)).max(axis=1)[-1] == 0.0  # braked to rest, then held
+    assert np.abs(arm.q - goal).max() > 0.05  # it did not go on
+
+    clock_stop = {"n": 0}
+
+    def operator():
+        clock_stop["n"] += 1
+        return "stopped by the operator" if clock_stop["n"] > 100 else ""
+
+    result, arm, _ = _move(goal, stop_flag=operator)
+    assert result.stopped == "stopped by the operator" and arm.stopped
+
+
+class _StartDist:
+    def __init__(self, T_world: list[np.ndarray]):
+        self.start_p = np.array([T[:3, 3] for T in T_world])
+        self.start_q = np.array([rt.matrix_to_quat_xyzw(T[:3, :3]) for T in T_world])
+        self.summary = {}
+
+    def start_problem(self, T_world, width):
+        d = np.linalg.norm(self.start_p - T_world[:3, 3], axis=1).min()
+        return "" if d < 0.02 else f"start: {d * 1e3:.0f} mm from any training start"
+
+
+def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0.5)):
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    class Model:
+        r = np.zeros(1)
+
+        def place(self, arm, path):
+            return path, path
+
+        def table_mask(self):
+            return None
+
+    class Col:
+        def obstacle_gaps(self, obstacles, A, B, r, mask):
+            return gap(A)[:, None]
+
+    plan = object.__new__(ro.PlanContext)
+    plan.kin, plan.T_tool, plan.T_base_world = kin, np.eye(4), np.eye(4)
+    plan.model, plan.col, plan.obstacles, plan.problems = Model(), Col(), [], []
+    plan.distribution = _StartDist(T_world)
+    return plan
+
+
+def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singularity():
+    q_start = np.array([1.1, -0.5, -1.0, -2.25, 0.1, 2.9, 0.7])  # j2 well away from 0
+    T_start = _fk(q_start) @ np.eye(4)
+    plan = _start_plan([T_start])
+    q_now = np.array([1.0, -0.6, -0.9, -2.3, 0.1, 2.85, 0.65])
+    out = plan.plan_to_start(q_now, rng=np.random.default_rng(0))
+    assert out["ok"] and out["index"] == 0 and not out["near_shoulder_singularity"]
+    np.testing.assert_allclose(_fk(np.array(out["q_goal"]))[:3, 3], T_start[:3, 3], atol=1e-3)
+    assert abs(out["q_goal"][1]) >= 0.25
+
+    blocked = _start_plan([T_start], gap=lambda path: np.linspace(0.3, 0.004, len(path)))
+    out = blocked.plan_to_start(q_now, rng=np.random.default_rng(0))
+    assert not out["ok"] and "from the carts/table/cameras" in out["why"]
+
+    beyond = q_now.copy()
+    beyond[5] = -0.2  # past panda_py's wall on j6
+    out = plan.plan_to_start(beyond, rng=np.random.default_rng(0))
+    assert not out["ok"] and "walls now" in out["why"]
+
+
+def test_moving_to_a_start_without_attended_loads_nothing_and_moves_nothing(tmp_path: Path, monkeypatch, capsys):
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    def nothing(*_a, **_k):
+        raise AssertionError("nothing may run without --attended")
+
+    monkeypatch.setattr(ro, "to_start", nothing)
+    rc = ro.main(["to-start", "--checkpoint", str(tmp_path / "ckpt"), "--record", str(tmp_path / "rec"), "--arm", "right"])
+    assert rc == 1 and "a hand on" in capsys.readouterr().err and not (tmp_path / "rec").exists()
+
+
 # ------------------------------------------------------- the report on a record ---
 
 

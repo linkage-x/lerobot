@@ -1214,15 +1214,10 @@ def run_loop(
         return RunResult(refusal, False, 0, 0.0, 0, 0.0)
     t_start = clock()
     # a short still history before anything is asked: the first observation's history is "standing still"
-    still_forces = []
-    for _ in range(max(3, int(0.15 * loop_hz))):
-        q, dq, f = arm.read()
-        history.add(clock(), fk_tcp(q), q)
-        still_forces.append(np.asarray(f, dtype=np.float64))
-        sleep(period)
-    if not np.any(still_forces):  # an estimate always carries noise; exactly 0 throughout is no estimate
-        return RunResult(f"the arm reports no external force estimate (O_F_ext_hat_K exactly 0 on all {len(still_forces)} "
-                         "reads standing still): the force stop would be blind; nothing moved", False, 0, clock() - t_start, 0, 0.0)
+    q, refusal = _stand_still(arm, max(3, int(0.15 * loop_hz)), lambda t, qq: history.add(t, fk_tcp(qq), qq),
+                              clock, sleep, period)
+    if refusal:
+        return RunResult(refusal, False, 0, clock() - t_start, 0, 0.0)
     q_cmd = q.copy()
     dq_cmd = np.zeros(7)
     T_cmd = fk_tcp(q_cmd)
@@ -1351,24 +1346,151 @@ def run_loop(
         if record and busy:
             record({"event": {"kind": "predictor", "t": clock(), "phase": busy, "since": since}})
         try:
-            q, dq, _ = arm.read()
-            q0, v0 = (q, dq) if kind in HOLD_MEASURED else (q_cmd, dq_cmd)
-            t_brake, brake = stop_motion(q0, v0)
-            t_hold = clock()
-            while clock() - t_hold < t_brake + HOLD_S:
-                q_hold, dq_hold = brake(clock() - t_hold)
-                arm.command(q_hold, dq_hold)
-                if record:  # what the arm did after the stop (phase 2): an overshoot shows here
-                    qh, dqh, fh = arm.read()
-                    record({"tick": {"t": clock(), "q": qh, "dq": dqh, "f_ext": fh, "q_cmd": q_hold.copy(),
-                                     "cursor": cursor, "chunk": -1 if chunk is None else chunk.index, "phase": 2}})
-                sleep(period)
-        except Exception as exc:  # noqa: BLE001 -- the controller is let go below either way
-            why = why or f"hold: {type(exc).__name__}: {exc}"
+            why = brake_and_hold(arm, kind, q_cmd, dq_cmd, why, record=record, clock=clock, sleep=sleep, period=period,
+                                 cursor=cursor, chunk=-1 if chunk is None else chunk.index)
         finally:
-            arm.stop()
             predictor.close()
     return RunResult(why, completed and not why, accepted, clock() - t_start, ticks, cursor)
+
+
+def _stand_still(arm: ArmIO, n: int, on_read: Callable[[float, np.ndarray], None], clock, sleep,
+                 period: float) -> tuple[np.ndarray, str]:
+    """``n`` reads of the arm standing still before it is taken: (the last joints, "" or why it may not start).
+    An external force estimate always carries noise; exactly 0 on every read is no estimate, and the force
+    stop would be blind (11-19: O_F_ext_hat_K read 0 through two whole runs)."""
+    forces = []
+    q = None
+    for _ in range(n):
+        q, _, f = arm.read()
+        on_read(clock(), q)
+        forces.append(np.asarray(f, dtype=np.float64))
+        sleep(period)
+    if not np.any(forces):
+        return q, (f"the arm reports no external force estimate (O_F_ext_hat_K exactly 0 on all {n} reads standing "
+                   "still): the force stop would be blind; nothing moved")
+    return q, ""
+
+
+def brake_and_hold(arm: ArmIO, kind: str, q_cmd: np.ndarray, dq_cmd: np.ndarray, why: str, *, record, clock, sleep,
+                   period: float, cursor: float = 0.0, chunk: int = -1) -> str:
+    """After any end: brake to rest (stop_motion) from the last command, or from where the arm is and how it
+    moves after contact, tracking, speed or a robot error; hold there HOLD_S; let the controller go. Returns
+    ``why``, or why the hold failed when nothing else had."""
+    try:
+        q, dq, _ = arm.read()
+        q0, v0 = (q, dq) if kind in HOLD_MEASURED else (q_cmd, dq_cmd)
+        t_brake, brake = stop_motion(q0, v0)
+        t_hold = clock()
+        while clock() - t_hold < t_brake + HOLD_S:
+            q_hold, dq_hold = brake(clock() - t_hold)
+            arm.command(q_hold, dq_hold)
+            if record:  # what the arm did after the stop (phase 2): an overshoot shows here
+                qh, dqh, fh = arm.read()
+                record({"tick": {"t": clock(), "q": qh, "dq": dqh, "f_ext": fh, "q_cmd": q_hold.copy(),
+                                 "cursor": cursor, "chunk": chunk, "phase": 2}})
+            sleep(period)
+    except Exception as exc:  # noqa: BLE001 -- the controller is let go below either way
+        why = why or f"hold: {type(exc).__name__}: {exc}"
+    finally:
+        arm.stop()
+    return why
+
+
+# ------------------------------------------------------- a move to a start ---
+
+MOVE_SPEED_RAD_S = 0.3  # j1-j4 peak (the wrist by JOINT_SCALE): about panda_py's move_to_start speed
+MOVE_ACCELERATION = 0.25 * FR3_ACCELERATION_LIMITS
+
+
+def joint_move(q0: np.ndarray, q1: np.ndarray, *, speed: float = MOVE_SPEED_RAD_S,
+               accel: np.ndarray = MOVE_ACCELERATION) -> tuple[float, Callable[[float], tuple[np.ndarray, np.ndarray]]]:
+    """(duration, at(t) -> (q, dq)): the straight line in joint space on a minimum-jerk (quintic) profile, every
+    joint together, at rest at both ends; no joint above ``speed`` (scaled per joint) or ``accel`` (a quintic
+    peaks at 1.875 d/T and 5.774 d/T^2)."""
+    q0, q1 = np.asarray(q0, dtype=np.float64), np.asarray(q1, dtype=np.float64)
+    d = q1 - q0
+    T = float(max(1e-3, np.max(1.875 * np.abs(d) / (speed * JOINT_SCALE)), np.max(np.sqrt(5.774 * np.abs(d) / accel))))
+
+    def at(t: float) -> tuple[np.ndarray, np.ndarray]:
+        s = min(max(t / T, 0.0), 1.0)
+        return q0 + d * (10 * s**3 - 15 * s**4 + 6 * s**5), d * (30 * s**2 - 60 * s**3 + 30 * s**4) / T
+
+    return T, at
+
+
+def run_joint_move(
+    *,
+    arm: ArmIO,
+    q_goal: np.ndarray,
+    limits: Limits,
+    fk_tcp: Callable[[np.ndarray], np.ndarray],
+    wall_lower: np.ndarray,
+    wall_upper: np.ndarray,
+    stop_flag: Callable[[], str],
+    log: Callable[..., None],
+    clock=time.monotonic,
+    sleep=time.sleep,
+    loop_hz: float = LOOP_HZ,
+    record: Callable[[dict[str, Any]], None] | None = None,
+    q_planned: np.ndarray | None = None,
+) -> RunResult:
+    """Drive the arm to ``q_goal`` along ``joint_move`` with the run's stops (tick_problem, a silent force
+    estimate, the operator's stop); any stop brakes to rest (brake_and_hold). ``q_planned``: the joints the
+    move was planned from; refused when the arm stands elsewhere now (the plan's checks were for that path)."""
+    period = 1.0 / loop_hz
+    q, dq, f0 = arm.read()
+    if np.abs(dq).max() > limits.start_speed_rad_s:
+        return RunResult(f"the arm is moving ({np.abs(dq).max():.3f} rad/s); it must stand still to start", False, 0, 0.0, 0, 0.0)
+    if q_planned is not None and np.abs(q - q_planned).max() > 0.01:
+        return RunResult("the arm moved since the move was planned; plan again", False, 0, 0.0, 0, 0.0)
+    t_start = clock()
+    q, refusal = _stand_still(arm, max(3, int(0.15 * loop_hz)), lambda t, qq: None, clock, sleep, period)
+    if refusal:
+        return RunResult(refusal, False, 0, clock() - t_start, 0, 0.0)
+    duration, path = joint_move(q, q_goal)
+    q_cmd, dq_cmd = q.copy(), np.zeros(7)
+    arm.start(q_cmd)
+    log(event="move", duration_s=round(duration, 2), max_joint_move_deg=round(math.degrees(float(np.abs(q_goal - q).max())), 1))
+    f_window: deque[np.ndarray] = deque(maxlen=max(1, round(FORCE_WINDOW_S * loop_hz)))
+    why = kind = ""
+    silent = ticks = 0
+    t0 = t_last = clock()
+    try:
+        while True:
+            now = clock()
+            loop_dt, t_last = now - t_last, now
+            q, dq, f_ext = arm.read()
+            why = stop_flag()
+            if why:
+                break
+            f_window.append(np.asarray(f_ext, dtype=np.float64))
+            silent = 0 if np.any(f_ext) else silent + 1
+            if silent >= max(2, round(FORCE_SILENT_S * loop_hz)):
+                why, kind = f"the external force estimate read exactly 0 for {silent} ticks: the force stop is blind", "force"
+                break
+            if ticks > 0:
+                kind, why = tick_problem(q=q, dq=dq, f_ext=f_ext, f0=f0, T_meas=fk_tcp(q), T_cmd=fk_tcp(q_cmd),
+                                         loop_dt=loop_dt, limits=limits, wall_lower=wall_lower, wall_upper=wall_upper,
+                                         f_avg=np.mean(f_window, axis=0))
+                if why:
+                    break
+            t = now - t0
+            if t > duration + HOLD_S:  # there, and settled
+                break
+            q_cmd, dq_cmd = path(t)
+            arm.command(q_cmd, dq_cmd)
+            arm.check()
+            if record:
+                record({"tick": {"t": now, "q": q, "dq": dq, "f_ext": f_ext, "q_cmd": q_cmd.copy(),
+                                 "cursor": min(t / duration, 1.0), "chunk": -1}})
+            ticks += 1
+            sleep(max(0.0, period - (clock() - now)))
+    except Exception as exc:  # noqa: BLE001 -- a robot error ends the move; the brake below still runs
+        why, kind = f"{type(exc).__name__}: {exc}", "robot"
+    progress_s = clock() - t0
+    why = brake_and_hold(arm, kind, q_cmd, dq_cmd, why, record=record, clock=clock, sleep=sleep, period=period,
+                         cursor=min(progress_s / duration, 1.0))
+    return RunResult(why, not why, 0, clock() - t_start, ticks, min(progress_s / duration, 1.0))
 
 
 # ---------------------------------------------------------------- recording ---

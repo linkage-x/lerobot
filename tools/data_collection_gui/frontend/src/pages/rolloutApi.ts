@@ -7,7 +7,7 @@ export type Stage = { id: string; label: string; status: string };
 
 export type RolloutJob = {
   id: string;
-  kind: "offline" | "preview" | "replay" | "execute";
+  kind: "offline" | "preview" | "replay" | "execute" | "tostart";
   checkpoint: string;
   state: "running" | "done" | "failed" | "stopped";
   message: string;
@@ -158,6 +158,9 @@ export const rolloutApi = {
   replay: (record: string) => call<{ job: RolloutJob }>("/api/rollout/replay", { record }),
   execute: (checkpoint: string, arm: string, stage: number, attended: boolean) =>
     call<{ job: RolloutJob }>("/api/rollout/execute", { checkpoint, arm, stage, attended }),
+  // Moves the arm (slowly) to a random real start of the checkpoint's training episodes; a person at the e-stop.
+  toStart: (checkpoint: string, arm: string, attended: boolean) =>
+    call<{ job: RolloutJob }>("/api/rollout/to-start", { checkpoint, arm, attended }),
   stop: (job: string) => call("/api/rollout/stop", { job }),
   // Connect the recorder for inference: only these cameras, the main frame bus at 30 Hz, no episodes.
   connectForInference: (cameras: string[]) =>

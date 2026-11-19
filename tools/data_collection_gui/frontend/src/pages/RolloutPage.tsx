@@ -224,6 +224,7 @@ export function RolloutPage() {
   const [readJoints, setReadJoints] = useState(false);
   const [stage, setStage] = useState(1);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [moveConfirmOpen, setMoveConfirmOpen] = useState(false);
   const [selected, setSelected] = useState<ResultRow | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -271,7 +272,8 @@ export function RolloutPage() {
   const forInference = Boolean(status?.recorderConnected && openCameras.length);
   const wrongCameras = cameraBlocker(status, ckpt);
   const connecting = recorderConnecting(status);
-  const executing = running?.kind === "execute" ? running : undefined;
+  // the jobs that move the arm: Stop brakes it to rest
+  const executing = running?.kind === "execute" || running?.kind === "tostart" ? running : undefined;
   const episodeList = useMemo(
     () => episodes.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n >= 0),
     [episodes]
@@ -478,16 +480,33 @@ export function RolloutPage() {
               STOP (hold the arm)
             </button>
           ) : (
-            <button
-              className="danger"
-              disabled={blockers.length > 0}
-              title={blockers.join("; ")}
-              onClick={() => setConfirmOpen(true)}
-            >
-              Execute stage {stage}
-            </button>
+            <>
+              <button
+                className="danger"
+                disabled={!checkpoint || Boolean(running)}
+                title="slowly to a random real start of this checkpoint's training episodes (no policy, gripper untouched)"
+                onClick={() => setMoveConfirmOpen(true)}
+              >
+                Move to a training start
+              </button>
+              <button
+                className="danger"
+                disabled={blockers.length > 0}
+                title={blockers.join("; ")}
+                onClick={() => setConfirmOpen(true)}
+              >
+                Execute stage {stage}
+              </button>
+            </>
           )}
         </div>
+        <p className="panel-note">
+          Move to a training start: one of the poses of this checkpoint's training episodes in their first second,
+          drawn at random, with its joints chosen clear of the shoulder singularity (j2 away from 0) and the path in
+          joint space kept 10 mm from carts/table/cameras — refused, nothing moving, when no start drawn has such a
+          path. Slow (≤ 0.3 rad/s), with the execution's stops; Stop brakes the arm to rest. Open the gripper
+          yourself (the training starts were open).
+        </p>
         {executing ? (
           <p className="command-error">Running: {executing.message || "starting"}</p>
         ) : blockers.length ? (
@@ -496,6 +515,32 @@ export function RolloutPage() {
               <li key={b}>{b}</li>
             ))}
           </ul>
+        ) : null}
+        {moveConfirmOpen ? (
+          <div className="danger-modal-backdrop" role="presentation">
+            <div aria-labelledby="rollout-move-confirm" aria-modal="true" className="danger-modal" role="dialog">
+              <h3 id="rollout-move-confirm">机器人会动，手放急停</h3>
+              <p>
+                The {arm} arm moves slowly to a random training start of <strong>{runPath(checkpoint)}</strong>. Keep
+                a hand on the e-stop until it stops.
+              </p>
+              <div className="danger-modal-actions">
+                <button autoFocus onClick={() => setMoveConfirmOpen(false)} type="button">
+                  取消
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => {
+                    setMoveConfirmOpen(false);
+                    act(() => rolloutApi.toStart(checkpoint, arm, true));
+                  }}
+                  type="button"
+                >
+                  手已放在急停上，移动
+                </button>
+              </div>
+            </div>
+          </div>
         ) : null}
         {confirmOpen ? (
           <div className="danger-modal-backdrop" role="presentation">
