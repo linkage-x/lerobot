@@ -413,11 +413,79 @@ def test_a_newer_chunk_takes_over_without_a_jump():
     old.prepare(rx.Limits(), 4)
     new.prepare(rx.Limits(), 4)
     t0, t1 = 0.03, 0.03 + rx.BLEND_S * 0.5
-    np.testing.assert_allclose(rx.blend(old, new, t0, t0, t1)[0], old.command(t0)[0])
-    np.testing.assert_allclose(rx.blend(old, new, t1, t0, t1)[0], new.command(t1)[0])
+    q_run, dq_run, _ = old.command(t0)
+    r0, v0 = q_run - new.command(t0)[0], dq_run - new.command(t0)[1]
+    q_a, dq_a = rx.blend(new, t0, t0, t1, r0, v0)
+    np.testing.assert_allclose(q_a, q_run) and np.testing.assert_allclose(dq_a, dq_run)  # C1 at the switch
+    np.testing.assert_allclose(rx.blend(new, t1, t0, t1, r0, v0)[0], new.command(t1)[0])
     ts = np.linspace(t0, t1, 200)
-    qs = np.array([rx.blend(old, new, t, t0, t1)[0] for t in ts])
+    qs = np.array([rx.blend(new, t, t0, t1, r0, v0)[0] for t in ts])
     assert np.abs(np.diff(qs, axis=0)).max() < 0.02 / 50  # spread over the window, not one tick
+
+
+def test_a_takeover_in_the_middle_of_a_blend_starts_from_what_is_commanded():
+    """11-19: blending from the replaced chunk's own command dropped what was left of the blend before it."""
+    T = np.repeat(np.eye(4)[None], 9, axis=0)
+    base = np.outer(np.arange(9), np.full(7, 0.01))
+    a, b, c = (rx.Chunk(i, 0.0, 0.0, 1 / 30, T, base + off, np.ones(9, bool), [""] * 9, np.zeros(8))
+               for i, off in enumerate((0.0, 0.05, -0.04)))
+    for ch in (a, b, c):
+        ch.prepare(rx.Limits(), 8)
+    t0, t1 = 0.03, 0.03 + 0.5  # a -> b over 0.5 s
+    r0 = a.command(t0)[0] - b.command(t0)[0]
+    v0 = a.command(t0)[1] - b.command(t0)[1]
+    t_mid = 0.2  # c arrives while a -> b is still blending
+    q_mid, dq_mid = rx.blend(b, t_mid, t0, t1, r0, v0)
+    r1, v1 = q_mid - c.command(t_mid)[0], dq_mid - c.command(t_mid)[1]
+    q_after, dq_after = rx.blend(c, t_mid, t_mid, t_mid + 0.5, r1, v1)
+    np.testing.assert_allclose(q_after, q_mid) and np.testing.assert_allclose(dq_after, dq_mid)
+
+
+def test_takeovers_that_disagree_by_what_the_policy_does_by_itself_run_on_without_a_step():
+    """Consecutive predictions 16 mm apart at the switch (the policy's own p95 is 23 mm): taken, and the
+    command never steps (each tick moves no more than the motion itself)."""
+    c = _contract()
+    calls = {"n": 0}
+    base = _policy(c)
+
+    def wobbly(sample):
+        calls["n"] += 1
+        a = base(sample)
+        T = rt.decode(a[:, : rt.POSE_DIM])
+        T[:, 1, 3] += 0.008 * (1 if calls["n"] % 2 else -1)  # sideways, alternating
+        return np.concatenate([rt.encode(T), a[:, rt.POSE_DIM:]], axis=1)
+
+    clock = Clock()
+    arm = FakeArm(clock)
+    history = rx.PoseHistory()
+
+    def observe(min_t):
+        return rx.Observation(max(min_t, clock() - 0.15), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
+                              {"box_stale_s": 0.02})
+
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=wobbly, plan=_plan(),
+                        sample=lambda h, o: {"history": h}, limits=rx.Limits(), clock=clock)
+    pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
+    result = rx.run_loop(arm=arm, predictor=pred, stage=replace(rx.STAGES[2], max_s=2.0), n_exec=16, limits=rx.Limits(),
+                         fk_tcp=_fk, wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+                         stop_flag=lambda: "", log=lambda **kw: None, clock=clock, sleep=clock.sleep)
+    assert result.chunks_accepted >= 3, result.stopped
+    steps = np.abs(np.diff(np.array(arm.commands), axis=0)).max(axis=1)
+    assert steps.max() < 3 * np.percentile(steps[steps > 0], 50) + 1e-3
+
+
+def test_the_consistency_gap_compares_two_predictions_at_the_same_instant():
+    from tools.fr3 import rollout_chunk_consistency as cc
+
+    straight = [[0.001 * k, 0.0, 0.0] for k in range(1, 33)]  # 1 mm per step along x, from each anchor
+    rows = [{"episode": 0, "frame": 26 * i, "held_out": False,
+             "pred": [[0.013 * i + p[0], p[1], p[2]] for p in straight]} for i in range(4)]
+    rows.append({"episode": 1, "frame": 0, "held_out": True, "pred": straight})
+    g = cc.gaps({"stride": 26, "frame_stride": 2, "rows": rows}, at=3)
+    np.testing.assert_allclose(g["training"], 0.0, atol=1e-9)  # consistent: the same point at the same instant
+    rows[1]["pred"] = [[q[0], q[1] + 0.02, q[2]] for q in rows[1]["pred"]]  # the second one 20 mm aside
+    g = cc.gaps({"stride": 26, "frame_stride": 2, "rows": rows}, at=3)
+    np.testing.assert_allclose(g["training"], [20.0, 20.0, 0.0], atol=1e-6) and len(g["held_out"]) == 0
 
 
 def test_assess_ends_a_chunk_at_its_first_step_too_fast():
@@ -1096,6 +1164,8 @@ def test_a_takeover_blends_longer_over_a_larger_gap_so_its_own_speed_stays_small
     old.prepare(lim, 32)
     new.prepare(lim, 32)
     t0 = old.offsets[5]
-    t1 = t0 + rx.blend_duration(new.command(t0)[0] - old.command(t0)[0], lim, dt)
-    v = np.array([rx.blend(old, new, t, t0, t1)[1] for t in np.linspace(t0, t1, 200)])
+    r0 = old.command(t0)[0] - new.command(t0)[0]
+    v0 = old.command(t0)[1] - new.command(t0)[1]
+    t1 = t0 + rx.blend_duration(r0, lim, dt)
+    v = np.array([rx.blend(new, t, t0, t1, r0, v0)[1] for t in np.linspace(t0, t1, 200)])
     assert np.abs(v[:, 0]).max() <= vmax[0] + 1e-6

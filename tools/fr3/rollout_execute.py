@@ -124,9 +124,14 @@ class Limits:
     # i.e. an IK branch change, refused whatever the speed. 11-19 runs: at most 0.008 rad per step; the
     # IK pulled to the range middle (11-18) re-postured 0.69 rad in step 1
     reposture_rad: float = 0.05
-    # a newer chunk against the command it replaces, at the moment of the switch
-    switch_mm: float = 15.0
-    switch_joint_rad: float = 0.05
+    # a newer chunk against the command it replaces, at the moment of the switch. Two predictions of the
+    # policy 13 steps apart (the takeover interval) differ there by themselves: on stack_act_wrist_v1 030000's
+    # training episodes p50 8.1, p95 22.7, p99.5 33.8 mm (rollout_chunk_consistency.py, 11-19; held-out
+    # episodes p50 31 mm); online 6.6-20.3 mm. 15 mm refused about one normal takeover in seven. p99.5 x1.5
+    # (as the step limits); the joints: 50 mm at ~0.6 m is ~0.08 rad, and 0.062 rad of null-space drift was
+    # seen with 4 mm -- an IK branch change is ~1 rad, and the reposture check catches it within a chunk.
+    switch_mm: float = 50.0
+    switch_joint_rad: float = 0.10
     # the TCP (FK of the measured joints) against FK of the command
     tracking_mm: float = 20.0
     # |O_F_ext - its reading at the start|, force part, averaged over FORCE_WINDOW_S ...
@@ -595,13 +600,13 @@ class Chunk:
         return float(self.widths[k - 1])
 
 
-#: a newer chunk takes over from the running one over this long (smoothstep), not in one tick: the two
-#: predictions differ by up to switch_mm / switch_joint_rad at the switch, and in their speed
+#: a newer chunk takes over from the running command over this long, not in one tick: the two differ by up
+#: to switch_mm / switch_joint_rad at the switch, and in their speed
 BLEND_S = 0.15
-#: ... longer when the two differ more: the blend's own term (dw/dt x the gap) adds at most this share of a
+#: ... longer when the two differ more: the blend's own term (the decaying gap) adds at most this share of a
 #: joint's speed limit (11-19 11:40: a 0.15 s blend over a ~14 mrad gap put j1 at 1.64 rad/s, cap 1.5)
 BLEND_SPEED_SHARE = 0.1
-BLEND_MAX_S = 0.5
+BLEND_MAX_S = 1.0  # a switch_joint_rad gap within BLEND_SPEED_SHARE: 1.5 x 0.10 / (0.1 x 1.5 rad/s)
 
 
 def blend_duration(gap: np.ndarray, limits: Limits, dt: float) -> float:
@@ -610,15 +615,19 @@ def blend_duration(gap: np.ndarray, limits: Limits, dt: float) -> float:
     return float(min(BLEND_MAX_S, max(BLEND_S, 1.5 * share)))
 
 
-def blend(old: Chunk, new: Chunk, t: float, t_from: float, t_to: float) -> tuple[np.ndarray, np.ndarray]:
-    """(q, dq) at t going from ``old``'s command to ``new``'s between t_from and t_to (C1 smoothstep)."""
+def blend(new: Chunk, t: float, t_from: float, t_to: float, r0: np.ndarray, v0: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(q, dq) at t: ``new``'s command plus the takeover's offset -- ``r0``, ``v0``: what was being commanded
+    at t_from minus ``new``'s command and speed there -- decaying to 0 by t_to on a cubic Hermite. C1 from
+    whatever was commanded, a takeover in the middle of another's blend included (11-19: blending from the
+    replaced chunk's own command dropped what was left of the blend before it, a step of (1 - w) x its gap)."""
     qn, dqn, _ = new.command(t)
-    if t >= t_to or t_to <= t_from:
+    T = t_to - t_from
+    if t >= t_to or T <= 0:
         return qn, dqn
-    qo, dqo, _ = old.command(t)
-    s = min(max((t - t_from) / (t_to - t_from), 0.0), 1.0)
-    w, dw = s * s * (3 - 2 * s), 6 * s * (1 - s) / (t_to - t_from)
-    return (1 - w) * qo + w * qn, (1 - w) * dqo + w * dqn + dw * (qn - qo)
+    s = min(max((t - t_from) / T, 0.0), 1.0)
+    off = r0 * (2 * s**3 - 3 * s**2 + 1) + v0 * T * (s**3 - 2 * s**2 + s)
+    doff = r0 * (6 * s**2 - 6 * s) / T + v0 * (3 * s**2 - 4 * s + 1)
+    return qn + off, dqn + doff
 
 
 def step_limits(step1_m: float | None, step1_deg: float | None) -> dict[str, float]:
@@ -1237,7 +1246,8 @@ def run_loop(
     T_cmd = fk_tcp(q_cmd)
     arm.start(q_cmd)
     chunk: Chunk | None = None
-    previous: Chunk | None = None  # the chunk being blended out (BLEND_S)
+    blending = False  # a takeover's offset (r0, v0) is decaying (blend)
+    r0 = v0 = np.zeros(7)
     blend_from = blend_to = 0.0
     accepted = 0
     pending = False
@@ -1309,10 +1319,11 @@ def run_loop(
                 if refusal:
                     why = refusal
                     break
-                if chunk is not None:  # blend out (blend_duration), no longer than the old one's run remains
-                    previous, blend_from = chunk, now
-                    span = blend_duration(new.command(now)[0] - q_cmd, limits, new.dt)
-                    blend_to = min(now + span, chunk.time_of(chunk.end))
+                if chunk is not None:  # from the running command onto the new chunk (blend, blend_duration)
+                    qn0, dqn0, _ = new.command(now)
+                    r0, v0 = q_cmd + dq_cmd * loop_dt - qn0, dq_cmd - dqn0  # what this tick would have commanded
+                    blending, blend_from = True, now
+                    blend_to = now + blend_duration(r0, limits, new.dt)
                 chunk = new
                 accepted += 1
                 replan_at = max(1, n_exec - max(0, new.k0 - 1))
@@ -1320,11 +1331,11 @@ def run_loop(
                 dq_cmd = np.zeros(7)
                 arm.command(q_cmd, dq_cmd)
             else:
-                if previous is not None and now < blend_to:
-                    q_cmd, dq_cmd = blend(previous, chunk, now, blend_from, blend_to)
+                if blending and now < blend_to:
+                    q_cmd, dq_cmd = blend(chunk, now, blend_from, blend_to, r0, v0)
                     cursor = chunk.cursor(now)
                 else:
-                    previous = None
+                    blending = False
                     q_cmd, dq_cmd, cursor = chunk.command(now)
                 T_cmd = fk_tcp(q_cmd)
                 arm.command(q_cmd, dq_cmd)
