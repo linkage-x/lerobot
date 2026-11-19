@@ -270,7 +270,7 @@ if [[ -n "$sandbox" ]]; then
     # checkpoint and export content, so a cached one is the same one the dev side would build).
     if [[ -d "$production_dir/outputs/rollout/distribution" ]]; then
       mkdir -p "$repo_dir/outputs/rollout/distribution"
-      cp -an "$production_dir/outputs/rollout/distribution/." "$repo_dir/outputs/rollout/distribution/"
+      rsync -a --ignore-existing "$production_dir/outputs/rollout/distribution/" "$repo_dir/outputs/rollout/distribution/"
     fi
   elif [[ ! -e "$repo_dir/outputs/calibration" ]]; then
     echo "    first deploy: copying production calibration into the sandbox..."
