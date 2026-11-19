@@ -135,6 +135,35 @@ def test_the_joint_watcher_reads_until_stopped():
     assert watcher.latest()[0][0] == n
 
 
+def test_reading_the_joints_does_not_ask_the_arm_for_its_model(monkeypatch, capsys):
+    """11-19: Panda() downloads the robot model on every connect; read about once a second, the arm refused
+    that command for 20-30 s and the preview had no joints for its plan check."""
+    import types
+
+    from tools.fr3 import fr3_print_joints_runtime as pj
+
+    calls = []
+
+    class Robot:
+        def __init__(self, ip):
+            calls.append(("connect", ip))
+
+        def read_once(self):
+            calls.append(("read_once",))
+            return types.SimpleNamespace(q=[0.1, -0.2, 0.3, -2.0, 0.0, 1.5, 0.7])
+
+        def load_model(self):
+            raise AssertionError("the joints need no robot model")
+
+    fake = types.ModuleType("panda_py")
+    fake.libfranka = types.SimpleNamespace(Robot=Robot)
+    fake.Panda = lambda *a, **k: (_ for _ in ()).throw(AssertionError("Panda() loads the robot model"))
+    monkeypatch.setitem(sys.modules, "panda_py", fake)
+    assert pj.main(["--robot-ip", "10.0.0.2"]) == 0
+    assert calls == [("connect", "10.0.0.2"), ("read_once",)]
+    assert "Joint angles (rad): [0.1, -0.2, 0.3, -2.0, 0.0, 1.5, 0.7]" in capsys.readouterr().out
+
+
 def test_preview_is_refused_without_the_recorder_in_a_sandbox_or_off_thor(tmp_path):
     manager = _manager(tmp_path)
     ckpt = manager.checkpoints()[0]
