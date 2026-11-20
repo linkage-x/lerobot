@@ -72,8 +72,8 @@ how to run it: `run/README.md`, section 7.
 
 - Agents may deploy to the dev gateway (`--dev`) and use its offline features.
 - Agents never borrow, return or reclaim the hardware (`/api/hardware/*`) and never call a hardware endpoint of the
-  dev gateway (the ones the sandbox guard lists, plus the Rollout preview, execution and move to a training start).
-  A person does that, on the page.
+  dev gateway (the ones the sandbox guard lists, plus the Rollout preview and execution). A person does that, on
+  the page.
 - Do not deploy over a dev gateway that holds the hardware while someone is using it; `deploy.sh --dev` refuses
   when it can tell, and says what is running.
 
@@ -82,11 +82,10 @@ how to run it: `run/README.md`, section 7.
 - **Robot motion is started by a person, with a person at the e-stop.** Agents never run real replay, pivot,
   payload identification, `move-to-start`, dual-home or real inference, and never write scripts that do so
   unattended.
-- Policy execution on an arm, and the Rollout page's move to a training start, are started only by a person on the
-  Rollout page, who confirms its dialog (the arm moves, a hand on the e-stop). Agents never call
-  `/api/rollout/execute` or `/api/rollout/to-start`, never run `rollout_relative_tcp.py execute` or `to-start` (nor
-  pass `--attended`), and never create `outputs/fr3_infer_real_unlock.json` (the old absolute-pose runtime's
-  unlock). Agents run inference as `--preview` only.
+- Policy execution on an arm is started only by a person on the Rollout page, who confirms its dialog (the arm
+  moves, a hand on the e-stop). Agents never call `/api/rollout/execute`, never run `rollout_relative_tcp.py
+  execute` (nor pass `--attended`), and never create `outputs/fr3_infer_real_unlock.json` (the old absolute-pose
+  runtime's unlock). Agents run inference as `--preview` only.
 - Agents never borrow, return or reclaim Thor's hardware for the dev gateway (section 3), and never make the
   hardware lease say something other than what a person chose on a page (do not edit `outputs/hardware_lease.json`).
 - Never weaken or bypass a gate: MuJoCo / IK QC approval before real replay, the world-graph guard

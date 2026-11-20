@@ -7,7 +7,7 @@ export type Stage = { id: string; label: string; status: string };
 
 export type RolloutJob = {
   id: string;
-  kind: "offline" | "preview" | "replay" | "execute" | "tostart";
+  kind: "offline" | "preview" | "replay" | "execute";
   checkpoint: string;
   state: "running" | "done" | "failed" | "stopped";
   message: string;
@@ -18,17 +18,6 @@ export type RolloutJob = {
   last: Record<string, unknown>;
 };
 
-export type RecorderReadiness = {
-  state: string;
-  sensors: { id: string; kind: string; state: string }[];
-  ready: boolean;
-  pending: boolean;
-  failed: boolean;
-  // still connecting after the gateway's limit (60 s) with nothing failed: may be cancelled
-  stuck?: boolean;
-  elapsedS?: number | null;
-};
-
 export type RolloutStatus = {
   stages: Stage[];
   jobs: RolloutJob[];
@@ -37,8 +26,6 @@ export type RolloutStatus = {
   recorderConnected: boolean;
   // connected for inference: the only cameras the recorder opened ([] = a full session)
   recorderCameras?: string[];
-  // pending = the recorder is still bringing its cameras and BOXes up (it has not said "Episode N ready")
-  recorder?: RecorderReadiness;
   executeStages?: Record<string, string>;
 };
 
@@ -106,8 +93,6 @@ export type OfflineResult = {
 export type PreviewLatest = {
   step?: number;
   time?: string;
-  // no prediction now: an input is missing (e.g. the arm's gripper BOX stopped streaming)
-  blocked?: string;
   width?: number;
   wrench?: number[] | null;
   latency_ms?: number;
@@ -122,7 +107,6 @@ export type PreviewLatest = {
     ik_ok: boolean[];
     inside_workspace: boolean[] | null;
   } | null;
-  joints?: { source: "given" | "read"; age_s: number | null; error: string; q?: number[] } | null;
 };
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
@@ -158,9 +142,6 @@ export const rolloutApi = {
   replay: (record: string) => call<{ job: RolloutJob }>("/api/rollout/replay", { record }),
   execute: (checkpoint: string, arm: string, stage: number, attended: boolean) =>
     call<{ job: RolloutJob }>("/api/rollout/execute", { checkpoint, arm, stage, attended }),
-  // Moves the arm (slowly) to a random real start of the checkpoint's training episodes; a person at the e-stop.
-  toStart: (checkpoint: string, arm: string, attended: boolean) =>
-    call<{ job: RolloutJob }>("/api/rollout/to-start", { checkpoint, arm, attended }),
   stop: (job: string) => call("/api/rollout/stop", { job }),
   // Connect the recorder for inference: only these cameras, the main frame bus at 30 Hz, no episodes.
   connectForInference: (cameras: string[]) =>

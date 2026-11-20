@@ -55,7 +55,6 @@ class FakeArm:
         self.cmd = self.q.copy()
         self.t = clock()
         self.f_ext = f_ext or (lambda t: np.zeros(6))
-        self.bias = 0.05
         self.started = self.stopped = False
         self.commands: list[np.ndarray] = []
 
@@ -71,8 +70,7 @@ class FakeArm:
 
     def read(self):
         self._advance()
-        # + a small constant: a real estimate is never exactly 0 (exactly 0 means no estimate, which stops a run)
-        return self.q.copy(), self.dq.copy(), np.asarray(self.f_ext(self.clock()), dtype=float) + self.bias
+        return self.q.copy(), self.dq.copy(), np.asarray(self.f_ext(self.clock()), dtype=float)
 
     def start(self, q):
         self.started = True
@@ -93,7 +91,7 @@ class FakeArm:
 def _plan(fail_step: int | None = None):
     def plan(T_obs, actions, seed):
         targets, widths = rt.targets_from_actions(T_obs, actions)
-        q, ok = kin.ik_retry(kin.NOMINAL, targets, seed, early_exit=True, rest=seed)  # as PlanContext.evaluate
+        q, ok = kin.ik_retry(kin.NOMINAL, targets, seed, early_exit=True)
         why = ["" if o else "IK" for o in ok]
         ok = ok.copy()
         if fail_step is not None:
@@ -104,20 +102,20 @@ def _plan(fail_step: int | None = None):
     return plan
 
 
-def _policy(c: rt.PolicyContract, width=lambda k: 0.088, step=(0.0, 0.0, -STEP_DOWN_M)):
+def _policy(c: rt.PolicyContract, width=lambda k: 0.088):
     def predict(_sample):
         T = np.repeat(np.eye(4)[None], c.horizon, axis=0)
-        T[:, :3, 3] = np.outer(np.arange(1, c.horizon + 1), step)
+        T[:, 2, 3] = -STEP_DOWN_M * np.arange(1, c.horizon + 1)
         return np.concatenate([rt.encode(T), np.array([[width(k)] for k in range(c.horizon)])], axis=1)
 
     return predict
 
 
 def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_ext=None, limits=rx.Limits(), width=lambda k: 0.088,
-         gripper=None, stop_flag=lambda: "", record=None, start_check=None, step=(0.0, 0.0, -STEP_DOWN_M), arm_cls=None):
+         gripper=None, stop_flag=lambda: "", record=None, start_check=None):
     c = _contract()
     clock = Clock()
-    arm = (arm_cls or FakeArm)(clock, f_ext=f_ext)
+    arm = FakeArm(clock, f_ext=f_ext)
     history = rx.PoseHistory()
     seen: list[dict] = []
 
@@ -126,7 +124,7 @@ def _run(stage: rx.Stage, *, age_s=0.15, stale_frames=False, fail_step=None, f_e
         return rx.Observation(t_img, {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
                               {"box_stale_s": 0.02})
 
-    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c, width, step), plan=_plan(fail_step),
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c, width), plan=_plan(fail_step),
                         sample=lambda h, o: {"history": h}, limits=limits, clock=clock)
     # synchronous: each request is answered before the loop's next tick (the thread is not started)
     pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
@@ -191,48 +189,6 @@ def test_contact_stops_and_holds_where_the_arm_is():
     np.testing.assert_allclose(arm.commands[-1], arm.q, atol=1e-3)
 
 
-def test_a_force_swing_in_motion_does_not_stop_but_a_lasting_force_or_an_impact_does():
-    # 11-19: O_F_ext swings +-10 N for a few ticks with the TCP's acceleration, nothing touched
-    swing = lambda t: np.array([18.0 if 1000.60 < t < 1000.611 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
-    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=swing)
-    assert result.completed, result.stopped
-    impact = lambda t: np.array([30.0 if 1000.60 < t < 1000.606 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
-    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=impact)
-    assert "in one tick (limit 25)" in result.stopped
-    lasting = lambda t: np.array([16.0 if t > 1000.6 else 0.0, 0, 0, 0, 0, 0])  # noqa: E731
-    result, _, _ = _run(replace(rx.STAGES[2], max_s=1.0), f_ext=lasting)
-    assert "over 50 ms (limit 15)" in result.stopped
-
-
-def test_a_chunk_brakes_to_its_last_step_over_several_steps():
-    q = np.zeros((33, 7))
-    q[:, 0] = np.cumsum(np.r_[0.0, np.full(32, 0.045)])  # 1.35 rad/s to the end (end = 20)
-    T = np.repeat(np.eye(4)[None], 33, axis=0)
-    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(33, bool), [""] * 33, np.zeros(32))
-    ch.prepare(rx.Limits(), 20)
-    ts = np.arange(0.0, ch.offsets[20], 0.0005)
-    dq = np.array([ch.command(t)[1] for t in ts])
-    assert np.abs(ch.command(ch.offsets[20])[1]).max() == 0.0
-    # planned at BRAKE_SHARE of it; the cubic between steps adds up to about 2x of that
-    assert (np.abs(np.diff(dq[:, 0])) / 0.0005).max() < 1.5 * rx.STOP_ACCELERATION[0]
-    assert (ch.stretch()[:20] > 1.01).sum() >= 3  # spread over several steps, not all in the last
-
-
-def test_a_first_chunk_starts_from_rest_within_the_stop_acceleration():
-    q = np.zeros((6, 7))
-    q[1:, 0] = 0.012 + 0.002 * np.arange(5)  # step 1: 12 mrad at once (the policy's 1-2 mm offset), then slow
-    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=True, end=5)
-    T = np.repeat(np.eye(4)[None], 6, axis=0)
-    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(6, bool), [""] * 6, np.zeros(5), still_start=True)
-    ch.prepare(rx.Limits(), 5)
-    np.testing.assert_allclose(ch.offsets, off)
-    assert off[1] > 1 / 30  # the first step takes longer than 33 ms
-    ts = np.arange(0.0, off[1], 0.0005)
-    dq = np.array([ch.command(t)[1] for t in ts])
-    # planned at BRAKE_SHARE of it; an uneven step (12 mrad, then 2) lets the cubic add about half again
-    assert (np.abs(np.diff(dq, axis=0)) / 0.0005 / rx.STOP_ACCELERATION).max() < 1.6
-
-
 def test_inputs_too_old_stop_before_anything_moves():
     result, arm, _ = _run(rx.STAGES[2], age_s=0.6, stale_frames=True)
     assert "ms old" in result.stopped
@@ -256,264 +212,6 @@ def test_stage_three_closes_the_gripper_ahead_of_the_predicted_width():
                            gripper=sent.append)
     assert result.completed, result.stopped
     assert sent[:1] == ["close"]
-
-
-def _speeds(commands: list[np.ndarray], ticks: int) -> np.ndarray:
-    return np.diff(np.stack(commands[:ticks]), axis=0) / 0.005  # rad/s per joint, per 5 ms tick
-
-
-def test_a_step_too_fast_for_a_joint_is_slowed_down_not_refused():
-    # 24 mm per step along the TCP's y: more joint motion per step than allowed at Q0
-    lim = rx.Limits(step_mm=36.0)
-    stage = replace(rx.STAGES[2], max_s=1.3)  # from rest it ramps up first
-    result, arm, seen = _run(stage, limits=lim, step=(0.0, 0.024, 0.0), age_s=0.05)
-    assert result.completed, result.stopped
-    assert result.chunks_accepted >= 2  # through a switch (blended) as well
-    v = _speeds(arm.commands, result.ticks)
-    vmax = rx.joint_speed_limit(lim, 1 / 30)
-    assert (np.abs(v) / vmax).max() < 1.02  # never commanded faster than the limit
-    assert (np.abs(v) / vmax).max() > 0.75  # ... and it ran close to it (ramps up from rest, brakes ahead)
-    # what 11-19's stage 2 met: refusing such a step (no slowing allowed) stops the run
-    result, _, _ = _run(stage, limits=replace(lim, step_stretch_max=1.0), step=(0.0, 0.024, 0.0), age_s=0.05)
-    assert not result.completed and "in one step" in result.stopped
-
-
-def test_a_re_posture_is_refused_however_slowly_it_could_be_run():
-    # 11-18: IK pulled to the middle of the joint range re-postures the arm in step 1 for a 4 mm target
-    T0 = _fk(Q0)
-    T = np.repeat(T0[None], 3, axis=0)
-    T[1:, 2, 3] -= [0.002, 0.004]
-    q_mid, ok = kin.ik(kin.NOMINAL, T[1:], Q0)  # rest: the range middle
-    q_held, _ = kin.ik(kin.NOMINAL, T[1:], Q0, rest=Q0)
-    assert ok.all()
-    held = np.vstack([Q0, q_held])
-    ok, _ = rx.assess(T, held, np.ones(2, bool), ["", ""], rx.Limits())
-    assert ok.all() and rx.reposture(held).max() < 0.01
-    mid = np.vstack([Q0, q_mid])
-    ok, why = rx.assess(T, mid, np.ones(2, bool), ["", ""], rx.Limits(step_stretch_max=1e9))  # speed not the issue
-    assert not ok[1] and "re-postures" in why[1] and "IK branch change" in why[1]
-
-
-def test_retime_keeps_the_policys_timing_unless_a_joint_needs_longer():
-    q = np.zeros((6, 7))
-    q[:, 0] = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]  # 0.3 rad/s: well under 1.5
-    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
-    # the policy's timing, except where it brakes to rest on the last step (within STOP_ACCELERATION)
-    np.testing.assert_allclose(off[:4], np.arange(4) / 30, atol=1e-9)
-    assert off[5] > 5 / 30
-    q[3:, 0] += 0.06  # step 3 asks 0.07 rad in 33 ms
-    off = rx.retime(q, 1 / 30, rx.Limits(), still_start=False, end=5)
-    h = np.diff(off)
-    assert h[2] > 1.4 / 30  # the fast step itself
-    assert 1 / 30 < h[1] < h[2]  # and the arm speeds up into it within STOP_ACCELERATION, not in one knot
-
-
-def test_a_sharp_change_of_direction_is_passed_slowly_or_ends_the_chunk_before_it():
-    """11-19 (160814): j2 through 0, the IK turned j1 around at 29 rad/s² under every speed limit."""
-    dt = 1 / 30
-    smooth = np.zeros((12, 7))
-    smooth[:, 0] = 0.02 * np.arange(12)  # 0.6 rad/s, straight on
-    assert np.isinf(rx.turn_speed_cap(smooth)[1:-1]).all() or (rx.turn_speed_cap(smooth)[1:-1] > 1e3).all()
-    np.testing.assert_allclose(np.diff(rx.retime(smooth, dt, rx.Limits(), still_start=False, end=0))[:8], dt, atol=1e-9)
-
-    turn = smooth.copy()
-    turn[6:, 0] = turn[5, 0] - 0.008 * np.arange(1, 7)  # turns from +0.6 to -0.24 rad/s at step 5
-    a = np.abs(turn[6, 0] - 2 * turn[5, 0] + turn[4, 0]) / dt**2  # 25 rad/s², over STOP_ACCELERATION (7.5)
-    cap = rx.turn_speed_cap(turn)[5]
-    assert cap * dt == pytest.approx(np.sqrt(rx.STOP_ACCELERATION[0] / (a * dt * dt)) * dt)
-    h = np.diff(rx.retime(turn, dt, rx.Limits(), still_start=False, end=0))
-    assert h[4] > dt and h[5] > dt  # slowed into and out of the turn
-    T = np.repeat(np.eye(4)[None], 12, axis=0)
-    ok, why = rx.assess(T, turn, np.ones(11, bool), [""] * 11, rx.Limits(), dt=dt)
-    assert ok[:6].all() and ok[5]  # x1.8 slowed: within step_stretch_max, run through slowly
-    sharp = smooth.copy()
-    sharp[6:, 0] = sharp[5, 0] - 0.03 * np.arange(1, 7)  # +0.6 to -0.9 rad/s: x2.6 slowed
-    ok, why = rx.assess(T, sharp, np.ones(11, bool), [""] * 11, rx.Limits(), dt=dt)
-    assert ok[:6].all() and not ok[6] and "changes direction at step 5" in why[6] and "j1" in why[6]
-
-
-def test_a_stop_brakes_every_joint_to_rest_together_then_holds():
-    v0 = np.array([2.0, -1.0, 0.0, 0.0, 3.0, 0.0, 0.0])
-    dur, at = rx.stop_motion(np.zeros(7), v0)
-    assert pytest.approx(3.0 / 15.0) == dur  # the joint that needs longest (j5, 3 rad/s), at its rating
-    _, dq_mid = at(dur / 2)
-    np.testing.assert_allclose(dq_mid, v0 / 2)  # together: the direction of motion kept
-    q_end, dq_end = at(dur + 1.0)
-    np.testing.assert_allclose(dq_end, 0.0)
-    np.testing.assert_allclose(q_end, v0 * dur / 2)
-    assert rx.stop_motion(np.ones(7), np.zeros(7))[0] == 0.0
-
-
-def test_a_stop_in_motion_brakes_instead_of_stepping_the_speed_to_zero():
-    ticks = []
-    result, _, _ = _run(replace(rx.STAGES[2], max_s=2.0), f_ext=lambda t: np.array([0, 0, 20.0 if t > 1000.6 else 0.0, 0, 0, 0]),
-                        record=lambda item: ticks.append(item["tick"]) if "tick" in item else None)
-    assert "external force" in result.stopped
-    hold = np.array([t["q_cmd"] for t in ticks if t.get("phase") == 2])
-    steps = np.abs(np.diff(hold, axis=0)).max(axis=1)
-    assert steps[0] > 0 and steps[-1] == 0.0  # the command still moves right after the stop (braking), then stands
-
-
-def test_no_external_force_estimate_refuses_the_start_and_one_that_goes_silent_stops():
-    def silent_arm(clock, f_ext=None):
-        arm = FakeArm(clock, f_ext=f_ext)
-        arm.bias = 0.0
-        return arm
-
-    result, arm, _ = _run(rx.STAGES[2], arm_cls=silent_arm)
-    assert "no external force estimate" in result.stopped and not arm.started
-
-    def says_its_mode(clock, f_ext=None):
-        arm = silent_arm(clock, f_ext)
-        arm.condition = lambda: "robot mode kUserStopped"
-        return arm
-
-    result, _, _ = _run(rx.STAGES[2], arm_cls=says_its_mode)
-    assert "standing still; robot mode kUserStopped)" in result.stopped  # the robot's own state, in the message
-
-    class GoesSilent(FakeArm):
-        def read(self):
-            q, dq, f = super().read()
-            return q, dq, (np.zeros(6) if self.clock() > 1000.5 else f)
-
-    result, arm, _ = _run(replace(rx.STAGES[2], max_s=2.0), arm_cls=GoesSilent)
-    assert "read exactly 0" in result.stopped and arm.started
-
-
-def test_the_command_passes_every_step_with_continuous_speed_never_over_the_limit():
-    rng = np.random.default_rng(0)
-    q = np.cumsum(np.c_[rng.uniform(0.0, 0.08, (33, 1)), rng.uniform(-0.03, 0.03, (33, 6))], axis=0)  # uneven, fast
-    q[0] = 0.0
-    T = np.repeat(np.eye(4)[None], 33, axis=0)
-    ch = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, q, np.ones(33, bool), [""] * 33, np.zeros(32), still_start=True)
-    ch.prepare(rx.Limits(), 32)
-    for k in range(33):
-        np.testing.assert_allclose(ch.command(ch.offsets[k])[0], q[k], atol=1e-12)
-    ts = np.arange(0.0, ch.offsets[-1], 0.001)
-    dq = np.array([ch.command(t)[1] for t in ts])
-    vmax = rx.joint_speed_limit(rx.Limits(), 1 / 30)
-    assert (np.abs(dq) / vmax).max() <= 1.0 + 1e-3
-    for k in range(1, 32):  # the speed is continuous through every step (a linear command jumps there)
-        before, after = ch.command(ch.offsets[k] - 1e-7)[1], ch.command(ch.offsets[k] + 1e-7)[1]
-        assert np.abs(before - after).max() < 1e-3
-    assert np.abs(ch.command(0.0)[1]).max() == 0.0 and np.abs(ch.command(ch.offsets[-1])[1]).max() == 0.0
-    # monotone: between two steps no joint leaves their range
-    for k in range(32):
-        seg = np.array([ch.command(t)[0] for t in np.linspace(ch.offsets[k], ch.offsets[k + 1], 20)])
-        lo, hi = np.minimum(q[k], q[k + 1]) - 1e-12, np.maximum(q[k], q[k + 1]) + 1e-12
-        assert ((seg >= lo) & (seg <= hi)).all()
-
-
-def test_a_newer_chunk_takes_over_without_a_jump():
-    T = np.repeat(np.eye(4)[None], 5, axis=0)
-    qa = np.outer(np.arange(5), np.full(7, 0.01))
-    qb = qa + 0.02  # the newer prediction: 0.02 rad off the running one
-    old = rx.Chunk(0, 0.0, 0.0, 1 / 30, T, qa, np.ones(5, bool), [""] * 5, np.zeros(4))
-    new = rx.Chunk(1, 0.0, 0.0, 1 / 30, T, qb, np.ones(5, bool), [""] * 5, np.zeros(4))
-    old.prepare(rx.Limits(), 4)
-    new.prepare(rx.Limits(), 4)
-    t0, t1 = 0.03, 0.03 + rx.BLEND_S * 0.5
-    q_run, dq_run, _ = old.command(t0)
-    r0, v0 = q_run - new.command(t0)[0], dq_run - new.command(t0)[1]
-    q_a, dq_a = rx.blend(new, t0, t0, t1, r0, v0)
-    np.testing.assert_allclose(q_a, q_run) and np.testing.assert_allclose(dq_a, dq_run)  # C1 at the switch
-    np.testing.assert_allclose(rx.blend(new, t1, t0, t1, r0, v0)[0], new.command(t1)[0])
-    ts = np.linspace(t0, t1, 200)
-    qs = np.array([rx.blend(new, t, t0, t1, r0, v0)[0] for t in ts])
-    assert np.abs(np.diff(qs, axis=0)).max() < 0.02 / 50  # spread over the window, not one tick
-
-
-def test_a_takeover_in_the_middle_of_a_blend_starts_from_what_is_commanded():
-    """11-19: blending from the replaced chunk's own command dropped what was left of the blend before it."""
-    T = np.repeat(np.eye(4)[None], 9, axis=0)
-    base = np.outer(np.arange(9), np.full(7, 0.01))
-    a, b, c = (rx.Chunk(i, 0.0, 0.0, 1 / 30, T, base + off, np.ones(9, bool), [""] * 9, np.zeros(8))
-               for i, off in enumerate((0.0, 0.05, -0.04)))
-    for ch in (a, b, c):
-        ch.prepare(rx.Limits(), 8)
-    t0, t1 = 0.03, 0.03 + 0.5  # a -> b over 0.5 s
-    r0 = a.command(t0)[0] - b.command(t0)[0]
-    v0 = a.command(t0)[1] - b.command(t0)[1]
-    t_mid = 0.2  # c arrives while a -> b is still blending
-    q_mid, dq_mid = rx.blend(b, t_mid, t0, t1, r0, v0)
-    r1, v1 = q_mid - c.command(t_mid)[0], dq_mid - c.command(t_mid)[1]
-    q_after, dq_after = rx.blend(c, t_mid, t_mid, t_mid + 0.5, r1, v1)
-    np.testing.assert_allclose(q_after, q_mid) and np.testing.assert_allclose(dq_after, dq_mid)
-
-
-def test_takeovers_that_disagree_by_what_the_policy_does_by_itself_run_on_without_a_step():
-    """Consecutive predictions 16 mm apart at the switch (the policy's own p95 is 23 mm): taken, and the
-    command never steps (each tick moves no more than the motion itself)."""
-    c = _contract()
-    calls = {"n": 0}
-    base = _policy(c)
-
-    def wobbly(sample):
-        calls["n"] += 1
-        a = base(sample)
-        T = rt.decode(a[:, : rt.POSE_DIM])
-        T[:, 1, 3] += 0.008 * (1 if calls["n"] % 2 else -1)  # sideways, alternating
-        return np.concatenate([rt.encode(T), a[:, rt.POSE_DIM:]], axis=1)
-
-    clock = Clock()
-    arm = FakeArm(clock)
-    history = rx.PoseHistory()
-
-    def observe(min_t):
-        return rx.Observation(max(min_t, clock() - 0.15), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
-                              {"box_stale_s": 0.02})
-
-    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=wobbly, plan=_plan(),
-                        sample=lambda h, o: {"history": h}, limits=rx.Limits(), clock=clock)
-    pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
-    result = rx.run_loop(arm=arm, predictor=pred, stage=replace(rx.STAGES[2], max_s=2.0), n_exec=16, limits=rx.Limits(),
-                         fk_tcp=_fk, wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
-                         stop_flag=lambda: "", log=lambda **kw: None, clock=clock, sleep=clock.sleep)
-    assert result.chunks_accepted >= 3, result.stopped
-    steps = np.abs(np.diff(np.array(arm.commands), axis=0)).max(axis=1)
-    assert steps.max() < 3 * np.percentile(steps[steps > 0], 50) + 1e-3
-
-
-def test_the_consistency_gap_compares_two_predictions_at_the_same_instant():
-    from tools.fr3 import rollout_chunk_consistency as cc
-
-    straight = [[0.001 * k, 0.0, 0.0] for k in range(1, 33)]  # 1 mm per step along x, from each anchor
-    rows = [{"episode": 0, "frame": 26 * i, "held_out": False,
-             "pred": [[0.013 * i + p[0], p[1], p[2]] for p in straight]} for i in range(4)]
-    rows.append({"episode": 1, "frame": 0, "held_out": True, "pred": straight})
-    g = cc.gaps({"stride": 26, "frame_stride": 2, "rows": rows}, at=3)
-    np.testing.assert_allclose(g["training"], 0.0, atol=1e-9)  # consistent: the same point at the same instant
-    rows[1]["pred"] = [[q[0], q[1] + 0.02, q[2]] for q in rows[1]["pred"]]  # the second one 20 mm aside
-    g = cc.gaps({"stride": 26, "frame_stride": 2, "rows": rows}, at=3)
-    np.testing.assert_allclose(g["training"], [20.0, 20.0, 0.0], atol=1e-6) and len(g["held_out"]) == 0
-
-
-def test_a_takeover_whose_blend_would_come_too_near_the_table_is_refused():
-    """The blend runs neither chunk's checked steps: its own postures are checked before it is taken."""
-    seen = []
-
-    def near_table(qs):
-        seen.append(len(qs))
-        return "the takeover's blend comes 4 mm from the carts/table/cameras 30% of the way (needs 10)"
-
-    c = _contract()
-    clock = Clock()
-    arm = FakeArm(clock)
-    history = rx.PoseHistory()
-
-    def observe(min_t):
-        return rx.Observation(max(min_t, clock() - 0.15), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
-                              {"box_stale_s": 0.02})
-
-    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=_policy(c), plan=_plan(),
-                        sample=lambda h, o: {"history": h}, limits=rx.Limits(), clock=clock)
-    pred.request = lambda *, min_t, seed: pred.results.put(pred.once(min_t, seed))
-    result = rx.run_loop(arm=arm, predictor=pred, stage=replace(rx.STAGES[2], max_s=2.0), n_exec=16, limits=rx.Limits(),
-                         fk_tcp=_fk, wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
-                         stop_flag=lambda: "", log=lambda **kw: None, clock=clock, sleep=clock.sleep,
-                         blend_check=near_table)
-    assert result.chunks_accepted == 1 and "blend comes 4 mm" in result.stopped  # the first chunk has no blend
-    assert seen == [rx.BLEND_CHECK_POINTS]
 
 
 def test_assess_ends_a_chunk_at_its_first_step_too_fast():
@@ -553,18 +251,15 @@ def test_joint_limits_scale_with_each_joints_own_speed_limit():
     q[1, 6] = 0.08  # j7: within 0.05 x 2.0
     ok, _ = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
     assert ok.all()
-    q[1, 0] = 0.06  # j1: over 0.05, but within x2 of it: slowed down (retime), not refused
-    ok, _ = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
-    assert ok.all()
-    q[1, 0] = 0.11  # more than twice: an IK branch change, refused
+    q[1, 0] = 0.06  # j1: over 0.05
     ok, why = rx.assess(T, q, np.ones(1, bool), [""], rx.Limits())
-    assert not ok[1] and "j1 moves 0.110 rad in one step (limit 0.050 x2 slowed down" in why[1]
+    assert not ok[1] and "j1 moves 0.060 rad in one step (limit 0.050" in why[1]
     kw = {"f_ext": np.zeros(6), "f0": np.zeros(6), "T_meas": np.eye(4), "T_cmd": np.eye(4), "loop_dt": 0.005,
           "limits": rx.Limits(), "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
           "q": np.array([0, 0, 0, -1.5, 0, 1.5, 0.0])}
-    assert rx.tick_problem(dq=np.array([0, 0, 0, 0, 0, 0, 3.0]), **kw) == ("", "")  # j7 under 1.9 x 2.0
+    assert rx.tick_problem(dq=np.array([0, 0, 0, 0, 0, 0, 3.0]), **kw) == ("", "")  # j7 under 1.6 x 2.0
     kind, why = rx.tick_problem(dq=np.array([0, 0, 2.0, 0, 0, 0, 0]), **kw)
-    assert kind == "speed" and "j3 turns at 2.00 rad/s (limit 1.90" in why
+    assert kind == "speed" and "j3 turns at 2.00 rad/s (limit 1.60" in why
 
 
 def test_history_is_read_at_the_observation_instant():
@@ -579,156 +274,6 @@ def test_history_is_read_at_the_observation_instant():
         h.at(9.0)
     with pytest.raises(RuntimeError, match="no FK within"):
         h.at(10.5)
-
-
-def test_the_shared_history_reads_back_like_the_in_process_one():
-    """The loop writes its FK into shared memory; the predictor's process reads it (wrapping the ring)."""
-    local, shared = rx.PoseHistory(span_s=0.5), rx.SharedPoseHistory(span_s=0.5, capacity=64)
-    try:
-        reader = rx.SharedPoseHistory.attach(shared.spec())
-        for i in range(150):  # more than the ring holds
-            T = np.eye(4)
-            T[0, 3] = 0.001 * i
-            for h in (local, shared):
-                h.add(10.0 + 0.005 * i, T, np.full(7, float(i)))
-        for t in (10.6, 10.6025, 10.745, 10.75, 10.76):
-            np.testing.assert_allclose(reader.at(t), local.at(t))
-            np.testing.assert_allclose(reader.q_at(t), local.q_at(t))
-        np.testing.assert_allclose(reader.poses(10.74, [-0.02, -0.01, 0.0]), local.poses(10.74, [-0.02, -0.01, 0.0]))
-        with pytest.raises(RuntimeError, match="starts"):
-            reader.at(10.0)  # older than the ring (and the span)
-        with pytest.raises(RuntimeError, match="no FK within"):
-            reader.at(11.0)
-        reader.close()
-    finally:
-        shared.close()
-
-
-def _process_parts(*, fail: str = "", hang_s: float = 0.0):
-    """ProcessPredictor's build, in the spawned process: the fake policy and plan, frames on real time."""
-    import time
-
-    if fail:
-        raise RuntimeError(fail)
-    c = _contract()
-
-    def observe(min_t):
-        time.sleep(hang_s)
-        return rx.Observation(max(min_t, time.monotonic() - 0.03), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088,
-                              None, {"box_stale_s": 0.02})
-
-    return {"contract": c, "limits": rx.Limits(), "observe": observe, "predict": _policy(c), "plan": _plan(),
-            "sample": lambda h, o: {}, "info": {"n_exec": 16, "first_width": 0.088}}
-
-
-def _fill(history, seconds: float = 0.5) -> None:
-    import time
-
-    now = time.monotonic()
-    for k in range(int(seconds * 200) + 1):
-        history.add(now - seconds + k * 0.005, _fk(Q0), Q0)
-
-
-def _wait_result(pred, timeout_s: float = 30.0):
-    import time
-
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            return pred.results.get_nowait()
-        except queue.Empty:
-            time.sleep(0.01)
-    raise AssertionError("no prediction from the predictor's process")
-
-
-def test_the_predictor_runs_in_its_own_process_and_plans_like_the_thread():
-    history = rx.SharedPoseHistory()
-    pred = rx.ProcessPredictor((__name__, "_process_parts", {}), history=history)
-    try:
-        info = pred.start()
-        assert info["n_exec"] == 16 and pred.offsets_s == [-4 / 60, -2 / 60, 0.0]
-        _fill(history)
-        import time
-
-        pred.request(min_t=time.monotonic() - 0.2, seed=Q0)
-        first = _wait_result(pred)
-        assert first.error == "" and first.chunk is not None
-        assert list(first.timing) == ["requested", "observe", "predict", "plan", "chunk"]
-        _fill(history)
-        pred.request(min_t=first.obs.t_img + 1e-3, seed=first.chunk)  # a replan: seeded from the running chunk
-        second = _wait_result(pred)
-        assert second.error == "" and second.chunk is not None and pred.busy[0] == ""
-
-        local = rx.PoseHistory()
-        _fill(local)
-        thread = rx.Predictor(contract=_contract(), history=local, observe=_process_parts()["observe"],
-                              predict=_policy(_contract()), plan=_plan(), sample=lambda h, o: {}, limits=rx.Limits())
-        same = thread.serve(time.monotonic() - 0.2, Q0, time.monotonic())
-        np.testing.assert_allclose(first.chunk.q, same.chunk.q, atol=1e-9)
-    finally:
-        pred.close()
-        history.close()
-    assert not pred.process.is_alive()
-
-
-def test_a_predictor_process_that_cannot_load_says_why_before_anything_moves():
-    history = rx.SharedPoseHistory()
-    try:
-        with pytest.raises(RuntimeError, match="no such checkpoint"):
-            rx.ProcessPredictor((__name__, "_process_parts", {"fail": "no such checkpoint"}), history=history).start()
-    finally:
-        history.close()
-
-
-def _process_dies(**_kw):
-    import os
-
-    os._exit(3)  # noqa: SLF001 -- a crash while loading (CUDA, a segfault): no message comes back
-
-
-def test_a_predictor_process_that_dies_while_loading_says_so():
-    history = rx.SharedPoseHistory()
-    try:
-        with pytest.raises(RuntimeError, match=r"ended before it was ready \(exit code 3\)"):
-            rx.ProcessPredictor((__name__, "_process_dies", {}), history=history).start()
-    finally:
-        history.close()
-
-
-def test_the_predictor_process_ending_is_a_prediction_error_that_stops_the_run():
-    history = rx.SharedPoseHistory()
-    pred = rx.ProcessPredictor((__name__, "_process_parts", {"hang_s": 30.0}), history=history)
-    try:
-        pred.start()
-        import time
-
-        pred.request(min_t=time.monotonic(), seed=Q0)
-        time.sleep(0.3)
-        assert pred.busy[0] == "observe"  # the loop's record says where it was
-        pred.process.kill()
-        out = _wait_result(pred)
-        assert out.chunk is None and "predictor's process ended" in out.error
-        with pytest.raises(queue.Empty):
-            pred.results.get_nowait()  # said once
-    finally:
-        pred.close()
-        history.close()
-
-
-def test_the_loop_thread_asks_for_real_time_priority_and_says_when_refused(monkeypatch):
-    import os
-
-    calls = []
-    monkeypatch.setattr(os, "sched_setscheduler", lambda pid, policy, param: calls.append((pid, policy, param.sched_priority)))
-    assert rx.realtime_thread() == ""
-    assert calls == [(0, os.SCHED_FIFO, rx.RT_PRIORITY)]
-
-    def refuse(*_a):
-        raise PermissionError(1, "Operation not permitted")
-
-    monkeypatch.setattr(os, "sched_setscheduler", refuse)
-    assert "Operation not permitted" in rx.realtime_thread()
-    rx.normal_thread()  # never raises
 
 
 def test_gripper_hysteresis_and_interval():
@@ -770,22 +315,6 @@ def test_ik_early_exit_converges_to_the_posture_nearest_the_seed():
     # nearest the seed: never further from it than the 400-iteration answer, and smooth step to step
     assert np.abs(q_fast - Q0).sum() <= np.abs(q_full - Q0).sum() + 1e-6
     assert np.abs(np.diff(q_fast, axis=0)).max() < 0.03
-
-
-def test_an_unreachable_target_does_not_hold_a_plan_up_for_the_whole_iteration_budget():
-    """11-19 (163001): 3 targets that never converged kept a 32-target batch iterating 400 times (138 ms)."""
-    import time
-
-    targets = np.repeat(kin.NOMINAL.fk(Q0[None]), 32, axis=0)
-    targets[-3:, 0, 3] += 2.0  # 2 m away: out of reach
-    t = time.perf_counter()
-    _, ok = kin.ik_retry(kin.NOMINAL, targets, Q0, early_exit=True, rest=Q0)
-    fast = time.perf_counter() - t
-    t = time.perf_counter()
-    kin.ik(kin.NOMINAL, targets, Q0, early_exit=True, rest=Q0)  # one try at the full 400
-    full = time.perf_counter() - t
-    assert ok[:-3].all() and not ok[-3:].any()
-    assert fast < full  # five tries at EARLY_EXIT_ITERS cost less than one at 400
 
 
 def test_ik_for_execution_holds_the_posture_it_starts_from():
@@ -871,239 +400,10 @@ def test_the_preview_check_names_the_joint_step_execution_would_refuse():
     actions = np.zeros((32, rt.POSE_DIM + 1))
     actions[:, 3] = actions[:, 7] = 1.0
     assert plan.check(Q0, actions, None, 16)["step_limit"] == ""
-    jump["j5"] = 0.149  # 11-18's re-posture: within x2 of j5's 0.10 per step -- execution slows it, passes
-    assert plan.check(Q0, actions, None, 16)["step_limit"] == ""
-    jump["j5"] = 0.25
+    jump["j5"] = 0.149
     out = plan.check(Q0, actions, None, 16)
-    assert out["execution_steps"] == 16 and "j5 moves 0.250 rad" in out["step_limit"]
+    assert out["execution_steps"] == 16 and "j5 moves 0.149 rad" in out["step_limit"]
     assert any(r.startswith("execution: step 1: j5") for r in out["reasons"]) and not out["ok"]
-
-
-# ------------------------------------------------------ a move to a training start ---
-
-
-def test_a_joint_move_is_a_straight_minimum_jerk_line_within_its_speed_and_acceleration():
-    q1 = Q0 + np.array([0.6, -0.2, 0.3, 0.1, 0.0, 0.0, 0.9])
-    T, at = rx.joint_move(Q0, q1)
-    ts = np.linspace(0.0, T, 2001)
-    q = np.array([at(t)[0] for t in ts])
-    dq = np.array([at(t)[1] for t in ts])
-    np.testing.assert_allclose(q[0], Q0) and np.testing.assert_allclose(q[-1], q1)
-    np.testing.assert_allclose(dq[0], 0.0, atol=1e-12) and np.testing.assert_allclose(dq[-1], 0.0, atol=1e-12)
-    assert (np.abs(dq) <= rx.MOVE_SPEED_RAD_S * rx.JOINT_SCALE + 1e-6).all()
-    acc = np.diff(dq, axis=0) / np.diff(ts)[:, None]
-    assert (np.abs(acc) <= rx.MOVE_ACCELERATION * 1.01).all()
-    s = (q[:, [0, 6]] - Q0[[0, 6]]) / (q1 - Q0)[[0, 6]]  # every joint the same share of its way: a straight line
-    np.testing.assert_allclose(s[:, 0], s[:, 1], atol=1e-9)
-
-
-def _move(q_goal, *, arm_cls=FakeArm, f_ext=None, stop_flag=lambda: "", q_planned=None, record=None):
-    clock = Clock()
-    arm = arm_cls(clock, f_ext=f_ext)
-    seen = []
-    result = rx.run_joint_move(arm=arm, q_goal=q_goal, limits=rx.Limits(), fk_tcp=_fk, wall_lower=kin._WALL_LOWER,
-                               wall_upper=kin._WALL_UPPER, stop_flag=stop_flag, log=lambda **kw: seen.append(kw),
-                               clock=clock, sleep=clock.sleep, q_planned=q_planned, record=record)
-    return result, arm, seen
-
-
-def test_the_move_to_a_start_gets_there_and_lets_go():
-    goal = Q0 + np.array([0.2, -0.1, 0.1, 0.05, 0.0, 0.0, 0.3])
-    result, arm, seen = _move(goal, q_planned=Q0)
-    assert result.completed and result.stopped == "" and arm.started and arm.stopped
-    np.testing.assert_allclose(arm.q, goal, atol=1e-3)
-    assert seen[0]["event"] == "move" and seen[0]["duration_s"] > 1.0
-
-
-def test_the_move_to_a_start_refuses_a_moved_arm_and_a_dead_force_estimate_and_brakes_on_a_stop():
-    goal = Q0 + np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    result, arm, _ = _move(goal, q_planned=Q0 + 0.05)
-    assert "moved since the move was planned" in result.stopped and not arm.started
-
-    def silent(clock, f_ext=None):
-        a = FakeArm(clock, f_ext=f_ext)
-        a.bias = 0.0
-        return a
-
-    result, arm, _ = _move(goal, arm_cls=silent)
-    assert "no external force estimate" in result.stopped and not arm.started
-
-    ticks = []
-    result, arm, _ = _move(goal, f_ext=lambda t: np.array([0, 0, 20.0 if t > 1000.8 else 0.0, 0, 0, 0]),
-                           record=lambda item: ticks.append(item["tick"]) if "tick" in item else None)
-    assert "external force" in result.stopped and not result.completed and arm.stopped
-    hold = np.array([t["q_cmd"] for t in ticks if t.get("phase") == 2])
-    assert np.abs(np.diff(hold, axis=0)).max(axis=1)[-1] == 0.0  # braked to rest, then held
-    assert np.abs(arm.q - goal).max() > 0.05  # it did not go on
-
-    clock_stop = {"n": 0}
-
-    def operator():
-        clock_stop["n"] += 1
-        return "stopped by the operator" if clock_stop["n"] > 100 else ""
-
-    result, arm, _ = _move(goal, stop_flag=operator)
-    assert result.stopped == "stopped by the operator" and arm.stopped
-
-
-def test_a_planned_move_runs_without_the_force_estimate_and_still_stops_on_tracking():
-    """The move to a training start: its path is checked; the FR3 drops the estimate near a singularity."""
-    goal = Q0 + np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-    def silent(clock, f_ext=None):
-        a = FakeArm(clock, f_ext=f_ext)
-        a.bias = 0.0
-        return a
-
-    clock = Clock()
-    arm = silent(clock)
-    lim = rx.Limits(tracking_mm=rx.MOVE_TRACKING_MM)
-    run = {"limits": lim, "fk_tcp": _fk, "wall_lower": kin._WALL_LOWER, "wall_upper": kin._WALL_UPPER,
-           "stop_flag": lambda: "", "log": lambda **kw: None, "force_estimate_required": False}
-    result = rx.run_joint_move(arm=arm, q_goal=goal, clock=clock, sleep=clock.sleep, **run)
-    assert result.completed and np.abs(arm.q - goal).max() < 1e-3  # no estimate at all: refused neither at start nor on the way
-
-    class Blocked(FakeArm):  # something in the way: the arm stops following its command
-        def _advance(self):
-            if self.clock() <= 1000.9:
-                super()._advance()
-            else:
-                self.t = self.clock()
-                self.dq = np.zeros(7)
-
-    clock = Clock()
-    arm = Blocked(clock)
-    arm.bias = 0.0
-    result = rx.run_joint_move(arm=arm, q_goal=goal, clock=clock, sleep=clock.sleep, **run)
-    assert "off its command" in result.stopped and "limit 8" in result.stopped
-
-
-class _StartDist:
-    def __init__(self, T_world: list[np.ndarray], opening: list[np.ndarray] | None = None):
-        self.start_p = np.array([T[:3, 3] for T in T_world])
-        self.start_q = np.array([rt.matrix_to_quat_xyzw(T[:3, :3]) for T in T_world])
-        self.summary = {}
-        self.opening = np.array([rt.matrix_to_pose7(T) for T in opening or []]).reshape(-1, 7)
-
-    def opening_of(self, row):
-        return self.opening
-
-    def start_problem(self, T_world, width):
-        d = np.linalg.norm(self.start_p - T_world[:3, 3], axis=1).min()
-        return "" if d < 0.02 else f"start: {d * 1e3:.0f} mm from any training start"
-
-
-def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0.5), opening=None):
-    from tools.fr3 import rollout_relative_tcp as ro
-
-    class Model:
-        r = np.zeros(1)
-
-        def place(self, arm, path):
-            return path, path
-
-        def table_mask(self):
-            return None
-
-    class Col:
-        def obstacle_gaps(self, obstacles, A, B, r, mask):
-            return gap(A)[:, None]
-
-    plan = object.__new__(ro.PlanContext)
-    plan.kin, plan.T_tool, plan.T_base_world = kin, np.eye(4), np.eye(4)
-    plan.model, plan.col, plan.obstacles, plan.problems = Model(), Col(), [], []
-    plan.distribution = _StartDist(T_world, opening)
-    return plan
-
-
-def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singularity():
-    from tools.fr3 import rollout_relative_tcp as ro
-
-    q_start = np.array([1.1, -0.5, -1.0, -2.25, 0.1, 2.9, 0.7])  # j2 well away from 0
-    T_start = _fk(q_start) @ np.eye(4)
-    plan = _start_plan([T_start])
-    q_now = np.array([1.0, -0.6, -0.9, -2.3, 0.1, 2.85, 0.65])
-    out = plan.plan_to_start(q_now, rng=np.random.default_rng(0))
-    assert out["ok"] and out["index"] == 0 and not out["near_shoulder_singularity"]
-    np.testing.assert_allclose(_fk(np.array(out["q_goal"]))[:3, 3], T_start[:3, 3], atol=1e-3)
-    assert abs(out["q_goal"][1]) >= 0.25 and out["room_rad"] >= 0.25
-
-    # 11-19 (170940): standing in the other shoulder branch (j2 ~ 0, j3 near its wall), the start is still
-    # reached in the posture with room in every joint, not the branch the arm happens to be in
-    # (that posture also stands near a singularity, sigma_min 0.085: the yellow light, no force estimate)
-    flipped = np.array([2.14, -0.02, -2.11, -2.09, -0.02, 2.4, 0.8])
-    elbow_up = q_start + np.array([0.3, 0.1, -0.2, 0.2, 0.0, 0.1, 0.0])  # elsewhere, clear of singularities
-    for q_here in (elbow_up, flipped):
-        out = plan.plan_to_start(q_here, rng=np.random.default_rng(0))
-        if not out["ok"]:  # the only way to the start's usual branch crosses j2 = 0 near a singularity
-            assert "near a singularity" in out["why"] and q_here is flipped
-            continue
-        q_goal = np.array(out["q_goal"])
-        walls = np.minimum(q_goal - kin._WALL_LOWER, kin._WALL_UPPER - q_goal).min()
-        assert out["sigma_min_start"] >= ro.START_SIGMA_MIN  # the start keeps the force estimate
-        assert out["sigma_min_path"] >= min(ro.START_SIGMA_MIN, ro.sigma_min(q_here[None])[0]) - 1e-3  # never nearer
-        if q_here is elbow_up:
-            assert out["room_rad"] >= 0.3 and walls >= 0.3 and abs(q_goal[1]) >= 0.3 and not out["followed_opening"]
-
-    # with the episode's opening (12 cm down from the start), the room is the smallest along it
-    down = []
-    for k in range(13):
-        T = T_start.copy()
-        T[2, 3] -= 0.01 * k
-        down.append(T)
-    out = _start_plan([T_start], opening=down).plan_to_start(q_now, rng=np.random.default_rng(0))
-    assert out["ok"] and out["followed_opening"] and out["room_rad"] <= out["room_at_start_rad"] + 1e-9
-    away = [T_start] + [T_start @ _shift(2.0)]  # an opening the arm cannot follow
-    out = _start_plan([T_start], opening=away).plan_to_start(q_now, rng=np.random.default_rng(0))
-    assert not out["ok"] and "follow the episode's opening" in out["why"]
-
-    blocked = _start_plan([T_start], gap=lambda path: np.linspace(0.3, 0.004, len(path)))
-    out = blocked.plan_to_start(q_now, rng=np.random.default_rng(0))
-    assert not out["ok"] and "from the carts/table/cameras" in out["why"]
-
-    beyond = q_now.copy()
-    beyond[5] = -0.2  # past panda_py's wall on j6
-    out = plan.plan_to_start(beyond, rng=np.random.default_rng(0))
-    assert not out["ok"] and "walls now" in out["why"]
-
-
-def test_no_start_posture_near_a_singularity_where_the_robot_stops_estimating_force():
-    """11-19: at sigma_min 0.045-0.088 the FR3 reported no external wrench (yellow light); 0.081-0.30 it did."""
-    from tools.fr3 import rollout_relative_tcp as ro
-
-    singular = np.array([0.23, -0.58, -0.43, -2.73, 0.71, 3.29, 0.07])  # tostart_174159's end: estimate gone
-    fine = np.array([0.84, -0.57, -1.12, -2.63, 0.01, 3.22, 0.45])  # tostart_173708's end: estimate there
-    assert ro.sigma_min(singular[None])[0] < 0.083 < ro.sigma_min(fine[None])[0]
-    q_now = np.array([1.0, -0.6, -0.9, -2.3, 0.1, 2.85, 0.65])
-    out = _start_plan([_fk(singular)]).plan_to_start(q_now, rng=np.random.default_rng(0))
-    if out["ok"]:  # another branch reaches the same pose clear of the singularity
-        assert out["sigma_min_start"] >= ro.START_SIGMA_MIN and out["sigma_min_path"] >= ro.START_SIGMA_MIN
-    else:
-        assert "near a singularity" in out["why"]
-
-
-def test_the_blend_check_measures_the_blends_own_postures():
-    qs = np.repeat(Q0[None], 9, axis=0)
-    assert _start_plan([_fk(Q0)]).blend_problem(qs) == ""
-    near = _start_plan([_fk(Q0)], gap=lambda path: np.linspace(0.05, 0.004, len(path)))
-    assert "blend comes 4 mm from the carts/table/cameras 100% of the way" in near.blend_problem(qs)
-
-
-def _shift(dx: float) -> np.ndarray:
-    T = np.eye(4)
-    T[0, 3] = dx
-    return T
-
-
-def test_moving_to_a_start_without_attended_loads_nothing_and_moves_nothing(tmp_path: Path, monkeypatch, capsys):
-    from tools.fr3 import rollout_relative_tcp as ro
-
-    def nothing(*_a, **_k):
-        raise AssertionError("nothing may run without --attended")
-
-    monkeypatch.setattr(ro, "to_start", nothing)
-    rc = ro.main(["to-start", "--checkpoint", str(tmp_path / "ckpt"), "--record", str(tmp_path / "rec"), "--arm", "right"])
-    assert rc == 1 and "a hand on" in capsys.readouterr().err and not (tmp_path / "rec").exists()
 
 
 # ------------------------------------------------------- the report on a record ---
@@ -1141,53 +441,6 @@ def test_report_reads_a_closed_loop_run_back(tmp_path: Path):
     assert age["limit"] == 400.0 and age["use"] == pytest.approx(age["worst"] / 400.0, abs=1e-3)
     text = rep.format_text(r)
     assert "TCP vs target" in text and "fewer than" not in text
-
-
-def test_report_shows_the_tick_that_stopped_the_run_and_the_hold_after_it(tmp_path: Path):
-    class Overshoots(FakeArm):  # 11-19 120252: 2 mm behind at the last recorded tick, 20.4 mm at the stop's
-        def read(self):
-            q, dq, f = super().read()
-            if self.clock() > 1000.6:
-                q = q + np.array([0.0, 0.0, 0.0, 0.08, 0.0, 0.0, 0.0])
-            return q, dq, f
-
-    result, _ = _recorded(tmp_path, replace(rx.STAGES[2], max_s=2.0), arm_cls=Overshoots)
-    assert "off its command" in result.stopped
-    r = rep.analyze(tmp_path)
-    assert r["motion"]["tracking_mm"]["max"] < 5.0  # the run's own ticks: the stop's is reported apart
-    trip = r["stop"]["trip"]
-    assert trip["tracking_mm"] > 20.0 and 0.0 < trip["loop_dt_ms"] < 10.0
-    assert r["stop"]["hold"]["ticks"] >= int(rx.HOLD_S * rx.LOOP_HZ) - 2
-    assert r["timing"]["loop_ms"]["max"] < 10.0  # the hold's ticks do not count as loop periods
-    text = rep.format_text(r)
-    assert "the stop's tick" in text and "hold after stop" in text
-
-
-def test_predictor_records_when_each_phase_began():
-    c = _contract()
-    clock = Clock()
-    history = rx.PoseHistory()
-    for k in range(40):
-        history.add(clock() - 0.5 + k * 0.0125, _fk(Q0), Q0)
-
-    def observe(min_t):
-        clock.sleep(0.02)
-        return rx.Observation(clock() - 0.03, {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None, {"box_stale_s": 0.02})
-
-    def predict(sample):
-        clock.sleep(0.03)
-        return _policy(c)(sample)
-
-    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=predict, plan=_plan(), sample=lambda h, o: {},
-                        limits=rx.Limits(), clock=clock)
-    pred.request(min_t=clock() - 1.0, seed=Q0)
-    pred.close()
-    pred._run()  # in this thread: the request, then the close
-    out = pred.results.get_nowait()
-    assert out.chunk is not None and pred.busy == ("", pred.busy[1])
-    tm = out.timing
-    assert list(tm) == ["requested", "observe", "predict", "plan", "chunk"]
-    assert tm["predict"] - tm["observe"] == pytest.approx(0.02) and tm["plan"] - tm["predict"] == pytest.approx(0.03)
 
 
 def test_report_on_a_refused_first_chunk_says_the_arm_never_moved(tmp_path: Path):
@@ -1237,27 +490,3 @@ def test_report_refuses_a_preview_record(tmp_path: Path):
     (tmp_path / "record.json").write_text('{"kind": "preview"}', encoding="utf-8")
     with pytest.raises(ValueError, match="not an execute record"):
         rep.analyze(tmp_path)
-
-
-def test_a_takeover_blends_longer_over_a_larger_gap_so_its_own_speed_stays_small():
-    lim, dt = rx.Limits(), 1 / 30
-    vmax = rx.joint_speed_limit(lim, dt)
-    assert rx.blend_duration(np.zeros(7), lim, dt) == rx.BLEND_S
-    gap = np.zeros(7)
-    gap[0] = 0.03
-    T = rx.blend_duration(gap, lim, dt)
-    assert T > rx.BLEND_S and 1.5 * gap[0] / T <= rx.BLEND_SPEED_SHARE * vmax[0] + 1e-9
-    assert rx.blend_duration(np.full(7, 1.0), lim, dt) == rx.BLEND_MAX_S
-    # a chunk keeps that share free: a takeover at full speed stays under the cap (11:40: 1.64 rad/s, cap 1.5)
-    q = np.outer(np.arange(33), np.r_[0.06, np.zeros(6)])  # wants 1.8 rad/s on j1
-    T = np.repeat(np.eye(4)[None], 33, axis=0)
-    old = rx.Chunk(0, 0.0, 0.0, dt, T, q, np.ones(33, bool), [""] * 33, np.zeros(32))
-    new = rx.Chunk(1, 0.0, 0.0, dt, T, q + gap, np.ones(33, bool), [""] * 33, np.zeros(32))
-    old.prepare(lim, 32)
-    new.prepare(lim, 32)
-    t0 = old.offsets[5]
-    r0 = old.command(t0)[0] - new.command(t0)[0]
-    v0 = old.command(t0)[1] - new.command(t0)[1]
-    t1 = t0 + rx.blend_duration(r0, lim, dt)
-    v = np.array([rx.blend(new, t, t0, t1, r0, v0)[1] for t in np.linspace(t0, t1, 200)])
-    assert np.abs(v[:, 0]).max() <= vmax[0] + 1e-6

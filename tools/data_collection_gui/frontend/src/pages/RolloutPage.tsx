@@ -9,7 +9,7 @@ import {
   rolloutApi
 } from "./rolloutApi";
 import { ArmGripperPanel } from "./ArmGripperPanel";
-import { cameraBlocker, executeBlockers, recorderConnecting } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers } from "./rolloutExecute";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -147,14 +147,6 @@ function PreviewLive({ record, running }: { record: string; running: boolean }) 
   }, [record, running]);
   const targets = latest.targets_tcp_mm ?? [];
   const plan = latest.plan;
-  const joints = latest.joints;
-  if (latest.blocked) {
-    return (
-      <div className="rollout-live">
-        <p className="command-error">Preview blocked, no prediction: {latest.blocked}</p>
-      </div>
-    );
-  }
   return (
     <div className="rollout-live">
       {latest.step != null ? (
@@ -193,17 +185,10 @@ function PreviewLive({ record, running }: { record: string; running: boolean }) 
               Execution plan check: {plan.ok ? "would pass" : "would stop"} — IK {plan.ik_ok.filter(Boolean).length}/
               {plan.ik_ok.length}, environment gap {plan.min_env_gap_mm ?? "—"} mm
               {plan.reasons.length ? `; ${plan.reasons.join("; ")}` : ""}
-              {joints?.source === "read" ? ` (joints read ${joints.age_s} s before this prediction)` : ""}
-            </p>
-          ) : joints?.source === "read" ? (
-            <p className="command-error">
-              No plan check: the arm's joints were last read {joints.age_s} s ago
-              {joints.error ? ` (${joints.error})` : ""}; a check needs joints at most 5 s old.
             </p>
           ) : (
             <p className="panel-note">No plan check: the arm's joints were not read for this preview.</p>
           )}
-          {plan && joints?.error ? <p className="panel-note">Last joint read failed: {joints.error}</p> : null}
         </>
       ) : null}
     </div>
@@ -224,7 +209,6 @@ export function RolloutPage() {
   const [readJoints, setReadJoints] = useState(false);
   const [stage, setStage] = useState(1);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [moveConfirmOpen, setMoveConfirmOpen] = useState(false);
   const [selected, setSelected] = useState<ResultRow | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -271,9 +255,7 @@ export function RolloutPage() {
   const openCameras = status?.recorderCameras ?? [];
   const forInference = Boolean(status?.recorderConnected && openCameras.length);
   const wrongCameras = cameraBlocker(status, ckpt);
-  const connecting = recorderConnecting(status);
-  // the jobs that move the arm: Stop brakes it to rest
-  const executing = running?.kind === "execute" || running?.kind === "tostart" ? running : undefined;
+  const executing = running?.kind === "execute" ? running : undefined;
   const episodeList = useMemo(
     () => episodes.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n >= 0),
     [episodes]
@@ -375,9 +357,7 @@ export function RolloutPage() {
           <span>
             {!status?.recorderConnected
               ? "recorder not connected"
-              : connecting.pending
-                ? connecting.label
-                : forInference
+              : forInference
                 ? `connected for inference: ${openCameras.join(", ")} at 30 Hz`
                 : "recorder connected (full session, preview bus ~5 Hz)"}
           </span>
@@ -389,15 +369,6 @@ export function RolloutPage() {
               onClick={() => ckpt && act(() => rolloutApi.connectForInference(ckpt.cameras))}
             >
               Connect for inference ({ckpt?.cameras.join(", ") || "pick a checkpoint"})
-            </button>
-          ) : connecting.stuck ? (
-            <button onClick={() => act(() => rolloutApi.disconnect())}>
-              Cancel connect (not ready after {Math.round(status?.recorder?.elapsedS ?? 0)} s
-              {connecting.waiting.length ? `: ${connecting.waiting.join(", ")}` : ""})
-            </button>
-          ) : connecting.pending ? (
-            <button disabled title="Disconnect is available once every camera and BOX streams (or after 60 s)">
-              {connecting.label}
             </button>
           ) : forInference ? (
             <button disabled={Boolean(running)} onClick={() => act(() => rolloutApi.disconnect())}>
@@ -416,9 +387,8 @@ export function RolloutPage() {
           The policy reads the recorder's live frames (it never opens a camera) and the arm gripper BOX's width
           {ckpt?.wrench ? " and external wrench" : ""}, with the arm standing still; nothing is sent to the arm. Every
           step's inputs and outputs are recorded, and Replay check feeds them back through the offline path: the
-          predictions must be identical. Reading the joints connects to the arm about once a second to read its
-          position (connect, read, disconnect: no motion) so each prediction goes through the execution plan check
-          at the pose the arm stands in now, also after you move it to another start pose.
+          predictions must be identical. Reading the joints connects to the arm once to read its position (no
+          motion) so each prediction can go through the execution plan check.
         </p>
         <div className="control-row">
           <select value={arm} onChange={(e) => setArm(e.target.value)}>
@@ -432,7 +402,7 @@ export function RolloutPage() {
           </label>
           <label className="train-inline">
             <input type="checkbox" checked={readJoints} onChange={(e) => setReadJoints(e.target.checked)} />
-            read the arm's joints (for the plan check)
+            read the arm's joints once (for the plan check)
           </label>
           {running?.kind === "preview" ? (
             <button className="danger" onClick={() => act(() => rolloutApi.stop(running.id))}>
@@ -440,7 +410,7 @@ export function RolloutPage() {
             </button>
           ) : (
             <button
-              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected || connecting.pending || Boolean(wrongCameras)}
+              disabled={!checkpoint || Boolean(running) || !status?.recorderConnected || Boolean(wrongCameras)}
               onClick={() => act(() => rolloutApi.preview(checkpoint, arm, rate, readJoints))}
             >
               Start preview
@@ -480,35 +450,16 @@ export function RolloutPage() {
               STOP (hold the arm)
             </button>
           ) : (
-            <>
-              <button
-                className="danger"
-                disabled={!checkpoint || Boolean(running)}
-                title="slowly to a random real start of this checkpoint's training episodes (no policy, gripper untouched)"
-                onClick={() => setMoveConfirmOpen(true)}
-              >
-                Move to a training start
-              </button>
-              <button
-                className="danger"
-                disabled={blockers.length > 0}
-                title={blockers.join("; ")}
-                onClick={() => setConfirmOpen(true)}
-              >
-                Execute stage {stage}
-              </button>
-            </>
+            <button
+              className="danger"
+              disabled={blockers.length > 0}
+              title={blockers.join("; ")}
+              onClick={() => setConfirmOpen(true)}
+            >
+              Execute stage {stage}
+            </button>
           )}
         </div>
-        <p className="panel-note">
-          Move to a training start: one of the poses of this checkpoint's training episodes in their first second,
-          drawn at random, with its joints chosen with room along the motion that follows and clear of singularities
-          (where the FR3 stops estimating force: the yellow light), the path in joint space kept 10 mm from
-          carts/table/cameras — refused, nothing moving, when no start drawn has such a path. Slow (≤ 0.3 rad/s);
-          the path being checked, it runs without the force estimate (a live one still stops on force) and stops
-          when the arm is 8 mm off its command (a contact); Stop brakes the arm to rest. Open the gripper yourself
-          (the training starts were open).
-        </p>
         {executing ? (
           <p className="command-error">Running: {executing.message || "starting"}</p>
         ) : blockers.length ? (
@@ -517,32 +468,6 @@ export function RolloutPage() {
               <li key={b}>{b}</li>
             ))}
           </ul>
-        ) : null}
-        {moveConfirmOpen ? (
-          <div className="danger-modal-backdrop" role="presentation">
-            <div aria-labelledby="rollout-move-confirm" aria-modal="true" className="danger-modal" role="dialog">
-              <h3 id="rollout-move-confirm">机器人会动，手放急停</h3>
-              <p>
-                The {arm} arm moves slowly to a random training start of <strong>{runPath(checkpoint)}</strong>. Keep
-                a hand on the e-stop until it stops.
-              </p>
-              <div className="danger-modal-actions">
-                <button autoFocus onClick={() => setMoveConfirmOpen(false)} type="button">
-                  取消
-                </button>
-                <button
-                  className="danger"
-                  onClick={() => {
-                    setMoveConfirmOpen(false);
-                    act(() => rolloutApi.toStart(checkpoint, arm, true));
-                  }}
-                  type="button"
-                >
-                  手已放在急停上，移动
-                </button>
-              </div>
-            </div>
-          </div>
         ) : null}
         {confirmOpen ? (
           <div className="danger-modal-backdrop" role="presentation">

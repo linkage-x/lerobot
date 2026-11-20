@@ -56,31 +56,6 @@ def test_live_width_and_wrench_come_from_the_arms_box_in_the_recorders_layout():
         _live(_contract()).box_from_snapshot(single)
 
 
-def test_a_gripper_box_that_dropped_out_is_not_read_from_its_last_values():
-    """11-19: an unplugged gripper BOX keeps its last values in BOX_LIVE, which still comes at 10 Hz."""
-
-    def snap(gripper_age, six_d_age=0.01, seen=True):
-        row = lambda age: {"seen": seen, "fresh": age <= 1.0, "last_seen_age_s": age}  # noqa: E731
-        return {
-            "sensors": {"box3100715645/box_gripper": {"distance_m": 0.031},
-                        "box3100715645/box_six_d_force": {"fxyz_mxyz_external": [0.5, 0, -1.0, 0, 0, 0.01]},
-                        "box3906437858/box_gripper": {"distance_m": 0.07}},
-            "status": {"sensor_status": {"box3100715645/box_gripper": row(gripper_age),
-                                         "box3100715645/box_six_d_force": row(six_d_age),
-                                         "box3906437858/box_gripper": row(0.0)}},
-        }
-
-    width, _, meta = _live(_contract(wrench=True)).box_from_snapshot(snap(0.02))
-    assert width == pytest.approx(0.031) and meta["dataAgeS"] == pytest.approx(0.02)
-    with pytest.raises(RuntimeError, match=r"3100715645 is not streaming \(box3100715645/box_gripper: last sample 4.0 s"):
-        _live(_contract()).box_from_snapshot(snap(4.0))
-    with pytest.raises(RuntimeError, match="box_six_d_force: last sample 0.8 s"):
-        _live(_contract(wrench=True)).box_from_snapshot(snap(0.02, six_d_age=0.8))
-    _live(_contract()).box_from_snapshot(snap(0.02, six_d_age=0.8))  # a policy without the wrench does not need it
-    with pytest.raises(RuntimeError, match="sent nothing since Connect"):
-        _live(_contract()).box_from_snapshot(snap(0.0, seen=False))
-
-
 def test_chunk_errors_measure_position_rotation_width_and_skip_padding():
     T = np.repeat(np.eye(4)[None], 3, axis=0)
     gt = np.concatenate([rt.encode(T), np.full((3, 1), 0.04)], axis=1)
@@ -112,81 +87,6 @@ def _manager(tmp_path: Path, **kw) -> rr.RolloutManager:
     (tmp_path / "exports" / "e1" / "meta").mkdir(parents=True)
     (tmp_path / "exports" / "e1" / "meta" / "info.json").write_text("{}")
     return rr.RolloutManager(repo, exports_root=tmp_path / "exports", python=sys.executable, **kw)
-
-
-def test_the_preview_plan_check_follows_the_arm_when_a_person_moves_it():
-    now = [100.0]
-    reads = iter([np.full(7, 0.2), RuntimeError("connection refused")])
-
-    def read():
-        r = next(reads)
-        if isinstance(r, Exception):
-            raise r
-        return r
-
-    watcher = ro.JointWatcher(read, np.zeros(7), clock=lambda: now[0])  # never started: polled by hand
-    q, info = ro.joints_for_check(watcher, None)
-    assert np.allclose(q, 0.0) and info["age_s"] == 0.0 and info["source"] == "read"
-    now[0] += 1.0
-    watcher.poll()  # the arm was moved: the next check judges the new pose
-    q, info = ro.joints_for_check(watcher, None)
-    assert np.allclose(q, 0.2) and info["age_s"] == 0.0 and info["error"] == ""
-    now[0] += 1.0
-    watcher.poll()  # a failed read keeps the last joints while they are recent, and says why
-    q, info = ro.joints_for_check(watcher, None)
-    assert np.allclose(q, 0.2) and "connection refused" in info["error"]
-    now[0] += ro.JOINT_STALE_S
-    q, info = ro.joints_for_check(watcher, None)  # too old to vouch for the pose the arm stands in
-    assert q is None and info["age_s"] > ro.JOINT_STALE_S
-    q, info = ro.joints_for_check(None, np.ones(7))  # joints given on the command line stay as given
-    assert np.allclose(q, 1.0) and info["source"] == "given"
-    assert ro.joints_for_check(None, None) == (None, None)
-
-
-def test_the_joint_watcher_reads_until_stopped():
-    seen = threading.Event()
-    calls = []
-
-    def read():
-        calls.append(1)
-        seen.set()
-        return np.full(7, len(calls), dtype=float)
-
-    watcher = ro.JointWatcher(read, np.zeros(7), refresh_s=0.01).start()
-    assert seen.wait(2.0)
-    watcher.stop()
-    n = len(calls)
-    assert n >= 1 and not watcher._thread.is_alive()
-    assert watcher.latest()[0][0] == n
-
-
-def test_reading_the_joints_does_not_ask_the_arm_for_its_model(monkeypatch, capsys):
-    """11-19: Panda() downloads the robot model on every connect; read about once a second, the arm refused
-    that command for 20-30 s and the preview had no joints for its plan check."""
-    import types
-
-    from tools.fr3 import fr3_print_joints_runtime as pj
-
-    calls = []
-
-    class Robot:
-        def __init__(self, ip):
-            calls.append(("connect", ip))
-
-        def read_once(self):
-            calls.append(("read_once",))
-            return types.SimpleNamespace(q=[0.1, -0.2, 0.3, -2.0, 0.0, 1.5, 0.7])
-
-        def load_model(self):
-            raise AssertionError("the joints need no robot model")
-
-    fake = types.ModuleType("panda_py")
-    fake.libfranka = types.SimpleNamespace(Robot=Robot)
-    fake.Panda = lambda *a, **k: (_ for _ in ()).throw(AssertionError("Panda() loads the robot model"))
-    monkeypatch.setitem(sys.modules, "panda_py", fake)
-    assert pj.main(["--robot-ip", "10.0.0.2"]) == 0
-    assert calls == [("connect", "10.0.0.2"), ("read_once",)]
-    assert "Joint angles (rad): [0.1, -0.2, 0.3, -2.0, 0.0, 1.5, 0.7]" in capsys.readouterr().out
 
 
 def test_preview_is_refused_without_the_recorder_in_a_sandbox_or_off_thor(tmp_path):
@@ -293,31 +193,6 @@ def test_execute_is_refused_unless_every_condition_holds(tmp_path):
     assert job.kind == "execute" and job.params["attended"] is True
 
 
-def test_the_move_to_a_training_start_is_refused_unless_attended_and_free_and_holds_the_fci(tmp_path):
-    spawned = []
-
-    class Proc:
-        pid = 2**22 + 11  # a real integer, never a MagicMock (os.killpg)
-
-    holder = {"who": ""}
-    manager = _manager(tmp_path, fci_holder=lambda: holder["who"], popen=lambda cmd, **k: spawned.append(cmd) or Proc())
-    ckpt = manager.checkpoints()[0]["path"]
-    with pytest.raises(rr.RolloutError, match="e-stop"):
-        manager.start_to_start(ckpt, "right", attended=False)
-    holder["who"] = "真机 replay 正在运行"
-    with pytest.raises(rr.RolloutError, match="holds the arm's FCI"):
-        manager.start_to_start(ckpt, "right", attended=True)
-    holder["who"] = ""
-    for kw in ({"sandbox": "hph"}, {"profile": "workstation"}):
-        other = _manager(tmp_path / next(iter(kw)), **kw)
-        with pytest.raises(rr.RolloutError, match="sandbox|not a Thor"):
-            other.start_to_start(other.checkpoints()[0]["path"], "right", attended=True)
-    job = manager.start_to_start(ckpt, "right", attended=True)  # no recorder, no replayed preview needed
-    assert spawned[0][1:3] == [rr.SCRIPT, "to-start"] and "--attended" in spawned[0]
-    assert job.kind == "tostart" and job.params == {"arm": "right", "attended": True}
-    assert gateway._is_hardware_request("POST", "/api/rollout/to-start")  # a dev gateway needs the lease for it
-
-
 def test_jobs_find_the_venvs_cmeel_libraries_for_panda_py(tmp_path):
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
@@ -385,28 +260,6 @@ def test_execute_endpoint_answers_outside_the_gateway_lock(tmp_path):
         server.server_close()
 
 
-def test_to_start_endpoint_answers_outside_the_gateway_lock_and_wants_a_literal_confirmation(tmp_path):
-    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
-    state.rollout = _manager(tmp_path)
-    server = gateway.DataCollectionGuiServer(("127.0.0.1", 0), state)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        with state.lock:
-            request = urllib.request.Request(
-                f"{base}/api/rollout/to-start", method="POST",
-                data=json.dumps({"checkpoint": state.rollout.checkpoints()[0]["path"], "arm": "right",
-                                 "attended": 1}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with pytest.raises(urllib.error.HTTPError) as err:
-                urllib.request.urlopen(request, timeout=5)
-        assert err.value.code == 400 and "e-stop" in json.loads(err.value.read())["error"]
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
 def test_connected_for_inference_the_jobs_read_the_main_bus_if_it_has_the_checkpoints_cameras(tmp_path):
     spawned = []
 
@@ -448,32 +301,3 @@ def test_the_inference_bus_is_the_same_on_both_sides_and_tightens_the_frame_age(
     assert ro.frame_age_limit_s(ro.PREVIEW_FRAME_BUS) == pytest.approx(0.40)
     assert not ro.LiveInputs(_contract(), gateway="http://x", box_id="1", frame_bus=ro.INFERENCE_FRAME_BUS).demand_previews
     assert ro.LiveInputs(_contract(), gateway="http://x", box_id="1").demand_previews
-
-
-def test_live_jobs_wait_until_the_recorder_has_brought_every_sensor_up(tmp_path):
-    spawned = []
-
-    class Proc:
-        pid = 2**22 + 11  # a real integer, never a MagicMock (os.killpg)
-
-    rec = {"state": "connecting", "sensors": [{"id": "cam_10", "kind": "camera", "state": "running"},
-                                              {"id": "box/gripper", "kind": "box_collection", "state": "warning"}]}
-    manager = _manager(tmp_path, recorder_busy=lambda: True, recorder_cameras=lambda: ["cam_10"],
-                       recorder_sensors=lambda: rec, popen=lambda cmd, **k: spawned.append(cmd) or Proc())
-    ckpt = manager.checkpoints()[0]["path"]
-    readiness = manager.status()["recorder"]
-    assert readiness["pending"] and not readiness["ready"] and not readiness["failed"]
-    assert not readiness["stuck"]  # no elapsed time reported: never called stuck
-    rec["elapsedS"] = rr.CONNECT_STUCK_S - 1
-    assert not manager.status()["recorder"]["stuck"]
-    rec["elapsedS"] = rr.CONNECT_STUCK_S + 1  # hung without failing: the page may cancel it
-    assert manager.status()["recorder"]["stuck"] and manager.status()["recorder"]["pending"]
-    with pytest.raises(rr.RolloutError, match=r"still connecting \(not ready yet: box/gripper\)"):
-        manager.start_preview(ckpt, "right", 2.0, False)
-    assert not spawned
-    rec["sensors"][1]["state"] = "error"  # a failed connect is not pending: Disconnect may tear it down
-    assert manager.status()["recorder"]["failed"] and not manager.status()["recorder"]["pending"]
-    rec["state"], rec["sensors"][1]["state"] = "armed", "running"
-    assert manager.status()["recorder"]["ready"]
-    manager.start_preview(ckpt, "right", 2.0, False)
-    assert spawned

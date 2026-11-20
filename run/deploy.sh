@@ -235,23 +235,9 @@ if [[ -n "$sandbox" ]]; then
     # refreshed on every deploy; what it writes stays in its own copies.
     echo "    refreshing production's calibration, world state and gates into the dev tree..."
     mkdir -p "$repo_dir/outputs/calibration"
-    # Say what this refresh throws away: calibration results made on the dev gateway (camera solves, the
-    # ball check, BOX 6D captures) that production does not have, and dev-side world/gate files.
-    dev_only="$(rsync -a --delete -n --itemize-changes "$production_dir/outputs/calibration/" \
-      "$repo_dir/outputs/calibration/" | sed -n 's/^\*deleting  *//p')"
-    if [[ -n "$dev_only" ]]; then
-      echo "WARN: deleting $(wc -l <<<"$dev_only") path(s) under the dev tree's outputs/calibration that production" >&2
-      echo "      does not have (calibration done on the dev gateway; copy it out first if you need it):" >&2
-      head -20 <<<"$dev_only" | sed 's|^|        outputs/calibration/|' >&2
-    fi
     rsync -a --delete "$production_dir/outputs/calibration/" "$repo_dir/outputs/calibration/"
     for state_file in tools/thor/gmsl2/world/world_registration.json tools/thor/gmsl2/world/world_stable_source.json \
         outputs/box_six_d_origin.json outputs/world_graph_guard.json outputs/cart_check.json; do
-      # world_registration / world_stable_source are status every continuity check rewrites, not results
-      if [[ "$state_file" != tools/thor/gmsl2/world/world_* && -e "$repo_dir/$state_file" ]] \
-          && ! cmp -s "$production_dir/$state_file" "$repo_dir/$state_file"; then
-        echo "WARN: replacing the dev tree's ${state_file} with production's (it differed)" >&2
-      fi
       if [[ -e "$production_dir/$state_file" ]]; then
         mkdir -p "$(dirname "$repo_dir/$state_file")"
         cp -a "$production_dir/$state_file" "$repo_dir/$state_file"
@@ -265,12 +251,6 @@ if [[ -n "$sandbox" ]]; then
       mkdir -p "$repo_dir/outputs/training/runs"
       rsync -a --ignore-existing --link-dest="$production_dir/outputs/training/runs/" \
         "$production_dir/outputs/training/runs/" "$repo_dir/outputs/training/runs/"
-    fi
-    # ... and the training distributions production already built from their exports (small, keyed by
-    # checkpoint and export content, so a cached one is the same one the dev side would build).
-    if [[ -d "$production_dir/outputs/rollout/distribution" ]]; then
-      mkdir -p "$repo_dir/outputs/rollout/distribution"
-      rsync -a --ignore-existing "$production_dir/outputs/rollout/distribution/" "$repo_dir/outputs/rollout/distribution/"
     fi
   elif [[ ! -e "$repo_dir/outputs/calibration" ]]; then
     echo "    first deploy: copying production calibration into the sandbox..."
@@ -488,8 +468,6 @@ sandbox_args=()
 if [[ "$dev" == true ]]; then
   sandbox_args=(--dev --hardware-lease "$production_dir/outputs/hardware_lease.json"
                 --production-url "http://127.0.0.1:${production_port}")
-  # the Rollout plan check's training distribution reads production's exports (read-only, never copied)
-  gateway_env+=(LEROBOT_PRODUCTION_EXPORTS="$production_dir/outputs/exports")
 elif [[ -n "$sandbox" ]]; then
   sandbox_args=(--sandbox "$sandbox")
 fi
