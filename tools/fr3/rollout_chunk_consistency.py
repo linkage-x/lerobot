@@ -36,31 +36,69 @@ TAKEOVER_STEP = 3  # the new chunk's step at the switch (k0 2-4 online)
 
 
 def predictions(checkpoint: Path, export: Path, *, stride: int = TAKEOVER_STRIDE, device: str = "cpu",
-                log=print) -> dict[str, Any]:
-    """Every ``stride`` frames of every episode: the predicted TCP positions (world), from the full frames."""
+                rtc_delay: int | None = None, rtc_horizon: int | None = None, log=print) -> dict[str, Any]:
+    """Every ``stride`` frames of every episode: the predicted TCP positions (world), from the full frames,
+    and each step's distance to where the hand really was then (``err_mm``, None past the episode's end).
+
+    With ``rtc_delay`` (a flow-matching checkpoint): each prediction is guided by the one before it
+    (real-time chunking), as execution would -- the previous chunk's targets from this instant on,
+    re-anchored at this frame's TCP, ``rtc_delay`` steps frozen, guidance fading out at ``rtc_horizon``.
+    Offline the hand follows the demonstration, not the previous chunk: the prefix is what the arm would
+    have been told, the anchor where the demonstrator's hand was."""
     from tools.fr3 import relative_tcp_policy as rtp
 
     loaded = rtp.load_checkpoint(checkpoint, device=device)
     c = loaded.contract
+    if rtc_delay is not None and not getattr(loaded, "rtc", False):
+        raise ValueError(f"{checkpoint}: not a flow-matching policy, it has no real-time chunking")
+    lag = stride // c.frame_stride
+    if rtc_delay is not None and not 0 <= rtc_delay <= (rtc_horizon or 0) <= c.horizon - lag:
+        raise ValueError(f"RTC: need 0 <= delay <= horizon <= {c.horizon - lag} (the previous chunk's steps left)")
     held = set(loaded.provenance.get("holdout_episodes") or [])
     full = rd.ViewVideos(export, c.cameras)
     rows = []
     for arrays in rd.load_episode_arrays(export, c):
-        for t in range(0, len(arrays.poses), stride):
-            hist_i, _ = rd._clamped(len(arrays.poses), t, c.history_offsets)
+        n = len(arrays.poses)
+        prev: tuple[int, np.ndarray, np.ndarray] | None = None  # frame, world targets, widths
+        for t in range(0, n, stride):
+            hist_i, _ = rd._clamped(n, t, c.history_offsets)
             poses = arrays.poses[hist_i]
             if not np.all(np.isfinite(poses)):
+                prev = None
                 continue
             T_hist = rt.pose7_to_matrix(poses)
             wrench = arrays.wrench[t] if c.wrench_names else None
             images = {cam.name: full.frame(arrays.episode, t, cam.name) for cam in c.cameras}
-            pred = loaded.predict(rtp.observation_sample(c, T_hist, float(arrays.widths[t]), images, wrench))
-            world, _ = rt.targets_from_actions(T_hist[-1], pred)
+            sample = rtp.observation_sample(c, T_hist, float(arrays.widths[t]), images, wrench)
+            guided = rtc_delay is not None and prev is not None and prev[0] == t - stride
+            if guided:
+                prefix = rtp.rtc_prefix(T_hist[-1], prev[1][lag:], prev[2][lag:])
+                sample = rtp.with_rtc_prefix(sample, prefix, delay=rtc_delay, horizon=rtc_horizon)
+            pred = loaded.predict(sample)
+            world, widths = rt.targets_from_actions(T_hist[-1], pred)
+            err = []
+            for k, off in enumerate(c.action_offsets):
+                gt = arrays.poses[t + off, :3] if t + off < n else None
+                err.append(None if gt is None or not np.all(np.isfinite(gt))
+                           else round(float(np.linalg.norm(world[k, :3, 3] - gt) * 1e3), 2))
             rows.append({"episode": int(arrays.episode), "frame": t, "held_out": int(arrays.episode) in held,
-                         "pred": world[:, :3, 3].round(5).tolist()})
+                         "guided": guided, "pred": world[:, :3, 3].round(5).tolist(), "err_mm": err})
+            prev = (t, world, widths)
         log(f"episode {arrays.episode}: {len(rows)} predictions")
     return {"checkpoint": str(checkpoint), "export": str(export), "stride": stride, "frame_stride": c.frame_stride,
-            "rows": rows}
+            "rtc": None if rtc_delay is None else {"delay": rtc_delay, "horizon": rtc_horizon}, "rows": rows}
+
+
+def accuracy(result: dict[str, Any], *, steps: tuple[int, int]) -> dict[str, Any]:
+    """Mean distance to the hand's real path over steps ``steps[0]..steps[1]`` (1-based), per split: what a
+    guided chunk may cost in following the demonstration (guidance pulls it toward the previous chunk)."""
+    out: dict[str, list[float]] = {"training": [], "held_out": []}
+    for r in result["rows"]:
+        e = [v for v in r["err_mm"][steps[0] - 1: steps[1]] if v is not None]
+        if e:
+            out["held_out" if r["held_out"] else "training"].append(float(np.mean(e)))
+    return {k: {"mean": round(float(np.mean(v)), 1), "p95": round(float(np.percentile(v, 95)), 1), "n": len(v)}
+            for k, v in out.items() if v}
 
 
 def gaps(result: dict[str, Any], *, at: int = TAKEOVER_STEP) -> dict[str, np.ndarray]:
@@ -89,11 +127,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stride", type=int, default=TAKEOVER_STRIDE)
     ap.add_argument("--at", type=int, default=TAKEOVER_STEP)
     ap.add_argument("--device", default="cpu", help="cpu by default: not to compete with a live run's GPU")
+    ap.add_argument("--rtc-delay", type=int, default=None, help="guide each chunk by the previous one (RTC), "
+                    "this many steps frozen (execution: the takeover step - 1)")
+    ap.add_argument("--rtc-horizon", type=int, default=None, help="where RTC guidance fades to 0 (delay + the "
+                    "steps a chunk executes)")
     args = ap.parse_args(argv)
-    result = predictions(args.checkpoint, args.export, stride=args.stride, device=args.device)
+    if (args.rtc_delay is None) != (args.rtc_horizon is None):
+        ap.error("--rtc-delay and --rtc-horizon go together")
+    result = predictions(args.checkpoint, args.export, stride=args.stride, device=args.device,
+                         rtc_delay=args.rtc_delay, rtc_horizon=args.rtc_horizon)
     result["summary_mm"] = summary(gaps(result, at=args.at))
+    result["accuracy_mm"] = accuracy(result, steps=(args.at, min(len(result["rows"][0]["pred"]), args.at + 15)))
     args.out.write_text(json.dumps(result), encoding="utf-8")
-    print(json.dumps(result["summary_mm"], indent=2))
+    print(json.dumps({"gap": result["summary_mm"], "accuracy": result["accuracy_mm"]}, indent=2))
     return 0
 
 

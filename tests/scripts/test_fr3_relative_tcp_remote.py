@@ -1,4 +1,5 @@
 """The remote policy (tools/fr3/relative_tcp_remote.py): stub, wire, server gates, and the client end to end."""
+# ruff: noqa: N806  -- T: the usual name of a transform
 
 from __future__ import annotations
 
@@ -230,3 +231,87 @@ def test_execution_allows_a_remote_policy_the_remote_prediction_time_only():
     assert remote.predict_s == rr.REMOTE_PREDICT_S == 0.30
     assert {k: v for k, v in vars(local).items() if k != "predict_s"} == \
         {k: v for k, v in vars(remote).items() if k != "predict_s"}
+
+
+# ------------------------------------------------------------------ RTC ---
+
+
+def _postprocessor():
+    """A real unnormaliser with quantile stats, as pi0.5's postprocessor has."""
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
+
+    q01 = np.array([-0.2, -0.2, -0.3, -1, -1, -1, -1, -1, -1, 0.0], dtype=np.float32)
+    q99 = np.array([0.2, 0.25, 0.1, 1, 1, 1, 1, 1, 1, 0.09], dtype=np.float32)
+    step = UnnormalizerProcessorStep(
+        features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(10,))},
+        norm_map={FeatureType.ACTION: NormalizationMode.QUANTILES},
+        stats={"action": {"q01": q01, "q99": q99}})
+
+    class Post:
+        steps = [step]
+
+    return Post(), step
+
+
+def test_a_prefix_is_normalised_with_the_checkpoints_own_action_stats():
+    post, step = _postprocessor()
+    phys = np.random.default_rng(0).uniform(-0.1, 0.1, (12, 10)).astype(np.float32)
+    norm = rtp.normalize_actions(post, phys, "cpu")
+    back = step._normalize_action(norm, inverse=True)  # what the policy's postprocessor does to its output
+    assert np.allclose(back.numpy(), phys, atol=1e-6)
+    assert not np.allclose(norm.numpy(), phys)
+
+
+def test_the_rtc_prefix_is_the_previous_chunks_poses_re_anchored_at_this_observation():
+    from scipy.spatial.transform import Rotation
+
+    rng = np.random.default_rng(1)
+
+    def pose(t, rv):
+        T = np.eye(4)
+        T[:3, :3] = Rotation.from_rotvec(rv).as_matrix()
+        T[:3, 3] = t
+        return T
+
+    T_old = pose([0.4, 0.1, 0.3], [0.1, -0.2, 0.3])
+    old_actions = np.concatenate([rt.encode(np.stack([pose(rng.normal(0, 0.05, 3), rng.normal(0, 0.1, 3)) for _ in range(32)])),
+                                  rng.uniform(0, 0.08, (32, 1))], axis=1)
+    world, widths = rt.targets_from_actions(T_old, old_actions)
+    T_new = pose([0.42, 0.09, 0.28], [0.12, -0.18, 0.31])  # the TCP at the new observation, 9 steps later
+    prefix = rtp.rtc_prefix(T_new, world[9:], widths[9:])
+    again, w_again = rt.targets_from_actions(T_new, prefix)  # the new chunk's frame -> the same world poses
+    assert prefix.shape == (23, 10)
+    assert np.allclose(again, world[9:], atol=1e-6) and np.allclose(w_again, widths[9:], atol=1e-6)
+    assert not np.allclose(prefix, old_actions[9:], atol=1e-3)  # the old chunk's own actions are another frame
+
+
+def test_an_rtc_prefix_is_checked_and_crosses_the_wire_bit_for_bit():
+    c = _contract()
+    prefix = np.random.default_rng(2).normal(0, 0.05, (5, 10)).astype(np.float32)
+    with pytest.raises(ValueError, match="delay"):
+        rtp.with_rtc_prefix(_sample(), prefix, delay=6, horizon=4)
+    with pytest.raises(ValueError, match="expected"):
+        rtp.with_rtc_prefix(_sample(), prefix[:, :9], delay=1, horizon=4)
+    sample = rtp.with_rtc_prefix(_sample(), prefix, delay=2, horizon=4)
+    back, _ = rr.decode_sample(c, rr._unpack(rr.encode_sample(c, sample, "fp")))
+    assert np.array_equal(back[rtp.RTC_PREFIX_KEY], prefix)
+    assert (back[rtp.RTC_DELAY_KEY], back[rtp.RTC_HORIZON_KEY]) == (2, 4)
+    plain, _ = rr.decode_sample(c, rr._unpack(rr.encode_sample(c, _sample(), "fp")))
+    assert rtp.RTC_PREFIX_KEY not in plain
+
+
+def test_a_policy_without_rtc_refuses_a_prefix():
+    class Cfg:
+        type = "act"
+        rtc_config = None
+
+    class Policy:
+        config = Cfg()
+
+        def parameters(self):
+            yield torch.zeros(1)
+
+    sample = rtp.with_rtc_prefix(_sample(), np.zeros((4, 10), np.float32), delay=1, horizon=3)
+    with pytest.raises(ValueError, match="without real-time chunking"):
+        rtp.predict_chunk(Policy(), lambda b: b, lambda a: a, sample)

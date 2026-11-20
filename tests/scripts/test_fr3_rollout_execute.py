@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 from dataclasses import replace
 from pathlib import Path
@@ -1285,3 +1286,63 @@ def test_a_takeover_blends_longer_over_a_larger_gap_so_its_own_speed_stays_small
     t1 = t0 + rx.blend_duration(r0, lim, dt)
     v = np.array([rx.blend(new, t, t0, t1, r0, v0)[1] for t in np.linspace(t0, t1, 200)])
     assert np.abs(v[:, 0]).max() <= vmax[0] + 1e-6
+
+
+def test_rtc_guides_each_chunk_after_the_first_toward_what_the_running_one_commands():
+    """Real-time chunking: the prefix is the running chunk's command from the new observation on, re-anchored
+    at the TCP there; its frozen steps are the observation -> chunk lag, rounded up; guidance fades at n_exec."""
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    c = _contract()
+    clock = Clock()
+    arm = FakeArm(clock)
+    history = rx.PoseHistory()
+    samples: list[dict] = []
+    policy = _policy(c)
+
+    def observe(min_t):
+        return rx.Observation(max(min_t, clock() - 0.15), {"cam_10": np.zeros((18, 32, 3), np.uint8)}, 0.088, None,
+                              {"box_stale_s": 0.02})
+
+    def predict(sample):
+        samples.append(sample)
+        return policy(sample)
+
+    pred = rx.Predictor(contract=c, history=history, observe=observe, predict=predict, plan=_plan(),
+                        sample=lambda h, o: {"history": h}, limits=rx.Limits(), clock=clock,
+                        rtc_fk=lambda qs: np.stack([_fk(q) for q in qs]), rtc_horizon=16)
+    chunks: list[rx.Chunk] = []
+
+    def request(*, min_t, seed):
+        lags = list(pred.lags_s)  # what the delay is taken from: the lag of the predictions so far
+        p = pred.once(min_t, seed)
+        chunks.append((p.chunk, seed if isinstance(seed, rx.Chunk) else None, p, lags))
+        pred.results.put(p)
+
+    pred.request = request
+    result = rx.run_loop(arm=arm, predictor=pred, stage=replace(rx.STAGES[2], max_s=1.5), n_exec=16, limits=rx.Limits(),
+                         fk_tcp=_fk, wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+                         stop_flag=lambda: "", log=lambda **kw: None, clock=clock, sleep=clock.sleep)
+    assert result.chunks_accepted >= 3, result.stopped
+    assert rtp.RTC_PREFIX_KEY not in samples[0]  # the first chunk has nothing to follow
+    for sample, (chunk, running, p, lags) in zip(samples[1:], chunks[1:], strict=False):
+        delay, horizon = sample[rtp.RTC_DELAY_KEY], sample[rtp.RTC_HORIZON_KEY]
+        assert delay == math.ceil(max(lags) / c.step_s) >= 1  # the lag's recent peak, rounded up
+        assert horizon == 16 and p.rtc["delay"] == delay
+        # the prefix, back in the base: where the running chunk commands the arm at this observation's steps
+        world, widths = rt.targets_from_actions(chunk.T[0], sample[rtp.RTC_PREFIX_KEY])
+        for k in range(len(world)):
+            q_k = running.command(chunk.t_obs + (k + 1) * c.step_s)[0]
+            assert np.allclose(world[k], _fk(q_k), atol=1e-6)
+        assert np.allclose(widths, 0.088)
+
+
+def test_without_rtc_no_prefix_is_ever_sent():
+    c = _contract()
+    pred = rx.Predictor(contract=c, history=rx.PoseHistory(), observe=None, predict=None, plan=None, sample=None,
+                        limits=rx.Limits())
+    pred.lags_s.append(0.2)
+    chunk = rx.Chunk(0, 0.0, 0.0, c.step_s, np.repeat(np.eye(4)[None], c.horizon + 1, axis=0),
+                     np.repeat(Q0[None], c.horizon + 1, axis=0), np.ones(c.horizon, bool), [""] * c.horizon,
+                     np.full(c.horizon, 0.08))
+    assert pred.rtc_prefix(np.eye(4), chunk, 0.1) is None

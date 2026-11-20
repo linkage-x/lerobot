@@ -159,6 +159,9 @@ class Limits:
     start_speed_rad_s: float = 0.02
 
 
+#: predictions over which the RTC delay takes its peak lag (Predictor.rtc_delay_steps)
+RTC_LAG_WINDOW = 10
+
 FR3_VELOCITY_LIMITS = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])  # rad/s, dual_fr3_retarget
 JOINT_SCALE = FR3_VELOCITY_LIMITS / FR3_VELOCITY_LIMITS.min()  # the joint limits below are for j1-j4
 STEP_MM_CEILING = 40.0  # 1.2 m/s, whatever the data says: well under the FR3's Cartesian limit (1.7 m/s)
@@ -924,6 +927,7 @@ class Prediction:
     actions: np.ndarray | None = None
     plan: dict[str, Any] = field(default_factory=dict)
     timing: dict[str, float] = field(default_factory=dict)  # monotonic instant each phase began (Predictor.busy)
+    rtc: dict[str, Any] | None = None  # the RTC prefix this prediction was guided by ({prefix, delay, horizon})
 
 
 class Predictor:
@@ -936,8 +940,13 @@ class Predictor:
     """
 
     def __init__(self, *, contract: rt.PolicyContract, history: PoseHistory, observe, predict, plan, sample,
-                 limits: Limits, clock=time.monotonic, on_phase: Callable[[str, float], None] | None = None):
+                 limits: Limits, clock=time.monotonic, on_phase: Callable[[str, float], None] | None = None,
+                 rtc_fk: Callable[[np.ndarray], np.ndarray] | None = None, rtc_horizon: int = 0):
         self.c = contract
+        # real-time chunking (a flow-matching policy): each chunk after the first is guided toward the command
+        # the running one gives from its observation on (rtc_prefix). rtc_fk: joints (N, 7) -> TCP (N, 4, 4)
+        self.rtc_fk, self.rtc_horizon = rtc_fk, int(rtc_horizon)
+        self.lags_s: deque[float] = deque(maxlen=RTC_LAG_WINDOW)  # observation -> chunk ready, per prediction
         self.on_phase = on_phase
         self.history = history
         self.observe, self.predict, self.plan, self.sample = observe, predict, plan, sample
@@ -1010,8 +1019,14 @@ class Predictor:
         except RuntimeError as exc:
             return Prediction(obs, None, error=f"TCP history: {exc}", age_s=age)
         self._phase("predict")
+        sample = self.sample(hist, obs)
+        rtc = self.rtc_prefix(hist[-1], seed, obs.t_img) if isinstance(seed, Chunk) else None
+        if rtc is not None:
+            from tools.fr3 import relative_tcp_policy as rtp
+
+            sample = rtp.with_rtc_prefix(sample, rtc["prefix"], delay=rtc["delay"], horizon=rtc["horizon"])
         t = self.clock()
-        actions = np.asarray(self.predict(self.sample(hist, obs)), dtype=np.float64)
+        actions = np.asarray(self.predict(sample), dtype=np.float64)
         latency = self.clock() - t
         if latency > L.predict_s:
             return Prediction(obs, None, error=f"prediction took {latency * 1e3:.0f} ms (limit {L.predict_s * 1e3:.0f})",
@@ -1029,8 +1044,39 @@ class Predictor:
         self._phase("chunk")
         chunk = Chunk(self.count, obs.t_img, obs.t_img, self.c.step_s, T, q, ok, why, actions[:H, rt.POSE_DIM].copy())
         self.count += 1
+        self.lags_s.append(self.clock() - obs.t_img)
         return Prediction(obs, chunk, latency_s=latency, age_s=age, history=hist, actions=actions,
-                          plan={k: v for k, v in plan.items() if k not in ("T", "q", "ok", "why")})
+                          plan={k: v for k, v in plan.items() if k not in ("T", "q", "ok", "why")}, rtc=rtc)
+
+    def rtc_delay_steps(self) -> int | None:
+        """The steps a new chunk's first ones will have run by when it takes over: the observation -> chunk
+        lag at its recent peak, in steps, rounded up (lerobot_workstation: by the peak, not the median: its
+        median 298 ms, peak 341). None before the first prediction."""
+        if not self.lags_s:
+            return None
+        return int(math.ceil(max(self.lags_s) / self.c.step_s))
+
+    def rtc_prefix(self, T_obs: np.ndarray, running: Chunk, t_img: float) -> dict[str, Any] | None:  # noqa: N803
+        """The running chunk as the next one's RTC prefix: its command (FK) at this observation's steps 1, 2,
+        ... while it has executable steps, re-anchored at the TCP of the observation, with its widths.
+        None without RTC, before the lag is known, or when the running chunk ends within the frozen steps."""
+        if self.rtc_fk is None:
+            return None
+        delay = self.rtc_delay_steps()
+        if delay is None:
+            return None
+        qs, widths = [], []
+        for k in range(1, self.c.horizon + 1):
+            t = t_img + k * self.c.step_s
+            cursor = running.cursor(t)
+            if cursor > running.end:
+                break
+            qs.append(running.command(t)[0])
+            widths.append(running.width_at(cursor))
+        if len(qs) <= delay:
+            return None
+        prefix = rt.action_chunk(T_obs, self.rtc_fk(np.asarray(qs)), np.asarray(widths))
+        return {"prefix": prefix, "delay": delay, "horizon": max(delay, min(self.rtc_horizon, len(qs)))}
 
 
 PHASES = ("", "observe", "predict", "plan", "chunk")
@@ -1144,7 +1190,8 @@ def _predictor_process(build, conn, busy, history_spec) -> None:
 
         predictor = Predictor(contract=parts["contract"], history=history, observe=parts["observe"],
                               predict=parts["predict"], plan=parts["plan"], sample=parts["sample"],
-                              limits=parts["limits"], on_phase=on_phase)
+                              limits=parts["limits"], on_phase=on_phase, rtc_fk=parts.get("rtc_fk"),
+                              rtc_horizon=int(parts.get("rtc_horizon") or 0))
         conn.send(("ready", {**parts.get("info", {}), "offsets_s": predictor.offsets_s}))
     except Exception as exc:  # noqa: BLE001 -- the loop's process raises it; nothing has moved
         with contextlib.suppress(Exception):
@@ -1599,6 +1646,8 @@ class Recorder:
             row["width"] = pred.obs.width
         if pred.timing:
             row["timing"] = {k: round(v, 4) for k, v in pred.timing.items()}
+        if pred.rtc is not None:
+            row["rtc"] = {"delay": pred.rtc["delay"], "horizon": pred.rtc["horizon"], "prefix_steps": len(pred.rtc["prefix"])}
         if pred.chunk is not None:
             c = pred.chunk
             row.update(index=c.index, k0=c.k0, end=c.end, t0=c.t0, offsets=c.offsets.round(5).tolist(),
@@ -1613,6 +1662,8 @@ class Recorder:
                 wrench=np.zeros(0) if pred.obs.wrench is None else pred.obs.wrench,
                 actions=pred.actions,
                 history=pred.history,
+                **({} if pred.rtc is None else {"rtc_prefix": pred.rtc["prefix"],
+                                                "rtc_delay_horizon": np.array([pred.rtc["delay"], pred.rtc["horizon"]])}),
                 **{f"image_{name}": img for name, img in pred.obs.images.items()},
             )
         with (self.dir / "chunks.jsonl").open("a", encoding="utf-8") as handle:

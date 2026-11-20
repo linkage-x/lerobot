@@ -27,6 +27,19 @@ from tools.fr3 import relative_tcp as rt
 NOISE_POLICIES = ("pi05", "pi0")
 NOISE_SEED = 0
 
+#: Real-time chunking (Black, Galliker, Levine 2025; src/lerobot/policies/rtc): a flow-matching policy's new
+#: chunk is guided, at every denoising step, toward the part of the previous one the arm will still execute,
+#: so a takeover does not jump. Inference only, no training. The values are the ones lerobot_workstation ran
+#: pi0.5 with on the real FR3 for two months (fr3_act_infer_real_runtime: weight 10, EXP).
+RTC_MAX_GUIDANCE_WEIGHT = 10.0
+#: A sample carries the previous chunk as these keys (relative_tcp_policy.with_rtc_prefix): physical actions
+#: re-anchored at this observation's TCP, the steps frozen (the inference delay), and the step where guidance
+#: has faded to 0 (the steps the new chunk will execute should all be guided: lerobot_workstation ran 9
+#: executed steps unguided for weeks when its queue and its horizon disagreed).
+RTC_PREFIX_KEY = "rtc.prefix"
+RTC_DELAY_KEY = "rtc.delay"
+RTC_HORIZON_KEY = "rtc.horizon"
+
 #: Host RAM a pi0 / pi0.5 load peaks at, per byte of its base weights file. Measured 2026-11-17 on the A100:
 #: pi05_base (a 13.5 GiB fp32 safetensors) peaked at 41.2 GB RSS, because the pi_gemma wrappers build every
 #: layer twice in fp32 before the weights are read. The same load on a workstation with ~10 GB free swapped
@@ -147,8 +160,40 @@ def fixed_noise(policy, device) -> Any:
     return noise.to(device)
 
 
+def _action_normalizer(postprocessor):
+    """The postprocessor's unnormaliser step: its stats map physical actions into the policy's space."""
+    for step in getattr(postprocessor, "steps", []):
+        if hasattr(step, "_normalize_action"):
+            return step
+    raise ValueError("the checkpoint's postprocessor has no action (un)normaliser")
+
+
+def normalize_actions(postprocessor, actions: np.ndarray, device) -> Any:
+    """Physical (T, 10) actions -> the policy's normalised action space (the inverse of its postprocessor)."""
+    import torch
+
+    tensor = torch.as_tensor(np.asarray(actions, dtype=np.float32), device=device)
+    return _action_normalizer(postprocessor)._normalize_action(tensor, inverse=False)
+
+
+def enable_rtc(policy) -> bool:
+    """Give a flow-matching policy its RTC processor (unguided predictions are unchanged: without a prefix the
+    guided denoiser returns the plain velocity). False for a policy without one (ACT)."""
+    from lerobot.configs.types import RTCAttentionSchedule
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    if _config(policy).type not in NOISE_POLICIES:
+        return False
+    base = policy.get_base_model() if hasattr(policy, "get_base_model") else policy
+    base.config.rtc_config = RTCConfig(enabled=True, max_guidance_weight=RTC_MAX_GUIDANCE_WEIGHT,
+                                       prefix_attention_schedule=RTCAttentionSchedule.EXP)
+    base.init_rtc_processor()
+    return True
+
+
 def predict_chunk(policy, preprocessor, postprocessor, sample: dict[str, Any]) -> np.ndarray:
-    """(horizon, 10) unnormalised actions for one sample (tensors without a batch dimension)."""
+    """(horizon, 10) unnormalised actions for one sample (tensors without a batch dimension). A sample with
+    an RTC prefix (:func:`with_rtc_prefix`) is guided toward it; a policy without RTC refuses one."""
     import torch
 
     batch: dict[str, Any] = {}
@@ -158,12 +203,43 @@ def predict_chunk(policy, preprocessor, postprocessor, sample: dict[str, Any]) -
     batch["task"] = [sample.get("task") or ""]
     batch = preprocessor(batch)
     kwargs = {}
+    device = next(policy.parameters()).device
     if _config(policy).type in NOISE_POLICIES:
-        kwargs["noise"] = fixed_noise(policy, next(policy.parameters()).device)
-    with torch.no_grad():
+        kwargs["noise"] = fixed_noise(policy, device)
+    prefix = sample.get(RTC_PREFIX_KEY)
+    if prefix is not None:
+        base = policy.get_base_model() if hasattr(policy, "get_base_model") else policy
+        rtc = getattr(base.config, "rtc_config", None)
+        if rtc is None or not rtc.enabled:
+            raise ValueError("an RTC prefix was given to a policy without real-time chunking")
+        kwargs["prev_chunk_left_over"] = normalize_actions(postprocessor, np.asarray(prefix), device)
+        kwargs["inference_delay"] = int(sample[RTC_DELAY_KEY])
+        kwargs["execution_horizon"] = int(sample[RTC_HORIZON_KEY])
+    with torch.no_grad():  # the guidance takes its own gradient (torch.enable_grad inside the RTC step)
         actions = policy.predict_action_chunk(batch, **kwargs)
     actions = postprocessor(actions)
     return actions[0].detach().float().cpu().numpy()
+
+
+def rtc_prefix(T_obs: np.ndarray, targets: np.ndarray, widths: np.ndarray) -> np.ndarray:  # noqa: N803
+    """The previous chunk as the new one's RTC prefix: the poses the arm will be commanded to at this
+    observation's steps 1, 2, ... (``targets``, (L, 4, 4) in any one frame with ``T_obs``), re-anchored at
+    the TCP of this observation, and their widths -- in the actions' own physical units.
+
+    The actions are poses relative to the TCP at the observation, so the previous chunk's own actions are in
+    another frame (its own observation's); lerobot_workstation's per-step deltas needed no re-anchoring."""
+    return rt.action_chunk(T_obs, targets, widths)
+
+
+def with_rtc_prefix(sample: dict[str, Any], prefix: np.ndarray, *, delay: int, horizon: int) -> dict[str, Any]:
+    """``sample`` plus an RTC prefix: ``delay`` steps frozen (they run while this chunk is predicted), guidance
+    fading to 0 at step ``horizon`` (capped at the prefix's length by the RTC step)."""
+    prefix = np.asarray(prefix, dtype=np.float32)
+    if prefix.ndim != 2 or prefix.shape[1] != rt.POSE_DIM + 1 or not len(prefix):
+        raise ValueError(f"RTC prefix: (steps, {rt.POSE_DIM + 1}) expected, got {prefix.shape}")
+    if not 0 <= delay <= horizon:
+        raise ValueError(f"RTC: delay {delay} and horizon {horizon} must satisfy 0 <= delay <= horizon")
+    return {**sample, RTC_PREFIX_KEY: prefix, RTC_DELAY_KEY: int(delay), RTC_HORIZON_KEY: int(horizon)}
 
 
 @dataclass
@@ -175,6 +251,7 @@ class LoadedPolicy:
     preprocessor: Any
     postprocessor: Any
     device: str
+    rtc: bool = False  # real-time chunking available (a flow-matching policy): predict takes an RTC prefix
 
     def predict(self, sample: dict[str, Any]) -> np.ndarray:
         return predict_chunk(self.policy, self.preprocessor, self.postprocessor, sample)
@@ -223,7 +300,9 @@ def load_checkpoint(path: Path, device: str | None = None) -> LoadedPolicy:
     got = set(cfg.input_features)
     if got != expected:
         raise ValueError(f"{path}: the policy's inputs {sorted(got)} are not the contract's {sorted(expected)}")
-    return LoadedPolicy(path, contract, provenance, policy, pre, post, device)
+    loaded = LoadedPolicy(path, contract, provenance, policy, pre, post, device)
+    loaded.rtc = enable_rtc(policy)
+    return loaded
 
 
 def observation_sample(

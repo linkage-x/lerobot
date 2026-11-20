@@ -56,7 +56,7 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.fr3 import relative_tcp as rt
+from tools.fr3 import relative_tcp as rt, relative_tcp_policy as rtp
 
 REMOTE_FILE = "fr3_remote_policy.json"
 REMOTE_SCHEMA = "fr3_remote_policy/1"
@@ -154,6 +154,9 @@ def encode_sample(contract: rt.PolicyContract, sample: dict[str, Any], fp: str) 
         t = sample[cam.key]
         img = torch.round(t.detach().cpu() * 255.0).clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
         arrays[f"image.{cam.name}"] = np.ascontiguousarray(img.numpy())
+    if sample.get(rtp.RTC_PREFIX_KEY) is not None:
+        arrays["rtc_prefix"] = np.asarray(sample[rtp.RTC_PREFIX_KEY], dtype=np.float32)
+        arrays["rtc_delay_horizon"] = np.array([sample[rtp.RTC_DELAY_KEY], sample[rtp.RTC_HORIZON_KEY]], np.int64)
     return _npz(**arrays)
 
 
@@ -171,6 +174,11 @@ def decode_sample(contract: rt.PolicyContract, arrays: dict[str, np.ndarray]) ->
         if img is None or img.dtype != np.uint8 or img.shape != (cam.height, cam.width, 3):
             raise ValueError(f"image.{cam.name}: uint8 {(cam.height, cam.width, 3)} expected")
         sample[cam.key] = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).float() / 255.0
+    if "rtc_prefix" in arrays:
+        dh = arrays.get("rtc_delay_horizon")
+        if dh is None or dh.shape != (2,) or arrays["rtc_prefix"].dtype != np.float32:
+            raise ValueError("rtc_prefix: float32 with rtc_delay_horizon (2,) expected")
+        sample = rtp.with_rtc_prefix(sample, arrays["rtc_prefix"], delay=int(dh[0]), horizon=int(dh[1]))
     return sample, str(arrays.get("fingerprint", np.array("")))
 
 
@@ -237,6 +245,7 @@ class RemotePolicy:
     device: str = ""
     status: dict[str, Any] = field(default_factory=dict)
     last_server_s: float = 0.0
+    rtc: bool = False  # the server's policy takes an RTC prefix (relative_tcp_policy.LoadedPolicy.rtc)
     _conn: _Connection | None = None
 
     @property
@@ -259,6 +268,7 @@ class RemotePolicy:
                 f"the policy server {self.server} holds {status.get('checkpoint')} (weights {status.get('fingerprint')}), "
                 f"not the weights this stub was made from ({self.remote['fingerprint']}, {self.remote.get('source')})")
         self.status = status
+        self.rtc = bool(status.get("rtc"))
         return status
 
     def predict(self, sample: dict[str, Any]) -> np.ndarray:
@@ -367,6 +377,7 @@ class PolicyServer:
             "fingerprint": self.fp,
             "contract": self.loaded.contract.to_dict(),
             "device": str(self.loaded.device),
+            "rtc": bool(getattr(self.loaded, "rtc", False)),
             "exclusive": self.exclusive,
             "gpu_problem": self.gpu_problem(),
             "others": self.others,
@@ -454,8 +465,6 @@ def make_handler(server: PolicyServer):
 
 def serve(checkpoint: Path, *, host: str, port: int, allow_from: list[str], exclusive: bool,
           device: str | None = None) -> None:
-    from tools.fr3 import relative_tcp_policy as rtp
-
     if is_stub(checkpoint):
         raise ValueError(f"{checkpoint} is a stub: serve the checkpoint with its weights")
     fp = fingerprint(Path(checkpoint) / "pretrained_model" if (Path(checkpoint) / "pretrained_model").is_dir() else checkpoint)
@@ -472,7 +481,11 @@ def serve(checkpoint: Path, *, host: str, port: int, allow_from: list[str], excl
     # warm up (the first CUDA calls are slow) on a synthetic input
     sample = synthetic_sample(loaded.contract)
     for _ in range(3):
-        loaded.predict(sample)
+        actions = loaded.predict(sample)
+    if getattr(loaded, "rtc", False):  # the guided path is another path (autograd per step): warm it too
+        guided = rtp.with_rtc_prefix(sample, actions[8:], delay=8, horizon=16)
+        for _ in range(2):
+            loaded.predict(guided)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"[{_now()}] serving {loaded.path} (weights {fp}) on {host}:{port} for {', '.join(allow_from)}; "
           f"GPU exclusive: {exclusive}; other GPU processes: {state.others}", flush=True)
@@ -481,8 +494,6 @@ def serve(checkpoint: Path, *, host: str, port: int, allow_from: list[str], excl
 
 def synthetic_sample(contract: rt.PolicyContract) -> dict[str, Any]:
     """A grey frame per camera, the arm still, the gripper half open: for warm-ups and latency (no hardware)."""
-    from tools.fr3 import relative_tcp_policy as rtp
-
     images = {c.name: np.full((c.height, c.width, 3), 128, np.uint8) for c in contract.cameras}
     still = np.repeat(np.eye(4)[None], contract.history + 1, axis=0)
     wrench = np.zeros(len(contract.wrench_names)) if contract.wrench_names else None

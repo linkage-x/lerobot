@@ -1080,6 +1080,9 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
         wrench = data["wrench"] if c.wrench_names else None
         history = data["history"] if "history" in data.files else still  # an execute record keeps its FK history
         sample = rtp.observation_sample(c, history, float(data["width"]), images, wrench, already_cropped=True)
+        if "rtc_prefix" in data.files:  # a guided chunk of an execution: the same guidance
+            dh = data["rtc_delay_horizon"]
+            sample = rtp.with_rtc_prefix(sample, data["rtc_prefix"], delay=int(dh[0]), horizon=int(dh[1]))
         diffs.append(float(np.abs(loaded.predict(sample) - data["actions"]).max()))
     if not diffs:
         raise RuntimeError("the record has no steps")
@@ -1233,9 +1236,21 @@ def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bu
     first = observe(time.monotonic() - 1.0)
     for _ in range(2):
         loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
+    # a flow-matching policy: each chunk guided by the running one (RTC). Guidance fades out at n_exec: the
+    # loop asks for the next chunk at cursor n_exec - (k0 - 1) (run_loop's replan_at), so a chunk taken over
+    # at k0 runs to about n_exec -- every step it executes is guided (lerobot_workstation ran 9 executed
+    # steps unguided when its queue and its RTC horizon disagreed)
+    rtc = bool(getattr(loaded, "rtc", False))
+
+    def rtc_fk(qs: np.ndarray) -> np.ndarray:
+        return np.stack([plan.tcp(q) for q in qs])
+
     return {"contract": c, "limits": limits, "observe": observe, "predict": loaded.predict, "plan": plan_fn,
-            "sample": sample,
+            "sample": sample, "rtc_fk": rtc_fk if rtc else None, "rtc_horizon": n_exec,
             "info": {"contract": c.to_dict(), "provenance": loaded.provenance, "n_exec": n_exec, "remote": remote,
+                     "rtc": {"horizon": n_exec, "max_guidance_weight": rtp.RTC_MAX_GUIDANCE_WEIGHT,
+                             "delay": "the observation -> chunk lag's peak over the last predictions, in steps"}
+                     if rtc else None,
                      "first_width": first.width, "first_images": first.images}}
 
 
@@ -1310,6 +1325,7 @@ def execute(
                             "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
             "predictor": "own process (spawned), FK through shared memory",
             "policy_server": remote,
+            "rtc": info.get("rtc"),
             **rx.stage_dict(st, limits),
         }
         (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
