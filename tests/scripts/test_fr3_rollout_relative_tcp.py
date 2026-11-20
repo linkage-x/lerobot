@@ -477,3 +477,59 @@ def test_live_jobs_wait_until_the_recorder_has_brought_every_sensor_up(tmp_path)
     assert manager.status()["recorder"]["ready"]
     manager.start_preview(ckpt, "right", 2.0, False)
     assert spawned
+
+
+#: 11-19 18:08 (execute_20261119_180851): the second chunk's anchor, from which the policy's descent took j2
+#: through 0. The synthetic path below drives j2 from there to +0.25.
+_Q_SINGULAR_ANCHOR = np.array([0.736, -0.443, -0.946, -2.473, -0.618, 3.065, 1.056])
+
+
+def _through_the_shoulder_singularity():
+    from tools.fr3 import fr3_kinematics as kin
+
+    qa = _Q_SINGULAR_ANCHOR
+    qb = qa.copy()
+    qb[1] = 0.25
+    F = kin.NOMINAL.fk(qa + np.linspace(0, 1, 33)[1:, None] * (qb - qa))
+    q, ok = kin.ik_retry(kin.NOMINAL, F, qa, early_exit=True, rest=qa)
+    return kin, qa, F, q, ok
+
+
+def test_a_chunk_toward_a_singularity_is_steered_off_it_on_the_same_tcp_path():
+    from tools.fr3 import rollout_execute as rx
+
+    kin, qa, F, q, ok = _through_the_shoulder_singularity()
+    assert ok.all()
+    q_s, ok_s, sig = ro.steer_off_singularity(F, q, ok, qa)
+    assert ok_s.all()
+    np.testing.assert_allclose(sig, ro.sigma_min(q_s))
+    assert np.abs(kin.NOMINAL.fk(q_s)[:, :3, 3] - F[:, :3, 3]).max() < 1e-5  # the policy's path, only the posture differs
+    assert sig.min() > ro.sigma_min(q).min() + 0.01
+    assert sig[-1] > ro.sigma_min(q)[-1] + 0.05
+    Q = np.concatenate([qa[None], q_s])
+    # the null-space motion is no re-posture and no turn of its own: every step stays executable
+    assert rx.reposture(Q).max() <= rx.Limits().reposture_rad
+    T = kin.NOMINAL.fk(Q)
+    steps_ok, why = rx.assess(T, Q, ok_s, [""] * len(ok_s), rx.Limits(step_mm=40.0))
+    assert steps_ok.all(), next(w for w in why if w)
+
+
+def test_a_chunk_clear_of_singularities_is_left_as_planned():
+    from tools.fr3 import fr3_kinematics as kin
+
+    qa = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])  # the ready posture: sigma_min ~0.2
+    assert ro.sigma_min(qa[None])[0] > ro.STEER_SIGMA
+    F = kin.NOMINAL.fk(qa + np.linspace(0, 0.05, 8)[:, None] * np.array([1, 0, 0, 0, 0, 0, 0]))
+    q, ok = kin.ik_retry(kin.NOMINAL, F, qa, early_exit=True, rest=qa)
+    q_s, ok_s, _ = ro.steer_off_singularity(F, q, ok, qa)
+    assert ok_s.all()
+    np.testing.assert_array_equal(q_s, q)
+
+
+def test_a_step_the_steering_cannot_reach_ends_the_chunk_there():
+    kin, qa, F, q, ok = _through_the_shoulder_singularity()
+    F = F.copy()
+    F[20, :3, 3] += [2.0, 0.0, 0.0]  # 2 m away: out of reach
+    ok[20] = False
+    _, ok_s, _ = ro.steer_off_singularity(F, q, ok, qa)
+    assert ok_s[:20].all() and not ok_s[20:].any()

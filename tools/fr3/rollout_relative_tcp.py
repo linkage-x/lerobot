@@ -84,6 +84,17 @@ START_FOLLOW_JUMP_RAD = 0.3  # a joint jump this large between two points of the
 #: 0.081-0.30 (a threshold of 0.083 sorts 99.1 %); moves to a start died mid-path four times. 0.11: ~25 % above.
 START_SIGMA_MIN = 0.11
 START_PATH_STEP_RAD = 0.02  # the path's clearance is checked every this much of its largest joint
+#: A chunk's IK steers away from a singularity in the null space of its own targets (steer_off_singularity): the
+#: TCP path is the policy's, only the posture differs. 11-19 18:08: the policy's descent took j2 through 0
+#: (sigma_min 0.014): IK nearest the seed swung j1 0.147 rad in one step and the chunk was refused; 18:09 the
+#: next run went in and the force estimate dropped. The steering starts below STEER_SIGMA ...
+STEER_SIGMA = 0.15
+#: ... and moves the posture at most this much per step beyond what the TCP needs (Limits.reposture_rad: 0.05) ...
+STEER_STEP_RAD = 0.04
+#: ... changing that motion by at most this much from one step to the next (rad/step²: 4.5 rad/s² at 30 Hz,
+#: within what a step may change without being slowed, rollout_execute.turn_speed_cap)
+STEER_RAMP_RAD = 0.005
+STEER_IK_ITERS = 12  # Gauss-Newton iterations per step from the step before (a policy step is a few mm)
 WORKSPACE_MARGIN_M = 0.03
 
 
@@ -313,6 +324,7 @@ class PlanContext:
         ``T_obs`` is the TCP (ARM_FK_FRAME) in the arm's base at the observation; ``seed`` one posture (7,) or
         one per step (n, 7). ``early_exit`` is the
         execution loop's IK (kin.ik: stop when every target has converged, the posture nearest the seed).
+        Where that walks toward a singularity the postures are steered off it (steer_off_singularity).
         """
         kin = self.kin
         targets, widths = rt.targets_from_actions(T_obs, actions)
@@ -321,6 +333,8 @@ class PlanContext:
         # execution checks every step's joint motion, and a re-posture toward the middle lands in step 1
         seed = np.asarray(seed, dtype=np.float64)
         q_sol, ik_ok = kin.ik_retry(kin.NOMINAL, flange, seed, early_exit=early_exit, rest=seed)
+        # ... then kept off the singularities that batch walks into (the arm would stop estimating force there)
+        q_sol, ik_ok, sig = steer_off_singularity(flange, q_sol, ik_ok, seed if seed.ndim == 1 else seed[0])
         n = len(targets)
         inside = np.ones(n, dtype=bool)
         off_dist = [""] * n
@@ -360,6 +374,7 @@ class PlanContext:
             "inside_workspace": None if self.T_base_world is None else inside,
             "off_distribution": off_dist,
             "env_gap_m": gap,
+            "sigma_min": sig,
         }
 
     def start_problem(self, q: np.ndarray, width: float | None) -> str:
@@ -588,6 +603,76 @@ def sigma_min(q: np.ndarray) -> np.ndarray:
 
     _, J = kin.NOMINAL.kinematics(np.asarray(q, dtype=np.float64))
     return np.linalg.svd(J, compute_uv=False)[:, -1]
+
+
+def _sigma_and_gradient(q: np.ndarray, eps: float = 1e-5) -> tuple[float, np.ndarray, np.ndarray]:
+    """sigma_min at ``q`` (7,), its gradient in joint space (forward differences) and the flange Jacobian there,
+    from one batched call."""
+    from tools.fr3 import fr3_kinematics as kin
+
+    _, J = kin.NOMINAL.kinematics(q[None] + np.vstack([np.zeros(7), eps * np.eye(7)]))
+    s = np.linalg.svd(J, compute_uv=False)[:, -1]
+    return float(s[0]), (s[1:] - s[0]) / eps, J[0]
+
+
+def _solve_from(F: np.ndarray, q: np.ndarray, iters: int = STEER_IK_ITERS) -> tuple[np.ndarray, bool]:
+    """The flange pose ``F`` from ``q`` by minimum-norm Gauss-Newton steps (no pull anywhere else): the posture
+    nearest ``q`` along the way. Inside the joint walls, within kin.IK_TOL_* or not converged."""
+    from tools.fr3 import fr3_kinematics as kin
+
+    tol_m, tol_rad = kin.IK_TOL_MM * 1e-3, math.radians(kin.IK_TOL_DEG)
+    q = q.copy()
+    for _ in range(iters + 1):
+        T, J = kin.NOMINAL.kinematics(q[None])
+        e = np.concatenate([F[:3, 3] - T[0, :3, 3], kin._rotvec((F[:3, :3] @ T[0, :3, :3].T)[None])[0]])
+        if np.linalg.norm(e[:3]) < tol_m * 0.5 and np.linalg.norm(e[3:]) < tol_rad * 0.5:
+            return q, bool(np.all(q >= kin.Q_LOWER) and np.all(q <= kin.Q_UPPER))
+        J = J[0]
+        q = q + J.T @ np.linalg.solve(J @ J.T + 1e-6 * np.eye(6), e)
+    return q, False
+
+
+def steer_off_singularity(flange: np.ndarray, q: np.ndarray, ok: np.ndarray,
+                          q_before: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A chunk's postures ``q`` (n,7) for its flange poses (n,4,4), kept off the singularities the batched IK
+    (every step nearest the seed, independently) walks into. ``(q, ok, sigma_min)``.
+
+    Unchanged when every step is reachable and keeps sigma_min >= STEER_SIGMA. Otherwise from the step before
+    the first that does not, step to step: each target from the step before (``q_before`` before step 1) plus a
+    motion in the null space of the flange's Jacobian up the gradient of sigma_min -- the TCP stays on the
+    policy's path, only the posture differs -- at most STEER_STEP_RAD per step and changing by at most
+    STEER_RAMP_RAD per step, so it adds neither a re-posture (Limits.reposture_rad) nor a turn
+    (rollout_execute.turn_speed_cap) of its own. Above STEER_SIGMA it ramps down. A step it cannot reach ends
+    the chunk there (not reachable).
+
+    It only keeps the posture it starts in away from a singularity: 11-19, at the lowest-sigma pose of five runs
+    the planned posture had 0.014-0.068 and another posture family (j2 ~ -1.57, j6 ~ 2.1) 0.23 at the same
+    flange pose, more than a radian away; a chunk does not cross over to it (the start posture decides)."""
+    q = np.array(q, dtype=np.float64)
+    ok = np.array(ok, dtype=bool)
+    sig = sigma_min(q)
+    low = np.flatnonzero(~ok | (sig < STEER_SIGMA))
+    if not low.size:
+        return q, ok, sig
+    k0 = int(low[0])
+    q_cur = np.asarray(q_before, dtype=np.float64) if k0 == 0 else q[k0 - 1].copy()
+    v = np.zeros(7)  # the null-space motion added to the next step, rad
+    for k in range(k0, len(q)):
+        qk, reached = _solve_from(flange[k], q_cur + v)
+        if not reached:
+            ok[k:] = False
+            break
+        q[k], ok[k] = qk, True
+        q_cur = qk
+        s, g, J = _sigma_and_gradient(qk)
+        null = np.eye(7) - np.linalg.pinv(J) @ J
+        d = null @ g
+        want = np.zeros(7)
+        if s < STEER_SIGMA and np.abs(d).max() > 1e-9:
+            want = STEER_STEP_RAD * d / np.abs(d).max()
+        v = null @ (v + np.clip(want - v, -STEER_RAMP_RAD, STEER_RAMP_RAD))
+        v *= min(1.0, STEER_STEP_RAD / max(float(np.abs(v).max()), 1e-12))
+    return q, ok, sigma_min(q)
 
 
 def frame_age_limit_s(frame_bus: Path) -> float:
