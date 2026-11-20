@@ -56,6 +56,7 @@ for _p in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
 
 from tools.fr3 import relative_tcp as rt  # noqa: E402, I001
 from tools.fr3 import relative_tcp_data as rd  # noqa: E402
+from tools.fr3.relative_tcp_remote import REMOTE_PREDICT_S, RemotePolicyError  # noqa: E402
 
 RESULT_SCHEMA = "fr3_rollout_result/1"
 RECORD_SCHEMA = "fr3_rollout_record/1"
@@ -993,6 +994,7 @@ def preview(
         "tcp_history": "arm still: every history pose equals the current one (exact while it does not move)",
         "wrench_bias": "live: this Connect's last BOX zero (an export takes each episode's still ends)" if c.wrench_names else None,
         "frame_source": str(frame_bus),
+        "policy_server": getattr(loaded, "remote", None),
         "plan_problem": plan_problem,
         "distribution": None if plan is None or plan.distribution is None else plan.distribution.summary,
     }
@@ -1016,7 +1018,13 @@ def preview(
         cropped = {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras}
         sample = rtp.observation_sample(c, history, width, cropped, wrench, already_cropped=True)
         t_pred = time.monotonic()
-        actions = loaded.predict(sample)
+        try:
+            actions = loaded.predict(sample)
+        except RemotePolicyError as exc:  # the server refused (GPU shared) or is gone: shown, retried
+            progress(event="wait", error=str(exc))
+            (record_dir / "latest.json").write_text(json.dumps({"time": _now(), "blocked": str(exc)}), encoding="utf-8")
+            time.sleep(1.0)
+            continue
         latency_ms = (time.monotonic() - t_pred) * 1e3
         q_now, joint_info = joints_for_check(joints, q_arm)
         checked = plan.check(q_now, actions, width, n_exec) if (plan is not None and q_now is not None) else None
@@ -1163,14 +1171,16 @@ NOT_ATTENDED = (
 )
 
 
-def execution_limits(plan: PlanContext, frame_bus: Path):
+def execution_limits(plan: PlanContext, frame_bus: Path, *, remote: bool = False):
     """The run's limits: the per-step ones are the checkpoint's own, what one step of its demonstrations did
-    (rollout_execute.step_limits). Both of execute's processes compute them the same way."""
+    (rollout_execute.step_limits). Both of execute's processes compute them the same way. A policy on a
+    server (``remote``) is allowed REMOTE_PREDICT_S per prediction instead of Limits.predict_s."""
     from tools.fr3 import rollout_execute as rx
 
     dist = plan.distribution
+    extra = {"predict_s": REMOTE_PREDICT_S} if remote else {}
     return rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
-                     **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
+                     **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])), **extra)
 
 
 def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bus: str, device: str | None,
@@ -1191,7 +1201,15 @@ def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bu
                        contract=c)
     if plan.problems:
         raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
-    limits = execution_limits(plan, bus)
+    remote = getattr(loaded, "remote", None)
+    if remote is not None:
+        status = loaded.status
+        if not status.get("exclusive"):
+            raise RuntimeError(f"the policy server {remote['server']} was started with --allow-shared-gpu: an "
+                               "execution needs its GPU to itself (restart it without that flag)")
+        if status.get("gpu_problem"):
+            raise RuntimeError(f"the policy server {remote['server']}: {status['gpu_problem']}")
+    limits = execution_limits(plan, bus, remote=remote is not None)
     live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=bus)
 
     def observe(min_t: float) -> rx.Observation:
@@ -1217,7 +1235,7 @@ def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bu
         loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
     return {"contract": c, "limits": limits, "observe": observe, "predict": loaded.predict, "plan": plan_fn,
             "sample": sample,
-            "info": {"contract": c.to_dict(), "provenance": loaded.provenance, "n_exec": n_exec,
+            "info": {"contract": c.to_dict(), "provenance": loaded.provenance, "n_exec": n_exec, "remote": remote,
                      "first_width": first.width, "first_images": first.images}}
 
 
@@ -1266,7 +1284,8 @@ def execute(
         if plan.problems:
             raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
         dist = plan.distribution
-        limits = execution_limits(plan, frame_bus)
+        remote = info.get("remote")
+        limits = execution_limits(plan, frame_bus, remote=remote is not None)
         cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
 
         record_dir.mkdir(parents=True, exist_ok=True)
@@ -1290,6 +1309,7 @@ def execute(
                             "used_mm": limits.step_mm, "used_deg": limits.step_deg,
                             "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
             "predictor": "own process (spawned), FK through shared memory",
+            "policy_server": remote,
             **rx.stage_dict(st, limits),
         }
         (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")

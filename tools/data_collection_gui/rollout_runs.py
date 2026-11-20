@@ -161,6 +161,9 @@ class RolloutManager:
             prov: dict[str, Any] = {}
             with contextlib.suppress(OSError, ValueError):
                 prov = json.loads((model / "fr3_provenance.json").read_text(encoding="utf-8"))
+            remote: dict[str, Any] = {}  # a stub: the weights are on a policy server (relative_tcp_remote)
+            with contextlib.suppress(OSError, ValueError):
+                remote = json.loads((model / "fr3_remote_policy.json").read_text(encoding="utf-8"))
             out.append({
                 "path": str(model),
                 "run": model.parents[3].name,
@@ -172,6 +175,8 @@ class RolloutManager:
                 "reloadCheck": prov.get("reload_check"),
                 "hasWorkspace": bool(prov.get("workspace")),
                 "saved": prov.get("saved", ""),
+                "policyServer": remote.get("server") or None,
+                "policyType": remote.get("policy_type") or (prov.get("policy") or {}).get("type"),
             })
         return sorted(out, key=lambda c: (c["run"], c["step"] if isinstance(c["step"], int) else 0), reverse=True)
 

@@ -318,6 +318,7 @@ export function RolloutPage() {
             <option key={c.path} value={c.path}>
               {c.run} · step {c.step} · {c.hand} · {c.cameras.join("+")}
               {c.wrench ? " · wrench" : ""}
+              {c.policyServer ? " · on policy server" : ""}
             </option>
           ))}
         </select>
@@ -326,7 +327,9 @@ export function RolloutPage() {
             Trained on {ckpt.exports.join(", ") || "?"}; reload check{" "}
             {ckpt.reloadCheck ? (ckpt.reloadCheck.ok ? "identical" : "FAILED") : "not run (an intermediate checkpoint)"}
             {ckpt.hasWorkspace ? "" : "; carries no training workspace, so the plan check cannot bound the arm"}.
-            Remote runs appear here after Fetch on the Training page.
+            {ckpt.policyServer
+              ? ` Its ${ckpt.policyType || "policy"} runs on the policy server ${ckpt.policyServer} (this machine keeps no weights): each prediction takes a round trip, up to 0.30 s while executing, and the server refuses while another process uses its GPU.`
+              : " Remote runs appear here after Fetch on the Training page."}
           </p>
         ) : (
           <p className="panel-note">No checkpoint: train one on the Training page (and Fetch it if it trained elsewhere).</p>

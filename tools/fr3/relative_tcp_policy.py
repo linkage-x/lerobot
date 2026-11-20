@@ -189,6 +189,10 @@ def load_checkpoint(path: Path, device: str | None = None) -> LoadedPolicy:
     path = Path(path)
     if (path / "pretrained_model").is_dir():
         path = path / "pretrained_model"
+    from tools.fr3 import relative_tcp_remote
+
+    if relative_tcp_remote.is_stub(path):  # weights on a policy server (pi0.5 is not run on Thor)
+        return relative_tcp_remote.load_remote(path)  # type: ignore[return-value]
     contract = rt.PolicyContract.read(path)
     prov_path = path / rt.PROVENANCE_FILE
     provenance = json.loads(prov_path.read_text(encoding="utf-8")) if prov_path.is_file() else {}

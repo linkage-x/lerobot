@@ -53,6 +53,9 @@ export type RolloutCheckpoint = {
   reloadCheck: { ok: boolean; max_abs_diff?: number } | null;
   hasWorkspace: boolean;
   saved: string;
+  // a stub: the weights are on this policy server (pi0.5 is not run on Thor)
+  policyServer?: string | null;
+  policyType?: string | null;
 };
 
 export type ResultRow = {
