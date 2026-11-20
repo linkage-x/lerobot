@@ -77,6 +77,11 @@ START_SINGULAR_GIVE_UP = 6  # ... but this many in a row whose only ways cross a
 START_J2_MARGIN_RAD = 0.25  # a start posture with |j2| under this is flagged: near the shoulder singularity
 START_MARGIN_TIE_RAD = 0.05  # postures whose margins differ less than this: the one with the least travel
 START_FOLLOW_JUMP_RAD = 0.3  # a joint jump this large between two points of the opening: the posture cannot follow it
+#: postures the start's IK is also seeded from, the same every time (a fixed generator): where the arm stands and
+#: the ready posture only find the family the arm is in (11-19 every start: j2 ~ -0.4, j6 ~ pi, near-singular over
+#: the whole task); 24 random ones missed the j2 ~ -1.6, j6 ~ 2.2 family on most starts, 64 found it
+START_RANDOM_SEEDS = 64
+START_SEED_GENERATOR = 20261120
 #: the smallest singular value of the flange Jacobian (kin.NOMINAL, m and rad) a start, the path to it and, when
 #: any posture allows, the opening keep. 11-19: near a singularity the FR3 stops estimating the external wrench
 #: (O_F_ext_hat_K exactly 0, robot mode kIdle, the status light yellow) and the run's force stop would be blind;
@@ -94,6 +99,13 @@ STEER_STEP_RAD = 0.04
 #: ... changing that motion by at most this much from one step to the next (rad/step²: 4.5 rad/s² at 30 Hz,
 #: within what a step may change without being slowed, rollout_execute.turn_speed_cap)
 STEER_RAMP_RAD = 0.005
+#: A start posture that keeps sigma_min >= START_SIGMA_KEEP along its whole episode and START_ROOM_MIN_RAD of room
+#: (|j2|, the walls) is preferred to the roomiest one that keeps START_SIGMA_MIN. 11-20, from where the 11-19
+#: executions began: the roomiest posture keeping 0.11 kept 0.12 on the demonstration -- the policy's own path
+#: (held-out p50 31 mm off) took that family under 0.085 -- while the j2 ~ -1.6, j6 ~ 2.2 family, reachable without
+#: nearing a singularity, kept 0.185-0.215. 0.10 rad: twice the IK's own margin to the walls (LIMIT_MARGIN_DEG).
+START_SIGMA_KEEP = 0.15
+START_ROOM_MIN_RAD = 0.10
 STEER_IK_ITERS = 12  # Gauss-Newton iterations per step from the step before (a policy step is a few mm)
 WORKSPACE_MARGIN_M = 0.03
 
@@ -461,11 +473,13 @@ class PlanContext:
         """A move from ``q_now`` to a real training start: one of the poses of the episodes' first second
         (rollout_distribution), drawn at random until one has a clear path (at most ``tries``).
 
-        Its joints: IK from where the arm stands and from the ready posture, each also nudged; of the distinct
-        postures that converge, the one with the most room along the motion that follows: from each posture,
-        the opening of the episode the start is from (its first OPENING_S, rollout_distribution) is followed by
-        IK point to point, and its room is the smallest, all along, of |j2| (the shoulder singularity: j1 and j3
-        collinear) and every joint's distance to panda_py's walls; a posture that loses the opening (no IK, or
+        Its joints: IK from where the arm stands, from the ready posture (each also nudged) and from
+        START_RANDOM_SEEDS random postures; of the distinct postures that converge, the one that keeps the force
+        estimate (sigma_min >= START_SIGMA_KEEP with START_ROOM_MIN_RAD of room, else >= START_SIGMA_MIN) and then
+        has the most room along the motion that follows: from each
+        posture, the episode the start is from (all of it since 11-20, rollout_distribution.OPENING_S) is followed
+        by IK point to point, and its room is the smallest, all along, of |j2| (the shoulder singularity: j1 and j3
+        collinear) and every joint's distance to panda_py's walls; a posture that loses the episode (no IK, or
         a joint jumping START_FOLLOW_JUMP_RAD) has none. Within START_MARGIN_TIE_RAD of the best: the least joint
         travel. 11-19: a start at j2 = -0.16 took the arm through the shoulder singularity (160814); preferring
         room at the start alone chose the other shoulder branch (j2 +0.39, j3 0.27 rad from its wall), where 77
@@ -486,7 +500,13 @@ class PlanContext:
                     "why": f"{', '.join(f'j{j + 1}' for j in beyond)} past panda_py's walls now: guide the arm in Desk"}
         dist = self.distribution
         T_world_base = np.linalg.inv(self.T_base_world)
-        seeds = [np.clip(base + n, kin.Q_LOWER, kin.Q_UPPER) for base in (q_now, kin.Q_READY) for n in kin._SEED_NUDGES]
+        seeds = np.array([np.clip(base + n, kin.Q_LOWER, kin.Q_UPPER) for base in (q_now, kin.Q_READY)
+                          for n in kin._SEED_NUDGES]
+                         + list(np.random.default_rng(START_SEED_GENERATOR).uniform(
+                             kin.Q_LOWER, kin.Q_UPPER, size=(START_RANDOM_SEEDS, 7))))
+
+        def rooms_of(Q: np.ndarray) -> np.ndarray:
+            return np.minimum(np.abs(Q[:, 1]), np.minimum(Q - kin._WALL_LOWER, kin._WALL_UPPER - Q).min(axis=1))
 
         def room(q: np.ndarray) -> float:
             return float(min(abs(q[1]), np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q).min()))
@@ -510,16 +530,26 @@ class PlanContext:
                         f"the way (needs {need * 1e3:.0f})"), float(sig[ks]), float(gap[k])
             return "", float(sig[ks]), float(gap[k])
 
-        def room_along(q0: np.ndarray, flanges: np.ndarray) -> tuple[float, float]:
-            """(the smallest room, the smallest sigma_min) along the opening; room -inf when it is lost."""
-            q, worst, sig = q0, room(q0), sigma_min(q0[None])[0]
+        def room_along(Q0: np.ndarray, flanges: np.ndarray) -> list[tuple[float, float]]:
+            """Per posture (m,7): (the smallest room, the smallest sigma_min) along the episode, all followed at
+            once; room -inf when it is lost."""
+            Q = np.array(Q0, dtype=np.float64)
+            worst, sig = rooms_of(Q), sigma_min(Q)
+            alive = np.ones(len(Q), dtype=bool)
             for F in flanges:
-                q_next, ok = kin.ik(kin.NOMINAL, F[None], q, rest=q, early_exit=True)
-                if not ok[0] or np.abs(q_next[0] - q).max() > START_FOLLOW_JUMP_RAD:
-                    return -math.inf, sig
-                q = q_next[0]
-                worst, sig = min(worst, room(q)), min(sig, sigma_min(q[None])[0])
-            return worst, sig
+                idx = np.flatnonzero(alive)
+                if not idx.size:
+                    break
+                q_next, ok = kin.ik(kin.NOMINAL, np.repeat(F[None], idx.size, axis=0), Q[idx], rest=Q[idx],
+                                    early_exit=True)
+                lost = ~ok | (np.abs(q_next - Q[idx]).max(axis=1) > START_FOLLOW_JUMP_RAD)
+                alive[idx[lost]] = False
+                keep = idx[~lost]
+                Q[keep] = q_next[~lost]
+                worst[keep] = np.minimum(worst[keep], rooms_of(Q[keep]))
+                sig[keep] = np.minimum(sig[keep], sigma_min(Q[keep]))
+            worst[~alive] = -math.inf
+            return [(float(r), float(g)) for r, g in zip(worst, sig, strict=True)]
         last, tried, singular_ways = "", 0, 0
         for idx in rng.permutation(len(dist.start_p))[: max(1, tries)]:
             tried += 1
@@ -531,11 +561,8 @@ class PlanContext:
                                 f"(j2 negative, away from 0), then move again (the last: {last})")}
             T_world = rt.pose7_to_matrix(np.concatenate([dist.start_p[idx], dist.start_q[idx]]))
             flange = (self.T_base_world @ T_world @ np.linalg.inv(self.T_tool))[None]
-            found = []
-            for seed in seeds:
-                q, ok = kin.ik(kin.NOMINAL, flange, seed, rest=seed)
-                if ok[0]:
-                    found.append(q[0])
+            q_all, ok_all = kin.ik(kin.NOMINAL, np.repeat(flange, len(seeds), axis=0), seeds, rest=seeds)
+            found = list(q_all[ok_all])
             if not found:
                 last = f"training start {idx}: no IK inside the joint walls"
                 continue
@@ -562,17 +589,24 @@ class PlanContext:
             if len(opening):
                 near = int(np.argmin(np.linalg.norm(opening[:, :3] - dist.start_p[idx], axis=1)))
                 follow = self.T_base_world @ rt.pose7_to_matrix(opening[near:]) @ np.linalg.inv(self.T_tool)
-            along = [(-math.inf, 0.0) if w[0] else  # not reachable from here: not followed
-                     room_along(q, follow) if follow is not None else (room(q), float(sigma_min(q[None])[0]))
-                     for q, w in zip(distinct, ways, strict=True)]
+            reach = [i for i, w in enumerate(ways) if not w[0]]  # not reachable from here: not followed
+            along = [(-math.inf, 0.0)] * len(distinct)
+            followed = (room_along(np.array([distinct[i] for i in reach]), follow) if follow is not None else
+                        [(room(distinct[i]), float(sigma_min(distinct[i][None])[0])) for i in reach])
+            for i, a in zip(reach, followed, strict=True):
+                along[i] = a
             rooms = [r for r, _ in along]
             keeps = [sig >= START_SIGMA_MIN for _, sig in along]
             usable = [i for i in range(len(distinct)) if math.isfinite(rooms[i])]
             if not usable:
-                last = f"training start {idx}: no posture reachable from here can follow the episode's opening"
+                last = f"training start {idx}: no posture reachable from here can follow the episode"
                 continue
-            # the force estimate kept along the opening first (when any posture does), then the room
-            pool = [i for i in usable if keeps[i] or not any(keeps[j] for j in usable)]
+            # the force estimate kept along the episode with a margin and room (when any posture does), else kept
+            # at all, then the room
+            tier = [0 if along[i][1] >= START_SIGMA_KEEP and rooms[i] >= START_ROOM_MIN_RAD else 1 if keeps[i] else 2
+                    for i in range(len(distinct))]
+            top = min(tier[i] for i in usable)
+            pool = [i for i in usable if tier[i] == top]
             best = max(rooms[i] for i in pool)
             pick = min((i for i in pool if rooms[i] >= best - START_MARGIN_TIE_RAD),
                        key=lambda i: float(np.abs(distinct[i] - q_now).max()))
@@ -589,6 +623,7 @@ class PlanContext:
                 "room_rad": round(best, 3), "room_at_start_rad": round(room(q_goal), 3), "postures": len(distinct),
                 "sigma_min_start": round(float(sigma_min(q_goal[None])[0]), 3),
                 "sigma_min_path": round(path_sigma_min, 3), "sigma_min_opening": round(float(opening_sigma), 3),
+                "keeps_margin": tier[pick] == 0,
                 "followed_opening": bool(len(opening)),
                 "max_joint_move_deg": round(math.degrees(float(np.abs(q_goal - q_now).max())), 1),
                 "min_env_gap_mm": None if not math.isfinite(gap_min) else round(gap_min * 1e3, 1),

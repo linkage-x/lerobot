@@ -424,6 +424,8 @@ class RolloutManager:
             elif event.get("event") == "to_start":
                 job.message = (f"moving to training start {event.get('index')} (j2 {event.get('j2')}, up to "
                                f"{event.get('max_joint_move_deg')}° of joint travel; arm under control)")
+                if (event.get("max_joint_move_deg") or 0) > 60:
+                    job.message += "; a posture change: the elbow swings wide"
             elif event.get("event") == "done":
                 if job.kind in ARM_KINDS:
                     job.message = ("completed" if event.get("completed")

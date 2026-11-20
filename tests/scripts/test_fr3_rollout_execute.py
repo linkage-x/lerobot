@@ -1016,6 +1016,30 @@ def _start_plan(T_world: list[np.ndarray], gap=lambda path: np.full(len(path), 0
     return plan
 
 
+def test_the_start_posture_keeps_the_force_estimate_along_the_whole_episode_not_the_arms_family():
+    """11-19: every start was planned in the family the arm stood in (j2 ~ -0.5, j6 ~ pi); 12 cm down from
+    180945's start that family falls to sigma_min 0.05 (the yellow light), another keeps 0.15 all the way."""
+    from tools.fr3 import rollout_relative_tcp as ro
+
+    q_now = np.array([0.59, -0.54, -1.07, -2.54, -0.81, 3.25, 1.18])  # where execute_20261119_180945 began
+    T0 = _fk(q_now)
+    down = []
+    for k in range(13):
+        T = T0.copy()
+        T[2, 3] -= 0.01 * k
+        down.append(T)
+    q, low = q_now.copy(), np.inf
+    for T in down:  # the arm's own family, followed down
+        q = kin.ik(kin.NOMINAL, T[None], q, rest=q, early_exit=True)[0][0]
+        low = min(low, ro.sigma_min(q[None])[0])
+    assert low < 0.085
+    out = _start_plan([T0], opening=down).plan_to_start(q_now, rng=np.random.default_rng(0))
+    assert out["ok"] and out["keeps_margin"]
+    assert out["sigma_min_opening"] >= ro.START_SIGMA_KEEP and out["room_rad"] >= ro.START_ROOM_MIN_RAD
+    assert out["sigma_min_path"] >= ro.sigma_min(q_now[None])[0] - 1e-3  # the way there never nearer a singularity
+    np.testing.assert_allclose(_fk(np.array(out["q_goal"]))[:3, 3], T0[:3, 3], atol=1e-3)
+
+
 def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singularity():
     from tools.fr3 import rollout_relative_tcp as ro
 
@@ -1055,7 +1079,7 @@ def test_the_start_is_a_real_training_start_reached_clear_of_the_shoulder_singul
     assert out["ok"] and out["followed_opening"] and out["room_rad"] <= out["room_at_start_rad"] + 1e-9
     away = [T_start] + [T_start @ _shift(2.0)]  # an opening the arm cannot follow
     out = _start_plan([T_start], opening=away).plan_to_start(q_now, rng=np.random.default_rng(0))
-    assert not out["ok"] and "follow the episode's opening" in out["why"]
+    assert not out["ok"] and "follow the episode" in out["why"]
 
     blocked = _start_plan([T_start], gap=lambda path: np.linspace(0.3, 0.004, len(path)))
     out = blocked.plan_to_start(q_now, rng=np.random.default_rng(0))

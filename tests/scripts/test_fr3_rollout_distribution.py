@@ -101,7 +101,7 @@ def test_each_start_knows_its_episode_and_the_opening_it_leads_into(dist, tmp_pa
     assert len(dist.start_ep) == len(dist.start_p) and set(dist.start_ep) == set(range(10))
     row = int(np.flatnonzero(dist.start_ep == 3)[0])
     opening = dist.opening_of(row)
-    assert len(opening) == 25  # the whole 2.5 s episode (shorter than OPENING_S) at OPENING_HZ
+    assert len(opening) == 25  # the whole 2.5 s episode at OPENING_HZ
     assert opening[-1, 0] - opening[0, 0] == pytest.approx(0.12, abs=0.01)  # the episode's 12 cm along +x
     back = rd.Distribution.load(_saved(dist, tmp_path))
     np.testing.assert_array_equal(back.start_ep, dist.start_ep)

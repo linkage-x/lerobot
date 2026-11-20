@@ -46,8 +46,12 @@ FLOOR_STEP_DEG = 2.0
 START_WIDTH_SLACK_M = 0.010
 EARLY_S = 1.0  # an episode's "start": its first second (the hand is still or just leaving)
 SUBSAMPLE = 2  # 60 fps exports -> 30 Hz reference points
-VERSION = 2  # bump when what is computed changes (the cache key carries it). 2: the episodes' openings
-OPENING_S = 4.0  # an episode's "opening": its first seconds, the motion a start leads into (the reach, the descent)
+VERSION = 3  # bump when what is computed changes (the cache key carries it). 2: the episodes' openings; 3: whole
+#: an episode's "opening": the motion a start leads into, which a move to a training start judges a posture by. The
+#: whole episode since 11-20: over the first 4 s the usual posture (j2 ~ -0.4, j6 ~ pi) kept sigma_min, over the
+#: whole episodes of stack_act_wrist_v1 its median was 0.100 (the force estimate drops below ~0.085); postures with
+#: j6 ~ 2 kept 0.15-0.18 (28 of 29 episodes had one keeping 0.11 and 10 mm of clearance all the way)
+OPENING_S = math.inf
 OPENING_HZ = 10.0
 
 

@@ -502,8 +502,9 @@ export function RolloutPage() {
         </div>
         <p className="panel-note">
           Move to a training start: one of the poses of this checkpoint's training episodes in their first second,
-          drawn at random, with its joints chosen with room along the motion that follows and clear of singularities
-          (where the FR3 stops estimating force: the yellow light), the path in joint space kept 10 mm from
+          drawn at random, with its joints chosen to stay clear of singularities (where the FR3 stops estimating
+          force: the yellow light) along the whole episode, with room from the joint walls; the posture may differ
+          from the one the arm is in (once: the elbow can swing to the other side), the path in joint space kept 10 mm from
           carts/table/cameras — refused, nothing moving, when no start drawn has such a path. Slow (≤ 0.3 rad/s);
           the path being checked, it runs without the force estimate (a live one still stops on force) and stops
           when the arm is 8 mm off its command (a contact); Stop brakes the arm to rest. Open the gripper yourself
@@ -525,6 +526,10 @@ export function RolloutPage() {
               <p>
                 The {arm} arm moves slowly to a random training start of <strong>{runPath(checkpoint)}</strong>. Keep
                 a hand on the e-stop until it stops.
+              </p>
+              <p>
+                It may change the arm's posture (the elbow to the other side, large joint motions, up to ~10 s): clear
+                the space around the whole arm and watch the cables, not only the gripper.
               </p>
               <div className="danger-modal-actions">
                 <button autoFocus onClick={() => setMoveConfirmOpen(false)} type="button">
