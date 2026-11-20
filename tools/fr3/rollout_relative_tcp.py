@@ -23,8 +23,7 @@ What is the same online and offline (user guide #infer-inputs), and where it liv
   zero; an export takes the bias from each episode's still ends -- recorded in every preview record).
 * TCP history: offline the tracked TCP; online the arm's FK at ARM_FK_FRAME. In preview the arm does not
   move, so the history is "not moving" whatever the FK (exact, not an approximation, while it stands
-  still); the arm's joints are still read for the execution plan check, again every JOINT_REFRESH_S
-  (:class:`JointWatcher`) so the check follows the arm when a person moves it to another start pose.
+  still); FK of the arm's joints is still read once for the execution plan check.
 
 The execution plan check (:meth:`PlanContext.check`) is the execution layer's first half, run on every preview
 prediction and never followed by motion: targets = FK(q_obs) · ΔT in the arm's base; IK reachability
@@ -72,18 +71,6 @@ STAGES = (
     {"id": "execute", "label": "Execution on the arm (stages 1-3, a hand on the e-stop)", "status": "available"},
 )
 ENV_MARGIN_M = 0.010  # dual_fr3_retarget.ENV_MARGIN_MM
-START_TRIES = 24  # a move to a training start: random training starts tried until one has a clear path
-START_SINGULAR_GIVE_UP = 6  # ... but this many in a row whose only ways cross a singularity: the arm stands where none leads out
-START_J2_MARGIN_RAD = 0.25  # a start posture with |j2| under this is flagged: near the shoulder singularity
-START_MARGIN_TIE_RAD = 0.05  # postures whose margins differ less than this: the one with the least travel
-START_FOLLOW_JUMP_RAD = 0.3  # a joint jump this large between two points of the opening: the posture cannot follow it
-#: the smallest singular value of the flange Jacobian (kin.NOMINAL, m and rad) a start, the path to it and, when
-#: any posture allows, the opening keep. 11-19: near a singularity the FR3 stops estimating the external wrench
-#: (O_F_ext_hat_K exactly 0, robot mode kIdle, the status light yellow) and the run's force stop would be blind;
-#: over 3615 ticks of that day's runs and moves the estimate was gone at sigma_min 0.045-0.088 and there at
-#: 0.081-0.30 (a threshold of 0.083 sorts 99.1 %); moves to a start died mid-path four times. 0.11: ~25 % above.
-START_SIGMA_MIN = 0.11
-START_PATH_STEP_RAD = 0.02  # the path's clearance is checked every this much of its largest joint
 WORKSPACE_MARGIN_M = 0.03
 
 
@@ -250,8 +237,6 @@ def arm_tcp_tool(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
 class PlanContext:
     """What the execution plan check needs about one arm, read once: tool frame, edge, workspace, scene."""
 
-    step_s = 1.0 / 30.0  # a policy step (the contract's, when given)
-
     def __init__(self, arm: str, workspace: dict[str, Any] | None, repo_root: Path = _REPO_ROOT, *,
                  provenance: dict[str, Any] | None = None, contract: rt.PolicyContract | None = None):
         from tools.fr3 import (
@@ -265,8 +250,6 @@ class PlanContext:
         self.arm = arm
         self.kin = kin
         self.col = col
-        if contract is not None:
-            self.step_s = contract.step_s
         self.problems: list[str] = []
         self.T_tool = arm_tcp_tool(arm, repo_root=repo_root)
         self.base = fr3_arms.base_world_id(arm)
@@ -384,12 +367,12 @@ class PlanContext:
 
         q_obs = np.asarray(q_obs, dtype=np.float64)
         T_obs = self.kin.NOMINAL.fk(q_obs[None])[0] @ self.T_tool
-        ev = self.evaluate(T_obs, rx.smooth_steps(actions), q_obs, early_exit=True)  # as execution plans it
+        ev = self.evaluate(T_obs, actions, q_obs, early_exit=True)
         ok, inside, gap = ev["ik_ok"], ev["inside_workspace"], ev["env_gap_m"]
         dist = self.distribution
         limits = rx.Limits(**rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0]))) if dist else rx.Limits()
         steps_ok, steps_why = rx.assess(np.concatenate([T_obs[None], ev["T"]]), np.concatenate([q_obs[None], ev["q"]]),
-                                        ev["ok"], ev["why"], limits, gap, dt=self.step_s)
+                                        ev["ok"], ev["why"], limits, gap)
         need = n_exec if 0 < n_exec <= len(ok) else len(ok)
         step_limit = next((steps_why[k] for k in range(1, need + 1) if not steps_ok[k] and ev["ok"][k - 1]), "")
         reasons = list(self.problems)
@@ -428,167 +411,6 @@ class PlanContext:
         """FK to ARM_FK_FRAME in the arm's base."""
         return self.kin.NOMINAL.fk(np.asarray(q, dtype=np.float64)[None])[0] @ self.T_tool
 
-    def blend_problem(self, qs: np.ndarray) -> str:
-        """"" or why a takeover's blend (postures ``qs``) may not run: it comes nearer the carts, the table or
-        the cameras than ENV_MARGIN_M (the steps of both chunks were checked; the blend between them was not)."""
-        A, B = self.model.place(self.kin.NOMINAL, np.asarray(qs, dtype=np.float64))
-        env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
-        if not env.size:
-            return ""
-        gap = env.reshape(len(qs), -1).min(axis=1)
-        k = int(np.argmin(gap))
-        if gap[k] >= ENV_MARGIN_M:
-            return ""
-        return (f"the takeover's blend comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras "
-                f"{k / max(len(qs) - 1, 1):.0%} of the way (needs {ENV_MARGIN_M * 1e3:.0f})")
-
-    def plan_to_start(self, q_now: np.ndarray, *, rng: np.random.Generator, tries: int = START_TRIES) -> dict[str, Any]:
-        """A move from ``q_now`` to a real training start: one of the poses of the episodes' first second
-        (rollout_distribution), drawn at random until one has a clear path (at most ``tries``).
-
-        Its joints: IK from where the arm stands and from the ready posture, each also nudged; of the distinct
-        postures that converge, the one with the most room along the motion that follows: from each posture,
-        the opening of the episode the start is from (its first OPENING_S, rollout_distribution) is followed by
-        IK point to point, and its room is the smallest, all along, of |j2| (the shoulder singularity: j1 and j3
-        collinear) and every joint's distance to panda_py's walls; a posture that loses the opening (no IK, or
-        a joint jumping START_FOLLOW_JUMP_RAD) has none. Within START_MARGIN_TIE_RAD of the best: the least joint
-        travel. 11-19: a start at j2 = -0.16 took the arm through the shoulder singularity (160814); preferring
-        room at the start alone chose the other shoulder branch (j2 +0.39, j3 0.27 rad from its wall), where 77
-        mm of the policy's descent took j2 to 0.14 (170940) -- in the usual branch the same task moved j2 0.02.
-        The FK of the joints must pass the start check itself. The path is the straight line in joint space (rollout_execute.joint_move);
-        all along it the capsule model keeps ENV_MARGIN_M from the carts, the table and the cameras (or never
-        closer than now, when it already is). ``ok`` False with ``why`` when none does; nothing moves."""
-        kin = self.kin
-        q_now = np.asarray(q_now, dtype=np.float64)
-        if self.problems:
-            return {"ok": False, "why": "; ".join(self.problems), "tried": 0}
-        if self.T_base_world is None or self.distribution is None:
-            return {"ok": False, "why": "no training distribution: the checkpoint says nothing about where episodes began",
-                    "tried": 0}
-        beyond = np.flatnonzero((q_now < kin._WALL_LOWER) | (q_now > kin._WALL_UPPER))
-        if beyond.size:
-            return {"ok": False, "tried": 0,
-                    "why": f"{', '.join(f'j{j + 1}' for j in beyond)} past panda_py's walls now: guide the arm in Desk"}
-        dist = self.distribution
-        T_world_base = np.linalg.inv(self.T_base_world)
-        seeds = [np.clip(base + n, kin.Q_LOWER, kin.Q_UPPER) for base in (q_now, kin.Q_READY) for n in kin._SEED_NUDGES]
-
-        def room(q: np.ndarray) -> float:
-            return float(min(abs(q[1]), np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q).min()))
-
-        def way(q_goal: np.ndarray) -> tuple[str, float, float]:
-            """("" or why not, the smallest sigma_min, the smallest clearance) along the straight joint path."""
-            n = max(2, int(math.ceil(float(np.abs(q_goal - q_now).max()) / START_PATH_STEP_RAD)) + 1)
-            path = q_now + np.linspace(0.0, 1.0, n)[:, None] * (q_goal - q_now)
-            sig = sigma_min(path)
-            ks = int(np.argmin(sig))
-            if sig[ks] < min(START_SIGMA_MIN, float(sig[0])) - 1e-3:
-                return (f"the path passes near a singularity {ks / (n - 1):.0%} of the way (sigma_min {sig[ks]:.3f} < "
-                        f"{START_SIGMA_MIN}: the force estimate would drop)"), float(sig[ks]), math.nan
-            A, B = self.model.place(kin.NOMINAL, path)
-            env = self.col.obstacle_gaps(self.obstacles, A, B, self.model.r, self.model.table_mask())
-            gap = env.reshape(n, -1).min(axis=1) if env.size else np.full(n, math.inf)
-            need = min(ENV_MARGIN_M, float(gap[0]) - 0.005)
-            k = int(np.argmin(gap))
-            if gap[k] < need:
-                return (f"the path comes {gap[k] * 1e3:.0f} mm from the carts/table/cameras {k / (n - 1):.0%} of "
-                        f"the way (needs {need * 1e3:.0f})"), float(sig[ks]), float(gap[k])
-            return "", float(sig[ks]), float(gap[k])
-
-        def room_along(q0: np.ndarray, flanges: np.ndarray) -> tuple[float, float]:
-            """(the smallest room, the smallest sigma_min) along the opening; room -inf when it is lost."""
-            q, worst, sig = q0, room(q0), sigma_min(q0[None])[0]
-            for F in flanges:
-                q_next, ok = kin.ik(kin.NOMINAL, F[None], q, rest=q, early_exit=True)
-                if not ok[0] or np.abs(q_next[0] - q).max() > START_FOLLOW_JUMP_RAD:
-                    return -math.inf, sig
-                q = q_next[0]
-                worst, sig = min(worst, room(q)), min(sig, sigma_min(q[None])[0])
-            return worst, sig
-        last, tried, singular_ways = "", 0, 0
-        for idx in rng.permutation(len(dist.start_p))[: max(1, tries)]:
-            tried += 1
-            if singular_ways >= START_SINGULAR_GIVE_UP:
-                tried -= 1
-                return {"ok": False, "tried": tried,
-                        "why": (f"from here every way to the {tried} training starts tried crosses a singularity (the "
-                                "force estimate would drop on the way): guide the arm by hand toward its usual posture "
-                                f"(j2 negative, away from 0), then move again (the last: {last})")}
-            T_world = rt.pose7_to_matrix(np.concatenate([dist.start_p[idx], dist.start_q[idx]]))
-            flange = (self.T_base_world @ T_world @ np.linalg.inv(self.T_tool))[None]
-            found = []
-            for seed in seeds:
-                q, ok = kin.ik(kin.NOMINAL, flange, seed, rest=seed)
-                if ok[0]:
-                    found.append(q[0])
-            if not found:
-                last = f"training start {idx}: no IK inside the joint walls"
-                continue
-            distinct: list[np.ndarray] = []
-            for q in found:
-                if all(np.abs(q - d).max() > 0.05 for d in distinct):
-                    distinct.append(q)
-            singular = [q for q in distinct if sigma_min(q[None])[0] < START_SIGMA_MIN]
-            distinct = [q for q in distinct if sigma_min(q[None])[0] >= START_SIGMA_MIN]
-            if not distinct:
-                last = (f"training start {idx}: every posture there is near a singularity (sigma_min "
-                        f"{max(sigma_min(np.array(singular))):.3f} < {START_SIGMA_MIN}: no force estimate)")
-                continue
-            # each posture's way there first (cheap): never nearer a singularity than the arm stands now (it may
-            # stand near one: the way out is allowed), the capsule clearance all along; only those are followed
-            ways = [way(q) for q in distinct]
-            if all(w[0] for w in ways):
-                last = f"training start {idx}: {ways[0][0]}"
-                singular_ways = singular_ways + 1 if all("singularity" in w[0] for w in ways) else 0
-                continue
-            singular_ways = 0
-            opening = dist.opening_of(int(idx))
-            follow = None
-            if len(opening):
-                near = int(np.argmin(np.linalg.norm(opening[:, :3] - dist.start_p[idx], axis=1)))
-                follow = self.T_base_world @ rt.pose7_to_matrix(opening[near:]) @ np.linalg.inv(self.T_tool)
-            along = [(-math.inf, 0.0) if w[0] else  # not reachable from here: not followed
-                     room_along(q, follow) if follow is not None else (room(q), float(sigma_min(q[None])[0]))
-                     for q, w in zip(distinct, ways, strict=True)]
-            rooms = [r for r, _ in along]
-            keeps = [sig >= START_SIGMA_MIN for _, sig in along]
-            usable = [i for i in range(len(distinct)) if math.isfinite(rooms[i])]
-            if not usable:
-                last = f"training start {idx}: no posture reachable from here can follow the episode's opening"
-                continue
-            # the force estimate kept along the opening first (when any posture does), then the room
-            pool = [i for i in usable if keeps[i] or not any(keeps[j] for j in usable)]
-            best = max(rooms[i] for i in pool)
-            pick = min((i for i in pool if rooms[i] >= best - START_MARGIN_TIE_RAD),
-                       key=lambda i: float(np.abs(distinct[i] - q_now).max()))
-            q_goal, opening_sigma = distinct[pick], along[pick][1]
-            _, path_sigma_min, gap_min = ways[pick]
-            problem = dist.start_problem(T_world_base @ self.tcp(q_goal), None)
-            if problem:
-                last = f"training start {idx}: {problem}"
-                continue
-            return {
-                "ok": True, "why": "", "tried": tried, "index": int(idx),
-                "T_world": T_world.round(6).tolist(), "q_goal": q_goal.round(6).tolist(),
-                "j2": round(float(q_goal[1]), 3), "near_shoulder_singularity": bool(abs(q_goal[1]) < START_J2_MARGIN_RAD),
-                "room_rad": round(best, 3), "room_at_start_rad": round(room(q_goal), 3), "postures": len(distinct),
-                "sigma_min_start": round(float(sigma_min(q_goal[None])[0]), 3),
-                "sigma_min_path": round(path_sigma_min, 3), "sigma_min_opening": round(float(opening_sigma), 3),
-                "followed_opening": bool(len(opening)),
-                "max_joint_move_deg": round(math.degrees(float(np.abs(q_goal - q_now).max())), 1),
-                "min_env_gap_mm": None if not math.isfinite(gap_min) else round(gap_min * 1e3, 1),
-            }
-        return {"ok": False, "tried": tried,
-                "why": f"none of the {tried} training starts tried has a clear path from here (the last: {last})"}
-
-
-def sigma_min(q: np.ndarray) -> np.ndarray:
-    """(n,) the smallest singular value of the flange Jacobian at each posture (kin.NOMINAL, m and rad)."""
-    from tools.fr3 import fr3_kinematics as kin
-
-    _, J = kin.NOMINAL.kinematics(np.asarray(q, dtype=np.float64))
-    return np.linalg.svd(J, compute_uv=False)[:, -1]
-
 
 def frame_age_limit_s(frame_bus: Path) -> float:
     """How old a frame may be when a chunk is predicted from it. The preview bus publishes every 12th
@@ -598,34 +420,6 @@ def frame_age_limit_s(frame_bus: Path) -> float:
 
 
 # ------------------------------------------------------------------ preview ---
-
-
-BOX_SENSOR_STALE_S = 0.5  # the arm's gripper BOX: its own newest sample of a sensor the policy reads, at most this old
-
-
-def box_sensor_problem(snapshot: dict[str, Any], sensors: list[str]) -> tuple[str, float | None]:
-    """("" or why, the oldest age in seconds) of the BOX's own samples of ``sensors`` (namespaced as in
-    ``snapshot["sensors"]``) when the recorder read this snapshot.
-
-    11-19: a gripper BOX that drops out (unplugged, powered off) leaves its last values in the recorder's
-    BOX_LIVE, which keeps coming at 10 Hz; the gateway's ``active``/``updatedAt`` only say the recorder still
-    sends. ``status.sensor_status`` says when each sensor last delivered. Without it nothing is judged."""
-    table = (snapshot.get("status") or {}).get("sensor_status")
-    if not isinstance(table, dict) or not table:
-        return "", None
-    oldest = 0.0
-    for sid in sensors:
-        row = table.get(sid)
-        if not isinstance(row, dict):
-            return f"the BOX reports no status for {sid}", None
-        age = row.get("last_seen_age_s")
-        if not row.get("seen") or age is None:
-            return f"{sid} has sent nothing since Connect", None
-        age = float(age)
-        oldest = max(oldest, age)
-        if age > BOX_SENSOR_STALE_S or row.get("fresh") is False:
-            return f"{sid}: last sample {age:.1f} s ago (limit {BOX_SENSOR_STALE_S:g} s)", age
-    return "", oldest
 
 
 class LiveInputs:
@@ -719,11 +513,6 @@ class LiveInputs:
         width_i = next((i for i, n in enumerate(names) if n.endswith(rd.WIDTH_SUFFIX)), None)
         if width_i is None:
             raise RuntimeError(f"the live BOX state has no {rd.WIDTH_SUFFIX}")
-        used = [prefix + "box_gripper"] + ([prefix + "box_six_d_force"] if self.contract.wrench_names else [])
-        problem, data_age = box_sensor_problem(snapshot, used)
-        if problem:
-            raise RuntimeError(f"the arm's gripper BOX {self.box_id} is not streaming ({problem}): "
-                               "disconnected or powered off? Its last values are not used")
         wrench = None
         if self.contract.wrench_names:
             six = snapshot["sensors"].get(prefix + "box_six_d_force") or {}
@@ -732,8 +521,7 @@ class LiveInputs:
                 raise RuntimeError(f"no live external wrench for BOX {self.box_id}: {six.get('external_note') or 'no 6D reading'}")
             wrench = np.asarray(ext[:6], dtype=np.float64)
         payload = payload or {}
-        return float(values[width_i]), wrench, {"updatedAt": payload.get("updatedAt"), "staleS": payload.get("staleS"),
-                                                "dataAgeS": data_age}
+        return float(values[width_i]), wrench, {"updatedAt": payload.get("updatedAt"), "staleS": payload.get("staleS")}
 
 
 def read_arm_joints(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
@@ -757,66 +545,6 @@ def read_arm_joints(arm: str, repo_root: Path = _REPO_ROOT) -> np.ndarray:
     raise RuntimeError(f"could not read the {arm} arm's joints: {(result.stderr or result.stdout).strip()[-300:]}")
 
 
-JOINT_REFRESH_S = 1.0  # the pause between two reads of the arm's joints during a preview
-JOINT_STALE_S = 5.0  # a plan check needs joints read this recently: the person may be moving the arm
-
-
-class JointWatcher:
-    """The arm's joints, read again and again while a preview runs (each read connects, reads, disconnects:
-    no motion), so the plan check follows the arm when a person moves it to another start pose. 11-19: the
-    joints were read once at the start, and "would pass" kept judging the pose the arm had left."""
-
-    def __init__(self, read, first: np.ndarray, *, refresh_s: float = JOINT_REFRESH_S, clock=time.monotonic):
-        import threading
-
-        self._read = read
-        self._clock = clock
-        self._refresh_s = refresh_s
-        self._lock = threading.Lock()
-        self._q = np.asarray(first, dtype=np.float64)
-        self._at = clock()
-        self._error = ""
-        self._done = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="joint-watcher", daemon=True)
-
-    def start(self) -> JointWatcher:
-        self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        self._done.set()
-        self._thread.join(timeout=2.0)  # a read under way finishes on its own (30 s timeout); the thread is a daemon
-
-    def poll(self) -> None:
-        """One read; the loop calls it, a test may too."""
-        try:
-            q = np.asarray(self._read(), dtype=np.float64)
-        except Exception as exc:  # noqa: BLE001 -- kept for the page; the last joints age out
-            with self._lock:
-                self._error = f"{type(exc).__name__}: {exc}"[-300:]
-            return
-        with self._lock:
-            self._q, self._at, self._error = q, self._clock(), ""
-
-    def _loop(self) -> None:
-        while not self._done.wait(self._refresh_s):
-            self.poll()
-
-    def latest(self) -> tuple[np.ndarray, float, str]:
-        """The last joints read, their age in seconds and the last read's error ("" when it succeeded)."""
-        with self._lock:
-            return self._q.copy(), self._clock() - self._at, self._error
-
-
-def joints_for_check(watcher: JointWatcher | None, q_fixed: np.ndarray | None) -> tuple[np.ndarray | None, dict | None]:
-    """The joints the plan check may use now and what the page shows about them: None when they are too old."""
-    if watcher is None:
-        return q_fixed, None if q_fixed is None else {"source": "given", "age_s": None, "error": ""}
-    q, age, error = watcher.latest()
-    info = {"source": "read", "age_s": round(age, 1), "error": error, "q": q.round(5).tolist()}
-    return (q if age <= JOINT_STALE_S else None), info
-
-
 _STOP = False
 
 
@@ -836,10 +564,8 @@ def preview(
     q_arm: np.ndarray | None = None,
     device: str | None = None,
     frame_bus: Path = PREVIEW_FRAME_BUS,
-    joints: JointWatcher | None = None,
 ) -> dict[str, Any]:
-    """Predict on live inputs with the arm still; record each step's inputs and outputs under ``record_dir``.
-    With ``joints`` the plan check uses the joints read last (not older than JOINT_STALE_S), else ``q_arm``."""
+    """Predict on live inputs with the arm still; record each step's inputs and outputs under ``record_dir``."""
     import cv2
 
     from tools.fr3 import fr3_arms, relative_tcp_policy as rtp
@@ -869,7 +595,6 @@ def preview(
         "arm": arm,
         "box_id": box_id,
         "q_arm": None if q_arm is None else q_arm.tolist(),
-        "q_arm_refresh": None if joints is None else f"read again every {JOINT_REFRESH_S:g} s, used up to {JOINT_STALE_S:g} s old",
         "tcp_history": "arm still: every history pose equals the current one (exact while it does not move)",
         "wrench_bias": "live: this Connect's last BOX zero (an export takes each episode's still ends)" if c.wrench_names else None,
         "frame_source": str(frame_bus),
@@ -889,8 +614,6 @@ def preview(
             width, wrench, box_meta = live.box()
         except Exception as exc:  # noqa: BLE001 -- the page shows it and the loop keeps trying
             progress(event="wait", error=str(exc))
-            # no prediction from these inputs: the page must not keep showing the last one as current
-            (record_dir / "latest.json").write_text(json.dumps({"time": _now(), "blocked": str(exc)}), encoding="utf-8")
             time.sleep(1.0)
             continue
         cropped = {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras}
@@ -898,8 +621,7 @@ def preview(
         t_pred = time.monotonic()
         actions = loaded.predict(sample)
         latency_ms = (time.monotonic() - t_pred) * 1e3
-        q_now, joint_info = joints_for_check(joints, q_arm)
-        checked = plan.check(q_now, actions, width, n_exec) if (plan is not None and q_now is not None) else None
+        checked = plan.check(q_arm, actions, width, n_exec) if (plan is not None and q_arm is not None) else None
         np.savez_compressed(
             record_dir / "steps" / f"{step:06d}.npz",
             width=np.float64(width),
@@ -921,7 +643,6 @@ def preview(
             "targets_tcp_mm": (rel[:, :3, 3] * 1e3).round(1).tolist(),
             "widths": actions[:, rt.POSE_DIM].round(4).tolist(),
             "plan": checked,
-            "joints": joint_info,
         }
         (record_dir / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
         with (record_dir / "steps.jsonl").open("a", encoding="utf-8") as handle:
@@ -964,141 +685,10 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
 # ------------------------------------------------------------------ execute ---
 
 
-MOVE_NOT_ATTENDED = (
-    "the move to a training start moves the arm: it is started from the Rollout page by a person with a hand on "
-    "the e-stop, who confirms its dialog (--attended); nothing was loaded and nothing moved"
-)
-
-
-def to_start(checkpoint: Path, record_dir: Path, *, arm: str, seed: int | None = None,
-             repo_root: Path = _REPO_ROOT) -> dict[str, Any]:
-    """Move the arm to a random real start of the checkpoint's training episodes (PlanContext.plan_to_start),
-    slowly, with the execution's stops (rollout_execute.run_joint_move). No policy runs; the gripper is not
-    touched. The caller (main) has checked ``--attended``."""
-    from tools.fr3 import fr3_arms, fr3_kinematics as kin, rollout_execute as rx
-
-    model = Path(checkpoint)
-    c = rt.PolicyContract.read(model)
-    prov_path = model / rt.PROVENANCE_FILE
-    provenance = json.loads(prov_path.read_text(encoding="utf-8")) if prov_path.is_file() else {}
-    plan = PlanContext(arm, provenance.get("workspace"), repo_root=repo_root, provenance=provenance, contract=c)
-    if plan.problems:
-        raise RuntimeError("the start cannot be checked for this arm: " + "; ".join(plan.problems))
-    entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
-    stop = {"why": ""}
-
-    def _signal(*_a) -> None:
-        stop["why"] = stop["why"] or "stopped by the operator"
-
-    signal.signal(signal.SIGTERM, _signal)
-    signal.signal(signal.SIGINT, _signal)
-    record_dir.mkdir(parents=True, exist_ok=True)
-    move_limits = rx.Limits(tracking_mm=rx.MOVE_TRACKING_MM)
-    panda = rx.PandaArm(str(entry["robot_ip"]))
-    q_now = panda.read()[0]
-    chosen = plan.plan_to_start(q_now, rng=np.random.default_rng(seed))
-    meta: dict[str, Any] = {
-        "schema": rx.RECORD_SCHEMA, "kind": "to_start", "created": _now(), "checkpoint": str(model.resolve()),
-        "arm": arm, "seed": seed, "q_now": q_now.round(6).tolist(), "plan": chosen,
-        "tcp_tool": plan.T_tool.tolist(), "distribution": plan.distribution.summary,
-        "move": {"speed_rad_s": rx.MOVE_SPEED_RAD_S, "acceleration": rx.MOVE_ACCELERATION.tolist(),
-                 "profile": "straight in joint space, minimum jerk, every joint together"},
-        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
-        "force_estimate": "not required: the path is checked before the move; tracking held to "
-                          f"{rx.MOVE_TRACKING_MM:g} mm, a live estimate still stops on force",
-        **rx.stage_dict(rx.Stage(0, 0, 0.0, False, "move to a training start"), move_limits),
-    }
-    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    if not chosen["ok"]:
-        raise RuntimeError(f"{chosen['why']}; nothing moved")
-    progress(event="to_start", index=chosen["index"], tried=chosen["tried"], j2=chosen["j2"],
-             max_joint_move_deg=chosen["max_joint_move_deg"], min_env_gap_mm=chosen["min_env_gap_mm"])
-    if stop["why"]:
-        raise RuntimeError(f"{stop['why']} before the arm was taken; nothing moved")
-    recorder = rx.Recorder(record_dir)
-    realtime = rx.realtime_thread()
-    meta["realtime"] = f"SCHED_FIFO {rx.RT_PRIORITY}" if not realtime else f"not granted: {realtime}"
-    try:
-        result = rx.run_joint_move(
-            arm=panda, q_goal=np.asarray(chosen["q_goal"], dtype=np.float64), limits=move_limits, fk_tcp=plan.tcp,
-            wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, stop_flag=lambda: stop["why"], log=progress,
-            record=recorder, q_planned=q_now, force_estimate_required=False,
-        )
-    finally:
-        rx.normal_thread()
-        recorder.close()
-    q_end = panda.read()[0]
-    start = plan.distribution.start_problem(np.linalg.inv(plan.T_base_world) @ plan.tcp(q_end), None)
-    meta["result"] = {"completed": result.completed, "stopped": result.stopped, "duration_s": round(result.duration_s, 3),
-                      "ticks": result.ticks, "progress": round(result.end_cursor, 3), "q_end": q_end.round(6).tolist(),
-                      "start_check": start or "inside the training starts (the gripper width is not judged here)"}
-    meta["finished"] = _now()
-    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    return meta
-
-
 NOT_ATTENDED = (
     "execute moves the arm: it is started from the Rollout page by a person with a hand on the e-stop, who "
     "confirms its dialog (--attended); nothing was loaded and nothing moved"
 )
-
-
-def execution_limits(plan: PlanContext, frame_bus: Path):
-    """The run's limits: the per-step ones are the checkpoint's own, what one step of its demonstrations did
-    (rollout_execute.step_limits). Both of execute's processes compute them the same way."""
-    from tools.fr3 import rollout_execute as rx
-
-    dist = plan.distribution
-    return rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
-                     **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
-
-
-def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bus: str, device: str | None,
-                            repo_root: str) -> dict[str, Any]:
-    """In the predictor's own process (rollout_execute.ProcessPredictor): the policy, the planner and the
-    live inputs, warmed up on a live observation (the arm untouched). ``info`` goes back to the loop."""
-    from tools.fr3 import fr3_arms, relative_tcp_policy as rtp, rollout_execute as rx
-
-    root, bus = Path(repo_root), Path(frame_bus)
-    loaded = rtp.load_checkpoint(Path(checkpoint), device=device)
-    c = loaded.contract
-    n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
-    if not 1 <= n_exec <= c.horizon:
-        raise RuntimeError(f"the checkpoint's n_action_steps ({n_exec}) is not within 1..{c.horizon}")
-    entry = fr3_arms.resolve(fr3_arms.load(repo_root=root), arm)
-    box_id = str(entry.get("corenetic_device_id") or "")
-    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=root, provenance=loaded.provenance,
-                       contract=c)
-    if plan.problems:
-        raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
-    limits = execution_limits(plan, bus)
-    live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=bus)
-
-    def observe(min_t: float) -> rx.Observation:
-        images, t_img, meta = live.frames_since(min_t)
-        width, wrench, box_meta = live.box()
-        updated = box_meta.get("updatedAt")
-        stale = None if updated is None else max(0.0, time.time() - float(updated))
-        if stale is not None and box_meta.get("dataAgeS") is not None:
-            stale += float(box_meta["dataAgeS"])  # the BOX's own sample was this old when the recorder sent it
-        meta = {**meta, "box": box_meta, "box_stale_s": stale}
-        return rx.Observation(t_img, {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras},
-                              width, wrench, meta)
-
-    def sample(history: np.ndarray, obs: rx.Observation) -> dict[str, Any]:
-        return rtp.observation_sample(c, history, obs.width, obs.images, obs.wrench, already_cropped=True)
-
-    def plan_fn(T_obs: np.ndarray, actions: np.ndarray, seed: np.ndarray) -> dict[str, Any]:
-        return plan.evaluate(T_obs, actions, seed, early_exit=True)
-
-    # warm-up on a live observation, arm untouched: the first CUDA call is slower than the 100 ms allowed
-    first = observe(time.monotonic() - 1.0)
-    for _ in range(2):
-        loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
-    return {"contract": c, "limits": limits, "observe": observe, "predict": loaded.predict, "plan": plan_fn,
-            "sample": sample,
-            "info": {"contract": c.to_dict(), "provenance": loaded.provenance, "n_exec": n_exec,
-                     "first_width": first.width, "first_images": first.images}}
 
 
 def execute(
@@ -1112,110 +702,118 @@ def execute(
     device: str | None = None,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
-    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``.
-
-    Two processes: this one runs the 200 Hz loop (SCHED_FIFO, no policy, no torch); the policy, the planner
-    and the live inputs run in a spawned one (rollout_execute.ProcessPredictor), so a slow prediction or
-    plan can delay a chunk -- which the loop judges -- but never the loop itself."""
+    """One staged run on the arm (rollout_execute). The caller (main) has checked ``--attended``."""
     import cv2
 
-    from tools.fr3 import fr3_arms, fr3_kinematics as kin, rollout_execute as rx
+    from tools.fr3 import (
+        fr3_arms,
+        fr3_kinematics as kin,
+        relative_tcp_policy as rtp,
+        rollout_execute as rx,
+    )
     from tools.thor.gmsl2 import cart_state
 
     if stage not in rx.STAGES:
         raise ValueError(f"stage {stage}: one of {sorted(rx.STAGES)}")
     st = rx.STAGES[stage]
+    loaded = rtp.load_checkpoint(checkpoint, device=device)
+    c = loaded.contract
+    n_exec = int(getattr(rtp._config(loaded.policy), "n_action_steps", 0) or 0)  # what training's eval executed
+    if not 1 <= n_exec <= c.horizon:
+        raise RuntimeError(f"the checkpoint's n_action_steps ({n_exec}) is not within 1..{c.horizon}")
     entry = fr3_arms.resolve(fr3_arms.load(repo_root=repo_root), arm)
     box_id = str(entry.get("corenetic_device_id") or "")
     if not box_id:
         raise RuntimeError(f"the {arm} arm has no gripper BOX ({entry.get('no_gripper_why') or 'not wired'})")
-    history = rx.SharedPoseHistory()
-    predictor = rx.ProcessPredictor(
-        (__name__ if __name__ != "__main__" else "tools.fr3.rollout_relative_tcp", "execute_predictor_parts",
-         {"checkpoint": str(checkpoint), "arm": arm, "gateway": gateway, "frame_bus": str(frame_bus),
-          "device": device, "repo_root": str(repo_root)}),
-        history=history,
-    )
+    plan = PlanContext(arm, loaded.provenance.get("workspace"), repo_root=repo_root, provenance=loaded.provenance,
+                       contract=c)
+    if plan.problems:
+        raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
+    # the per-step limits are the checkpoint's own: what one step of its demonstrations did (rx.step_limits)
+    dist = plan.distribution
+    limits = rx.Limits(frame_age_s=frame_age_limit_s(frame_bus),
+                       **rx.step_limits(float(dist.step_m[0]), float(dist.step_deg[0])))
+    cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
+    live = LiveInputs(c, gateway=gateway, box_id=box_id, frame_bus=frame_bus)
+
+    def observe(min_t: float) -> rx.Observation:
+        images, t_img, meta = live.frames_since(min_t)
+        width, wrench, box_meta = live.box()
+        updated = box_meta.get("updatedAt")
+        meta = {**meta, "box": box_meta,
+                "box_stale_s": None if updated is None else max(0.0, time.time() - float(updated))}
+        return rx.Observation(t_img, {cam.name: rt.crop_resize(images[cam.name], cam) for cam in c.cameras},
+                              width, wrench, meta)
+
+    def sample(history: np.ndarray, obs: rx.Observation) -> dict[str, Any]:
+        return rtp.observation_sample(c, history, obs.width, obs.images, obs.wrench, already_cropped=True)
+
+    def plan_fn(T_obs: np.ndarray, actions: np.ndarray, seed: np.ndarray) -> dict[str, Any]:
+        return plan.evaluate(T_obs, actions, seed, early_exit=True)
+
+    # warm-up on a live observation, arm untouched: the first CUDA call is slower than the 100 ms allowed
+    first = observe(time.monotonic() - 1.0)
+    for _ in range(2):
+        loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
+
+    record_dir.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {
+        "schema": rx.RECORD_SCHEMA,
+        "kind": "execute",
+        "created": _now(),
+        "checkpoint": str(Path(checkpoint).resolve()),
+        "contract": c.to_dict(),
+        "arm": arm,
+        "box_id": box_id,
+        "n_action_steps": n_exec,
+        "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
+        "cart_check": cart or None,
+        "frame_source": str(frame_bus),
+        "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
+        "distribution": plan.distribution.summary if plan.distribution is not None else None,
+        "step_limits": {"from_training_mm": round(float(dist.step_m[0]) * 1e3, 1),
+                        "from_training_deg": round(float(dist.step_deg[0]), 2),
+                        "ceiling_mm": rx.STEP_MM_CEILING, "ceiling_deg": rx.STEP_DEG_CEILING,
+                        "used_mm": limits.step_mm, "used_deg": limits.step_deg,
+                        "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
+        **rx.stage_dict(st, limits),
+    }
+    (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    recorder = rx.Recorder(record_dir)
+    history = rx.PoseHistory()
+    predictor = rx.Predictor(contract=c, history=history, observe=observe, predict=loaded.predict, plan=plan_fn,
+                             sample=sample, limits=limits)
+    stop = {"why": ""}
+
+    def _signal(*_a) -> None:
+        stop["why"] = stop["why"] or "stopped by the operator"
+
+    def _gripper_error(message: str) -> None:
+        stop["why"] = stop["why"] or message
+
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
+    gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
+    progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
+             cart=cart.get("verdict"))
+    if stop["why"]:
+        raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
+    panda = rx.PandaArm(str(entry["robot_ip"]))
+    predictor.start()
+    sys.setswitchinterval(0.001)
+    resume_gc = rx.hold_gc()
     try:
-        info = predictor.start()
-        c = rt.PolicyContract.from_dict(info["contract"])
-        n_exec = int(info["n_exec"])
-        width_now = float(info["first_width"])
-        provenance = info["provenance"]
-        plan = PlanContext(arm, provenance.get("workspace"), repo_root=repo_root, provenance=provenance, contract=c)
-        if plan.problems:
-            raise RuntimeError("the plan check cannot vouch for this arm: " + "; ".join(plan.problems))
-        dist = plan.distribution
-        limits = execution_limits(plan, frame_bus)
-        cart = (cart_state.read(repo_root).get("bases") or {}).get(plan.base) or {}
-
-        record_dir.mkdir(parents=True, exist_ok=True)
-        meta: dict[str, Any] = {
-            "schema": rx.RECORD_SCHEMA,
-            "kind": "execute",
-            "created": _now(),
-            "checkpoint": str(Path(checkpoint).resolve()),
-            "contract": c.to_dict(),
-            "arm": arm,
-            "box_id": box_id,
-            "n_action_steps": n_exec,
-            "attended": "confirmed on the Rollout page: the arm moves, a hand on the e-stop",
-            "cart_check": cart or None,
-            "frame_source": str(frame_bus),
-            "tcp_tool": plan.T_tool.tolist(),  # the FK the loop used (rollout_execute_report reads it back)
-            "distribution": plan.distribution.summary if plan.distribution is not None else None,
-            "step_limits": {"from_training_mm": round(float(dist.step_m[0]) * 1e3, 1),
-                            "from_training_deg": round(float(dist.step_deg[0]), 2),
-                            "ceiling_mm": rx.STEP_MM_CEILING, "ceiling_deg": rx.STEP_DEG_CEILING,
-                            "used_mm": limits.step_mm, "used_deg": limits.step_deg,
-                            "near": f"<= {limits.near_step_mm:g} mm closer than {limits.near_clearance_m * 1e3:.0f} mm"},
-            "predictor": "own process (spawned), FK through shared memory",
-            **rx.stage_dict(st, limits),
-        }
-        (record_dir / "record.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-        recorder = rx.Recorder(record_dir)
-        stop = {"why": ""}
-
-        def _signal(*_a) -> None:
-            stop["why"] = stop["why"] or "stopped by the operator"
-
-        def _gripper_error(message: str) -> None:
-            stop["why"] = stop["why"] or message
-
-        signal.signal(signal.SIGTERM, _signal)
-        signal.signal(signal.SIGINT, _signal)
-        gripper = rx.GatewayGripper(gateway, arm, _gripper_error) if st.gripper else None
-        try:
-            # SCHED_FIFO from here: this thread (the loop) and the threads it starts (panda_py's control
-            # thread); the recorder's and the gripper's threads above keep the normal policy
-            realtime = rx.realtime_thread()
-            meta["realtime"] = f"SCHED_FIFO {rx.RT_PRIORITY}" if not realtime else f"not granted: {realtime}"
-            progress(event="execute", stage=stage, label=st.label, n_action_steps=n_exec, max_s=st.max_s,
-                     cart=cart.get("verdict"), realtime=meta["realtime"])
-            if stop["why"]:
-                raise RuntimeError(f"{stop['why']} before the arm was connected; nothing moved")
-            panda = rx.PandaArm(str(entry["robot_ip"]))
-            sys.setswitchinterval(0.001)
-            resume_gc = rx.hold_gc()
-            try:
-                result = rx.run_loop(
-                    arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
-                    wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
-                    stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=width_now,
-                    record=recorder, start_check=lambda q: plan.start_problem(q, width_now),
-                    blend_check=plan.blend_problem,
-                )
-            finally:
-                resume_gc()
-        finally:
-            rx.normal_thread()
-            recorder.close()
+        result = rx.run_loop(
+            arm=panda, predictor=predictor, stage=st, n_exec=n_exec, limits=limits, fk_tcp=plan.tcp,
+            wall_lower=kin._WALL_LOWER, wall_upper=kin._WALL_UPPER, history=history,
+            stop_flag=lambda: stop["why"], log=progress, gripper=gripper, width_now=first.width,
+            record=recorder, start_check=lambda q: plan.start_problem(q, first.width),
+        )
     finally:
-        predictor.close()
-        history.close()
+        resume_gc()
+        recorder.close()
     with contextlib.suppress(Exception):
-        images = info["first_images"]
-        strip = np.concatenate([cv2.resize(img, (int(img.shape[1] * 240 / img.shape[0]), 240)) for img in images.values()], axis=1)
+        strip = np.concatenate([cv2.resize(img, (int(img.shape[1] * 240 / img.shape[0]), 240)) for img in first.images.values()], axis=1)
         cv2.imwrite(str(record_dir / "latest.jpg"), cv2.cvtColor(strip, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
     meta["result"] = {"completed": result.completed, "stopped": result.stopped, "chunks": result.chunks_accepted,
                       "duration_s": round(result.duration_s, 3), "ticks": result.ticks,
@@ -1246,7 +844,7 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
     pre.add_argument("--steps", type=int, default=0)
     pre.add_argument("--q", default="", help="the arm's joints (JSON list, rad) for the plan check")
-    pre.add_argument("--read-joints", action="store_true", help="read the arm's joints at the start and again every JOINT_REFRESH_S (no motion)")
+    pre.add_argument("--read-joints", action="store_true", help="read the arm's joints once at the start (no motion)")
     rep = sub.add_parser("replay")
     rep.add_argument("--record", type=Path, required=True)
     exe = sub.add_parser("execute", help="moves the arm: started from the Rollout page, a hand on the e-stop")
@@ -1258,13 +856,6 @@ def main(argv: list[str] | None = None) -> int:
     exe.add_argument("--frame-bus", type=Path, default=PREVIEW_FRAME_BUS)
     exe.add_argument("--attended", action="store_true",
                      help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
-    tos = sub.add_parser("to-start", help="moves the arm to a training start: from the Rollout page, a hand on the e-stop")
-    tos.add_argument("--checkpoint", type=Path, required=True)
-    tos.add_argument("--record", type=Path, required=True)
-    tos.add_argument("--arm", choices=("right", "left"), required=True)
-    tos.add_argument("--seed", type=int, default=None)
-    tos.add_argument("--attended", action="store_true",
-                     help="the person who started it confirmed: the arm moves, a hand is on the e-stop")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "offline":
@@ -1275,17 +866,11 @@ def main(argv: list[str] | None = None) -> int:
                      pos_mm=result["error"]["pos_mm"].get("mean"))
         elif args.cmd == "preview":
             q = np.asarray(json.loads(args.q), dtype=np.float64) if args.q else None
-            watcher = None
             if q is None and args.read_joints:
-                q = read_arm_joints(args.arm)  # the first read fails the preview loudly; later ones are shown
+                q = read_arm_joints(args.arm)
                 progress(event="joints", q=q.round(5).tolist())
-                watcher = JointWatcher(lambda: read_arm_joints(args.arm), q).start()
-            try:
-                meta = preview(args.checkpoint, args.record, arm=args.arm, gateway=args.gateway, rate_hz=args.rate,
-                               max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus, joints=watcher)
-            finally:
-                if watcher is not None:
-                    watcher.stop()
+            meta = preview(args.checkpoint, args.record, arm=args.arm, gateway=args.gateway, rate_hz=args.rate,
+                           max_steps=args.steps, q_arm=q, frame_bus=args.frame_bus)
             progress(event="done", steps=meta["steps"])
         elif args.cmd == "execute":
             if not args.attended:
@@ -1295,13 +880,6 @@ def main(argv: list[str] | None = None) -> int:
             r = meta["result"]
             progress(event="done", completed=r["completed"], stopped=r["stopped"], chunks=r["chunks"],
                      duration_s=r["duration_s"])
-        elif args.cmd == "to-start":
-            if not args.attended:
-                raise RuntimeError(MOVE_NOT_ATTENDED)
-            meta = to_start(args.checkpoint, args.record, arm=args.arm, seed=args.seed)
-            r = meta["result"]
-            progress(event="done", completed=r["completed"], stopped=r["stopped"], duration_s=r["duration_s"],
-                     start_check=r["start_check"])
         else:
             progress(event="done", **replay(args.record))
     except Exception as exc:  # noqa: BLE001 -- one line the page can show

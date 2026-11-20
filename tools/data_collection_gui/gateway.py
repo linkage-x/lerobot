@@ -21065,9 +21065,7 @@ def _sandbox_hardware_refusal(state: GatewayState, method: str, path: str) -> st
 #
 # hardware_lease.py has the protocol. A hardware request here is one the sandbox guard refuses, plus the
 # Rollout page's preview and execution (a sandbox's rollout manager refuses those itself).
-LEASE_HARDWARE_POST_PREFIXES = SANDBOX_HARDWARE_POST_PREFIXES + (
-    "/api/rollout/preview", "/api/rollout/execute", "/api/rollout/to-start",
-)
+LEASE_HARDWARE_POST_PREFIXES = SANDBOX_HARDWARE_POST_PREFIXES + ("/api/rollout/preview", "/api/rollout/execute")
 
 
 def _is_hardware_request(method: str, path: str) -> bool:
@@ -21405,22 +21403,9 @@ def _rollout(state: GatewayState, port: int) -> rollout_runs.RolloutManager:
             recorder_busy=lambda: state.process is not None and state.process.poll() is None,
             fci_holder=lambda: _rollout_fci_holder(state),
             recorder_cameras=lambda: list(state.recording.inferenceCameras),
-            recorder_sensors=lambda: _rollout_recorder_sensors(state),
             gateway_url=f"http://127.0.0.1:{port}",
         )
     return state.rollout
-
-
-def _rollout_recorder_sensors(state: GatewayState) -> dict[str, Any]:
-    """The recorder's state and the rows of the sensors it opened (cameras, BOXes); read without state.lock."""
-    sensors = [
-        {"id": str(d.get("id")), "kind": str(d.get("kind")), "state": str(d.get("state"))}
-        for d in list(state.devices)
-        if d.get("kind") in ("camera", "box_collection") and d.get("state") != NOT_OPENED_FOR_INFERENCE
-    ]
-    started = state.process_started_at_s
-    elapsed = None if started is None else round(max(0.0, time.monotonic() - started), 1)
-    return {"state": state.recording.state, "sensors": sensors, "elapsedS": elapsed}
 
 
 def _rollout_fci_holder(state: GatewayState) -> str:
@@ -21491,11 +21476,6 @@ def _rollout_post(handler: BaseHTTPRequestHandler, state: GatewayState, path: st
                                         int(body.get("stage") or 0), body.get("attended") is True)
             state.log("warn", f"Rollout execute {job.id} started: stage {job.params.get('stage')} on the "
                               f"{job.params.get('arm')} arm (operator confirmed: hand on the e-stop); the arm moves")
-        elif path == "/api/rollout/to-start":
-            job = manager.start_to_start(str(body.get("checkpoint") or ""), str(body.get("arm") or ""),
-                                         body.get("attended") is True)
-            state.log("warn", f"Rollout move to a training start {job.id} started on the {job.params.get('arm')} arm "
-                              "(operator confirmed: hand on the e-stop); the arm moves")
         elif path == "/api/rollout/stop":
             _json_response(handler, HTTPStatus.OK, {"ok": True, "message": manager.stop(str(body.get("job") or ""))})
             return True

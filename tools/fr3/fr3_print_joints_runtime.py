@@ -16,17 +16,13 @@
 
 """
 Print the FR3 arm's current joint angles from inside the Docker runtime.
-
-It connects a bare libfranka Robot and reads one fresh state: no controller, no motion, and no robot model.
-panda_py's Panda() also downloads the robot model ("Get Robot Model"); 11-19 the Rollout preview read the
-joints this way about once a second, and after 5-10 reads the arm refused that command for 20-30 s
-("libfranka: Unexpected response while handling Get Robot Model command!"), so the plan check had no joints.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+
 
 DEFAULT_ROBOT_IP = "192.168.1.208"
 
@@ -40,22 +36,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    from panda_py import libfranka
+    from panda_py import Panda
 
-    print(f"fr3_print_joints=CONNECT robot_ip={args.robot_ip}")
-    robot = libfranka.Robot(args.robot_ip)
+    robot = None
     try:
-        state = robot.read_once()
+        print(f"fr3_print_joints=CONNECT robot_ip={args.robot_ip}")
+        robot = Panda(args.robot_ip)
+        state = robot.get_state()
+        q = list(getattr(state, "q", []))
+        if not q:
+            raise RuntimeError("state.q is unavailable.")
+        q_deg = [math.degrees(v) for v in q]
+        print("fr3_print_joints=PASS")
+        print(f"Joint angles (rad): {[round(v, 6) for v in q]}")
+        print(f"Joint angles (deg): {[round(v, 3) for v in q_deg]}")
+        return 0
     finally:
-        del robot  # closes the connection
-    q = list(getattr(state, "q", []))
-    if not q:
-        raise RuntimeError("state.q is unavailable.")
-    q_deg = [math.degrees(v) for v in q]
-    print("fr3_print_joints=PASS")
-    print(f"Joint angles (rad): {[round(v, 6) for v in q]}")
-    print(f"Joint angles (deg): {[round(v, 3) for v in q_deg]}")
-    return 0
+        if robot is not None and hasattr(robot, "stop_controller"):
+            try:
+                robot.stop_controller()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

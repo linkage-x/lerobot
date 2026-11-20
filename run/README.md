@@ -177,10 +177,6 @@ bash run/sandbox.sh thor1 stop dev      # 先归还硬件；没还就停了，�
 1. **部署**：每次部署都会从生产刷新标定（`outputs/calibration`）、world 状态和门禁文件（`world_graph_guard.json`、
    `cart_check.json`、`box_six_d_origin.json`），并用硬链接带上生产训练好的 checkpoint
    （`outputs/training/runs`，不占额外空间，已有的同名 run 不覆盖）。开发网关写的东西（录制、rollout 记录、标定结果）只留在它自己的目录里。
-   **在开发网关上做的标定，下次部署就没了**：`outputs/calibration` 用 `--delete` 同步，生产没有的文件
-   （相机内外参解算、同球检验 `fr3_base_ball_check`、BOX 6D 采集 `box_six_d`）都会被删掉；world 状态和门禁文件
-   被生产的版本覆盖。部署时会列出被删和被覆盖的文件。要保留，重新部署前先拷出来；正式的标定回生产网关上做。
-   pivot（`outputs/fr3_tcp_pivot`）、负载辨识（`outputs/fr3_payload`）、录制和 rollout 记录不在这个目录里，不受影响。
 2. **借用**：在开发网关页面顶部的横幅上按「借用硬件」。生产必须空闲：录制器没连接，也没有 replay、rollout、
    pivot、负载辨识或标定会话在运行。生产的相机预览会被自动关掉。借出后，生产页面显示黄条，所有硬件接口都返回 409。
 3. **使用**：在开发网关上 Connect、预览、Execute，操作和生产一样。真机运动仍然只能由现场的人启动，手放在急停上。

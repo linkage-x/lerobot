@@ -11,11 +11,6 @@ export type LeaseBanner = {
   confirm: string;
 };
 
-/** run/deploy.sh --dev refreshes these from production on every deploy (run/README.md section 7). */
-export const DEV_CALIBRATION_NOTE =
-  " 注意：每次部署开发网关都会用生产的版本覆盖 outputs/calibration（相机标定、同球检验、BOX 6D 采集）和" +
-  " world/门禁文件，在这里做的标定结果会被删掉，也不会进入生产；要保留就在重新部署前拷出来，或者回生产网关上做标定。";
-
 const since = (lease: HardwareLease) => (lease.since ? lease.since.replace("T", " ").replace("Z", " UTC") : "?");
 
 /** What to show for the lease, or null when nothing needs saying (production holding its own hardware). */
@@ -50,7 +45,7 @@ export function leaseBanner(lease: HardwareLease | null | undefined, commit = ""
       tone: "alert",
       text:
         `开发网关${version ? ` ${version}` : ""}正持有硬件（${since(lease)} 起）：生产网关的硬件功能已暂停，` +
-        "学生不能录制。用完请归还。" + DEV_CALIBRATION_NOTE,
+        "学生不能录制。用完请归还。",
       action: "return",
       label: "归还硬件",
       confirm: "把硬件还给生产网关？录制器、replay、rollout 等必须已经停下。"
@@ -60,7 +55,7 @@ export function leaseBanner(lease: HardwareLease | null | undefined, commit = ""
     tone: "info",
     text:
       `开发网关${version ? ` ${version}` : ""}：没有借用硬件，相机、BOX、激光跟踪仪和机械臂不可用。` +
-      "借用时生产网关必须空闲（录制器未连接，没有 replay、rollout 或标定在运行）。" + DEV_CALIBRATION_NOTE,
+      "借用时生产网关必须空闲（录制器未连接，没有 replay、rollout 或标定在运行）。",
     action: "borrow",
     label: "借用硬件",
     confirm:

@@ -12,7 +12,7 @@ For each run:
   each chunk ran before the next took over, the interval between chunks, the loop period.
 - **motion**: the TCP (FK of the measured joints) against FK of the command at every tick (what the
   ``tracking_mm`` stop watches), and against the policy's target at each executed step's due time
-  ``t0 + offsets[k]`` (``k*dt`` unless retimed) -- what the policy asked against what the arm did; the external force against the first
+  ``t0 + k*dt`` -- what the policy asked against what the arm did; the external force against the first
   tick, the fastest joint, the closest panda_py wall.
 - **headroom**: the worst value of each against its stop (``Limits``) -- what to look at before tightening or
   loosening one. A limit is changed from several runs' worst values, not from one -- and not from stage 1,
@@ -96,13 +96,9 @@ def _executed_steps(rows: list[dict[str, Any]], t_end: float, dt: float) -> list
     for i, r in enumerate(taken):
         until = taken[i + 1]["t"] if i + 1 < len(taken) else t_end
         k0, end, t0 = int(r["k0"]), int(r["end"]), float(r["t0"])
-        n = len(r["targets_base"])
-        offsets = r.get("offsets") or [k * dt for k in range(n)]  # retimed steps (11-19); before: k*dt
-        ks = [k for k in range(k0, end + 1) if t0 + offsets[k] <= until + 1e-9]
+        ks = [k for k in range(k0, end + 1) if t0 + k * dt <= until + 1e-9]
         out.append({"index": r.get("index"), "k0": k0, "end": end, "t": r["t"], "t0": t0,
-                    "steps": ks, "due": [t0 + offsets[k] for k in ks],
-                    "stretch": [(offsets[k] - offsets[k - 1]) / dt for k in ks],
-                    "targets": np.asarray(r["targets_base"], dtype=np.float64)})
+                    "steps": ks, "due": [t0 + k * dt for k in ks], "targets": np.asarray(r["targets_base"], dtype=np.float64)})
     return out
 
 
@@ -140,18 +136,11 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
     }
     later = accepted[1:]
     gaps = np.diff([r["t"] for r in accepted]) * 1e3 if len(accepted) > 1 else []
-    after: dict[str, np.ndarray] = {}
-    if ticks and "phase" in ticks:  # 11-19 on: the stop's own tick (1) and the hold after it (2) are recorded
-        run = ticks["phase"] == 0
-        after = {k: v[~run] for k, v in ticks.items()}
-        ticks = {k: v[run] for k, v in ticks.items()} if run.any() else {}
     t_end = float(ticks["t"][-1]) if ticks else (rows[-1]["t"] if rows else 0.0)
     executed = _executed_steps(rows, t_end, dt)
     report["timing"] = {
         "late_steps": stats([int(r["k0"]) - 1 for r in later]),
         "steps_run_per_chunk": stats([len(e["steps"]) for e in executed]),
-        # each executed step's duration over dt: 1 = the policy's speed, more = slowed for a joint (retime)
-        "stretch": stats([x for e in executed for x in e["stretch"]]),
         "chunk_interval_ms": stats(gaps),
     }
 
@@ -180,12 +169,6 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
         arm["net_mm"] = round(float(np.linalg.norm(P[-1] - P[0]) * 1e3), 1)
         f = ticks["f_ext"][:, :3]
         arm["force_n"] = stats(np.linalg.norm(f - f[0], axis=1))
-        # what the stop holds against force_n (11-19 on): the force averaged over the loop's window
-        from tools.fr3.rollout_execute import FORCE_WINDOW_S, LOOP_HZ
-
-        w = max(1, round(FORCE_WINDOW_S * LOOP_HZ))
-        avg = np.stack([np.convolve(f[:, i] - f[0, i], np.ones(w) / w, mode="valid") for i in range(3)], axis=1) if len(f) >= w else f - f[0]
-        arm["force_avg_n"] = stats(np.linalg.norm(avg, axis=1))
         speed = np.abs(ticks["dq"]).max(axis=1)
         arm["joint_speed_rad_s"] = stats(speed)
         from tools.fr3 import fr3_kinematics as kin
@@ -196,40 +179,10 @@ def analyze(record_dir: Path, *, fk: Callable[[np.ndarray], np.ndarray] | None =
         arm["wall_joint"] = int(np.degrees(np.minimum(q - kin._WALL_LOWER, kin._WALL_UPPER - q)).min(axis=0).argmin()) + 1
     else:
         arm["note"] = "no ticks: the arm was never commanded (the first chunk was refused, or the run stopped before it)"
-    if after:
-        fk = fk or tcp_fk(meta, repo_root)
-        report["stop"] = _stop_block(ticks, after, fk)
-    report["predictor_at_stop"] = [ev for ev in events if ev.get("kind") == "predictor"]
-    report["prediction_timing_ms"] = [
-        {k: round((v - r["timing"]["requested"]) * 1e3, 1) for k, v in r["timing"].items()}
-        for r in rows if (r.get("timing") or {}).get("requested") is not None
-    ]
     report["motion"] = arm
     report["gripper"] = [ev for ev in events if ev.get("kind") == "gripper"]
     report["headroom"] = _headroom(report, limits, n_exec)
     return report
-
-
-def _stop_block(ticks: dict[str, np.ndarray], after: dict[str, np.ndarray], fk) -> dict[str, Any]:
-    """The tick that tripped the stop (how long after the one before, how far off its command) and the hold
-    after it (how far the arm went past where the stop found it)."""
-    out: dict[str, Any] = {}
-    trip = np.flatnonzero(after["phase"] == 1)
-    if trip.size:
-        i = int(trip[0])
-        P = fk(after["q"][i : i + 1])[0, :3, 3]
-        P_cmd = fk(after["q_cmd"][i : i + 1])[0, :3, 3]
-        out["trip"] = {
-            "loop_dt_ms": round(float(after["t"][i] - ticks["t"][-1]) * 1e3, 1) if ticks else None,
-            "tracking_mm": round(float(np.linalg.norm(P - P_cmd)) * 1e3, 1),
-            "joint_speed_rad_s": round(float(np.abs(after["dq"][i]).max()), 3),
-        }
-    hold = after["phase"] == 2
-    if hold.any():
-        P = fk(after["q"][hold])[:, :3, 3]
-        out["hold"] = {"ticks": int(hold.sum()), "travel_mm": round(float(np.linalg.norm(P - P[0], axis=1).max()) * 1e3, 1),
-                       "joint_speed_first_rad_s": round(float(np.abs(after["dq"][hold][0]).max()), 3)}
-    return out
 
 
 def _headroom(report: dict[str, Any], limits: dict[str, Any], n_exec: int) -> list[dict[str, Any]]:
@@ -252,11 +205,7 @@ def _headroom(report: dict[str, Any], limits: dict[str, Any], n_exec: int) -> li
     add("late steps", tim["late_steps"], float(n_exec) if n_exec else None, "steps")
     add("loop period", tim.get("loop_ms"), _ms(limits.get("loop_stall_s"), s), "ms")
     add("tracking", arm.get("tracking_mm"), limits.get("tracking_mm"), "mm")
-    if limits.get("force_peak_n") is not None:  # 11-19 on: averaged against force_n, one tick against the peak
-        add("external force (50 ms)", arm.get("force_avg_n"), limits.get("force_n"), "N")
-        add("external force (tick)", arm.get("force_n"), limits.get("force_peak_n"), "N")
-    else:
-        add("external force", arm.get("force_n"), limits.get("force_n"), "N")
+    add("external force", arm.get("force_n"), limits.get("force_n"), "N")
     add("joint speed", arm.get("joint_speed_rad_s"), limits.get("joint_speed_rad_s"), "rad/s")
     add("wall margin", arm.get("wall_margin_deg"), limits.get("wall_deg"), "deg", worst="min", inverse=True)
     return rows
@@ -275,8 +224,7 @@ def pooled(reports: list[dict[str, Any]], record_dirs: list[Path]) -> dict[str, 
         lat += [r["latency_ms"] for r in rows if r.get("latency_ms")]
         late += [int(r["k0"]) - 1 for r in [r for r in rows if r.get("accepted")][1:]]
         if ticks:
-            t = ticks["t"][ticks["phase"] == 0] if "phase" in ticks else ticks["t"]
-            loop += (np.diff(t) * 1e3).tolist()
+            loop += (np.diff(ticks["t"]) * 1e3).tolist()
     return {"runs": len(reports), "age_ms": stats(age), "latency_ms": stats(lat), "late_steps": stats(late),
             "loop_ms": stats(loop)}
 
@@ -307,7 +255,6 @@ def format_text(report: dict[str, Any]) -> str:
         "timing",
         f"  later chunks late  {_fmt_stats(tim['late_steps'], 'steps')}",
         f"  steps run / chunk  {_fmt_stats(tim['steps_run_per_chunk'], 'steps')}",
-        f"  step stretch       {_fmt_stats(tim.get('stretch'), 'x dt')}  (1 = the policy's speed; more = slowed for a joint)",
         f"  chunk interval     {_fmt_stats(tim['chunk_interval_ms'], 'ms')}",
     ]
     if "loop_ms" in tim:
@@ -321,25 +268,11 @@ def format_text(report: dict[str, Any]) -> str:
             f"  TCP vs target      {_fmt_stats(arm['target_mm'], 'mm')}  (at each executed step's due time)",
             f"  moved              {arm['path_mm']:g} mm along the path, {arm['net_mm']:g} mm net",
             f"  external force     {_fmt_stats(arm['force_n'], 'N')}  (against the first tick)",
-            f"    averaged 50 ms   {_fmt_stats(arm.get('force_avg_n'), 'N')}",
             f"  fastest joint      {_fmt_stats(arm['joint_speed_rad_s'], 'rad/s')}",
             f"  wall margin        min {arm['wall_margin_deg']['min']:g} deg (j{arm['wall_joint']})",
         ]
     for ev in report["gripper"]:
         lines.append(f"  gripper {ev.get('action')} at step {ev.get('cursor')}")
-    stop = report.get("stop") or {}
-    if stop.get("trip"):
-        tr = stop["trip"]
-        lines.append(f"  the stop's tick   {tr['loop_dt_ms']} ms after the one before, TCP {tr['tracking_mm']} mm off its "
-                     f"command, fastest joint {tr['joint_speed_rad_s']} rad/s")
-    if stop.get("hold"):
-        h = stop["hold"]
-        lines.append(f"  hold after stop   TCP moved {h['travel_mm']} mm from where the stop found it ({h['ticks']} ticks)")
-    for ev in report.get("predictor_at_stop") or []:
-        lines.append(f"  predictor at stop in '{ev.get('phase')}' for {(ev['t'] - ev['since']) * 1e3:.0f} ms")
-    for k, tm in enumerate(report.get("prediction_timing_ms") or []):
-        phases = ", ".join(f"{name} +{v:g}" for name, v in tm.items() if name != "requested")
-        lines.append(f"  prediction {k} ms after request: {phases}")
     if report["headroom"]:
         lines.append("headroom (worst / stop)")
         if report["inputs"]["age_ms"].get("n", 0) < FEW_PREDICTIONS:
