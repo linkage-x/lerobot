@@ -30,6 +30,25 @@ export function recorderConnecting(status: RolloutStatus | null): {
   return { pending: true, stuck: Boolean(r.stuck), label, waiting };
 }
 
+// Once the recorder is up, the sensors it opened that do not stream: a BOX it did not discover ("Box devices:
+// (none)") or that went stale, a camera that failed. The recorder still says "Episode N ready" without its
+// BOX, so the page must say so out loud: the policy reads the arm gripper BOX's width. noBox = no BOX row
+// at all. Empty while not connected or still connecting (recorderConnecting says that).
+export function recorderNotStreaming(status: RolloutStatus | null): {
+  boxes: string[];
+  cameras: string[];
+  noBox: boolean;
+} {
+  const r = status?.recorder;
+  if (!status?.recorderConnected || !r || r.pending) return { boxes: [], cameras: [], noBox: false };
+  const down = (kind: string) => r.sensors.filter((s) => s.kind === kind && s.state !== "running").map((s) => s.id);
+  return {
+    boxes: down("box_collection"),
+    cameras: down("camera"),
+    noBox: !r.sensors.some((s) => s.kind === "box_collection")
+  };
+}
+
 export function executeBlockers(args: {
   status: RolloutStatus | null;
   checkpoint: RolloutCheckpoint | undefined;

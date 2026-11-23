@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RolloutCheckpoint, RolloutStatus } from "./rolloutApi";
-import { cameraBlocker, executeBlockers, recorderConnecting } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers, recorderConnecting, recorderNotStreaming } from "./rolloutExecute";
 
 const status = (over: Partial<RolloutStatus> = {}): RolloutStatus => ({
   stages: [],
@@ -69,5 +69,26 @@ describe("recorderConnecting", () => {
   it("lets a connect stuck past the gateway's limit be cancelled, naming what never came up", () => {
     const s = status({ recorder: { state: "connecting", sensors, ready: false, pending: true, failed: false, stuck: true, elapsedS: 61 } });
     expect(recorderConnecting(s)).toMatchObject({ pending: true, stuck: true, waiting: ["box/gripper"] });
+  });
+});
+
+describe("recorderNotStreaming", () => {
+  const cam = { id: "cam_10", kind: "camera", state: "running" };
+  const box = (state: string) => ({ id: "box/gripper", kind: "box_collection", state });
+  const up = (sensors: { id: string; kind: string; state: string }[], pending = false) =>
+    status({ recorderCameras: ["cam_10"], recorder: { state: pending ? "connecting" : "armed", sensors, ready: !pending, pending, failed: false } });
+  it("names a BOX the recorder came up without (Box devices: (none) marks its rows error)", () => {
+    expect(recorderNotStreaming(up([cam, box("error")]))).toEqual({ boxes: ["box/gripper"], cameras: [], noBox: false });
+  });
+  it("says when there is no BOX row at all", () => {
+    expect(recorderNotStreaming(up([cam])).noBox).toBe(true);
+  });
+  it("is silent when every sensor streams, while connecting, and when not connected", () => {
+    expect(recorderNotStreaming(up([cam, box("running")]))).toEqual({ boxes: [], cameras: [], noBox: false });
+    expect(recorderNotStreaming(up([cam, box("warning")], true))).toEqual({ boxes: [], cameras: [], noBox: false });
+    expect(recorderNotStreaming(status({ recorderConnected: false })).boxes).toEqual([]);
+  });
+  it("names a camera that failed", () => {
+    expect(recorderNotStreaming(up([{ ...cam, state: "error" }, box("running")])).cameras).toEqual(["cam_10"]);
   });
 });

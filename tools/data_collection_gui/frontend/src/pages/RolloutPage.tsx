@@ -9,7 +9,7 @@ import {
   rolloutApi
 } from "./rolloutApi";
 import { ArmGripperPanel } from "./ArmGripperPanel";
-import { cameraBlocker, executeBlockers, recorderConnecting } from "./rolloutExecute";
+import { cameraBlocker, executeBlockers, recorderConnecting, recorderNotStreaming } from "./rolloutExecute";
 import { boundsOf, pathOf, stepSeries } from "./rolloutPlot";
 import { type TrainingExport, trainingApi } from "./trainingApi";
 
@@ -228,6 +228,8 @@ export function RolloutPage() {
   const [selected, setSelected] = useState<ResultRow | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState("");
+  // the set of not-streaming sensors whose dialog was closed: a new set (a BOX that drops out later) opens it again
+  const [downDismissed, setDownDismissed] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -272,6 +274,12 @@ export function RolloutPage() {
   const forInference = Boolean(status?.recorderConnected && openCameras.length);
   const wrongCameras = cameraBlocker(status, ckpt);
   const connecting = recorderConnecting(status);
+  const down = recorderNotStreaming(status);
+  const downNames = [...(down.noBox ? ["no BOX"] : down.boxes), ...down.cameras];
+  const downKey = downNames.join(", ");
+  useEffect(() => {
+    if (!downKey) setDownDismissed("");
+  }, [downKey]);
   // the jobs that move the arm: Stop brakes it to rest
   const executing = running?.kind === "execute" || running?.kind === "tostart" ? running : undefined;
   const episodeList = useMemo(
@@ -383,6 +391,7 @@ export function RolloutPage() {
                 : forInference
                 ? `connected for inference: ${openCameras.join(", ")} at 30 Hz`
                 : "recorder connected (full session, preview bus ~5 Hz)"}
+            {downKey ? ` · not streaming: ${downKey}` : ""}
           </span>
         </div>
         <div className="control-row">
@@ -415,6 +424,36 @@ export function RolloutPage() {
           </span>
         </div>
         {wrongCameras ? <p className="command-error">{wrongCameras}: Disconnect and connect for this checkpoint.</p> : null}
+        {downKey ? (
+          <p className="command-error">
+            Connected, but not streaming: {downKey}. The policy reads the arm gripper BOX's width
+            {ckpt?.wrench ? " and wrench" : ""}: power the BOX, then Disconnect and connect again.
+          </p>
+        ) : null}
+        {downKey && downKey !== downDismissed ? (
+          <div className="danger-modal-backdrop" role="presentation">
+            <div aria-labelledby="rollout-sensor-down" aria-modal="true" className="danger-modal" role="dialog">
+              <h3 id="rollout-sensor-down">{down.noBox || down.boxes.length ? "BOX 没有连接" : "相机没有出流"}</h3>
+              <p>
+                The recorder is connected, but these do not stream: <strong>{downKey}</strong>.
+              </p>
+              {down.noBox || down.boxes.length ? (
+                <p>
+                  The policy reads the arm gripper BOX's width{ckpt?.wrench ? " and external wrench" : ""}; without
+                  it a preview or execution has no gripper input. Check that the BOX is powered and on the network
+                  (a single BOX powered after Connect can still come up on its own: this closes when it streams), or Disconnect and connect again.
+                </p>
+              ) : (
+                <p>Disconnect and connect again; if the camera stays down, see the Device Manager.</p>
+              )}
+              <div className="danger-modal-actions">
+                <button autoFocus onClick={() => setDownDismissed(downKey)} type="button">
+                  知道了
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <p className="panel-note">
           The policy reads the recorder's live frames (it never opens a camera) and the arm gripper BOX's width
           {ckpt?.wrench ? " and external wrench" : ""}, with the arm standing still; nothing is sent to the arm. Every
