@@ -722,6 +722,21 @@ def assess(
     return ok, why
 
 
+def replan_cursor(chunk: Chunk, n_exec: int, wait_steps: float) -> int:
+    """The step of a just-taken chunk at which the loop asks for the next one, so that the next takes over at
+    about k0 + n_exec: this one runs the n_exec steps ``accept`` checked -- as many as training's evaluation
+    ran per chunk, and as lerobot_workstation's RTC queue runs (chunk 50, replan at 34 left: steps d .. d + 16).
+    ``wait_steps``: how long this chunk took from its request to being taken (the prediction; the frame's age
+    at the request does not delay a takeover). Never so late that the next would come after this one's end,
+    or find fewer running steps than the frozen ones (k0 - 1 stands for both lags), so RTC stays on.
+
+    11-23: asking at n_exec - (k0 - 1) asked as soon as a chunk was taken: each ran only its steps 9..17 (the
+    fade from the frozen prefix to its own plan), pi0.5 re-chose "wait" or "go down" every 0.27 s, and the arm
+    swung back and forth at the start (execute_20261123_172134)."""
+    late = max(0, chunk.k0 - 1)
+    return max(1, min(chunk.k0 + n_exec - math.ceil(max(0.0, wait_steps)), chunk.end - late - 2))
+
+
 def accept(
     chunk: Chunk,
     now: float,
@@ -1313,7 +1328,7 @@ def run_loop(
     # the first frame must be taken after the FK buffer covers its whole history (offsets back to -67 ms)
     span = -min(predictor.offsets_s) if predictor.offsets_s else 0.0
     predictor.request(min_t=t_start + span + 0.005, seed=q_cmd)
-    pending = True
+    pending, t_request = True, clock()
     replan_at = max(1, n_exec - 6)  # updated from each chunk's measured lateness
     f_window: deque[np.ndarray] = deque(maxlen=max(1, round(FORCE_WINDOW_S * loop_hz)))
     silent = 0  # ticks in a row with O_F_ext_hat_K exactly 0
@@ -1382,7 +1397,7 @@ def run_loop(
                     r0, v0, blending, blend_from, blend_to = r1, v1, True, now, t_end
                 chunk = new
                 accepted += 1
-                replan_at = max(1, n_exec - max(0, new.k0 - 1))
+                replan_at = replan_cursor(new, n_exec, (now - t_request) / new.dt)
             if chunk is None:
                 dq_cmd = np.zeros(7)
                 arm.command(q_cmd, dq_cmd)
@@ -1404,7 +1419,7 @@ def run_loop(
                     break
                 if (not pending) and (stage.chunks == 0 or accepted < stage.chunks) and cursor >= replan_at:
                     predictor.request(min_t=chunk.t_obs + 1e-3, seed=chunk)
-                    pending = True
+                    pending, t_request = True, now
                     replan_at = math.inf
                 if gripper is not None and stage.gripper:
                     action = decider.decide(chunk.width_at(chunk.cursor(now + GRIPPER_LEAD_S)), now)

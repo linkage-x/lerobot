@@ -148,7 +148,7 @@ def test_stage_one_runs_exactly_one_chunks_n_action_steps_then_holds():
 
 
 def test_closed_loop_joins_each_late_chunk_at_its_first_future_step_and_keeps_the_speed():
-    stage = replace(rx.STAGES[2], max_s=1.2)
+    stage = replace(rx.STAGES[2], max_s=2.0)  # each chunk runs 16 steps: 3 takeovers need ~1.6 s
     result, arm, seen = _run(stage, age_s=0.15)
     assert result.completed, result.stopped
     chunks = [e for e in seen if e.get("event") == "chunk" and e["accepted"]]
@@ -1152,7 +1152,7 @@ def _recorded(tmp_path: Path, stage: rx.Stage, **kw):
 
 
 def test_report_reads_a_closed_loop_run_back(tmp_path: Path):
-    result, _ = _recorded(tmp_path, replace(rx.STAGES[2], max_s=2.0), age_s=0.15)
+    result, _ = _recorded(tmp_path, replace(rx.STAGES[2], max_s=2.4), age_s=0.15)
     r = rep.analyze(tmp_path)
     assert r["result"]["completed"] and r["chunks"]["accepted"] == result.chunks_accepted >= 3
     assert r["inputs"]["age_ms"]["p50"] == pytest.approx(150.0, abs=6.0)
@@ -1346,3 +1346,15 @@ def test_without_rtc_no_prefix_is_ever_sent():
                      np.repeat(Q0[None], c.horizon + 1, axis=0), np.ones(c.horizon, bool), [""] * c.horizon,
                      np.full(c.horizon, 0.08))
     assert pred.rtc_prefix(np.eye(4), chunk, 0.1) is None
+
+
+def test_each_chunk_runs_its_n_action_steps_before_the_next_takes_over():
+    # 11-23: with ~9 steps of lateness the loop asked for the next chunk as soon as one was taken, each ran
+    # only its steps 9..17 and pi0.5 swung between "wait" and "go down"; lerobot_workstation's RTC queue runs
+    # 16 steps of each chunk (rollout_execute.replan_cursor)
+    taken = []
+    result, _, _ = _run(replace(rx.STAGES[2], max_s=2.5), age_s=0.15,
+                        record=lambda r: taken.append(r["t"]) if r.get("accepted") else None)
+    assert result.completed, result.stopped
+    gaps = np.diff(taken[1:]) * 30  # in policy steps
+    assert len(gaps) >= 2 and np.all(np.abs(gaps - 16) <= 1), gaps

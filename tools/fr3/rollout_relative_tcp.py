@@ -1238,10 +1238,11 @@ def execute_predictor_parts(*, checkpoint: str, arm: str, gateway: str, frame_bu
     first = observe(time.monotonic() - 1.0)
     for _ in range(2):
         loaded.predict(sample(np.repeat(np.eye(4)[None], c.history + 1, axis=0), first))
-    # a flow-matching policy: each chunk guided by the running one (RTC). Guidance fades out at n_exec: the
-    # loop asks for the next chunk at cursor n_exec - (k0 - 1) (run_loop's replan_at), so a chunk taken over
-    # at k0 runs to about n_exec -- every step it executes is guided (lerobot_workstation ran 9 executed
-    # steps unguided when its queue and its RTC horizon disagreed)
+    # a flow-matching policy: each chunk guided by the running one (RTC). Guidance fades out at n_exec, as
+    # lerobot_workstation's does (execution horizon 16). The loop asks for the next chunk at the running
+    # one's step n_exec (rollout_execute.replan_cursor), so a chunk runs its steps k0 .. k0 + n_exec - 1 and
+    # the tail past n_exec runs unguided -- as on the workstation, whose pi0.5 runs smoothly that way.
+    # Asking as soon as a chunk was taken (each ran only steps 9..17) made the arm swing (11-23).
     rtc = bool(getattr(loaded, "rtc", False))
 
     def rtc_fk(qs: np.ndarray) -> np.ndarray:
