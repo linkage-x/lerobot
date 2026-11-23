@@ -523,11 +523,16 @@ class RolloutManager:
                 "stillMm": (r.get("not_moving_baseline_pos_mm") or {}).get("mean"),
                 "viewVsOnlineMm": (r.get("view_vs_online_path_mm") or {}).get("max"),
             })
-        for path in sorted((self.root / "records").glob("*/record.json"), reverse=True):
+        records = []
+        for path in (self.root / "records").glob("*/record.json"):
             try:
-                r = json.loads(path.read_text(encoding="utf-8"))
+                records.append((path, json.loads(path.read_text(encoding="utf-8"))))
             except ValueError:
                 continue
+        # newest first by when they were made: sorted by directory name, every tostart_* came before every preview_*
+        # and buried the previews (the ones with a Replay check) under dozens of moves (11-23)
+        records.sort(key=lambda pr: str(pr[1].get("created") or ""), reverse=True)
+        for path, r in records:
             out.append({
                 "path": str(path.parent), "kind": r.get("kind") or "preview", "created": r.get("created"),
                 "checkpoint": r.get("checkpoint"), "arm": r.get("arm"), "steps": r.get("steps"),

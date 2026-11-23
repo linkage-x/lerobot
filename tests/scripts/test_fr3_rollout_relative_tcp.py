@@ -554,3 +554,13 @@ def test_a_move_to_a_training_start_is_not_replayed(tmp_path):
     _replayed_preview(manager)
     manager.start_replay(str(manager.root / "records" / "preview_1"))
     assert spawned and spawned[0][1:3] == [rr.SCRIPT, "replay"]
+
+
+def test_records_are_listed_newest_first_whatever_their_kind(tmp_path):
+    manager = _manager(tmp_path)
+    for name, kind, created in (("tostart_a", "to_start", "2026-11-23T08:00:00+00:00"),
+                                ("preview_b", "preview", "2026-11-23T08:30:00+00:00"),
+                                ("tostart_c", "to_start", "2026-11-23T08:40:00+00:00")):
+        (manager.root / "records" / name).mkdir(parents=True)
+        (manager.root / "records" / name / "record.json").write_text(json.dumps({"kind": kind, "created": created}))
+    assert [Path(r["path"]).name for r in manager.results()] == ["tostart_c", "preview_b", "tostart_a"]
