@@ -142,6 +142,69 @@ def test_pi05_load_that_would_not_fit_in_ram_is_refused(tmp_path):
         rtp.check_host_memory("pi05", weights, available=need - 1)
     rtp.check_host_memory("act", weights, available=0)  # ACT is small and loads as before
     rtp.check_host_memory("pi05", None, available=0)  # ACT: nothing to measure
+    # A lean load's peak is the process's, not a multiple of the weights file.
+    rtp.check_host_memory("pi05", weights, available=rtp.LEAN_LOAD_PEAK_BYTES, lean=True)
+    with pytest.raises(rtp.HostMemoryError):
+        rtp.check_host_memory("pi05", weights, available=rtp.LEAN_LOAD_PEAK_BYTES - 1, lean=True)
+
+
+class _ToyPolicy:
+    """The parts of a pi0.5 the lean load touches: a module tree, its key fixer and a config."""
+
+    def __init__(self):
+        import torch
+
+        self.module = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2, bias=False))
+        self.module[1].to(torch.bfloat16)
+        self.config = None
+
+    def state_dict(self, keep_vars=False):
+        return {f"model.{k}": v for k, v in self.module.state_dict(keep_vars=keep_vars).items()}
+
+    def _fix_pytorch_state_dict_keys(self, state_dict, config):
+        fixed = {k.replace("old_", ""): v for k, v in state_dict.items()}
+        if "lm_head.weight" in fixed:  # as pi0.5 does: the head's weights also become the embedding's
+            fixed["1.weight"] = fixed.pop("lm_head.weight").clone()
+        return fixed
+
+
+def test_lean_weight_load_copies_every_tensor_and_refuses_a_mismatch(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    toy = _ToyPolicy()
+    saved = {"old_0.weight": torch.randn(4, 3), "0.bias": torch.randn(4), "lm_head.weight": torch.randn(2, 4)}
+    save_file(saved, tmp_path / "model.safetensors")
+    with torch.no_grad():
+        rtp._load_weights_streaming(toy, tmp_path / "model.safetensors")
+    assert torch.equal(toy.module[0].weight, saved["old_0.weight"])
+    assert torch.equal(toy.module[0].bias, saved["0.bias"])
+    assert toy.module[1].weight.dtype == torch.bfloat16  # cast as load_state_dict casts
+    assert torch.equal(toy.module[1].weight, saved["lm_head.weight"].to(torch.bfloat16))
+
+    # A key the model does not have, or one it lacks, is an error: never a partly random model.
+    save_file({**saved, "extra.weight": torch.zeros(1)}, tmp_path / "extra.safetensors")
+    with pytest.raises(RuntimeError, match="1 unexpected"), torch.no_grad():
+        rtp._load_weights_streaming(toy, tmp_path / "extra.safetensors")
+    save_file({k: v for k, v in saved.items() if k != "0.bias"}, tmp_path / "short.safetensors")
+    with pytest.raises(RuntimeError, match="1 missing"), torch.no_grad():
+        rtp._load_weights_streaming(toy, tmp_path / "short.safetensors")
+    save_file({**saved, "0.bias": torch.zeros(5)}, tmp_path / "shape.safetensors")
+    with pytest.raises(RuntimeError, match=r"model\.0\.bias"), torch.no_grad():
+        rtp._load_weights_streaming(toy, tmp_path / "shape.safetensors")
+
+
+def test_lean_load_refuses_an_unsaved_buffer_it_cannot_compute():
+    import torch
+
+    from tools.fr3 import relative_tcp_policy as rtp
+
+    module = torch.nn.Module()
+    module.register_buffer("mystery", torch.zeros(3), persistent=False)
+    with pytest.raises(RuntimeError, match="mystery"), torch.no_grad():
+        rtp._recompute_unsaved_buffers(module)
 
 
 def test_missing_pi05_base_weights_are_refused_not_replaced_by_random_ones(tmp_path):

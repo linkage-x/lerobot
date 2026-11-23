@@ -7,9 +7,10 @@ fingerprint of the weights the stub was made from. :func:`relative_tcp_policy.lo
 returns a :class:`RemotePolicy`; preview, replay and execute then work as with a local checkpoint, and the
 server must hold the very weights the stub names (checked at load and on every answer).
 
-The server (on the GPU machine, e.g. the 5090 workstation)::
+The server (on the GPU machine, e.g. the 5090 workstation; a Python with transformers, there ``.venv-pi``). The
+load is lean (:func:`relative_tcp_policy.load_lean`): about 2 GB of RAM, not the ~40 GB ``from_pretrained`` peaks at::
 
-    PYTHONPATH=src:. .venv/bin/python tools/fr3/relative_tcp_remote.py serve \\
+    PYTHONPATH=src:. .venv-pi/bin/python tools/fr3/relative_tcp_remote.py serve \\
         --checkpoint outputs/training/runs/<run>/lerobot/checkpoints/<step>/pretrained_model \\
         --allow-from 192.168.111.122
 

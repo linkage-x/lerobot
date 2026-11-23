@@ -46,6 +46,21 @@ RTC_HORIZON_KEY = "rtc.horizon"
 #: for ten minutes and froze the desktop until the OOM killer ended it, so a load that does not fit is refused.
 LOAD_PEAK_PER_WEIGHT_BYTE = 3.1
 
+#: Policies :func:`load_checkpoint` builds on the meta device and fills tensor by tensor (:func:`load_lean`)
+#: instead of through ``from_pretrained``. That peak comes from construction, not from the weights: the pi_gemma
+#: wrappers call their parents' ``__init__`` first, so the language model's layers exist four times over in
+#: fp32 before one set is kept (PaliGemmaForConditionalGeneration, PaliGemmaModel inside it, GemmaModel inside
+#: PiGemmaModel, PiGemmaModel's own layers). On the meta device none of them holds memory; the kept tensors
+#: are allocated once, on the target device, in their final dtypes.
+LEAN_POLICIES = ("pi05",)
+
+#: Host RAM a lean load (:func:`load_lean`) is allowed to need, the whole process included (Python, torch, the
+#: CUDA context's host side, the largest single tensor read from the weights file). Measured 2026-11-23 on the
+#: A100 for pi05_base + a LoRA adapter: anonymous RSS peaked at 1.49 GiB (from_pretrained: 38.98 GiB), load
+#: 36 s (158 s), GPU 8.82 GiB either way. The weights file is read through mmap, i.e. page cache, which the
+#: kernel can drop instead of swapping. 4 GiB leaves room for a larger adapter and the processors.
+LEAN_LOAD_PEAK_BYTES = 4 * 2**30
+
 
 #: Total GPU memory pi0 / pi0.5 needs: inference alone peaked at 8.83 GiB allocated (A100, 2026-11-17: weights
 #: 8.71 GiB, one 32-step chunk), plus the CUDA context. An 8 GB card (the RTX 4060) can never hold it, whatever
@@ -129,15 +144,24 @@ def require_weights(name_or_path: str | Path) -> Path:
 
 
 def check_host_memory(
-    policy_type: str, weights: Path | None, processes: int = 1, available: int | None = None
+    policy_type: str,
+    weights: Path | None,
+    processes: int = 1,
+    available: int | None = None,
+    *,
+    lean: bool = False,
 ) -> None:
-    """Refuse a pi0 / pi0.5 load (``processes`` of them at once) that would not fit in free RAM."""
+    """Refuse a pi0 / pi0.5 load (``processes`` of them at once) that would not fit in free RAM.
+
+    ``lean``: the load goes through :func:`load_lean`, whose peak does not scale with the model's construction.
+    """
     if policy_type not in NOISE_POLICIES or weights is None:
         return
     available = host_memory_available() if available is None else available
     if available is None:
         return
-    need = int(weights.stat().st_size * LOAD_PEAK_PER_WEIGHT_BYTE) * max(1, processes)
+    per_load = LEAN_LOAD_PEAK_BYTES if lean else int(weights.stat().st_size * LOAD_PEAK_PER_WEIGHT_BYTE)
+    need = per_load * max(1, processes)
     if need > available:
         each = f" ({processes} processes)" if processes > 1 else ""
         raise HostMemoryError(
@@ -257,7 +281,101 @@ class LoadedPolicy:
         return predict_chunk(self.policy, self.preprocessor, self.postprocessor, sample)
 
 
-def load_checkpoint(path: Path, device: str | None = None) -> LoadedPolicy:
+def _recompute_unsaved_buffers(policy) -> None:
+    """Fill the buffers a weights file does not hold (``persistent=False``) as the usual build leaves them.
+
+    The usual build makes them on the CPU in float32 and casts them with the rest of the model
+    (``to_bfloat16_for_selected_params``), so they are computed on the CPU here and cast to the dtype the meta
+    build gave them. A buffer no rule here knows is refused: left as ``to_empty`` made it, it is garbage.
+    """
+    import torch
+
+    saved = set(policy.state_dict().keys())
+    for name, module in policy.named_modules():
+        unsaved = sorted(b for b, _ in module.named_buffers(recurse=False) if f"{name}.{b}".lstrip(".") not in saved)
+        if not unsaved:
+            continue
+        kind = type(module).__name__
+        if kind.endswith("RotaryEmbedding") and set(unsaved) <= {"inv_freq", "original_inv_freq"}:
+            fresh = type(module)(config=module.config, device="cpu")
+            module.attention_scaling = fresh.attention_scaling
+            values = {b: getattr(fresh, b) for b in unsaved}
+        elif kind == "SiglipVisionEmbeddings" and unsaved == ["position_ids"]:
+            values = {"position_ids": torch.arange(module.num_positions).expand((1, -1))}
+        else:
+            raise RuntimeError(
+                f"{name} ({kind}) has buffers {unsaved} that the weights file does not hold and that no rule here "
+                "computes; load this checkpoint with lean=False"
+            )
+        for b, value in values.items():
+            buf = getattr(module, b)
+            if tuple(buf.shape) != tuple(value.shape):
+                raise RuntimeError(f"{name}.{b}: computed {tuple(value.shape)}, the model has {tuple(buf.shape)}")
+            buf.copy_(value.to(buf.dtype))
+
+
+def _load_weights_streaming(policy, weights: Path) -> None:
+    """``from_pretrained``'s state-dict load, one tensor at a time (strict: every key, nothing extra).
+
+    The key mapping is the policy's own ``_fix_pytorch_state_dict_keys`` plus the ``model.`` prefix, run on the
+    names only; it copies ``lm_head`` into ``embed_tokens`` with ``value.clone()``, which a name answers.
+    """
+    from safetensors import safe_open
+
+    class _Name(str):
+        def clone(self) -> _Name:
+            return self
+
+    with safe_open(str(weights), framework="pt", device="cpu") as f:
+        fixed = policy._fix_pytorch_state_dict_keys({k: _Name(k) for k in f.keys()}, policy.config)  # noqa: SLF001, SIM118
+        source = {(k if k.startswith("model.") else f"model.{k}"): str(v) for k, v in fixed.items()}
+        targets = policy.state_dict(keep_vars=True)
+        missing, unexpected = sorted(set(targets) - set(source)), sorted(set(source) - set(targets))
+        if missing or unexpected:
+            raise RuntimeError(
+                f"{weights} does not match the model: {len(missing)} missing {missing[:5]}, "
+                f"{len(unexpected)} unexpected {unexpected[:5]}"
+            )
+        for key, target in targets.items():
+            value = f.get_tensor(source[key])
+            if tuple(value.shape) != tuple(target.shape):
+                raise RuntimeError(f"{key}: {tuple(value.shape)} in {weights}, {tuple(target.shape)} in the model")
+            target.copy_(value)
+            del value
+
+
+def load_lean(cfg, weights: Path, device: str):
+    """The policy ``from_pretrained(weights, config=cfg)`` returns, without its construction peak in RAM.
+
+    Built on the meta device (no memory), allocated once on ``device`` in the dtypes the build chose, the
+    unsaved buffers recomputed, then the weights copied in one tensor at a time. The result is bit-identical
+    to ``from_pretrained``'s (A100, 2026-11-23: all 1074 tensors and buffers equal, plain and RTC-guided chunks
+    equal to the bit); peak host RAM: :data:`LEAN_LOAD_PEAK_BYTES`.
+    """
+    import torch
+
+    from lerobot.policies.factory import get_policy_class
+
+    cls = get_policy_class(cfg.type)
+    cfg.device = "meta"  # the policy's __init__ moves its model to cfg.device
+    try:
+        with torch.device("meta"):
+            policy = cls(cfg)
+    finally:
+        cfg.device = device
+    policy.to_empty(device=device)
+    with torch.no_grad():
+        _recompute_unsaved_buffers(policy)
+        _load_weights_streaming(policy, weights)
+    left = [n for n, t in [*policy.named_parameters(), *policy.named_buffers()] if t.is_meta]
+    left += [f"{n}.{a}" for n, m in policy.named_modules() for a, v in vars(m).items()
+             if isinstance(v, torch.Tensor) and v.is_meta]
+    if left:
+        raise RuntimeError(f"tensors still on the meta device after a lean load: {left[:5]}")
+    return policy
+
+
+def load_checkpoint(path: Path, device: str | None = None, *, lean: bool = True) -> LoadedPolicy:
     import torch
 
     from lerobot.configs.policies import PreTrainedConfig
@@ -277,19 +395,24 @@ def load_checkpoint(path: Path, device: str | None = None) -> LoadedPolicy:
     cfg = PreTrainedConfig.from_pretrained(path)
     cfg.device = device
     check_gpu_memory(cfg.type, device)  # before anything is loaded: the 4060 is refused, not tried
+    lean = lean and cfg.type in LEAN_POLICIES
+
+    def load(weights_dir: str | Path):
+        weights = require_weights(weights_dir) if cfg.type in NOISE_POLICIES else None
+        check_host_memory(cfg.type, weights, lean=lean)
+        if lean:
+            return load_lean(cfg, weights, device)
+        return get_policy_class(cfg.type).from_pretrained(weights_dir, config=cfg)
+
     if getattr(cfg, "use_peft", False):
         # A LoRA run saves the adapter only; the base it adapted is named in the adapter's config and has to
         # be on this machine (the Hugging Face cache; nothing is downloaded here).
         from peft import PeftConfig, PeftModel
 
         adapter = PeftConfig.from_pretrained(str(path))
-        base_weights = adapter.base_model_name_or_path
-        check_host_memory(cfg.type, require_weights(base_weights) if cfg.type in NOISE_POLICIES else None)
-        base = get_policy_class(cfg.type).from_pretrained(base_weights, config=cfg)
-        policy = PeftModel.from_pretrained(base, str(path), config=adapter)
+        policy = PeftModel.from_pretrained(load(adapter.base_model_name_or_path), str(path), config=adapter)
     else:
-        check_host_memory(cfg.type, require_weights(path) if cfg.type in NOISE_POLICIES else None)
-        policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
+        policy = load(path)
     policy.to(device).eval()
     pre, post = make_pre_post_processors(
         policy_cfg=cfg,
