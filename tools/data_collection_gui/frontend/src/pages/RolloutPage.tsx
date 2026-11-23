@@ -677,7 +677,9 @@ export function RolloutPage() {
                     ? `${r.export} (${r.frames} frames)`
                     : r.kind === "execute"
                       ? `${r.arm} arm, stage ${r.stage ?? "?"}`
-                      : `${r.arm} arm, ${r.steps ?? "…"} steps`}
+                      : r.kind === "to_start"
+                        ? `${r.arm} arm, move to a training start`
+                        : `${r.arm} arm, ${r.steps ?? "…"} steps`}
                 </td>
                 <td>
                   {r.kind === "offline"
@@ -686,6 +688,10 @@ export function RolloutPage() {
                       ? r.result
                         ? `${r.result.completed ? "completed" : `stopped: ${r.result.stopped}`} (${r.result.chunks} chunks, ${r.result.duration_s.toFixed(1)} s)`
                         : "running or interrupted"
+                      : r.kind === "to_start"
+                        ? r.result
+                          ? `${r.result.completed ? "completed" : `stopped: ${r.result.stopped}`} (${r.result.duration_s.toFixed(1)} s); ${r.result.start_check ?? ""}`
+                          : "running or interrupted"
                       : r.replayCheck
                       ? `replay ${r.replayCheck.ok ? "identical" : "DIFFERENT"} (max ${r.replayCheck.max_abs_diff.toExponential(1)})`
                       : r.planProblem || "not replayed yet"}
@@ -693,7 +699,7 @@ export function RolloutPage() {
                 <td>
                   {r.kind === "offline" ? (
                     <button onClick={() => setSelected(r)}>Open</button>
-                  ) : (
+                  ) : r.kind === "to_start" ? null /* no policy ran in it: nothing to replay */ : (
                     <button disabled={Boolean(running)} onClick={() => act(() => rolloutApi.replay(r.path))}>
                       Replay check
                     </button>

@@ -533,3 +533,24 @@ def test_a_step_the_steering_cannot_reach_ends_the_chunk_there():
     ok[20] = False
     _, ok_s, _ = ro.steer_off_singularity(F, q, ok, qa)
     assert ok_s[:20].all() and not ok_s[20:].any()
+
+
+def test_a_move_to_a_training_start_is_not_replayed(tmp_path):
+    # 11-23: Replay check on a to-start record died on KeyError: 'contract' (no policy ran in it)
+    spawned = []
+
+    class Proc:
+        pid = 2**22 + 13  # a real integer, never a MagicMock (os.killpg)
+
+    manager = _manager(tmp_path, popen=lambda cmd, **k: spawned.append(cmd) or Proc())
+    record = manager.root / "records" / "tostart_1"
+    record.mkdir(parents=True)
+    (record / "record.json").write_text(json.dumps({"kind": "to_start", "checkpoint": manager.checkpoints()[0]["path"]}))
+    with pytest.raises(rr.RolloutError, match="nothing to replay"):
+        manager.start_replay(str(record))
+    assert not spawned
+    with pytest.raises(RuntimeError, match="nothing to replay"):
+        ro.replay(record)
+    _replayed_preview(manager)
+    manager.start_replay(str(manager.root / "records" / "preview_1"))
+    assert spawned and spawned[0][1:3] == [rr.SCRIPT, "replay"]

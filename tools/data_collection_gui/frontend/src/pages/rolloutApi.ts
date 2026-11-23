@@ -75,7 +75,8 @@ export type ResultRow = {
   replayCheck?: { ok: boolean; max_abs_diff: number; steps: number } | null;
   planProblem?: string;
   stage?: number | null;
-  result?: { completed: boolean; stopped: string; chunks: number; duration_s: number } | null;
+  // execute: chunks; a move to a training start (kind to_start): start_check
+  result?: { completed: boolean; stopped: string; chunks?: number; duration_s: number; start_check?: string } | null;
 };
 
 export type ErrorSummary = { mean: number; p95: number; by_step: (number | null)[] };

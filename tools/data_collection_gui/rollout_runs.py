@@ -34,6 +34,7 @@ from typing import Any
 
 SCRIPT = "tools/fr3/rollout_relative_tcp.py"
 ARM_KINDS = ("execute", "tostart")  # the jobs that move an arm: they hold its FCI while they run
+REPLAYABLE_KINDS = ("preview", "execute")  # the records a policy ran in; a move to a training start ran none
 PROGRESS_PREFIX = "FR3_ROLLOUT "
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$")
 STAGES = (
@@ -351,6 +352,8 @@ class RolloutManager:
         if (self.root / "records").resolve() not in path.parents or not (path / "record.json").is_file():
             raise RolloutError(f"no preview record {record!r}")
         meta = json.loads((path / "record.json").read_text(encoding="utf-8"))
+        if (meta.get("kind") or "preview") not in REPLAYABLE_KINDS:
+            raise RolloutError(f"{path.name} is a {meta.get('kind')} record: no policy ran in it, so there is nothing to replay")
         return self._spawn("replay", str(meta.get("checkpoint", "")), ["replay", "--record", str(path)], str(path), {})
 
     def stop(self, job_id: str) -> str:

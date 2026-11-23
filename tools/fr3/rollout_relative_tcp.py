@@ -1068,6 +1068,8 @@ def replay(record_dir: Path, *, device: str | None = None) -> dict[str, Any]:
     from tools.fr3 import relative_tcp_policy as rtp
 
     meta = json.loads((record_dir / "record.json").read_text(encoding="utf-8"))
+    if (meta.get("kind") or "preview") not in ("preview", "execute"):  # a move to a training start: no policy ran
+        raise RuntimeError(f"a {meta.get('kind')} record: no policy ran in it, so there is nothing to replay")
     loaded = rtp.load_checkpoint(Path(meta["checkpoint"]), device=device)
     c = loaded.contract
     if c.to_dict() != meta["contract"]:
