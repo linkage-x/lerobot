@@ -22,6 +22,8 @@ export type TrainingForm = {
   numWorkers: number;
   wrench: boolean;
   imageAug: boolean;
+  /** Share of training samples whose pose history is replaced by a still one (0 = none), 0 <= p < 1. */
+  historyDropout: number;
   jobName: string;
   hostId: string;
   policy: Policy;
@@ -54,6 +56,7 @@ export const DEFAULT_FORM: TrainingForm = {
   numWorkers: 8,
   wrench: false,
   imageAug: true,
+  historyDropout: 0,
   jobName: "",
   // The 8x A100 (run/training_hosts/a100-19.json); the page falls back to this machine when it is not listed.
   hostId: "a100-19",
@@ -129,6 +132,8 @@ export function formProblems(form: TrainingForm, cameraSizes: Record<string, [nu
   }
   if (form.nActionSteps > form.horizon) problems.push("Steps executed per call cannot exceed the chunk length.");
   if (form.policy === "pi05" && !form.task.trim()) problems.push("pi0.5 needs the task described in words.");
+  if (!(form.historyDropout >= 0 && form.historyDropout < 1)) problems.push("History dropout: 0 to below 1.");
+  if (form.historyDropout > 0 && form.history === 0) problems.push("History dropout needs a pose history.");
   if (parseEpisodes(form.holdout) === null) problems.push("Held-out episodes: whole numbers, comma separated.");
   if (form.hostId !== "local" && form.gpus.length === 0) problems.push("Pick at least one GPU.");
   if (form.jobName && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(form.jobName)) {

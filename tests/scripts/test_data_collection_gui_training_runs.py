@@ -351,6 +351,12 @@ def test_pi05_needs_a_task_and_passes_its_settings(tmp_path):
     assert args[args.index("--lora-r") + 1] == "16" and args[args.index("--holdout-episodes") + 1] == "1,4"
     with pytest.raises(tr.TrainingError, match="policy"):
         manager._train_args({**base, "policy": "diffusion"}, ["good"], "j", host)
+    assert "--history-dropout" not in args
+    args = manager._train_args({**base, "task": "t", "historyDropout": 0.3}, ["good"], "j", host)
+    assert args[args.index("--history-dropout") + 1] == "0.3"
+    for bad in (1, -0.1, "x"):
+        with pytest.raises(tr.TrainingError, match="history dropout"):
+            manager._train_args({**base, "task": "t", "historyDropout": bad}, ["good"], "j", host)
 
 
 def test_gpu_status_lists_every_gpu_with_whose_processes_run_on_it():

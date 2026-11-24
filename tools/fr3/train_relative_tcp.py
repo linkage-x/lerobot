@@ -170,6 +170,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log-freq", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--image-aug", action="store_true", help="LeRobot's colour/affine image augmentation")
+    ap.add_argument("--history-dropout", type=float, default=0.0,
+                    help="probability a training sample sees a still pose history (the TCP at rest) instead of its "
+                         "own, so the policy judges the motion from the image (relative_tcp_data.RelativeTcpDataset)")
     ap.add_argument("--device", default=None, help="cuda / cpu (default: cuda when available)")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--policy-arg", action="append", default=[],
@@ -288,7 +291,8 @@ class _Hooks:
 
         transforms = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
         self.dataset = rd.RelativeTcpDataset(self.views, self.contract, self.stats, image_transforms=transforms,
-                                             holdout=self.run.get("holdout_episodes") or [])
+                                             holdout=self.run.get("holdout_episodes") or [],
+                                             history_dropout=float(self.run["policy"].get("history_dropout") or 0.0))
         progress(event="dataset", frames=self.dataset.num_frames, episodes=self.dataset.num_episodes)
         return self.dataset
 
@@ -420,6 +424,10 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
         print(f"WARNING: {warning}", flush=True)
     check.raise_if_bad()
     contract = make_contract(args, check)
+    if not 0.0 <= args.history_dropout < 1.0:
+        raise rd.TrainingDataError(f"--history-dropout {args.history_dropout}: 0 <= p < 1")
+    if args.history_dropout and contract.history == 0:
+        raise rd.TrainingDataError("--history-dropout needs a pose history (--history > 0)")
     job = args.job_name or f"{args.policy}_{args.hand}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = (args.runs_root / job).resolve()
     if args.check:
@@ -444,6 +452,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, dict[str, Any], rt.PolicyCo
         "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "export"},
         "policy": {"type": args.policy, "steps": args.steps, "batch_size": args.batch_size,
                    "n_action_steps": args.n_action_steps, "extra": list(args.policy_arg),
+                   "history_dropout": args.history_dropout,
                    **({"pretrained": args.pretrained or PI05_BASE, "lora_r": args.lora_r} if args.policy == "pi05" else {})},
         "holdout_episodes": list(args.holdout_episodes),
         "contract": contract.to_dict(),

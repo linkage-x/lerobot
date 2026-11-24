@@ -888,6 +888,15 @@ class TrainingManager:
             args.append("--wrench")
         if params.get("imageAug"):
             args.append("--image-aug")
+        if params.get("historyDropout") not in (None, "", 0):
+            try:
+                dropout = float(params["historyDropout"])
+            except (TypeError, ValueError):
+                raise TrainingError("history dropout must be a number") from None
+            if not 0.0 <= dropout < 1.0:
+                raise TrainingError("history dropout must be between 0 and 1 (exclusive)")
+            if dropout:
+                args += ["--history-dropout", f"{dropout:g}"]
         if params.get("box"):
             box = str(params["box"])
             if not re.match(r"^[A-Za-z0-9_./-]*$", box):

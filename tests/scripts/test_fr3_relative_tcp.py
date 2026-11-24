@@ -89,6 +89,39 @@ def test_samples_pad_untracked_targets_and_skip_untracked_observations():
     np.testing.assert_allclose(first[:3], 0.0, atol=1e-9)
 
 
+def test_history_dropout_shows_some_samples_a_still_history_and_keeps_their_width():
+    import torch
+
+    contract = _contract(history=2, horizon=3, cameras=[])
+    n = 20
+    poses = np.tile([0.1, 0.2, 0.3, 0, 0, 0, 1.0], (n, 1))
+    poses[:, 2] += np.arange(n) * 0.01  # moving: the own history is not the still one
+    arrays = rd.EpisodeArrays(poses=poses, widths=np.full(n, 0.07), wrench=None)
+    own, actions, _ = rd.sample_vectors(contract, arrays, 10)
+    still = rd.still_history(contract, own)
+    at_rest = rt.state_vector(contract, np.tile(rt.pose7_to_matrix(poses[10]), (3, 1, 1)), 0.07)
+    np.testing.assert_allclose(still, at_rest, atol=1e-6)  # what a TCP that did not move gives
+    assert still[-1] == pytest.approx(0.07) and not np.allclose(own, still)
+
+    ds = object.__new__(rd.RelativeTcpDataset)  # the sample path only: no views on disk
+    ds.contract, ds.arrays, ds.index, ds.image_transforms = contract, [[arrays]], [(0, 0, 10)], None
+    ds.history_dropout = 0.5
+    torch.manual_seed(0)
+    got = [ds[0] for _ in range(400)]
+    dropped = sum(np.allclose(g["observation.state"].numpy(), still) for g in got)
+    assert 150 < dropped < 250  # about half
+    assert all(np.allclose(g["observation.state"].numpy(), own) for g in got
+               if not np.allclose(g["observation.state"].numpy(), still))
+    assert all(np.array_equal(g["action"].numpy(), actions) for g in got)  # the targets never change
+    ds.history_dropout = 0.0
+    assert all(np.allclose(ds[0]["observation.state"].numpy(), own) for _ in range(20))
+
+    with pytest.raises(rd.TrainingDataError, match="0 <= p < 1"):
+        rd.RelativeTcpDataset([], contract, {}, history_dropout=1.0)
+    with pytest.raises(rd.TrainingDataError, match="needs a pose history"):
+        rd.RelativeTcpDataset([], _contract(history=0, cameras=[]), {}, history_dropout=0.3)
+
+
 def test_view_videos_return_each_frame_in_order(tmp_path):
     """A view is decoded with PyAV directly (Thor has neither torchcodec nor torchvision's VideoReader)."""
     import json

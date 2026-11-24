@@ -486,6 +486,12 @@ export function TrainingPage() {
           <NumberField label="Executed per call" value={form.nActionSteps} onChange={(v) => set("nActionSteps", v)} />
           <NumberField label="Frame stride" value={form.frameStride} onChange={(v) => set("frameStride", v)} />
           <NumberField label="Pose history" value={form.history} onChange={(v) => set("history", v)} />
+          <NumberField
+            label="History dropout"
+            value={form.historyDropout}
+            onChange={(v) => set("historyDropout", v)}
+            hint="share of samples trained with a still pose history"
+          />
           <NumberField label="Image long side" value={form.imageLongSide} onChange={(v) => set("imageLongSide", v)} />
           <NumberField label="Checkpoint every" value={form.saveFreq} onChange={(v) => set("saveFreq", v)} />
           <NumberField label="Data workers" value={form.numWorkers} onChange={(v) => set("numWorkers", v)} />

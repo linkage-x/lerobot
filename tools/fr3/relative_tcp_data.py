@@ -467,6 +467,15 @@ def sample_vectors(
     return state, actions, pad
 
 
+def still_history(contract: rt.PolicyContract, state: np.ndarray) -> np.ndarray:
+    """``state`` with its pose history replaced by the TCP at rest (every past pose = now), what
+    rt.state_vector gives for a TCP that did not move; the width (and wrench) are kept."""
+    out = np.array(state, dtype=np.float32, copy=True)
+    n = contract.history * rt.POSE_DIM
+    out[:n] = np.tile(rt.encode(np.eye(4)), contract.history).astype(np.float32)
+    return out
+
+
 def training_workspace(view_roots: Sequence[Path], contract: rt.PolicyContract, world_frame_id: str) -> dict[str, Any]:
     """Where the training TCP went, in the recording's camera world: what execution must keep the arm inside.
 
@@ -606,9 +615,21 @@ class RelativeTcpDataset:
         *,
         image_transforms=None,
         holdout: Collection[int] = (),
+        history_dropout: float = 0.0,
     ):
-        """``holdout``: episode indices (of every view) that are not trained on (evaluation episodes)."""
+        """``holdout``: episode indices (of every view) that are not trained on (evaluation episodes).
+
+        ``history_dropout``: the probability that a sample's pose history is replaced by a still one (the
+        TCP at rest: every past pose = now), so the policy learns to judge the motion from the image and not
+        only to continue its own (11-23 on the arm: a slow start stayed slow). Training only; inference
+        always gets the measured history. 0 = every sample keeps its own.
+        """
+        if not 0.0 <= history_dropout < 1.0:
+            raise TrainingDataError(f"history dropout {history_dropout}: 0 <= p < 1")
+        if history_dropout and contract.history == 0:
+            raise TrainingDataError("history dropout needs a pose history (--history > 0)")
         self.contract = contract
+        self.history_dropout = float(history_dropout)
         self.holdout = sorted({int(e) for e in holdout})
         self.image_transforms = image_transforms
         self.view_roots = [Path(r) for r in view_roots]
@@ -655,6 +676,9 @@ class RelativeTcpDataset:
         d, e, t = self.index[int(i)]
         arrays = self.arrays[d][e]
         state, actions, pad = sample_vectors(self.contract, arrays, t)
+        # torch's generator, not numpy's: DataLoader seeds it per worker, so workers do not drop the same samples
+        if self.history_dropout and float(torch.rand(())) < self.history_dropout:
+            state = still_history(self.contract, state)
         out = {
             "observation.state": torch.from_numpy(state),
             "action": torch.from_numpy(actions),
