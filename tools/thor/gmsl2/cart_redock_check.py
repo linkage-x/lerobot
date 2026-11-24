@@ -253,19 +253,27 @@ def _fisheye_intrinsics(source: Path) -> dict[str, dict[str, Any]]:
 
 
 def load_bundle_cameras(
-    report_path: Path, intrinsics: Path | None = None
+    report_path: Path, intrinsics: Path | None = None, carried: Path | None = None
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """A bundle's cameras in its own gauge S, before any registration: fisheye K, D and ``T_ref_cam``.
 
     The pose sits under ``T_world_camera`` because that is what ``project``/``triangulate`` read; the "world" here
     is the bundle's gauge.  ``intrinsics`` overrides the report's ``intrinsics_source`` (a copied bundle whose
-    paths point at Thor).
+    paths point at Thor), ``carried`` its ``intrinsics_carried_forward_from``.
+
+    A bundle solved over a partial lens re-sweep names the re-fitted lenses as its source and the run the
+    other cameras' lenses came from separately (2026-11-24: cam_03 and cam_13 replaced). Both are read, the
+    re-fitted ones winning, so the table is seen by every camera the bundle solved -- not just the new two.
     """
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if str(report.get("camera_model", "fisheye")) != "fisheye":
         raise SystemExit(f"{report_path}: a {report.get('camera_model')} bundle; the table tags need fisheye")
     source = Path(intrinsics or report["intrinsics_source"])
     lenses = _fisheye_intrinsics(source)
+    carried_from = carried or (Path(report["intrinsics_carried_forward_from"])
+                               if report.get("intrinsics_carried_forward_from") else None)
+    if carried_from is not None:
+        lenses = {**_fisheye_intrinsics(carried_from), **lenses}
     cams = {
         name: {**lenses[name], "T_world_camera": np.asarray(T, dtype=np.float64).reshape(4, 4)}
         for name, T in (report.get("T_ref_cam") or {}).items()
@@ -278,6 +286,7 @@ def load_bundle_cameras(
         "sha256": _sha256(report_path),
         "reference": report.get("reference"),
         "intrinsics_source": str(source),
+        "intrinsics_carried_forward_from": str(carried_from or ""),
         "cameras": sorted(cams),
     }
     return cams, identity
@@ -1481,7 +1490,7 @@ def _anchor(args: argparse.Namespace) -> int:
         print(f"{capture}: no cam_XX.mkv and no episodes/episode_* under it")
         return 2
     datum = json.loads(args.datum.read_text(encoding="utf-8"))
-    session_cams, bundle = load_bundle_cameras(args.bundle.resolve(), args.intrinsics)
+    session_cams, bundle = load_bundle_cameras(args.bundle.resolve(), args.intrinsics, args.carried_intrinsics)
     ids = {int(t) for v in datum["camera_pixels"].values() for t in v}
     detections = detect_capture(
         episodes, sorted(session_cams), datum["dictionary"], ids, samples=args.samples
@@ -2290,6 +2299,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     a.add_argument("--bundle", type=Path, required=True, help="the bundle's extrinsics_report.json")
     a.add_argument("--intrinsics", type=Path, default=None, help="instead of the report's intrinsics_source")
+    a.add_argument(
+        "--carried-intrinsics", type=Path, default=None,
+        help="instead of the report's intrinsics_carried_forward_from",
+    )
     a.add_argument("--datum", type=Path, default=DATUM_PATH)
     a.add_argument("--samples", type=int, default=ANCHOR_SAMPLES, help="frames read per camera")
     a.add_argument("--out", type=Path, required=True, help=f"conventionally <bundle dir>/{ANCHOR_FILE}")

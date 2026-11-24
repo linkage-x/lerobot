@@ -669,6 +669,29 @@ def test_the_anchor_reads_the_bundle_in_its_own_gauge(tmp_path) -> None:
     assert bundle["sha256"] == rc._sha256(report) and bundle["reference"] == "cam_07"
 
 
+def test_a_partial_lens_resweep_is_anchored_by_every_camera_the_bundle_solved(tmp_path) -> None:
+    """2026-11-24: cam_03 and cam_13 replaced, only their lenses re-fitted. The bundle names that two-camera
+    report as its intrinsics_source and the run the others came from apart; the anchor reads both."""
+    intr = tmp_path / "intrinsics_by_serial" / "converted" / "cam_07_SN"
+    intr.mkdir(parents=True)
+    (intr / "intrinsics_producer.json").write_text(
+        json.dumps({"camera_name": "cam_07", "model": "opencv_fisheye", "image_width": 1920, "image_height": 1080,
+                    "camera_matrix": K.tolist(), "dist_coeffs": [D.tolist()]})
+    )  # fmt: skip
+    refit = tmp_path / "intrinsics_report.json"
+    refit.write_text(json.dumps({"cameras": {"cam_03": {"models": {"fisheye": {"K": K.tolist(), "D": D.tolist()}}}}}))
+    T = _cameras()["cam_07"]["T_world_camera"]
+    report = tmp_path / "extrinsics_report.json"
+    report.write_text(
+        json.dumps({"camera_model": "fisheye", "reference": "cam_07", "intrinsics_source": str(refit),
+                    "intrinsics_carried_forward_from": str(tmp_path / "intrinsics_by_serial"),
+                    "T_ref_cam": {"cam_07": T.tolist(), "cam_03": T.tolist()}})
+    )  # fmt: skip
+    cams, bundle = rc.load_bundle_cameras(report)
+    assert sorted(cams) == ["cam_03", "cam_07"]
+    assert bundle["intrinsics_carried_forward_from"] == str(tmp_path / "intrinsics_by_serial")
+
+
 def test_episodes_on_a_new_calibration_are_held_against_its_own_capture(tmp_path, monkeypatch) -> None:
     """After a recalibration the datum's pixels are stale for whatever moved; the run's capture is not."""
     cams, layout = _cameras(), _layout(tmp_path)

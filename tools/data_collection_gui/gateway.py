@@ -10969,6 +10969,18 @@ def _write_calibration_identity(extrinsics_run: Path, run_name: str, port_serial
     )
 
 
+def _intrinsics_carry_source(state: GatewayState, staged: Path | None, intrinsics_run: Path) -> Path | None:
+    """The run whose lenses fill in the cameras a re-fit did not sweep: the lenses
+    staged by serial, else the run production loads, else none (a fresh rig).
+    One answer for the bundle and the export, so they are solved and shipped
+    against the same lenses."""
+    if staged is not None:
+        return staged
+    if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+        return intrinsics_run
+    return None
+
+
 def _run_extrinsics_calibration(
     state: GatewayState,
     dataset: Path,
@@ -11131,6 +11143,14 @@ def _run_extrinsics_calibration(
         # fisheye (cube_tracker.camera_model). Shipping the other one would be a
         # mismatch nothing downstream can detect.
         intrinsics_source = ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
+        # A re-sweep of a few lenses fits a report about those few. The bundle
+        # must still see every camera, solved against the lenses the export will
+        # carry forward; without them it dropped every other view, the gauge
+        # camera's included, and stopped at "Reference cam_14 never observed the
+        # board" (2026-11-24, cam_03 and cam_13 replaced).
+        carry_from = _intrinsics_carry_source(state, staged_intrinsics, intrinsics_run)
+        if carry_from is not None:
+            intrinsics_source += ["--carry-forward-intrinsics", str(carry_from)]
 
     detect_index = 3 if intrinsics_dataset is not None else 1
     detections = _detect("检测外参采集…" if intrinsics_dataset is not None else "检测 ChArUco 角点…",
@@ -11179,10 +11199,9 @@ def _run_extrinsics_calibration(
             # run holding three lenses -- the other eight not stale, just gone.
             # Carrying them across is what makes a partial re-sweep a thing the
             # operator can actually do.
-            if staged_intrinsics is not None:
-                export_args += ["--carry-forward-intrinsics", str(staged_intrinsics)]
-            elif state.calibration.intrinsicsRun and intrinsics_run.is_dir():
-                export_args += ["--carry-forward-intrinsics", str(intrinsics_run)]
+            carry_from = _intrinsics_carry_source(state, staged_intrinsics, intrinsics_run)
+            if carry_from is not None:
+                export_args += ["--carry-forward-intrinsics", str(carry_from)]
         elif staged_intrinsics is not None:
             pass  # copied into place after the export succeeds, below
         elif not keep_intrinsics_run:
