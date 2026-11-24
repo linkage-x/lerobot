@@ -5746,9 +5746,10 @@ def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypa
 
 
 def _refit_and_capture_export_args(
-    tmp_path: Path, monkeypatch, run_name: str, production_run: str = ""
+    tmp_path: Path, monkeypatch, run_name: str, production_run: str = "", bundle_args: list[str] | None = None
 ) -> list[str]:
-    """Run a re-fit solve to completion and hand back the export's argv."""
+    """Run a re-fit solve to completion and hand back the export's argv (and the bundle's, into
+    ``bundle_args``)."""
     state = _solve_state(tmp_path)
     state.calibration.intrinsicsRun = production_run
     state.calibration.state = "running"
@@ -5765,6 +5766,8 @@ def _refit_and_capture_export_args(
         if module.endswith("calibrate_extrinsics"):
             report.parent.mkdir(parents=True, exist_ok=True)
             report.write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}), encoding="utf-8")
+            if bundle_args is not None:
+                bundle_args.extend(args)
         if module.endswith("export_production_calibration"):
             export_args.extend(args)
         return subprocess.CompletedProcess(["python"], 0, "", "")
@@ -5795,13 +5798,31 @@ def test_a_refit_tells_the_exporter_to_keep_the_lenses_it_did_not_touch(tmp_path
     )
 
 
+def test_a_refit_solves_the_bundle_against_the_lenses_the_export_carries(tmp_path, monkeypatch):
+    """2026-11-24: cam_03 and cam_13 replaced and only they re-swept. The bundle got the two-camera report
+    alone, dropped every other camera's views and stopped at "Reference cam_14 never observed the board".
+    It must be handed the same carry-forward run as the export, so the rig is solved, and shipped, against
+    one set of lenses."""
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00", "cam_01"])
+    bundle: list[str] = []
+
+    export = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_e", "prod_intrinsics", bundle)
+
+    assert "--intrinsics-report" in bundle and "--carry-forward-intrinsics" in bundle
+    carried = bundle[bundle.index("--carry-forward-intrinsics") + 1]
+    assert carried == export[export.index("--carry-forward-intrinsics") + 1]
+    assert carried == str(tmp_path / "outputs" / "calibration" / "prod_intrinsics")
+
+
 def test_a_first_calibration_has_nothing_to_carry_forward(tmp_path, monkeypatch):
     """The flag names a run to copy out of, and the exporter refuses one that
     holds nothing. On a fresh rig there is no such run, so it must not be sent
     -- the refusal would land on an export that is perfectly correct."""
-    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_d")
+    bundle: list[str] = []
+    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_d", bundle_args=bundle)
 
     assert "--carry-forward-intrinsics" not in args
+    assert "--carry-forward-intrinsics" not in bundle
 
 
 def test_asking_to_refit_intrinsics_without_a_capture_is_refused_up_front(tmp_path, monkeypatch):
