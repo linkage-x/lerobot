@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>Monte02 左臂前置工作</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-soft:#eff6ff;
+    --ok:#15803d;--ok-bg:#ecfdf5;--warn:#b45309;--warn-bg:#fffbeb;--bad:#991b1b;--bad-bg:#fef2f2;--shadow:0 8px 24px rgba(15,23,42,.06)}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 16px 60px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:20px;padding:28px 32px;box-shadow:var(--shadow);margin-bottom:20px}
+  .hero h1{margin:0 0 8px;font-size:26px}
+  .hero p{margin:4px 0;color:#d1d5db}
+  .hero code{background:#374151;color:#e5e7eb}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2{margin:0 0 12px;font-size:20px}
+  h3{margin:16px 0 8px;font-size:16px}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:12px 16px;border-radius:10px;margin:10px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;white-space:nowrap}
+  td.id{font-weight:700;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+  .done{color:var(--ok);background:var(--ok-bg)} .warn{color:var(--warn);background:var(--warn-bg)} .bad{color:var(--bad);background:var(--bad-bg)}
+  .now{color:var(--accent);background:var(--accent-soft)}
+  .small{font-size:13px;color:var(--muted)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:1px 5px;font-size:.92em}
+  ul,ol{margin:6px 0;padding-left:22px} li{margin:3px 0}
+  pre{background:#f3f4f6;border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  nav a{color:var(--accent);text-decoration:none;margin-right:14px;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="hero">
+  <h1>Monte02 左臂前置工作</h1>
+  <p>v1.0 · 2026-11-24 · 目标：用<b>手持 BOX 左手采集器</b>录数据，在 <b>Monte02 左臂</b>上做 replay 和 rollout。Monte02 硬件还没到，本页列出现在就能做的事、要等硬件的事、要问厂家的事，并把两份厂家文档的要点整理在后面。</p>
+  <p>资料来源：厂家文档《Monte02 操作接口说明 V1.0》（68 页，SDK 1.2.0，2026-10-04）和《05_URDF 可视化配置上位机操作说明 1.3.0》（16 页）；本地模型 <code>~/Codes/box_cad/urdf/monte02_h_v1_description.urdf</code>（与 <code>~/Downloads/monte02_h_v1_description.zip</code> 只差网格路径，运动学相同）；从厂家 pip 源下载、解包但没有运行的 <code>robot_hardware_api-2.2.7</code> wheel；仓库现有的 FR3 链路。</p>
+  <p><b>11-24 更新：</b>排期和决策已移到 <code>docs/monte02_left_arm_roadmap.html</code>，本页保留为参考资料（SDK、上位机、运动学、问厂家）。已定：末端相机用新夹爪上的 GMSL2 相机，安装结构和 FR3 上一样（下文 M0.1 那几个选项作废，生成的 URDF 在 <code>third_party/opencv_kalibr/monte02_h_v1_description/</code>）；SDK 以同事说的 2.3.0 的实际行为为准，下文附 A 的 PDF 内容和附 B 的 2.2.7 实测都要按 2.3.0 复核。</p>
+  <p>与其它文档的关系：本页细化 <code>docs/dual_fr3_bimanual_replay_roadmap.html</code> 的 H 线（轮式人形），用到的输入规格见使用指南 §8（<code>tools/data_collection_gui/frontend/public/user_guide.html</code>）。</p>
+</div>
+
+<div class="card">
+  <nav><a href="#tldr">结论</a><a href="#iso">哪里同构、哪里不同</a><a href="#kin">左臂运动学</a><a href="#todo">前置清单</a><a href="#hw">硬件到货当天</a><a href="#ask">问厂家</a><a href="#sdk">SDK 要点</a><a href="#wheel">wheel 实测</a><a href="#zoo">URDF 上位机</a><a href="#safety">安全</a></nav>
+</div>
+
+<div class="card" id="tldr">
+  <h2>结论</h2>
+  <div class="callout ok"><b>这条路走得通，原因是末端同构。</b>手持采集器的末端，和 Monte02 手臂末端用的是同一套厂家模块：六维力 <code>link_l_sensor_ft</code>、夹爪 <code>gripper_w_v2</code>、指尖 <code>tip_ldt_2gripw_v1</code>（<code>box_cad/urdf/left_end.urdf</code> 就是 Monte02 左末端拆出来的那一段）。11-16 定的相对 TCP 规格（策略只看 <code>T_t⁻¹·T_{t+k}</code>，注册边不进控制回路）本来就不依赖哪台臂，换成 Monte02 时策略和训练代码都不用改，要改的是执行层。</div>
+  <div class="callout warn"><b>会卡住的四件事，现在就要开始：</b>
+    <ol>
+      <li><b>末端相机不一定同构。</b>策略的第一个输入是 <code>cam_10</code>：手持采集器上的相机，走 Thor 的 GMSL2，是 Thor 的一路通道。Monte02 腕部是 <code>tcam_s_v2</code> RGBD 模组，接在机器人自己的电脑上。两者的传感器、镜头、曝光、时间戳很可能都不一样，要决策（M0.1）。</li>
+      <li><b>腕部限位窄。</b>左臂 j6（腕 pitch）和 j7（腕 roll）只有 ±90°，FR3 的 j7 约 ±166°。人手持采集器时手腕常常转得很大，所以先拿现有左手数据离线算一遍可达性（M2.2），再决定怎么录。</li>
+      <li><b>臂的基座会动。</b>左臂基座 <code>link_l0_arm_base</code> 装在胸上，下面是腰的 3 个关节（膝 pitch、髋 pitch、腰 yaw），再往下是轮式底盘。replay 和 rollout 时这几个关节要锁在固定姿态，底盘要抱闸，每停一次车都要重新注册（M0.3、H 线 H2）。</li>
+      <li><b>SDK 只有 Python 3.10 的包。</b>厂家源上只有 <code>cp310</code> 的 wheel（2.2.6、2.2.7，分 x86_64 和 aarch64），Thor 的网关跑系统自带的 Python 3.12。Monte02 的执行层只能作为单独的 3.10 进程运行（M7.1）。</li>
+    </ol>
+  </div>
+  <div class="callout"><b>现在就能做、不需要硬件的</b>（详见<a href="#todo">前置清单</a>）：模型入库并加上和 FR3 同一个点的 <code>socket_ee</code>；不限臂型的 URDF 运动学；MuJoCo 模型和胶囊碰撞模型；拿现有左手数据扫腰姿态和停靠位做 IK QC；在本体描述文件和臂登记表里加 Monte02；按现有 <code>ArmIO</code> 协议写 <code>Monte02Arm</code> 适配器（只用假的 RobotLib 测）；夹爪、外力、触觉的单位映射；时钟对齐方案；把 Monte02 接进沙箱硬件守卫和硬件租约。硬件到货当天要做的检查也可以先把只读脚本写好。</div>
+</div>
+
+<div class="card" id="iso">
+  <h2>哪里同构、哪里不同（对比 FR3 现有链路）</h2>
+  <div class="scroll"><table>
+    <tr><th>项</th><th>FR3（现在）</th><th>Monte02 左臂</th><th>影响</th></tr>
+    <tr><td>末端（力传感器→夹爪→指尖）</td><td><code>link_sensor_ft</code> → <code>gripper_w_v2</code></td><td><code>link_l_sensor_ft</code> → 同款，指尖 <code>tip_ldt_2gripw_v1</code></td><td>同构。从 sensor_ft 到 TCP 的变换逐项相同（下节已数值核对）</td></tr>
+    <tr><td>TCP（训练标签的点）</td><td><code>corenetic_socket_ee</code>：插件 nov4 的球窝中心</td><td>URDF 里没有，要按同一个变换加上</td><td>M1.2</td></tr>
+    <tr><td>运动学</td><td>7 轴，DH（<code>fr3_kinematics.py</code>）</td><td>7 轴，URDF；肩 pitch 轴倾斜约 8°；腕 pitch/roll 各 ±90°</td><td>要一份不限臂型的 URDF 运动学（M1.3），可达性要重新评估（M2.2）</td></tr>
+    <tr><td>根（基座）</td><td>固定，每台一条静态注册边</td><td>底盘（会移动）→ 腰 3 关节 → 胸 → 臂基座</td><td>锁腰、抱闸；停靠时注册（H2）</td></tr>
+    <tr><td>控制</td><td>panda_py，机器人侧 1 kHz 控制线程，FCI</td><td>gRPC 客户端，<code>set_arm_servo_angle_j</code> 推荐客户端以 100–200 Hz 发送，底层不做规划</td><td>插值、限速都要在我们这边做；网络延迟和抖动要实测</td></tr>
+    <tr><td>状态时间戳</td><td>libfranka 自带</td><td>文档里的读取接口没有时间戳；wheel 里有推送回调，带 <code>timestamp_us</code>，只在 LOW_LATENCY 模式下有效</td><td>需要设计时钟对齐（M5.1）</td></tr>
+    <tr><td>夹爪 / 外力 / 触觉</td><td>臂上的 BOX，走 UDP</td><td>Monte02 SDK：<code>set_gripper_position</code>（m）、<code>get_force_sensor_data</code>、<code>get_gripper_touch_*</code></td><td>数据来源换了，语义要逐项对齐（M4）</td></tr>
+    <tr><td>末端相机</td><td><code>cam_10</code>，GMSL2，进 Thor</td><td><code>tcam_s_v2</code> RGBD（<code>link_lt_sensor_rgbd</code>），接机器人电脑</td><td><b>可能不同构</b>（M0.1）</td></tr>
+    <tr><td>独占</td><td>FCI 一次只允许一个连接</td><td>每个进程只能实例化一个 <code>Robot</code>，appName 不能重复；wheel 里有 <code>resource_acquire</code> 锁（other client 占用时报错）</td><td>和硬件租约一起设计（M6.1）</td></tr>
+    <tr><td>Python</td><td>.venv-fr3</td><td>只能用 3.10（<code>Requires-Python ==3.10.*</code>），还要系统里有 <code>libjsoncpp.so.25</code>、<code>libcurl.so.4</code></td><td>M7.1</td></tr>
+  </table></div>
+</div>
+
+<div class="card" id="kin">
+  <h2>左臂运动学（来自本地 URDF，标定状态 THEORY）</h2>
+  <div class="callout warn">本地 URDF 的 <code>robot_definition</code> 是 <code>arm02_h_l_v1</code>，但厂家上位机手册里的示例整机用的是“双臂 v2”，指尖是 <code>tip_s_2gripg_v2</code>。<b>实际到货那台装的哪一版臂、哪一款指尖还不知道。</b>下面的数字只能用来做离线评估。真正用来算 FK 的，必须是机器人上发布出来、按单台标定过的那份 URDF（见 <a href="#zoo">URDF 上位机</a>）。</div>
+  <div class="scroll"><table>
+    <tr><th>SDK id / 名称</th><th>URDF 关节</th><th>轴（父系）</th><th>限位 rad</th><th>速度 rad/s</th><th>力矩 N·m</th></tr>
+    <tr><td>6 left_arm_joint_1</td><td>joint_l1_shoulder_pitch</td><td>(0, −0.990, −0.139)</td><td>−2.618 … 3.142</td><td>2.09</td><td>66</td></tr>
+    <tr><td>7 left_arm_joint_2</td><td>joint_l2_shoulder_roll</td><td>(1, 0, 0)</td><td>−0.157 … 3.142</td><td>2.09</td><td>66</td></tr>
+    <tr><td>8 left_arm_joint_3</td><td>joint_l3_shoulder_yaw（下移 335 mm）</td><td>(0, 0, 1)</td><td>±2.618</td><td>3.14</td><td>49</td></tr>
+    <tr><td>9 left_arm_joint_4</td><td>joint_l4_elbow_pitch（偏 10 mm）</td><td>(0, −1, 0)</td><td>0.087 … 2.444</td><td>3.14</td><td>49</td></tr>
+    <tr><td>10 left_arm_joint_5</td><td>joint_l5_wrist_yaw（下移 231 mm）</td><td>(0, 0, 1)</td><td>±2.444</td><td>3.87</td><td>19</td></tr>
+    <tr><td>11 left_arm_joint_6</td><td>joint_l6_wrist_pitch</td><td>(0, −1, 0)</td><td><b>±1.571</b></td><td>3.87</td><td>19</td></tr>
+    <tr><td>12 left_arm_joint_7</td><td>joint_l7_wrist_roll（下移 78 mm）</td><td>(1, 0, 0)</td><td><b>±1.571</b></td><td>3.87</td><td>19</td></tr>
+  </table></div>
+  <ul>
+    <li><b>SDK 的关节号和 URDF 关节名的对应是按顺序推出来的</b>，零位和正方向是否一致没有核对过。硬件到了以后用 H-3 核对，核对之前不能把 SDK 角度直接代进我们的 FK。</li>
+    <li>腰（SDK id 1–3）：<code>joint_t1_knee_pitch</code>（−1.012…1.292）、<code>joint_t2_hip_pitch</code>（−1.710…1.937）、<code>joint_t3_waist_yaw</code>（±2.967）。头（id 4–5）：pitch、yaw。注意头、腰各自的接口用局部编号（头 1=pitch、2=yaw，腰 1=膝、2=腰 pitch、3=腰 yaw），全身接口用全局编号 1–19。</li>
+    <li>腰全部为零时，左臂基座在 <code>link_b0_base</code> 的 (−0.146, +0.220, +1.223) m；右臂基座在 y = −0.220。</li>
+    <li>从 sensor_ft 到 TCP：<code>link_l_sensor_ft</code> → <code>link_lt_gripper_base</code>（+13.75 mm，rpy π,0,π/2）→ <code>link_lt_gripper_tcp</code>（−135.99 mm，rpy π,0,0），和 FR3 夹爪 URDF 完全相同。<b>球窝点</b> = <code>link_lt_gripper_tcp</code> ∘ 平移 (−0.96, 2.06, 33.50) mm，轴向不变，在 sensor_ft 系里位于 z = 183.24 mm。用脚本把它和 FR3 的 <code>corenetic_socket_ee</code>（相对 <code>link_sensor_ft</code>）比，最大差 2×10⁻¹⁶。这组偏移是在 FR3 那只夹爪上 pivot 测出来的，Monte02 上要重新测一次（H-6）。</li>
+    <li>左手和右手的末端 URDF 只差 l/r 前缀，没有做镜像，所以左手采集器的标签可以直接对到左臂的同名 link。</li>
+    <li>腕部相机 <code>link_lt_sensor_rgbd</code> 在 sensor_ft 系里的位置是 (9.0, 89.1, 59.4) mm，光轴 (0, −0.574, 0.819)，也就是向夹爪方向倾斜约 35°。</li>
+    <li>粗略臂长：肩到肘 335 mm，肘到腕 231 mm，腕到 sensor_ft 146 mm，sensor_ft 到球窝 183 mm，从肩到 TCP 拉直约 0.90 m。</li>
+  </ul>
+</div>
+
+<div class="card" id="todo">
+  <h2>前置清单</h2>
+  <p class="small"><span class="badge now">现在</span> 不需要硬件　<span class="badge warn">决策</span> 需要老板或维护者拍板　<span class="badge bad">硬件</span> 要等 Monte02 到货，并且由人操作</p>
+
+  <h3>M0 · 先要定的事</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>事项</th><th>为什么 / 选项</th><th>状态</th></tr>
+    <tr><td class="id">M0.1</td><td>末端相机怎么做到同构</td><td>策略最先读的就是 <code>cam_10</code>。选项：(a) 在 Monte02 腕部装一只和手持采集器同款的 GMSL2 相机，位置也相同，线接到 Thor（要看线能不能拉过去，以及支架怎么做）；(b) 手持采集器改用 <code>tcam_s_v2</code>（之后所有录制都要换）；(c) 接受两边相机不一样，用增强去补（不推荐）。不管选哪个，都要先确认手持采集器上 cam_10 的实际型号和安装位置，再和 <code>link_lt_sensor_rgbd</code> 的位姿对比。<br/><b>11-24 已定：</b>用新夹爪上的 GMSL2 相机，安装结构和 FR3 上一样，<code>tcam_s_v2</code> 已从生成的左末端 URDF 里去掉。</td><td><span class="badge done">已定</span></td></tr>
+    <tr><td class="id">M0.2</td><td>Monte02 在哪里干活</td><td>策略除了 cam_10，还用 Thor 工位上的固定外部相机。Monte02 要停在 Thor 的相机覆盖区里，而且视角和录制时一样；做不到的话，训练时就去掉外部相机。</td><td><span class="badge warn">决策</span></td></tr>
+    <tr><td class="id">M0.3</td><td>腰和底盘怎么固定</td><td>建议：每个任务定一组固定的腰姿态（由 M2.2 选出来），执行期间不用 WBC（全身控制），底盘抱闸并去使能。这样臂基座在一次 session 里是刚性的，可以沿用“固定根”的那套代码。</td><td><span class="badge warn">决策</span></td></tr>
+    <tr><td class="id">M0.4</td><td>用哪个控制接口</td><td>建议：用我们自己的 IK，加 PCHIP 插值，通过 <code>set_arm_servo_angle_j</code> 以 100–200 Hz 发关节角，和 FR3 的做法一样，逐步检查才能在关节层做。厂家 IK（<code>set_arm_end_pose</code>）只拿来交叉核对。§8 要求“阻抗执行，不做纯位置跟踪”，Monte02 有导纳模式（组件控制模式 2），放到第二阶段评估。</td><td><span class="badge warn">决策</span></td></tr>
+  </table></div>
+
+  <h3>M1 · 模型与运动学</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M1.1</td><td>Monte02 描述文件入库（暂作占位）</td><td>把 <code>monte02_h_v1_description</code>（URDF、网格、robot_definition）放进 <code>third_party/opencv_kalibr/</code>，和 <code>corenetic_gripper_ldt_tip_description</code> 放在一起，README 写清来源、sha256（本地 URDF 是 <code>408e7a5d46a560ba…</code>）、THEORY、arm v1。真机的 URDF 到了以后替换，所有校验都绑这份文件的指纹。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M1.2</td><td>加上 <code>socket_ee</code></td><td>在左右末端各加一个和 FR3 <code>corenetic_socket_ee</code> 同一点的 frame（命名待定，例如 <code>l_corenetic_socket_ee</code>），同时加一项和 <code>rollout_relative_tcp</code> 一样的“轴向一致”检查，再加一个单元测试：相对 sensor_ft 的变换必须和 FR3 相同。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M1.3</td><td>不限臂型的 URDF 运动学</td><td>从 URDF 链直接算 FK、Jacobian、带限位的 IK、给胶囊模型用的 link 点。<code>fr3_kinematics.py</code> 是 DH 写死的，接口按它来（<code>fk</code> / <code>ik_retry</code> / <code>link_points</code>）。测试：在 FR3 的 URDF 上结果要和现有 DH 一致；在 Monte02 上要和 MuJoCo 的 FK 一致。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M1.4</td><td>MuJoCo 模型 + 胶囊碰撞模型</td><td>左臂可动，腰锁在参数给定的姿态，头、右臂、底盘当静止障碍物。姿态一律写四元数，不写 euler（MJCF 的 euler 和 URDF 的 rpy 约定不同，已经踩过）。人形要加<b>自碰撞</b>：臂和胸、头、右臂之间，这是 FR3 没有的。</td><td><span class="badge done">11-24 已做</span>（见 roadmap M1.4）</td></tr>
+    <tr><td class="id">M1.5</td><td>本体描述文件</td><td><code>tools/thor/gmsl2/embodiments/monte02_left.json</code>：根为底盘（kind 是浮动），腰关节每个 session 固定一次，注册方式是停靠注册，<code>arms.left.tcp_frame</code>，控制接口是 monte02_sdk。<code>embodiment/v1</code> 目前只支持 fixed 根，要扩展（H1）。</td><td><span class="badge done">已做</span>（见 roadmap M1.5）</td></tr>
+  </table></div>
+
+  <h3>M2 · 可达性与数据</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M2.1</td><td>清点已有的左手数据</td><td>用 <code>run/sandbox.sh thor datasets</code> 列出有左手标签的 session（rig v9b 的左手 target）。挑几段拷进自己的沙箱，不动生产数据。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M2.2</td><td>Monte02 左臂离线 IK QC，同时扫摆位</td><td>变量是腰 3 关节和停靠位（底盘在 world 里的 x、y、yaw），对每组取值算：能到达的帧占多少、离关节限位还有多少余量、哪个关节最先顶到限位（预计是腕 roll/pitch）、自碰撞。产出推荐的腰姿态和停靠位，以及一行 “Deployable on monte02_left”。复用 IK QC 的逐 episode 判定方式，注意别再掉进“逐帧 IK 种子假象”（10-26 的教训）。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M2.3</td><td>给录制者的约束</td><td>根据 M2.2 写出“在 Monte02 够得着的范围里录”的规则（腕部转角、工作区包络），以后再考虑在 GUI 上叠一层提示。不要用现有数据回推还没录的数据会怎样（见“离线重建的陷阱”）。</td><td><span class="badge now">现在</span>（等 M2.2）</td></tr>
+    <tr><td class="id">M2.4</td><td>速度</td><td>把人手轨迹换算成 Monte02 的关节速度，和限速（2.09 / 3.14 / 3.87 rad/s）比，用现有的 retime 逻辑看要拉长多少时间。</td><td><span class="badge now">现在</span></td></tr>
+  </table></div>
+
+  <h3>M3 · 执行层适配（只用假机器人）</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M3.1</td><td>臂登记表加入 Monte02</td><td><code>fr3_arms.json</code> 改成可以登记多种臂（加 <code>kind: fr3 | monte02</code>），或者另开一份 <code>robots.json</code>。Monte02 那一条写：SDK 地址（写进 <code>run/targets/</code>，不写进代码）、<code>component_type: 1</code>、唯一的 appName、腰姿态、起始关节角、夹爪由 SDK 驱动。“不指定臂就拒绝”的规则保留。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M3.2</td><td><code>Monte02Arm</code>（实现 <code>rollout_execute.ArmIO</code>）</td><td>流程：连接 → <code>resource_acquire</code> → 清错误码 → 使能 → mode 1 → state 0 → 以 100–200 Hz 发 <code>set_arm_servo_angle_j</code>。<b>厂家回答 Q1 之前，一律按最坏情况设计：<code>_j</code> 不做规划，会全速冲向目标。</b>每条指令在发出前都检查一遍，离当前测得的关节角不能超过每步上限（沿用 <code>Limits.step_joint_rad</code>），超了就拒绝并原地保持，永远不把远处的目标直接交给 <code>_j</code>；移到起点也走我们自己插值后的小步序列，不用低频接口“一步到位”。<code>set_arm_end_pose</code> 底层走的也是 <code>_j</code>，同样适用。状态从推送回调读（带 <code>timestamp_us</code>）；停机时原地保持，再按需软急停。去使能接口还没开放，所以不能把它当成停机手段。跑在单独的 Python 3.10 进程里，和网关之间用子进程通信（子进程 <code>stdin=DEVNULL</code>）。测试只用假的 RobotLib，假对象的 pid 必须是真整数。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M3.3</td><td>GUI 单臂 replay 支持 Monte02</td><td>IK QC 和 MuJoCo 两道门禁绑定 Monte02 模型的指纹；真机 replay 按钮仍然要过这两道门禁，并且必须由人启动。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M3.4</td><td>四元数顺序</td><td>SDK 的位姿是 <code>[x,y,z, w,x,y,z]</code>，我们的 <code>relative_tcp</code> 用 xyzw。只写一个转换函数，加测试，禁止在别处自己转。</td><td><span class="badge now">现在</span></td></tr>
+  </table></div>
+
+  <h3>M4 · 末端量映射</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M4.1</td><td>夹爪开度</td><td>策略输出 <code>gripper_width_m</code>，SDK 设置范围是 [0, 0.1] m，二代夹爪读回范围是 [0, 0.089] m（手持采集器实测全开 88.7 mm，对得上）。写映射和限幅；“position”到底是哪两点之间的距离，要等硬件核对（H-5）。旧 HIROL 代码里的上限是 0.074，那是旧款夹爪。</td><td><span class="badge now">现在</span> + <span class="badge bad">硬件</span></td></tr>
+    <tr><td class="id">M4.2</td><td>外力</td><td>Monte02 的六维力装在 <code>link_l_sensor_ft</code>，和手持采集器同一个位置。训练用的外力是 BOX 的 <code>f − K·acc − b</code>，而 SDK 有 raw 和 filtered 两种读数，厂家还有自己的零偏、负载补偿和 <code>get_external_force</code>。推荐读 raw，再用我们的 K 模型扣，和训练一致。K 的登记只能由人通过自助门禁完成。第一版策略先不用外力。</td><td><span class="badge now">现在</span>（方案）</td></tr>
+    <tr><td class="id">M4.3</td><td>触觉</td><td>SDK 每个夹爪 2 片贴片 × 9 点 × xyz。点序见手册 5.6.10 的图，还要和 BOX M2020 的点序对齐。M2020 的逐点数组有整片跳变的伪影，只能用两边都验证过的通道。第一版先不用。</td><td><span class="badge now">现在</span>（方案）</td></tr>
+  </table></div>
+
+  <h3>M5 · 时间与相机</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M5.1</td><td>时钟对齐方案</td><td>SDK 的 <code>timestamp_us</code> 用的是机器人的钟，图像的 SOF 用的是 Thor 的 CLOCK_MONOTONIC。按红线来：用 RTT 估偏移、拟合、超差就 warn，对齐方法写进执行记录的 meta；禁止静默拼接两个时间基。先写方案和代码，用假数据测，实测等 H-4。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M5.2</td><td>腕部相机接入</td><td>取决于 M0.1。如果用 tcam，要解决图像从机器人电脑传到推理端、时间戳、曝光和分辨率与录制一致这几件事。</td><td><span class="badge warn">决策</span> 之后</td></tr>
+    <tr><td class="id">M5.3</td><td>延迟预算</td><td>FR3 是机器人侧 1 kHz；Monte02 是客户端通过网络以 100–200 Hz 发指令。控制只走有线（192.168.11.3），禁止走无线。预算表现在就写，数字等实测。</td><td><span class="badge now">现在</span></td></tr>
+  </table></div>
+
+  <h3>M6 · 安全与门禁</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M6.1</td><td>沙箱守卫和硬件租约覆盖 Monte02</td><td>Monte02 的端点加进 <code>_sandbox_hardware_refusal</code> 的清单；硬件租约（<code>hardware_lease.py</code>）也要管住 Monte02；和 SDK 的 <code>resource_acquire</code> 锁对应起来。加 HTTP 级测试。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M6.2</td><td>分阶段、有人值守地执行</td><td>沿用 Rollout 页的三个阶段和确认对话框。启动前先查 <code>get_emergency_stop_state</code>；任何一项停机条件触发时原地保持，再调软急停。前几次试跑能不能用 DryRun（<code>set_run_mode(1)</code>），要先问清楚厂家它的语义（Q7）。</td><td><span class="badge now">现在</span></td></tr>
+    <tr><td class="id">M6.3</td><td>agent 红线扩展到 Monte02</td><td>提议把 <a href="#safety">安全</a> 一节的内容加进 <code>AGENTS.md</code> 第 4 节，由维护者决定。</td><td><span class="badge warn">决策</span></td></tr>
+    <tr><td class="id">M6.4</td><td>第二层保护</td><td>我们自己的工作空间、碰撞、限速检查是第一层；厂家的 <code>set_arm_closed_boundary</code>、<code>set_self_collision_distance</code>、关节碰撞力矩阈值是第二层。第二层由人配置，配置值记进登记表。</td><td><span class="badge now">现在</span>（方案）</td></tr>
+  </table></div>
+
+  <h3>M7 · 环境与部署</h3>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>工作</th><th>产出 / 退出条件</th><th>状态</th></tr>
+    <tr><td class="id">M7.1</td><td>Thor 上的 Python 3.10 环境</td><td>在独立目录用 uv 建 3.10 venv，装 <code>robot-hardware-api==2.2.7</code>（aarch64），检查 <code>libjsoncpp.so.25</code>、<code>libcurl.so.4</code> 在不在。<code>import RobotLib</code> 要能成功，但<b>不连接机器人</b>。连接时 SDK 会核对和控制器的版本是否兼容，所以版本号要钉死。这是给 Thor 加新依赖，按 AGENTS.md §6 先和维护者确认。</td><td><span class="badge now">现在</span>（问过维护者后）</td></tr>
+    <tr><td class="id">M7.2</td><td>网络规划</td><td>机器人 x86 默认地址 192.168.11.3:50051，和左 FR3（192.168.11.102）在同一个 /24 网段。要定地址，写进 target 文件；Thor 的网口配置已经很脆弱，改之前和维护者对一下。</td><td><span class="badge now">现在</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card" id="hw">
+  <h2>硬件到货当天（由人操作；agent 只事先写好只读脚本）</h2>
+  <div class="scroll"><table>
+    <tr><th>#</th><th>检查</th><th>做法</th><th>是否运动</th></tr>
+    <tr><td class="id">H-1</td><td>版本与身份</td><td><code>get_robot_device_info</code>、<code>get_module_version(0)</code>，记录 SN、各关节的模组 SN 和控制器版本，登记进臂登记表</td><td>否</td></tr>
+    <tr><td class="id">H-2</td><td>真机 URDF</td><td>从上位机（<code>http://&lt;上位机IP&gt;:18763</code>）的“发布结果”取 URDF、<code>robot_definition.yaml</code>、<code>calibration_status.yaml</code>，算指纹，确认左臂各部件是 CALIB，臂和指尖的版本以真机为准，并替换 M1.1 的占位文件</td><td>否</td></tr>
+    <tr><td class="id">H-3</td><td>SDK 角度和我们的 FK 对不对得上</td><td>人把臂切到关节拖动示教（mode 2），拖到 N 个姿态；脚本读 <code>get_arm_servo_angle</code>、<code>get_arm_end_pose</code>、<code>get_arm_end_pose_in_base</code>、<code>get_robot_joint_limit</code>，和我们的 URDF FK 比，搞清零位、正方向，以及 SDK 说的“末端”是哪个 link</td><td>人拖动</td></tr>
+    <tr><td class="id">H-4</td><td>时序</td><td>推送回调的实际频率和抖动、时钟偏移、指令到状态的延迟（最后一项要发指令，必须有人值守）。<b>同时确认 Q1：</b>人扶在急停上，单个腕关节发一个很小的阶跃（比如 0.02 rad），分别看 <code>_j</code> 和低频接口实际的速度曲线，判断到底是哪个接口在做规划，结论写进本页和执行代码</td><td>最后一项是</td></tr>
+    <tr><td class="id">H-5</td><td>末端量</td><td>夹爪开度范围和“position”的定义、静止时的六维力读数、触觉点序（人按压指定的点）</td><td>夹爪会动</td></tr>
+    <tr><td class="id">H-6</td><td>球窝 pivot</td><td>装 nov4 插件，在 Monte02 上做一次 pivot，核对球窝点在 sensor_ft 系里是否为 z = 183.24 mm</td><td>是</td></tr>
+    <tr><td class="id">H-7</td><td>停靠注册</td><td>H 线 H2：底盘或躯干上的 marker rig 加相机测 T_W_root，测重复性</td><td>底盘</td></tr>
+    <tr><td class="id">H-8</td><td>第一次运动</td><td>先做 MuJoCo 和 IK QC，再按阶段执行，有人扶在急停上</td><td>是</td></tr>
+  </table></div>
+</div>
+
+<div class="card" id="ask">
+  <h2>要问厂家的问题</h2>
+  <ol>
+    <li><b>Q1</b> 5.2.6 和 5.2.7 的标题与正文正好相反（<code>set_arm_servo_angle</code> 标题写“无规划”，正文说底层会再规划；<code>_j</code> 标题写“有规划”，正文说不规划、以最大速度和加速度到位）。哪个说法对？<code>_j</code> 如果一步跨得太大，是报错、截断还是硬跟？</li>
+    <li><b>Q2</b> <code>set_arm_servo_angle_j</code> 推荐用什么频率？有没有指令超时的看门狗，停止发送以后臂会怎样？</li>
+    <li><b>Q3</b> 怎么切到 LOW_LATENCY 工作模式？<code>timestamp_us</code> 用的是哪个钟，能不能和外部时钟同步（PTP/NTP）？</li>
+    <li><b>Q4</b> <code>get_arm_end_pose</code> 的“末端”是哪个 link？是否受 <code>set_tcp_offset</code> 影响？</li>
+    <li><b>Q5</b> SDK 关节角的零位和正方向，是否和发布的 URDF 里 <code>joint_l*</code> 一致？</li>
+    <li><b>Q6</b> 有多个客户端时（厂家 App 和我们）谁拥有控制权？<code>resource_acquire</code> 怎么用？急停以后锁会不会被清掉（<code>RESOURCE_ERROR_LOCKS_CLEARED_BY_SAFETY</code>）？</li>
+    <li><b>Q7</b> <code>set_run_mode(1)</code>（DryRun）是不是完全不驱动电机？这时候状态是仿真出来的吗？</li>
+    <li><b>Q8</b> <code>get_force_sensor_data</code> 是否已经去掉重力和零偏？<code>get_external_force</code> 是什么意思？文档标为 v2.3.0 的 <code>calib_force_sensor_bias</code> / <code>calib_force_bias_and_load</code> 在 2.2.7 的 wheel 里找不到，什么时候发布？</li>
+    <li><b>Q9</b> 夹爪 position 量的是哪两点之间的距离？二代上限 0.089 m；effort 的 0–20 档对应多大的力？</li>
+    <li><b>Q10</b> <code>get_gripper_touch_tac_data</code> 的点序；它和 BOX 的 M2020 是不是同一种传感器？</li>
+    <li><b>Q11</b> 腕部 <code>tcam_s_v2</code> 的传感器、分辨率、快门、时间戳是什么？能不能换成或加装 GMSL2 相机？</li>
+    <li><b>Q12</b> 臂运动时腰 3 关节的刚度怎样，能不能锁死？底盘抱闸以后，臂的反作用力会不会把底盘推动？</li>
+    <li><b>Q13</b> 臂去使能（<code>set_arm_enable(…, 0)</code>）还没开放，那平时怎么安全地让臂放松或断电？</li>
+    <li><b>Q14</b> 控制器地址能不能改到别的网段？</li>
+    <li><b>Q15</b> 有没有 Python 3.12 / aarch64 的 wheel 计划？</li>
+    <li><b>Q16</b> 到货那台装的是哪一版臂（v1 还是 v2）、哪一款指尖、哪一款相机？出厂时哪些部件已经标定（CALIB）？</li>
+  </ol>
+</div>
+
+<div class="card" id="sdk">
+  <h2>附 A · 《Monte02 操作接口说明 V1.0》要点</h2>
+  <h3>安装与连接</h3>
+  <ul>
+    <li>推荐 Ubuntu 22.04，依赖 gRPC。两种装法：一是 apt 装 deb 包（<code>corenetic-robot-hardware-api</code>，示例版本 2.2.6，装到 <code>/opt/corenetic/lib</code>，头文件 <code>robot_hardware_api.h</code>）；二是 pip 装 <code>robot-hardware-api</code>（源 <code>pypi.yuanluo.cloud</code>）。机器人本体上已经全局装好。</li>
+    <li><code>Robot("192.168.11.3:50051", appName, "")</code>：192.168.11.3 是机器人 x86 的有线地址，无线时换成无线地址。<b>每个进程只能实例化一个 Robot，appName 不能和别人重复。</b></li>
+    <li>控制臂之前固定要走这几步：使能（<code>set_arm_enable</code>）→ 设模式（<code>set_arm_mode</code>：1 伺服，2 关节拖动示教）→ 设状态（<code>set_arm_state</code>，Monte02 一律设 0）。</li>
+    <li><code>component_type</code>：1 左，2 右（<code>calib_force_bias_and_load</code> 里 5 表示双臂）。位姿都是 <code>[x,y,z, qw,qx,qy,qz]</code>，单位米。不带 <code>_in_base</code> 的是臂基座系，带的是机器人基座系；关节接口没有这个区分。</li>
+  </ul>
+  <h3>运动接口（全部会动臂，agent 不得调用）</h3>
+  <div class="scroll"><table>
+    <tr><th>接口</th><th>空间</th><th>规划</th><th>说明</th></tr>
+    <tr><td><code>set_arm_servo_angle(ct, q7, speed, acc, wait)</code></td><td>关节</td><td>底层规划</td><td>低频；speed/acc 只是上限</td></tr>
+    <tr><td><code>set_arm_servo_angle_j(ct, q7, …)</code></td><td>关节</td><td>不规划</td><td>高频伺服，要先切伺服模式；speed/acc/wait 目前无效，“以最大速度和加速度到位”</td></tr>
+    <tr><td><code>set_arm_end_pose(_in_base)(ct, pose)</code></td><td>笛卡尔</td><td>不规划</td><td>内部 IK 后调 <code>_j</code>；要求上层规划，100–200 Hz 调用，每步不能太大</td></tr>
+    <tr><td><code>set_arm_position(_in_base)(ct, pose, speed, acc, wait)</code></td><td>笛卡尔</td><td>规划</td><td>直线，速度 0.03–0.1 m/s；wait 取 0 或 2</td></tr>
+    <tr><td><code>set_arm_waypoint(ct, mode, wps, …, type, max_deviation)</code></td><td>关节或笛卡尔</td><td>规划</td><td>平滑路点；type 0 表示从当前位置起步</td></tr>
+    <tr><td><code>set_robot_servo_angle(q19, …)</code></td><td>全身 19 轴</td><td>规划</td><td>19 个值要一起给</td></tr>
+    <tr><td><code>set_trunk_* / set_head_*</code></td><td>腰 / 头</td><td>profile 或 servoJ</td><td>腰有 <code>set_trunk_joint_mode</code>（0 profile，1 servoJ）</td></tr>
+    <tr><td><code>set_chassis_velocity(v, w)</code></td><td>底盘</td><td>—</td><td>每次调用生效 1 s，调用频率至少 1 Hz，否则停车</td></tr>
+    <tr><td>导航 <code>start_navigation / navigate_to …</code></td><td>底盘</td><td>—</td><td><code>navi_mode</code> 2 表示看 AprilTag 精定位；回充 / 离桩</td></tr>
+  </table></div>
+  <h3>状态、夹爪、力、安全</h3>
+  <ul>
+    <li>读状态：<code>get_arm_servo_angle</code>、<code>get_arm_joint_state</code>（位置、速度、加速度、力矩各 7 个）、<code>get_joint_state(ids)</code>、<code>get_robot_joint_state</code>（19 个）、<code>get_arm_end_pose(_in_base)</code> / <code>get_arm_position(_in_base)</code>。文档里这些接口都没有时间戳。</li>
+    <li>夹爪：<code>set_gripper_enable</code>；<code>set_gripper_position</code>，范围 [0, 0.1] m；<code>get_gripper_position</code> 返回位置和电流力矩，一代范围 0–0.094，二代 0–0.089；<code>set_gripper_effort</code> 一代 0–15 N·m，二代 0–20 档；<code>find_gripper_home</code> 找零位，约 3 s，期间不能碰夹爪；触觉有 <code>calib_gripper_sensor</code>、<code>set_gripper_sensor_status</code>、<code>get_gripper_touch_net_data</code>（2 片的合力 xyz）、<code>get_gripper_touch_tac_data</code>（A、B 两片，每片 9 点 × xyz）。</li>
+    <li>六维力：<code>get_force_sensor_data</code> 和 <code>get_filtered_force_sensor_data</code> 给 [fx,fy,fz,mx,my,mz]；<code>get_force_sensor_wrench_bias</code> 只读 YAML 里存的零偏；<code>calib_force_sensor_bias</code> 要求静止、负载已经辨识过；<code>calib_force_bias_and_load</code> <b>会按配置执行默认动作，臂会动</b>。</li>
+    <li>安全：<code>set_soft_emergency_stop(1/0)</code>；<code>get_emergency_stop_state</code> 的位 0 是硬急停、位 1 是软急停；<code>get_arm_err_warn_code</code> / <code>clear_arm_err_warn_code</code>；<code>get_sys_err_warn_code</code> 在 2.3.0 上总是返回 False。组件控制模式（<code>set_component_control_mode</code>）：1 控制，2 导纳；大于 20 的模式由机器人自己切换，用户不能设。</li>
+  </ul>
+  <h3>文档里的错误与不一致（用的时候注意）</h3>
+  <ul>
+    <li>5.2.6 / 5.2.7 标题里的“有/无规划”和正文相反（见 Q1）。</li>
+    <li><code>set_arm_state</code> 每个示例都要调用，但接口章节没有它的说明。</li>
+    <li>版本号很乱：文档写 SDK 1.2.0（2026-10-04），apt 示例装 2.2.6，日志打印 API 2.2.0，pip 源上是 2.2.6 和 2.2.7，力传感器零偏接口标的是 v2.3.0。</li>
+    <li><code>get_gripper_touch_tac_data</code> 写着“大小 27x2”，实际是两片各 9 点 × 3 = 27 个值。<code>get_body_joint_state</code> 的示例给了 7 个值，但只有 5 个关节。</li>
+    <li>旧版 SDK（HIROLRobotPlatform 里 2025 年的那份）把清错误码的接口叫 <code>clean_arm_err_warn_code</code>，现在改名为 <code>clear_…</code>，按旧代码直接抄会出错。</li>
+  </ul>
+</div>
+
+<div class="card" id="wheel">
+  <h2>附 B · 2.2.7 wheel 实测（解包看字符串，没有运行）</h2>
+  <p class="small">做法：从 <code>pypi.yuanluo.cloud/simple/robot-hardware-api/</code> 下载 <code>robot_hardware_api-2.2.7-cp310-cp310-linux_x86_64.whl</code>，解压后用 <code>strings</code> 看 <code>RobotLib.cpython-310-x86_64-linux-gnu.so</code> 里的接口名和 docstring。和 BOX SDK 的经验一样，二进制才是真相。源上一共只有 4 个包：2.2.6、2.2.7，各有 x86_64 和 aarch64，全是 cp310。</p>
+  <ul>
+    <li><b>METADATA：</b><code>Requires-Python: ==3.10.*</code>；导入方式 <code>from RobotLib import Robot</code>；目标机器上要有 <code>libjsoncpp.so.25</code> 和 <code>libcurl.so.4</code>。</li>
+    <li><b>推送回调（文档没写，对时间对齐最关键）：</b><code>set_joint_state_callback</code>，回调参数 <code>(position, velocity, acceleration, torque, timestamp_us)</code>；<code>set_arm_end_pose_callback</code>，<code>rate_hz</code> 范围 1–100；<code>set_force_sensor_callback</code>；<code>set_gripper_state_callback</code>；<code>set_emergency_stop_callback</code>；<code>set_commanded_state_callback</code>，回调带 <code>cmd_timestamp_us</code>，<code>rate_hz</code> 最高 1000。除急停回调以外，都写着“只在 WORK_MODE_LOW_LATENCY 下有效”（连接日志里默认显示的是 <code>WORK_MODE: NORMAL</code>）。另外还有 <code>get_arm_end_pose_with_timestamp</code>。</li>
+    <li><b>资源锁：</b><code>resource_acquire</code>、<code>resource_release</code>、<code>resource_query_status</code>，错误码有 <code>CALLER_CONFLICT</code>、<code>NOT_ACQUIRED_FOR_COMMAND</code>、<code>DOMAIN_HELD_BY_OTHER_CLIENT</code>、<code>LOCKS_CLEARED_BY_SAFETY</code>。</li>
+    <li><b>运行模式：</b><code>set_run_mode</code>（0 真机，1 DryRun，要先拿到 body 的资源锁）、<code>get_run_mode</code>、<code>is_dry_run</code>。</li>
+    <li><b>运动学和坐标系：</b><code>get_arm_end_pose_by_fk</code>、<code>get_arm_joint_state_by_ik</code>、<code>inverse_kinematics_arm_in_base</code>、<code>get_robot_joint_limit</code>、<code>get_tf_transform</code>、<code>get_robot_tf_transform</code>、<code>add_tf_frame</code>、<code>set_tcp_offset</code>、<code>set_tcp_load</code>。这些在 H-3 做交叉核对时有用。</li>
+    <li><b>保护：</b><code>set_arm_closed_boundary</code>（臂工作空间边界）、<code>set_self_collision_distance</code>、<code>set_environment_collision_distance</code>、<code>set_joint_collision_detection_*</code>、<code>get_last_collision_feedback</code>、<code>get_last_joint_limit_feedback</code>。</li>
+    <li><b>会动臂、或者会改机器人配置的（agent 一律不碰）：</b><code>start_load_identification</code>、<code>start_online_load_identification</code>（默认 300 s）、<code>start_friction_identification</code>（约 2 h）、<code>start_batch_friction_identification</code>（约 8 h）、<code>set_zero_force_drag_mode</code>、<code>set_wbc_*</code> 和 <code>set_track_wbc_*</code>、<code>execute_urdf_fusion</code>、<code>change_end_effector_device</code>、<code>set_robot_home_pose</code>、<code>set_robot_power_on</code>。</li>
+    <li>没有找到：<code>calib_force_sensor_bias</code>、<code>calib_force_bias_and_load</code>（文档标的是 v2.3.0）。</li>
+  </ul>
+</div>
+
+<div class="card" id="zoo">
+  <h2>附 C · 《URDF 可视化配置上位机 1.3.0》（Modeling Zoo）要点</h2>
+  <ul>
+    <li>用途：在厂家的上位机上，按模块（躯干、左右臂、TCAM 相机、TOOL 夹爪、TIP 指尖，QCHG 快换可以不装）拼出整机 URDF，合入单台的标定，再发布到机器人用的目录。用浏览器打开 <code>http://&lt;上位机IP&gt;:18763</code>。“机器人名称”决定包名，例如 <code>monte02_h_v1_description</code>，网格路径写成 <code>package://monte02_h_v1_description/…</code>。</li>
+    <li>操作顺序：选模块 → 用系统密码解锁（默认用户 <code>corenetic</code>）→ 保存并融合（产物在工作目录）→ 检查结果 → 发布（<b>只拷贝文件，不重新融合</b>）→ 检查发布结果。</li>
+    <li>相关路径（以界面上“配置来源”显示的为准）：整机配置 <code>…/modeling_zoo/tools/config/robot_definition.yaml</code>，流水线配置 <code>…/step02_create_complete_urdf/pipeline_config.yaml</code>，标定状态 <code>/home/corenetic/robot_workspace/config/calibration/calibration_status.yaml</code>。</li>
+    <li>标定合入：<code>calib_files</code>、<code>calib_file</code>、<code>calib_dir</code> 三选一；多文件只能在高级 YAML 里配。<code>merge_calib_files.py</code> 会核对部件位置、完整型号 <code>metadata.component_model_id</code>（比如 <code>tcam_s_v1</code> 和 <code>tcam_s_v2</code> 算不同）、关节名和数值参数。</li>
+    <li>结果的含义：<b>CALIB</b> 表示这个部件的标定合并成功了，<b>但不代表精度已经核实</b>；<b>THEORY</b> 表示用的是理论参数，标定没有生效；“退出码 0”只说明进程正常结束；“发布一致”只说明工作区和发布目录的文件相同。<b>这三样都不能当成“标定正确”。</b>状态文件里留着的旧 CALIB，也不能证明这一次融合成功了。</li>
+    <li>对我们的意义：
+      <ul>
+        <li>我们的 FK 必须用机器人上<b>发布出来</b>的那份 URDF，并且记下它的指纹，以及每个部件是 CALIB 还是 THEORY（H-2）。<code>box_cad</code> 里那份是 THEORY，只能当占位。</li>
+        <li>末端换了东西（装 pivot 插件、加 GMSL2 相机支架、换指尖），都要先有对应的模块，再重新融合。这一步由厂家或维护者在上位机上做，agent 不做；SDK 里的 <code>execute_urdf_fusion</code> 也一样不碰。</li>
+        <li>提议的门禁（由维护者决定）：左臂链上只要有部件是 THEORY，或者 URDF 指纹和登记的不一致，就拒绝真机 replay 和 rollout。</li>        <li><b>11-24 重新评估：</b>上位机本身不做标定，只是拼模块、合并已有的单台标定文件（关节的 xyz/rpy），惯量还是模块理论值，所以称重（T1′）不能省。TCAM/TOOL/TIP 必选而库里没有 GMSL2 支架，因此流程定为：发布的 URDF → <code>build_gmsl2cam_urdf.py</code> → <code>build_mjcf.py</code> → 胶囊重拟合 → 本体文件、白名单重新验证。CALIB 的精度由我们用相机跟踪 rig 和 pivot 自己核。详见 roadmap H-2。</li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<div class="card" id="safety">
+  <h2>安全（提议加进 AGENTS.md 第 4 节，由维护者决定）</h2>
+  <div class="callout bad">
+    <ul>
+      <li>agent 不调用 Monte02 任何会动的接口：<code>set_arm_*</code>（包括 servo、end_pose、position、waypoint）、<code>set_robot_servo_angle*</code>、<code>set_trunk_*</code>、<code>set_head_*</code>、<code>set_gripper_position</code>、<code>find_gripper_home</code>、<code>set_chassis_*</code>、导航和回充、各类辨识、<code>calib_force_bias_and_load</code>、<code>set_zero_force_drag_mode</code>、WBC，也不解除急停、不切换 <code>set_run_mode</code>。</li>
+      <li>只读接口也要先问：每个进程只能有一个 <code>Robot</code>，还有资源锁，agent 一连上去，就可能把正在操作的人挤掉或者和他冲突。有人在用机器人的时候，agent 不连接。</li>
+      <li>不改上位机的模块配置、标定文件和发布目录，不触发融合，也不改 <code>calibration_status.yaml</code>。</li>
+      <li>真机 replay 和 rollout 沿用现在的规矩：先过 MuJoCo 和 IK QC，由人在页面上确认启动，人扶在急停上；沙箱和租约的守卫不能绕开。</li>
+    </ul>
+  </div>
+</div>
+
+<p class="small">维护：Monte02 到货、厂家回答问题、或者上面的决策定下来以后，更新本页，并在 <code>docs/dual_fr3_bimanual_replay_roadmap.html</code> 的 H 线同步状态。</p>
+
+</div>
+</body>
+</html>

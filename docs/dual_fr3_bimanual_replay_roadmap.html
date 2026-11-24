@@ -169,6 +169,7 @@
 <div class="card">
   <h2>H 线 · 轮式人形（10-23 确认可移动；硬件到之前只做设计）</h2>
   <div class="callout">和双 FR3 相比，难点从「两台 base 之间」挪到了「底盘在 world 里在哪」：两手之间靠自身运动链，而底盘每停一次都要重新注册。建议先只做<b>停靠操作</b>（开到位、停稳、再操作），边走边操作放到后面。</div>
+  <div class="callout">11-24：人形确定为 Monte02（源络，轮式，腰 3 轴，两臂各 7 轴，末端和手持采集器同构）。先做“左手采集器 → Monte02 左臂”这一条：厂家 SDK、URDF 上位机的要点和现在能做的前置工作见 <code>docs/monte02_left_arm_prep.html</code>，Q7 的大部分问题在那里有答案。</div>
   <div class="scroll"><table>
     <tr><th>#</th><th>工作</th><th>做法</th><th>退出条件 / 产物</th><th>状态</th></tr>
     <tr><td class="id">H1</td><td>本体描述</td><td>用 G1 的格式描述：轮式底盘根 + 升降/腰（如有）+ 两臂 + 夹爪 TCP。注册方式写成「停靠后由相机测 T_W_root」。</td><td>retarget / 仿真 / runtime 不改代码就能读</td><td><span class="badge warn">看 Q7</span></td></tr>

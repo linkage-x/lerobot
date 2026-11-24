@@ -15,6 +15,22 @@ that in exactly the things this file names:
   holds its controller settings (IP, gripper BOX, URDF). The config file stays the one place for those;
   this file only points at it, so the two cannot disagree.
 
+A robot whose arm hangs on a body (Monte02, docs/monte02_left_arm_roadmap.html M1.5) says three more things,
+each checked against its URDF when given:
+
+* ``kinematics`` -- the URDF, the link the chain starts at (the root's ``link``) and the TCP link (its name
+  ends in ``tcp_frame``, the point the arm's FK and the labels share);
+* ``free_joints`` / ``session_locked_joints`` -- the joints the arm moves, and the ones set once per session
+  and held (the waist, the head, the other arm). Every moving joint between the root link and the TCP must be
+  one or the other: a joint nobody named would be silently taken at zero. The locked values are the
+  session's, not the description's;
+* ``collision`` -- the self-collision model fitted to that URDF; ``control`` -- the controller kind.
+
+Such a robot is ``mobile``: it drives between sessions and is registered when it stops (``session_edge``).
+A dataset is never re-expressed into a mobile root -- its frame is a different place after every docking --
+so its ``dataset_frame`` is ``auto``: the camera world the episodes were recorded in (what export keeps since
+11-10).
+
 A dataset is exported in one frame (``dataset_frame``: ``fr3_base``, the registered arm's base -- the left
 arm's since 10-26), both hands together, so ``T_LR = inv(T_L) T_R`` stays a product of two columns of one
 file. Getting the other hand's target into the other arm's base is the replay's job, through the graph (:func:`arm_transform`), and the
@@ -28,6 +44,7 @@ from __future__ import annotations
 
 import json
 import sys
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -44,6 +61,10 @@ EMBODIMENT_DIR = Path("tools") / "thor" / "gmsl2" / "embodiments"
 REGISTRATIONS = ("static_edge", "session_edge", "tracked")
 ROOT_KINDS = ("fixed", "mobile")
 HANDS = ("left", "right")
+CONTROLS = ("libfranka", "monte02_sdk")
+#: ``dataset_frame`` of a robot with no root a dataset can live in: the camera world it was recorded in.
+DATASET_FRAME_RECORDED = wp.TARGET_WORLD_AUTO
+_MOVING_JOINTS = ("revolute", "continuous", "prismatic")
 
 
 class EmbodimentError(ValueError):
@@ -72,8 +93,16 @@ def validate(description: Mapping[str, Any], *, repo_root: Path | str = _REPO_RO
             problems.append(
                 f"root {name}: a mobile root cannot hold a static edge; it moves between sessions"
             )
-    if str(description.get("dataset_frame") or "") not in roots:
-        problems.append(f"dataset_frame {description.get('dataset_frame')!r} is not one of the roots")
+    dataset_frame = str(description.get("dataset_frame") or "")
+    if dataset_frame != DATASET_FRAME_RECORDED and dataset_frame not in roots:
+        problems.append(
+            f"dataset_frame {description.get('dataset_frame')!r} is not one of the roots nor {DATASET_FRAME_RECORDED!r}"
+        )
+    elif isinstance(roots.get(dataset_frame), Mapping) and roots[dataset_frame].get("kind") == "mobile":
+        problems.append(
+            f"dataset_frame {dataset_frame} is a mobile root, a different place after every docking; "
+            f"use {DATASET_FRAME_RECORDED!r} (the camera world of the recording)"
+        )
     arms = description.get("arms")
     if not isinstance(arms, Mapping) or not arms:
         return [*problems, "no arms"]
@@ -100,6 +129,71 @@ def validate(description: Mapping[str, Any], *, repo_root: Path | str = _REPO_RO
         config = str(arm.get("replay_config") or "")
         if config and not (Path(repo_root) / config).is_file():
             problems.append(f"arm {name}: replay_config {config} does not exist")
+        if "control" in arm and arm.get("control") not in CONTROLS:
+            problems.append(f"arm {name}: control {arm.get('control')!r} not one of {CONTROLS}")
+        collision = str(arm.get("collision") or "")
+        if collision and not (Path(repo_root) / collision).is_file():
+            problems.append(f"arm {name}: collision {collision} does not exist")
+        root = roots.get(str(arm.get("root") or ""))
+        problems += [f"arm {name}: {p}" for p in _kinematics_problems(arm, root, Path(repo_root))]
+    return problems
+
+
+def _kinematics_problems(arm: Mapping[str, Any], root: Any, repo_root: Path) -> list[str]:
+    """What is wrong with an arm's ``kinematics`` / ``free_joints`` / ``session_locked_joints`` against its URDF."""
+    kinematics = arm.get("kinematics")
+    locked = arm.get("session_locked_joints") or []
+    free = arm.get("free_joints") or []
+    if kinematics is None:
+        return ["free_joints / session_locked_joints need kinematics"] if locked or free else []
+    if not isinstance(kinematics, Mapping):
+        return ["kinematics: not an object"]
+    urdf = repo_root / str(kinematics.get("urdf") or "")
+    if not urdf.is_file():
+        return [f"kinematics: urdf {kinematics.get('urdf')} does not exist"]
+    try:
+        tree = ET.parse(urdf).getroot()
+    except ET.ParseError as exc:
+        return [f"kinematics: urdf {kinematics.get('urdf')} does not parse: {exc}"]
+    links = {link.get("name") for link in tree.iter("link")}
+    joints: dict[str, str] = {}
+    up: dict[str, tuple[str, str]] = {}  # child link -> (joint, parent link)
+    for joint in tree.iter("joint"):
+        joints[str(joint.get("name"))] = str(joint.get("type"))
+        up[str(joint.find("child").get("link"))] = (str(joint.get("name")), str(joint.find("parent").get("link")))
+    problems: list[str] = []
+    base, tcp = str(kinematics.get("base_link") or ""), str(kinematics.get("tcp_link") or "")
+    for key, link in (("base_link", base), ("tcp_link", tcp)):
+        if link not in links:
+            problems.append(f"kinematics: {key} {link!r} is not a link of {kinematics.get('urdf')}")
+    if isinstance(root, Mapping) and root.get("link") and root.get("link") != base:
+        problems.append(f"kinematics: base_link {base} is not the root's link {root.get('link')}")
+    if not tcp.endswith(str(arm.get("tcp_frame") or "")):
+        problems.append(f"kinematics: tcp_link {tcp} is not the tcp_frame {arm.get('tcp_frame')}")
+    for kind, names in (("free", free), ("session-locked", locked)):
+        for joint in names:
+            if joints.get(joint) not in _MOVING_JOINTS:
+                problems.append(f"{kind} joint {joint} is not a moving joint of {kinematics.get('urdf')}")
+    if both := sorted(set(free) & set(locked)):
+        problems.append(f"joints both free and session-locked: {', '.join(both)}")
+    if problems:
+        return problems
+    path: list[str] = []
+    link = tcp
+    while link != base:
+        if link not in up:
+            return [f"kinematics: tcp_link {tcp} does not hang below base_link {base}"]
+        joint, link = up[link]
+        if joints[joint] in _MOVING_JOINTS:
+            path.append(joint)
+    if unnamed := [j for j in reversed(path) if j not in free and j not in locked]:
+        problems.append(
+            f"moving joints between {base} and {tcp} neither free nor session-locked: {', '.join(unnamed)}"
+        )
+    if off := [j for j in free if j not in path]:
+        problems.append(f"free joints not between {base} and {tcp}: {', '.join(off)}")
+    elif [j for j in reversed(path) if j in free] != list(free):
+        problems.append(f"free joints not in chain order from {base}: {', '.join(free)}")
     return problems
 
 

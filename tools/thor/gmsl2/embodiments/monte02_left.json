@@ -1,0 +1,38 @@
+{
+  "schema": "embodiment/v1",
+  "name": "monte02_left",
+  "description": "Monte02's left arm on its wheeled body, replaying the left hand of BOX recordings (docs/monte02_left_arm_roadmap.html, M1.5). The gripper is the BOX's, moved over with its BOX (D2): its opening, force and touch come from the BOX, not from the robot. The chassis drives between sessions and is registered when it docks (session_edge, H2: a marker rig on the body, measured after the brakes are on); that registration does not exist yet, so absolute replay is refused. The waist, the head and the right arm are set once per session and held (session_locked_joints); their values are the session's, chosen by M2.2' within the T2 anti-tip whitelist -- the wheels and the body never move together. Datasets stay in the camera world they were recorded in. Not in service: no replay_config until the Monte02Arm adapter (M3.2); the URDF is the vendor's theory v1 with our GMSL2 camera, to be replaced by the one the robot's host publishes.",
+  "dataset_frame": "auto",
+  "roots": {
+    "monte02_base": {
+      "kind": "mobile",
+      "registration": "session_edge",
+      "link": "link_b0_base",
+      "definition": "Monte02 chassis frame (URDF link_b0_base): on the floor, +x forward, +z up"
+    }
+  },
+  "arms": {
+    "left": {
+      "root": "monte02_base",
+      "hands": ["left"],
+      "tcp_frame": "corenetic_socket_ee",
+      "control": "monte02_sdk",
+      "kinematics": {
+        "urdf": "third_party/opencv_kalibr/monte02_h_v1_description/urdf/monte02_h_v1_gmsl2cam.urdf",
+        "base_link": "link_b0_base",
+        "tcp_link": "lt_corenetic_socket_ee"
+      },
+      "free_joints": [
+        "joint_l1_shoulder_pitch", "joint_l2_shoulder_roll", "joint_l3_shoulder_yaw", "joint_l4_elbow_pitch",
+        "joint_l5_wrist_yaw", "joint_l6_wrist_pitch", "joint_l7_wrist_roll"
+      ],
+      "session_locked_joints": [
+        "joint_t1_knee_pitch", "joint_t2_hip_pitch", "joint_t3_waist_yaw",
+        "joint_h1_pitch", "joint_h2_yaw",
+        "joint_r1_shoulder_pitch", "joint_r2_shoulder_roll", "joint_r3_shoulder_yaw", "joint_r4_elbow_pitch",
+        "joint_r5_wrist_yaw", "joint_r6_wrist_pitch", "joint_r7_wrist_roll"
+      ],
+      "collision": "third_party/opencv_kalibr/monte02_h_v1_description/mjcf/monte02_capsules.json"
+    }
+  }
+}
