@@ -20,6 +20,7 @@ import type {
   ProcessingItem,
   ProcessingStatus,
   TrackingTarget,
+  MarkerRig,
   RecordedDataset,
   RecordingStatus,
   ReplayStatus,
@@ -100,6 +101,8 @@ export type GuiSnapshot = {
   calibrationSession?: CalibrationSession;
   trackerMountSession?: TrackerMountSession;
   markerTcp?: MarkerTcpSession;
+  /** Marker rigs the gateway can track and solve pivots on; absent from a gateway older than the registry. */
+  markerRigs?: MarkerRig[];
   datasetExport: DatasetExportStatus;
   /** world_graph.json against the graph this machine last trusted (outputs/world_graph_guard.json). */
   worldGraphGuard?: WorldGraphGuard;

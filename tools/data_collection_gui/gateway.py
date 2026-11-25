@@ -112,30 +112,52 @@ DEFAULT_EE_TRAJECTORY_CONFIG = Path(
 HYBRID_CARRIER_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/hybrid_carrier_tracking_in_robot_base_thor.yaml"
 )
-# Gripper-holder V3 marker rig (v9b, ArUco DICT_6X6_250 ids 106-109). Its corner
-# table and rig->TCP bundle are generated from the CAD descriptor and the measured
-# socket centre by metrology.cli.export_marker_rig_layout; the config names both.
-GRIPPER_RIG_V9B_TARGET = "gripper_rig_v9b"
-GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG = Path(
-    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_tracking_in_robot_base_thor.yaml"
-)
-# The same holder on the right hand-held gripper (BOX 3906437858), ids 100/101/110/111,
-# target `right`; its own corner table (pads from the 11-09 paste check) and bundle (TCP
-# from its own 11-09 pivots, the mean of two recordings 0.35 mm apart, validated).
-GRIPPER_RIG_V9B_RIGHT_TARGET = "gripper_rig_v9b_right"
-GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG = Path(
-    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_right_tracking_in_robot_base_thor.yaml"
-)
-# The colleague's holder V12 (夹爪支架V12.STEP) replaced v9b on the left hand-held gripper
-# (BOX 3969377039) on 2026-11-25: four 58 mm pads level with the FT sensor, ids 102-105, the same
-# link_sensor_ft frame as v9b; TCP from two 11-25 pivots 0.77 mm apart (validated). Both bundles
-# name that BOX, so each target says from when its rig was on it (see _marker_tcp_rig_for_box).
-GRIPPER_RIG_V12_TARGET = "gripper_rig_v12"
-GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG = Path(
-    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v12_tracking_in_robot_base_thor.yaml"
-)
-# The first recording with V12 on BOX 3969377039 (thor_gmsl2_9ch_v1_20261125_144305 ep0).
-GRIPPER_RIG_V12_MOUNTED_FROM_UTC = "2026-11-25T06:49:14Z"
+# Marker rigs on the hand-held grippers (v9b left/right, V12, ...) are listed in one registry in
+# the kalibr submodule, next to their corner tables and bundles; metrology.cli.swap_marker_rig
+# adds a rig there, so a new rig needs no change here or in the frontend. Each entry names its
+# tracking config, the BOX it is on and since when (one BOX carries different rigs over time).
+MARKER_RIG_REGISTRY = Path("third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/marker_rigs.json")
+MARKER_RIG_ALGORITHM = "marker_layout_rig_corner_ba"
+_MARKER_RIG_TARGET_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _load_marker_rigs(path: Path) -> list[dict[str, Any]]:
+    """The registry's rigs, each checked; a broken entry is dropped with a warning, never guessed."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] marker rig registry {path} unreadable ({exc}); no marker rig targets", file=sys.stderr)
+        return []
+    rigs: list[dict[str, Any]] = []
+    for raw in doc.get("rigs") if isinstance(doc, dict) and isinstance(doc.get("rigs"), list) else []:
+        target = str(raw.get("target") or "") if isinstance(raw, dict) else ""
+        config = str(raw.get("config") or "") if isinstance(raw, dict) else ""
+        if (
+            not _MARKER_RIG_TARGET_RE.match(target)
+            or target in ("april_cube", "hybrid_carrier_v1")
+            or not config.endswith(".yaml")
+            or ".." in Path(config).parts
+            or raw.get("hand") not in ("left", "right")
+            or any(r["target"] == target for r in rigs)
+        ):
+            print(f"[WARN] marker rig registry {path}: skipping entry {raw!r}", file=sys.stderr)
+            continue
+        rigs.append({
+            "target": target,
+            "hand": raw["hand"],
+            "device_id": str(raw.get("device_id") or ""),
+            "marker_ids": [int(m) for m in raw.get("marker_ids") or []],
+            "config": MARKER_RIG_REGISTRY.parent.parent / config,
+            "mounted_from_utc": str(raw.get("mounted_from_utc") or ""),
+            "label": str(raw.get("label") or target),
+            "title": str(raw.get("title") or raw.get("label") or target),
+            "description": str(raw.get("description") or ""),
+            "pivot_note": str(raw.get("pivot_note") or ""),
+        })
+    return rigs
+
+
+MARKER_RIGS = _load_marker_rigs(Path(__file__).resolve().parents[2] / MARKER_RIG_REGISTRY)
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -155,29 +177,20 @@ TRACKING_TARGETS = {
         "config": HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
         "algorithm": "hybrid_carrier_v1_anchors_facets",
     },
-    GRIPPER_RIG_V9B_TARGET: {
-        "label": "Gripper Rig v9b left (ArUco 106-109)",
-        "config": GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
-        "algorithm": "marker_layout_rig_corner_ba",
-    },
-    GRIPPER_RIG_V9B_RIGHT_TARGET: {
-        "label": "Gripper Rig v9b right (ArUco 100/101/110/111)",
-        "config": GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
-        "algorithm": "marker_layout_rig_corner_ba",
-    },
-    GRIPPER_RIG_V12_TARGET: {
-        "label": "Gripper Rig V12 left (ArUco 102-105)",
-        "config": GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG,
-        "algorithm": "marker_layout_rig_corner_ba",
-        "mounted_from_utc": GRIPPER_RIG_V12_MOUNTED_FROM_UTC,
+    **{
+        rig["target"]: {
+            "label": rig["label"],
+            "config": rig["config"],
+            "algorithm": MARKER_RIG_ALGORITHM,
+            "mounted_from_utc": rig["mounted_from_utc"],
+        }
+        for rig in MARKER_RIGS
     },
 }
 # Rigs the marker->TCP pivot solve accepts. The cube's corner table is resolved
 # from the production cube template; a layout rig ships its own table, its own
 # dictionary and its own CAD bundle, all named by its tracking config.
-MARKER_TCP_RIGS = (
-    DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET, GRIPPER_RIG_V9B_RIGHT_TARGET, GRIPPER_RIG_V12_TARGET,
-)
+MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, *(rig["target"] for rig in MARKER_RIGS))
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -6299,9 +6312,7 @@ _TRACKING_CONFIG = (
 # _TRACKING_CONFIG points at; they are never the authority on what is live.
 _FOLLOWER_TRACKING_CONFIGS = (
     HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
-    GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
-    GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
-    GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG,
+    *(rig["config"] for rig in MARKER_RIGS),
 )
 
 
@@ -7647,6 +7658,35 @@ def _utc_or_none(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _marker_rigs_payload() -> list[dict[str, Any]]:
+    """The registry's rigs for the GUI, each with the time it was on its BOX until (the next rig's start)."""
+    out = []
+    for rig in MARKER_RIGS:
+        since = _utc_or_none(rig["mounted_from_utc"]) if rig["mounted_from_utc"] else None
+        later = [
+            (_utc_or_none(other["mounted_from_utc"]), other["target"])
+            for other in MARKER_RIGS
+            if other is not rig and other["device_id"] == rig["device_id"] and rig["device_id"]
+            and other["mounted_from_utc"] and _utc_or_none(other["mounted_from_utc"]) is not None
+        ]
+        later = [(t, name) for t, name in later if since is None or t > since]
+        until, replaced_by = min(later) if later else (None, "")
+        out.append({
+            "target": rig["target"],
+            "hand": rig["hand"],
+            "deviceId": rig["device_id"],
+            "markerIds": rig["marker_ids"],
+            "label": rig["label"],
+            "title": rig["title"],
+            "description": rig["description"],
+            "pivotNote": rig["pivot_note"],
+            "mountedFromUtc": since.strftime("%Y-%m-%dT%H:%M:%SZ") if since else "",
+            "mountedUntilUtc": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until else "",
+            "replacedBy": replaced_by,
+        })
+    return out
 
 
 def _marker_tcp_rig_for_box(state: GatewayState, box_id: str, at_utc: Any = None) -> str:
@@ -16825,6 +16865,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "calibrationSession": _calibration_session_payload(state),
         "trackerMountSession": _tracker_mount_session_payload(state),
         "markerTcp": _marker_tcp_session_payload(state),
+        "markerRigs": _marker_rigs_payload(),
         "recordedDatasets": recorded_datasets,
         "processing": list(state.cached_processing_items),
         "trajectory": trajectory,
