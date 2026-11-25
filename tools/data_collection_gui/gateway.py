@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -126,6 +126,16 @@ GRIPPER_RIG_V9B_RIGHT_TARGET = "gripper_rig_v9b_right"
 GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b_right_tracking_in_robot_base_thor.yaml"
 )
+# The colleague's holder V12 (夹爪支架V12.STEP) replaced v9b on the left hand-held gripper
+# (BOX 3969377039) on 2026-11-25: four 58 mm pads level with the FT sensor, ids 102-105, the same
+# link_sensor_ft frame as v9b; TCP from two 11-25 pivots 0.77 mm apart (validated). Both bundles
+# name that BOX, so each target says from when its rig was on it (see _marker_tcp_rig_for_box).
+GRIPPER_RIG_V12_TARGET = "gripper_rig_v12"
+GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v12_tracking_in_robot_base_thor.yaml"
+)
+# The first recording with V12 on BOX 3969377039 (thor_gmsl2_9ch_v1_20261125_144305 ep0).
+GRIPPER_RIG_V12_MOUNTED_FROM_UTC = "2026-11-25T06:49:14Z"
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -155,11 +165,19 @@ TRACKING_TARGETS = {
         "config": GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
         "algorithm": "marker_layout_rig_corner_ba",
     },
+    GRIPPER_RIG_V12_TARGET: {
+        "label": "Gripper Rig V12 left (ArUco 102-105)",
+        "config": GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG,
+        "algorithm": "marker_layout_rig_corner_ba",
+        "mounted_from_utc": GRIPPER_RIG_V12_MOUNTED_FROM_UTC,
+    },
 }
 # Rigs the marker->TCP pivot solve accepts. The cube's corner table is resolved
 # from the production cube template; a layout rig ships its own table, its own
 # dictionary and its own CAD bundle, all named by its tracking config.
-MARKER_TCP_RIGS = (DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET, GRIPPER_RIG_V9B_RIGHT_TARGET)
+MARKER_TCP_RIGS = (
+    DEFAULT_TRACKING_TARGET, GRIPPER_RIG_V9B_TARGET, GRIPPER_RIG_V9B_RIGHT_TARGET, GRIPPER_RIG_V12_TARGET,
+)
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -6283,6 +6301,7 @@ _FOLLOWER_TRACKING_CONFIGS = (
     HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
     GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG,
     GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG,
+    GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG,
 )
 
 
@@ -7622,20 +7641,39 @@ def _marker_tcp_layout_rig(state: GatewayState, rig: str) -> dict[str, Any]:
     }
 
 
-def _marker_tcp_rig_for_box(state: GatewayState, box_id: str) -> str:
+def _utc_or_none(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _marker_tcp_rig_for_box(state: GatewayState, box_id: str, at_utc: Any = None) -> str:
     """The target a BOX's pivot is solved on when the operator did not name one.
 
     A layout rig's bundle names the BOX mounted on it. That has to win over the BOX registry,
     which calls the same BOX a left-hand handheld and so resolves it to the cube `left`
     (11-06: a rig pivot solved with the cube's dictionary found no rig marker, and all the
     operator saw was "no fused samples").
+
+    One BOX can carry different rigs over time (11-25: V12 replaced v9b on BOX 3969377039), and
+    both bundles keep its id. The rig mounted last wins; ``at_utc`` (a recording's start) picks
+    the one that was on the BOX then, so older recordings keep their own rig.
     """
+    at = _utc_or_none(at_utc) if at_utc else None
+    best: tuple[datetime, str] | None = None
     for rig in MARKER_TCP_RIGS:
         if rig == DEFAULT_TRACKING_TARGET or not (state.repo_root / TRACKING_TARGETS[rig]["config"]).is_file():
             continue
-        if str(_marker_tcp_layout_rig(state, rig)["bundleEntry"].get("device_id") or "").strip() == box_id:
-            return rig
-    return DEFAULT_TRACKING_TARGET
+        if str(_marker_tcp_layout_rig(state, rig)["bundleEntry"].get("device_id") or "").strip() != box_id:
+            continue
+        since = _utc_or_none(TRACKING_TARGETS[rig].get("mounted_from_utc") or "") or datetime.min.replace(tzinfo=UTC)
+        if at is not None and since > at:
+            continue
+        if best is None or since > best[0]:
+            best = (since, rig)
+    return best[1] if best else DEFAULT_TRACKING_TARGET
 
 
 def _marker_tcp_cad_check(pivot_report: dict[str, Any], bundle_entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -8801,7 +8839,9 @@ def _tracking_target_for_episodes(state: GatewayState, dataset: Path, episodes: 
                 continue
             key = str(box_id).strip().lower()
             try:
-                targets.add(_marker_tcp_rig_for_box(state, key if key.startswith("box") else f"box{key}"))
+                targets.add(_marker_tcp_rig_for_box(
+                    state, key if key.startswith("box") else f"box{key}", at_utc=meta.get("wallclock_start_utc")
+                ))
             except (OSError, ValueError, KeyError):
                 targets.add(DEFAULT_TRACKING_TARGET)
     return targets.pop() if len(targets) == 1 else DEFAULT_TRACKING_TARGET

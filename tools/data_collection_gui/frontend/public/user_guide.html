@@ -236,7 +236,7 @@
       <tr><td class="k">FR3 right</td><td><code>192.168.1.210</code></td><td>基座系 <code>fr3_base_right</code>；夹爪 BOX 3100715645；回放配置 <code>tools/fr3/replay_cube_pose_in_robot_base.thor.right.yaml</code>。</td></tr>
       <tr><td class="k">FR3 left</td><td><code>192.168.11.102</code></td><td>基座系 <code>fr3_base</code>；末端与右臂相同（夹爪 + 相机），夹爪 BOX 还没接进注册表和回放配置；注册边已退役。</td></tr>
       <tr><td class="k">手持 rig 右手</td><td>ArUco 100/101/110/111</td><td>BOX 3906437858；marker→TCP 常量 11-09 实测并验证（两次录制相差 0.35 mm）。</td></tr>
-      <tr><td class="k">手持 rig 左手</td><td>ArUco 106–109</td><td>BOX 3969377039；marker→TCP 常量 11-06 实测并验证。当前不用于采集。</td></tr>
+      <tr><td class="k">手持 rig 左手</td><td>ArUco 102–105（V12）</td><td>BOX 3969377039；11-25 起换成同学的 V12 支架（替换 v9b 106–109），marker→TCP 常量 11-25 实测并验证（两次录制相差 0.77 mm）。11-25 前的左手录制仍用 v9b。</td></tr>
       <tr><td class="k">激光跟踪仪（可选）</td><td>—</td><td>用作独立真值（回放误差分析），日常采集回放不需要。</td></tr>
     </tbody>
   </table></div>
@@ -659,7 +659,7 @@
     <h3>阶段 7 · 端到端验证 <span class="who op">操作员</span></h3>
     <ol>
       <li><b>用右手数据在左臂上回放</b>（不需要左手 rig）：选一段 QC 通过的右手 episode，Arm 选 left，MuJoCo 选 Right hand 并在左臂基座里预演 → 通过 → <span class="ui">Preflight left</span> → 起点 → 执行。这一步验证左臂的边、负载和夹爪。注意右手录制的动作原本是给右臂的，左臂不一定都够得着，IK/MuJoCo 不过就换一段。</li>
-      <li><b>左手采集：</b>手持左手 rig（106–109，BOX 3969377039），Dataset Processing 目标选 <span class="ui">Gripper Rig v9b · 左手</span>，生成和 QC 后，用 Left hand + left 臂回放。</li>
+      <li><b>左手采集：</b>手持左手 rig（V12，102–105，BOX 3969377039），Dataset Processing 目标选 <span class="ui">Gripper Rig V12 · 左手（11-25 起）</span>（11-25 前的录制选 v9b），生成和 QC 后，用 Left hand + left 臂回放。</li>
       <li>（推荐）勾上激光跟踪仪做一次回放误差分析，作为独立于同球检验的端到端核对。</li>
     </ol>
   </div>
@@ -712,7 +712,7 @@
       <tr><td>标定图守卫记录（Thor 本机，部署不会动）</td><td><code>outputs/world_graph_guard.json</code></td></tr>
       <tr><td>FR3 自动 pivot 工具</td><td><code>tools/fr3/fr3_pivot_auto.py</code></td></tr>
       <tr><td>同球检验结果 / 候选边（Thor）</td><td><code>outputs/calibration/fr3_base_ball_check/</code>、<code>outputs/calibration/fr3_base_registration/</code></td></tr>
-      <tr><td>手持 rig 追踪配置与 marker→TCP 常量</td><td><code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b*_…</code></td></tr>
+      <tr><td>手持 rig 追踪配置与 marker→TCP 常量</td><td><code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b*_…</code>、<code>…/gripper_rig_v12_…</code>（左手 11-25 起换成 V12）</td></tr>
       <tr><td>Thor 启动与恢复</td><td><code>tools/thor/README.md</code>、<code>tools/thor/DEPLOYMENT.md</code></td></tr>
     </tbody>
   </table></div>
