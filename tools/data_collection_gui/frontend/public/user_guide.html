@@ -242,6 +242,22 @@
   </table></div>
   <p class="muted small">左右按机器人自己的方向定义：站在底座后面、和机械臂朝同一个方向时的左右。</p>
 
+  <h3 id="rig-swap">更换手持 marker rig（11-25 起有脚本）</h3>
+  <p>手持夹爪换新支架、贴新 marker 时，按下面做。GUI 的检测目标卡片和 pivot 页的 rig 下拉框都读 rig 注册表
+  <code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/marker_rigs.json</code>，新 rig 登记进去、部署后就出现，
+  不用改网关或前端代码。命令都在 <code>third_party/opencv_kalibr</code> 下运行，详细说明见
+  <code>docs/gripper_rig_v9b_runbook.md</code> 的“Replacing a rig”一节，或 <code>python -m metrology.cli.swap_marker_rig --help</code>。</p>
+  <ol class="steps">
+    <li><span class="who op">操作员</span>贴好 marker，记下<b>站在夹爪后方、面向指尖时从左到右</b>的 id 顺序；用卡尺量黑块边长。录一条短 episode，把 rig 在相机前转一圈，最好让每台相机同时看到两张以上 marker。</li>
+    <li><span class="who mt">维护者</span><code>swap_marker_rig paste --rig &lt;新名字&gt; --step &lt;STEP&gt; --ids … --order …（从左到右） --dataset &lt;这条录制&gt;</code>：从 STEP 找贴纸面，判定哪张贴纸贴在哪个面、转了几圈。四面 rig 转半圈也能对上，靠 <code>--order</code> 区分；有警告时到实物上再核对一次顺序。</li>
+    <li><span class="who mt">维护者</span><code>swap_marker_rig configs --rig &lt;新名字&gt; --replaces &lt;旧 rig&gt; --mounted-from-dataset &lt;首条录制&gt; --black-mm &lt;卡尺读数&gt;</code>：生成角点表、bundle、追踪配置并登记。从这条录制开始的数据自动用新 rig 解算，之前的录制仍用旧 rig。TCP 先沿用旧 rig 的值，标为未验证。</li>
+    <li><span class="who mt">维护者</span><code>swap_marker_rig report --rig &lt;新名字&gt; --dataset &lt;录制&gt;</code>：看检出率，包括每帧有几台相机看到、每张 marker 的检出比例。侧面 marker 检出率低是正常的。</li>
+    <li><span class="who op">操作员</span>用 nov4 插件录两条 pivot：两条之间重新夹一次，球座挪个位置；夹爪夹在插件上，不要张开。<span class="who mt">维护者</span><code>swap_marker_rig pivot --rig &lt;新名字&gt; --dataset &lt;pivot1&gt; &lt;pivot2&gt; --write</code>：只有两条都合格（rmse ≤ 1.5 mm）且相差 ≤ 1.5 mm 才标 validated。</li>
+    <li><span class="who mt">维护者</span>提交 kalibr 的 PR，合并后再提交 lerobot 的子模块指针 PR；部署到 Thor 后重新提升一次当前标定，让新 rig 的追踪配置也指向生产标定。</li>
+    <li><span class="who op">操作员</span>BOX 上的负载变了：在标定页重新登记这台 BOX 的六维力负载模型（K）。</li>
+  </ol>
+  <p class="muted small">不要在夹爪张开的录制上目测判断 TCP：张开时指尖离球窝点很远，11-25 曾因此误判为差了 30–40 mm。</p>
+
   <h3>右臂回放的精度预期</h3>
   <p>world → <code>fr3_base_right</code> 这条边是 11-10 用 4 个球位做的同球检验拟合的：随机误差 p95 约 1.5 mm，另有最多约 3 mm 的竖直方向系统偏差（球垫是软的，FR3 和手按压的深度不同）。合起来在标定覆盖的区域内<b>典型约 3 mm、最大约 5 mm</b>，FR3 自身跟踪误差和相机标签误差另算。</p>
   <p>标定覆盖的区域（右臂基座系，mm）：x 507…611，y −315…236，z 250…615。<b>示教动作尽量落在这个范围附近</b>，离得越远，旋转误差放大得越多。</p>
@@ -712,7 +728,7 @@
       <tr><td>标定图守卫记录（Thor 本机，部署不会动）</td><td><code>outputs/world_graph_guard.json</code></td></tr>
       <tr><td>FR3 自动 pivot 工具</td><td><code>tools/fr3/fr3_pivot_auto.py</code></td></tr>
       <tr><td>同球检验结果 / 候选边（Thor）</td><td><code>outputs/calibration/fr3_base_ball_check/</code>、<code>outputs/calibration/fr3_base_registration/</code></td></tr>
-      <tr><td>手持 rig 追踪配置与 marker→TCP 常量</td><td><code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b*_…</code>、<code>…/gripper_rig_v12_…</code>（左手 11-25 起换成 V12）</td></tr>
+      <tr><td>手持 rig 追踪配置与 marker→TCP 常量</td><td><code>third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/gripper_rig_v9b*_…</code>、<code>…/gripper_rig_v12_…</code>（左手 11-25 起换成 V12）；rig 列表在 <code>…/config_thor/marker_rigs.json</code>，换 rig 见 <a href="#rig-swap">更换手持 marker rig</a></td></tr>
       <tr><td>Thor 启动与恢复</td><td><code>tools/thor/README.md</code>、<code>tools/thor/DEPLOYMENT.md</code></td></tr>
     </tbody>
   </table></div>

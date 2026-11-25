@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackingTarget } from "../types";
+import { isMarkerRigTarget, markerRigPeriod } from "../markerRigs";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskExportPlan } from "../shared/ui";
 
 export const processingStatusDot: Record<ProcessingStatus, string> = {
@@ -250,6 +251,7 @@ export function DatasetProcessingPage({
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
   const latestMarkerTcpPath = snapshot.markerTcp?.solvePath ?? "";
+  const markerRigs = snapshot.markerRigs ?? [];
   // Deliberately NOT pre-filled with the latest solve. A solve directory's bundle is
   // merged from whatever bundle it started from, so it is only fresh for the ONE cube
   // that was just solved -- every other cube in it is whatever the previous bundle held.
@@ -324,37 +326,28 @@ export function DatasetProcessingPage({
             <strong>0907 Hybrid Carrier V1</strong>
             <span>ArUco 30/31/32 anchors plus red/green/blue CAD-facet refinement.</span>
           </button>
-          <button
-            className={trackingTarget === "gripper_rig_v9b" ? "tracking-target-card active" : "tracking-target-card"}
-            aria-pressed={trackingTarget === "gripper_rig_v9b"}
-            disabled={busy}
-            onClick={() => setTrackingTarget("gripper_rig_v9b")}
-          >
-            <strong>Gripper Rig v9b · 左手（11-25 前）</strong>
-            <span>4 pads, ArUco DICT_6X6_250 ids 106–109; CAD corner table + measured socket TCP. Replaced by V12 on 11-25.</span>
-          </button>
-          <button
-            className={trackingTarget === "gripper_rig_v9b_right" ? "tracking-target-card active" : "tracking-target-card"}
-            aria-pressed={trackingTarget === "gripper_rig_v9b_right"}
-            disabled={busy}
-            onClick={() => setTrackingTarget("gripper_rig_v9b_right")}
-          >
-            <strong>Gripper Rig v9b · 右手</strong>
-            <span>Same holder, ArUco ids 100/101/110/111 (BOX 3906437858); TCP from its own 11-09 pivots (validated).</span>
-          </button>
-          <button
-            className={trackingTarget === "gripper_rig_v12" ? "tracking-target-card active" : "tracking-target-card"}
-            aria-pressed={trackingTarget === "gripper_rig_v12"}
-            disabled={busy}
-            onClick={() => setTrackingTarget("gripper_rig_v12")}
-          >
-            <strong>Gripper Rig V12 · 左手（11-25 起）</strong>
-            <span>Holder V12, ArUco ids 102–105 (BOX 3969377039); TCP from its own 11-25 pivots (validated).</span>
-          </button>
+          {markerRigs.map((rig) => (
+            <button
+              key={rig.target}
+              className={trackingTarget === rig.target ? "tracking-target-card active" : "tracking-target-card"}
+              aria-pressed={trackingTarget === rig.target}
+              disabled={busy}
+              onClick={() => setTrackingTarget(rig.target)}
+            >
+              <strong>{rig.title}{markerRigPeriod(rig)}</strong>
+              <span>
+                {rig.description}
+                {rig.replacedBy ? ` Replaced by ${rig.replacedBy}.` : ""}
+              </span>
+            </button>
+          ))}
         </div>
         <p className="panel-note">
           目标必须显式选择：错误的字典和几何模型可能得到“无检测”，不能靠文件名猜测物理夹具。
         </p>
+        {snapshot.markerRigs === undefined ? (
+          <p className="panel-note">网关没有提供 marker rig 列表（版本比前端旧），夹爪 rig 目标暂不可选；请重新部署网关。</p>
+        ) : null}
         {trackingTarget === "april_cube" ? (
           <>
             <div className="datasets-root-row trajectory-option-row">
@@ -463,9 +456,7 @@ export function DatasetProcessingPage({
                 value={
                   (selected.trackingTarget ?? "april_cube") === "hybrid_carrier_v1"
                     ? "CAD socket origin"
-                    : selected.trackingTarget === "gripper_rig_v9b" ||
-                      selected.trackingTarget === "gripper_rig_v9b_right" ||
-                      selected.trackingTarget === "gripper_rig_v12"
+                    : isMarkerRigTarget(markerRigs, selected.trackingTarget)
                       ? "rig bundle"
                       : selected.markerTcpCalibrationPath || "default"
                 }

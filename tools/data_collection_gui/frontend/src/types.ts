@@ -986,12 +986,25 @@ export type CubeVideoOverlay = {
   usedForFusion: boolean;
 };
 
-export type TrackingTarget =
-  | "april_cube"
-  | "hybrid_carrier_v1"
-  | "gripper_rig_v9b"
-  | "gripper_rig_v9b_right"
-  | "gripper_rig_v12";
+/** The two built-in targets, or a marker rig the gateway lists in snapshot.markerRigs. */
+export type TrackingTarget = "april_cube" | "hybrid_carrier_v1" | (string & {});
+
+/** A marker rig from the registry (opencv_kalibr config_thor/marker_rigs.json), as the gateway serves it. */
+export type MarkerRig = {
+  target: string;
+  hand: "left" | "right";
+  deviceId: string;
+  markerIds: number[];
+  label: string;
+  title: string;
+  description: string;
+  pivotNote: string;
+  /** Start of the first recording with this rig on its BOX; "" for the BOX's first rig. */
+  mountedFromUtc: string;
+  /** When the next rig on the same BOX took over; "" while it is still on. */
+  mountedUntilUtc: string;
+  replacedBy: string;
+};
 
 export type TrackingDetectionSummary = {
   target: TrackingTarget;

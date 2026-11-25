@@ -6263,13 +6263,13 @@ def test_marker_tcp_solve_refuses_a_box_the_production_bundle_does_not_cover(tmp
     assert "box_unknown" in result["error"]
 
 
-_RIG_V9B_SOURCE = Path(__file__).resolve().parents[2] / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG
+_RIG_V9B_SOURCE = Path(__file__).resolve().parents[2] / gateway.TRACKING_TARGETS["gripper_rig_v9b"]["config"]
 
 
 def _install_rig_v9b(repo_root: Path) -> Path:
     """Copy the shipped v9b config, layout and bundle into a test repo at their real paths."""
     config_dir = _RIG_V9B_SOURCE.parent
-    target_dir = repo_root / gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG.parent
+    target_dir = repo_root / gateway.TRACKING_TARGETS["gripper_rig_v9b"]["config"].parent
     target_dir.mkdir(parents=True, exist_ok=True)
     for name in (
         _RIG_V9B_SOURCE.name,
@@ -6304,7 +6304,7 @@ def test_gripper_rig_v9b_is_a_tracking_target_with_its_own_entrypoint_config(tmp
             marker_to_tcp_calibration_path=tmp_path / "x.json",
         )
     # Calibration promotion rewrites it together with production, never leaves it behind.
-    assert gateway.GRIPPER_RIG_V9B_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert gateway.TRACKING_TARGETS["gripper_rig_v9b"]["config"] in gateway._FOLLOWER_TRACKING_CONFIGS
 
 
 def test_marker_tcp_solve_on_the_v9b_rig_uses_its_own_layout_dictionary_and_bundle(tmp_path, monkeypatch):
@@ -10605,7 +10605,7 @@ def test_the_right_hand_rig_is_its_own_target_and_its_box_picks_it(tmp_path):
     target_dir = _install_rig_v9b(repo_root)
     source_dir = _RIG_V9B_SOURCE.parent
     for name in (
-        gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG.name,
+        gateway.TRACKING_TARGETS["gripper_rig_v9b_right"]["config"].name,
         "gripper_rig_v9b_right_marker_layout.json",
         "marker_to_tcp_calibration_gripper_rig_v9b_right.json",
     ):
@@ -10635,7 +10635,7 @@ def test_the_right_hand_rig_is_its_own_target_and_its_box_picks_it(tmp_path):
     # each hand-held BOX's pivot is solved on its own rig
     assert gateway._marker_tcp_rig_for_box(state, "box3906437858") == "gripper_rig_v9b_right"
     assert gateway._marker_tcp_rig_for_box(state, "box3969377039") == "gripper_rig_v9b"
-    assert gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert gateway.TRACKING_TARGETS["gripper_rig_v9b_right"]["config"] in gateway._FOLLOWER_TRACKING_CONFIGS
     assert "gripper_rig_v9b_right" in gateway.MARKER_TCP_RIGS
 
 
@@ -10644,7 +10644,7 @@ def test_rig_v12_replaces_v9b_on_the_left_box_from_its_first_recording(tmp_path)
     repo_root = tmp_path / "repo"
     target_dir = _install_rig_v9b(repo_root)
     for name in (
-        gateway.GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG.name,
+        gateway.TRACKING_TARGETS["gripper_rig_v12"]["config"].name,
         "gripper_rig_v12_marker_layout.json",
         "marker_to_tcp_calibration_gripper_rig_v12.json",
     ):
@@ -10682,8 +10682,51 @@ def test_rig_v12_replaces_v9b_on_the_left_box_from_its_first_recording(tmp_path)
             "wallclock_start_utc": start, "box_devices": {"3969377039": {"role": "handheld", "hand": "left"}},
         }))
         assert gateway._tracking_target_for_episodes(state, dataset, [0]) == rig
-    assert gateway.GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert gateway.TRACKING_TARGETS["gripper_rig_v12"]["config"] in gateway._FOLLOWER_TRACKING_CONFIGS
     assert gateway.TRACKING_TARGETS["gripper_rig_v12"]["algorithm"] == "marker_layout_rig_corner_ba"
+
+
+def test_marker_rigs_come_from_the_registry_with_their_period_on_the_box():
+    """A rig added by swap_marker_rig is a target, a pivot rig and a promotion follower, with no code change."""
+    targets = [rig["target"] for rig in gateway.MARKER_RIGS]
+    assert {"gripper_rig_v9b", "gripper_rig_v9b_right", "gripper_rig_v12"} <= set(targets)
+    for rig in gateway.MARKER_RIGS:
+        assert gateway.TRACKING_TARGETS[rig["target"]]["algorithm"] == gateway.MARKER_RIG_ALGORITHM
+        assert rig["target"] in gateway.MARKER_TCP_RIGS
+        assert rig["config"] in gateway._FOLLOWER_TRACKING_CONFIGS
+        assert (Path(__file__).resolve().parents[2] / rig["config"]).is_file()
+    payload = {rig["target"]: rig for rig in gateway._marker_rigs_payload()}
+    assert payload["gripper_rig_v9b"]["mountedUntilUtc"] == "2026-11-25T06:49:14Z"
+    assert payload["gripper_rig_v9b"]["replacedBy"] == "gripper_rig_v12"
+    assert payload["gripper_rig_v12"]["mountedFromUtc"] == "2026-11-25T06:49:14Z"
+    assert payload["gripper_rig_v12"]["mountedUntilUtc"] == "" and payload["gripper_rig_v12"]["replacedBy"] == ""
+    assert payload["gripper_rig_v9b_right"]["mountedUntilUtc"] == ""  # another BOX
+    assert payload["gripper_rig_v12"]["markerIds"] == [102, 103, 104, 105]
+
+
+def test_a_broken_registry_entry_is_dropped_not_guessed(tmp_path, capsys):
+    registry = tmp_path / "marker_rigs.json"
+    good = {"target": "rig_ok", "hand": "left", "config": "config_thor/rig_ok.yaml", "label": "ok"}
+    registry.write_text(json.dumps({"schema": "marker_rigs/v1", "rigs": [
+        good,
+        {**good, "target": "april_cube"},  # would shadow a built-in target
+        {**good, "target": "Bad Name"},
+        {**good, "target": "rig_up", "config": "../../etc/x.yaml"},
+        {**good, "target": "rig_nohand", "hand": "both"},
+        {**good},  # duplicate
+    ]}))
+    rigs = gateway._load_marker_rigs(registry)
+    assert [rig["target"] for rig in rigs] == ["rig_ok"]
+    assert rigs[0]["config"] == gateway.MARKER_RIG_REGISTRY.parent.parent / "config_thor/rig_ok.yaml"
+    assert capsys.readouterr().err.count("skipping entry") == 5
+    registry.write_text("{not json")
+    assert gateway._load_marker_rigs(registry) == []
+
+
+def test_the_snapshot_lists_the_marker_rigs(tmp_path):
+    state = _marker_tcp_gateway_state(tmp_path)
+    rigs = gateway._snapshot(state)["markerRigs"]
+    assert [rig["target"] for rig in rigs] == [rig["target"] for rig in gateway.MARKER_RIGS]
 
 
 def test_the_arm_held_6d_zero_reads_the_recorder_through_the_gateway(tmp_path: Path) -> None:
