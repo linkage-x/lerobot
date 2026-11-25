@@ -8757,7 +8757,9 @@ def test_a_rig_pivot_nobody_tracked_is_tracked_with_its_boxs_rig(tmp_path, monke
     meta.write_text(json.dumps({"box_devices": {"3906437858": {"role": "handheld", "hand": "right"}}}))
     os.utime(meta, (time.time() + 60,) * 2)
     rigs = {"box3906437858": "gripper_rig_v9b_right"}
-    monkeypatch.setattr(gateway, "_marker_tcp_rig_for_box", lambda _s, box: rigs.get(box, gateway.DEFAULT_TRACKING_TARGET))
+    monkeypatch.setattr(
+        gateway, "_marker_tcp_rig_for_box", lambda _s, box, at_utc=None: rigs.get(box, gateway.DEFAULT_TRACKING_TARGET)
+    )
     queued: list[str] = []
 
     def track(_state, root, tracking_target=gateway.DEFAULT_TRACKING_TARGET, **_kw):
@@ -10635,6 +10637,53 @@ def test_the_right_hand_rig_is_its_own_target_and_its_box_picks_it(tmp_path):
     assert gateway._marker_tcp_rig_for_box(state, "box3969377039") == "gripper_rig_v9b"
     assert gateway.GRIPPER_RIG_V9B_RIGHT_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
     assert "gripper_rig_v9b_right" in gateway.MARKER_TCP_RIGS
+
+
+def test_rig_v12_replaces_v9b_on_the_left_box_from_its_first_recording(tmp_path):
+    """11-25: V12 took v9b's place on BOX 3969377039; both bundles keep that BOX's id."""
+    repo_root = tmp_path / "repo"
+    target_dir = _install_rig_v9b(repo_root)
+    for name in (
+        gateway.GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG.name,
+        "gripper_rig_v12_marker_layout.json",
+        "marker_to_tcp_calibration_gripper_rig_v12.json",
+    ):
+        shutil.copy2(_RIG_V9B_SOURCE.parent / name, target_dir / name)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    v12 = gateway._marker_tcp_layout_rig(state, "gripper_rig_v12")
+    v9b = gateway._marker_tcp_layout_rig(state, "gripper_rig_v9b")
+    assert v12["cubeName"] == v9b["cubeName"] == "left"
+    assert v12["dictionary"] == "DICT_6X6_250" and v12["markerSizeSource"] == "caliper"
+    layout = json.loads(Path(v12["layoutPath"]).read_text())
+    # the paste check's pads: read 102..105 left to right from behind, i.e. along -x
+    assert {m["id"]: m["pad"] for m in layout["markers"]} == {
+        102: "R_side", 103: "R_front", 104: "L_front", 105: "L_side"
+    }
+    assert v12["bundleEntry"]["device_id"] == v9b["bundleEntry"]["device_id"] == "box3969377039"
+    bundle = json.loads((target_dir / "marker_to_tcp_calibration_gripper_rig_v12.json").read_text())
+    assert bundle["validated"] is True
+    assert bundle["cubes"]["left"]["expected_pivot_points_mm"]["insert_nov4_socket_centre"] == [2.63, -1.93, 167.19]
+    # a pivot solved now uses the rig on the BOX now; a recording uses the rig on it then
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039") == "gripper_rig_v12"
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039", at_utc="2026-11-25T06:49:14.4+00:00") == "gripper_rig_v12"
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039", at_utc="2026-11-06T02:35:12+00:00") == "gripper_rig_v9b"
+    assert gateway._marker_tcp_rig_for_box(state, "box3969377039", at_utc="not a time") == "gripper_rig_v12"
+    dataset = tmp_path / "ds"
+    meta = dataset / "episodes" / "episode_000000" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    for start, rig in (("2026-11-06T02:35:12+00:00", "gripper_rig_v9b"), ("2026-11-25T07:53:35+00:00", "gripper_rig_v12")):
+        meta.write_text(json.dumps({
+            "wallclock_start_utc": start, "box_devices": {"3969377039": {"role": "handheld", "hand": "left"}},
+        }))
+        assert gateway._tracking_target_for_episodes(state, dataset, [0]) == rig
+    assert gateway.GRIPPER_RIG_V12_EE_TRAJECTORY_CONFIG in gateway._FOLLOWER_TRACKING_CONFIGS
+    assert gateway.TRACKING_TARGETS["gripper_rig_v12"]["algorithm"] == "marker_layout_rig_corner_ba"
 
 
 def test_the_arm_held_6d_zero_reads_the_recorder_through_the_gateway(tmp_path: Path) -> None:

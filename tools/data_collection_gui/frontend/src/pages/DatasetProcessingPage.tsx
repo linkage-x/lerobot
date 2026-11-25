@@ -330,8 +330,8 @@ export function DatasetProcessingPage({
             disabled={busy}
             onClick={() => setTrackingTarget("gripper_rig_v9b")}
           >
-            <strong>Gripper Rig v9b · 左手</strong>
-            <span>4 pads, ArUco DICT_6X6_250 ids 106–109; CAD corner table + measured socket TCP.</span>
+            <strong>Gripper Rig v9b · 左手（11-25 前）</strong>
+            <span>4 pads, ArUco DICT_6X6_250 ids 106–109; CAD corner table + measured socket TCP. Replaced by V12 on 11-25.</span>
           </button>
           <button
             className={trackingTarget === "gripper_rig_v9b_right" ? "tracking-target-card active" : "tracking-target-card"}
@@ -341,6 +341,15 @@ export function DatasetProcessingPage({
           >
             <strong>Gripper Rig v9b · 右手</strong>
             <span>Same holder, ArUco ids 100/101/110/111 (BOX 3906437858); TCP from its own 11-09 pivots (validated).</span>
+          </button>
+          <button
+            className={trackingTarget === "gripper_rig_v12" ? "tracking-target-card active" : "tracking-target-card"}
+            aria-pressed={trackingTarget === "gripper_rig_v12"}
+            disabled={busy}
+            onClick={() => setTrackingTarget("gripper_rig_v12")}
+          >
+            <strong>Gripper Rig V12 · 左手（11-25 起）</strong>
+            <span>Holder V12, ArUco ids 102–105 (BOX 3969377039); TCP from its own 11-25 pivots (validated).</span>
           </button>
         </div>
         <p className="panel-note">
@@ -454,7 +463,9 @@ export function DatasetProcessingPage({
                 value={
                   (selected.trackingTarget ?? "april_cube") === "hybrid_carrier_v1"
                     ? "CAD socket origin"
-                    : selected.trackingTarget === "gripper_rig_v9b" || selected.trackingTarget === "gripper_rig_v9b_right"
+                    : selected.trackingTarget === "gripper_rig_v9b" ||
+                      selected.trackingTarget === "gripper_rig_v9b_right" ||
+                      selected.trackingTarget === "gripper_rig_v12"
                       ? "rig bundle"
                       : selected.markerTcpCalibrationPath || "default"
                 }
